@@ -19,6 +19,7 @@ import {
 import { toast } from "sonner";
 import {
   useObservabilityStore,
+  decodeEditorContent,
   parseLogMessage,
   findCorrelatedRequest,
   calculateLatency,
@@ -27,15 +28,6 @@ import {
 } from "@/store/observability";
 import { Button } from "@/components/ui/button";
 import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
-
-function formatJSON(jsonStr: string): string {
-  try {
-    const parsed = JSON.parse(jsonStr);
-    return JSON.stringify(parsed, null, 2);
-  } catch {
-    return jsonStr;
-  }
-}
 
 interface Insight {
   icon: React.ElementType;
@@ -146,10 +138,17 @@ export function Inspector() {
     [logs, selectedLogId]
   );
 
+  const editorPayload = useMemo(
+    () => decodeEditorContent(selectedLog?.content),
+    [selectedLog?.content]
+  );
+  const isJsonEditor = editorPayload.language === "json";
+
   // Check message type
   const isRawMessage = selectedLog?.message_type === "raw";
   const isStderrMessage = selectedLog?.message_type === "stderr";
-  const isNonJsonRpc = isRawMessage || isStderrMessage;
+  const showRawUi = !!isRawMessage && !isJsonEditor;
+  const isNonJsonRpc = isStderrMessage || showRawUi;
 
   // Parse and correlate
   const parsed = selectedLog && !isNonJsonRpc ? parseLogMessage(selectedLog) : null;
@@ -187,11 +186,6 @@ export function Inspector() {
     }
   }, [correlatedRequest, selectLog]);
 
-  // Formatted JSON for display
-  const formattedJSON = selectedLog
-    ? formatJSON(selectedLog.content)
-    : "";
-
   // Get latency color
   const getLatencyColor = (ms: number) => {
     if (ms >= 1000) return "text-red-500";
@@ -206,13 +200,13 @@ export function Inspector() {
         <div className="flex items-center gap-2">
           {isStderrMessage ? (
             <WarningCircle className="w-4 h-4 text-red-500" weight="fill" />
-          ) : isRawMessage ? (
+          ) : showRawUi ? (
             <Terminal className="w-4 h-4 text-amber-500" weight="duotone" />
           ) : (
             <FileJs className="w-4 h-4 text-accent" weight="duotone" />
           )}
           <h2 className="text-sm font-semibold text-foreground">
-            {isStderrMessage ? "Stderr Output" : isRawMessage ? "Raw Output" : "Inspector"}
+            {isStderrMessage ? "Stderr Output" : showRawUi ? "Raw Output" : "Inspector"}
           </h2>
         </div>
         {selectedLog && (
@@ -254,7 +248,7 @@ export function Inspector() {
                 </span>
               </div>
             )}
-            {isRawMessage && (
+            {showRawUi && (
               <div className="flex items-center gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-md mb-2">
                 <Terminal className="w-4 h-4 text-amber-500 flex-shrink-0" weight="duotone" />
                 <span className="text-xs text-amber-500">
@@ -393,8 +387,8 @@ export function Inspector() {
           <div className="flex-1 overflow-hidden">
             <Editor
               height="100%"
-              defaultLanguage={isNonJsonRpc ? "plaintext" : "json"}
-              value={isNonJsonRpc ? selectedLog.content : formattedJSON}
+              language={editorPayload.language}
+              value={editorPayload.content}
               theme="vs-dark"
               options={{
                 readOnly: true,
@@ -405,7 +399,7 @@ export function Inspector() {
                 scrollBeyondLastLine: false,
                 automaticLayout: true,
                 wordWrap: "on",
-                folding: !isNonJsonRpc,
+                folding: editorPayload.language === "json",
                 renderLineHighlight: "all",
                 scrollbar: {
                   vertical: "auto",

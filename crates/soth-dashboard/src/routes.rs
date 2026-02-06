@@ -122,7 +122,7 @@ pub fn api_router_with_events(state: AppState) -> Router {
             "/api/events/stream",
             get({
                 let events = events.clone();
-                move |ws| event_stream_handler(ws, State(events.clone()))
+                move |ws, query| event_stream_handler(ws, State(events.clone()), query)
             }),
         );
     }
@@ -149,6 +149,7 @@ async fn get_snapshot(State(state): State<AppState>) -> Json<ApiResponse<Dashboa
 pub struct EventsQuery {
     #[serde(default = "default_limit")]
     pub limit: usize,
+    pub since_seq: Option<i64>,
 }
 
 fn default_limit() -> usize {
@@ -202,7 +203,11 @@ async fn get_events(
     Query(query): Query<EventsQuery>,
 ) -> Json<ApiResponse<EventsSummary>> {
     let summary = if let Some(ref events) = state.events {
-        events.get_events(query.limit)
+        if let Some(since_seq) = query.since_seq {
+            events.get_events_since_seq(since_seq, query.limit)
+        } else {
+            events.get_events(query.limit)
+        }
     } else {
         EventsSummary {
             total_events: 0,

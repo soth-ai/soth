@@ -11,11 +11,10 @@ import type {
   DashboardSnapshot,
   AgentsSummary,
 } from "@/types";
-
-const API_BASE = "/api";
+import { buildApiUrl } from "@/lib/endpoints";
 
 async function fetchJson<T>(endpoint: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${endpoint}`);
+  const response = await fetch(buildApiUrl(endpoint));
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }

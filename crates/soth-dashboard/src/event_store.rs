@@ -136,6 +136,58 @@ impl EventStore {
         }
     }
 
+    /// Get events strictly newer than a sqlite sequence cursor.
+    ///
+    /// For sqlite backends this queries durable storage (ordered ASC by sequence).
+    /// For JSONL backends this falls back to in-memory filtering when sequence data exists.
+    pub fn get_events_since_seq(&self, since_seq: i64, limit: usize) -> EventsSummary {
+        if limit == 0 {
+            return EventsSummary {
+                total_events: self.inner.read().events.len(),
+                events: Vec::new(),
+            };
+        }
+
+        let capped_limit = limit.min(5_000);
+        match &self.backend {
+            EventStoreBackend::Sqlite(path) => {
+                let rows = read_sqlite_events(path, Some(since_seq)).unwrap_or_default();
+                let total_events = self.inner.read().events.len();
+
+                let mut events: Vec<WrapEvent> = rows.into_iter().map(|(_, event)| event).collect();
+                if events.len() > capped_limit {
+                    let keep_from = events.len() - capped_limit;
+                    events = events.split_off(keep_from);
+                }
+
+                EventsSummary {
+                    total_events,
+                    events,
+                }
+            }
+            EventStoreBackend::Jsonl(_) => {
+                let inner = self.inner.read();
+                let mut events: Vec<WrapEvent> = inner
+                    .events
+                    .iter()
+                    .rev()
+                    .filter(|event| event.seq.map(|seq| seq > since_seq).unwrap_or(false))
+                    .cloned()
+                    .collect();
+
+                if events.len() > capped_limit {
+                    let keep_from = events.len() - capped_limit;
+                    events = events.split_off(keep_from);
+                }
+
+                EventsSummary {
+                    total_events: inner.events.len(),
+                    events,
+                }
+            }
+        }
+    }
+
     /// Get agent statistics.
     pub fn get_agents(&self) -> AgentsSummary {
         let inner = self.inner.read();
@@ -454,7 +506,8 @@ fn read_sqlite_events(
 
         for row in rows {
             let (seq, json) = row.map_err(to_io_err)?;
-            if let Ok(event) = serde_json::from_str::<WrapEvent>(&json) {
+            if let Ok(mut event) = serde_json::from_str::<WrapEvent>(&json) {
+                event.seq = Some(seq);
                 events.push((seq, event));
             }
         }
@@ -477,7 +530,8 @@ fn read_sqlite_events(
 
         for row in rows {
             let (seq, json) = row.map_err(to_io_err)?;
-            if let Ok(event) = serde_json::from_str::<WrapEvent>(&json) {
+            if let Ok(mut event) = serde_json::from_str::<WrapEvent>(&json) {
+                event.seq = Some(seq);
                 events.push((seq, event));
             }
         }
@@ -597,5 +651,27 @@ mod tests {
 
         let summary = store.get_events(10);
         assert_eq!(summary.total_events, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_events_since_seq_sqlite() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let logger = EventLogger::new(db_path.clone()).unwrap();
+        logger.log(&make_event("Claude Desktop", "postgres"));
+        logger.log(&make_event("Cursor", "filesystem"));
+        logger.log(&make_event("Windsurf", "git"));
+        logger.close();
+
+        let store = EventStore::new(db_path);
+        store.load_initial().await.unwrap();
+
+        let replay = store.get_events_since_seq(1, 10);
+        assert_eq!(replay.events.len(), 2);
+        assert!(replay
+            .events
+            .iter()
+            .all(|event| event.seq.map(|seq| seq > 1).unwrap_or(false)));
     }
 }

@@ -21,6 +21,11 @@ pub enum EventSource {
 /// An event captured during a wrap session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrapEvent {
+    /// Monotonic SQLite sequence cursor when sourced from DB-backed event logs.
+    /// Absent for JSONL/newly-created in-memory events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+
     /// Unique event ID
     pub id: String,
 
@@ -125,6 +130,7 @@ impl WrapEvent {
         agent: AgentInfo,
     ) -> Self {
         Self {
+            seq: None,
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
             session_id: session_id.into(),

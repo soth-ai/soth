@@ -16,6 +16,7 @@ import {
 import { toast } from "sonner";
 import {
   useObservabilityStore,
+  decodeSmartDisplayText,
   type LogEntry,
   type Filters,
 } from "@/store/observability";
@@ -112,7 +113,7 @@ const getAgentName = (serverName: string): string => {
 };
 
 const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) {
-  const { selectedLogId, selectLog } = useObservabilityStore();
+  const { selectedLogId, selectedLogPart, selectLog } = useObservabilityStore();
   const [isHovered, setIsHovered] = useState(false);
   const isSelected = selectedLogId === log.id;
   const rowRef = useRef<HTMLDivElement>(null);
@@ -137,9 +138,24 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
   // Parse method for display
   const displayMethod = log.method?.split(" ").slice(0, 2).join(" ") || "request";
   const agentName = getAgentName(log.server_name);
+  const requestPreview = useMemo(
+    () => decodeSmartDisplayText(log.request_preview || log.request_content || ""),
+    [log.request_preview, log.request_content]
+  );
+  const responsePreview = useMemo(
+    () => decodeSmartDisplayText(log.response_preview || log.response_content || ""),
+    [log.response_preview, log.response_content]
+  );
+  const contentPreview = useMemo(
+    () => decodeSmartDisplayText(log.content_preview || log.content),
+    [log.content_preview, log.content]
+  );
 
   // For paired events, render two connected rows
   if (isPairedEvent) {
+    const requestIsSelected = isSelected && selectedLogPart !== "response";
+    const responseIsSelected = isSelected && selectedLogPart === "response";
+
     return (
       <div
         ref={rowRef}
@@ -147,20 +163,20 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
           "group relative border-l-2 transition-all duration-150",
           isSelected ? "border-l-purple-500 bg-purple-500/5" : "border-l-muted-foreground/30 hover:border-l-purple-500/50 hover:bg-muted/20",
         )}
-        onClick={() => selectLog(log.id)}
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
       >
         {/* Request Row */}
         <div
+          onClick={() => selectLog(log.id, "request")}
           className={cn(
             "flex items-center gap-3 px-4 h-8 cursor-pointer border-b border-border/50",
-            isSelected && "bg-cyan-500/5"
+            requestIsSelected && "bg-cyan-500/5"
           )}
         >
           {/* Status Dot */}
           <div className="flex-shrink-0">
-            <div className={cn("w-2 h-2 rounded-full bg-cyan-500", isSelected && "ring-2 ring-purple-500/50")} />
+            <div className={cn("w-2 h-2 rounded-full bg-cyan-500", requestIsSelected && "ring-2 ring-purple-500/50")} />
           </div>
 
           {/* Timestamp */}
@@ -202,7 +218,7 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
 
           {/* Request Preview */}
           <span className="text-xs text-cyan-600 dark:text-cyan-400 flex-1 truncate font-mono">
-            {truncate(log.request_preview || "", 60)}
+            {truncate(requestPreview, 60)}
           </span>
 
           {/* Copy button */}
@@ -221,9 +237,10 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
 
         {/* Response Row */}
         <div
+          onClick={() => selectLog(log.id, "response")}
           className={cn(
             "flex items-center gap-3 px-4 h-8 cursor-pointer border-b border-border",
-            isSelected && "bg-emerald-500/5"
+            responseIsSelected && "bg-emerald-500/5"
           )}
         >
           {/* Status Dot */}
@@ -231,7 +248,7 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
             <div className={cn(
               "w-2 h-2 rounded-full",
               log.status_code && log.status_code >= 400 ? "bg-red-500" : "bg-emerald-500",
-              isSelected && "ring-2 ring-purple-500/50"
+              responseIsSelected && "ring-2 ring-purple-500/50"
             )} />
           </div>
 
@@ -263,7 +280,7 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
 
           {/* Response Preview */}
           <span className="text-xs text-emerald-600 dark:text-emerald-400 flex-1 truncate font-mono">
-            {truncate(log.response_preview || "", 60)}
+            {truncate(responsePreview, 60)}
           </span>
 
           {/* Policy indicator */}
@@ -401,7 +418,7 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
 
       {/* Content Preview */}
       <span className="text-xs text-muted-foreground flex-1 truncate font-mono">
-        {truncate(log.content_preview || log.content.slice(0, 100), 50)}
+        {truncate(contentPreview, 50)}
       </span>
 
       {/* Policy indicator */}

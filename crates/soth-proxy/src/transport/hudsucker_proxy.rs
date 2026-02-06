@@ -595,47 +595,154 @@ fn detect_compression_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Try to decompress bytes, returns decompressed data or original if decompression fails
-fn try_decompress(bytes: &[u8], encoding: Option<&str>) -> Vec<u8> {
-    let encoding = encoding.or_else(|| detect_compression_from_bytes(bytes));
+fn parse_content_encoding_chain(encoding: Option<&str>) -> Vec<String> {
+    let mut codings = Vec::new();
+    if let Some(enc) = encoding {
+        for token in enc.split(',') {
+            let coding = token
+                .trim()
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if coding.is_empty() || coding == "identity" {
+                continue;
+            }
+            codings.push(coding);
+        }
+    }
+    codings
+}
 
+fn decompress_once(bytes: &[u8], encoding: &str) -> Option<Vec<u8>> {
     match encoding {
-        Some("zstd") => {
+        "zstd" => {
             let cursor = Cursor::new(bytes);
-            if let Ok(mut decoder) = zstd::stream::Decoder::new(cursor) {
-                let mut decompressed = Vec::new();
-                if decoder.read_to_end(&mut decompressed).is_ok() && !decompressed.is_empty() {
-                    return decompressed;
+            let mut decoder = zstd::stream::Decoder::new(cursor).ok()?;
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).ok()?;
+            Some(out)
+        }
+        "gzip" => {
+            let mut decoder = GzDecoder::new(bytes);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).ok()?;
+            Some(out)
+        }
+        "br" | "brotli" => {
+            let mut decoder = BrotliDecoder::new(bytes, 4096);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).ok()?;
+            Some(out)
+        }
+        "deflate" => {
+            // In practice "deflate" is often zlib-wrapped, sometimes raw deflate.
+            use flate2::read::{DeflateDecoder, ZlibDecoder};
+
+            let mut zlib_decoder = ZlibDecoder::new(bytes);
+            let mut zlib_out = Vec::new();
+            if zlib_decoder.read_to_end(&mut zlib_out).is_ok() && !zlib_out.is_empty() {
+                return Some(zlib_out);
+            }
+
+            let mut deflate_decoder = DeflateDecoder::new(bytes);
+            let mut deflate_out = Vec::new();
+            if deflate_decoder.read_to_end(&mut deflate_out).is_ok() && !deflate_out.is_empty() {
+                return Some(deflate_out);
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+fn maybe_binary_placeholder(bytes: &[u8], encoding: Option<&str>) -> Option<String> {
+    let lossy = String::from_utf8_lossy(bytes);
+    let chars = lossy.chars().count().max(1);
+    let replacement_chars = lossy.chars().filter(|c| *c == '\u{FFFD}').count();
+    let replacement_ratio = replacement_chars as f32 / chars as f32;
+
+    if replacement_chars >= 3 || replacement_ratio >= 0.08 {
+        let coding = parse_content_encoding_chain(encoding)
+            .first()
+            .cloned()
+            .or_else(|| detect_compression_from_bytes(bytes).map(str::to_string))
+            .unwrap_or_else(|| "binary".to_string());
+        return Some(format!(
+            "[compressed/{} payload: {} bytes]",
+            coding,
+            bytes.len()
+        ));
+    }
+
+    None
+}
+
+/// Try to decompress bytes using Content-Encoding chain, then heuristic fallbacks.
+/// Returns original bytes if all decoding attempts fail.
+fn try_decompress(bytes: &[u8], encoding: Option<&str>) -> Vec<u8> {
+    let chain = parse_content_encoding_chain(encoding);
+
+    // RFC: encodings are listed in application order; decode in reverse.
+    if !chain.is_empty() {
+        let mut current = bytes.to_vec();
+        let mut ok = true;
+        for coding in chain.iter().rev() {
+            match decompress_once(&current, coding) {
+                Some(next) => current = next,
+                None => {
+                    ok = false;
+                    break;
                 }
             }
         }
-        Some("gzip") => {
-            let mut decoder = GzDecoder::new(bytes);
-            let mut decompressed = Vec::new();
-            if decoder.read_to_end(&mut decompressed).is_ok() && !decompressed.is_empty() {
-                return decompressed;
-            }
+        if ok && !current.is_empty() {
+            return current;
         }
-        Some("br") | Some("brotli") => {
-            let mut decoder = BrotliDecoder::new(bytes, 4096);
-            let mut decompressed = Vec::new();
-            if decoder.read_to_end(&mut decompressed).is_ok() && !decompressed.is_empty() {
-                return decompressed;
-            }
-        }
-        Some("deflate") => {
-            use flate2::read::DeflateDecoder;
-            let mut decoder = DeflateDecoder::new(bytes);
-            let mut decompressed = Vec::new();
-            if decoder.read_to_end(&mut decompressed).is_ok() && !decompressed.is_empty() {
-                return decompressed;
-            }
-        }
-        _ => {}
     }
 
-    // Return original if no decompression or decompression failed
+    // Fallback 1: direct decode from magic bytes (missing/incorrect header).
+    if let Some(detected) = detect_compression_from_bytes(bytes) {
+        if let Some(out) = decompress_once(bytes, detected) {
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+
+    // Fallback 2: iterative magic decode for stacked codings.
+    let mut current = bytes.to_vec();
+    let mut changed = false;
+    for _ in 0..3 {
+        let Some(detected) = detect_compression_from_bytes(&current) else {
+            break;
+        };
+        match decompress_once(&current, detected) {
+            Some(next) if !next.is_empty() => {
+                current = next;
+                changed = true;
+            }
+            _ => break,
+        }
+    }
+    if changed {
+        return current;
+    }
+
     bytes.to_vec()
+}
+
+fn decode_body_for_logging(bytes: &[u8], encoding: Option<&str>) -> String {
+    let decoded = try_decompress(bytes, encoding);
+    if let Ok(text) = String::from_utf8(decoded.clone()) {
+        return text;
+    }
+    if let Some(marker) = maybe_binary_placeholder(&decoded, encoding) {
+        return marker;
+    }
+    String::from_utf8_lossy(&decoded).to_string()
 }
 
 /// AI-aware HTTP handler for hudsucker
@@ -943,12 +1050,18 @@ impl HttpHandler for AiProxyHandler {
             .as_ref()
             .map(|ct| ct.contains("application/json"))
             .unwrap_or(false);
+        let request_content_encoding = req
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_lowercase());
         let should_inspect_body = is_post && provider.is_some(); // Always inspect AI POST requests
 
         debug!(
             is_post = is_post,
             content_type = ?content_type,
             is_json = is_json,
+            request_content_encoding = ?request_content_encoding,
             provider = ?provider,
             should_inspect = should_inspect_body,
             "Request inspection check"
@@ -975,7 +1088,8 @@ impl HttpHandler for AiProxyHandler {
                     Ok(collected) => {
                         let bytes = collected.to_bytes();
                         let body_len = bytes.len();
-                        let body_str = String::from_utf8_lossy(&bytes).to_string();
+                        let body_str =
+                            decode_body_for_logging(&bytes, request_content_encoding.as_deref());
 
                         debug!(
                             body_len = body_len,
@@ -984,7 +1098,7 @@ impl HttpHandler for AiProxyHandler {
                         );
 
                         // Extract model from request body
-                        let model = serde_json::from_slice::<AiRequestBody>(&bytes)
+                        let model = serde_json::from_str::<AiRequestBody>(&body_str)
                             .ok()
                             .and_then(|b| b.model);
 
@@ -1019,7 +1133,8 @@ impl HttpHandler for AiProxyHandler {
                 );
 
                 match enforcement {
-                    Ok(identity_result) => {
+                    Ok(identity_result) =>
+                    {
                         #[cfg(feature = "dashboard")]
                         if let Some(ref dashboard) = dashboard {
                             if let Some(ref did) = identity_result.did {
@@ -1217,10 +1332,8 @@ impl HttpHandler for AiProxyHandler {
                     Ok(collected) => {
                         let bytes = collected.to_bytes();
 
-                        // Decompress for logging (uses header or magic byte detection)
-                        let decompressed = try_decompress(&bytes, content_encoding.as_deref());
-
-                        let body_str = String::from_utf8_lossy(&decompressed).to_string();
+                        // Decode for logging (decompression + binary guard)
+                        let body_str = decode_body_for_logging(&bytes, content_encoding.as_deref());
                         // Return original bytes to client (they handle decompression)
                         let new_body = Body::from(Full::new(bytes));
                         let res = Response::from_parts(parts, new_body);
@@ -1287,10 +1400,8 @@ impl HttpHandler for AiProxyHandler {
                             "Decompressing SSE response"
                         );
 
-                        // Decompress using header or magic byte detection
-                        let decompressed = try_decompress(&raw_bytes, log_content_encoding.as_deref());
-
-                        String::from_utf8_lossy(&decompressed).to_string()
+                        // Decode using header/magic decompression + binary guard
+                        decode_body_for_logging(&raw_bytes, log_content_encoding.as_deref())
                     };
 
                     if let Some(ref logger) = log_event_logger {
@@ -1697,8 +1808,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{write::GzEncoder, Compression};
     use soth_core::types::policy::PolicyData;
     use soth_identity::Did;
+    use std::io::Write;
+
+    fn gzip_compress(input: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(input).unwrap();
+        encoder.finish().unwrap()
+    }
 
     #[test]
     fn test_detect_provider() {
@@ -1851,5 +1970,34 @@ mod tests {
         );
 
         assert!(matches!(result, Err((429, _, _))));
+    }
+
+    #[test]
+    fn test_try_decompress_zstd() {
+        let original = br#"{"ok":true,"source":"zstd"}"#;
+        let compressed = zstd::stream::encode_all(Cursor::new(original), 0).unwrap();
+
+        let decoded = try_decompress(&compressed, Some("zstd"));
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_try_decompress_stacked_chain_reverse_order() {
+        let original = br#"{"ok":true,"source":"zstd+gzip"}"#;
+        let zstd_first = zstd::stream::encode_all(Cursor::new(original), 0).unwrap();
+        let gzip_last = gzip_compress(&zstd_first);
+
+        // Applied order: zstd then gzip => header order "zstd, gzip"
+        let decoded = try_decompress(&gzip_last, Some("zstd, gzip"));
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_try_decompress_magic_fallback_without_header() {
+        let original = br#"{"ok":true,"source":"magic"}"#;
+        let compressed = zstd::stream::encode_all(Cursor::new(original), 0).unwrap();
+
+        let decoded = try_decompress(&compressed, None);
+        assert_eq!(decoded, original);
     }
 }

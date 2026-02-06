@@ -13,6 +13,19 @@ Real-time metrics dashboard for the SOTH edge proxy.
 
 ## Development
 
+### Backend Endpoint Configuration
+
+By default, the dashboard uses same-origin `/api` for HTTP and same-origin `/api/events/stream` for WebSocket.
+In local dev on port `3002`, WebSocket defaults to `ws://localhost:3001`.
+
+Override these when your API/WS endpoint is not same-origin:
+
+```bash
+# .env.local
+NEXT_PUBLIC_SOTH_API_BASE=http://localhost:3001/api
+NEXT_PUBLIC_SOTH_WS_BASE=ws://localhost:3001
+```
+
 ### UI Primitive Workflow (shadcn)
 
 This dashboard is now configured for shadcn (`components.json`).

@@ -15,24 +15,16 @@ import {
   ArrowDown,
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
-import { useObservabilityStore } from "@/store/observability";
+import { useObservabilityStore, decodeEditorContent } from "@/store/observability";
 import { Button } from "@/components/ui/button";
 import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
 
 type TabType = "request" | "response";
 
-function formatJSON(jsonStr: string): string {
-  try {
-    const parsed = JSON.parse(jsonStr);
-    return JSON.stringify(parsed, null, 2);
-  } catch {
-    return jsonStr;
-  }
-}
-
 export function AiInspector() {
   const logs = useObservabilityStore((state) => state.logs);
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
+  const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<TabType>("request");
 
@@ -50,13 +42,22 @@ export function AiInspector() {
   // Reset copied state and tab when selection changes
   useEffect(() => {
     setCopied(false);
-    // Default to response tab for paired events, request otherwise
+    // Honor explicit row selection when available.
+    if (selectedLogPart === "request") {
+      setActiveTab("request");
+      return;
+    }
+    if (selectedLogPart === "response") {
+      setActiveTab("response");
+      return;
+    }
+    // Default to response tab for paired events, request otherwise.
     if (selectedLog?.response_content) {
       setActiveTab("response");
     } else {
       setActiveTab("request");
     }
-  }, [selectedLog?.id, selectedLog?.response_content]);
+  }, [selectedLog?.id, selectedLog?.response_content, selectedLogPart]);
 
   const handleCopy = useCallback(async () => {
     if (!selectedLog) return;
@@ -79,20 +80,20 @@ export function AiInspector() {
     }
   }, [selectedLog, hasPairedContent, activeTab]);
 
-  // Formatted content for display
-  const formattedContent = useMemo(() => {
-    if (!selectedLog) return "";
+  // Content for display (decoded + pretty-printed when JSON)
+  const editorPayload = useMemo(() => {
+    if (!selectedLog) return decodeEditorContent("");
 
     if (hasPairedContent) {
       const content = activeTab === "request"
         ? selectedLog.request_content
         : selectedLog.response_content;
-      return content ? formatJSON(content) : "";
+      return decodeEditorContent(content);
     }
 
     // For non-paired events, prefer response_content if available, then content
     const content = selectedLog.response_content || selectedLog.content;
-    return formatJSON(content);
+    return decodeEditorContent(content);
   }, [selectedLog, hasPairedContent, activeTab]);
 
   // Get latency color
@@ -331,8 +332,8 @@ export function AiInspector() {
           <div className="flex-1 overflow-hidden">
             <Editor
               height="100%"
-              defaultLanguage="json"
-              value={formattedContent}
+              language={editorPayload.language}
+              value={editorPayload.content}
               theme="vs-dark"
               options={{
                 readOnly: true,
@@ -343,7 +344,7 @@ export function AiInspector() {
                 scrollBeyondLastLine: false,
                 automaticLayout: true,
                 wordWrap: "on",
-                folding: true,
+                folding: editorPayload.language === "json",
                 renderLineHighlight: "all",
                 scrollbar: {
                   vertical: "auto",
