@@ -472,8 +472,8 @@ const HEADERS_TO_STRIP: &[&str] = &[
     "x-cluster-client-ip",
 ];
 
-/// Keep cookie header very small to avoid strict upstream 431 limits.
-const CHATGPT_MAX_COOKIE_HEADER_BYTES: usize = 1800;
+/// Keep cookie header reasonably bounded without breaking login/session state.
+const CHATGPT_MAX_COOKIE_HEADER_BYTES: usize = 3500;
 /// Second-pass cap when total header budget is still too high.
 const CHATGPT_STRICT_COOKIE_HEADER_BYTES: usize = 900;
 /// Chat UI upstreams can be stricter than generic HTTP servers.
@@ -616,7 +616,13 @@ fn reduce_chat_ui_headers_for_budget<T>(req: &mut Request<T>, path: &str) {
     let headers = req.headers_mut();
     let is_backend_api = path.contains("/backend-api/");
 
-    if !is_backend_api && header_size_bytes(headers) <= CHAT_UI_STRICT_TOTAL_HEADER_BYTES {
+    // Do not run strict auth/header pruning for non-backend chat UI routes
+    // (e.g. login/session pages), because dropping cookies there can cause auth loops.
+    if !is_backend_api {
+        return;
+    }
+
+    if header_size_bytes(headers) <= CHAT_UI_STRICT_TOTAL_HEADER_BYTES {
         return;
     }
 
@@ -651,13 +657,7 @@ fn reduce_chat_ui_headers_for_budget<T>(req: &mut Request<T>, path: &str) {
         }
     }
 
-    // Backend API requests with bearer auth do not need cookie for upstream auth.
-    // Dropping it aggressively prevents cookie-driven 431s on strict edge servers.
-    if path.contains("/backend-api/") && headers.contains_key("authorization") {
-        headers.remove("cookie");
-    }
-
-    // Absolute last resort.
+    // Absolute last resort for backend API only.
     if header_size_bytes(headers) > CHAT_UI_MAX_TOTAL_HEADER_BYTES {
         headers.remove("cookie");
     }
@@ -681,11 +681,6 @@ fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path: &str) {
 
         // Remove Client Hints headers (only for ChatGPT to reduce header size)
         if is_chatgpt {
-            // Backend API requests with bearer auth do not require cookies for upstream auth.
-            if path.contains("/backend-api/") && headers.contains_key("authorization") {
-                headers.remove("cookie");
-            }
-
             headers.remove("sec-ch-ua");
             headers.remove("sec-ch-ua-mobile");
             headers.remove("sec-ch-ua-platform");
@@ -768,8 +763,12 @@ fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path: &str) {
                 total_size = header_size_bytes(headers);
             }
 
-            // Last resort for chat UI: if still too large, drop cookie entirely to avoid 431.
-            if total_size > 7600 {
+            // Last resort: only drop cookie for backend API calls where bearer auth exists.
+            // Keeping cookies on non-backend routes avoids login/session redirect loops.
+            if total_size > 7600
+                && path.contains("/backend-api/")
+                && headers.contains_key("authorization")
+            {
                 headers.remove("cookie");
             }
         }
@@ -2395,7 +2394,7 @@ mod tests {
         );
         req.headers_mut().insert(
             "x-debug-big-header",
-            hyper::header::HeaderValue::from_str(&"x".repeat(4096)).unwrap(),
+            hyper::header::HeaderValue::from_str(&"x".repeat(9000)).unwrap(),
         );
 
         sanitize_request_headers(&mut req, "chatgpt.com", "/backend-api/codex/responses");
@@ -2407,7 +2406,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_request_headers_drops_cookie_for_backend_api_with_auth() {
+    fn test_sanitize_request_headers_keeps_cookie_for_backend_api_with_auth_when_budget_ok() {
         let mut req = Request::builder()
             .uri("https://chatgpt.com/backend-api/f/conversation")
             .header("host", "chatgpt.com")
@@ -2425,7 +2424,39 @@ mod tests {
         sanitize_request_headers(&mut req, "chatgpt.com", "/backend-api/f/conversation");
 
         assert!(req.headers().get("authorization").is_some());
-        assert!(req.headers().get("cookie").is_none());
+        assert!(req.headers().get("cookie").is_some());
+    }
+
+    #[test]
+    fn test_sanitize_request_headers_keeps_cookie_for_non_backend_auth_routes() {
+        let mut req = Request::builder()
+            .uri("https://chatgpt.com/api/auth/session")
+            .header("host", "chatgpt.com")
+            .header("authorization", "Bearer test-token")
+            .body(())
+            .unwrap();
+
+        let mut cookie_parts = vec![
+            "__Secure-next-auth.session-token=session-token-value".to_string(),
+            "__Host-next-auth.csrf-token=csrf-value".to_string(),
+        ];
+        for i in 0..140 {
+            cookie_parts.push(format!("noise_{}={}", i, "n".repeat(100)));
+        }
+        req.headers_mut().insert(
+            "cookie",
+            hyper::header::HeaderValue::from_str(&cookie_parts.join("; ")).unwrap(),
+        );
+        req.headers_mut().insert(
+            "x-debug-big-header",
+            hyper::header::HeaderValue::from_str(&"x".repeat(9000)).unwrap(),
+        );
+
+        sanitize_request_headers(&mut req, "chatgpt.com", "/api/auth/session");
+
+        assert!(req.headers().get("authorization").is_some());
+        assert!(req.headers().get("cookie").is_some());
+        assert!(req.headers().get("x-debug-big-header").is_some());
     }
 
     #[test]
