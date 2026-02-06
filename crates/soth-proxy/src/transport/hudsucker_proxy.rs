@@ -471,8 +471,23 @@ const HEADERS_TO_STRIP: &[&str] = &[
     "x-cluster-client-ip",
 ];
 
-/// Keep cookie header under a conservative size to avoid upstream 431 responses.
-const CHATGPT_MAX_COOKIE_HEADER_BYTES: usize = 3500;
+/// Keep cookie header very small to avoid strict upstream 431 limits.
+const CHATGPT_MAX_COOKIE_HEADER_BYTES: usize = 1800;
+
+fn is_chat_ui_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    if host.contains("chatgpt.com") {
+        return true;
+    }
+    if host == "chat.openai.com" || host.ends_with(".chat.openai.com") {
+        return true;
+    }
+    // Include OpenAI web subdomains while excluding the direct API domain.
+    if host.ends_with(".openai.com") && !host.starts_with("api.") {
+        return true;
+    }
+    false
+}
 
 fn chatgpt_cookie_priority(name: &str) -> u8 {
     match name {
@@ -565,7 +580,7 @@ fn trim_cookie_header_for_chatgpt(cookie_str: &str, max_bytes: usize) -> Option<
 /// Only applies aggressive cookie trimming for ChatGPT (which has large cookies)
 fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str) {
     let headers = req.headers_mut();
-    let is_chatgpt = host.contains("chatgpt.com");
+    let is_chatgpt = is_chat_ui_host(host);
 
     // Remove known problematic headers
     for header_name in HEADERS_TO_STRIP {
@@ -639,6 +654,34 @@ fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str) {
                     }
                 }
             }
+        }
+
+        // If headers are still large, drop optional browser-only headers before forwarding.
+        let mut total_size: usize = headers
+            .iter()
+            .map(|(k, v)| k.as_str().len() + v.len() + 4)
+            .sum();
+        if total_size > 7600 {
+            for header_name in [
+                "referer",
+                "origin",
+                "accept-language",
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-dest",
+                "sec-fetch-user",
+            ] {
+                headers.remove(header_name);
+            }
+            total_size = headers
+                .iter()
+                .map(|(k, v)| k.as_str().len() + v.len() + 4)
+                .sum();
+        }
+
+        // Last resort for chat UI: if still too large, drop cookie entirely to avoid 431.
+        if total_size > 7600 {
+            headers.remove("cookie");
         }
     }
 
@@ -758,11 +801,29 @@ fn decompress_once(bytes: &[u8], encoding: &str) -> Option<Vec<u8>> {
 
 fn maybe_binary_placeholder(bytes: &[u8], encoding: Option<&str>) -> Option<String> {
     let lossy = String::from_utf8_lossy(bytes);
-    let chars = lossy.chars().count().max(1);
-    let replacement_chars = lossy.chars().filter(|c| *c == '\u{FFFD}').count();
+    let sample: Vec<char> = lossy.chars().take(4096).collect();
+    let chars = sample.len().max(1);
+    let replacement_chars = sample.iter().filter(|c| **c == '\u{FFFD}').count();
+    let control_chars = sample
+        .iter()
+        .filter(|c| c.is_control() && **c != '\n' && **c != '\r' && **c != '\t')
+        .count();
+    let ascii_printable = sample
+        .iter()
+        .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+        .count();
     let replacement_ratio = replacement_chars as f32 / chars as f32;
+    let control_ratio = control_chars as f32 / chars as f32;
+    let ascii_printable_ratio = ascii_printable as f32 / chars as f32;
 
-    if replacement_chars >= 3 || replacement_ratio >= 0.08 {
+    let has_magic = detect_compression_from_bytes(bytes).is_some();
+    let looks_binary = replacement_chars >= 2
+        || replacement_ratio >= 0.04
+        || control_ratio >= 0.03
+        || ascii_printable_ratio < 0.55
+        || (has_magic && bytes.len() <= 16);
+
+    if looks_binary {
         let coding = parse_content_encoding_chain(encoding)
             .first()
             .cloned()
@@ -835,6 +896,9 @@ fn try_decompress(bytes: &[u8], encoding: Option<&str>) -> Vec<u8> {
 fn decode_body_for_logging(bytes: &[u8], encoding: Option<&str>) -> String {
     let decoded = try_decompress(bytes, encoding);
     if let Ok(text) = String::from_utf8(decoded.clone()) {
+        if let Some(marker) = maybe_binary_placeholder(&decoded, encoding) {
+            return marker;
+        }
         return text;
     }
     if let Some(marker) = maybe_binary_placeholder(&decoded, encoding) {
@@ -2100,6 +2164,13 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_body_for_logging_short_zstd_magic_placeholder() {
+        let bytes = vec![0x28, 0xB5, 0x2F, 0xFD];
+        let decoded = decode_body_for_logging(&bytes, Some("zstd"));
+        assert!(decoded.contains("[compressed/zstd payload"));
+    }
+
+    #[test]
     fn test_trim_cookie_header_for_chatgpt_keeps_auth_under_limit() {
         let mut cookies = vec![
             "__Secure-next-auth.session-token=primary-session-token-value".to_string(),
@@ -2150,5 +2221,46 @@ mod tests {
             .unwrap_or("");
         assert!(!cookie.is_empty());
         assert!(cookie.len() <= CHATGPT_MAX_COOKIE_HEADER_BYTES);
+    }
+
+    #[test]
+    fn test_sanitize_request_headers_trims_chat_openai_cookie_header() {
+        let mut req = Request::builder()
+            .uri("https://chat.openai.com/backend-api/conversation")
+            .header("host", "chat.openai.com")
+            .body(())
+            .unwrap();
+
+        let mut cookie_parts = vec![
+            "__Secure-next-auth.session-token=session-token-value".to_string(),
+            "__Host-next-auth.csrf-token=csrf-value".to_string(),
+        ];
+        for i in 0..100 {
+            cookie_parts.push(format!("noise_{}={}", i, "z".repeat(100)));
+        }
+        req.headers_mut().insert(
+            "cookie",
+            hyper::header::HeaderValue::from_str(&cookie_parts.join("; ")).unwrap(),
+        );
+
+        sanitize_request_headers(&mut req, "chat.openai.com");
+
+        let cookie = req
+            .headers()
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(!cookie.is_empty());
+        assert!(cookie.len() <= CHATGPT_MAX_COOKIE_HEADER_BYTES);
+    }
+
+    #[test]
+    fn test_is_chat_ui_host_detection() {
+        assert!(is_chat_ui_host("chatgpt.com"));
+        assert!(is_chat_ui_host("chat.openai.com"));
+        assert!(is_chat_ui_host("foo.chat.openai.com"));
+        assert!(is_chat_ui_host("auth.openai.com"));
+        assert!(!is_chat_ui_host("api.openai.com"));
+        assert!(!is_chat_ui_host("example.com"));
     }
 }
