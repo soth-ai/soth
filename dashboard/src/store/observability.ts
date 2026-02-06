@@ -729,8 +729,13 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
       }
 
       // Server name filter
-      if (filters.serverName && log.server_name !== filters.serverName) {
-        return false;
+      if (filters.serverName) {
+        const server = (log.server_name || '').toLowerCase();
+        const selected = filters.serverName.toLowerCase();
+        const matchesServer = server === selected || server.endsWith(`.${selected}`);
+        if (!matchesServer) {
+          return false;
+        }
       }
 
       // Latency filter
@@ -928,9 +933,88 @@ function extractRpcId(log: LogEntry): string | null {
 function isPrePairedAiEvent(log: LogEntry): boolean {
   return (
     (log.source === 'ai_proxy' || log.source === 'agent_app') &&
-    !!log.request_content &&
-    !!log.response_content
+    (!!log.request_content || !!log.response_content)
   );
+}
+
+function isCodexRequestWithMissingResponse(log: LogEntry): boolean {
+  const method = (log.method || '').toLowerCase();
+  if (!method.includes('/backend-api/codex/responses')) {
+    return false;
+  }
+  const response = log.response_content || '';
+  if (!response.trim()) {
+    return true;
+  }
+  return response.includes('[no HTTP response body captured');
+}
+
+function looksLikeCodexWebsocketUpdate(log: LogEntry): boolean {
+  if (log.source !== 'agent_app') {
+    return false;
+  }
+  if (log.direction !== 'out') {
+    return false;
+  }
+  const method = log.method || '';
+  if (!method.startsWith('WebSocket /c2/ws/')) {
+    return false;
+  }
+  const content = (log.content || '').trim();
+  if (content.length < 120) {
+    return false;
+  }
+  const lower = content.toLowerCase();
+  return (
+    lower.includes('"conversation-update"') ||
+    lower.includes('"update_type":"add-messages"') ||
+    lower.includes('"conversation_id"') ||
+    lower.includes('"messages":[')
+  );
+}
+
+function isWithinCorrelationWindow(
+  requestTimestamp: string,
+  candidateTimestamp: string,
+  maxMs: number
+): boolean {
+  const req = Date.parse(requestTimestamp);
+  const cand = Date.parse(candidateTimestamp);
+  if (Number.isNaN(req) || Number.isNaN(cand)) {
+    return true;
+  }
+  if (cand < req) {
+    return false;
+  }
+  return cand - req <= maxMs;
+}
+
+function findCodexWebsocketResponse(
+  logs: LogEntry[],
+  requestIndex: number,
+  request: LogEntry,
+  usedResponseIds: Set<string>
+): LogEntry | null {
+  // Keep this bounded for latency and to avoid cross-turn mispairing.
+  const maxLookahead = Math.min(logs.length, requestIndex + 120);
+  for (let j = requestIndex + 1; j < maxLookahead; j++) {
+    const candidate = logs[j];
+    if (usedResponseIds.has(candidate.id)) {
+      continue;
+    }
+    if (candidate.session_id !== request.session_id) {
+      continue;
+    }
+    if (!looksLikeCodexWebsocketUpdate(candidate)) {
+      continue;
+    }
+    if (!isWithinCorrelationWindow(request.timestamp, candidate.timestamp, 120_000)) {
+      continue;
+    }
+    return candidate;
+  }
+
+  return null;
 }
 
 function isRequestLike(log: LogEntry): boolean {
@@ -969,23 +1053,46 @@ export function createClusters(logs: LogEntry[]): DisplayItem[] {
   const items: DisplayItem[] = [];
   const usedResponseIds = new Set<string>();
 
-  const buildPairedRequestLog = (log: LogEntry): LogEntry => ({
-    ...log,
-    direction: 'in',
-    content: log.request_content || '',
-    content_preview:
-      log.request_preview || (log.request_content ? log.request_content.slice(0, 200) : undefined),
-    status_code: undefined,
-  });
+  const buildEmptyResponsePlaceholder = (log: LogEntry): string => {
+    const method = log.method || 'request';
+    const status = log.status_code ?? 'unknown';
+    const methodLower = method.toLowerCase();
 
-  const buildPairedResponseLog = (log: LogEntry): LogEntry => ({
-    ...log,
-    direction: 'out',
-    content: log.response_content || '',
-    content_preview:
-      log.response_preview ||
-      (log.response_content ? log.response_content.slice(0, 200) : undefined),
-  });
+    if (methodLower.includes('/backend-api/codex/responses')) {
+      return `[no HTTP response body captured for ${method} (HTTP ${status}) - Codex output may be streamed via WebSocket]`;
+    }
+    return `[no HTTP response body captured for ${method} (HTTP ${status})]`;
+  };
+
+  const buildPairedRequestLog = (log: LogEntry): LogEntry => {
+    const requestContent = log.request_content?.trim() ? log.request_content : '';
+    const fallbackPreview =
+      log.request_preview ||
+      `[no request body captured for ${log.method || 'request'}]`;
+    const requestDisplay = requestContent || fallbackPreview;
+
+    return {
+      ...log,
+      direction: 'in',
+      content: requestDisplay,
+      content_preview: requestDisplay,
+      status_code: undefined,
+    };
+  };
+
+  const buildPairedResponseLog = (log: LogEntry): LogEntry => {
+    const responseContent = log.response_content?.trim() ? log.response_content : '';
+    const fallbackPreview =
+      log.response_preview || buildEmptyResponsePlaceholder(log);
+    const responseDisplay = responseContent || fallbackPreview;
+
+    return {
+      ...log,
+      direction: 'out',
+      content: responseDisplay,
+      content_preview: responseDisplay,
+    };
+  };
 
   const hasResponseError = (content?: string): boolean => {
     if (!content) return false;
@@ -1051,17 +1158,37 @@ export function createClusters(logs: LogEntry[]): DisplayItem[] {
     // Render them as coupled rows to match MCP request/response clustering behavior.
     if (isPrePairedAiEvent(log)) {
       const request = buildPairedRequestLog(log);
-      const response = buildPairedResponseLog(log);
+      let response = buildPairedResponseLog(log);
+      let correlatedWsResponse: LogEntry | null = null;
+
+      // Codex often returns an empty HTTP body and streams the actual output via websocket.
+      // Correlate nearby websocket conversation updates so the response row is meaningful.
+      if (isCodexRequestWithMissingResponse(log)) {
+        correlatedWsResponse = findCodexWebsocketResponse(logs, i, log, usedResponseIds);
+        if (correlatedWsResponse) {
+          response = {
+            ...response,
+            timestamp: correlatedWsResponse.timestamp,
+            content: correlatedWsResponse.content || response.content,
+            content_preview:
+              correlatedWsResponse.content || correlatedWsResponse.content_preview || response.content_preview,
+          };
+        }
+      }
+
+      const correlatedLatency = correlatedWsResponse
+        ? calculateLatency(request, correlatedWsResponse)
+        : null;
       const cluster: EventCluster = {
         id: `cluster-${log.id}`,
         request,
         response,
         method: log.tool_name ? `${log.method}/${log.tool_name}` : log.method || 'request',
-        latency: log.latency_ms ?? null,
+        latency: correlatedLatency ?? log.latency_ms ?? null,
         hasError:
           (log.status_code !== undefined && log.status_code >= 400) ||
           log.policy_allowed === false ||
-          hasResponseError(log.response_content),
+          hasResponseError(response.content),
         hasPii: log.pii_detected,
         policyDenied: log.policy_allowed === false,
         timestamp: log.timestamp,

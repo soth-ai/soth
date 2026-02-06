@@ -204,14 +204,20 @@ impl WrapEvent {
     /// Set request content (for paired events)
     pub fn with_request(mut self, content: impl Into<String>, preview: impl Into<String>) -> Self {
         self.request_content = Some(content.into());
-        self.request_preview = Some(preview.into());
+        let preview = preview.into();
+        if !preview.is_empty() {
+            self.request_preview = Some(preview);
+        }
         self
     }
 
     /// Set response content (for paired events)
     pub fn with_response(mut self, content: impl Into<String>, preview: impl Into<String>) -> Self {
         self.response_content = Some(content.into());
-        self.response_preview = Some(preview.into());
+        let preview = preview.into();
+        if !preview.is_empty() {
+            self.response_preview = Some(preview);
+        }
         self
     }
 

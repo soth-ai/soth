@@ -20,7 +20,7 @@ import {
   type LogEntry,
   type Filters,
 } from "@/store/observability";
-import { cn, formatTimestamp, formatLatency, truncate } from "@/lib/utils";
+import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 
@@ -38,7 +38,15 @@ function filterAgentLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
       const matchesModel = log.model?.toLowerCase().includes(search);
       const matchesMethod = log.method?.toLowerCase().includes(search);
       const matchesServer = log.server_name?.toLowerCase().includes(search);
-      if (!matchesContent && !matchesProvider && !matchesModel && !matchesMethod && !matchesServer) {
+      const matchesAgent = log.agent?.name?.toLowerCase().includes(search);
+      if (
+        !matchesContent &&
+        !matchesProvider &&
+        !matchesModel &&
+        !matchesMethod &&
+        !matchesServer &&
+        !matchesAgent
+      ) {
         return false;
       }
     }
@@ -68,8 +76,20 @@ const getLatencyColor = (ms: number) => {
 };
 
 // Get agent app color (purple theme for agents)
-const getAgentColor = (serverName: string) => {
+const getAgentColor = (agentName: string | undefined, serverName: string, model?: string) => {
+  const normalizedAgent = (agentName || "").toLowerCase();
+  const normalizedModel = (model || "").toLowerCase();
   const name = serverName.toLowerCase();
+
+  if (normalizedModel.includes("codex") || normalizedAgent.includes("codex")) {
+    return "bg-sky-500/20 text-sky-500 border-sky-500/30";
+  }
+  if (normalizedAgent.includes("chatgpt")) {
+    return "bg-emerald-500/20 text-emerald-500 border-emerald-500/30";
+  }
+  if (normalizedAgent.includes("claude")) {
+    return "bg-orange-500/20 text-orange-500 border-orange-500/30";
+  }
   // OpenAI/ChatGPT - emerald green
   if (name.includes("chatgpt") || (name.includes("openai.com") && !name.startsWith("api."))) {
     return "bg-emerald-500/20 text-emerald-500 border-emerald-500/30";
@@ -95,9 +115,24 @@ const getStatusCodeColor = (code: number) => {
   return "bg-emerald-500/20 text-emerald-500 border-emerald-500/30";
 };
 
-// Get friendly agent name from server_name
-const getAgentName = (serverName: string): string => {
-  const name = serverName.toLowerCase();
+// Get friendly agent name. Prefer backend-detected agent, fallback to host heuristics.
+const getAgentName = (log: LogEntry): string => {
+  const modelLower = log.model?.trim().toLowerCase();
+  if (modelLower?.includes("codex")) {
+    return "Codex";
+  }
+
+  const detected = log.agent?.name?.trim().toLowerCase();
+  if (detected) {
+    if (detected === "codex") return "Codex";
+    if (detected === "chatgpt") return "ChatGPT";
+    if (detected === "claude") return "Claude";
+    if (detected === "claude-code") return "Claude Code";
+    if (detected === "openai") return "OpenAI";
+    return log.agent.name;
+  }
+
+  const name = log.server_name.toLowerCase();
   // OpenAI/ChatGPT apps
   if (name.includes("chatgpt") || (name.includes("openai.com") && !name.startsWith("api."))) {
     return "ChatGPT";
@@ -109,7 +144,7 @@ const getAgentName = (serverName: string): string => {
   if (name.includes("perplexity")) return "Perplexity";
   if (name.includes("aistudio") || name.includes("makersuite")) return "AI Studio";
   // Return domain without common prefixes
-  return serverName.replace(/^(www\.|app\.|chat\.)/i, "");
+  return log.server_name.replace(/^(www\.|app\.|chat\.)/i, "");
 };
 
 const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) {
@@ -119,7 +154,7 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
   const rowRef = useRef<HTMLDivElement>(null);
 
   const isError = log.policy_allowed === false;
-  const isPairedEvent = !!(log.request_content && log.response_content);
+  const isPairedEvent = !!(log.request_content || log.response_content);
 
   // Copy JSON to clipboard
   const handleCopyJson = useCallback((e: React.MouseEvent, content: string) => {
@@ -137,18 +172,28 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
 
   // Parse method for display
   const displayMethod = log.method?.split(" ").slice(0, 2).join(" ") || "request";
-  const agentName = getAgentName(log.server_name);
+  const agentName = getAgentName(log);
   const requestPreview = useMemo(
-    () => decodeSmartDisplayText(log.request_preview || log.request_content || ""),
-    [log.request_preview, log.request_content]
+    () => decodeSmartDisplayText(log.request_content || log.request_preview || ""),
+    [log.request_content, log.request_preview]
   );
   const responsePreview = useMemo(
-    () => decodeSmartDisplayText(log.response_preview || log.response_content || ""),
-    [log.response_preview, log.response_content]
+    () => {
+      const raw = log.response_content || log.response_preview || "";
+      if (raw) return decodeSmartDisplayText(raw);
+
+      const method = log.method || "request";
+      const status = log.status_code ?? "unknown";
+      if (method.toLowerCase().includes("/backend-api/codex/responses")) {
+        return `[no HTTP response body captured for ${method} (HTTP ${status}) - Codex output may be streamed via WebSocket]`;
+      }
+      return `[no HTTP response body captured for ${method} (HTTP ${status})]`;
+    },
+    [log.response_content, log.response_preview, log.method, log.status_code]
   );
   const contentPreview = useMemo(
-    () => decodeSmartDisplayText(log.content_preview || log.content),
-    [log.content_preview, log.content]
+    () => decodeSmartDisplayText(log.content || log.content_preview || ""),
+    [log.content, log.content_preview]
   );
 
   // For paired events, render two connected rows
@@ -191,7 +236,7 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
           <span
             className={cn(
               "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-mono font-medium flex-shrink-0 min-w-[70px] max-w-[100px] truncate border",
-              getAgentColor(log.server_name)
+              getAgentColor(log.agent?.name, log.server_name, log.model)
             )}
           >
             <Robot className="w-3 h-3" weight="fill" />
@@ -217,8 +262,8 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
           </span>
 
           {/* Request Preview */}
-          <span className="text-xs text-cyan-600 dark:text-cyan-400 flex-1 truncate font-mono">
-            {truncate(requestPreview, 60)}
+          <span className="text-xs text-cyan-600 dark:text-cyan-400 flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+            {requestPreview}
           </span>
 
           {/* Copy button */}
@@ -279,8 +324,8 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
           </span>
 
           {/* Response Preview */}
-          <span className="text-xs text-emerald-600 dark:text-emerald-400 flex-1 truncate font-mono">
-            {truncate(responsePreview, 60)}
+          <span className="text-xs text-emerald-600 dark:text-emerald-400 flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+            {responsePreview}
           </span>
 
           {/* Policy indicator */}
@@ -302,7 +347,7 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
             <Button
               variant="ghost"
               size="sm"
-              onClick={(e) => handleCopyJson(e, log.response_content || "")}
+              onClick={(e) => handleCopyJson(e, log.response_content || responsePreview || "")}
               className="h-6 w-6 p-0 bg-secondary border border-border hover:bg-muted"
               title="Copy response"
             >
@@ -371,7 +416,7 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
       <span
         className={cn(
           "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-mono font-medium flex-shrink-0 min-w-[70px] max-w-[100px] truncate border",
-          getAgentColor(log.server_name)
+          getAgentColor(log.agent?.name, log.server_name, log.model)
         )}
         title={log.server_name}
       >
@@ -417,8 +462,8 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
       )}
 
       {/* Content Preview */}
-      <span className="text-xs text-muted-foreground flex-1 truncate font-mono">
-        {truncate(contentPreview, 50)}
+      <span className="text-xs text-muted-foreground flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+        {contentPreview}
       </span>
 
       {/* Policy indicator */}

@@ -21,7 +21,7 @@ import {
   type LogEntry,
   type Filters,
 } from "@/store/observability";
-import { cn, formatTimestamp, formatLatency, truncate } from "@/lib/utils";
+import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 
@@ -69,9 +69,13 @@ const getLatencyColor = (ms: number) => {
 
 const getProviderColor = (provider: string) => {
   switch (provider.toLowerCase()) {
+    case "chatgpt":
+      return "bg-emerald-500/20 text-emerald-500 border-emerald-500/30";
     case "openai":
       return "bg-emerald-500/20 text-emerald-500 border-emerald-500/30";
     case "anthropic":
+      return "bg-orange-500/20 text-orange-500 border-orange-500/30";
+    case "claude":
       return "bg-orange-500/20 text-orange-500 border-orange-500/30";
     case "google":
       return "bg-blue-500/20 text-blue-500 border-blue-500/30";
@@ -93,7 +97,7 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
   const rowRef = useRef<HTMLDivElement>(null);
 
   const isError = log.policy_allowed === false;
-  const isPairedEvent = !!(log.request_content && log.response_content);
+  const isPairedEvent = !!(log.request_content || log.response_content);
 
   // Copy JSON to clipboard
   const handleCopyJson = useCallback((e: React.MouseEvent, content: string) => {
@@ -112,16 +116,26 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
   // Parse method for display
   const displayMethod = log.method?.split(" ").slice(0, 2).join(" ") || "request";
   const requestPreview = useMemo(
-    () => decodeSmartDisplayText(log.request_preview || log.request_content || ""),
-    [log.request_preview, log.request_content]
+    () => decodeSmartDisplayText(log.request_content || log.request_preview || ""),
+    [log.request_content, log.request_preview]
   );
   const responsePreview = useMemo(
-    () => decodeSmartDisplayText(log.response_preview || log.response_content || ""),
-    [log.response_preview, log.response_content]
+    () => {
+      const raw = log.response_content || log.response_preview || "";
+      if (raw) return decodeSmartDisplayText(raw);
+
+      const method = log.method || "request";
+      const status = log.status_code ?? "unknown";
+      if (method.toLowerCase().includes("/backend-api/codex/responses")) {
+        return `[no HTTP response body captured for ${method} (HTTP ${status}) - Codex output may be streamed via WebSocket]`;
+      }
+      return `[no HTTP response body captured for ${method} (HTTP ${status})]`;
+    },
+    [log.response_content, log.response_preview, log.method, log.status_code]
   );
   const contentPreview = useMemo(
-    () => decodeSmartDisplayText(log.content_preview || log.content),
-    [log.content_preview, log.content]
+    () => decodeSmartDisplayText(log.content || log.content_preview || ""),
+    [log.content, log.content_preview]
   );
 
   // For paired events, render two connected rows
@@ -191,8 +205,8 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
           </span>
 
           {/* Request Preview */}
-          <span className="text-xs text-cyan-600 dark:text-cyan-400 flex-1 truncate font-mono">
-            {truncate(requestPreview, 60)}
+          <span className="text-xs text-cyan-600 dark:text-cyan-400 flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+            {requestPreview}
           </span>
 
           {/* Copy button */}
@@ -253,8 +267,8 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
           </span>
 
           {/* Response Preview */}
-          <span className="text-xs text-emerald-600 dark:text-emerald-400 flex-1 truncate font-mono">
-            {truncate(responsePreview, 60)}
+          <span className="text-xs text-emerald-600 dark:text-emerald-400 flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+            {responsePreview}
           </span>
 
           {/* Policy indicator */}
@@ -276,7 +290,7 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
             <Button
               variant="ghost"
               size="sm"
-              onClick={(e) => handleCopyJson(e, log.response_content || "")}
+              onClick={(e) => handleCopyJson(e, log.response_content || responsePreview || "")}
               className="h-6 w-6 p-0 bg-secondary border border-border hover:bg-muted"
               title="Copy response"
             >
@@ -392,8 +406,8 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
       )}
 
       {/* Content Preview */}
-      <span className="text-xs text-muted-foreground flex-1 truncate font-mono">
-        {truncate(contentPreview, 50)}
+      <span className="text-xs text-muted-foreground flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+        {contentPreview}
       </span>
 
       {/* Policy indicator */}
