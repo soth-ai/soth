@@ -2,18 +2,17 @@
 //!
 //! End-to-end tests for the full processing pipeline
 
-use soth_proxy::{
-    PipelineBuilder,
-    IdentityLayer, PolicyLayer, ObserveLayer, BudgetLayer,
-    pipeline::middleware::RequestContext,
-    pipeline::identity::{IdentityConfig, IdentityMode},
-    pipeline::policy::{PolicyConfig, PolicyMode},
-    pipeline::observe::ObserveConfig,
-    pipeline::budget::BudgetConfig,
-    protocol::{JsonRpcMessage, JsonRpcRequest, RequestId},
-};
-use soth_core::types::policy::PolicyData;
 use serde_json::json;
+use soth_core::types::policy::PolicyData;
+use soth_proxy::{
+    pipeline::budget::BudgetConfig,
+    pipeline::identity::{IdentityConfig, IdentityMode},
+    pipeline::middleware::RequestContext,
+    pipeline::observe::ObserveConfig,
+    pipeline::policy::{PolicyConfig, PolicyMode},
+    protocol::{JsonRpcMessage, JsonRpcRequest, RequestId},
+    BudgetLayer, IdentityLayer, ObserveLayer, PipelineBuilder, PolicyLayer,
+};
 
 fn make_tool_call_request(tool: &str, id: u64) -> JsonRpcMessage {
     JsonRpcMessage::Request(JsonRpcRequest {
@@ -81,10 +80,12 @@ async fn test_pipeline_with_identity_layer_optional() {
 async fn test_pipeline_with_policy_layer() {
     // Create and configure the policy engine first
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        blocked_tools: vec!["blocked_tool".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            blocked_tools: vec!["blocked_tool".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let policy_layer = PolicyLayer::with_engine(
         PolicyConfig {
@@ -94,9 +95,7 @@ async fn test_pipeline_with_policy_layer() {
         engine,
     );
 
-    let pipeline = PipelineBuilder::new()
-        .layer(policy_layer)
-        .build();
+    let pipeline = PipelineBuilder::new().layer(policy_layer).build();
 
     // Test allowed tool
     let mut ctx = RequestContext::new("policy-session".to_string());
@@ -257,7 +256,7 @@ async fn test_concurrent_pipeline_processing() {
                 count_tokens: false,
                 log_to_file: false,
             }))
-            .build()
+            .build(),
     );
 
     // Spawn multiple concurrent requests

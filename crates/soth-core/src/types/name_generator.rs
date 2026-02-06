@@ -8,42 +8,27 @@ use rand::thread_rng;
 
 /// Adjectives for name generation
 const ADJECTIVES: &[&str] = &[
-    "agile", "bold", "brave", "bright", "calm",
-    "clever", "cool", "cosmic", "crisp", "curious",
-    "dapper", "daring", "deft", "eager", "elegant",
-    "epic", "fast", "fearless", "fierce", "fluffy",
-    "gentle", "gleaming", "golden", "graceful", "grand",
-    "happy", "hidden", "honest", "humble", "icy",
-    "jade", "jolly", "keen", "kind", "lively",
-    "lucky", "lunar", "magic", "merry", "mighty",
-    "misty", "noble", "peaceful", "playful", "polite",
-    "proud", "quick", "quiet", "rapid", "ruby",
-    "rustic", "serene", "sharp", "shiny", "silent",
-    "silver", "sleek", "smart", "smooth", "snowy",
-    "solar", "sonic", "speedy", "steady", "stellar",
-    "stormy", "sunny", "super", "swift", "tender",
-    "tidy", "tiny", "topaz", "tranquil", "turbo",
-    "vivid", "warm", "wild", "winter", "witty",
+    "agile", "bold", "brave", "bright", "calm", "clever", "cool", "cosmic", "crisp", "curious",
+    "dapper", "daring", "deft", "eager", "elegant", "epic", "fast", "fearless", "fierce", "fluffy",
+    "gentle", "gleaming", "golden", "graceful", "grand", "happy", "hidden", "honest", "humble",
+    "icy", "jade", "jolly", "keen", "kind", "lively", "lucky", "lunar", "magic", "merry", "mighty",
+    "misty", "noble", "peaceful", "playful", "polite", "proud", "quick", "quiet", "rapid", "ruby",
+    "rustic", "serene", "sharp", "shiny", "silent", "silver", "sleek", "smart", "smooth", "snowy",
+    "solar", "sonic", "speedy", "steady", "stellar", "stormy", "sunny", "super", "swift", "tender",
+    "tidy", "tiny", "topaz", "tranquil", "turbo", "vivid", "warm", "wild", "winter", "witty",
     "young", "zesty", "zippy",
 ];
 
 /// Nouns for name generation (animals)
 const NOUNS: &[&str] = &[
-    "alpaca", "badger", "bear", "beaver", "buffalo",
-    "camel", "cheetah", "cobra", "coyote", "crane",
-    "deer", "dolphin", "dragon", "eagle", "elephant",
-    "falcon", "ferret", "finch", "fox", "gazelle",
-    "gecko", "giraffe", "goose", "gorilla", "hawk",
-    "heron", "husky", "jaguar", "koala", "lemur",
-    "leopard", "lion", "llama", "lynx", "mantis",
-    "moose", "mouse", "narwhal", "otter", "owl",
-    "panda", "panther", "parrot", "pelican", "penguin",
-    "phoenix", "pigeon", "pony", "puma", "python",
-    "rabbit", "raccoon", "raven", "reindeer", "rhino",
-    "robin", "salmon", "seal", "shark", "sparrow",
-    "spider", "squirrel", "stork", "swan", "tiger",
-    "toucan", "turtle", "unicorn", "viper", "walrus",
-    "whale", "wolf", "wombat", "yak", "zebra",
+    "alpaca", "badger", "bear", "beaver", "buffalo", "camel", "cheetah", "cobra", "coyote",
+    "crane", "deer", "dolphin", "dragon", "eagle", "elephant", "falcon", "ferret", "finch", "fox",
+    "gazelle", "gecko", "giraffe", "goose", "gorilla", "hawk", "heron", "husky", "jaguar", "koala",
+    "lemur", "leopard", "lion", "llama", "lynx", "mantis", "moose", "mouse", "narwhal", "otter",
+    "owl", "panda", "panther", "parrot", "pelican", "penguin", "phoenix", "pigeon", "pony", "puma",
+    "python", "rabbit", "raccoon", "raven", "reindeer", "rhino", "robin", "salmon", "seal",
+    "shark", "sparrow", "spider", "squirrel", "stork", "swan", "tiger", "toucan", "turtle",
+    "unicorn", "viper", "walrus", "whale", "wolf", "wombat", "yak", "zebra",
 ];
 
 /// Generate a random beautiful session name
@@ -57,18 +42,14 @@ pub fn generate_session_name() -> String {
 /// Generate a deterministic name from a seed (e.g., session ID)
 pub fn generate_name_from_seed(seed: &str) -> String {
     // Use a simple hash to derive indices
-    let hash = seed.bytes().fold(0u64, |acc, b| {
-        acc.wrapping_mul(31).wrapping_add(b as u64)
-    });
+    let hash = seed
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
 
     let adj_idx = (hash % ADJECTIVES.len() as u64) as usize;
     let noun_idx = ((hash / ADJECTIVES.len() as u64) % NOUNS.len() as u64) as usize;
 
-    format!(
-        "{}-{}",
-        ADJECTIVES[adj_idx],
-        NOUNS[noun_idx]
-    )
+    format!("{}-{}", ADJECTIVES[adj_idx], NOUNS[noun_idx])
 }
 
 /// Generate multiple unique names
@@ -122,10 +103,14 @@ impl NameGenerator {
     /// Generate a random name
     pub fn generate(&self) -> String {
         let mut rng = thread_rng();
-        let adjective = self.adjectives.choose(&mut rng)
+        let adjective = self
+            .adjectives
+            .choose(&mut rng)
             .map(|s| s.as_str())
             .unwrap_or("happy");
-        let noun = self.nouns.choose(&mut rng)
+        let noun = self
+            .nouns
+            .choose(&mut rng)
             .map(|s| s.as_str())
             .unwrap_or("penguin");
         format!("{}-{}", adjective, noun)
@@ -133,18 +118,14 @@ impl NameGenerator {
 
     /// Generate a name from a seed
     pub fn generate_from_seed(&self, seed: &str) -> String {
-        let hash = seed.bytes().fold(0u64, |acc, b| {
-            acc.wrapping_mul(31).wrapping_add(b as u64)
-        });
+        let hash = seed
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
 
         let adj_idx = (hash % self.adjectives.len() as u64) as usize;
         let noun_idx = ((hash / self.adjectives.len() as u64) % self.nouns.len() as u64) as usize;
 
-        format!(
-            "{}-{}",
-            self.adjectives[adj_idx],
-            self.nouns[noun_idx]
-        )
+        format!("{}-{}", self.adjectives[adj_idx], self.nouns[noun_idx])
     }
 
     /// Get the total number of possible combinations

@@ -11,7 +11,7 @@ pub mod merkle;
 pub mod pii;
 pub mod storage;
 
-pub use logging::{AsyncWriter, ObservationLogger};
+pub use logging::{AsyncWriter, LoggerConfig, ObservationLogger};
 pub use merkle::{MerkleProof, MerkleTree, TransparencyLog};
 pub use pii::{PiiDetector, PiiMatch, PiiRedactor};
 pub use storage::jsonl::JsonlStorage;

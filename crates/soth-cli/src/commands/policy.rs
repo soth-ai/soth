@@ -2,8 +2,8 @@
 
 use crate::PolicyCommands;
 use anyhow::Result;
-use soth_policy::{PolicyCompiler, PolicyEngine, PolicyLoader, EvaluationResult};
 use soth_core::types::policy::PolicyInputBuilder;
+use soth_policy::{EvaluationResult, PolicyCompiler, PolicyEngine, PolicyLoader};
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::info;
@@ -44,17 +44,17 @@ async fn compile_policies(input: PathBuf, output: Option<PathBuf>) -> Result<()>
 
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().map(|e| e == "yaml" || e == "yml").unwrap_or(false) {
+        if path
+            .extension()
+            .map(|e| e == "yaml" || e == "yml")
+            .unwrap_or(false)
+        {
             let content = fs::read_to_string(&path).await?;
 
             match PolicyCompiler::compile_yaml(&content) {
                 Ok(rego) => {
-                    let output_name = path
-                        .file_stem()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_string()
-                        + ".rego";
+                    let output_name =
+                        path.file_stem().unwrap().to_string_lossy().to_string() + ".rego";
                     let output_path = output_dir.join(&output_name);
 
                     fs::write(&output_path, &rego).await?;
@@ -89,7 +89,11 @@ async fn test_policies(dir: PathBuf) -> Result<()> {
 
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().map(|e| e == "yaml" || e == "yml").unwrap_or(false) {
+        if path
+            .extension()
+            .map(|e| e == "yaml" || e == "yml")
+            .unwrap_or(false)
+        {
             match PolicyLoader::load_policy_data_yaml(&path) {
                 Ok(data) => {
                     engine.set_policy_data(data)?;
@@ -181,7 +185,10 @@ async fn evaluate_policy(input_path: PathBuf, policy_path: Option<PathBuf>) -> R
     if let Some(resource) = input_json.get("resource").and_then(|v| v.as_str()) {
         builder = builder.resource(resource);
     }
-    if let Some(verified) = input_json.get("identity_verified").and_then(|v| v.as_bool()) {
+    if let Some(verified) = input_json
+        .get("identity_verified")
+        .and_then(|v| v.as_bool())
+    {
         builder = builder.identity_verified(verified);
     }
     if let Some(did) = input_json.get("identity_did").and_then(|v| v.as_str()) {
@@ -235,14 +242,28 @@ async fn list_policies() -> Result<()> {
     let mut entries = fs::read_dir(&policies_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().map(|e| e == "yaml" || e == "yml").unwrap_or(false) {
+        if path
+            .extension()
+            .map(|e| e == "yaml" || e == "yml")
+            .unwrap_or(false)
+        {
             let content = fs::read_to_string(&path).await?;
 
             // Try to parse and show summary
             if let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                let name = yaml.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
-                let desc = yaml.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                let rules = yaml.get("rules").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let name = yaml
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unnamed");
+                let desc = yaml
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let rules = yaml
+                    .get("rules")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
 
                 println!("  {name} ({rules} rules)");
                 if !desc.is_empty() {

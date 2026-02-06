@@ -2,9 +2,9 @@
 //!
 //! Tests for policy evaluation, YAML compilation, and enforcement
 
-use soth_policy::{PolicyEngine, PolicyEngineConfig, PolicyCompiler, PolicyLoader};
-use soth_core::types::policy::{PolicyInputBuilder, PolicyData};
 use soth_core::types::identity::AgentContext;
+use soth_core::types::policy::{PolicyData, PolicyInputBuilder};
+use soth_policy::{PolicyCompiler, PolicyEngine, PolicyEngineConfig, PolicyLoader};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
@@ -33,7 +33,9 @@ fn test_policy_engine_blocked_tool() {
         blocked_tools: vec!["dangerous_tool".to_string(), "shell_exec".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // Blocked tool should be denied
     let input = PolicyInputBuilder::new()
@@ -43,7 +45,11 @@ fn test_policy_engine_blocked_tool() {
 
     let result = engine.evaluate(&input).expect("evaluation should succeed");
     assert!(!result.decision.allow);
-    assert!(result.decision.violations.iter().any(|v| v.contains("blocked")));
+    assert!(result
+        .decision
+        .violations
+        .iter()
+        .any(|v| v.contains("blocked")));
 
     // Non-blocked tool should be allowed
     let input = PolicyInputBuilder::new()
@@ -63,7 +69,9 @@ fn test_policy_engine_blocked_agent() {
         blocked_agents: vec!["malicious-agent".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // Blocked agent should be denied
     let input = PolicyInputBuilder::new()
@@ -92,7 +100,9 @@ fn test_policy_engine_identity_required_tools_denied() {
         identity_required_tools: vec!["write_file".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // Without identity verification, should be denied
     let input = PolicyInputBuilder::new()
@@ -103,7 +113,11 @@ fn test_policy_engine_identity_required_tools_denied() {
 
     let result = engine.evaluate(&input).expect("evaluation should succeed");
     assert!(!result.decision.allow);
-    assert!(result.decision.violations.iter().any(|v| v.contains("identity")));
+    assert!(result
+        .decision
+        .violations
+        .iter()
+        .any(|v| v.contains("identity")));
 }
 
 #[test]
@@ -114,7 +128,9 @@ fn test_policy_engine_identity_required_tools_allowed() {
         identity_required_tools: vec!["write_file".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // With identity verification, should be allowed
     let input = PolicyInputBuilder::new()
@@ -125,7 +141,11 @@ fn test_policy_engine_identity_required_tools_allowed() {
         .build();
 
     let result = engine.evaluate(&input).expect("evaluation should succeed");
-    assert!(result.decision.allow, "Expected allow but got: {:?}", result.decision);
+    assert!(
+        result.decision.allow,
+        "Expected allow but got: {:?}",
+        result.decision
+    );
 }
 
 #[test]
@@ -140,7 +160,9 @@ fn test_policy_engine_capability_requirements() {
         tool_capabilities,
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // Agent without required capability should be denied
     let input = PolicyInputBuilder::new()
@@ -182,7 +204,9 @@ fn test_policy_engine_audit_mode() {
         blocked_tools: vec!["blocked_tool".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // In audit mode, blocked tool should still be "allowed" but flagged
     let input = PolicyInputBuilder::new()
@@ -190,7 +214,9 @@ fn test_policy_engine_audit_mode() {
         .tool("blocked_tool")
         .build();
 
-    let (allowed, result) = engine.is_allowed(&input).expect("evaluation should succeed");
+    let (allowed, result) = engine
+        .is_allowed(&input)
+        .expect("evaluation should succeed");
 
     // is_allowed returns true in audit mode
     assert!(allowed);
@@ -231,7 +257,9 @@ fn test_policy_engine_disabled() {
         blocked_tools: vec!["everything".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     let input = PolicyInputBuilder::new()
         .method("tools/call")
@@ -240,7 +268,10 @@ fn test_policy_engine_disabled() {
 
     let result = engine.evaluate(&input).expect("evaluation should succeed");
     assert!(result.decision.allow);
-    assert_eq!(result.decision.matched_rule, Some("policy_disabled".to_string()));
+    assert_eq!(
+        result.decision.matched_rule,
+        Some("policy_disabled".to_string())
+    );
 }
 
 #[test]
@@ -264,8 +295,7 @@ rules:
       type: allow
 "#;
 
-    let rego = PolicyCompiler::compile_yaml(yaml)
-        .expect("YAML compilation should succeed");
+    let rego = PolicyCompiler::compile_yaml(yaml).expect("YAML compilation should succeed");
 
     // Should produce valid Rego code
     assert!(rego.contains("package mcp.policy"));
@@ -291,12 +321,13 @@ identity_required_tools:
     std::fs::write(&data_path, yaml_content).expect("write should succeed");
 
     // Load the policy data
-    let data = PolicyLoader::load_policy_data_yaml(&data_path)
-        .expect("loading should succeed");
+    let data = PolicyLoader::load_policy_data_yaml(&data_path).expect("loading should succeed");
 
     assert!(data.blocked_tools.contains(&"dangerous_tool".to_string()));
     assert!(data.blocked_agents.contains(&"bad_agent".to_string()));
-    assert!(data.identity_required_tools.contains(&"write_file".to_string()));
+    assert!(data
+        .identity_required_tools
+        .contains(&"write_file".to_string()));
 }
 
 #[test]
@@ -307,7 +338,9 @@ fn test_policy_allowed_dids_no_did_denied() {
         allowed_dids: vec!["did:key:z6MkAllowed".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // Request without DID should be denied when allowed_dids is set
     let input = PolicyInputBuilder::new()
@@ -316,7 +349,11 @@ fn test_policy_allowed_dids_no_did_denied() {
         .build();
 
     let result = engine.evaluate(&input).expect("evaluation should succeed");
-    assert!(!result.decision.allow, "Expected deny but got: {:?}", result.decision);
+    assert!(
+        !result.decision.allow,
+        "Expected deny but got: {:?}",
+        result.decision
+    );
 }
 
 #[test]
@@ -327,7 +364,9 @@ fn test_policy_allowed_dids_wrong_did_denied() {
         allowed_dids: vec!["did:key:z6MkAllowed".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // Request with wrong DID should be denied
     let input = PolicyInputBuilder::new()
@@ -338,7 +377,11 @@ fn test_policy_allowed_dids_wrong_did_denied() {
         .build();
 
     let result = engine.evaluate(&input).expect("evaluation should succeed");
-    assert!(!result.decision.allow, "Expected deny but got: {:?}", result.decision);
+    assert!(
+        !result.decision.allow,
+        "Expected deny but got: {:?}",
+        result.decision
+    );
 }
 
 #[test]
@@ -349,7 +392,9 @@ fn test_policy_allowed_dids_correct_did_allowed() {
         allowed_dids: vec!["did:key:z6MkAllowed".to_string()],
         ..Default::default()
     };
-    engine.set_policy_data(policy_data).expect("set policy data should succeed");
+    engine
+        .set_policy_data(policy_data)
+        .expect("set policy data should succeed");
 
     // Request with allowed DID should succeed
     let input = PolicyInputBuilder::new()
@@ -360,7 +405,11 @@ fn test_policy_allowed_dids_correct_did_allowed() {
         .build();
 
     let result = engine.evaluate(&input).expect("evaluation should succeed");
-    assert!(result.decision.allow, "Expected allow but got: {:?}", result.decision);
+    assert!(
+        result.decision.allow,
+        "Expected allow but got: {:?}",
+        result.decision
+    );
 }
 
 #[test]

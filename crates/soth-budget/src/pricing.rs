@@ -80,7 +80,10 @@ impl PricingCatalog {
                 alias_map.insert(alias.to_lowercase(), (provider.clone(), model_id.clone()));
             }
             // Also add the model_id itself as an alias
-            alias_map.insert(model_id.to_lowercase(), (provider.clone(), model_id.clone()));
+            alias_map.insert(
+                model_id.to_lowercase(),
+                (provider.clone(), model_id.clone()),
+            );
         }
     }
 
@@ -155,10 +158,7 @@ impl PricingCatalog {
     /// List all known models across all providers
     pub fn list_all_models(&self) -> Vec<ModelPricingEntry> {
         let entries = self.entries.read();
-        entries
-            .values()
-            .flat_map(|m| m.values().cloned())
-            .collect()
+        entries.values().flat_map(|m| m.values().cloned()).collect()
     }
 
     /// List all providers
@@ -178,7 +178,10 @@ impl PricingCatalog {
                 entry.model_id.to_lowercase().contains(&query_lower)
                     || entry.model_name.to_lowercase().contains(&query_lower)
                     || entry.provider.to_lowercase().contains(&query_lower)
-                    || entry.aliases.iter().any(|a| a.to_lowercase().contains(&query_lower))
+                    || entry
+                        .aliases
+                        .iter()
+                        .any(|a| a.to_lowercase().contains(&query_lower))
             })
             .cloned()
             .collect();
@@ -650,8 +653,17 @@ mod tests {
     fn test_detect_provider() {
         let catalog = PricingCatalog::with_defaults();
 
-        assert_eq!(catalog.detect_provider("gpt-4o"), Some("openai".to_string()));
-        assert_eq!(catalog.detect_provider("claude-sonnet-4"), Some("anthropic".to_string()));
-        assert_eq!(catalog.detect_provider("gemini-1.5-pro"), Some("google".to_string()));
+        assert_eq!(
+            catalog.detect_provider("gpt-4o"),
+            Some("openai".to_string())
+        );
+        assert_eq!(
+            catalog.detect_provider("claude-sonnet-4"),
+            Some("anthropic".to_string())
+        );
+        assert_eq!(
+            catalog.detect_provider("gemini-1.5-pro"),
+            Some("google".to_string())
+        );
     }
 }

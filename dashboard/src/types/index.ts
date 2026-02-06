@@ -34,6 +34,7 @@ export interface PolicyMetrics {
   denied: number;
   cache_hits: number;
   cache_misses: number;
+  active_version: string | null;
   recent_denials: DenialEntry[];
 }
 
@@ -220,6 +221,7 @@ export interface ProviderTokens {
 }
 
 export interface ProxyRequestEntry {
+  request_id: string | null;
   timestamp: string;
   provider: string;
   host: string;
@@ -250,4 +252,12 @@ export interface ProxyMetrics {
   total_cost_usd: number;
   recent_requests: ProxyRequestEntry[];
   status: ProxyStatus;
+}
+
+export interface DashboardSnapshot {
+  identity: IdentityMetrics;
+  policy: PolicyMetrics;
+  observe: ObserveMetrics;
+  budget: BudgetMetrics;
+  proxy: ProxyMetrics;
 }

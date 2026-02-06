@@ -54,6 +54,7 @@ impl DashboardServer {
         // Load initial events and start watcher
         if let Some(ref store) = self.event_store {
             let store_clone = store.clone();
+            let store_path = store.path().display().to_string();
 
             // Load initial events
             if let Err(e) = store.load_initial().await {
@@ -65,7 +66,7 @@ impl DashboardServer {
                 store_clone.watch().await;
             });
 
-            info!("Event store enabled, watching ~/.soth/logs/events.jsonl");
+            info!("Event store enabled, watching {}", store_path);
         }
 
         let app = Router::new()
@@ -77,7 +78,10 @@ impl DashboardServer {
         info!("Dashboard API available at http://{}", addr);
 
         if self.event_store.is_some() {
-            info!("WebSocket streaming available at ws://{}/api/events/stream", addr);
+            info!(
+                "WebSocket streaming available at ws://{}/api/events/stream",
+                addr
+            );
         }
 
         info!("For the full React dashboard, run: cd dashboard && npm run dev");

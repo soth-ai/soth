@@ -2,17 +2,16 @@
 //!
 //! Tests the full SOTH proxy with real transports
 
+use serde_json::json;
+use soth_core::types::policy::PolicyData;
 use soth_proxy::{
-    PipelineBuilder,
-    ObserveLayer, PolicyLayer, BudgetLayer,
-    pipeline::observe::ObserveConfig,
-    pipeline::policy::{PolicyConfig, PolicyMode},
     pipeline::budget::BudgetConfig,
     pipeline::middleware::RequestContext,
+    pipeline::observe::ObserveConfig,
+    pipeline::policy::{PolicyConfig, PolicyMode},
     protocol::{JsonRpcMessage, JsonRpcRequest, RequestId},
+    BudgetLayer, ObserveLayer, PipelineBuilder, PolicyLayer,
 };
-use soth_core::types::policy::PolicyData;
-use serde_json::json;
 use std::sync::Arc;
 
 /// Helper to create a tool call request
@@ -122,10 +121,12 @@ async fn test_e2e_pipeline_initialize() {
 async fn test_e2e_pipeline_blocked_tool() {
     // Create policy engine with blocked tools
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        blocked_tools: vec!["dangerous_exec".to_string(), "rm_rf".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            blocked_tools: vec!["dangerous_exec".to_string(), "rm_rf".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -157,8 +158,11 @@ async fn test_e2e_pipeline_blocked_tool() {
         Ok(Some(JsonRpcMessage::Response(resp))) => {
             assert!(resp.error.is_some(), "Blocked tool should return error");
             let error = resp.error.unwrap();
-            assert!(error.message.contains("denied") || error.message.contains("blocked"),
-                "Error should mention denial: {}", error.message);
+            assert!(
+                error.message.contains("denied") || error.message.contains("blocked"),
+                "Error should mention denial: {}",
+                error.message
+            );
         }
         other => {
             // In some configurations this might return differently
@@ -171,10 +175,12 @@ async fn test_e2e_pipeline_blocked_tool() {
 async fn test_e2e_pipeline_identity_required() {
     // Create policy requiring identity for write operations
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        identity_required_tools: vec!["write_file".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            identity_required_tools: vec!["write_file".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -205,7 +211,10 @@ async fn test_e2e_pipeline_identity_required() {
 
     match result {
         Ok(Some(JsonRpcMessage::Response(resp))) => {
-            assert!(resp.error.is_some(), "write_file without identity should be denied");
+            assert!(
+                resp.error.is_some(),
+                "write_file without identity should be denied"
+            );
         }
         other => {
             println!("Got result: {:?}", other);
@@ -217,10 +226,12 @@ async fn test_e2e_pipeline_identity_required() {
 async fn test_e2e_pipeline_identity_verified() {
     // Same policy but with verified identity
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        identity_required_tools: vec!["write_file".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            identity_required_tools: vec!["write_file".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -235,8 +246,8 @@ async fn test_e2e_pipeline_identity_verified() {
     let pipeline = Arc::new(pipeline);
 
     // Test: write_file WITH identity should be allowed
-    let mut ctx = RequestContext::new("e2e-session-5")
-        .with_verified_identity("did:key:z6MkTestAgent");
+    let mut ctx =
+        RequestContext::new("e2e-session-5").with_verified_identity("did:key:z6MkTestAgent");
 
     let request = make_request(
         "tools/call",
@@ -256,8 +267,11 @@ async fn test_e2e_pipeline_identity_verified() {
         }
         Ok(Some(JsonRpcMessage::Response(resp))) => {
             // If it's a response, it shouldn't be an error
-            assert!(resp.error.is_none(),
-                "write_file with identity should be allowed, got: {:?}", resp.error);
+            assert!(
+                resp.error.is_none(),
+                "write_file with identity should be allowed, got: {:?}",
+                resp.error
+            );
         }
         Ok(None) => {
             // Dropped - unexpected but not a failure
@@ -298,7 +312,10 @@ async fn test_e2e_pipeline_pii_detection() {
     // The pipeline should process this without error
     // PII detection happens in the observe layer but doesn't block
     let result = pipeline.process(&mut ctx, request).await;
-    assert!(result.is_ok(), "Pipeline should handle PII-containing requests");
+    assert!(
+        result.is_ok(),
+        "Pipeline should handle PII-containing requests"
+    );
 }
 
 #[tokio::test]
@@ -363,10 +380,12 @@ async fn test_e2e_pipeline_resources_read() {
 async fn test_e2e_pipeline_audit_mode() {
     // In audit mode, violations are logged but not blocked
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        blocked_tools: vec!["forbidden_tool".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            blocked_tools: vec!["forbidden_tool".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -425,7 +444,7 @@ async fn test_e2e_concurrent_requests() {
                 block_on_exceeded: false,
                 default_model: "gpt-4o".to_string(),
             }))
-            .build()
+            .build(),
     );
 
     // Spawn many concurrent requests
@@ -465,13 +484,15 @@ async fn test_e2e_concurrent_requests() {
 async fn test_e2e_allowed_dids_enforcement() {
     // Only allow specific DIDs
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        allowed_dids: vec![
-            "did:key:z6MkAllowedAgent1".to_string(),
-            "did:key:z6MkAllowedAgent2".to_string(),
-        ],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            allowed_dids: vec![
+                "did:key:z6MkAllowedAgent1".to_string(),
+                "did:key:z6MkAllowedAgent2".to_string(),
+            ],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -492,7 +513,10 @@ async fn test_e2e_allowed_dids_enforcement() {
     let result = pipeline.process(&mut ctx, request).await;
     match result {
         Ok(Some(JsonRpcMessage::Response(resp))) => {
-            assert!(resp.error.is_some(), "Request without allowed DID should be denied");
+            assert!(
+                resp.error.is_some(),
+                "Request without allowed DID should be denied"
+            );
         }
         _ => {}
     }
@@ -505,14 +529,17 @@ async fn test_e2e_allowed_dids_enforcement() {
     let result = pipeline.process(&mut ctx, request).await;
     match result {
         Ok(Some(JsonRpcMessage::Response(resp))) => {
-            assert!(resp.error.is_some(), "Request with wrong DID should be denied");
+            assert!(
+                resp.error.is_some(),
+                "Request with wrong DID should be denied"
+            );
         }
         _ => {}
     }
 
     // Request with allowed DID should pass
-    let mut ctx = RequestContext::new("e2e-session-12")
-        .with_verified_identity("did:key:z6MkAllowedAgent1");
+    let mut ctx =
+        RequestContext::new("e2e-session-12").with_verified_identity("did:key:z6MkAllowedAgent1");
     let request = make_request("tools/call", Some(json!({"name": "test"})), 3);
 
     let result = pipeline.process(&mut ctx, request).await;
@@ -521,8 +548,11 @@ async fn test_e2e_allowed_dids_enforcement() {
             // Passed through - good
         }
         Ok(Some(JsonRpcMessage::Response(resp))) => {
-            assert!(resp.error.is_none(),
-                "Request with allowed DID should pass, got: {:?}", resp.error);
+            assert!(
+                resp.error.is_none(),
+                "Request with allowed DID should pass, got: {:?}",
+                resp.error
+            );
         }
         _ => {}
     }
@@ -531,8 +561,7 @@ async fn test_e2e_allowed_dids_enforcement() {
 #[tokio::test]
 async fn test_debug_context_identity() {
     // Debug test to verify RequestContext identity fields
-    let ctx = RequestContext::new("debug-session")
-        .with_verified_identity("did:key:z6MkTestDID");
+    let ctx = RequestContext::new("debug-session").with_verified_identity("did:key:z6MkTestDID");
 
     println!("identity_verified: {}", ctx.identity_verified);
     println!("agent_did: {:?}", ctx.agent_did);
@@ -546,8 +575,7 @@ async fn test_debug_policy_input_builder() {
     use soth_core::types::policy::PolicyInputBuilder;
 
     // Simulate what the PolicyLayer does
-    let ctx = RequestContext::new("debug-session")
-        .with_verified_identity("did:key:z6MkTestDID");
+    let ctx = RequestContext::new("debug-session").with_verified_identity("did:key:z6MkTestDID");
 
     let mut builder = PolicyInputBuilder::new()
         .session_id(&ctx.session_id)
@@ -575,10 +603,12 @@ async fn test_debug_policy_layer_direct() {
     // Test the PolicyLayer directly with allowed_dids
 
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        allowed_dids: vec!["did:key:z6MkAllowedDirect".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            allowed_dids: vec!["did:key:z6MkAllowedDirect".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let policy_layer = PolicyLayer::with_engine(
         PolicyConfig {
@@ -589,10 +619,13 @@ async fn test_debug_policy_layer_direct() {
     );
 
     // Create context with verified identity
-    let mut ctx = RequestContext::new("debug-direct")
-        .with_verified_identity("did:key:z6MkAllowedDirect");
+    let mut ctx =
+        RequestContext::new("debug-direct").with_verified_identity("did:key:z6MkAllowedDirect");
 
-    println!("Before pipeline - ctx.identity_verified: {}", ctx.identity_verified);
+    println!(
+        "Before pipeline - ctx.identity_verified: {}",
+        ctx.identity_verified
+    );
     println!("Before pipeline - ctx.agent_did: {:?}", ctx.agent_did);
 
     let request = make_request(
@@ -602,14 +635,15 @@ async fn test_debug_policy_layer_direct() {
     );
 
     // Use PipelineBuilder with just PolicyLayer
-    let pipeline = PipelineBuilder::new()
-        .layer(policy_layer)
-        .build();
+    let pipeline = PipelineBuilder::new().layer(policy_layer).build();
 
     let result = pipeline.process(&mut ctx, request).await;
 
     println!("After pipeline - result: {:?}", result);
-    println!("After pipeline - ctx.identity_verified: {}", ctx.identity_verified);
+    println!(
+        "After pipeline - ctx.identity_verified: {}",
+        ctx.identity_verified
+    );
     println!("After pipeline - ctx.agent_did: {:?}", ctx.agent_did);
 
     match result {
@@ -635,13 +669,15 @@ async fn test_debug_allowed_dids_sequence() {
     // Replicate exact sequence from failing test
 
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        allowed_dids: vec![
-            "did:key:z6MkAllowedAgent1".to_string(),
-            "did:key:z6MkAllowedAgent2".to_string(),
-        ],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            allowed_dids: vec![
+                "did:key:z6MkAllowedAgent1".to_string(),
+                "did:key:z6MkAllowedAgent2".to_string(),
+            ],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -676,8 +712,8 @@ async fn test_debug_allowed_dids_sequence() {
 
     // Third: Request with allowed DID
     println!("\n=== Test 3: Allowed DID ===");
-    let mut ctx3 = RequestContext::new("e2e-session-12")
-        .with_verified_identity("did:key:z6MkAllowedAgent1");
+    let mut ctx3 =
+        RequestContext::new("e2e-session-12").with_verified_identity("did:key:z6MkAllowedAgent1");
     println!("ctx3.identity_verified: {}", ctx3.identity_verified);
     println!("ctx3.agent_did: {:?}", ctx3.agent_did);
     let request3 = make_request("tools/call", Some(json!({"name": "test"})), 3);
@@ -709,10 +745,12 @@ async fn test_debug_without_arc() {
     // Same test but WITHOUT Arc wrapper
 
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        allowed_dids: vec!["did:key:z6MkAllowedAgent1".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            allowed_dids: vec!["did:key:z6MkAllowedAgent1".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -727,8 +765,8 @@ async fn test_debug_without_arc() {
     // NO Arc wrapping
 
     println!("\n=== Test WITHOUT Arc ===");
-    let mut ctx = RequestContext::new("no-arc-session")
-        .with_verified_identity("did:key:z6MkAllowedAgent1");
+    let mut ctx =
+        RequestContext::new("no-arc-session").with_verified_identity("did:key:z6MkAllowedAgent1");
     println!("ctx.identity_verified: {}", ctx.identity_verified);
     println!("ctx.agent_did: {:?}", ctx.agent_did);
     let request = make_request("tools/call", Some(json!({"name": "test"})), 1);
@@ -752,10 +790,12 @@ async fn test_debug_with_arc_single() {
     // Same test but WITH Arc wrapper - single call
 
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        allowed_dids: vec!["did:key:z6MkAllowedAgent1".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            allowed_dids: vec!["did:key:z6MkAllowedAgent1".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -767,11 +807,11 @@ async fn test_debug_with_arc_single() {
         ))
         .build();
 
-    let pipeline = Arc::new(pipeline);  // Wrapped in Arc!
+    let pipeline = Arc::new(pipeline); // Wrapped in Arc!
 
     println!("\n=== Test WITH Arc (single call) ===");
-    let mut ctx = RequestContext::new("arc-session")
-        .with_verified_identity("did:key:z6MkAllowedAgent1");
+    let mut ctx =
+        RequestContext::new("arc-session").with_verified_identity("did:key:z6MkAllowedAgent1");
     println!("ctx.identity_verified: {}", ctx.identity_verified);
     println!("ctx.agent_did: {:?}", ctx.agent_did);
     let request = make_request("tools/call", Some(json!({"name": "test"})), 1);
@@ -795,10 +835,12 @@ async fn test_debug_with_arc_multiple() {
     // WITH Arc wrapper - multiple calls
 
     let engine = soth_policy::PolicyEngine::new();
-    engine.set_policy_data(PolicyData {
-        allowed_dids: vec!["did:key:z6MkAllowedAgent1".to_string()],
-        ..Default::default()
-    }).expect("policy data should be set");
+    engine
+        .set_policy_data(PolicyData {
+            allowed_dids: vec!["did:key:z6MkAllowedAgent1".to_string()],
+            ..Default::default()
+        })
+        .expect("policy data should be set");
 
     let pipeline = PipelineBuilder::new()
         .layer(PolicyLayer::with_engine(
@@ -821,8 +863,8 @@ async fn test_debug_with_arc_multiple() {
 
     // Second call - WITH identity (should pass)
     println!("\n=== Call 2: With identity ===");
-    let mut ctx2 = RequestContext::new("multi-2")
-        .with_verified_identity("did:key:z6MkAllowedAgent1");
+    let mut ctx2 =
+        RequestContext::new("multi-2").with_verified_identity("did:key:z6MkAllowedAgent1");
     println!("ctx2.identity_verified: {}", ctx2.identity_verified);
     println!("ctx2.agent_did: {:?}", ctx2.agent_did);
     let request2 = make_request("tools/call", Some(json!({"name": "test"})), 2);

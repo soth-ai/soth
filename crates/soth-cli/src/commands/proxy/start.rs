@@ -2,19 +2,19 @@
 
 use crate::style;
 use owo_colors::OwoColorize;
-use soth_core::config::load_config;
+use soth_budget::BudgetTracker;
+use soth_core::config::{load_config, SothConfig};
 use soth_core::EventLogger;
 use soth_dashboard::server::DashboardServer;
 use soth_dashboard::DashboardState;
-use soth_proxy::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use soth_identity::TrustStore;
+use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine, PolicyLoader};
 use soth_proxy::metrics;
-use soth_proxy::rate_limit::{RateLimiter, RateLimitConfig};
-use soth_proxy::transport::forward_proxy::ForwardProxyTransport;
-use soth_proxy::transport::hudsucker_proxy;
-use soth_proxy::Transport;
-use soth_tls::CertificateAuthority;
-use std::path::PathBuf;
-use tokio_util::sync::CancellationToken;
+use soth_proxy::transport::hudsucker_proxy::{
+    self, ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode,
+};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Expand tilde in path
 fn expand_path(path: &PathBuf) -> PathBuf {
@@ -28,23 +28,110 @@ fn expand_path(path: &PathBuf) -> PathBuf {
     path.clone()
 }
 
-/// Run the start command with mode selection
-pub async fn run_with_mode(
-    port: Option<u16>,
-    config_path: Option<PathBuf>,
-    legacy: bool,
-) -> anyhow::Result<()> {
+fn resolve_trust_store_file(path: &Path) -> PathBuf {
+    if path.extension().is_some() {
+        path.to_path_buf()
+    } else {
+        path.join("trust_store")
+    }
+}
+
+fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer> {
+    let identity_mode = match config.identity.mode.as_str() {
+        "disabled" => ProxyIdentityMode::Disabled,
+        "required" => ProxyIdentityMode::Required,
+        _ => ProxyIdentityMode::Optional,
+    };
+
+    let mut trusted_dids: HashSet<String> = HashSet::new();
+    for did in &config.identity.allowed_dids {
+        trusted_dids.insert(did.clone());
+    }
+
+    if let Some(path) = &config.identity.trust_store_path {
+        let trust_store_file = resolve_trust_store_file(path);
+        if trust_store_file.exists() {
+            let store = TrustStore::new(&trust_store_file)?;
+            for did in store.list() {
+                trusted_dids.insert(did.to_string());
+            }
+        }
+    }
+
+    let mut enforcer = ProxyEnforcer::new()
+        .with_identity_mode(identity_mode, trusted_dids)
+        .with_identity_headers("X-Agent-DID", "X-Agent-Signature");
+
+    if config.policy.enabled {
+        let policy_mode = match config.policy.mode.as_str() {
+            "audit" => ProxyPolicyMode::Audit,
+            "enforce" => ProxyPolicyMode::Enforce,
+            _ => ProxyPolicyMode::Enforce,
+        };
+        let cache_config: PolicyCacheConfig = config.policy.cache.clone().into();
+        let engine = PolicyEngine::with_cache_config(cache_config);
+
+        if let Some(data_file) = &config.policy.data_file {
+            let data = match data_file.extension().and_then(|e| e.to_str()) {
+                Some("yaml") | Some("yml") => PolicyLoader::load_policy_data_yaml(data_file)?,
+                _ => PolicyLoader::load_policy_data(data_file)?,
+            };
+            engine.set_policy_data(data)?;
+        }
+
+        if let Some(policy_dir) = &config.policy.policy_dir {
+            let mut modules = std::collections::HashMap::new();
+
+            if policy_dir.exists() {
+                if let Ok(rego_modules) = PolicyLoader::load_rego_dir(policy_dir) {
+                    modules.extend(rego_modules);
+                }
+                if let Ok(yaml_modules) = PolicyLoader::load_yaml_dir(policy_dir) {
+                    modules.extend(yaml_modules);
+                }
+            }
+
+            if !modules.is_empty() {
+                engine.load_modules(modules)?;
+            }
+        }
+
+        enforcer = enforcer.with_policy(policy_mode, engine);
+    }
+
+    if config.budget.enabled {
+        let tracker = BudgetTracker::new();
+        for limit in &config.budget.limits {
+            match limit.scope.as_str() {
+                "global" => tracker.set_global_budget(limit.daily, limit.weekly, limit.monthly),
+                "per_agent" => {
+                    if let Some(agent_id) = &limit.agent_id {
+                        tracker.set_agent_budget(
+                            agent_id,
+                            limit.daily,
+                            limit.weekly,
+                            limit.monthly,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        enforcer = enforcer.with_budget(tracker, true, "gpt-4o");
+    }
+
+    Ok(enforcer)
+}
+
+/// Run the start command
+pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Result<()> {
     // Load config
     let config = if let Some(path) = config_path {
         load_config(path)?
     } else {
         // Try default paths
-        let default_paths = [
-            "soth.yaml",
-            "soth.yml",
-            ".soth.yaml",
-            "~/.soth/soth.yaml",
-        ];
+        let default_paths = ["soth.yaml", "soth.yml", ".soth.yaml", "~/.soth/soth.yaml"];
         let mut loaded = None;
         for path in default_paths {
             let expanded = if path.starts_with("~/") {
@@ -80,7 +167,7 @@ pub async fn run_with_mode(
     // Show startup spinner
     let spinner = style::spinner("Loading CA certificate...");
 
-    // For hudsucker, we need the paths; for legacy, we need the CertificateAuthority
+    // Hudsucker proxy requires cert and key paths.
     let ca_cert_path = ca_path.join("ca.crt");
     let ca_key_path = ca_path.join("ca.key");
 
@@ -96,8 +183,7 @@ pub async fn run_with_mode(
     // Display startup banner
     style::header("SOTH Forward Proxy");
 
-    let mode = if legacy { "legacy" } else { "hudsucker" };
-    style::kv("Mode", mode);
+    style::kv("Mode", "hudsucker");
     style::kv("Listen address", &proxy_config.socket_addr().to_string());
     style::kv("CA certificate", &ca_cert_path.display().to_string());
     println!();
@@ -170,33 +256,28 @@ pub async fn run_with_mode(
     );
     println!();
 
-    if legacy {
-        // Legacy mode: use ForwardProxyTransport
-        run_legacy_proxy(config, proxy_config, ca_path).await
-    } else {
-        // Default: use hudsucker-based proxy
-        run_hudsucker_proxy(config.dashboard, proxy_config, ca_cert_path, ca_key_path).await
-    }
+    run_hudsucker_proxy(&config, proxy_config, ca_cert_path, ca_key_path).await
 }
 
 /// Run the hudsucker-based proxy (default, battle-tested)
 async fn run_hudsucker_proxy(
-    dashboard_config: soth_core::config::DashboardConfig,
+    config: &SothConfig,
     proxy_config: soth_core::config::ForwardProxyConfig,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
 ) -> anyhow::Result<()> {
+    let enforcer = build_proxy_enforcer(config)?;
+
     // Create dashboard state for metrics
     let dashboard_state = DashboardState::new();
 
     // Start dashboard server if enabled
-    if dashboard_config.enabled {
+    if config.dashboard.enabled {
         let state_clone = dashboard_state.clone();
-        let port = dashboard_config.port;
+        let port = config.dashboard.port;
 
         tokio::spawn(async move {
-            let server = DashboardServer::new(state_clone, port)
-                .with_event_store();
+            let server = DashboardServer::new(state_clone, port).with_event_store();
 
             if let Err(e) = server.run().await {
                 tracing::error!("Dashboard server error: {}", e);
@@ -209,7 +290,11 @@ async fn run_hudsucker_proxy(
     // Create event logger for observability
     let event_logger = match EventLogger::with_default_path() {
         Ok(logger) => {
-            style::kv_colored("Event logging", logger.path().display().to_string().as_str(), true);
+            style::kv_colored(
+                "Event logging",
+                logger.path().display().to_string().as_str(),
+                true,
+            );
             Some(logger)
         }
         Err(e) => {
@@ -239,6 +324,7 @@ async fn run_hudsucker_proxy(
         },
         Some(dashboard_state),
         event_logger,
+        Some(enforcer),
     )
     .await;
 
@@ -252,104 +338,4 @@ async fn run_hudsucker_proxy(
             Err(anyhow::anyhow!("Proxy error: {}", e))
         }
     }
-}
-
-/// Run the legacy ForwardProxyTransport (for compatibility/testing)
-async fn run_legacy_proxy(
-    config: soth_core::config::SothConfig,
-    proxy_config: soth_core::config::ForwardProxyConfig,
-    ca_path: PathBuf,
-) -> anyhow::Result<()> {
-    // Load CA
-    let ca = CertificateAuthority::load_or_generate(ca_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load CA: {}", e))?;
-
-    // Create rate limiter from production config
-    let rate_limiter = if config.production.rate_limit.enabled {
-        style::kv_colored(
-            "Rate limiting",
-            &format!(
-                "{} req/s, burst {}",
-                config.production.rate_limit.requests_per_second,
-                config.production.rate_limit.burst_size
-            ),
-            true,
-        );
-        Some(RateLimiter::new(RateLimitConfig {
-            requests_per_second: config.production.rate_limit.requests_per_second,
-            burst_size: config.production.rate_limit.burst_size,
-            enabled: true,
-        }))
-    } else {
-        None
-    };
-
-    // Create circuit breaker from production config
-    let circuit_breaker = if config.production.circuit_breaker.enabled {
-        style::kv_colored(
-            "Circuit breaker",
-            &format!(
-                "threshold {}, open {:?}",
-                config.production.circuit_breaker.failure_threshold,
-                config.production.circuit_breaker.open_duration
-            ),
-            true,
-        );
-        Some(CircuitBreaker::new(CircuitBreakerConfig {
-            failure_threshold: config.production.circuit_breaker.failure_threshold,
-            open_duration: config.production.circuit_breaker.open_duration,
-            success_threshold: config.production.circuit_breaker.success_threshold,
-            failure_window: config.production.circuit_breaker.failure_window,
-            enabled: true,
-        }))
-    } else {
-        None
-    };
-
-    // Get graceful shutdown timeout from config
-    let shutdown_timeout = config.server.graceful_shutdown;
-
-    // Create and start transport
-    let mut transport = ForwardProxyTransport::new(proxy_config, ca)
-        .with_shutdown_timeout(shutdown_timeout);
-
-    // Wire in production features
-    if let Some(limiter) = rate_limiter {
-        transport = transport.with_rate_limiter(limiter);
-    }
-    if let Some(breaker) = circuit_breaker {
-        transport = transport.with_circuit_breaker(breaker);
-    }
-
-    // Add event logger for observability
-    match EventLogger::with_default_path() {
-        Ok(logger) => {
-            style::kv_colored("Event logging", logger.path().display().to_string().as_str(), true);
-            transport = transport.with_event_logger(logger);
-        }
-        Err(e) => {
-            style::warning(&format!("Event logging disabled: {}", e));
-        }
-    }
-
-    // Set up signal handler
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        println!();
-        style::warning("Initiating graceful shutdown...");
-        style::info("Waiting for in-flight connections to complete...");
-        cancel_clone.cancel();
-    });
-
-    // Start the proxy
-    transport
-        .start(cancel)
-        .await
-        .map_err(|e| anyhow::anyhow!("Proxy error: {}", e))?;
-
-    style::success("Proxy stopped.");
-    Ok(())
 }

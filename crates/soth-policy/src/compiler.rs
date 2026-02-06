@@ -52,9 +52,7 @@ pub enum RuleCondition {
         arguments: HashMap<String, serde_json::Value>,
     },
     /// Match method
-    Method {
-        name: String,
-    },
+    Method { name: String },
     /// Match identity status
     Identity {
         #[serde(default)]
@@ -63,17 +61,11 @@ pub enum RuleCondition {
         did_pattern: Option<String>,
     },
     /// Combined conditions (all must match)
-    All {
-        conditions: Vec<RuleCondition>,
-    },
+    All { conditions: Vec<RuleCondition> },
     /// Combined conditions (any must match)
-    Any {
-        conditions: Vec<RuleCondition>,
-    },
+    Any { conditions: Vec<RuleCondition> },
     /// Negated condition
-    Not {
-        condition: Box<RuleCondition>,
-    },
+    Not { condition: Box<RuleCondition> },
 }
 
 /// Rule action
@@ -83,13 +75,9 @@ pub enum RuleAction {
     /// Allow the request
     Allow,
     /// Deny the request with a message
-    Deny {
-        message: String,
-    },
+    Deny { message: String },
     /// Allow with obligations
-    AllowWithObligations {
-        obligations: Vec<Obligation>,
-    },
+    AllowWithObligations { obligations: Vec<Obligation> },
 }
 
 /// An obligation to be fulfilled
@@ -134,10 +122,7 @@ impl PolicyCompiler {
 
         Ok(format!(
             "# {}: {}\ndecision := {} if {{\n{}\n}}",
-            rule.name,
-            rule.description,
-            action_rego,
-            condition_rego
+            rule.name, rule.description, action_rego, condition_rego
         ))
     }
 
@@ -146,7 +131,11 @@ impl PolicyCompiler {
         match condition {
             RuleCondition::Always => Ok("    true".to_string()),
 
-            RuleCondition::Agent { id, name, capabilities } => {
+            RuleCondition::Agent {
+                id,
+                name,
+                capabilities,
+            } => {
                 let mut checks = Vec::new();
 
                 if let Some(id) = id {
@@ -179,20 +168,19 @@ impl PolicyCompiler {
                 Ok(checks.join("\n"))
             }
 
-            RuleCondition::Method { name } => {
-                Ok(format!("    input.request.method == \"{name}\""))
-            }
+            RuleCondition::Method { name } => Ok(format!("    input.request.method == \"{name}\"")),
 
-            RuleCondition::Identity { verified, did_pattern } => {
+            RuleCondition::Identity {
+                verified,
+                did_pattern,
+            } => {
                 let mut checks = Vec::new();
 
                 if let Some(v) = verified {
                     checks.push(format!("    input.identity.verified == {v}"));
                 }
                 if let Some(pattern) = did_pattern {
-                    checks.push(format!(
-                        "    startswith(input.identity.did, \"{pattern}\")"
-                    ));
+                    checks.push(format!("    startswith(input.identity.did, \"{pattern}\")"));
                 }
 
                 if checks.is_empty() {
@@ -246,10 +234,7 @@ impl PolicyCompiler {
                     .iter()
                     .map(|o| {
                         let params = serde_json::to_string(&o.params).unwrap_or_default();
-                        format!(
-                            "{{\"action\": \"{}\", \"params\": {}}}",
-                            o.action, params
-                        )
+                        format!("{{\"action\": \"{}\", \"params\": {}}}", o.action, params)
                     })
                     .collect();
 

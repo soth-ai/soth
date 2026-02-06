@@ -295,32 +295,50 @@ impl JsonRpcError {
 
     /// Tool not found
     pub fn tool_not_found(name: &str) -> Self {
-        Self::new(error_codes::TOOL_NOT_FOUND, format!("Tool not found: {name}"))
+        Self::new(
+            error_codes::TOOL_NOT_FOUND,
+            format!("Tool not found: {name}"),
+        )
     }
 
     /// Resource not found
     pub fn resource_not_found(uri: &str) -> Self {
-        Self::new(error_codes::RESOURCE_NOT_FOUND, format!("Resource not found: {uri}"))
+        Self::new(
+            error_codes::RESOURCE_NOT_FOUND,
+            format!("Resource not found: {uri}"),
+        )
     }
 
     /// Prompt not found
     pub fn prompt_not_found(name: &str) -> Self {
-        Self::new(error_codes::PROMPT_NOT_FOUND, format!("Prompt not found: {name}"))
+        Self::new(
+            error_codes::PROMPT_NOT_FOUND,
+            format!("Prompt not found: {name}"),
+        )
     }
 
     /// Policy denied
     pub fn policy_denied(reason: &str) -> Self {
-        Self::new(error_codes::POLICY_DENIED, format!("Policy denied: {reason}"))
+        Self::new(
+            error_codes::POLICY_DENIED,
+            format!("Policy denied: {reason}"),
+        )
     }
 
     /// Budget exceeded
     pub fn budget_exceeded(reason: &str) -> Self {
-        Self::new(error_codes::BUDGET_EXCEEDED, format!("Budget exceeded: {reason}"))
+        Self::new(
+            error_codes::BUDGET_EXCEEDED,
+            format!("Budget exceeded: {reason}"),
+        )
     }
 
     /// Identity required
     pub fn identity_required() -> Self {
-        Self::new(error_codes::IDENTITY_REQUIRED, "Identity verification required")
+        Self::new(
+            error_codes::IDENTITY_REQUIRED,
+            "Identity verification required",
+        )
     }
 }
 
@@ -340,7 +358,11 @@ pub fn extract_resource_uri(params: &Value) -> Option<&str> {
 }
 
 /// Create an initialize request
-pub fn create_initialize_request(client_info: McpClientInfo, capabilities: McpCapabilities, id: RequestId) -> JsonRpcRequest {
+pub fn create_initialize_request(
+    client_info: McpClientInfo,
+    capabilities: McpCapabilities,
+    id: RequestId,
+) -> JsonRpcRequest {
     let params = InitializeParams {
         protocol_version: MCP_VERSION.to_string(),
         capabilities,

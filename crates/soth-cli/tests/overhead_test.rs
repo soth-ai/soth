@@ -307,8 +307,11 @@ async fn test_timing_consistency() {
         }
         let sum: u64 = times.iter().sum();
         let mean = sum as f64 / times.len() as f64;
-        let variance =
-            times.iter().map(|&t| (t as f64 - mean).powi(2)).sum::<f64>() / times.len() as f64;
+        let variance = times
+            .iter()
+            .map(|&t| (t as f64 - mean).powi(2))
+            .sum::<f64>()
+            / times.len() as f64;
         let std_dev = variance.sqrt();
         let min = *times.iter().min().unwrap_or(&0) as f64;
         (mean, std_dev, min)

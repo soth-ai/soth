@@ -41,7 +41,11 @@ impl StdioTransport {
     }
 
     /// Create a stdio transport that spawns a child process
-    pub fn with_command(command: &str, args: &[&str], config: TransportConfig) -> Result<Self, ProxyError> {
+    pub fn with_command(
+        command: &str,
+        args: &[&str],
+        config: TransportConfig,
+    ) -> Result<Self, ProxyError> {
         let child = Command::new(command)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -169,22 +173,31 @@ impl StdioTransport {
 #[async_trait]
 impl Transport for StdioTransport {
     async fn start(&mut self, cancel: CancellationToken) -> Result<(), ProxyError> {
-        let handler = self.handler.take()
+        let handler = self
+            .handler
+            .take()
             .ok_or_else(|| ProxyError::Transport("No handler set".to_string()))?;
 
-        let child = self.child.as_mut()
+        let child = self
+            .child
+            .as_mut()
             .ok_or_else(|| ProxyError::Transport("No child process".to_string()))?;
 
-        let stdin = child.stdin.take()
+        let stdin = child
+            .stdin
+            .take()
             .ok_or_else(|| ProxyError::Transport("No stdin".to_string()))?;
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| ProxyError::Transport("No stdout".to_string()))?;
 
         let reader = BufReader::new(stdout);
         let (tx, rx) = mpsc::channel(self.config.buffer_size);
 
         self.outgoing_tx = Some(tx.clone());
-        self.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let running = self.running.clone();
         let cancel_clone = cancel.clone();
@@ -205,7 +218,8 @@ impl Transport for StdioTransport {
     }
 
     async fn stop(&mut self) -> Result<(), ProxyError> {
-        self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         if let Some(ref mut child) = self.child {
             let _ = child.kill().await;
@@ -263,7 +277,9 @@ impl StdioProxy {
 
     /// Run the proxy, connecting stdin/stdout to the upstream process
     pub async fn run(&mut self, cancel: CancellationToken) -> Result<(), ProxyError> {
-        let handler = self.handler.take()
+        let handler = self
+            .handler
+            .take()
             .ok_or_else(|| ProxyError::Transport("No handler set".to_string()))?;
 
         // Spawn upstream process
@@ -275,14 +291,20 @@ impl StdioProxy {
             .spawn()
             .map_err(|e| ProxyError::Transport(format!("Failed to spawn upstream: {e}")))?;
 
-        let upstream_stdin = upstream.stdin.take()
+        let upstream_stdin = upstream
+            .stdin
+            .take()
             .ok_or_else(|| ProxyError::Transport("No upstream stdin".to_string()))?;
-        let upstream_stdout = upstream.stdout.take()
+        let upstream_stdout = upstream
+            .stdout
+            .take()
             .ok_or_else(|| ProxyError::Transport("No upstream stdout".to_string()))?;
 
         // Set up channels
-        let (to_upstream_tx, to_upstream_rx) = mpsc::channel::<JsonRpcMessage>(self.config.buffer_size);
-        let (from_upstream_tx, mut from_upstream_rx) = mpsc::channel::<JsonRpcMessage>(self.config.buffer_size);
+        let (to_upstream_tx, to_upstream_rx) =
+            mpsc::channel::<JsonRpcMessage>(self.config.buffer_size);
+        let (from_upstream_tx, mut from_upstream_rx) =
+            mpsc::channel::<JsonRpcMessage>(self.config.buffer_size);
 
         let cancel_clone = cancel.clone();
 

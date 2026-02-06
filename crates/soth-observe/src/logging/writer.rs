@@ -3,6 +3,8 @@
 use crate::merkle::TransparencyLog;
 use crate::pii::{PiiDetector, PiiRedactor};
 use crate::storage::jsonl::JsonlStorage;
+#[cfg(feature = "sqlite")]
+use crate::storage::sqlite::SqliteStorage;
 use soth_core::types::observation::ObservationEvent;
 use std::path::Path;
 use std::time::Duration;
@@ -27,12 +29,17 @@ pub struct AsyncWriter {
 impl AsyncWriter {
     /// Send an event to be written
     pub async fn write(&self, event: ObservationEvent) -> bool {
-        self.sender.send(WriterMessage::Write(Box::new(event))).await.is_ok()
+        self.sender
+            .send(WriterMessage::Write(Box::new(event)))
+            .await
+            .is_ok()
     }
 
     /// Try to send without blocking (for hot path)
     pub fn try_write(&self, event: ObservationEvent) -> bool {
-        self.sender.try_send(WriterMessage::Write(Box::new(event))).is_ok()
+        self.sender
+            .try_send(WriterMessage::Write(Box::new(event)))
+            .is_ok()
     }
 
     /// Request a flush
@@ -63,6 +70,8 @@ pub struct LoggerConfig {
     pub tamper_proof: bool,
     /// Log file path
     pub log_path: std::path::PathBuf,
+    /// Storage backend: local (JSONL) or sqlite
+    pub storage_backend: String,
 }
 
 impl Default for LoggerConfig {
@@ -75,6 +84,31 @@ impl Default for LoggerConfig {
             pii_redaction: false,
             tamper_proof: false,
             log_path: std::path::PathBuf::from("./logs/observations.jsonl"),
+            storage_backend: "local".to_string(),
+        }
+    }
+}
+
+enum Storage {
+    Jsonl(JsonlStorage),
+    #[cfg(feature = "sqlite")]
+    Sqlite(SqliteStorage),
+}
+
+impl Storage {
+    fn write(&self, event: &ObservationEvent) -> std::io::Result<()> {
+        match self {
+            Storage::Jsonl(storage) => storage.write(event),
+            #[cfg(feature = "sqlite")]
+            Storage::Sqlite(storage) => storage.write(event),
+        }
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        match self {
+            Storage::Jsonl(storage) => storage.flush(),
+            #[cfg(feature = "sqlite")]
+            Storage::Sqlite(storage) => storage.flush(),
         }
     }
 }
@@ -120,7 +154,7 @@ impl ObservationLogger {
 
     /// Writer loop running in background
     async fn writer_loop(mut receiver: mpsc::Receiver<WriterMessage>, config: LoggerConfig) {
-        let storage = match JsonlStorage::new(&config.log_path) {
+        let storage = match Self::create_storage(&config) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to create storage: {}", e);
@@ -202,7 +236,33 @@ impl ObservationLogger {
         tracing::info!("Observation logger shut down");
     }
 
-    fn flush_buffer(storage: &JsonlStorage, buffer: &mut Vec<ObservationEvent>) {
+    fn create_storage(config: &LoggerConfig) -> std::io::Result<Storage> {
+        match config.storage_backend.to_lowercase().as_str() {
+            "local" | "jsonl" => JsonlStorage::new(&config.log_path).map(Storage::Jsonl),
+            "sqlite" => {
+                #[cfg(feature = "sqlite")]
+                {
+                    return SqliteStorage::new(&config.log_path).map(Storage::Sqlite);
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    tracing::warn!(
+                        "SQLite backend requested but sqlite feature is disabled; falling back to JSONL"
+                    );
+                    JsonlStorage::new(&config.log_path).map(Storage::Jsonl)
+                }
+            }
+            other => {
+                tracing::warn!(
+                    backend = %other,
+                    "Unknown observe storage backend; falling back to JSONL"
+                );
+                JsonlStorage::new(&config.log_path).map(Storage::Jsonl)
+            }
+        }
+    }
+
+    fn flush_buffer(storage: &Storage, buffer: &mut Vec<ObservationEvent>) {
         for event in buffer.drain(..) {
             if let Err(e) = storage.write(&event) {
                 tracing::error!("Failed to write event: {}", e);
@@ -226,12 +286,24 @@ pub struct SyncLogger {
 #[allow(dead_code)]
 impl SyncLogger {
     /// Create a new sync logger
-    pub fn new(path: impl AsRef<Path>, pii_detection: bool, tamper_proof: bool) -> std::io::Result<Self> {
+    pub fn new(
+        path: impl AsRef<Path>,
+        pii_detection: bool,
+        tamper_proof: bool,
+    ) -> std::io::Result<Self> {
         Ok(Self {
             storage: JsonlStorage::new(path)?,
-            detector: if pii_detection { Some(PiiDetector::new()) } else { None },
+            detector: if pii_detection {
+                Some(PiiDetector::new())
+            } else {
+                None
+            },
             redactor: None,
-            log: if tamper_proof { Some(TransparencyLog::new()) } else { None },
+            log: if tamper_proof {
+                Some(TransparencyLog::new())
+            } else {
+                None
+            },
         })
     }
 
@@ -280,6 +352,8 @@ impl SyncLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "sqlite")]
+    use crate::storage::sqlite::SqliteStorage;
     use soth_core::types::observation::{Direction, EventType};
     use tempfile::tempdir;
 
@@ -295,7 +369,12 @@ mod tests {
 
         let logger = ObservationLogger::new(config).await.unwrap();
 
-        let event = ObservationEvent::new("session-1", Direction::In, EventType::Request, "test content");
+        let event = ObservationEvent::new(
+            "session-1",
+            Direction::In,
+            EventType::Request,
+            "test content",
+        );
         assert!(logger.write(event).await);
 
         logger.writer.flush().await;
@@ -306,12 +385,43 @@ mod tests {
         assert!(content.contains("session-1"));
     }
 
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_async_writer_sqlite_backend() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let config = LoggerConfig {
+            log_path: db_path.clone(),
+            storage_backend: "sqlite".to_string(),
+            pii_detection: false,
+            tamper_proof: false,
+            ..Default::default()
+        };
+
+        let logger = ObservationLogger::new(config).await.unwrap();
+        let event = ObservationEvent::new("session-sqlite", Direction::In, EventType::Request, "x");
+        assert!(logger.write(event).await);
+
+        logger.writer.flush().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let storage = SqliteStorage::new(&db_path).unwrap();
+        let events = storage.read_all().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, "session-sqlite");
+    }
+
     #[test]
     fn test_sync_logger() {
         let dir = tempdir().unwrap();
         let mut logger = SyncLogger::new(dir.path().join("sync.jsonl"), true, false).unwrap();
 
-        let event = ObservationEvent::new("session-1", Direction::In, EventType::Request, "test@example.com");
+        let event = ObservationEvent::new(
+            "session-1",
+            Direction::In,
+            EventType::Request,
+            "test@example.com",
+        );
         logger.write(event).unwrap();
         logger.flush().unwrap();
 
@@ -326,7 +436,12 @@ mod tests {
             .unwrap()
             .with_redaction();
 
-        let event = ObservationEvent::new("session-1", Direction::In, EventType::Request, "SSN: 123-45-6789");
+        let event = ObservationEvent::new(
+            "session-1",
+            Direction::In,
+            EventType::Request,
+            "SSN: 123-45-6789",
+        );
         logger.write(event).unwrap();
         logger.flush().unwrap();
 

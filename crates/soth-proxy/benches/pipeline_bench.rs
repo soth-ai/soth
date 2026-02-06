@@ -106,8 +106,23 @@ fn generate_pii_content(size: usize) -> String {
 /// Generate clean text content without PII
 fn generate_clean_content(size: usize) -> String {
     let words = [
-        "lorem", "ipsum", "dolor", "sit", "amet", "consectetur", "adipiscing", "elit", "sed", "do",
-        "eiusmod", "tempor", "incididunt", "labore", "dolore", "magna", "aliqua",
+        "lorem",
+        "ipsum",
+        "dolor",
+        "sit",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
+        "sed",
+        "do",
+        "eiusmod",
+        "tempor",
+        "incididunt",
+        "labore",
+        "dolore",
+        "magna",
+        "aliqua",
     ];
 
     let mut content = String::with_capacity(size);
@@ -430,19 +445,27 @@ fn bench_pii_detection(c: &mut Criterion) {
 
         // Clean content (no PII)
         let clean_content = generate_clean_content(size);
-        group.bench_with_input(BenchmarkId::new("clean", size), &clean_content, |b, content| {
-            b.iter(|| {
-                let _ = black_box(detector.detect(content));
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("clean", size),
+            &clean_content,
+            |b, content| {
+                b.iter(|| {
+                    let _ = black_box(detector.detect(content));
+                })
+            },
+        );
 
         // Content with PII
         let pii_content = generate_pii_content(size);
-        group.bench_with_input(BenchmarkId::new("with_pii", size), &pii_content, |b, content| {
-            b.iter(|| {
-                let _ = black_box(detector.detect(content));
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("with_pii", size),
+            &pii_content,
+            |b, content| {
+                b.iter(|| {
+                    let _ = black_box(detector.detect(content));
+                })
+            },
+        );
     }
 
     group.finish();

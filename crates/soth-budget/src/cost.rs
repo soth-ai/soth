@@ -72,10 +72,7 @@ impl CostCalculator {
         );
 
         // OpenAI models
-        pricing.insert(
-            "gpt-4o".to_string(),
-            ModelPricing::new("gpt-4o", 5.0, 20.0),
-        );
+        pricing.insert("gpt-4o".to_string(), ModelPricing::new("gpt-4o", 5.0, 20.0));
         pricing.insert(
             "gpt-4o-mini".to_string(),
             ModelPricing::new("gpt-4o-mini", 0.15, 0.60),
@@ -84,10 +81,7 @@ impl CostCalculator {
             "gpt-4-turbo".to_string(),
             ModelPricing::new("gpt-4-turbo", 10.0, 30.0),
         );
-        pricing.insert(
-            "gpt-4".to_string(),
-            ModelPricing::new("gpt-4", 30.0, 60.0),
-        );
+        pricing.insert("gpt-4".to_string(), ModelPricing::new("gpt-4", 30.0, 60.0));
         pricing.insert(
             "gpt-3.5-turbo".to_string(),
             ModelPricing::new("gpt-3.5-turbo", 0.50, 1.50),
@@ -103,7 +97,12 @@ impl CostCalculator {
     }
 
     /// Add or update pricing for a model
-    pub fn set_pricing(&mut self, model: impl Into<String>, input_per_million: f64, output_per_million: f64) {
+    pub fn set_pricing(
+        &mut self,
+        model: impl Into<String>,
+        input_per_million: f64,
+        output_per_million: f64,
+    ) {
         let model = model.into();
         self.pricing.insert(
             model.clone(),

@@ -1,7 +1,7 @@
 //! Budget tracking layer
 
 use super::middleware::{error_response, get_request_id, Layer, LayerResult, RequestContext};
-use crate::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, methods};
+use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
 use soth_budget::{BudgetTracker, CostCalculator, TokenCounter};
 use soth_dashboard::{BudgetAlert, DashboardState};
 use std::future::Future;
@@ -178,7 +178,10 @@ impl Layer for BudgetLayer {
                         }
 
                         let id = get_request_id(&message);
-                        return error_response(id, JsonRpcError::budget_exceeded("Budget limit reached"));
+                        return error_response(
+                            id,
+                            JsonRpcError::budget_exceeded("Budget limit reached"),
+                        );
                     }
 
                     // Count input tokens
@@ -192,10 +195,8 @@ impl Layer for BudgetLayer {
 
                     // Store model for later
                     let model = self.extract_model(ctx, req);
-                    ctx.metadata.insert(
-                        "budget_model".to_string(),
-                        serde_json::json!(model),
-                    );
+                    ctx.metadata
+                        .insert("budget_model".to_string(), serde_json::json!(model));
 
                     LayerResult::Continue(message)
                 }
@@ -205,26 +206,29 @@ impl Layer for BudgetLayer {
                     let output_tokens = TokenCounter::count_mcp_context_tokens(&content);
 
                     // Get input tokens and model from context
-                    let input_tokens = ctx.metadata
+                    let input_tokens = ctx
+                        .metadata
                         .get("budget_input_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
 
-                    let model = ctx.metadata
+                    let model = ctx
+                        .metadata
                         .get("budget_model")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| self.config.default_model.clone());
 
                     // Record the spend
-                    self.record_spend(ctx, &model, input_tokens, output_tokens).await;
+                    self.record_spend(ctx, &model, input_tokens, output_tokens)
+                        .await;
 
                     // Calculate cost for metadata
-                    let cost = self.calculator.calculate_cost_tokens(&model, input_tokens, output_tokens);
-                    ctx.metadata.insert(
-                        "budget_cost".to_string(),
-                        serde_json::json!(cost),
-                    );
+                    let cost =
+                        self.calculator
+                            .calculate_cost_tokens(&model, input_tokens, output_tokens);
+                    ctx.metadata
+                        .insert("budget_cost".to_string(), serde_json::json!(cost));
 
                     // Record to dashboard
                     if let Some(ref dash) = self.dashboard {

@@ -47,7 +47,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::raw("Cost           "),
-            Span::styled(format_currency(metrics.total_cost_usd), theme.success_style()),
+            Span::styled(
+                format_currency(metrics.total_cost_usd),
+                theme.success_style(),
+            ),
         ]),
         Line::from(vec![
             Span::raw("Daily Limit    "),
@@ -88,10 +91,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // Model breakdown
     if !metrics.cost_by_model.is_empty() && chunks[2].height > 1 {
-        let mut lines = vec![Line::from(Span::styled(
-            "By Model:",
-            theme.muted_style(),
-        ))];
+        let mut lines = vec![Line::from(Span::styled("By Model:", theme.muted_style()))];
 
         let mut models: Vec<_> = metrics.cost_by_model.iter().collect();
         models.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));

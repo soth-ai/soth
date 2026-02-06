@@ -2,8 +2,8 @@
 //!
 //! Defines types for token counting, cost calculation, and budget tracking.
 
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -76,10 +76,14 @@ impl ModelPricingEntry {
         cost += (output_tokens as f64 / 1_000_000.0) * self.output_cost_per_million;
 
         // Cache costs (Anthropic prompt caching)
-        if let (Some(cache_read), Some(rate)) = (cache_read_tokens, self.cache_read_cost_per_million) {
+        if let (Some(cache_read), Some(rate)) =
+            (cache_read_tokens, self.cache_read_cost_per_million)
+        {
             cost += (cache_read as f64 / 1_000_000.0) * rate;
         }
-        if let (Some(cache_write), Some(rate)) = (cache_write_tokens, self.cache_write_cost_per_million) {
+        if let (Some(cache_write), Some(rate)) =
+            (cache_write_tokens, self.cache_write_cost_per_million)
+        {
             cost += (cache_write as f64 / 1_000_000.0) * rate;
         }
 
@@ -473,7 +477,10 @@ impl BudgetState {
 
     /// Get percentage of limit used
     pub fn usage_percent(&self) -> Option<f64> {
-        let limit = self.daily_limit.or(self.weekly_limit).or(self.monthly_limit)?;
+        let limit = self
+            .daily_limit
+            .or(self.weekly_limit)
+            .or(self.monthly_limit)?;
         if limit <= 0.0 {
             return None;
         }

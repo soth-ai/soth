@@ -8,9 +8,21 @@ Real-time metrics dashboard for the SOTH edge proxy.
 - **TanStack Query** - Data fetching with auto-refresh
 - **Tailwind CSS v4** - Styling
 - **Radix UI** - Accessible primitives
+- **shadcn/ui (configured)** - Canonical UI primitive workflow
 - **Phosphor Icons** - Icon set
 
 ## Development
+
+### UI Primitive Workflow (shadcn)
+
+This dashboard is now configured for shadcn (`components.json`).
+
+- Add a new shadcn component:
+  ```bash
+  npm run ui:add -- button
+  ```
+- Generated components should live in `src/components/ui`.
+- Keep performance-critical stream/panel views custom; use shadcn primitives for shared controls/surfaces.
 
 ### With MCP Proxy
 

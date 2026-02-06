@@ -20,6 +20,8 @@ const MAX_DAILY_TREND_POINTS: usize = 30;
 #[derive(Clone)]
 pub struct DashboardState {
     inner: Arc<RwLock<Inner>>,
+    /// Dedicated shard for high-frequency proxy metrics to reduce lock contention
+    proxy: Arc<RwLock<ProxyMetrics>>,
 }
 
 struct Inner {
@@ -28,7 +30,6 @@ struct Inner {
     policy: PolicyMetrics,
     observe: ObserveMetrics,
     budget: BudgetMetrics,
-    proxy: ProxyMetrics,
     advanced_budget: AdvancedBudgetMetrics,
     /// Set of unique DIDs seen
     unique_dids: HashSet<String>,
@@ -61,6 +62,7 @@ pub struct PolicyMetrics {
     pub denied: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub active_version: Option<String>,
     pub recent_denials: VecDeque<DenialEntry>,
 }
 
@@ -130,6 +132,7 @@ pub struct ProviderTokens {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestEntry {
+    pub request_id: Option<String>,
     pub timestamp: String,
     pub provider: String,
     pub host: String,
@@ -259,11 +262,11 @@ impl DashboardState {
                 policy: PolicyMetrics::default(),
                 observe: ObserveMetrics::default(),
                 budget: BudgetMetrics::default(),
-                proxy: ProxyMetrics::default(),
                 advanced_budget: AdvancedBudgetMetrics::default(),
                 unique_dids: HashSet::new(),
                 current_date: Utc::now().format("%Y-%m-%d").to_string(),
             })),
+            proxy: Arc::new(RwLock::new(ProxyMetrics::default())),
         }
     }
 
@@ -338,6 +341,12 @@ impl DashboardState {
         }
     }
 
+    /// Set the active policy version reported by runtime evaluation paths.
+    pub fn set_policy_active_version(&self, version: impl Into<String>) {
+        let mut inner = self.inner.write();
+        inner.policy.active_version = Some(version.into());
+    }
+
     /// Record a request
     pub fn record_request(&self) {
         let mut inner = self.inner.write();
@@ -395,22 +404,29 @@ impl DashboardState {
         inner.budget.alerts.clear();
     }
 
-    // --- Proxy methods (called by ForwardProxyTransport) ---
+    // --- Proxy methods (called by proxy transport runtime) ---
 
     /// Record a proxy request starting
-    pub fn record_proxy_request(&self, provider: &str, host: &str, method: &str, path: &str) {
-        let mut inner = self.inner.write();
-        inner.proxy.total_requests += 1;
-        inner.proxy.active_connections += 1;
+    pub fn record_proxy_request(
+        &self,
+        request_id: Option<&str>,
+        provider: &str,
+        host: &str,
+        method: &str,
+        path: &str,
+    ) {
+        let mut proxy = self.proxy.write();
+        proxy.total_requests += 1;
+        proxy.active_connections += 1;
 
-        *inner
-            .proxy
+        *proxy
             .requests_by_provider
             .entry(provider.to_string())
             .or_insert(0) += 1;
 
         // Add to recent requests
         let entry = ProxyRequestEntry {
+            request_id: request_id.map(|id| id.to_string()),
             timestamp: Utc::now().to_rfc3339(),
             provider: provider.to_string(),
             host: host.to_string(),
@@ -424,15 +440,16 @@ impl DashboardState {
             model: None,
         };
 
-        inner.proxy.recent_requests.push_front(entry);
-        while inner.proxy.recent_requests.len() > MAX_RECENT_PROXY_REQUESTS {
-            inner.proxy.recent_requests.pop_back();
+        proxy.recent_requests.push_front(entry);
+        while proxy.recent_requests.len() > MAX_RECENT_PROXY_REQUESTS {
+            proxy.recent_requests.pop_back();
         }
     }
 
     /// Record a proxy response
     pub fn record_proxy_response(
         &self,
+        request_id: Option<&str>,
         provider: &str,
         status_code: u16,
         latency_ms: u64,
@@ -441,61 +458,76 @@ impl DashboardState {
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     ) {
-        let mut inner = self.inner.write();
-        inner.proxy.total_responses += 1;
+        let mut proxy = self.proxy.write();
+        proxy.total_responses += 1;
 
-        if inner.proxy.active_connections > 0 {
-            inner.proxy.active_connections -= 1;
+        if proxy.active_connections > 0 {
+            proxy.active_connections -= 1;
         }
 
         // Update tokens by provider
         if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
-            let tokens = inner
-                .proxy
-                .tokens_by_provider
-                .entry(provider.to_string())
-                .or_default();
+            let tokens = proxy.tokens_by_provider.entry(provider.to_string()).or_default();
             tokens.input_tokens += input;
             tokens.output_tokens += output;
-            inner.proxy.total_tokens += input + output;
+            proxy.total_tokens += input + output;
         }
 
         // Update cost by provider
         if let Some(cost) = cost_usd {
-            *inner
-                .proxy
+            *proxy
                 .cost_by_provider
                 .entry(provider.to_string())
                 .or_insert(0.0) += cost;
-            inner.proxy.total_cost_usd += cost;
+            proxy.total_cost_usd += cost;
         }
 
-        // Update most recent request with response data
-        if let Some(entry) = inner.proxy.recent_requests.front_mut() {
-            if entry.provider == provider && entry.status_code.is_none() {
-                entry.status_code = Some(status_code);
-                entry.latency_ms = Some(latency_ms);
-                entry.input_tokens = input_tokens;
-                entry.output_tokens = output_tokens;
-                entry.cost_usd = cost_usd;
-                entry.model = model.map(|s| s.to_string());
-            }
+        // Update matching pending request by request_id first, then provider fallback.
+        let match_index = request_id
+            .and_then(|request_id| {
+                proxy.recent_requests.iter().position(|entry| {
+                    entry.request_id.as_deref() == Some(request_id) && entry.status_code.is_none()
+                })
+            })
+            .or_else(|| {
+                proxy
+                    .recent_requests
+                    .iter()
+                    .position(|entry| entry.provider == provider && entry.status_code.is_none())
+            });
+
+        if let Some(index) = match_index {
+            let entry = proxy
+                .recent_requests
+                .get_mut(index)
+                .expect("index returned by position must exist");
+            entry.status_code = Some(status_code);
+            entry.latency_ms = Some(latency_ms);
+            entry.input_tokens = input_tokens;
+            entry.output_tokens = output_tokens;
+            entry.cost_usd = cost_usd;
+            entry.model = model.map(|s| s.to_string());
         }
     }
 
     /// Update proxy status
-    pub fn set_proxy_status(&self, enabled: bool, listen_address: Option<&str>, ca_installed: bool) {
-        let mut inner = self.inner.write();
-        inner.proxy.status.enabled = enabled;
-        inner.proxy.status.listen_address = listen_address.map(|s| s.to_string());
-        inner.proxy.status.ca_installed = ca_installed;
+    pub fn set_proxy_status(
+        &self,
+        enabled: bool,
+        listen_address: Option<&str>,
+        ca_installed: bool,
+    ) {
+        let mut proxy = self.proxy.write();
+        proxy.status.enabled = enabled;
+        proxy.status.listen_address = listen_address.map(|s| s.to_string());
+        proxy.status.ca_installed = ca_installed;
     }
 
     /// Decrement active connections (for error cases)
     pub fn decrement_proxy_connections(&self) {
-        let mut inner = self.inner.write();
-        if inner.proxy.active_connections > 0 {
-            inner.proxy.active_connections -= 1;
+        let mut proxy = self.proxy.write();
+        if proxy.active_connections > 0 {
+            proxy.active_connections -= 1;
         }
     }
 
@@ -523,7 +555,7 @@ impl DashboardState {
 
     /// Get proxy metrics
     pub fn proxy(&self) -> ProxyMetrics {
-        self.inner.read().proxy.clone()
+        self.proxy.read().clone()
     }
 
     /// Get advanced budget metrics
@@ -548,15 +580,25 @@ impl DashboardState {
         // Update basic metrics
         inner.budget.total_tokens += input_tokens + output_tokens;
         inner.budget.total_cost_usd += cost;
-        *inner.budget.cost_by_model.entry(model.to_string()).or_insert(0.0) += cost;
+        *inner
+            .budget
+            .cost_by_model
+            .entry(model.to_string())
+            .or_insert(0.0) += cost;
 
         // Update advanced metrics
         inner.advanced_budget.total_tokens += input_tokens + output_tokens;
         inner.advanced_budget.total_cost_usd += cost;
-        *inner.advanced_budget.cost_by_model.entry(model.to_string()).or_insert(0.0) += cost;
+        *inner
+            .advanced_budget
+            .cost_by_model
+            .entry(model.to_string())
+            .or_insert(0.0) += cost;
 
         // Update provider breakdown
-        let provider_breakdown = inner.advanced_budget.cost_by_provider
+        let provider_breakdown = inner
+            .advanced_budget
+            .cost_by_provider
             .entry(provider.to_string())
             .or_default();
         provider_breakdown.total_cost += cost;
@@ -566,7 +608,8 @@ impl DashboardState {
         provider_breakdown.request_count += 1;
 
         // Update model breakdown within provider
-        let model_entry = provider_breakdown.model_breakdown
+        let model_entry = provider_breakdown
+            .model_breakdown
             .entry(model.to_string())
             .or_default();
         model_entry.model_name = model.to_string();
@@ -577,7 +620,9 @@ impl DashboardState {
         model_entry.avg_cost_per_request = model_entry.cost / model_entry.request_count as f64;
 
         // Update request type breakdown
-        *inner.advanced_budget.cost_by_request_type
+        *inner
+            .advanced_budget
+            .cost_by_request_type
             .entry(request_type.to_string())
             .or_insert(0.0) += cost;
 
@@ -593,18 +638,24 @@ impl DashboardState {
                 today_point.cost += cost;
                 today_point.tokens += input_tokens + output_tokens;
                 today_point.requests += 1;
-                *today_point.by_provider.entry(provider.to_string()).or_insert(0.0) += cost;
+                *today_point
+                    .by_provider
+                    .entry(provider.to_string())
+                    .or_insert(0.0) += cost;
             } else {
                 // New day, create new point
                 let mut by_provider = HashMap::new();
                 by_provider.insert(provider.to_string(), cost);
-                inner.advanced_budget.daily_trend.push_front(DailyTrendPoint {
-                    date: today,
-                    cost,
-                    tokens: input_tokens + output_tokens,
-                    requests: 1,
-                    by_provider,
-                });
+                inner
+                    .advanced_budget
+                    .daily_trend
+                    .push_front(DailyTrendPoint {
+                        date: today,
+                        cost,
+                        tokens: input_tokens + output_tokens,
+                        requests: 1,
+                        by_provider,
+                    });
 
                 // Trim to max size
                 while inner.advanced_budget.daily_trend.len() > MAX_DAILY_TREND_POINTS {
@@ -615,13 +666,16 @@ impl DashboardState {
             // First data point
             let mut by_provider = HashMap::new();
             by_provider.insert(provider.to_string(), cost);
-            inner.advanced_budget.daily_trend.push_front(DailyTrendPoint {
-                date: today,
-                cost,
-                tokens: input_tokens + output_tokens,
-                requests: 1,
-                by_provider,
-            });
+            inner
+                .advanced_budget
+                .daily_trend
+                .push_front(DailyTrendPoint {
+                    date: today,
+                    cost,
+                    tokens: input_tokens + output_tokens,
+                    requests: 1,
+                    by_provider,
+                });
         }
     }
 
@@ -630,7 +684,9 @@ impl DashboardState {
         let mut inner = self.inner.write();
 
         // Find existing tool entry or create new one
-        if let Some(entry) = inner.advanced_budget.cost_by_tool
+        if let Some(entry) = inner
+            .advanced_budget
+            .cost_by_tool
             .iter_mut()
             .find(|e| e.tool_name == tool_name && e.server_name == server_name)
         {
@@ -649,7 +705,9 @@ impl DashboardState {
 
         // Sort by total cost descending
         inner.advanced_budget.cost_by_tool.sort_by(|a, b| {
-            b.total_cost.partial_cmp(&a.total_cost).unwrap_or(std::cmp::Ordering::Equal)
+            b.total_cost
+                .partial_cmp(&a.total_cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Keep top 50 tools
@@ -659,7 +717,9 @@ impl DashboardState {
     /// Record a cost tag
     pub fn record_cost_tag(&self, tag_key: &str, tag_value: &str, cost: f64) {
         let mut inner = self.inner.write();
-        let tag_map = inner.advanced_budget.cost_by_tag
+        let tag_map = inner
+            .advanced_budget
+            .cost_by_tag
             .entry(tag_key.to_string())
             .or_default();
         *tag_map.entry(tag_value.to_string()).or_insert(0.0) += cost;
@@ -763,6 +823,14 @@ mod tests {
     }
 
     #[test]
+    fn test_policy_active_version() {
+        let state = DashboardState::new();
+        state.set_policy_active_version("v9");
+        let metrics = state.policy();
+        assert_eq!(metrics.active_version.as_deref(), Some("v9"));
+    }
+
+    #[test]
     fn test_observe_metrics() {
         let state = DashboardState::new();
 
@@ -814,7 +882,13 @@ mod tests {
         let state = DashboardState::new();
 
         // Record a request
-        state.record_proxy_request("openai", "api.openai.com", "POST", "/v1/chat/completions");
+        state.record_proxy_request(
+            Some("req-openai-1"),
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+        );
 
         let metrics = state.proxy();
         assert_eq!(metrics.total_requests, 1);
@@ -823,7 +897,16 @@ mod tests {
         assert_eq!(metrics.recent_requests.len(), 1);
 
         // Record response with usage
-        state.record_proxy_response("openai", 200, 150, Some("gpt-4o"), Some(100), Some(50), Some(0.015));
+        state.record_proxy_response(
+            Some("req-openai-1"),
+            "openai",
+            200,
+            150,
+            Some("gpt-4o"),
+            Some(100),
+            Some(50),
+            Some(0.015),
+        );
 
         let metrics = state.proxy();
         assert_eq!(metrics.total_responses, 1);
@@ -844,7 +927,57 @@ mod tests {
 
         let metrics = state.proxy();
         assert!(metrics.status.enabled);
-        assert_eq!(metrics.status.listen_address, Some("127.0.0.1:8080".to_string()));
+        assert_eq!(
+            metrics.status.listen_address,
+            Some("127.0.0.1:8080".to_string())
+        );
         assert!(metrics.status.ca_installed);
+    }
+
+    #[test]
+    fn test_proxy_response_updates_matching_pending_provider() {
+        let state = DashboardState::new();
+
+        state.record_proxy_request(
+            Some("req-openai-2"),
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+        );
+        state.record_proxy_request(
+            Some("req-anthropic-1"),
+            "anthropic",
+            "api.anthropic.com",
+            "POST",
+            "/v1/messages",
+        );
+
+        // Response arrives for an older request (openai), not the front entry.
+        state.record_proxy_response(
+            Some("req-openai-2"),
+            "openai",
+            200,
+            123,
+            Some("gpt-4o"),
+            Some(10),
+            Some(20),
+            Some(0.01),
+        );
+
+        let metrics = state.proxy();
+        let openai_entry = metrics
+            .recent_requests
+            .iter()
+            .find(|entry| entry.provider == "openai")
+            .expect("openai request entry should exist");
+        let anthropic_entry = metrics
+            .recent_requests
+            .iter()
+            .find(|entry| entry.provider == "anthropic")
+            .expect("anthropic request entry should exist");
+
+        assert_eq!(openai_entry.status_code, Some(200));
+        assert_eq!(anthropic_entry.status_code, None);
     }
 }

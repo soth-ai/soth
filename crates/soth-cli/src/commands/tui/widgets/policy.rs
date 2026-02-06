@@ -62,7 +62,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // Add recent denials if space allows
     if inner.height > 6 && !metrics.recent_denials.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Recent Denials:", theme.muted_style())));
+        lines.push(Line::from(Span::styled(
+            "Recent Denials:",
+            theme.muted_style(),
+        )));
 
         let max_denials = (inner.height as usize).saturating_sub(7).min(5);
         for entry in metrics.recent_denials.iter().take(max_denials) {

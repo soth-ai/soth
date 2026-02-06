@@ -18,6 +18,7 @@ parking_lot = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 dirs = "5.0"
+rusqlite = { workspace = true }
 
 # File watching
 notify = { workspace = true }

@@ -41,7 +41,11 @@ pub struct SignatureBlock {
 /// Creates a canonical representation of the document (excluding any existing
 /// signature fields), signs it with the provided key pair, and returns a
 /// SignedDocument with the signature attached.
-pub fn sign_json(document: &serde_json::Value, keypair: &KeyPair, did: &str) -> Result<SignedDocument> {
+pub fn sign_json(
+    document: &serde_json::Value,
+    keypair: &KeyPair,
+    did: &str,
+) -> Result<SignedDocument> {
     // Normalize the document (remove existing signature fields)
     let normalized = normalize_for_signing(document, true)?;
 

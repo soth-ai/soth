@@ -103,9 +103,17 @@ fn display_connections(metrics: &ProxyMetrics) {
 
     // Color active connections based on count
     let active_display = if metrics.active_connections > 0 {
-        format!("{} {}", style::CIRCLE_FILLED.cyan(), metrics.active_connections)
+        format!(
+            "{} {}",
+            style::CIRCLE_FILLED.cyan(),
+            metrics.active_connections
+        )
     } else {
-        format!("{} {}", style::CIRCLE_EMPTY.dimmed(), metrics.active_connections)
+        format!(
+            "{} {}",
+            style::CIRCLE_EMPTY.dimmed(),
+            metrics.active_connections
+        )
     };
 
     summary_table.add_row(vec![
@@ -126,7 +134,11 @@ fn display_connections(metrics: &ProxyMetrics) {
     ]);
     summary_table.add_row(vec![
         Cell::new("Total Cost"),
-        Cell::new(format!("${:.4}", metrics.total_cost_usd).green().to_string()),
+        Cell::new(
+            format!("${:.4}", metrics.total_cost_usd)
+                .green()
+                .to_string(),
+        ),
     ]);
     println!("{summary_table}");
 

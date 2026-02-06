@@ -42,13 +42,8 @@ pub async fn enable(port: Option<u16>) -> Result<()> {
         configure_windows_proxy(true, proxy_port).await?;
     }
 
-    println!(
-        "\n{} System proxy enabled",
-        style::success_prefix()
-    );
-    println!(
-        "   All HTTPS traffic will now route through SOTH proxy"
-    );
+    println!("\n{} System proxy enabled", style::success_prefix());
+    println!("   All HTTPS traffic will now route through SOTH proxy");
     println!(
         "   {} AI traffic: MITM intercepted (inspection enabled)",
         style::INFO
@@ -97,10 +92,7 @@ pub async fn disable() -> Result<()> {
         configure_windows_proxy(false, 0).await?;
     }
 
-    println!(
-        "\n{} System proxy disabled",
-        style::success_prefix()
-    );
+    println!("\n{} System proxy disabled", style::success_prefix());
     println!("   Direct connections restored");
 
     Ok(())
@@ -153,7 +145,12 @@ async fn configure_macos_proxy(enable: bool, port: u16) -> Result<()> {
             run_networksetup(&["-setwebproxystate", service, "on"])?;
 
             // Enable secure web proxy (HTTPS)
-            run_networksetup(&["-setsecurewebproxy", service, "127.0.0.1", &port.to_string()])?;
+            run_networksetup(&[
+                "-setsecurewebproxy",
+                service,
+                "127.0.0.1",
+                &port.to_string(),
+            ])?;
             run_networksetup(&["-setsecurewebproxystate", service, "on"])?;
 
             // Set proxy bypass domains (critical to avoid localhost loops)
@@ -272,29 +269,13 @@ async fn configure_linux_proxy(enable: bool, port: u16) -> Result<()> {
 
     // Fall back to environment variable instructions
     if enable {
-        println!(
-            "   {} Add to your shell profile:",
-            style::INFO
-        );
-        println!(
-            "      export https_proxy=\"http://127.0.0.1:{}\"",
-            port
-        );
-        println!(
-            "      export HTTPS_PROXY=\"http://127.0.0.1:{}\"",
-            port
-        );
-        println!(
-            "      export no_proxy=\"localhost,127.0.0.1,::1,*.local\""
-        );
-        println!(
-            "      export NO_PROXY=\"localhost,127.0.0.1,::1,*.local\""
-        );
+        println!("   {} Add to your shell profile:", style::INFO);
+        println!("      export https_proxy=\"http://127.0.0.1:{}\"", port);
+        println!("      export HTTPS_PROXY=\"http://127.0.0.1:{}\"", port);
+        println!("      export no_proxy=\"localhost,127.0.0.1,::1,*.local\"");
+        println!("      export NO_PROXY=\"localhost,127.0.0.1,::1,*.local\"");
     } else {
-        println!(
-            "   {} Remove from your shell profile:",
-            style::INFO
-        );
+        println!("   {} Remove from your shell profile:", style::INFO);
         println!("      unset https_proxy HTTPS_PROXY no_proxy NO_PROXY");
     }
 
@@ -308,12 +289,27 @@ fn configure_gnome_proxy(enable: bool, port: u16) -> Result<()> {
         run_gsettings(&["set", "org.gnome.system.proxy", "mode", "'manual'"])?;
         // Set HTTPS proxy
         run_gsettings(&["set", "org.gnome.system.proxy.https", "host", "'127.0.0.1'"])?;
-        run_gsettings(&["set", "org.gnome.system.proxy.https", "port", &port.to_string()])?;
+        run_gsettings(&[
+            "set",
+            "org.gnome.system.proxy.https",
+            "port",
+            &port.to_string(),
+        ])?;
         // Set HTTP proxy
         run_gsettings(&["set", "org.gnome.system.proxy.http", "host", "'127.0.0.1'"])?;
-        run_gsettings(&["set", "org.gnome.system.proxy.http", "port", &port.to_string()])?;
+        run_gsettings(&[
+            "set",
+            "org.gnome.system.proxy.http",
+            "port",
+            &port.to_string(),
+        ])?;
         // Set ignore hosts (bypass proxy for local addresses)
-        run_gsettings(&["set", "org.gnome.system.proxy", "ignore-hosts", "\"['localhost', '127.0.0.0/8', '::1', '*.local']\""])?;
+        run_gsettings(&[
+            "set",
+            "org.gnome.system.proxy",
+            "ignore-hosts",
+            "\"['localhost', '127.0.0.0/8', '::1', '*.local']\"",
+        ])?;
         println!("   {} Configured GNOME proxy settings", style::CHECK);
     } else {
         // Set proxy mode to none

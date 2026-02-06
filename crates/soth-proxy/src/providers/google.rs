@@ -94,7 +94,9 @@ impl AiProvider for GoogleProvider {
                 usage.get("promptTokenCount").and_then(|v| v.as_u64()),
                 usage.get("candidatesTokenCount").and_then(|v| v.as_u64()),
             ) {
-                let cached = usage.get("cachedContentTokenCount").and_then(|v| v.as_u64());
+                let cached = usage
+                    .get("cachedContentTokenCount")
+                    .and_then(|v| v.as_u64());
                 return Some(SseEvent::Usage(ProviderUsage {
                     input_tokens: input,
                     output_tokens: output,
@@ -186,10 +188,7 @@ mod tests {
             Some("gemini-1.5-flash".to_string())
         );
 
-        let request = HttpRequest::new(
-            "POST",
-            "/v1/models/gemini-pro:streamGenerateContent",
-        );
+        let request = HttpRequest::new("POST", "/v1/models/gemini-pro:streamGenerateContent");
         assert_eq!(
             provider.extract_model(&request),
             Some("gemini-pro".to_string())

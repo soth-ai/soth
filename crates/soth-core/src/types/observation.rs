@@ -2,8 +2,8 @@
 //!
 //! Defines types for logging, auditing, and observability.
 
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Direction of message flow
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

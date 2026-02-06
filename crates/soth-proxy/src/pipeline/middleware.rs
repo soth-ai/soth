@@ -1,7 +1,7 @@
 //! Core pipeline middleware types and builder
 
 use crate::error::ProxyError;
-use crate::protocol::{JsonRpcMessage, JsonRpcResponse, JsonRpcError, RequestId};
+use crate::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

@@ -4,8 +4,8 @@ use crate::{Result, SothError};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use soth_core::types::budget::{
-    BudgetScope, BudgetState, DailyTrendPoint, SpendRecord,
-    SpendRequestType, TaggedSpendRecord, TokenUsage, ToolCostEntry,
+    BudgetScope, BudgetState, DailyTrendPoint, SpendRecord, SpendRequestType, TaggedSpendRecord,
+    TokenUsage, ToolCostEntry,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -45,7 +45,10 @@ impl BudgetStorage {
 
     /// Initialize database schema
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         conn.execute_batch(
             r#"
@@ -136,14 +139,18 @@ impl BudgetStorage {
             CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_cost_aggregates(date);
             CREATE INDEX IF NOT EXISTS idx_daily_provider ON daily_cost_aggregates(provider);
             "#,
-        ).map_err(db_err)?;
+        )
+        .map_err(db_err)?;
 
         Ok(())
     }
 
     /// Save a spend record
     pub fn save_spend_record(&self, record: &SpendRecord) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         conn.execute(
             r#"
@@ -168,7 +175,10 @@ impl BudgetStorage {
 
     /// Get spend records for a session
     pub fn get_session_records(&self, session_id: &str) -> Result<Vec<SpendRecord>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         let mut stmt = conn.prepare(
             r#"
@@ -196,15 +206,20 @@ impl BudgetStorage {
                     cost: row.get(7)?,
                     method: row.get(8)?,
                 })
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
         Ok(records)
     }
 
     /// Get spend records since a timestamp
     pub fn get_records_since(&self, since: DateTime<Utc>) -> Result<Vec<SpendRecord>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         let mut stmt = conn.prepare(
             r#"
@@ -232,28 +247,38 @@ impl BudgetStorage {
                     cost: row.get(7)?,
                     method: row.get(8)?,
                 })
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
         Ok(records)
     }
 
     /// Get total spend since a timestamp
     pub fn get_total_spend_since(&self, since: DateTime<Utc>) -> Result<f64> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
-        let total: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(cost), 0) FROM spend_records WHERE timestamp >= ?1",
-            params![since.to_rfc3339()],
-            |row| row.get(0),
-        ).map_err(db_err)?;
+        let total: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost), 0) FROM spend_records WHERE timestamp >= ?1",
+                params![since.to_rfc3339()],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
 
         Ok(total)
     }
 
     /// Get spend for an agent since a timestamp
     pub fn get_agent_spend_since(&self, agent_id: &str, since: DateTime<Utc>) -> Result<f64> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         let total: f64 = conn.query_row(
             "SELECT COALESCE(SUM(cost), 0) FROM spend_records WHERE agent_id = ?1 AND timestamp >= ?2",
@@ -266,7 +291,10 @@ impl BudgetStorage {
 
     /// Save a budget state
     pub fn save_budget_state(&self, budget: &BudgetState) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         conn.execute(
             r#"
@@ -293,7 +321,10 @@ impl BudgetStorage {
 
     /// Get a budget state by ID
     pub fn get_budget_state(&self, id: &str) -> Result<Option<BudgetState>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         let result = conn
             .query_row(
@@ -338,7 +369,10 @@ impl BudgetStorage {
 
     /// Get all budget states
     pub fn get_all_budget_states(&self) -> Result<Vec<BudgetState>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         let mut stmt = conn.prepare(
             r#"
@@ -374,37 +408,49 @@ impl BudgetStorage {
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
                 })
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
         Ok(budgets)
     }
 
     /// Delete spend records older than a timestamp
     pub fn cleanup_old_records(&self, before: DateTime<Utc>) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
-        let deleted = conn.execute(
-            "DELETE FROM spend_records WHERE timestamp < ?1",
-            params![before.to_rfc3339()],
-        ).map_err(db_err)?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM spend_records WHERE timestamp < ?1",
+                params![before.to_rfc3339()],
+            )
+            .map_err(db_err)?;
 
         Ok(deleted)
     }
 
     /// Get spending summary by model
     pub fn get_spend_by_model(&self, since: DateTime<Utc>) -> Result<Vec<(String, f64, u64)>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
-        let mut stmt = conn.prepare(
-            r#"
+        let mut stmt = conn
+            .prepare(
+                r#"
             SELECT model, SUM(cost) as total_cost, SUM(input_tokens + output_tokens) as total_tokens
             FROM spend_records
             WHERE timestamp >= ?1
             GROUP BY model
             ORDER BY total_cost DESC
             "#,
-        ).map_err(db_err)?;
+            )
+            .map_err(db_err)?;
 
         let results = stmt
             .query_map(params![since.to_rfc3339()], |row| {
@@ -413,15 +459,20 @@ impl BudgetStorage {
                     row.get::<_, f64>(1)?,
                     row.get::<_, i64>(2)? as u64,
                 ))
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
         Ok(results)
     }
 
     /// Get spending summary by agent
     pub fn get_spend_by_agent(&self, since: DateTime<Utc>) -> Result<Vec<(String, f64, u64)>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         let mut stmt = conn.prepare(
             r#"
@@ -440,8 +491,10 @@ impl BudgetStorage {
                     row.get::<_, f64>(1)?,
                     row.get::<_, i64>(2)? as u64,
                 ))
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
         Ok(results)
     }
@@ -452,7 +505,10 @@ impl BudgetStorage {
 
     /// Save a tagged spend record with MCP attribution
     pub fn save_tagged_spend_record(&self, record: &TaggedSpendRecord) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         // Save base spend record
         conn.execute(
@@ -532,11 +588,19 @@ impl BudgetStorage {
     }
 
     /// Get cost breakdown by tag for a time period
-    pub fn get_cost_by_tag(&self, tag_key: &str, since: DateTime<Utc>) -> Result<Vec<(String, f64, u64)>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+    pub fn get_cost_by_tag(
+        &self,
+        tag_key: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(String, f64, u64)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
-        let mut stmt = conn.prepare(
-            r#"
+        let mut stmt = conn
+            .prepare(
+                r#"
             SELECT ct.tag_value, SUM(sr.cost) as total_cost, COUNT(*) as request_count
             FROM spend_records sr
             INNER JOIN cost_tags ct ON sr.id = ct.record_id
@@ -544,7 +608,8 @@ impl BudgetStorage {
             GROUP BY ct.tag_value
             ORDER BY total_cost DESC
             "#,
-        ).map_err(db_err)?;
+            )
+            .map_err(db_err)?;
 
         let results = stmt
             .query_map(params![tag_key, since.to_rfc3339()], |row| {
@@ -553,18 +618,24 @@ impl BudgetStorage {
                     row.get::<_, f64>(1)?,
                     row.get::<_, i64>(2)? as u64,
                 ))
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
         Ok(results)
     }
 
     /// Get cost breakdown by MCP tool
     pub fn get_cost_by_mcp_tool(&self, since: DateTime<Utc>) -> Result<Vec<ToolCostEntry>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
-        let mut stmt = conn.prepare(
-            r#"
+        let mut stmt = conn
+            .prepare(
+                r#"
             SELECT ma.mcp_tool, ma.mcp_server, SUM(sr.cost) as total_cost, COUNT(*) as call_count
             FROM spend_records sr
             INNER JOIN mcp_attribution ma ON sr.id = ma.record_id
@@ -572,7 +643,8 @@ impl BudgetStorage {
             GROUP BY ma.mcp_tool, ma.mcp_server
             ORDER BY total_cost DESC
             "#,
-        ).map_err(db_err)?;
+            )
+            .map_err(db_err)?;
 
         let results = stmt
             .query_map(params![since.to_rfc3339()], |row| {
@@ -589,30 +661,39 @@ impl BudgetStorage {
                         0.0
                     },
                 })
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
         Ok(results)
     }
 
     /// Get cost breakdown by request type (ai_inference vs mcp_inference)
     pub fn get_cost_by_request_type(&self, since: DateTime<Utc>) -> Result<HashMap<String, f64>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
-        let mut stmt = conn.prepare(
-            r#"
+        let mut stmt = conn
+            .prepare(
+                r#"
             SELECT COALESCE(ma.request_type, 'ai_inference') as req_type, SUM(sr.cost) as total_cost
             FROM spend_records sr
             LEFT JOIN mcp_attribution ma ON sr.id = ma.record_id
             WHERE sr.timestamp >= ?1
             GROUP BY req_type
             "#,
-        ).map_err(db_err)?;
+            )
+            .map_err(db_err)?;
 
         let mut results = HashMap::new();
-        let rows = stmt.query_map(params![since.to_rfc3339()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        }).map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![since.to_rfc3339()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(db_err)?;
 
         for row in rows {
             let (req_type, cost) = row.map_err(db_err)?;
@@ -623,8 +704,15 @@ impl BudgetStorage {
     }
 
     /// Get daily cost trend
-    pub fn get_daily_trend(&self, days: u32, provider: Option<&str>) -> Result<Vec<DailyTrendPoint>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+    pub fn get_daily_trend(
+        &self,
+        days: u32,
+        provider: Option<&str>,
+    ) -> Result<Vec<DailyTrendPoint>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         let since = Utc::now() - chrono::Duration::days(days as i64);
         let since_date = since.format("%Y-%m-%d").to_string();
@@ -664,8 +752,10 @@ impl BudgetStorage {
                     requests: row.get::<_, i64>(3)? as u64,
                     by_provider: HashMap::new(),
                 })
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?
         } else {
             stmt.query_map(params![params_vec[0]], |row| {
                 Ok(DailyTrendPoint {
@@ -675,16 +765,24 @@ impl BudgetStorage {
                     requests: row.get::<_, i64>(3)? as u64,
                     by_provider: HashMap::new(),
                 })
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?
         };
 
         Ok(results)
     }
 
     /// Get cost breakdown by provider
-    pub fn get_cost_by_provider(&self, since: DateTime<Utc>) -> Result<Vec<(String, f64, u64, u64, u64)>> {
-        let conn = self.conn.lock().map_err(|_| SothError::Internal("Lock poisoned".into()))?;
+    pub fn get_cost_by_provider(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(String, f64, u64, u64, u64)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SothError::Internal("Lock poisoned".into()))?;
 
         let since_date = since.format("%Y-%m-%d").to_string();
 
@@ -707,8 +805,10 @@ impl BudgetStorage {
                     row.get::<_, i64>(3)? as u64,
                     row.get::<_, i64>(4)? as u64,
                 ))
-            }).map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
         Ok(results)
     }

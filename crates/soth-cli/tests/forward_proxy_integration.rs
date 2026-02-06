@@ -1,9 +1,8 @@
 //! Integration tests for forward proxy functionality
 
 use soth_core::config::{ForwardProxyConfig, HostFilterConfig};
+use soth_proxy::providers::{HttpRequest, ProviderRegistry};
 use soth_tls::CertificateAuthority;
-use soth_proxy::providers::{ProviderRegistry, HttpRequest};
-use soth_proxy::transport::forward_proxy::ForwardProxyTransport;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -61,7 +60,8 @@ fn test_cert_cache() {
     // Generate certs for multiple domains
     ca.get_or_create_cert("api.openai.com").unwrap();
     ca.get_or_create_cert("api.anthropic.com").unwrap();
-    ca.get_or_create_cert("generativelanguage.googleapis.com").unwrap();
+    ca.get_or_create_cert("generativelanguage.googleapis.com")
+        .unwrap();
 
     let stats = ca.cache_stats();
     assert_eq!(stats.total, 3);
@@ -69,7 +69,7 @@ fn test_cert_cache() {
     assert_eq!(stats.expired, 0);
 }
 
-/// Test host filtering - whitelist mode (legacy)
+/// Test host filtering - whitelist mode
 #[test]
 fn test_host_filter_whitelist() {
     use soth_core::HostAction;
@@ -85,8 +85,14 @@ fn test_host_filter_whitelist() {
     };
 
     // In whitelist mode, allowed hosts are intercepted, others blocked
-    assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Intercept);
-    assert_eq!(filter.action_for_host("api.anthropic.com"), HostAction::Intercept);
+    assert_eq!(
+        filter.action_for_host("api.openai.com"),
+        HostAction::Intercept
+    );
+    assert_eq!(
+        filter.action_for_host("api.anthropic.com"),
+        HostAction::Intercept
+    );
     assert_eq!(filter.action_for_host("malicious.com"), HostAction::Block);
     assert_eq!(filter.action_for_host("example.com"), HostAction::Block);
 }
@@ -107,8 +113,14 @@ fn test_host_filter_selective() {
     };
 
     // AI domains intercepted
-    assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Intercept);
-    assert_eq!(filter.action_for_host("api.anthropic.com"), HostAction::Intercept);
+    assert_eq!(
+        filter.action_for_host("api.openai.com"),
+        HostAction::Intercept
+    );
+    assert_eq!(
+        filter.action_for_host("api.anthropic.com"),
+        HostAction::Intercept
+    );
 
     // Blocked hosts blocked
     assert_eq!(filter.action_for_host("blocked.com"), HostAction::Block);
@@ -138,8 +150,8 @@ fn test_openai_provider() {
 
     // Test model extraction
     let body = r#"{"model": "gpt-4o", "messages": []}"#;
-    let request = HttpRequest::new("POST", "/v1/chat/completions")
-        .with_body(body.as_bytes().to_vec());
+    let request =
+        HttpRequest::new("POST", "/v1/chat/completions").with_body(body.as_bytes().to_vec());
     assert_eq!(provider.extract_model(&request), Some("gpt-4o".to_string()));
 
     // Test usage extraction
@@ -165,8 +177,7 @@ fn test_anthropic_provider() {
 
     // Test model extraction
     let body = r#"{"model": "claude-3-5-sonnet", "messages": []}"#;
-    let request = HttpRequest::new("POST", "/v1/messages")
-        .with_body(body.as_bytes().to_vec());
+    let request = HttpRequest::new("POST", "/v1/messages").with_body(body.as_bytes().to_vec());
     assert_eq!(
         provider.extract_model(&request),
         Some("claude-3-5-sonnet".to_string())
@@ -217,17 +228,6 @@ fn test_google_provider() {
     let usage = provider.extract_usage(response.as_bytes()).unwrap();
     assert_eq!(usage.input_tokens, 100);
     assert_eq!(usage.output_tokens, 50);
-}
-
-/// Test forward proxy transport creation
-#[test]
-fn test_forward_proxy_transport_creation() {
-    let temp_dir = TempDir::new().unwrap();
-    let ca = CertificateAuthority::generate_new(temp_dir.path().to_path_buf()).unwrap();
-    let config = ForwardProxyConfig::default();
-
-    let transport = ForwardProxyTransport::new(config, ca);
-    assert_eq!(transport.listen_addr(), "127.0.0.1:8080");
 }
 
 /// Test config defaults

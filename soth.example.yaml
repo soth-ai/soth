@@ -51,8 +51,8 @@ observe:
   log_responses: true      # Log outbound responses
   tamper_proof: true       # Enable Merkle tree verification
   storage:
-    backend: "local"       # Options: local | sqlite
-    path: "./logs/"
+    backend: "sqlite"      # Options: local | sqlite
+    path: "./logs/observations.db"
 
 # Budget configuration
 # Controls spend tracking and limits

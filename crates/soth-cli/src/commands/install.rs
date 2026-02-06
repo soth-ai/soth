@@ -8,6 +8,7 @@ use chrono::Utc;
 use comfy_table::Cell;
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
+use soth_core::event_logger::default_event_log_write_path;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::info;
@@ -122,8 +123,12 @@ pub async fn run_install(target: Option<String>, dry_run: bool) -> Result<()> {
     println!();
 
     let clients = if let Some(ref t) = target {
-        let client = McpClient::from_str(t)
-            .with_context(|| format!("Unknown client: {}. Valid: claude-desktop, cursor, windsurf", t))?;
+        let client = McpClient::from_str(t).with_context(|| {
+            format!(
+                "Unknown client: {}. Valid: claude-desktop, cursor, windsurf",
+                t
+            )
+        })?;
         vec![client]
     } else {
         McpClient::all()
@@ -167,7 +172,10 @@ pub async fn run_install(target: Option<String>, dry_run: bool) -> Result<()> {
         style::success("Installation complete");
         style::info("Please restart your MCP clients.");
         println!();
-        style::kv("Log file", "~/.soth/logs/events.jsonl");
+        match get_log_path() {
+            Ok(path) => style::kv("Log file", &path.display().to_string()),
+            Err(_) => style::kv("Log file", "~/.soth/logs/events.db"),
+        }
         println!();
         style::info("Run 'soth tail' to see live events.");
     }
@@ -181,8 +189,7 @@ pub async fn run_uninstall(target: Option<String>) -> Result<()> {
     style::header("SOTH Uninstallation");
 
     let clients = if let Some(ref t) = target {
-        let client = McpClient::from_str(t)
-            .with_context(|| format!("Unknown client: {}", t))?;
+        let client = McpClient::from_str(t).with_context(|| format!("Unknown client: {}", t))?;
         vec![client]
     } else {
         McpClient::all()
@@ -252,7 +259,11 @@ pub async fn run_status() -> Result<()> {
         if !config_path.exists() {
             table.add_row(vec![
                 Cell::new(client.name()),
-                Cell::new(style::truncate(&config_path.display().to_string(), 35).dimmed().to_string()),
+                Cell::new(
+                    style::truncate(&config_path.display().to_string(), 35)
+                        .dimmed()
+                        .to_string(),
+                ),
                 Cell::new(format!("{} not configured", style::CIRCLE_EMPTY.dimmed())),
             ]);
             continue;
@@ -271,14 +282,22 @@ pub async fn run_status() -> Result<()> {
                 };
                 table.add_row(vec![
                     Cell::new(client.name()),
-                    Cell::new(style::truncate(&config_path.display().to_string(), 35).dimmed().to_string()),
+                    Cell::new(
+                        style::truncate(&config_path.display().to_string(), 35)
+                            .dimmed()
+                            .to_string(),
+                    ),
                     Cell::new(status_icon),
                 ]);
             }
             Err(e) => {
                 table.add_row(vec![
                     Cell::new(client.name()),
-                    Cell::new(style::truncate(&config_path.display().to_string(), 35).dimmed().to_string()),
+                    Cell::new(
+                        style::truncate(&config_path.display().to_string(), 35)
+                            .dimmed()
+                            .to_string(),
+                    ),
                     Cell::new(format!("{} {}", style::CROSS.red(), e)),
                 ]);
             }
@@ -304,11 +323,15 @@ pub async fn run_status() -> Result<()> {
 }
 
 async fn install_for_client(client: McpClient, soth_path: &str, dry_run: bool) -> Result<String> {
-    let config_path = client.config_path()
+    let config_path = client
+        .config_path()
         .context("Config path not available for this platform")?;
 
     if !config_path.exists() {
-        return Ok(format!("skipped (no config at {})", style::truncate(&config_path.display().to_string(), 20)));
+        return Ok(format!(
+            "skipped (no config at {})",
+            style::truncate(&config_path.display().to_string(), 20)
+        ));
     }
 
     // Read current config
@@ -354,7 +377,8 @@ async fn install_for_client(client: McpClient, soth_path: &str, dry_run: bool) -
 }
 
 async fn uninstall_for_client(client: McpClient) -> Result<String> {
-    let config_path = client.config_path()
+    let config_path = client
+        .config_path()
         .context("Config path not available for this platform")?;
 
     if !config_path.exists() {
@@ -367,7 +391,11 @@ async fn uninstall_for_client(client: McpClient) -> Result<String> {
     // Find most recent backup
     let mut backups: Vec<_> = std::fs::read_dir(&backup_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{}-", client.id())))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{}-", client.id()))
+        })
         .collect();
 
     backups.sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
@@ -407,7 +435,11 @@ async fn check_client_status(_client: McpClient, config_path: &PathBuf) -> Resul
         return Ok("no MCP servers".to_string());
     }
 
-    let wrapped_count = config.mcp_servers.values().filter(|s| is_wrapped(s)).count();
+    let wrapped_count = config
+        .mcp_servers
+        .values()
+        .filter(|s| is_wrapped(s))
+        .count();
     let total = config.mcp_servers.len();
 
     if wrapped_count == 0 {
@@ -415,7 +447,10 @@ async fn check_client_status(_client: McpClient, config_path: &PathBuf) -> Resul
     } else if wrapped_count == total {
         Ok(format!("fully wrapped ({} servers)", total))
     } else {
-        Ok(format!("partially wrapped ({}/{} servers)", wrapped_count, total))
+        Ok(format!(
+            "partially wrapped ({}/{} servers)",
+            wrapped_count, total
+        ))
     }
 }
 
@@ -442,7 +477,10 @@ fn wrap_server(name: &str, server: &mut McpServerConfig, soth_path: &str) {
 
 fn unwrap_server(server: &mut McpServerConfig) -> Result<()> {
     // Find the -- separator
-    let separator_pos = server.args.iter().position(|a| a == "--")
+    let separator_pos = server
+        .args
+        .iter()
+        .position(|a| a == "--")
         .context("Malformed wrap config: missing '--' separator")?;
 
     // Extract original command and args
@@ -483,12 +521,14 @@ fn backup_config(config_path: &PathBuf) -> Result<()> {
     let backup_dir = get_backup_dir()?;
     std::fs::create_dir_all(&backup_dir)?;
 
-    let filename = config_path.file_name()
+    let filename = config_path
+        .file_name()
         .context("No filename")?
         .to_string_lossy();
 
     // Include client name in backup
-    let client_name = config_path.parent()
+    let client_name = config_path
+        .parent()
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
@@ -509,8 +549,7 @@ fn get_backup_dir() -> Result<PathBuf> {
 }
 
 fn get_log_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
-    Ok(home.join(".soth").join("logs").join("events.jsonl"))
+    default_event_log_write_path().context("Could not determine default event log path")
 }
 
 #[cfg(test)]
@@ -521,7 +560,10 @@ mod tests {
     fn test_wrap_server() {
         let mut server = McpServerConfig {
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-postgres".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-postgres".to_string(),
+            ],
             env: HashMap::new(),
         };
 
@@ -555,7 +597,10 @@ mod tests {
         unwrap_server(&mut server).unwrap();
 
         assert_eq!(server.command, "npx");
-        assert_eq!(server.args, vec!["-y", "@modelcontextprotocol/server-postgres"]);
+        assert_eq!(
+            server.args,
+            vec!["-y", "@modelcontextprotocol/server-postgres"]
+        );
     }
 
     #[test]
@@ -577,7 +622,10 @@ mod tests {
 
     #[test]
     fn test_client_from_str() {
-        assert_eq!(McpClient::from_str("claude-desktop"), Some(McpClient::ClaudeDesktop));
+        assert_eq!(
+            McpClient::from_str("claude-desktop"),
+            Some(McpClient::ClaudeDesktop)
+        );
         assert_eq!(McpClient::from_str("CURSOR"), Some(McpClient::Cursor));
         assert_eq!(McpClient::from_str("unknown"), None);
     }

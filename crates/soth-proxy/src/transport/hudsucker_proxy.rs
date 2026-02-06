@@ -7,7 +7,6 @@ use async_stream::stream;
 use brotli::Decompressor as BrotliDecoder;
 use flate2::read::GzDecoder;
 use http_body_util::{BodyExt, Full, StreamBody};
-use std::io::{Cursor, Read};
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{Request, Response},
@@ -18,7 +17,12 @@ use hudsucker::{
 };
 use parking_lot::Mutex;
 use serde::Deserialize;
-use std::collections::HashMap;
+use soth_budget::{BudgetTracker, TokenCounter};
+use soth_core::types::policy::PolicyInputBuilder;
+use soth_identity::{signing::verify_bytes, signing::SignatureBlock, Did};
+use soth_policy::PolicyEngine;
+use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,7 +30,7 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "dashboard")]
-use soth_dashboard::DashboardState;
+use soth_dashboard::{DashboardState, DenialEntry};
 
 use crate::error::ProxyError;
 use soth_core::config::{ForwardProxyConfig, HostAction, HostFilterConfig};
@@ -55,6 +59,7 @@ struct AiRequestBody {
 /// Pending request info for correlating with responses
 #[derive(Debug, Clone)]
 struct PendingRequest {
+    request_id: u64,
     host: String,
     path: String,
     method: String,
@@ -76,6 +81,354 @@ fn request_id_from_ctx(ctx: &HttpContext) -> u64 {
     // Use the context's internal connection/request tracking
     // Hash the pointer address as a simple unique ID
     ctx as *const _ as u64
+}
+
+/// Identity verification mode for proxy enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyIdentityMode {
+    Disabled,
+    Optional,
+    Required,
+}
+
+/// Policy mode for proxy enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyPolicyMode {
+    Disabled,
+    Audit,
+    Enforce,
+}
+
+/// Request enforcement configuration for hudsucker transport.
+#[derive(Clone)]
+pub struct ProxyEnforcer {
+    identity_mode: ProxyIdentityMode,
+    did_header: String,
+    signature_header: String,
+    trusted_dids: Arc<HashSet<String>>,
+    policy_mode: ProxyPolicyMode,
+    policy_engine: Option<Arc<PolicyEngine>>,
+    budget_tracker: Option<Arc<BudgetTracker>>,
+    budget_block_on_exceeded: bool,
+    default_model: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EnforcementResult {
+    identity_verified: bool,
+    did: Option<String>,
+    policy_version: Option<String>,
+}
+
+impl ProxyEnforcer {
+    /// Create a default no-op enforcer.
+    pub fn new() -> Self {
+        Self {
+            identity_mode: ProxyIdentityMode::Disabled,
+            did_header: "X-Agent-DID".to_string(),
+            signature_header: "X-Agent-Signature".to_string(),
+            trusted_dids: Arc::new(HashSet::new()),
+            policy_mode: ProxyPolicyMode::Disabled,
+            policy_engine: None,
+            budget_tracker: None,
+            budget_block_on_exceeded: true,
+            default_model: "gpt-4o".to_string(),
+        }
+    }
+
+    pub fn with_identity_mode(
+        mut self,
+        mode: ProxyIdentityMode,
+        trusted_dids: HashSet<String>,
+    ) -> Self {
+        self.identity_mode = mode;
+        self.trusted_dids = Arc::new(trusted_dids);
+        self
+    }
+
+    pub fn with_identity_headers(
+        mut self,
+        did_header: impl Into<String>,
+        signature_header: impl Into<String>,
+    ) -> Self {
+        self.did_header = did_header.into();
+        self.signature_header = signature_header.into();
+        self
+    }
+
+    pub fn with_policy(mut self, mode: ProxyPolicyMode, engine: PolicyEngine) -> Self {
+        self.policy_mode = mode;
+        self.policy_engine = Some(Arc::new(engine));
+        self
+    }
+
+    pub fn with_budget(
+        mut self,
+        tracker: BudgetTracker,
+        block_on_exceeded: bool,
+        default_model: impl Into<String>,
+    ) -> Self {
+        self.budget_tracker = Some(Arc::new(tracker));
+        self.budget_block_on_exceeded = block_on_exceeded;
+        self.default_model = default_model.into();
+        self
+    }
+
+    pub fn did_header(&self) -> &str {
+        &self.did_header
+    }
+
+    pub fn signature_header(&self) -> &str {
+        &self.signature_header
+    }
+
+    fn parse_signature(raw_signature: &str, did: &str) -> Result<SignatureBlock, String> {
+        let signature = match serde_json::from_str::<SignatureBlock>(raw_signature) {
+            Ok(block) => block,
+            Err(_) => SignatureBlock {
+                algorithm: "Ed25519".to_string(),
+                value: raw_signature.to_string(),
+                signer: did.to_string(),
+                created: chrono::Utc::now(),
+            },
+        };
+
+        if signature.algorithm != "Ed25519" {
+            return Err(format!(
+                "Unsupported signature algorithm: {}",
+                signature.algorithm
+            ));
+        }
+        if signature.signer != did {
+            return Err(format!(
+                "Signature signer mismatch: signer={}, did={}",
+                signature.signer, did
+            ));
+        }
+
+        Ok(signature)
+    }
+
+    fn canonical_request_bytes(
+        host: &str,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let value = serde_json::json!({
+            "host": host,
+            "method": method,
+            "path": path,
+            "body": body.unwrap_or(""),
+        });
+        soth_identity::canonicalize_json(&value)
+            .map_err(|e| format!("Failed to canonicalize proxy request for signing: {e}"))
+    }
+
+    fn verify_identity(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        did: Option<&str>,
+        signature: Option<&str>,
+    ) -> Result<EnforcementResult, String> {
+        if self.identity_mode == ProxyIdentityMode::Disabled {
+            return Ok(EnforcementResult::default());
+        }
+
+        match (did, signature) {
+            (None, None) => {
+                if self.identity_mode == ProxyIdentityMode::Required {
+                    Err("Identity required: missing DID and signature".to_string())
+                } else {
+                    Ok(EnforcementResult::default())
+                }
+            }
+            (Some(did), None) => {
+                if self.identity_mode == ProxyIdentityMode::Required {
+                    Err("Identity required: signature missing".to_string())
+                } else {
+                    Ok(EnforcementResult {
+                        identity_verified: false,
+                        did: Some(did.to_string()),
+                        policy_version: None,
+                    })
+                }
+            }
+            (None, Some(_)) => Err("Signature provided without DID".to_string()),
+            (Some(did), Some(signature)) => {
+                if !self.trusted_dids.contains(did) {
+                    return Err(format!("DID not in trust store: {did}"));
+                }
+
+                let parsed_did = Did::parse(did).map_err(|e| format!("Invalid DID: {e}"))?;
+                let keypair = parsed_did
+                    .to_key_pair()
+                    .map_err(|e| format!("Invalid DID key: {e}"))?;
+
+                let signature_block = Self::parse_signature(signature, did)?;
+                let canonical = Self::canonical_request_bytes(host, method, path, body)?;
+                let verified = verify_bytes(&canonical, &signature_block, &keypair)
+                    .map_err(|e| format!("Signature verification failed: {e}"))?;
+
+                if !verified {
+                    return Err(format!("Invalid signature for DID: {did}"));
+                }
+
+                Ok(EnforcementResult {
+                    identity_verified: true,
+                    did: Some(did.to_string()),
+                    policy_version: None,
+                })
+            }
+        }
+    }
+
+    fn evaluate_policy(
+        &self,
+        session_id: &str,
+        provider: &str,
+        host: &str,
+        http_method: &str,
+        path: &str,
+        model: Option<&str>,
+        agent: Option<&str>,
+        identity: &EnforcementResult,
+    ) -> Result<(bool, Option<String>, Option<String>), String> {
+        let Some(engine) = self.policy_engine.as_ref() else {
+            return Ok((true, None, None));
+        };
+
+        let mut builder = PolicyInputBuilder::new()
+            .session_id(session_id)
+            .method(format!("proxy/{}", http_method.to_lowercase()))
+            .tool(format!("{provider}:{path}"))
+            .arguments_json(serde_json::json!({
+                "provider": provider,
+                "host": host,
+                "method": http_method,
+                "path": path,
+                "model": model,
+            }));
+
+        if let Some(agent) = agent {
+            builder = builder.agent_id(agent);
+        }
+
+        if identity.identity_verified {
+            builder = builder.identity_verified(true);
+            if let Some(ref did) = identity.did {
+                builder = builder.identity_did(did);
+            }
+        }
+
+        let input = builder.build();
+        let result = engine
+            .evaluate(&input)
+            .map_err(|e| format!("Policy evaluation failed: {e}"))?;
+        let policy_version = Some(result.policy_version);
+        let decision = result.decision;
+
+        if decision.allow {
+            Ok((true, None, policy_version))
+        } else {
+            let reason = decision
+                .reason
+                .or_else(|| {
+                    if decision.violations.is_empty() {
+                        None
+                    } else {
+                        Some(decision.violations.join("; "))
+                    }
+                })
+                .unwrap_or_else(|| "Policy denied proxy request".to_string());
+            Ok((false, Some(reason), policy_version))
+        }
+    }
+
+    fn enforce_request(
+        &self,
+        session_id: &str,
+        provider: &str,
+        host: &str,
+        http_method: &str,
+        path: &str,
+        model: Option<&str>,
+        request_body: Option<&str>,
+        agent: Option<&str>,
+        did: Option<&str>,
+        signature: Option<&str>,
+    ) -> Result<EnforcementResult, (u16, String, Option<String>)> {
+        let mut identity =
+            match self.verify_identity(host, http_method, path, request_body, did, signature) {
+                Ok(result) => result,
+                Err(err) => {
+                    if self.identity_mode == ProxyIdentityMode::Required {
+                        return Err((401, err, None));
+                    }
+                    warn!("Optional identity verification failed: {}", err);
+                    EnforcementResult {
+                        identity_verified: false,
+                        did: did.map(|s| s.to_string()),
+                        policy_version: None,
+                    }
+                }
+            };
+
+        if let Some(tracker) = self.budget_tracker.as_ref() {
+            let agent_id = identity.did.as_deref().or(agent).map(|s| s.to_string());
+
+            if self.budget_block_on_exceeded && tracker.is_budget_exceeded(agent_id.as_deref()) {
+                return Err((429, "Budget exceeded".to_string(), None));
+            }
+
+            if let Some(body) = request_body {
+                let input_tokens = TokenCounter::estimate_tokens(body);
+                let effective_model = model.unwrap_or(&self.default_model);
+                tracker.record_spend(
+                    session_id,
+                    agent_id.as_deref(),
+                    effective_model,
+                    input_tokens,
+                    0,
+                );
+            }
+        }
+
+        let (allowed, denial_reason, policy_version) = match self.evaluate_policy(
+            session_id,
+            provider,
+            host,
+            http_method,
+            path,
+            model,
+            agent,
+            &identity,
+        ) {
+            Ok(result) => result,
+            Err(err) => return Err((500, err, None)),
+        };
+        identity.policy_version = policy_version.clone();
+
+        if !allowed {
+            let reason = denial_reason.unwrap_or_else(|| "Policy denied".to_string());
+            match self.policy_mode {
+                ProxyPolicyMode::Enforce => return Err((403, reason, policy_version)),
+                ProxyPolicyMode::Audit => warn!("Policy audit violation: {}", reason),
+                ProxyPolicyMode::Disabled => {}
+            }
+        }
+
+        Ok(identity)
+    }
+}
+
+impl Default for ProxyEnforcer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Safely truncate a string to max_chars characters without splitting UTF-8
@@ -192,16 +545,20 @@ fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str) {
     }
 
     // Calculate final header size and warn if still large
-    let total_size: usize = headers.iter()
+    let total_size: usize = headers
+        .iter()
         .map(|(k, v)| k.as_str().len() + v.len() + 4)
         .sum();
 
     if total_size > 8000 {
-        let mut sizes: Vec<(String, usize)> = headers.iter()
+        let mut sizes: Vec<(String, usize)> = headers
+            .iter()
             .map(|(k, v)| (k.to_string(), v.len()))
             .collect();
         sizes.sort_by(|a, b| b.1.cmp(&a.1));
-        let top3: String = sizes.iter().take(3)
+        let top3: String = sizes
+            .iter()
+            .take(3)
             .map(|(k, v)| format!("{}={}", k, v))
             .collect::<Vec<_>>()
             .join(", ");
@@ -229,7 +586,9 @@ fn detect_compression_from_bytes(bytes: &[u8]) -> Option<&'static str> {
         return Some("gzip");
     }
     // Zlib/deflate magic: 78 01, 78 5e, 78 9c, 78 da
-    if bytes[0] == 0x78 && (bytes[1] == 0x01 || bytes[1] == 0x5e || bytes[1] == 0x9c || bytes[1] == 0xda) {
+    if bytes[0] == 0x78
+        && (bytes[1] == 0x01 || bytes[1] == 0x5e || bytes[1] == 0x9c || bytes[1] == 0xda)
+    {
         return Some("deflate");
     }
     // Brotli doesn't have a fixed magic - only try as last resort with header hint
@@ -293,6 +652,8 @@ pub struct AiProxyHandler {
     session_id: String,
     /// Pending requests for response correlation
     pending_requests: PendingRequests,
+    /// Optional enforcement runtime for identity/policy/budget checks
+    enforcer: Option<Arc<ProxyEnforcer>>,
 }
 
 impl AiProxyHandler {
@@ -304,6 +665,7 @@ impl AiProxyHandler {
             event_logger: None,
             session_id: uuid::Uuid::new_v4().to_string(),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            enforcer: None,
         }
     }
 
@@ -325,6 +687,12 @@ impl AiProxyHandler {
         self
     }
 
+    /// Set enforcement runtime for request allow/deny checks.
+    pub fn with_enforcer(mut self, enforcer: ProxyEnforcer) -> Self {
+        self.enforcer = Some(Arc::new(enforcer));
+        self
+    }
+
     /// Check if host is blocked
     fn is_blocked(&self, host: &str) -> bool {
         matches!(self.hosts.action_for_host(host), HostAction::Block)
@@ -343,11 +711,7 @@ impl AiProxyHandler {
             .host()
             .map(|h| h.to_string())
             // Try authority (works for CONNECT requests like "host:port")
-            .or_else(|| {
-                req.uri()
-                    .authority()
-                    .map(|a| a.host().to_string())
-            })
+            .or_else(|| req.uri().authority().map(|a| a.host().to_string()))
             // Fallback to Host header
             .or_else(|| {
                 req.headers()
@@ -360,7 +724,8 @@ impl AiProxyHandler {
 
     /// Detect agent/client from User-Agent header
     fn detect_agent<T>(req: &Request<T>) -> Option<&'static str> {
-        let ua = req.headers()
+        let ua = req
+            .headers()
             .get("user-agent")
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
@@ -401,7 +766,10 @@ impl AiProxyHandler {
 
     /// Detect AI provider from host
     fn detect_provider(host: &str) -> Option<&'static str> {
-        if host.contains("openai.com") || host.contains("openai.azure.com") || host.contains("chatgpt.com") {
+        if host.contains("openai.com")
+            || host.contains("openai.azure.com")
+            || host.contains("chatgpt.com")
+        {
             Some("openai")
         } else if host.contains("anthropic.com") || host.contains("claude.ai") {
             Some("anthropic")
@@ -549,6 +917,20 @@ impl HttpHandler for AiProxyHandler {
         let is_blocked = self.is_blocked(&host);
         let provider = Self::detect_provider(&host);
         let agent = Self::detect_agent(&req);
+        let enforcer = self.enforcer.clone();
+        let session_id = self.session_id.clone();
+        let did_header = enforcer.as_ref().map(|e| e.did_header().to_string());
+        let signature_header = enforcer.as_ref().map(|e| e.signature_header().to_string());
+        let identity_did = did_header
+            .as_deref()
+            .and_then(|header| req.headers().get(header))
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string());
+        let identity_signature = signature_header
+            .as_deref()
+            .and_then(|header| req.headers().get(header))
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string());
 
         // Check if we should inspect body
         let is_post = req.method() == hyper::Method::POST;
@@ -574,8 +956,6 @@ impl HttpHandler for AiProxyHandler {
 
         #[cfg(feature = "dashboard")]
         let dashboard = self.dashboard.clone();
-        let event_logger = self.event_logger.clone();
-        let session_id = self.session_id.clone();
         let pending_requests = self.pending_requests.clone();
         let request_id = request_id_from_ctx(ctx);
 
@@ -584,10 +964,7 @@ impl HttpHandler for AiProxyHandler {
             if is_blocked {
                 warn!(host = %host, "Blocked request");
                 return RequestOrResponse::Response(
-                    Response::builder()
-                        .status(403)
-                        .body(Body::empty())
-                        .unwrap(),
+                    Response::builder().status(403).body(Body::empty()).unwrap(),
                 );
             }
 
@@ -627,6 +1004,84 @@ impl HttpHandler for AiProxyHandler {
                 (None, None, req)
             };
 
+            if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
+                let enforcement = enforcer.enforce_request(
+                    &session_id,
+                    provider,
+                    &host,
+                    &http_method,
+                    &path,
+                    model.as_deref(),
+                    body_content.as_deref(),
+                    agent,
+                    identity_did.as_deref(),
+                    identity_signature.as_deref(),
+                );
+
+                match enforcement {
+                    Ok(identity_result) => {
+                        #[cfg(feature = "dashboard")]
+                        if let Some(ref dashboard) = dashboard {
+                            if let Some(ref did) = identity_result.did {
+                                dashboard.record_identity_verification(
+                                    did,
+                                    identity_result.identity_verified,
+                                );
+                            }
+                            if let Some(ref version) = identity_result.policy_version {
+                                dashboard.set_policy_active_version(version.clone());
+                            }
+                            if enforcer.policy_mode != ProxyPolicyMode::Disabled {
+                                dashboard.record_policy_evaluation(true, None);
+                            }
+                        }
+                    }
+                    Err((status, reason, policy_version)) => {
+                        warn!(
+                            status = status,
+                            provider = provider,
+                            host = %host,
+                            path = %path,
+                            reason = %reason,
+                            "Proxy request denied by enforcement"
+                        );
+
+                        #[cfg(feature = "dashboard")]
+                        if let Some(ref dashboard) = dashboard {
+                            if let Some(ref did) = identity_did {
+                                dashboard.record_identity_verification(did, false);
+                            }
+                            if let Some(ref version) = policy_version {
+                                dashboard.set_policy_active_version(version.clone());
+                            }
+                            if enforcer.policy_mode != ProxyPolicyMode::Disabled {
+                                dashboard.record_policy_evaluation(
+                                    false,
+                                    Some(DenialEntry {
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        method: format!("{} {}", http_method, path),
+                                        tool: Some(format!("{provider}:{path}")),
+                                        reason: reason.clone(),
+                                    }),
+                                );
+                            }
+                        }
+
+                        let response_body = serde_json::json!({
+                            "error": reason,
+                            "status": status,
+                        });
+                        return RequestOrResponse::Response(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(Body::from(Full::new(response_body.to_string().into())))
+                                .unwrap(),
+                        );
+                    }
+                }
+            }
+
             // Log AI traffic (only inference endpoints, not images/tracking/etc)
             if let Some(provider) = provider {
                 let display_path = if path.is_empty() || path == "/" {
@@ -660,24 +1115,35 @@ impl HttpHandler for AiProxyHandler {
                 #[cfg(feature = "dashboard")]
                 if let Some(ref dashboard) = dashboard {
                     if should_log {
-                        dashboard.record_proxy_request(provider, &host, &http_method, &display_path);
+                        let request_id_str = request_id.to_string();
+                        dashboard.record_proxy_request(
+                            Some(&request_id_str),
+                            provider,
+                            &host,
+                            &http_method,
+                            &display_path,
+                        );
                     }
                 }
 
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
                     let mut pending = pending_requests.lock();
-                    pending.insert(request_id, PendingRequest {
-                        host: host.clone(),
-                        path: display_path.clone(),
-                        method: http_method.clone(),
-                        provider,
-                        agent,
-                        model: model.clone(),
-                        started_at: Instant::now(),
-                        request_content: body_content,
-                        is_agent_app: Self::is_agent_app(&host),
-                    });
+                    pending.insert(
+                        request_id,
+                        PendingRequest {
+                            request_id,
+                            host: host.clone(),
+                            path: display_path.clone(),
+                            method: http_method.clone(),
+                            provider,
+                            agent,
+                            model: model.clone(),
+                            started_at: Instant::now(),
+                            request_content: body_content,
+                            is_agent_app: Self::is_agent_app(&host),
+                        },
+                    );
                 }
 
                 // Note: We don't log request events separately anymore.
@@ -890,7 +1356,9 @@ impl HttpHandler for AiProxyHandler {
 
             #[cfg(feature = "dashboard")]
             if let Some(ref dashboard) = dashboard {
+                let request_id_str = pending.request_id.to_string();
                 dashboard.record_proxy_response(
+                    Some(&request_id_str),
                     pending.provider,
                     status,
                     latency_ms,
@@ -909,7 +1377,8 @@ impl HttpHandler for AiProxyHandler {
                     let method_str = format!("{} {}", pending.method, pending.path);
 
                     // Create request preview
-                    let request_preview = pending.request_content
+                    let request_preview = pending
+                        .request_content
                         .as_ref()
                         .map(|b| safe_truncate(b, 300))
                         .unwrap_or_else(|| format!("{} {}", pending.method, pending.path));
@@ -920,13 +1389,22 @@ impl HttpHandler for AiProxyHandler {
                         .map(|b| safe_truncate(b, 300))
                         .unwrap_or_else(|| format!("HTTP {}", status));
 
-                    let source = if pending.is_agent_app { EventSource::AgentApp } else { EventSource::AiProxy };
-                    let mut event = WrapEvent::new(&session_id, pending.host.clone(), WrapDirection::Out, agent_info)
-                        .with_source(source)
-                        .with_provider(pending.provider)
-                        .with_method(method_str)
-                        .with_status_code(status)
-                        .with_latency(latency_ms);
+                    let source = if pending.is_agent_app {
+                        EventSource::AgentApp
+                    } else {
+                        EventSource::AiProxy
+                    };
+                    let mut event = WrapEvent::new(
+                        &session_id,
+                        pending.host.clone(),
+                        WrapDirection::Out,
+                        agent_info,
+                    )
+                    .with_source(source)
+                    .with_provider(pending.provider)
+                    .with_method(method_str)
+                    .with_status_code(status)
+                    .with_latency(latency_ms);
 
                     // Add paired request/response content
                     if let Some(ref req_body) = pending.request_content {
@@ -939,7 +1417,10 @@ impl HttpHandler for AiProxyHandler {
                     }
 
                     // Also set content_preview for backward compatibility
-                    event = event.with_content_preview(format!("→ {} | ← {}", request_preview, response_preview));
+                    event = event.with_content_preview(format!(
+                        "→ {} | ← {}",
+                        request_preview, response_preview
+                    ));
 
                     // Add model if we had it from request
                     if let Some(ref m) = pending.model {
@@ -1023,7 +1504,10 @@ impl WebSocketHandler for AiWebSocketHandler {
         };
 
         // Detect provider from host
-        let provider = if host.contains("openai.com") || host.contains("openai.azure.com") || host.contains("chatgpt.com") {
+        let provider = if host.contains("openai.com")
+            || host.contains("openai.azure.com")
+            || host.contains("chatgpt.com")
+        {
             "openai"
         } else if host.contains("anthropic.com") || host.contains("claude.ai") {
             "anthropic"
@@ -1112,6 +1596,7 @@ pub async fn start_proxy(
         #[cfg(feature = "dashboard")]
         dashboard,
         None,
+        None,
     )
     .await
 }
@@ -1124,6 +1609,7 @@ pub async fn start_proxy_with_shutdown<F>(
     shutdown: F,
     #[cfg(feature = "dashboard")] dashboard: Option<DashboardState>,
     event_logger: Option<EventLogger>,
+    enforcer: Option<ProxyEnforcer>,
 ) -> Result<(), ProxyError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -1165,6 +1651,9 @@ where
         if let Some(ref logger) = event_logger_arc {
             h = h.with_event_logger_arc(logger.clone());
         }
+        if let Some(ref proxy_enforcer) = enforcer {
+            h = h.with_enforcer(proxy_enforcer.clone());
+        }
         h
     };
 
@@ -1173,6 +1662,9 @@ where
         let mut h = AiProxyHandler::new(&config);
         if let Some(ref logger) = event_logger_arc {
             h = h.with_event_logger_arc(logger.clone());
+        }
+        if let Some(ref proxy_enforcer) = enforcer {
+            h = h.with_enforcer(proxy_enforcer.clone());
         }
         h
     };
@@ -1205,6 +1697,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soth_core::types::policy::PolicyData;
+    use soth_identity::Did;
 
     #[test]
     fn test_detect_provider() {
@@ -1246,5 +1740,116 @@ mod tests {
         );
         assert_eq!(AiProxyHandler::detect_provider("google.com"), None);
         assert_eq!(AiProxyHandler::detect_provider("example.com"), None);
+    }
+
+    #[test]
+    fn test_proxy_enforcer_identity_required_blocks_missing_identity() {
+        let enforcer =
+            ProxyEnforcer::new().with_identity_mode(ProxyIdentityMode::Required, HashSet::new());
+
+        let result = enforcer.enforce_request(
+            "session-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-4o"),
+            Some(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#),
+            Some("cursor"),
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err((401, _, _))));
+    }
+
+    #[test]
+    fn test_proxy_enforcer_identity_required_valid_signature() {
+        let keypair = soth_identity::KeyPair::generate();
+        let did = Did::from_key_pair(&keypair).unwrap().uri();
+
+        let mut trusted = HashSet::new();
+        trusted.insert(did.clone());
+        let enforcer =
+            ProxyEnforcer::new().with_identity_mode(ProxyIdentityMode::Required, trusted);
+
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+        let canonical = ProxyEnforcer::canonical_request_bytes(
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some(body),
+        )
+        .unwrap();
+        let signature = keypair.sign_base64(&canonical).unwrap();
+
+        let result = enforcer.enforce_request(
+            "session-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-4o"),
+            Some(body),
+            Some("cursor"),
+            Some(&did),
+            Some(&signature),
+        );
+
+        assert!(result.is_ok());
+        let identity = result.unwrap();
+        assert!(identity.identity_verified);
+        assert_eq!(identity.did, Some(did));
+    }
+
+    #[test]
+    fn test_proxy_enforcer_policy_enforce_deny() {
+        let engine = PolicyEngine::new();
+        engine
+            .set_policy_data(PolicyData {
+                blocked_tools: vec!["openai:/v1/chat/completions".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let enforcer = ProxyEnforcer::new().with_policy(ProxyPolicyMode::Enforce, engine);
+
+        let result = enforcer.enforce_request(
+            "session-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-4o"),
+            Some(r#"{"model":"gpt-4o"}"#),
+            Some("cursor"),
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err((403, _, _))));
+    }
+
+    #[test]
+    fn test_proxy_enforcer_budget_blocks_when_exceeded() {
+        let tracker = BudgetTracker::new();
+        tracker.set_global_budget(Some(0.0), None, None);
+        tracker.record_spend("session-1", None, "gpt-4o", 10_000, 10_000);
+
+        let enforcer = ProxyEnforcer::new().with_budget(tracker, true, "gpt-4o");
+        let result = enforcer.enforce_request(
+            "session-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-4o"),
+            Some(r#"{"model":"gpt-4o"}"#),
+            Some("cursor"),
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err((429, _, _))));
     }
 }

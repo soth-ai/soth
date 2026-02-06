@@ -37,8 +37,9 @@ export default function ObservabilityPage() {
     let reconnectTimeout: NodeJS.Timeout | null = null;
 
     const connect = () => {
-      // Connect to the dashboard API WebSocket
-      ws = new WebSocket("ws://localhost:3001/api/events/stream");
+      const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${wsProtocol}//${window.location.host}/api/events/stream`;
+      ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
         console.log("WebSocket connected to event stream");
@@ -114,7 +115,7 @@ export default function ObservabilityPage() {
       ws.onerror = () => {
         // Connection failed - this is expected if backend isn't running
         // Don't log as error to avoid Next.js error overlay
-        console.warn("WebSocket connection failed. Is the SOTH backend running on port 3001?");
+        console.warn("WebSocket connection failed. Is the SOTH backend running?");
         ws?.close();
       };
     };

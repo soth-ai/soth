@@ -69,10 +69,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut server_table = style::table();
     server_table.set_header(vec!["Property", "Value"]);
 
-    server_table.add_row(vec![
-        Cell::new("Default Address"),
-        Cell::new(proxy_addr),
-    ]);
+    server_table.add_row(vec![Cell::new("Default Address"), Cell::new(proxy_addr)]);
 
     let running = tokio::net::TcpStream::connect(proxy_addr).await.is_ok();
     let status_display = if running {
@@ -80,10 +77,7 @@ pub async fn run() -> anyhow::Result<()> {
     } else {
         format!("{} Not running", style::CIRCLE_EMPTY.dimmed())
     };
-    server_table.add_row(vec![
-        Cell::new("Status"),
-        Cell::new(status_display),
-    ]);
+    server_table.add_row(vec![Cell::new("Status"), Cell::new(status_display)]);
     println!("{server_table}");
 
     if !running {

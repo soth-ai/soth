@@ -208,11 +208,7 @@ mod tests {
     #[test]
     fn test_cache_insert_and_get() {
         let cache = CertCache::new(Duration::from_secs(60), 100);
-        cache.insert(
-            "example.com".to_string(),
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-        );
+        cache.insert("example.com".to_string(), vec![1, 2, 3], vec![4, 5, 6]);
 
         let entry = cache.get("example.com").unwrap();
         assert_eq!(entry.cert_der, vec![1, 2, 3]);
@@ -228,11 +224,7 @@ mod tests {
     #[test]
     fn test_cache_expiration() {
         let cache = CertCache::new(Duration::from_millis(50), 100);
-        cache.insert(
-            "example.com".to_string(),
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-        );
+        cache.insert("example.com".to_string(), vec![1, 2, 3], vec![4, 5, 6]);
 
         // Should be present initially
         assert!(cache.get("example.com").is_some());

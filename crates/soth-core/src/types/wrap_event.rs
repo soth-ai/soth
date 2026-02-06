@@ -349,8 +349,8 @@ mod tests {
 
     #[test]
     fn test_wrap_event_creation() {
-        let agent = AgentInfo::new("Claude Code", DetectionSource::McpInitialize)
-            .with_version("1.0.0");
+        let agent =
+            AgentInfo::new("Claude Code", DetectionSource::McpInitialize).with_version("1.0.0");
         let event = WrapEvent::new("session-1", "postgres", WrapDirection::In, agent)
             .with_method("tools/call")
             .with_tool_name("query")
@@ -366,8 +366,7 @@ mod tests {
 
     #[test]
     fn test_agent_info() {
-        let agent = AgentInfo::new("Cursor", DetectionSource::Environment)
-            .with_version("0.42.0");
+        let agent = AgentInfo::new("Cursor", DetectionSource::Environment).with_version("0.42.0");
 
         assert_eq!(agent.name, "Cursor");
         assert_eq!(agent.version, Some("0.42.0".to_string()));

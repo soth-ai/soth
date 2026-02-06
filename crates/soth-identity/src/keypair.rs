@@ -49,11 +49,9 @@ impl KeyPair {
 
     /// Create a key pair from base64-encoded private key
     pub fn from_private_key_base64(encoded: &str) -> Result<Self> {
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            encoded,
-        )
-        .map_err(|e| SothError::Identity(format!("Invalid base64: {e}")))?;
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded)
+                .map_err(|e| SothError::Identity(format!("Invalid base64: {e}")))?;
 
         Self::from_private_key_bytes(&bytes)
     }
@@ -70,11 +68,9 @@ impl KeyPair {
             .filter(|line| !line.starts_with("-----"))
             .collect();
 
-        let der_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &base64_content,
-        )
-        .map_err(|e| SothError::Identity(format!("Invalid PEM base64: {e}")))?;
+        let der_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &base64_content)
+                .map_err(|e| SothError::Identity(format!("Invalid PEM base64: {e}")))?;
 
         // PKCS#8 format: extract the raw 32-byte Ed25519 key from DER
         // The raw key is at the end of the DER structure
@@ -119,11 +115,9 @@ impl KeyPair {
 
     /// Create a verification-only key pair from base64-encoded public key
     pub fn from_public_key_base64(encoded: &str) -> Result<Self> {
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            encoded,
-        )
-        .map_err(|e| SothError::Identity(format!("Invalid base64: {e}")))?;
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded)
+                .map_err(|e| SothError::Identity(format!("Invalid base64: {e}")))?;
 
         Self::from_public_key_bytes(&bytes)
     }
@@ -270,7 +264,11 @@ impl KeyPair {
 
 impl std::fmt::Debug for KeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let key_type = if self.can_sign() { "full" } else { "verify-only" };
+        let key_type = if self.can_sign() {
+            "full"
+        } else {
+            "verify-only"
+        };
         f.debug_struct("KeyPair")
             .field("type", &key_type)
             .field("fingerprint", &self.short_fingerprint())
@@ -295,11 +293,7 @@ impl std::hash::Hash for KeyPair {
 // Hex encoding helper
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 

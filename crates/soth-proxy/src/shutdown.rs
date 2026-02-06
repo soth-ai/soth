@@ -59,10 +59,7 @@ impl ShutdownCoordinator {
         }
 
         self.inner.active_count.fetch_add(1, Ordering::SeqCst);
-        debug!(
-            "Connection registered, active: {}",
-            self.active_count()
-        );
+        debug!("Connection registered, active: {}", self.active_count());
 
         Some(ConnectionGuard {
             coordinator: self.clone(),
@@ -107,11 +104,7 @@ impl ShutdownCoordinator {
         );
 
         // Wait for connections to drain with timeout
-        let result = timeout(
-            self.inner.shutdown_timeout,
-            self.wait_for_zero(),
-        )
-        .await;
+        let result = timeout(self.inner.shutdown_timeout, self.wait_for_zero()).await;
 
         match result {
             Ok(_) => {

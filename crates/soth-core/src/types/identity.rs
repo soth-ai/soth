@@ -2,8 +2,8 @@
 //!
 //! Defines identity context and trust levels for agent verification.
 
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Trust level for an agent
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

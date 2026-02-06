@@ -23,7 +23,7 @@ import {
 import { format } from "date-fns";
 import { useObservabilityStore, type LogEntry } from "@/store/observability";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@radix-ui/react-scroll-area";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 
 // Compute AI-specific metrics

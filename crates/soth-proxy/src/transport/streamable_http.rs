@@ -13,6 +13,7 @@ use super::{AsyncMessageHandler, Transport, TransportConfig};
 use crate::error::ProxyError;
 use crate::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
 use async_trait::async_trait;
+use axum::body::Bytes;
 use axum::{
     body::Body,
     extract::State,
@@ -21,7 +22,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use axum::body::Bytes;
 use dashmap::DashMap;
 use futures::stream::Stream;
 use std::collections::HashSet;
@@ -67,10 +67,8 @@ impl Session {
     }
 
     fn touch(&self) {
-        self.last_activity.store(
-            self.created_at.elapsed().as_secs(),
-            Ordering::Relaxed,
-        );
+        self.last_activity
+            .store(self.created_at.elapsed().as_secs(), Ordering::Relaxed);
     }
 
     fn next_event_id(&self) -> u64 {
@@ -161,7 +159,7 @@ pub struct StreamableHttpConfig {
 impl Default for StreamableHttpConfig {
     fn default() -> Self {
         Self {
-            session_timeout_secs: 3600,     // 1 hour
+            session_timeout_secs: 3600, // 1 hour
             require_session: true,
             max_batch_size: 100,
             sse_keepalive_secs: 30,
@@ -216,7 +214,10 @@ impl StreamableHttpTransport {
     /// Create the router
     fn create_router(state: Arc<StreamableHttpState>) -> Router {
         Router::new()
-            .route("/mcp", post(handle_post).get(handle_get).delete(handle_delete))
+            .route(
+                "/mcp",
+                post(handle_post).get(handle_get).delete(handle_delete),
+            )
             .route("/health", get(handle_health))
             .with_state(state)
     }
@@ -245,7 +246,8 @@ async fn handle_post(
                 "jsonrpc": "2.0",
                 "error": {"code": -32600, "message": "Invalid origin"}
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Check session ID for non-initialize requests
@@ -265,7 +267,8 @@ async fn handle_post(
                         "jsonrpc": "2.0",
                         "error": {"code": -32600, "message": "Batch too large"}
                     })),
-                ).into_response();
+                )
+                    .into_response();
             }
             Ok(msgs) => msgs,
             Err(_) => {
@@ -275,7 +278,8 @@ async fn handle_post(
                         "jsonrpc": "2.0",
                         "error": {"code": -32700, "message": "Parse error"}
                     })),
-                ).into_response();
+                )
+                    .into_response();
             }
         }
     } else {
@@ -283,9 +287,9 @@ async fn handle_post(
     };
 
     // Check if this is an initialization request
-    let is_initialize = messages.iter().any(|m| {
-        m.get("method").and_then(|v| v.as_str()) == Some("initialize")
-    });
+    let is_initialize = messages
+        .iter()
+        .any(|m| m.get("method").and_then(|v| v.as_str()) == Some("initialize"));
 
     // Require session ID for non-initialize requests if configured
     if !is_initialize && state.config.require_session && session_id.is_none() {
@@ -295,7 +299,8 @@ async fn handle_post(
                 "jsonrpc": "2.0",
                 "error": {"code": -32600, "message": "Missing Mcp-Session-Id header"}
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Validate session if provided
@@ -312,7 +317,8 @@ async fn handle_post(
                         "jsonrpc": "2.0",
                         "error": {"code": -32600, "message": "Session not found"}
                     })),
-                ).into_response();
+                )
+                    .into_response();
             }
         }
     } else {
@@ -403,16 +409,11 @@ async fn handle_post(
         serde_json::to_string(&responses).unwrap()
     };
 
-    response_builder
-        .body(Body::from(body))
-        .unwrap()
+    response_builder.body(Body::from(body)).unwrap()
 }
 
 /// Handle GET requests (SSE stream for server-to-client messages)
-async fn handle_get(
-    State(state): State<Arc<StreamableHttpState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_get(State(state): State<Arc<StreamableHttpState>>, headers: HeaderMap) -> Response {
     // Validate origin
     if !state.validate_origin(headers.get(header::ORIGIN)) {
         return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
@@ -425,16 +426,11 @@ async fn handle_get(
         .unwrap_or("");
 
     if !accept.contains("text/event-stream") {
-        return (
-            StatusCode::NOT_ACCEPTABLE,
-            "Must accept text/event-stream",
-        ).into_response();
+        return (StatusCode::NOT_ACCEPTABLE, "Must accept text/event-stream").into_response();
     }
 
     // Get session
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok());
+    let session_id = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
 
     let session = match session_id {
         Some(sid) => match state.get_session(sid) {
@@ -478,9 +474,7 @@ async fn handle_delete(
     State(state): State<Arc<StreamableHttpState>>,
     headers: HeaderMap,
 ) -> Response {
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok());
+    let session_id = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
 
     match session_id {
         Some(sid) => {
@@ -545,7 +539,9 @@ impl Stream for SseStream {
                 // Convert JsonRpcMessage to JSON value, then to string
                 let data = match &msg {
                     JsonRpcMessage::Request(req) => serde_json::to_string(req).unwrap_or_default(),
-                    JsonRpcMessage::Response(resp) => serde_json::to_string(resp).unwrap_or_default(),
+                    JsonRpcMessage::Response(resp) => {
+                        serde_json::to_string(resp).unwrap_or_default()
+                    }
                 };
                 let event = Self::format_sse_event("message", &data, Some(&event_id));
                 Poll::Ready(Some(Ok(Bytes::from(event))))
@@ -563,9 +559,7 @@ impl Stream for SseStream {
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            Err(broadcast::error::TryRecvError::Closed) => {
-                Poll::Ready(None)
-            }
+            Err(broadcast::error::TryRecvError::Closed) => Poll::Ready(None),
         }
     }
 }

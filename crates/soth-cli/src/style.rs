@@ -41,7 +41,10 @@ pub fn header(title: &str) {
 pub fn footer() {
     let term_width = Term::stdout().size().1 as usize;
     let width = term_width.min(60);
-    println!("\u{2570}{}\u{256F}", "\u{2500}".repeat(width.saturating_sub(2)));
+    println!(
+        "\u{2570}{}\u{256F}",
+        "\u{2500}".repeat(width.saturating_sub(2))
+    );
     println!();
 }
 
@@ -242,11 +245,7 @@ pub fn highlight(text: &str) -> String {
 
 /// Print a step in a multi-step process
 pub fn step(num: usize, total: usize, msg: &str) {
-    println!(
-        "{} {}",
-        format!("[{}/{}]", num, total).dimmed(),
-        msg
-    );
+    println!("{} {}", format!("[{}/{}]", num, total).dimmed(), msg);
 }
 
 /// Print a completed step with checkmark

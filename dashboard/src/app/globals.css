@@ -28,6 +28,8 @@
 
 /* DARK THEME (Default - OLED optimized) */
 :root {
+  --font-geist-sans: "Avenir Next", "Segoe UI", "SF Pro Text", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-geist-mono: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --background: #050505;
   --foreground: #F2F2F2;
 

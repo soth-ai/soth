@@ -124,7 +124,9 @@ fn parse_client_hello(data: &[u8]) -> Result<Option<String>> {
 
     // Compression methods length (1 byte) + compression methods
     if data.len() < pos + 1 {
-        return Err(TlsError::sni_extraction("Missing compression methods length"));
+        return Err(TlsError::sni_extraction(
+            "Missing compression methods length",
+        ));
     }
     let compression_methods_len = data[pos] as usize;
     pos += 1;

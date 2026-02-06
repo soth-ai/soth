@@ -17,6 +17,7 @@ regex = { workspace = true }
 humantime = "2.1"
 dirs = { workspace = true }
 rand = { workspace = true }
+rusqlite = { workspace = true }
 
 # File watching
 notify = { workspace = true }

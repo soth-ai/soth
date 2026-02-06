@@ -10,9 +10,9 @@ pub mod agent_detect;
 use anyhow::{Context, Result};
 use clap::Args;
 use soth_core::types::{AgentInfo, DetectionSource, WrapDirection, WrapEvent};
-use soth_core::{generate_session_name, MessageDirection, SessionRecorder, SessionStorage};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use soth_core::{
+    generate_session_name, EventLogger, MessageDirection, SessionRecorder, SessionStorage,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -58,7 +58,7 @@ struct WrapSession {
     session_id: String,
     server_name: String,
     agent: RwLock<AgentInfo>,
-    log_writer: Option<std::sync::Mutex<BufWriter<File>>>,
+    event_logger: Option<EventLogger>,
     request_times: RwLock<std::collections::HashMap<String, Instant>>,
     /// Session recorder for full message capture (optional)
     recorder: Option<Arc<SessionRecorder>>,
@@ -68,28 +68,11 @@ impl WrapSession {
     fn new(
         server_name: String,
         agent: AgentInfo,
-        log_path: Option<PathBuf>,
+        event_logger: Option<EventLogger>,
         record: bool,
         session_name: Option<String>,
     ) -> Result<Self> {
         let session_id = uuid::Uuid::new_v4().to_string();
-
-        let log_writer = if let Some(path) = log_path {
-            // Ensure parent directory exists
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .with_context(|| format!("Failed to open log file: {:?}", path))?;
-
-            Some(std::sync::Mutex::new(BufWriter::new(file)))
-        } else {
-            None
-        };
 
         // Create session recorder if recording is enabled
         let recorder = if record {
@@ -109,20 +92,15 @@ impl WrapSession {
             session_id,
             server_name,
             agent: RwLock::new(agent),
-            log_writer,
+            event_logger,
             request_times: RwLock::new(std::collections::HashMap::new()),
             recorder,
         })
     }
 
     async fn log_event(&self, event: &WrapEvent) {
-        if let Some(ref writer) = self.log_writer {
-            if let Ok(json) = serde_json::to_string(event) {
-                if let Ok(mut w) = writer.lock() {
-                    let _ = writeln!(w, "{}", json);
-                    let _ = w.flush();
-                }
-            }
+        if let Some(ref logger) = self.event_logger {
+            logger.log(event);
         }
     }
 
@@ -162,15 +140,17 @@ impl WrapSession {
 
     async fn get_latency(&self, id: &str) -> Option<u64> {
         let times = self.request_times.read().await;
-        times.get(id).map(|start| start.elapsed().as_millis() as u64)
+        times
+            .get(id)
+            .map(|start| start.elapsed().as_millis() as u64)
     }
 
     /// Finalize the session recording and save to disk
     async fn finalize_recording(&self) -> Result<Option<PathBuf>> {
         if let Some(ref recorder) = self.recorder {
             // Clone the recorder to finalize (consumes it)
-            let recorder_clone = Arc::try_unwrap(recorder.clone())
-                .unwrap_or_else(|arc| (*arc).clone());
+            let recorder_clone =
+                Arc::try_unwrap(recorder.clone()).unwrap_or_else(|arc| (*arc).clone());
 
             let session = recorder_clone.finalize().await?;
             let storage = SessionStorage::new()?;
@@ -197,7 +177,9 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     let (cmd, cmd_args) = (&args.command[0], &args.command[1..]);
 
     // Derive server name
-    let server_name = args.name.unwrap_or_else(|| derive_server_name(cmd, cmd_args));
+    let server_name = args
+        .name
+        .unwrap_or_else(|| derive_server_name(cmd, cmd_args));
 
     // Get initial agent info
     let initial_agent = if let Some(ref agent_name) = args.agent {
@@ -207,16 +189,16 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     };
 
     // Set up log path
-    let log_path = if args.no_log {
+    let event_logger = if args.no_log {
         None
     } else {
-        Some(get_default_log_path()?)
+        Some(EventLogger::with_default_path().context("Failed to initialize event logger")?)
     };
 
     let session = Arc::new(WrapSession::new(
         server_name.clone(),
         initial_agent,
-        log_path,
+        event_logger,
         args.record,
         args.session_name,
     )?);
@@ -331,10 +313,7 @@ async fn read_from_stdin(session: Arc<WrapSession>, tx: mpsc::Sender<String>) {
     }
 }
 
-async fn write_to_child(
-    mut writer: tokio::process::ChildStdin,
-    mut rx: mpsc::Receiver<String>,
-) {
+async fn write_to_child(mut writer: tokio::process::ChildStdin, mut rx: mpsc::Receiver<String>) {
     while let Some(line) = rx.recv().await {
         if writer.write_all(line.as_bytes()).await.is_err() {
             break;
@@ -450,10 +429,16 @@ async fn process_inbound_message(session: &WrapSession, content: &str) {
     }
 
     // Record full message for session replay
-    session.record_message(content, MessageDirection::ToServer).await;
+    session
+        .record_message(content, MessageDirection::ToServer)
+        .await;
 
     session.log_event(&event).await;
-    debug!("→ {} {}", event.method.as_deref().unwrap_or("-"), event.tool_name.as_deref().unwrap_or(""));
+    debug!(
+        "→ {} {}",
+        event.method.as_deref().unwrap_or("-"),
+        event.tool_name.as_deref().unwrap_or("")
+    );
 }
 
 async fn process_outbound_message(session: &WrapSession, content: &str) {
@@ -502,10 +487,16 @@ async fn process_outbound_message(session: &WrapSession, content: &str) {
     }
 
     // Record full message for session replay
-    session.record_message(content, MessageDirection::ToClient).await;
+    session
+        .record_message(content, MessageDirection::ToClient)
+        .await;
 
     session.log_event(&event).await;
-    debug!("← {} ({}ms)", event.method.as_deref().unwrap_or("response"), event.latency_ms.unwrap_or(0));
+    debug!(
+        "← {} ({}ms)",
+        event.method.as_deref().unwrap_or("response"),
+        event.latency_ms.unwrap_or(0)
+    );
 }
 
 fn derive_server_name(cmd: &str, args: &[String]) -> String {
@@ -547,11 +538,6 @@ fn derive_server_name(cmd: &str, args: &[String]) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
-}
-
-fn get_default_log_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
-    Ok(home.join(".soth").join("logs").join("events.jsonl"))
 }
 
 fn truncate_content(content: &str, max_len: usize) -> String {
@@ -606,6 +592,9 @@ mod tests {
     #[test]
     fn test_truncate_content() {
         assert_eq!(truncate_content("short", 10), "short");
-        assert_eq!(truncate_content("this is a longer string", 10), "this is a ...");
+        assert_eq!(
+            truncate_content("this is a longer string", 10),
+            "this is a ..."
+        );
     }
 }

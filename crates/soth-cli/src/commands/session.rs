@@ -446,11 +446,7 @@ async fn run_replay(
     Ok(())
 }
 
-fn print_message_compact(
-    index: usize,
-    total: usize,
-    msg: &soth_core::RecordedMessage,
-) {
+fn print_message_compact(index: usize, total: usize, msg: &soth_core::RecordedMessage) {
     let direction_symbol = match msg.direction {
         MessageDirection::ToServer => "→".green().to_string(),
         MessageDirection::ToClient => "←".blue().to_string(),
@@ -468,11 +464,7 @@ fn print_message_compact(
     );
 }
 
-fn print_message_verbose(
-    index: usize,
-    total: usize,
-    msg: &soth_core::RecordedMessage,
-) {
+fn print_message_verbose(index: usize, total: usize, msg: &soth_core::RecordedMessage) {
     let direction_symbol = match msg.direction {
         MessageDirection::ToServer => "→ TO SERVER".green().to_string(),
         MessageDirection::ToClient => "← TO CLIENT".blue().to_string(),
@@ -539,11 +531,7 @@ async fn run_export(session_id: String, output: PathBuf, format: String) -> anyh
     };
 
     std::fs::write(&output, content)?;
-    println!(
-        "{} Exported to {}",
-        "Success:".green(),
-        output.display()
-    );
+    println!("{} Exported to {}", "Success:".green(), output.display());
     Ok(())
 }
 
@@ -583,12 +571,19 @@ async fn run_stats() -> anyhow::Result<()> {
 
     if !sessions.is_empty() {
         println!();
-        println!("  {} {}", "Avg Messages/Session:".dimmed(), total_messages / total_sessions);
+        println!(
+            "  {} {}",
+            "Avg Messages/Session:".dimmed(),
+            total_messages / total_sessions
+        );
 
         // Top servers
-        let mut server_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut server_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         for session in &sessions {
-            *server_counts.entry(session.server_name.clone()).or_insert(0) += 1;
+            *server_counts
+                .entry(session.server_name.clone())
+                .or_insert(0) += 1;
         }
 
         let mut servers: Vec<_> = server_counts.into_iter().collect();
@@ -605,7 +600,10 @@ async fn run_stats() -> anyhow::Result<()> {
 }
 
 /// Find a session by ID or name
-fn find_session(storage: &SessionStorage, id_or_name: &str) -> Result<RecordedSession, anyhow::Error> {
+fn find_session(
+    storage: &SessionStorage,
+    id_or_name: &str,
+) -> Result<RecordedSession, anyhow::Error> {
     // Try loading by exact ID first
     if let Ok(session) = storage.load(id_or_name) {
         return Ok(session);

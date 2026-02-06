@@ -288,10 +288,7 @@ impl SessionReplayer {
     }
 
     /// Run the replay, sending events to a channel
-    pub async fn run(
-        mut self,
-        tx: mpsc::Sender<ReplayEvent>,
-    ) -> Result<usize, SessionRecordError> {
+    pub async fn run(mut self, tx: mpsc::Sender<ReplayEvent>) -> Result<usize, SessionRecordError> {
         let total = self.filtered_indices.len();
 
         // Send started event

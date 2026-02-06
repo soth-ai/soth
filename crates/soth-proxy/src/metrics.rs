@@ -2,7 +2,7 @@
 //!
 //! Provides counters, gauges, and histograms for monitoring proxy health and performance.
 
-use metrics::{counter, gauge, histogram, describe_counter, describe_gauge, describe_histogram};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
 use std::time::Duration;
@@ -14,18 +14,20 @@ static PROMETHEUS_HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
 ///
 /// Call this once at startup. Returns the handle for rendering metrics.
 pub fn init_metrics() -> PrometheusHandle {
-    PROMETHEUS_HANDLE.get_or_init(|| {
-        let handle = PrometheusBuilder::new()
-            .install_recorder()
-            .expect("Failed to install Prometheus recorder");
+    PROMETHEUS_HANDLE
+        .get_or_init(|| {
+            let handle = PrometheusBuilder::new()
+                .install_recorder()
+                .expect("Failed to install Prometheus recorder");
 
-        // Describe all metrics
-        describe_counters();
-        describe_gauges();
-        describe_histograms();
+            // Describe all metrics
+            describe_counters();
+            describe_gauges();
+            describe_histograms();
 
-        handle
-    }).clone()
+            handle
+        })
+        .clone()
 }
 
 /// Get the Prometheus handle (must call init_metrics first)
@@ -68,14 +70,8 @@ fn describe_counters() {
         RESPONSES_TOTAL,
         "Total number of responses returned by the proxy"
     );
-    describe_counter!(
-        ERRORS_TOTAL,
-        "Total number of errors encountered"
-    );
-    describe_counter!(
-        TOKENS_TOTAL,
-        "Total number of tokens processed"
-    );
+    describe_counter!(ERRORS_TOTAL, "Total number of errors encountered");
+    describe_counter!(TOKENS_TOTAL, "Total number of tokens processed");
     describe_counter!(
         RATE_LIMITED_TOTAL,
         "Total number of requests rejected due to rate limiting"
@@ -87,10 +83,7 @@ fn describe_counters() {
 }
 
 fn describe_gauges() {
-    describe_gauge!(
-        ACTIVE_CONNECTIONS,
-        "Current number of active connections"
-    );
+    describe_gauge!(ACTIVE_CONNECTIONS, "Current number of active connections");
     describe_gauge!(
         CIRCUIT_BREAKER_STATE,
         "Circuit breaker state (0=closed, 1=half-open, 2=open)"
@@ -98,14 +91,8 @@ fn describe_gauges() {
 }
 
 fn describe_histograms() {
-    describe_histogram!(
-        REQUEST_DURATION,
-        "Request duration in seconds"
-    );
-    describe_histogram!(
-        UPSTREAM_LATENCY,
-        "Upstream server latency in seconds"
-    );
+    describe_histogram!(REQUEST_DURATION, "Request duration in seconds");
+    describe_histogram!(UPSTREAM_LATENCY, "Upstream server latency in seconds");
 }
 
 // === Recording Functions ===
@@ -135,7 +122,8 @@ pub fn record_tokens(provider: &str, model: &str, token_type: &str, count: u64) 
         "provider" => provider.to_string(),
         "model" => model.to_string(),
         "type" => token_type.to_string()
-    ).increment(count);
+    )
+    .increment(count);
 }
 
 /// Record a rate-limited request
@@ -144,7 +132,8 @@ pub fn record_rate_limited(provider: &str, key: &str) {
         RATE_LIMITED_TOTAL,
         "provider" => provider.to_string(),
         "key" => key.to_string()
-    ).increment(1);
+    )
+    .increment(1);
 }
 
 /// Record a circuit breaker trip
@@ -175,14 +164,12 @@ pub fn set_circuit_breaker_state(provider: &str, state: CircuitState) {
 
 /// Record request duration
 pub fn record_request_duration(provider: &str, duration: Duration) {
-    histogram!(REQUEST_DURATION, "provider" => provider.to_string())
-        .record(duration.as_secs_f64());
+    histogram!(REQUEST_DURATION, "provider" => provider.to_string()).record(duration.as_secs_f64());
 }
 
 /// Record upstream latency
 pub fn record_upstream_latency(provider: &str, duration: Duration) {
-    histogram!(UPSTREAM_LATENCY, "provider" => provider.to_string())
-        .record(duration.as_secs_f64());
+    histogram!(UPSTREAM_LATENCY, "provider" => provider.to_string()).record(duration.as_secs_f64());
 }
 
 /// Circuit breaker states

@@ -78,15 +78,11 @@ impl Theme {
     }
 
     pub fn title_style(&self) -> Style {
-        Style::default()
-            .fg(self.fg)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.fg).add_modifier(Modifier::BOLD)
     }
 
     pub fn header_style(&self) -> Style {
-        Style::default()
-            .fg(self.info)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.info).add_modifier(Modifier::BOLD)
     }
 
     pub fn highlight_style(&self) -> Style {

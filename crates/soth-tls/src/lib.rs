@@ -28,5 +28,5 @@ pub mod sni;
 pub use ca::CertificateAuthority;
 pub use cert_cache::CertCache;
 pub use cert_gen::CertGenerator;
-pub use error::{TlsError, Result};
+pub use error::{Result, TlsError};
 pub use sni::extract_sni;

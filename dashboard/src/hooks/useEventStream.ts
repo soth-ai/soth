@@ -38,8 +38,7 @@ export function useEventStream(
       try {
         // Use the same host but with WebSocket protocol
         const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        // Connect to the Rust API backend (port 3001)
-        const wsUrl = `${wsProtocol}//localhost:3001/api/events/stream`;
+        const wsUrl = `${wsProtocol}//${window.location.host}/api/events/stream`;
 
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;

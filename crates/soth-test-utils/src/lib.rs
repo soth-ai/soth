@@ -10,6 +10,6 @@ pub mod mock_mcp;
 pub mod overhead;
 pub mod scenarios;
 
-pub use mock_mcp::{MockMcpServer, MockTool, LatencyConfig};
-pub use overhead::{measure_overhead, OverheadMeasurement, LatencyStats};
+pub use mock_mcp::{LatencyConfig, MockMcpServer, MockTool};
+pub use overhead::{measure_overhead, LatencyStats, OverheadMeasurement};
 pub use scenarios::*;

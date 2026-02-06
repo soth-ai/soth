@@ -7,16 +7,16 @@
 //! - Observation/logging
 //! - Budget tracking
 
-pub mod middleware;
-pub mod identity;
-pub mod policy;
-pub mod forward;
-pub mod observe;
 pub mod budget;
+pub mod forward;
+pub mod identity;
+pub mod middleware;
+pub mod observe;
+pub mod policy;
 
-pub use middleware::{Pipeline, PipelineBuilder};
-pub use identity::IdentityLayer;
-pub use policy::PolicyLayer;
-pub use forward::ForwardLayer;
-pub use observe::ObserveLayer;
 pub use budget::BudgetLayer;
+pub use forward::ForwardLayer;
+pub use identity::IdentityLayer;
+pub use middleware::{Pipeline, PipelineBuilder};
+pub use observe::ObserveLayer;
+pub use policy::PolicyLayer;

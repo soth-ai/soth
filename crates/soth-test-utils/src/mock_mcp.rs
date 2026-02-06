@@ -202,10 +202,7 @@ impl MockMcpServer {
     /// Process a JSON-RPC request and return a response
     ///
     /// Returns `None` for notifications (no id).
-    pub async fn process(
-        &self,
-        request: &JsonRpcRequest,
-    ) -> Option<JsonRpcResponse> {
+    pub async fn process(&self, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
         // Notifications don't get responses
         if request.id.is_none() {
             return None;
@@ -256,10 +253,7 @@ impl MockMcpServer {
                 JsonRpcResponse::success(id.clone(), json!({ "tools": tools }))
             }
             "tools/call" => {
-                let tool_name = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
                 if let Some(tool) = self.tools.get(tool_name) {
                     // Apply tool-specific latency if set

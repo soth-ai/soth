@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use soth_core::error::Result;
 use soth_core::types::policy::{EvaluationResult, PolicyData, PolicyDecision, PolicyInput};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,8 @@ pub struct PolicyEngine {
     cache: Arc<DecisionCache>,
     /// Statistics
     stats: RwLock<EngineStats>,
+    /// Monotonic version for active policy artifacts/data.
+    active_policy_version: AtomicU64,
 }
 
 /// Engine statistics
@@ -76,6 +79,7 @@ impl PolicyEngine {
             modules: RwLock::new(HashMap::new()),
             policy_data: RwLock::new(PolicyData::default()),
             stats: RwLock::new(EngineStats::default()),
+            active_policy_version: AtomicU64::new(1),
         }
     }
 
@@ -90,6 +94,7 @@ impl PolicyEngine {
             modules: RwLock::new(HashMap::new()),
             policy_data: RwLock::new(PolicyData::default()),
             stats: RwLock::new(EngineStats::default()),
+            active_policy_version: AtomicU64::new(1),
         }
     }
 
@@ -109,6 +114,7 @@ impl PolicyEngine {
         *m = modules;
         // Invalidate cache when modules change
         self.cache.invalidate();
+        self.bump_policy_version();
         Ok(())
     }
 
@@ -118,7 +124,20 @@ impl PolicyEngine {
         *d = data;
         // Invalidate cache when data changes
         self.cache.invalidate();
+        self.bump_policy_version();
         Ok(())
+    }
+
+    /// Get current active policy version.
+    pub fn active_policy_version(&self) -> String {
+        format!(
+            "v{}",
+            self.active_policy_version.load(Ordering::Relaxed)
+        )
+    }
+
+    fn bump_policy_version(&self) {
+        self.active_policy_version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Evaluate a policy decision
@@ -127,6 +146,7 @@ impl PolicyEngine {
 
         // If disabled, allow everything
         if !self.config.enabled {
+            let policy_version = self.active_policy_version();
             return Ok(EvaluationResult {
                 decision: PolicyDecision {
                     allow: true,
@@ -138,12 +158,22 @@ impl PolicyEngine {
                 cache_hit: false,
                 cache_tier: String::new(),
                 policy_mode: self.config.mode.clone(),
+                policy_version,
             });
+        }
+
+        // Fail closed if policy modules were loaded but module execution runtime
+        // is not wired into this engine implementation.
+        if !self.modules.read().is_empty() {
+            return Err(soth_core::error::SothError::PolicyEvaluation(
+                "Loaded policy modules cannot be executed by current runtime".to_string(),
+            ));
         }
 
         // Check cache
         let (cached, hit, tier) = self.cache.get(input);
         if hit {
+            let policy_version = self.active_policy_version();
             return Ok(EvaluationResult {
                 decision: cached.unwrap(),
                 input: input.clone(),
@@ -151,6 +181,7 @@ impl PolicyEngine {
                 cache_hit: true,
                 cache_tier: tier,
                 policy_mode: self.config.mode.clone(),
+                policy_version,
             });
         }
 
@@ -177,6 +208,8 @@ impl PolicyEngine {
         // Cache the result
         self.cache.set(input, &decision);
 
+        let policy_version = self.active_policy_version();
+
         Ok(EvaluationResult {
             decision,
             input: input.clone(),
@@ -184,6 +217,7 @@ impl PolicyEngine {
             cache_hit: false,
             cache_tier: String::new(),
             policy_mode: self.config.mode.clone(),
+            policy_version,
         })
     }
 
@@ -274,7 +308,7 @@ impl PolicyEngine {
                 }
             } else {
                 return Ok(PolicyDecision::deny(vec![
-                    "identity required (allowed_dids policy)".to_string()
+                    "identity required (allowed_dids policy)".to_string(),
                 ]));
             }
         }
@@ -352,7 +386,10 @@ mod tests {
         let result = engine.evaluate(&input).unwrap();
 
         assert!(result.decision.allow);
-        assert_eq!(result.decision.matched_rule, Some("policy_disabled".to_string()));
+        assert_eq!(
+            result.decision.matched_rule,
+            Some("policy_disabled".to_string())
+        );
     }
 
     #[test]
@@ -454,5 +491,14 @@ mod tests {
         let result2 = engine.evaluate(&input).unwrap();
         assert!(result2.cache_hit);
         assert_eq!(result2.cache_tier, "L1");
+    }
+
+    #[test]
+    fn test_policy_version_increments_on_data_update() {
+        let engine = PolicyEngine::new();
+        assert_eq!(engine.active_policy_version(), "v1");
+
+        engine.set_policy_data(PolicyData::default()).unwrap();
+        assert_eq!(engine.active_policy_version(), "v2");
     }
 }

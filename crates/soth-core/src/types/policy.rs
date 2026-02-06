@@ -2,10 +2,10 @@
 //!
 //! Defines policy input and decision types for OPA evaluation.
 
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
-use std::collections::HashMap;
 use crate::types::identity::{AgentContext, IdentityContext};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Policy input structure sent to OPA for evaluation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +240,9 @@ pub struct EvaluationResult {
 
     /// Policy mode: "audit" or "enforce"
     pub policy_mode: String,
+
+    /// Active policy artifact/data version used for this decision.
+    pub policy_version: String,
 }
 
 /// Builder for constructing PolicyInput
