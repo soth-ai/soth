@@ -10,6 +10,7 @@ use http_body_util::{BodyExt, Full, StreamBody};
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{Request, Response},
+    hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoServerBuilder},
     rcgen::{Issuer, KeyPair},
     rustls::crypto::aws_lc_rs,
     tokio_tungstenite::tungstenite::Message,
@@ -2053,10 +2054,22 @@ where
     info!("  AI domains -> MITM intercept");
     info!("  Other domains -> blind tunnel");
 
+    // ChatGPT web requests can carry extremely large sentinel/auth headers.
+    // Raise parser budgets so requests are accepted and then sanitized in handler logic.
+    let mut server = AutoServerBuilder::new(TokioExecutor::new());
+    server
+        .http1()
+        .max_headers(512)
+        .max_buf_size(1024 * 1024)
+        .title_case_headers(true)
+        .preserve_header_case(true);
+    server.http2().max_header_list_size(262_144);
+
     let proxy = Proxy::builder()
         .with_addr(listen_addr)
         .with_ca(ca)
         .with_rustls_connector(aws_lc_rs::default_provider())
+        .with_server(server)
         .with_http_handler(handler)
         .with_websocket_handler(ws_handler)
         .with_graceful_shutdown(shutdown)
@@ -2423,5 +2436,17 @@ mod tests {
         assert!(is_chat_ui_host("auth.openai.com"));
         assert!(!is_chat_ui_host("api.openai.com"));
         assert!(!is_chat_ui_host("example.com"));
+    }
+
+    #[test]
+    fn test_custom_server_builder_accepts_large_headers_config() {
+        let mut server = AutoServerBuilder::new(TokioExecutor::new());
+        server
+            .http1()
+            .max_headers(512)
+            .max_buf_size(1024 * 1024)
+            .title_case_headers(true)
+            .preserve_header_case(true);
+        server.http2().max_header_list_size(262_144);
     }
 }
