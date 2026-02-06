@@ -512,7 +512,7 @@ pub struct StorageConfig {
 }
 
 fn default_storage_backend() -> String {
-    "local".to_string()
+    "sqlite".to_string()
 }
 
 fn default_storage_path() -> PathBuf {
@@ -795,126 +795,98 @@ fn default_intercept_hosts() -> Vec<String> {
     vec![
         // ===== OpenAI / ChatGPT =====
         "api.openai.com".to_string(),
-        "*.openai.azure.com".to_string(),  // Azure OpenAI
-        "chatgpt.com".to_string(),         // ChatGPT web app
-        "*.chatgpt.com".to_string(),       // ChatGPT WebSocket (ws.chatgpt.com)
-
+        "*.openai.azure.com".to_string(), // Azure OpenAI
+        "chatgpt.com".to_string(),        // ChatGPT web app
+        "*.chatgpt.com".to_string(),      // ChatGPT WebSocket (ws.chatgpt.com)
         // ===== Anthropic =====
         "api.anthropic.com".to_string(),
-        "*.anthropic.com".to_string(),  // Claude Desktop uses a-api, statsig, s-cdn subdomains
-        "claude.ai".to_string(),        // Claude Desktop app
-        "*.claude.ai".to_string(),      // Claude Desktop WebSocket connections
-
+        "*.anthropic.com".to_string(), // Claude Desktop uses a-api, statsig, s-cdn subdomains
+        "claude.ai".to_string(),       // Claude Desktop app
+        "*.claude.ai".to_string(),     // Claude Desktop WebSocket connections
         // ===== Google =====
-        "generativelanguage.googleapis.com".to_string(),  // Gemini API
-        "aiplatform.googleapis.com".to_string(),          // Vertex AI
-        "*-aiplatform.googleapis.com".to_string(),        // Regional
+        "generativelanguage.googleapis.com".to_string(), // Gemini API
+        "aiplatform.googleapis.com".to_string(),         // Vertex AI
+        "*-aiplatform.googleapis.com".to_string(),       // Regional
         "*.aiplatform.googleapis.com".to_string(),
-
         // ===== AWS Bedrock =====
         "bedrock.*.amazonaws.com".to_string(),
         "bedrock-runtime.*.amazonaws.com".to_string(),
-
         // ===== Microsoft/GitHub =====
         "api.githubcopilot.com".to_string(),
         "copilot-proxy.githubusercontent.com".to_string(),
-        "*.ingest.monitor.azure.com".to_string(),  // Azure AI telemetry
-
+        "*.ingest.monitor.azure.com".to_string(), // Azure AI telemetry
         // ===== Mistral =====
         "api.mistral.ai".to_string(),
         "*.mistral.ai".to_string(),
-
         // ===== Cohere =====
         "api.cohere.ai".to_string(),
         "api.cohere.com".to_string(),
         "*.cohere.ai".to_string(),
-
         // ===== xAI (Grok) =====
         "api.x.ai".to_string(),
         "*.x.ai".to_string(),
-
         // ===== Groq =====
         "api.groq.com".to_string(),
         "*.groq.com".to_string(),
-
         // ===== Together AI =====
         "api.together.xyz".to_string(),
         "*.together.xyz".to_string(),
-
         // ===== Perplexity =====
         "api.perplexity.ai".to_string(),
         "*.perplexity.ai".to_string(),
-
         // ===== Replicate =====
         "api.replicate.com".to_string(),
-        "*.replicate.delivery".to_string(),  // Model delivery
-
+        "*.replicate.delivery".to_string(), // Model delivery
         // ===== Hugging Face =====
         "*.huggingface.co".to_string(),
-        "*.hf.co".to_string(),  // Short domain
-
+        "*.hf.co".to_string(), // Short domain
         // ===== Fireworks AI =====
         "api.fireworks.ai".to_string(),
         "*.fireworks.ai".to_string(),
-
         // ===== DeepInfra =====
         "api.deepinfra.com".to_string(),
         "*.deepinfra.com".to_string(),
-
         // ===== AI21 Labs =====
         "api.ai21.com".to_string(),
         "*.ai21.com".to_string(),
-
         // ===== Stability AI =====
         "api.stability.ai".to_string(),
         "*.stability.ai".to_string(),
-
         // ===== OpenRouter =====
         "openrouter.ai".to_string(),
         "*.openrouter.ai".to_string(),
-
         // ===== Anyscale =====
         "*.anyscale.com".to_string(),
-
         // ===== Voyage AI (embeddings) =====
         "api.voyageai.com".to_string(),
-
         // ===== Nvidia =====
         "api.nvcf.nvidia.com".to_string(),
         "integrate.api.nvidia.com".to_string(),
-        "*.ngc.nvidia.com".to_string(),  // NGC containers
-
+        "*.ngc.nvidia.com".to_string(), // NGC containers
         // ===== IBM watsonx =====
         "*.watsonx.ai".to_string(),
         "*.ml.cloud.ibm.com".to_string(),
-
         // ===== Databricks =====
         "*.databricks.com".to_string(),
         "*.azuredatabricks.net".to_string(),
         "*.cloud.databricks.com".to_string(),
-
         // ===== Snowflake Cortex =====
         "*.snowflakecomputing.com".to_string(),
-
         // ===== LangChain / LangSmith =====
         "*.langchain.com".to_string(),
         "*.langsmith.com".to_string(),
-
         // ===== Writer =====
         "api.writer.com".to_string(),
         "*.writer.com".to_string(),
-
         // ===== Reka =====
         "api.reka.ai".to_string(),
-
         // ===== Code Completion Tools =====
         "api2.cursor.sh".to_string(),
         "*.cursor.sh".to_string(),
         "api.vercel.ai".to_string(),
         "*.tabnine.com".to_string(),
         "*.codeium.com".to_string(),
-        "*.sourcegraph.com".to_string(),  // Cody
-
+        "*.sourcegraph.com".to_string(), // Cody
         // ===== Inference Platforms =====
         "*.modal.com".to_string(),
         "*.lepton.ai".to_string(),
@@ -926,12 +898,10 @@ fn default_intercept_hosts() -> Vec<String> {
         "*.sambanova.ai".to_string(),
         "*.octo.ai".to_string(),
         "*.octoml.ai".to_string(),
-
         // ===== Embedding Providers =====
         "api.jina.ai".to_string(),
         "*.jina.ai".to_string(),
         "api.mixedbread.ai".to_string(),
-
         // ===== Speech/Audio AI =====
         "api.elevenlabs.io".to_string(),
         "*.elevenlabs.io".to_string(),
@@ -939,52 +909,47 @@ fn default_intercept_hosts() -> Vec<String> {
         "*.assemblyai.com".to_string(),
         "api.deepgram.com".to_string(),
         "*.deepgram.com".to_string(),
-        "api.openai.com".to_string(),  // Whisper via OpenAI
-
+        "api.openai.com".to_string(), // Whisper via OpenAI
         // ===== Image Generation =====
         "api.leonardo.ai".to_string(),
         "*.leonardo.ai".to_string(),
         "api.getimg.ai".to_string(),
         "*.clipdrop.co".to_string(),
         "api.ideogram.ai".to_string(),
-        "api.black-forest-labs.ai".to_string(),  // FLUX
-
+        "api.black-forest-labs.ai".to_string(), // FLUX
         // ===== Vector DBs =====
         "*.pinecone.io".to_string(),
         "*.weaviate.cloud".to_string(),
         "*.qdrant.io".to_string(),
         "*.qdrant.cloud".to_string(),
         "*.milvus.io".to_string(),
-        "*.zilliz.com".to_string(),  // Managed Milvus
+        "*.zilliz.com".to_string(), // Managed Milvus
         "*.chroma.com".to_string(),
         "*.turbopuffer.com".to_string(),
-
         // ===== AI Agents / Orchestration =====
-        "api.e2b.dev".to_string(),       // Code execution
+        "api.e2b.dev".to_string(), // Code execution
         "*.e2b.dev".to_string(),
         "*.relevanceai.com".to_string(),
         "*.dust.tt".to_string(),
-
         // ===== Enterprise AI =====
-        "*.scale.com".to_string(),        // Scale AI
+        "*.scale.com".to_string(), // Scale AI
         "*.enterprisedb.ai".to_string(),
         "*.vectara.io".to_string(),
         "*.forethought.ai".to_string(),
-
         // ===== China AI Providers =====
-        "api.moonshot.cn".to_string(),           // Moonshot (Kimi)
+        "api.moonshot.cn".to_string(), // Moonshot (Kimi)
         "*.moonshot.cn".to_string(),
-        "aip.baidubce.com".to_string(),          // Baidu ERNIE
+        "aip.baidubce.com".to_string(), // Baidu ERNIE
         "*.baidubce.com".to_string(),
-        "dashscope.aliyuncs.com".to_string(),    // Alibaba Qwen
+        "dashscope.aliyuncs.com".to_string(), // Alibaba Qwen
         "*.dashscope.aliyuncs.com".to_string(),
-        "open.bigmodel.cn".to_string(),          // Zhipu (GLM)
+        "open.bigmodel.cn".to_string(), // Zhipu (GLM)
         "*.bigmodel.cn".to_string(),
-        "api.minimax.chat".to_string(),          // MiniMax
-        "*.sensecore.cn".to_string(),            // SenseTime
-        "*.baichuan-ai.com".to_string(),         // Baichuan
-        "*.01.ai".to_string(),                   // Yi (01.AI)
-        "*.deepseek.com".to_string(),            // DeepSeek
+        "api.minimax.chat".to_string(),  // MiniMax
+        "*.sensecore.cn".to_string(),    // SenseTime
+        "*.baichuan-ai.com".to_string(), // Baichuan
+        "*.01.ai".to_string(),           // Yi (01.AI)
+        "*.deepseek.com".to_string(),    // DeepSeek
     ]
 }
 
@@ -1006,12 +971,16 @@ impl Default for HostFilterConfig {
 impl HostFilterConfig {
     /// Check if a host should be intercepted (full MITM)
     pub fn should_intercept(&self, host: &str) -> bool {
-        self.intercept.iter().any(|pattern| Self::matches_pattern(host, pattern))
+        self.intercept
+            .iter()
+            .any(|pattern| Self::matches_pattern(host, pattern))
     }
 
     /// Check if a host is blocked (rejected with 403)
     pub fn is_blocked(&self, host: &str) -> bool {
-        self.block.iter().any(|pattern| Self::matches_pattern(host, pattern))
+        self.block
+            .iter()
+            .any(|pattern| Self::matches_pattern(host, pattern))
     }
 
     /// Match a host against a pattern with wildcard support
@@ -1028,8 +997,8 @@ impl HostFilterConfig {
 
         // Find the wildcard position
         if let Some(star_pos) = pattern.find('*') {
-            let prefix = &pattern[..star_pos];      // Everything before *
-            let suffix = &pattern[star_pos + 1..];  // Everything after *
+            let prefix = &pattern[..star_pos]; // Everything before *
+            let suffix = &pattern[star_pos + 1..]; // Everything after *
 
             // Check if host matches prefix...suffix pattern
             if host.starts_with(prefix) && host.ends_with(suffix) {
@@ -1539,12 +1508,24 @@ upstream:
         let filter = HostFilterConfig::default();
 
         // AI domains should be intercepted
-        assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Intercept);
-        assert_eq!(filter.action_for_host("api.anthropic.com"), HostAction::Intercept);
-        assert_eq!(filter.action_for_host("generativelanguage.googleapis.com"), HostAction::Intercept);
+        assert_eq!(
+            filter.action_for_host("api.openai.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            filter.action_for_host("api.anthropic.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            filter.action_for_host("generativelanguage.googleapis.com"),
+            HostAction::Intercept
+        );
 
         // Non-AI domains should be tunneled (not blocked!)
-        assert_eq!(filter.action_for_host("random.example.com"), HostAction::Tunnel);
+        assert_eq!(
+            filter.action_for_host("random.example.com"),
+            HostAction::Tunnel
+        );
         assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
 
         // All should be "allowed" in selective mode (not blocked)
@@ -1573,10 +1554,10 @@ upstream:
     fn test_host_filter_wildcard_patterns() {
         let filter = HostFilterConfig {
             intercept: vec![
-                "api.openai.com".to_string(),           // Exact
-                "*.openai.azure.com".to_string(),       // Prefix wildcard
-                "bedrock.*.amazonaws.com".to_string(),  // Middle wildcard
-                "*.huggingface.co".to_string(),         // Prefix wildcard
+                "api.openai.com".to_string(),          // Exact
+                "*.openai.azure.com".to_string(),      // Prefix wildcard
+                "bedrock.*.amazonaws.com".to_string(), // Middle wildcard
+                "*.huggingface.co".to_string(),        // Prefix wildcard
             ],
             allow: vec![],
             block: vec![],
@@ -1682,8 +1663,14 @@ upstream:
         };
 
         assert_eq!(filter.action_for_host("malware.com"), HostAction::Block);
-        assert_eq!(filter.action_for_host("anything.bad.com"), HostAction::Block);
-        assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Intercept);
+        assert_eq!(
+            filter.action_for_host("anything.bad.com"),
+            HostAction::Block
+        );
+        assert_eq!(
+            filter.action_for_host("api.openai.com"),
+            HostAction::Intercept
+        );
         assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
     }
 
@@ -1710,15 +1697,36 @@ forward_proxy:
         assert_eq!(config.forward_proxy.address, "0.0.0.0");
 
         // AI domains intercepted
-        assert_eq!(config.forward_proxy.hosts.action_for_host("api.openai.com"), HostAction::Intercept);
-        assert_eq!(config.forward_proxy.hosts.action_for_host("api.anthropic.com"), HostAction::Intercept);
-        assert_eq!(config.forward_proxy.hosts.action_for_host("foo.openai.azure.com"), HostAction::Intercept);
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("api.openai.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            config
+                .forward_proxy
+                .hosts
+                .action_for_host("api.anthropic.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            config
+                .forward_proxy
+                .hosts
+                .action_for_host("foo.openai.azure.com"),
+            HostAction::Intercept
+        );
 
         // Blocked domains blocked
-        assert_eq!(config.forward_proxy.hosts.action_for_host("malware.com"), HostAction::Block);
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("malware.com"),
+            HostAction::Block
+        );
 
         // Other domains tunneled
-        assert_eq!(config.forward_proxy.hosts.action_for_host("google.com"), HostAction::Tunnel);
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("google.com"),
+            HostAction::Tunnel
+        );
     }
 
     #[test]
@@ -1737,11 +1745,20 @@ forward_proxy:
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
 
         // Allowed hosts intercepted
-        assert_eq!(config.forward_proxy.hosts.action_for_host("api.openai.com"), HostAction::Intercept);
-        assert_eq!(config.forward_proxy.hosts.action_for_host("custom.api.com"), HostAction::Intercept);
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("api.openai.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("custom.api.com"),
+            HostAction::Intercept
+        );
 
         // Other hosts blocked (whitelist mode)
-        assert_eq!(config.forward_proxy.hosts.action_for_host("other.com"), HostAction::Block);
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("other.com"),
+            HostAction::Block
+        );
     }
 
     #[test]
@@ -1829,7 +1846,10 @@ production:
         // Circuit breaker
         assert!(config.production.circuit_breaker.enabled);
         assert_eq!(config.production.circuit_breaker.failure_threshold, 3);
-        assert_eq!(config.production.circuit_breaker.open_duration, Duration::from_secs(60));
+        assert_eq!(
+            config.production.circuit_breaker.open_duration,
+            Duration::from_secs(60)
+        );
         assert_eq!(config.production.circuit_breaker.success_threshold, 2);
 
         // Health
@@ -1839,12 +1859,30 @@ production:
         assert_eq!(config.production.health.metrics_path, "/prom");
 
         // Connection limits
-        assert_eq!(config.production.connection_limits.max_total_connections, 500);
-        assert_eq!(config.production.connection_limits.max_connections_per_host, 50);
-        assert_eq!(config.production.connection_limits.idle_timeout, Duration::from_secs(120));
-        assert_eq!(config.production.connection_limits.connect_timeout, Duration::from_secs(5));
-        assert_eq!(config.production.connection_limits.request_timeout, Duration::from_secs(600));
-        assert_eq!(config.production.connection_limits.tls_timeout, Duration::from_secs(15));
+        assert_eq!(
+            config.production.connection_limits.max_total_connections,
+            500
+        );
+        assert_eq!(
+            config.production.connection_limits.max_connections_per_host,
+            50
+        );
+        assert_eq!(
+            config.production.connection_limits.idle_timeout,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            config.production.connection_limits.connect_timeout,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.production.connection_limits.request_timeout,
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            config.production.connection_limits.tls_timeout,
+            Duration::from_secs(15)
+        );
     }
 
     #[test]

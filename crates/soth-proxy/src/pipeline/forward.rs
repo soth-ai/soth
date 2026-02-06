@@ -52,10 +52,7 @@ pub struct ForwardLayer {
 
 impl ForwardLayer {
     /// Create a new forward layer
-    pub fn new(
-        config: ForwardConfig,
-        outgoing_tx: mpsc::Sender<JsonRpcMessage>,
-    ) -> Self {
+    pub fn new(config: ForwardConfig, outgoing_tx: mpsc::Sender<JsonRpcMessage>) -> Self {
         Self {
             config,
             outgoing_tx,
@@ -192,9 +189,7 @@ impl Layer for ForwardLayer {
                         let id = req.id.clone().unwrap_or(RequestId::Null);
 
                         match self.forward_request(req).await {
-                            Ok(response) => {
-                                LayerResult::Response(response)
-                            }
+                            Ok(response) => LayerResult::Response(response),
                             Err(ProxyError::Timeout(_)) => {
                                 error_response(id, JsonRpcError::request_timeout())
                             }
@@ -229,9 +224,7 @@ impl Layer for PassthroughLayer {
         _ctx: &mut RequestContext,
         message: JsonRpcMessage,
     ) -> Pin<Box<dyn Future<Output = LayerResult> + Send + '_>> {
-        Box::pin(async move {
-            LayerResult::Continue(message)
-        })
+        Box::pin(async move { LayerResult::Continue(message) })
     }
 
     fn name(&self) -> &'static str {
@@ -247,11 +240,7 @@ mod tests {
     async fn test_passthrough_layer() {
         let layer = PassthroughLayer;
         let mut ctx = RequestContext::new("session-1");
-        let msg = JsonRpcMessage::Request(JsonRpcRequest::new(
-            "test",
-            None,
-            RequestId::Number(1),
-        ));
+        let msg = JsonRpcMessage::Request(JsonRpcRequest::new("test", None, RequestId::Number(1)));
 
         let result = layer.process(&mut ctx, msg).await;
         assert!(matches!(result, LayerResult::Continue(_)));

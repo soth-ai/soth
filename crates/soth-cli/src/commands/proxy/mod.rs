@@ -64,10 +64,6 @@ pub enum ProxyCommands {
         /// Config file path
         #[arg(short, long)]
         config: Option<PathBuf>,
-
-        /// Use legacy ForwardProxyTransport instead of hudsucker
-        #[arg(long)]
-        legacy: bool,
     },
 
     /// Output shell environment variables for proxy configuration
@@ -144,45 +140,19 @@ pub enum CircuitAction {
 /// Run proxy command
 pub async fn run(cmd: ProxyCommands) -> anyhow::Result<()> {
     match cmd {
-        ProxyCommands::On { port } => {
-            system::enable(port).await
-        }
-        ProxyCommands::Off => {
-            system::disable().await
-        }
-        ProxyCommands::SetupCa { no_trust, output } => {
-            setup_ca::run(output, no_trust).await
-        }
-        ProxyCommands::Start { port, config, legacy } => {
-            start::run_with_mode(port, config, legacy).await
-        }
-        ProxyCommands::Env { shell, ca_only } => {
-            env::run(&shell, ca_only).await
-        }
-        ProxyCommands::Status => {
-            status::run().await
-        }
-        ProxyCommands::CaInfo => {
-            ca_info::run().await
-        }
-        ProxyCommands::Metrics { config, raw } => {
-            metrics::run(config, raw).await
-        }
-        ProxyCommands::Connections { config } => {
-            connections::run(config).await
-        }
-        ProxyCommands::Circuit { action } => {
-            match action {
-                CircuitAction::Status { config } => {
-                    circuit::run_status(config).await
-                }
-                CircuitAction::Reset { host, config } => {
-                    circuit::run_reset(host, config).await
-                }
-            }
-        }
-        ProxyCommands::RateLimit { config } => {
-            ratelimit::run(config).await
-        }
+        ProxyCommands::On { port } => system::enable(port).await,
+        ProxyCommands::Off => system::disable().await,
+        ProxyCommands::SetupCa { no_trust, output } => setup_ca::run(output, no_trust).await,
+        ProxyCommands::Start { port, config } => start::run(port, config).await,
+        ProxyCommands::Env { shell, ca_only } => env::run(&shell, ca_only).await,
+        ProxyCommands::Status => status::run().await,
+        ProxyCommands::CaInfo => ca_info::run().await,
+        ProxyCommands::Metrics { config, raw } => metrics::run(config, raw).await,
+        ProxyCommands::Connections { config } => connections::run(config).await,
+        ProxyCommands::Circuit { action } => match action {
+            CircuitAction::Status { config } => circuit::run_status(config).await,
+            CircuitAction::Reset { host, config } => circuit::run_reset(host, config).await,
+        },
+        ProxyCommands::RateLimit { config } => ratelimit::run(config).await,
     }
 }

@@ -7,6 +7,8 @@ import {
   Check,
   FileJs,
   ArrowRight,
+  ArrowUp,
+  ArrowDown,
   WarningCircle,
   Terminal,
   ShieldSlash,
@@ -19,6 +21,7 @@ import {
 import { toast } from "sonner";
 import {
   useObservabilityStore,
+  decodeEditorContent,
   parseLogMessage,
   findCorrelatedRequest,
   calculateLatency,
@@ -27,15 +30,6 @@ import {
 } from "@/store/observability";
 import { Button } from "@/components/ui/button";
 import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
-
-function formatJSON(jsonStr: string): string {
-  try {
-    const parsed = JSON.parse(jsonStr);
-    return JSON.stringify(parsed, null, 2);
-  } catch {
-    return jsonStr;
-  }
-}
 
 interface Insight {
   icon: React.ElementType;
@@ -137,8 +131,10 @@ function WhyThisMatters({
 export function Inspector() {
   const logs = useObservabilityStore((state) => state.logs);
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
+  const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
   const selectLog = useObservabilityStore((state) => state.selectLog);
   const [copied, setCopied] = useState(false);
+  const [activeTab, setActiveTab] = useState<"request" | "response">("request");
 
   // Memoize selected log lookup
   const selectedLog = useMemo(
@@ -146,10 +142,39 @@ export function Inspector() {
     [logs, selectedLogId]
   );
 
+  const hasPairedContent = useMemo(
+    () => !!(selectedLog?.request_content || selectedLog?.response_content),
+    [selectedLog]
+  );
+
+  const getEmptyResponsePlaceholder = useCallback(() => {
+    if (!selectedLog) return "[no response body captured]";
+    const method = selectedLog.method || "request";
+    const status = selectedLog.status_code ?? "unknown";
+    if (method.toLowerCase().includes("/backend-api/codex/responses")) {
+      return `[no HTTP response body captured for ${method} (HTTP ${status}) - Codex output may be streamed via WebSocket]`;
+    }
+    return `[no HTTP response body captured for ${method} (HTTP ${status})]`;
+  }, [selectedLog]);
+
+  const displayContent = useMemo(() => {
+    if (!selectedLog) return "";
+    if (!hasPairedContent) return selectedLog.content;
+    if (activeTab === "request") return selectedLog.request_content || "";
+    return selectedLog.response_content || getEmptyResponsePlaceholder();
+  }, [selectedLog, hasPairedContent, activeTab, getEmptyResponsePlaceholder]);
+
+  const editorPayload = useMemo(
+    () => decodeEditorContent(displayContent),
+    [displayContent]
+  );
+  const isJsonEditor = editorPayload.language === "json";
+
   // Check message type
   const isRawMessage = selectedLog?.message_type === "raw";
   const isStderrMessage = selectedLog?.message_type === "stderr";
-  const isNonJsonRpc = isRawMessage || isStderrMessage;
+  const showRawUi = !!isRawMessage && !isJsonEditor;
+  const isNonJsonRpc = isStderrMessage || showRawUi;
 
   // Parse and correlate
   const parsed = selectedLog && !isNonJsonRpc ? parseLogMessage(selectedLog) : null;
@@ -165,13 +190,27 @@ export function Inspector() {
   // Reset copied state when selection changes
   useEffect(() => {
     setCopied(false);
-  }, [selectedLog?.id]);
+    if (!selectedLog) return;
+    if (!hasPairedContent) {
+      setActiveTab("request");
+      return;
+    }
+    if (selectedLogPart === "request") {
+      setActiveTab("request");
+      return;
+    }
+    if (selectedLogPart === "response") {
+      setActiveTab("response");
+      return;
+    }
+    setActiveTab(selectedLog.response_content ? "response" : "request");
+  }, [selectedLog, selectedLogPart, hasPairedContent, selectedLog?.response_content]);
 
   const handleCopy = useCallback(async () => {
     if (!selectedLog) return;
 
     try {
-      await navigator.clipboard.writeText(selectedLog.content);
+      await navigator.clipboard.writeText(displayContent);
       setCopied(true);
       toast.success("JSON copied to clipboard", { duration: 2000 });
       setTimeout(() => setCopied(false), 2000);
@@ -179,18 +218,13 @@ export function Inspector() {
       console.error("Failed to copy:", err);
       toast.error("Failed to copy to clipboard", { duration: 3000 });
     }
-  }, [selectedLog]);
+  }, [selectedLog, displayContent]);
 
   const handleJumpToRequest = useCallback(() => {
     if (correlatedRequest) {
       selectLog(correlatedRequest.id);
     }
   }, [correlatedRequest, selectLog]);
-
-  // Formatted JSON for display
-  const formattedJSON = selectedLog
-    ? formatJSON(selectedLog.content)
-    : "";
 
   // Get latency color
   const getLatencyColor = (ms: number) => {
@@ -199,6 +233,12 @@ export function Inspector() {
     return "text-emerald-500";
   };
 
+  const effectiveDirection = hasPairedContent
+    ? activeTab === "response"
+      ? "out"
+      : "in"
+    : selectedLog?.direction;
+
   return (
     <div className="flex flex-col h-full bg-background border-l border-border">
       {/* Header */}
@@ -206,17 +246,45 @@ export function Inspector() {
         <div className="flex items-center gap-2">
           {isStderrMessage ? (
             <WarningCircle className="w-4 h-4 text-red-500" weight="fill" />
-          ) : isRawMessage ? (
+          ) : showRawUi ? (
             <Terminal className="w-4 h-4 text-amber-500" weight="duotone" />
           ) : (
             <FileJs className="w-4 h-4 text-accent" weight="duotone" />
           )}
           <h2 className="text-sm font-semibold text-foreground">
-            {isStderrMessage ? "Stderr Output" : isRawMessage ? "Raw Output" : "Inspector"}
+            {isStderrMessage ? "Stderr Output" : showRawUi ? "Raw Output" : "Inspector"}
           </h2>
         </div>
         {selectedLog && (
           <div className="flex items-center gap-2">
+            {hasPairedContent && (
+              <div className="flex items-center rounded-md border border-border overflow-hidden">
+                <button
+                  onClick={() => setActiveTab("request")}
+                  className={cn(
+                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors",
+                    activeTab === "request"
+                      ? "bg-cyan-500/20 text-cyan-500"
+                      : "text-muted-foreground hover:bg-muted"
+                  )}
+                >
+                  <ArrowDown className="w-3 h-3" weight="bold" />
+                  Request
+                </button>
+                <button
+                  onClick={() => setActiveTab("response")}
+                  className={cn(
+                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors border-l border-border",
+                    activeTab === "response"
+                      ? "bg-emerald-500/20 text-emerald-500"
+                      : "text-muted-foreground hover:bg-muted"
+                  )}
+                >
+                  <ArrowUp className="w-3 h-3" weight="bold" />
+                  Response
+                </button>
+              </div>
+            )}
             {/* Copy button */}
             <Button
               variant="ghost"
@@ -254,7 +322,7 @@ export function Inspector() {
                 </span>
               </div>
             )}
-            {isRawMessage && (
+            {showRawUi && (
               <div className="flex items-center gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-md mb-2">
                 <Terminal className="w-4 h-4 text-amber-500 flex-shrink-0" weight="duotone" />
                 <span className="text-xs text-amber-500">
@@ -306,10 +374,10 @@ export function Inspector() {
               <span
                 className={cn(
                   "inline-flex items-center px-1.5 py-0.5 rounded-md font-mono font-medium bg-secondary border border-border",
-                  selectedLog.direction === "in" ? "text-cyan-500" : "text-emerald-500"
+                  effectiveDirection === "in" ? "text-cyan-500" : "text-emerald-500"
                 )}
               >
-                {selectedLog.direction === "in" ? "Incoming" : "Outgoing"}
+                {effectiveDirection === "in" ? "Incoming" : "Outgoing"}
               </span>
             </div>
             <div className="flex items-center justify-between text-xs">
@@ -393,8 +461,8 @@ export function Inspector() {
           <div className="flex-1 overflow-hidden">
             <Editor
               height="100%"
-              defaultLanguage={isNonJsonRpc ? "plaintext" : "json"}
-              value={isNonJsonRpc ? selectedLog.content : formattedJSON}
+              language={editorPayload.language}
+              value={editorPayload.content}
               theme="vs-dark"
               options={{
                 readOnly: true,
@@ -405,7 +473,7 @@ export function Inspector() {
                 scrollBeyondLastLine: false,
                 automaticLayout: true,
                 wordWrap: "on",
-                folding: !isNonJsonRpc,
+                folding: editorPayload.language === "json",
                 renderLineHighlight: "all",
                 scrollbar: {
                   vertical: "auto",

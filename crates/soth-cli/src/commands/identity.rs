@@ -2,7 +2,7 @@
 
 use crate::IdentityCommands;
 use anyhow::Result;
-use soth_identity::{KeyPair, TrustStore, Did};
+use soth_identity::{Did, KeyPair, TrustStore};
 use std::path::PathBuf;
 use tokio::fs;
 
@@ -50,7 +50,10 @@ async fn generate_keypair(output: Option<PathBuf>) -> Result<()> {
     let private_key_bytes = keypair.private_key_bytes()?;
     let pem_content = format!(
         "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, private_key_bytes)
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            private_key_bytes
+        )
     );
     fs::write(&output_path, pem_content).await?;
 
@@ -140,10 +143,8 @@ async fn show_did(key_path: PathBuf) -> Result<()> {
         .filter(|line| !line.starts_with("-----"))
         .collect::<String>();
 
-    let key_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &base64_content,
-    )?;
+    let key_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &base64_content)?;
 
     // Load keypair
     let keypair = KeyPair::from_private_key_bytes(&key_bytes)?;

@@ -170,7 +170,10 @@ mod tests {
 
         router.register("test/method", |req| async move {
             let id = req.id.unwrap_or(RequestId::Null);
-            Ok(JsonRpcResponse::success(id, serde_json::json!({"status": "ok"})))
+            Ok(JsonRpcResponse::success(
+                id,
+                serde_json::json!({"status": "ok"}),
+            ))
         });
 
         let req = JsonRpcRequest::new("test/method", None, RequestId::Number(1));
@@ -197,7 +200,10 @@ mod tests {
 
         router.set_default(|req| async move {
             let id = req.id.unwrap_or(RequestId::Null);
-            Ok(JsonRpcResponse::success(id, serde_json::json!({"handled": "default"})))
+            Ok(JsonRpcResponse::success(
+                id,
+                serde_json::json!({"handled": "default"}),
+            ))
         });
 
         let req = JsonRpcRequest::new("any/method", None, RequestId::Number(1));

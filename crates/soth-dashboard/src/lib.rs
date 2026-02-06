@@ -13,7 +13,7 @@ pub mod server;
 pub mod state;
 pub mod websocket;
 
-pub use event_store::{AgentStats, AgentsSummary, EventsSummary, EventStore};
+pub use event_store::{AgentStats, AgentsSummary, EventStore, EventsSummary};
 pub use routes::{api_router, api_router_with_events, AppState};
 pub use server::DashboardServer;
 pub use state::{

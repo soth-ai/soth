@@ -53,9 +53,9 @@ pub use error::{ProxyError, Result};
 pub use pipeline::{
     BudgetLayer, ForwardLayer, IdentityLayer, ObserveLayer, Pipeline, PipelineBuilder, PolicyLayer,
 };
-pub use protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcError, RequestId};
-pub use rate_limit::{RateLimiter, RateLimitConfig, RateLimitResult};
+pub use protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
+pub use rate_limit::{RateLimitConfig, RateLimitResult, RateLimiter};
 pub use router::Router;
 pub use session::{Session, SessionManager, SessionStats};
-pub use shutdown::{ShutdownCoordinator, ShutdownResult, ConnectionGuard};
+pub use shutdown::{ConnectionGuard, ShutdownCoordinator, ShutdownResult};
 pub use transport::{Transport, TransportBuilder, TransportConfig, TransportType};

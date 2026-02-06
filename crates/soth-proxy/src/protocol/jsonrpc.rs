@@ -266,14 +266,16 @@ mod tests {
 
     #[test]
     fn test_notification() {
-        let notif = JsonRpcRequest::notification("progress", Some(serde_json::json!({"percent": 50})));
+        let notif =
+            JsonRpcRequest::notification("progress", Some(serde_json::json!({"percent": 50})));
         assert!(notif.is_notification());
         assert!(notif.id.is_none());
     }
 
     #[test]
     fn test_response_success() {
-        let resp = JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({"result": "ok"}));
+        let resp =
+            JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({"result": "ok"}));
         assert!(!resp.is_error());
     }
 

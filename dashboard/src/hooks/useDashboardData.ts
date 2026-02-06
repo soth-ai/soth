@@ -8,13 +8,13 @@ import type {
   AdvancedBudgetMetrics,
   ProxyMetrics,
   HealthResponse,
+  DashboardSnapshot,
   AgentsSummary,
 } from "@/types";
-
-const API_BASE = "/api";
+import { buildApiUrl } from "@/lib/endpoints";
 
 async function fetchJson<T>(endpoint: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${endpoint}`);
+  const response = await fetch(buildApiUrl(endpoint));
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
@@ -81,28 +81,21 @@ export function useAgentsData() {
   });
 }
 
+export function useDashboardSnapshot() {
+  return useQuery({
+    queryKey: ["snapshot"],
+    queryFn: () => fetchJson<ApiResponse<DashboardSnapshot>>("/snapshot"),
+    refetchInterval: 2000,
+  });
+}
+
 // Combined hook for all metrics
 export function useDashboardMetrics() {
   const health = useHealth();
-  const identity = useIdentityMetrics();
-  const policy = usePolicyMetrics();
-  const observe = useObserveMetrics();
-  const budget = useBudgetMetrics();
-  const proxy = useProxyMetrics();
+  const snapshot = useDashboardSnapshot();
 
-  const isLoading =
-    identity.isLoading ||
-    policy.isLoading ||
-    observe.isLoading ||
-    budget.isLoading ||
-    proxy.isLoading;
-
-  const isError =
-    identity.isError ||
-    policy.isError ||
-    observe.isError ||
-    budget.isError ||
-    proxy.isError;
+  const isLoading = snapshot.isLoading;
+  const isError = snapshot.isError;
 
   const isConnected = health.isSuccess && health.data?.status === "ok";
 
@@ -111,10 +104,10 @@ export function useDashboardMetrics() {
     isError,
     isConnected,
     uptime: health.data?.uptime_secs ?? 0,
-    identity: identity.data?.data,
-    policy: policy.data?.data,
-    observe: observe.data?.data,
-    budget: budget.data?.data,
-    proxy: proxy.data?.data,
+    identity: snapshot.data?.data.identity,
+    policy: snapshot.data?.data.policy,
+    observe: snapshot.data?.data.observe,
+    budget: snapshot.data?.data.budget,
+    proxy: snapshot.data?.data.proxy,
   };
 }

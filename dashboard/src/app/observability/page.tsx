@@ -1,24 +1,87 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Panel,
   PanelGroup,
   PanelResizeHandle,
 } from "react-resizable-panels";
-import { List, X, Funnel, MagnifyingGlass } from "@phosphor-icons/react";
+import { List, Funnel, MagnifyingGlass } from "@phosphor-icons/react";
 import { MessageStream, Inspector, Sidebar, CommandBar } from "@/components/observability";
 import { useObservabilityStore, type LogEntry } from "@/store/observability";
 import { useIsMobile } from "@/hooks/useMobile";
+import { useEventStream } from "@/hooks/useEventStream";
+import { buildApiUrl } from "@/lib/endpoints";
+import type { ApiResponse, EventsSummary, WrapEvent } from "@/types";
 import { cn } from "@/lib/utils";
 
 type MobilePanel = "stream" | "inspector" | "filters";
+const BOOTSTRAP_LIMIT = 500;
+
+function normalizePayload(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function normalizePreview(value: unknown): string | undefined {
+  const normalized = normalizePayload(value);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
+  const content =
+    normalizePayload(wrapEvent.content) ||
+    normalizePreview(wrapEvent.content_preview) ||
+    JSON.stringify(wrapEvent, null, 2);
+
+  return {
+    id: wrapEvent.id,
+    timestamp: wrapEvent.timestamp,
+    session_id: wrapEvent.session_id,
+    server_name: wrapEvent.server_name,
+    direction: wrapEvent.direction,
+    source: wrapEvent.source || "mcp",
+    provider: wrapEvent.provider,
+    model: wrapEvent.model,
+    method: wrapEvent.method,
+    tool_name: wrapEvent.tool_name,
+    content,
+    content_preview: normalizePreview(wrapEvent.content_preview),
+    request_content: normalizePreview(wrapEvent.request_content),
+    request_preview: normalizePreview(wrapEvent.request_preview),
+    response_content: normalizePreview(wrapEvent.response_content),
+    response_preview: normalizePreview(wrapEvent.response_preview),
+    status_code: wrapEvent.status_code,
+    agent: wrapEvent.agent || { name: "Unknown", detected_from: "unknown" },
+    policy_allowed: wrapEvent.policy_allowed,
+    policy_reason: wrapEvent.policy_reason,
+    pii_detected: wrapEvent.pii_detected || false,
+    pii_types: wrapEvent.pii_types || [],
+    token_count: wrapEvent.token_count,
+    cost_usd: wrapEvent.cost_usd,
+    latency_ms: wrapEvent.latency_ms,
+    message_type:
+      wrapEvent.source === "ai_proxy" || wrapEvent.source === "agent_app"
+        ? "raw"
+        : "json-rpc",
+  };
+}
 
 export default function ObservabilityPage() {
-  const { addLog, setConnected, addSession, selectedLogId } = useObservabilityStore();
+  const { addLog, setConnected, selectedLogId } = useObservabilityStore();
   const isMobile = useIsMobile();
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("stream");
   const [mounted, setMounted] = useState(false);
+  const [sinceSeq, setSinceSeq] = useState<number | null>(null);
 
   useEffect(() => {
     setMounted(true);
@@ -31,101 +94,65 @@ export default function ObservabilityPage() {
     }
   }, [isMobile, selectedLogId]);
 
-  // Connect to WebSocket event stream
+  const handleWrapEvent = useCallback(
+    (wrapEvent: WrapEvent) => {
+      addLog(mapWrapEventToLog(wrapEvent));
+
+      if (typeof wrapEvent.seq === "number") {
+        setSinceSeq((prev) => (prev === null ? wrapEvent.seq! : Math.max(prev, wrapEvent.seq!)));
+      }
+    },
+    [addLog]
+  );
+
+  const { isConnected: wsConnected } = useEventStream({
+    enabled: mounted,
+    sinceSeq,
+    onEvent: handleWrapEvent,
+  });
+
   useEffect(() => {
-    let ws: WebSocket | null = null;
-    let reconnectTimeout: NodeJS.Timeout | null = null;
+    setConnected(wsConnected);
+  }, [wsConnected, setConnected]);
 
-    const connect = () => {
-      // Connect to the dashboard API WebSocket
-      ws = new WebSocket("ws://localhost:3001/api/events/stream");
+  // Bootstrap with recent snapshot before relying on live stream updates.
+  useEffect(() => {
+    if (!mounted) {
+      return;
+    }
 
-      ws.onopen = () => {
-        console.log("WebSocket connected to event stream");
-        setConnected(true);
-      };
+    let cancelled = false;
 
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-
-          // Handle different message types
-          switch (data.type) {
-            case "event": {
-              // Transform WrapEvent to LogEntry
-              const wrapEvent = data.event;
-              const log: LogEntry = {
-                id: wrapEvent.id,
-                timestamp: wrapEvent.timestamp,
-                session_id: wrapEvent.session_id,
-                server_name: wrapEvent.server_name,
-                direction: wrapEvent.direction,
-                source: wrapEvent.source || "mcp",
-                provider: wrapEvent.provider,
-                model: wrapEvent.model,
-                method: wrapEvent.method,
-                tool_name: wrapEvent.tool_name,
-                // Use full content if available, fallback to content_preview, then full event
-                content: wrapEvent.content || wrapEvent.content_preview || JSON.stringify(wrapEvent, null, 2),
-                content_preview: wrapEvent.content_preview,
-                agent: wrapEvent.agent || { name: "Unknown", detected_from: "unknown" },
-                policy_allowed: wrapEvent.policy_allowed,
-                policy_reason: wrapEvent.policy_reason,
-                pii_detected: wrapEvent.pii_detected || false,
-                pii_types: wrapEvent.pii_types || [],
-                token_count: wrapEvent.token_count,
-                cost_usd: wrapEvent.cost_usd,
-                latency_ms: wrapEvent.latency_ms,
-                status_code: wrapEvent.status_code,
-                message_type: (wrapEvent.source === "ai_proxy" || wrapEvent.source === "agent_app") ? "raw" : "json-rpc",
-              };
-              addLog(log);
-              break;
-            }
-            case "session": {
-              addSession({
-                id: data.session.id,
-                name: data.session.name || `Session ${data.session.id.slice(-8)}`,
-                server_name: data.session.server_name,
-                started_at: data.session.started_at,
-                message_count: 0,
-                last_activity: data.session.started_at,
-              });
-              break;
-            }
-            case "connected": {
-              console.log("SOTH event stream:", data.message);
-              break;
-            }
-            default:
-              console.log("Unknown message type:", data.type);
-          }
-        } catch (err) {
-          console.error("Failed to parse WebSocket message:", err);
+    const loadBootstrap = async () => {
+      try {
+        const response = await fetch(
+          buildApiUrl(`/events?limit=${BOOTSTRAP_LIMIT}`),
+          { cache: "no-store" }
+        );
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
         }
-      };
 
-      ws.onclose = () => {
-        setConnected(false);
-        // Silent reconnect - don't spam console
-        reconnectTimeout = setTimeout(connect, 3000);
-      };
+        const payload = (await response.json()) as ApiResponse<EventsSummary>;
+        const bootstrapEvents = [...payload.data.events].reverse();
 
-      ws.onerror = () => {
-        // Connection failed - this is expected if backend isn't running
-        // Don't log as error to avoid Next.js error overlay
-        console.warn("WebSocket connection failed. Is the SOTH backend running on port 3001?");
-        ws?.close();
-      };
+        for (const event of bootstrapEvents) {
+          if (cancelled) {
+            return;
+          }
+          handleWrapEvent(event);
+        }
+      } catch (error) {
+        console.warn("Failed to load initial event snapshot", error);
+      }
     };
 
-    connect();
+    loadBootstrap();
 
     return () => {
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      if (ws) ws.close();
+      cancelled = true;
     };
-  }, [addLog, setConnected, addSession]);
+  }, [mounted, handleWrapEvent]);
 
   // Prevent hydration mismatch
   if (!mounted) {

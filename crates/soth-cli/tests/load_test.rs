@@ -5,7 +5,7 @@
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine};
 use soth_proxy::pipeline::middleware::RequestContext;
 use soth_proxy::pipeline::observe::{ObserveConfig, ObserveLayer};
-use soth_proxy::pipeline::policy::{PolicyConfig, PolicyMode, PolicyLayer};
+use soth_proxy::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
 use soth_proxy::protocol::{JsonRpcMessage, JsonRpcRequest, RequestId};
 use soth_proxy::{Pipeline, PipelineBuilder};
 use std::sync::Arc;
@@ -163,8 +163,14 @@ async fn load_test_simple_requests() {
     results.print("Simple Requests (1000)");
 
     // Assertions
-    assert!(results.throughput > 1000.0, "Throughput should be > 1000 req/s");
-    assert!(results.p95_latency < Duration::from_millis(10), "P95 should be < 10ms");
+    assert!(
+        results.throughput > 1000.0,
+        "Throughput should be > 1000 req/s"
+    );
+    assert!(
+        results.p95_latency < Duration::from_millis(10),
+        "P95 should be < 10ms"
+    );
 }
 
 #[tokio::test]
@@ -179,8 +185,14 @@ async fn load_test_pii_requests() {
     results.print("PII Requests (1000)");
 
     // PII detection adds overhead, so more lenient threshold
-    assert!(results.throughput > 500.0, "Throughput should be > 500 req/s");
-    assert!(results.p95_latency < Duration::from_millis(20), "P95 should be < 20ms");
+    assert!(
+        results.throughput > 500.0,
+        "Throughput should be > 500 req/s"
+    );
+    assert!(
+        results.p95_latency < Duration::from_millis(20),
+        "P95 should be < 20ms"
+    );
 }
 
 #[tokio::test]
@@ -239,5 +251,8 @@ async fn load_test_concurrent_sessions() {
     println!("  Duration:    {:?}", duration);
     println!("  Throughput:  {:.2} req/s", throughput);
 
-    assert!(throughput > 5000.0, "Concurrent throughput should be > 5000 req/s");
+    assert!(
+        throughput > 5000.0,
+        "Concurrent throughput should be > 5000 req/s"
+    );
 }

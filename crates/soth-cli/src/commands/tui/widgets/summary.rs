@@ -1,7 +1,9 @@
 //! Summary panel widget
 
 use crate::commands::tui::app::{App, ConnectionState, PanelFocus};
-use crate::commands::tui::theme::{format_duration, format_number, format_percent, Theme, CHECK, CROSS, WARNING};
+use crate::commands::tui::theme::{
+    format_duration, format_number, format_percent, Theme, CHECK, CROSS, WARNING,
+};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -34,22 +36,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     // Calculate average latency from recent proxy requests
-    let avg_latency = app
-        .metrics
-        .proxy
-        .as_ref()
-        .and_then(|p| {
-            let latencies: Vec<u64> = p
-                .recent_requests
-                .iter()
-                .filter_map(|r| r.latency_ms)
-                .collect();
-            if latencies.is_empty() {
-                None
-            } else {
-                Some(latencies.iter().sum::<u64>() / latencies.len() as u64)
-            }
-        });
+    let avg_latency = app.metrics.proxy.as_ref().and_then(|p| {
+        let latencies: Vec<u64> = p
+            .recent_requests
+            .iter()
+            .filter_map(|r| r.latency_ms)
+            .collect();
+        if latencies.is_empty() {
+            None
+        } else {
+            Some(latencies.iter().sum::<u64>() / latencies.len() as u64)
+        }
+    });
 
     // Calculate error rate
     let error_rate = app.metrics.policy.as_ref().map(|p| {

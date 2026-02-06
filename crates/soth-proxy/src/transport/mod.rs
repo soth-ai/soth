@@ -6,12 +6,11 @@
 //! - HTTP: HTTP POST for simple integrations
 //! - Streamable HTTP: MCP 2025-03-26 spec compliant HTTP with SSE streaming
 
-pub mod stdio;
-pub mod sse;
 pub mod http;
-pub mod streamable_http;
-pub mod forward_proxy;
 pub mod hudsucker_proxy;
+pub mod sse;
+pub mod stdio;
+pub mod streamable_http;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -22,10 +21,20 @@ use crate::error::ProxyError;
 use crate::protocol::JsonRpcMessage;
 
 /// Message handler callback type
-pub type MessageHandler = Arc<dyn Fn(JsonRpcMessage) -> Result<Option<JsonRpcMessage>, ProxyError> + Send + Sync>;
+pub type MessageHandler =
+    Arc<dyn Fn(JsonRpcMessage) -> Result<Option<JsonRpcMessage>, ProxyError> + Send + Sync>;
 
 /// Async message handler for pipeline processing
-pub type AsyncMessageHandler = Arc<dyn Fn(JsonRpcMessage) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<JsonRpcMessage>, ProxyError>> + Send>> + Send + Sync>;
+pub type AsyncMessageHandler = Arc<
+    dyn Fn(
+            JsonRpcMessage,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<JsonRpcMessage>, ProxyError>> + Send,
+            >,
+        > + Send
+        + Sync,
+>;
 
 /// Transport trait for MCP communication
 #[async_trait]
@@ -87,10 +96,16 @@ pub struct TransportBuilder {
 #[derive(Debug, Clone)]
 pub enum TransportType {
     Stdio,
-    Sse { port: u16 },
-    Http { port: u16 },
+    Sse {
+        port: u16,
+    },
+    Http {
+        port: u16,
+    },
     /// Streamable HTTP (MCP 2025-03-26 spec)
-    StreamableHttp { port: u16 },
+    StreamableHttp {
+        port: u16,
+    },
 }
 
 /// Transport configuration
@@ -141,9 +156,9 @@ impl TransportBuilder {
             TransportType::Stdio => Box::new(stdio::StdioTransport::new(self.config)),
             TransportType::Sse { port } => Box::new(sse::SseTransport::new(port, self.config)),
             TransportType::Http { port } => Box::new(http::HttpTransport::new(port, self.config)),
-            TransportType::StreamableHttp { port } => {
-                Box::new(streamable_http::StreamableHttpTransport::new(port, self.config))
-            }
+            TransportType::StreamableHttp { port } => Box::new(
+                streamable_http::StreamableHttpTransport::new(port, self.config),
+            ),
         }
     }
 }

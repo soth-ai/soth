@@ -3,13 +3,14 @@
 use crate::event_store::EventStore;
 use axum::{
     extract::{
+        Query,
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
     response::IntoResponse,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use soth_core::types::WrapEvent;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -24,15 +25,22 @@ enum WsMessage {
     Connected { message: String },
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EventStreamQuery {
+    pub since_seq: Option<i64>,
+    pub limit: Option<usize>,
+}
+
 /// WebSocket upgrade handler for event streaming
 pub async fn event_stream_handler(
     ws: WebSocketUpgrade,
     State(store): State<Arc<EventStore>>,
+    Query(query): Query<EventStreamQuery>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, store))
+    ws.on_upgrade(move |socket| handle_socket(socket, store, query))
 }
 
-async fn handle_socket(socket: WebSocket, store: Arc<EventStore>) {
+async fn handle_socket(socket: WebSocket, store: Arc<EventStore>, query: EventStreamQuery) {
     let (mut sender, mut receiver) = socket.split();
 
     // Subscribe to new events
@@ -47,9 +55,24 @@ async fn handle_socket(socket: WebSocket, store: Arc<EventStore>) {
         let _ = sender.send(Message::Text(json)).await;
     }
 
-    // Send recent events first (last 50)
-    let recent = store.get_events(50);
-    for event in recent.events.into_iter().rev() {
+    // Replay either:
+    // - cursor-based catch-up (since_seq), or
+    // - recent history (default).
+    let replay_limit = query.limit.unwrap_or(50).clamp(1, 5000);
+    let replay_events: Vec<WrapEvent> = if let Some(since_seq) = query.since_seq {
+        // get_events_since_seq already returns oldest->newest for replay.
+        store.get_events_since_seq(since_seq, replay_limit).events
+    } else {
+        // get_events returns newest->oldest; reverse for stable playback.
+        store
+            .get_events(replay_limit)
+            .events
+            .into_iter()
+            .rev()
+            .collect()
+    };
+
+    for event in replay_events {
         let wrapped = WsMessage::Event { event };
         if let Ok(json) = serde_json::to_string(&wrapped) {
             if sender.send(Message::Text(json)).await.is_err() {

@@ -10,7 +10,7 @@ pub mod replay;
 pub mod session;
 pub mod wrap_event;
 
-pub use name_generator::{generate_session_name, generate_name_from_seed, NameGenerator};
+pub use name_generator::{generate_name_from_seed, generate_session_name, NameGenerator};
 pub use replay::*;
 pub use session::*;
 pub use wrap_event::*;

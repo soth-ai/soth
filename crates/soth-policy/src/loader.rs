@@ -65,9 +65,9 @@ impl PolicyLoader {
             let entry = entry?;
             let file_path = entry.path();
 
-            let is_yaml = file_path.extension().is_some_and(|e| {
-                e == "yaml" || e == "yml"
-            });
+            let is_yaml = file_path
+                .extension()
+                .is_some_and(|e| e == "yaml" || e == "yml");
 
             if is_yaml {
                 let name = file_path

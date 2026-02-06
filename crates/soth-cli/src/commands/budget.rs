@@ -53,7 +53,10 @@ async fn show_status(detailed: bool) -> Result<()> {
         println!("{} ({:?})", budget.id, budget.scope);
 
         if let Some(daily) = budget.daily_limit {
-            println!("  Daily:   ${:.2} / ${:.2} ({:.1}%)", budget.current_spend, daily, usage);
+            println!(
+                "  Daily:   ${:.2} / ${:.2} ({:.1}%)",
+                budget.current_spend, daily, usage
+            );
             println!("           {bar}");
         }
         if let Some(weekly) = budget.weekly_limit {
@@ -66,7 +69,10 @@ async fn show_status(detailed: bool) -> Result<()> {
         if detailed {
             println!("  Tokens:  {} total", budget.total_tokens);
             println!("  Requests: {}", budget.total_requests);
-            println!("  Period start: {}", budget.period_start.format("%Y-%m-%d %H:%M"));
+            println!(
+                "  Period start: {}",
+                budget.period_start.format("%Y-%m-%d %H:%M")
+            );
         }
         println!();
     }
@@ -148,7 +154,11 @@ async fn generate_report(period: &str, format: &str) -> Result<()> {
         _ => {
             println!("Spend Report ({period})");
             println!("═══════════════════════════════════\n");
-            println!("Period: {} to {}", since.format("%Y-%m-%d"), Utc::now().format("%Y-%m-%d"));
+            println!(
+                "Period: {} to {}",
+                since.format("%Y-%m-%d"),
+                Utc::now().format("%Y-%m-%d")
+            );
             println!("Total spend: ${total_spend:.2}");
             println!("Total records: {}\n", records.len());
 
@@ -217,10 +227,16 @@ async fn set_budget(
 
     // Parse scope
     let (budget_id, budget_scope) = if scope == "global" {
-        ("global".to_string(), soth_core::types::budget::BudgetScope::Global)
+        (
+            "global".to_string(),
+            soth_core::types::budget::BudgetScope::Global,
+        )
     } else if scope.starts_with("agent:") {
         let agent_id = scope.strip_prefix("agent:").unwrap();
-        (agent_id.to_string(), soth_core::types::budget::BudgetScope::PerAgent)
+        (
+            agent_id.to_string(),
+            soth_core::types::budget::BudgetScope::PerAgent,
+        )
     } else {
         anyhow::bail!("Invalid scope: {scope}. Use \'global\' or \'agent:<id>\'");
     };
@@ -258,5 +274,6 @@ async fn set_budget(
 
 /// Get budget storage
 fn get_storage() -> Result<BudgetStorage> {
-    BudgetStorage::new(DEFAULT_DB_PATH).map_err(|e| anyhow::anyhow!("Failed to open budget storage: {e}"))
+    BudgetStorage::new(DEFAULT_DB_PATH)
+        .map_err(|e| anyhow::anyhow!("Failed to open budget storage: {e}"))
 }

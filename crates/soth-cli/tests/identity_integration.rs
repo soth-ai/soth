@@ -2,7 +2,7 @@
 //!
 //! Tests for keygen → sign → verify round-trip
 
-use soth_identity::{KeyPair, Did, TrustStore, sign_json, verify_json_signature};
+use soth_identity::{sign_json, verify_json_signature, Did, KeyPair, TrustStore};
 use tempfile::tempdir;
 
 #[test]
@@ -30,8 +30,8 @@ fn test_did_encoding_roundtrip() {
     let keypair = KeyPair::generate();
 
     // Create DID from public key
-    let did = Did::from_public_key(&keypair.public_key_bytes())
-        .expect("DID creation should succeed");
+    let did =
+        Did::from_public_key(&keypair.public_key_bytes()).expect("DID creation should succeed");
 
     // Get the DID URI
     let uri = did.uri();
@@ -41,7 +41,8 @@ fn test_did_encoding_roundtrip() {
     let parsed = Did::parse(&uri).expect("DID parsing should succeed");
 
     // Extract public key and verify it matches
-    let extracted_key = parsed.extract_public_key()
+    let extracted_key = parsed
+        .extract_public_key()
         .expect("public key extraction should succeed");
     assert_eq!(extracted_key, keypair.public_key_bytes());
 }
@@ -51,8 +52,7 @@ fn test_did_from_keypair() {
     let keypair = KeyPair::generate();
 
     // Create DID from keypair
-    let did = Did::from_key_pair(&keypair)
-        .expect("DID from keypair should succeed");
+    let did = Did::from_key_pair(&keypair).expect("DID from keypair should succeed");
 
     // The fingerprint should be consistent
     let fingerprint1 = did.fingerprint();
@@ -66,8 +66,7 @@ fn test_trust_store_operations() {
     let store_path = dir.path().join("trust_store");
 
     // Create trust store
-    let mut store = TrustStore::new(&store_path)
-        .expect("trust store creation should succeed");
+    let mut store = TrustStore::new(&store_path).expect("trust store creation should succeed");
 
     // Generate a DID
     let keypair = KeyPair::generate();
@@ -105,12 +104,10 @@ fn test_json_signing_and_verification() {
     });
 
     // Sign the JSON
-    let signed = sign_json(&data, &keypair, &did.uri())
-        .expect("JSON signing should succeed");
+    let signed = sign_json(&data, &keypair, &did.uri()).expect("JSON signing should succeed");
 
     // Verify the signed document
-    let is_valid = verify_json_signature(&signed, &keypair)
-        .expect("verification should succeed");
+    let is_valid = verify_json_signature(&signed, &keypair).expect("verification should succeed");
     assert!(is_valid);
 
     // The signed document should contain the original data
@@ -123,7 +120,8 @@ fn test_keypair_serialization() {
     let keypair = KeyPair::generate();
 
     // Get private key bytes
-    let private_bytes = keypair.private_key_bytes()
+    let private_bytes = keypair
+        .private_key_bytes()
         .expect("private key bytes should be available");
     assert_eq!(private_bytes.len(), 32);
 
@@ -177,7 +175,8 @@ fn test_base64_signature() {
     let message = b"Hello World";
 
     // Sign with base64 encoding
-    let sig_b64 = keypair.sign_base64(message)
+    let sig_b64 = keypair
+        .sign_base64(message)
         .expect("base64 signing should succeed");
 
     // Verify with base64

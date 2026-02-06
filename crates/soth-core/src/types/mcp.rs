@@ -305,10 +305,8 @@ mod tests {
 
     #[test]
     fn test_response_success() {
-        let resp = JsonRpcResponse::success(
-            Value::Number(1.into()),
-            serde_json::json!({"result": "ok"}),
-        );
+        let resp =
+            JsonRpcResponse::success(Value::Number(1.into()), serde_json::json!({"result": "ok"}));
         assert!(!resp.is_error());
         assert!(resp.result.is_some());
     }

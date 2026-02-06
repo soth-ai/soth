@@ -33,7 +33,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(vec![
             Span::raw("Verifications  "),
-            Span::styled(format_number(metrics.total_verifications), theme.bold_style()),
+            Span::styled(
+                format_number(metrics.total_verifications),
+                theme.bold_style(),
+            ),
         ]),
         Line::from(vec![
             Span::styled(format!("{} ", CHECK), theme.success_style()),
@@ -47,14 +50,20 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::raw("Unique DIDs    "),
-            Span::styled(format_number(metrics.unique_dids as u64), theme.info_style()),
+            Span::styled(
+                format_number(metrics.unique_dids as u64),
+                theme.info_style(),
+            ),
         ]),
     ];
 
     // Add recent DIDs if space allows
     if inner.height > 6 && !metrics.recent_dids.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Recent DIDs:", theme.muted_style())));
+        lines.push(Line::from(Span::styled(
+            "Recent DIDs:",
+            theme.muted_style(),
+        )));
 
         let max_dids = (inner.height as usize).saturating_sub(7).min(5);
         for entry in metrics.recent_dids.iter().take(max_dids) {

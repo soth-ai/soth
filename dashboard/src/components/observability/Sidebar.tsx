@@ -22,7 +22,7 @@ import {
 import { format } from "date-fns";
 import { useObservabilityStore, computeLogMetrics } from "@/store/observability";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@radix-ui/react-scroll-area";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 export function Sidebar() {
   const sessions = useObservabilityStore((state) => state.sessions);

@@ -170,7 +170,8 @@ impl CircuitBreaker {
             return CircuitBreakerResult::Allowed;
         }
 
-        let entry = self.circuits
+        let entry = self
+            .circuits
             .entry(upstream.to_string())
             .or_insert_with(|| RwLock::new(Circuit::new(self.config.clone())));
 
@@ -179,9 +180,10 @@ impl CircuitBreaker {
             CircuitBreakerResult::Allowed
         } else {
             CircuitBreakerResult::Rejected {
-                retry_after: self.config.open_duration.saturating_sub(
-                    circuit.opened_at.map(|t| t.elapsed()).unwrap_or_default()
-                ),
+                retry_after: self
+                    .config
+                    .open_duration
+                    .saturating_sub(circuit.opened_at.map(|t| t.elapsed()).unwrap_or_default()),
             }
         }
     }
@@ -211,7 +213,8 @@ impl CircuitBreaker {
             return;
         }
 
-        let entry = self.circuits
+        let entry = self
+            .circuits
             .entry(upstream.to_string())
             .or_insert_with(|| RwLock::new(Circuit::new(self.config.clone())));
 

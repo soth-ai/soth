@@ -91,7 +91,10 @@ policy:
     assert!(config.policy.cache.l2_ttl.is_none());
 
     // effective_l2_ttl should return 30x L1
-    assert_eq!(config.policy.cache.effective_l2_ttl(), Duration::from_secs(300));
+    assert_eq!(
+        config.policy.cache.effective_l2_ttl(),
+        Duration::from_secs(300)
+    );
 }
 
 /// Test: Cache config converts correctly to policy cache config

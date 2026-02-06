@@ -3,9 +3,9 @@
 //! This module provides parsers for extracting model, token usage, and other
 //! metadata from AI provider APIs (OpenAI, Anthropic, Google).
 
-pub mod openai;
 pub mod anthropic;
 pub mod google;
+pub mod openai;
 pub mod sse;
 
 use std::sync::Arc;
@@ -224,7 +224,9 @@ mod tests {
 
         assert!(registry.find_provider("api.openai.com").is_some());
         assert!(registry.find_provider("api.anthropic.com").is_some());
-        assert!(registry.find_provider("generativelanguage.googleapis.com").is_some());
+        assert!(registry
+            .find_provider("generativelanguage.googleapis.com")
+            .is_some());
         assert!(registry.find_provider("unknown.example.com").is_none());
     }
 

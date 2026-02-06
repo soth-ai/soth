@@ -3,10 +3,10 @@
 use crate::commands::tui::api;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use soth_core::types::WrapEvent;
+use soth_dashboard::event_store::AgentStats;
 use soth_dashboard::state::{
     BudgetMetrics, IdentityMetrics, ObserveMetrics, PolicyMetrics, ProxyMetrics,
 };
-use soth_dashboard::event_store::AgentStats;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -290,7 +290,11 @@ impl App {
 
                 // Update events (merge new ones)
                 for event in data.events.into_iter().rev() {
-                    if !self.events.iter().any(|e| e.timestamp == event.timestamp && e.session_id == event.session_id) {
+                    if !self
+                        .events
+                        .iter()
+                        .any(|e| e.timestamp == event.timestamp && e.session_id == event.session_id)
+                    {
                         self.events.push_front(event);
                     }
                 }

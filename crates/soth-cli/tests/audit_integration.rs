@@ -60,13 +60,13 @@ fn test_merkle_proof_generation_and_verification() {
 
     // Generate proof for each entry
     for i in 0..entries.len() {
-        let proof = tree.get_proof(i)
-            .expect("proof generation should succeed");
+        let proof = tree.get_proof(i).expect("proof generation should succeed");
 
         // Verify the proof using static method
         assert!(
             MerkleTree::verify_proof(&proof, Some(entries[i])),
-            "proof verification should succeed for entry {}", i
+            "proof verification should succeed for entry {}",
+            i
         );
     }
 }
@@ -142,8 +142,7 @@ fn test_transparency_log_persistence() {
 
     // Create and populate log
     {
-        let mut log = TransparencyLog::open(&log_path)
-            .expect("log creation should succeed");
+        let mut log = TransparencyLog::open(&log_path).expect("log creation should succeed");
 
         log.append(b"entry 1", "test", None);
         log.append(b"entry 2", "test", None);
@@ -151,8 +150,7 @@ fn test_transparency_log_persistence() {
 
     // Reopen and verify
     {
-        let log = TransparencyLog::open(&log_path)
-            .expect("log opening should succeed");
+        let log = TransparencyLog::open(&log_path).expect("log opening should succeed");
 
         assert_eq!(log.len(), 2);
         assert!(log.verify_integrity());
@@ -262,7 +260,8 @@ fn test_consistency_proof() {
     let new_root = log.root_hash();
 
     // Get consistency proof
-    let consistency = log.get_consistency_proof(5, 10)
+    let consistency = log
+        .get_consistency_proof(5, 10)
         .expect("consistency proof should exist");
 
     assert_eq!(consistency.old_size, 5);

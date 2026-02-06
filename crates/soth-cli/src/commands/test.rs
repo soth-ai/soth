@@ -153,7 +153,10 @@ pub async fn run(args: TestArgs) -> Result<()> {
     }
 
     // Add test filter
-    cmd.arg("--").arg("--format=json").arg("-Z").arg("unstable-options");
+    cmd.arg("--")
+        .arg("--format=json")
+        .arg("-Z")
+        .arg("unstable-options");
 
     if let Some(ref filter) = args.filter {
         cmd.arg(filter);
@@ -164,10 +167,7 @@ pub async fn run(args: TestArgs) -> Result<()> {
     }
 
     // Capture output
-    println!(
-        "{} Running tests...",
-        style::CIRCLE_FILLED.cyan()
-    );
+    println!("{} Running tests...", style::CIRCLE_FILLED.cyan());
 
     let output = cmd.output()?;
     let total_duration = start.elapsed();
@@ -205,11 +205,7 @@ pub async fn run(args: TestArgs) -> Result<()> {
     }
 }
 
-fn parse_cargo_test_output(
-    stdout: &[u8],
-    stderr: &[u8],
-    duration: Duration,
-) -> Result<TestReport> {
+fn parse_cargo_test_output(stdout: &[u8], stderr: &[u8], duration: Duration) -> Result<TestReport> {
     let stdout_str = String::from_utf8_lossy(stdout);
     let _stderr_str = String::from_utf8_lossy(stderr);
 
@@ -259,10 +255,22 @@ fn parse_cargo_test_output(
     }
 
     // Calculate summary
-    let passed = tests.iter().filter(|t| t.status == TestStatus::Passed).count();
-    let failed = tests.iter().filter(|t| t.status == TestStatus::Failed).count();
-    let skipped = tests.iter().filter(|t| t.status == TestStatus::Skipped).count();
-    let ignored = tests.iter().filter(|t| t.status == TestStatus::Ignored).count();
+    let passed = tests
+        .iter()
+        .filter(|t| t.status == TestStatus::Passed)
+        .count();
+    let failed = tests
+        .iter()
+        .filter(|t| t.status == TestStatus::Failed)
+        .count();
+    let skipped = tests
+        .iter()
+        .filter(|t| t.status == TestStatus::Skipped)
+        .count();
+    let ignored = tests
+        .iter()
+        .filter(|t| t.status == TestStatus::Ignored)
+        .count();
 
     let suite = TestSuite {
         name: current_suite,
@@ -298,7 +306,11 @@ fn parse_plain_text_output(output: &str) -> Vec<TestResult> {
     let mut tests = Vec::new();
 
     for line in output.lines() {
-        if line.starts_with("test ") && (line.contains(" ... ok") || line.contains(" ... FAILED") || line.contains(" ... ignored")) {
+        if line.starts_with("test ")
+            && (line.contains(" ... ok")
+                || line.contains(" ... FAILED")
+                || line.contains(" ... ignored"))
+        {
             let parts: Vec<&str> = line.split(" ... ").collect();
             if parts.len() >= 2 {
                 let name = parts[0].trim_start_matches("test ").to_string();
@@ -401,7 +413,10 @@ fn format_junit(report: &TestReport) -> String {
 
 fn format_tap(report: &TestReport) -> String {
     let mut tap = String::new();
-    tap.push_str(&format!("TAP version 13\n1..{}\n", report.summary.total_tests));
+    tap.push_str(&format!(
+        "TAP version 13\n1..{}\n",
+        report.summary.total_tests
+    ));
 
     let mut test_num = 1;
     for suite in &report.suites {

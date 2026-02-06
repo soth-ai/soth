@@ -74,14 +74,17 @@ impl FileWatcher {
 
         let (std_tx, std_rx) = std_mpsc::channel::<Result<Event, notify::Error>>();
 
-        let mut watcher =
-            RecommendedWatcher::new(std_tx, Config::default()).map_err(WatchError::CreateWatcher)?;
+        let mut watcher = RecommendedWatcher::new(std_tx, Config::default())
+            .map_err(WatchError::CreateWatcher)?;
 
         watcher
             .watch(&watch_path, RecursiveMode::NonRecursive)
             .map_err(WatchError::WatchPath)?;
 
-        debug!("Started watching directory: {:?} for file: {:?}", watch_path, target_filename);
+        debug!(
+            "Started watching directory: {:?} for file: {:?}",
+            watch_path, target_filename
+        );
 
         // Spawn a thread to convert sync notify events to async channel
         std::thread::spawn(move || {

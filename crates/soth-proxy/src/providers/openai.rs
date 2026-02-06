@@ -54,7 +54,10 @@ impl AiProvider for OpenAiProvider {
         let input_tokens = usage.get("prompt_tokens")?.as_u64()?;
         let output_tokens = usage.get("completion_tokens")?.as_u64()?;
 
-        let model = json.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+        let model = json
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string());
 
         Some(ProviderUsage {
             input_tokens,
@@ -87,7 +90,10 @@ impl AiProvider for OpenAiProvider {
                 usage.get("prompt_tokens").and_then(|v| v.as_u64()),
                 usage.get("completion_tokens").and_then(|v| v.as_u64()),
             ) {
-                let model = json.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+                let model = json
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string());
                 return Some(SseEvent::Usage(ProviderUsage {
                     input_tokens: input,
                     output_tokens: output,
@@ -148,8 +154,8 @@ mod tests {
     fn test_extract_model() {
         let provider = OpenAiProvider::new();
         let body = r#"{"model": "gpt-4o", "messages": []}"#;
-        let request = HttpRequest::new("POST", "/v1/chat/completions")
-            .with_body(body.as_bytes().to_vec());
+        let request =
+            HttpRequest::new("POST", "/v1/chat/completions").with_body(body.as_bytes().to_vec());
 
         assert_eq!(provider.extract_model(&request), Some("gpt-4o".to_string()));
     }
@@ -198,7 +204,8 @@ mod tests {
     #[test]
     fn test_parse_sse_usage() {
         let provider = OpenAiProvider::new();
-        let chunk = r#"data: {"model":"gpt-4o","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let chunk =
+            r#"data: {"model":"gpt-4o","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
 
         match provider.parse_sse_chunk(chunk) {
             Some(SseEvent::Usage(usage)) => {

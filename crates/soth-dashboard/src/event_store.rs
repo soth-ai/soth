@@ -1,39 +1,49 @@
-//! Event store - watches event log and stores recent events for dashboard
+//! Event store - watches event logs and stores recent events for dashboard.
 //!
+//! Supports JSONL and SQLite wrap-event backends.
 //! Provides real-time event streaming via broadcast channel.
-//! Uses notify-based file watching for instant event detection (<10ms latency).
 
 use parking_lot::RwLock;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use soth_core::event_logger::{default_event_log_read_path, is_sqlite_event_log_path};
 use soth_core::types::WrapEvent;
 use soth_core::watch::{FileWatcher, WatchEvent};
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-/// Maximum number of events to keep in memory
+/// Maximum number of events to keep in memory.
 const MAX_EVENTS: usize = 1000;
 
-/// Maximum number of agents to track
+/// Maximum number of agents to track.
 const MAX_AGENTS: usize = 100;
 
-/// Event store that watches the JSONL log and provides real-time streaming
+#[derive(Clone, Debug)]
+enum EventStoreBackend {
+    Jsonl(PathBuf),
+    Sqlite(PathBuf),
+}
+
+/// Event store that watches wrap events and provides real-time streaming.
 #[derive(Clone)]
 pub struct EventStore {
     inner: Arc<RwLock<EventStoreInner>>,
-    log_path: PathBuf,
+    backend: EventStoreBackend,
     event_tx: broadcast::Sender<WrapEvent>,
 }
 
 struct EventStoreInner {
-    /// Recent events (newest first)
+    /// Recent events (newest first).
     events: VecDeque<WrapEvent>,
-    /// Agent statistics
+    /// Agent statistics.
     agents: HashMap<String, AgentStats>,
-    /// File position for watching
+    /// File position for JSONL watching.
     file_position: u64,
+    /// Last seen SQLite sequence number.
+    sqlite_seq: i64,
 }
 
 /// Statistics for a detected agent
@@ -68,34 +78,49 @@ pub struct EventsSummary {
 }
 
 impl EventStore {
-    /// Create a new event store
+    /// Create a new event store.
+    ///
+    /// Backend is inferred from extension (`.db`, `.sqlite`, `.sqlite3` => sqlite).
     pub fn new(log_path: PathBuf) -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let backend = if is_sqlite_event_log_path(&log_path) {
+            EventStoreBackend::Sqlite(log_path)
+        } else {
+            EventStoreBackend::Jsonl(log_path)
+        };
 
         Self {
             inner: Arc::new(RwLock::new(EventStoreInner {
                 events: VecDeque::with_capacity(MAX_EVENTS),
                 agents: HashMap::new(),
                 file_position: 0,
+                sqlite_seq: 0,
             })),
-            log_path,
+            backend,
             event_tx,
         }
     }
 
-    /// Create with default log path (~/.soth/logs/events.jsonl)
+    /// Create with default log path (prefers `~/.soth/logs/events.db`, falls back to JSONL).
     pub fn with_default_path() -> Option<Self> {
-        let home = dirs::home_dir()?;
-        let log_path = home.join(".soth").join("logs").join("events.jsonl");
+        let log_path = default_event_log_read_path().ok()?;
         Some(Self::new(log_path))
     }
 
-    /// Subscribe to new events
+    /// Path currently used by this store.
+    pub fn path(&self) -> &Path {
+        match &self.backend {
+            EventStoreBackend::Jsonl(path) => path.as_path(),
+            EventStoreBackend::Sqlite(path) => path.as_path(),
+        }
+    }
+
+    /// Subscribe to new events.
     pub fn subscribe(&self) -> broadcast::Receiver<WrapEvent> {
         self.event_tx.subscribe()
     }
 
-    /// Get recent events
+    /// Get recent events.
     pub fn get_events(&self, limit: usize) -> EventsSummary {
         let inner = self.inner.read();
         let events: Vec<WrapEvent> = inner
@@ -111,7 +136,59 @@ impl EventStore {
         }
     }
 
-    /// Get agent statistics
+    /// Get events strictly newer than a sqlite sequence cursor.
+    ///
+    /// For sqlite backends this queries durable storage (ordered ASC by sequence).
+    /// For JSONL backends this falls back to in-memory filtering when sequence data exists.
+    pub fn get_events_since_seq(&self, since_seq: i64, limit: usize) -> EventsSummary {
+        if limit == 0 {
+            return EventsSummary {
+                total_events: self.inner.read().events.len(),
+                events: Vec::new(),
+            };
+        }
+
+        let capped_limit = limit.min(5_000);
+        match &self.backend {
+            EventStoreBackend::Sqlite(path) => {
+                let rows = read_sqlite_events(path, Some(since_seq)).unwrap_or_default();
+                let total_events = self.inner.read().events.len();
+
+                let mut events: Vec<WrapEvent> = rows.into_iter().map(|(_, event)| event).collect();
+                if events.len() > capped_limit {
+                    let keep_from = events.len() - capped_limit;
+                    events = events.split_off(keep_from);
+                }
+
+                EventsSummary {
+                    total_events,
+                    events,
+                }
+            }
+            EventStoreBackend::Jsonl(_) => {
+                let inner = self.inner.read();
+                let mut events: Vec<WrapEvent> = inner
+                    .events
+                    .iter()
+                    .rev()
+                    .filter(|event| event.seq.map(|seq| seq > since_seq).unwrap_or(false))
+                    .cloned()
+                    .collect();
+
+                if events.len() > capped_limit {
+                    let keep_from = events.len() - capped_limit;
+                    events = events.split_off(keep_from);
+                }
+
+                EventsSummary {
+                    total_events: inner.events.len(),
+                    events,
+                }
+            }
+        }
+    }
+
+    /// Get agent statistics.
     pub fn get_agents(&self) -> AgentsSummary {
         let inner = self.inner.read();
         let mut agents: Vec<AgentStats> = inner.agents.values().cloned().collect();
@@ -125,14 +202,21 @@ impl EventStore {
         }
     }
 
-    /// Load initial events from the log file
+    /// Load initial events from storage.
     pub async fn load_initial(&self) -> std::io::Result<usize> {
-        if !self.log_path.exists() {
-            debug!("Event log does not exist yet: {:?}", self.log_path);
+        match &self.backend {
+            EventStoreBackend::Jsonl(path) => self.load_initial_jsonl(path).await,
+            EventStoreBackend::Sqlite(path) => self.load_initial_sqlite(path).await,
+        }
+    }
+
+    async fn load_initial_jsonl(&self, log_path: &Path) -> std::io::Result<usize> {
+        if !log_path.exists() {
+            debug!("Event log does not exist yet: {:?}", log_path);
             return Ok(0);
         }
 
-        let content = tokio::fs::read_to_string(&self.log_path).await?;
+        let content = tokio::fs::read_to_string(log_path).await?;
         let mut count = 0;
 
         for line in content.lines() {
@@ -148,21 +232,52 @@ impl EventStore {
             inner.file_position = content.len() as u64;
         }
 
-        info!("Loaded {} initial events from {:?}", count, self.log_path);
+        info!("Loaded {} initial events from {:?}", count, log_path);
         Ok(count)
     }
 
-    /// Watch the log file for new events
-    ///
-    /// Uses notify-based file watching for instant event detection.
-    /// Falls back to polling if file watcher is unavailable.
+    async fn load_initial_sqlite(&self, db_path: &Path) -> std::io::Result<usize> {
+        if !db_path.exists() {
+            debug!("Event log database does not exist yet: {:?}", db_path);
+            return Ok(0);
+        }
+
+        let db_path = db_path.to_path_buf();
+        let query_path = db_path.clone();
+        let rows = tokio::task::spawn_blocking(move || read_sqlite_events(&query_path, None))
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))??;
+
+        let mut count = 0usize;
+        let mut last_seq = 0i64;
+        for (seq, event) in rows {
+            self.add_event(event);
+            count += 1;
+            last_seq = seq;
+        }
+
+        {
+            let mut inner = self.inner.write();
+            inner.sqlite_seq = last_seq;
+        }
+
+        info!("Loaded {} initial events from {:?}", count, db_path);
+        Ok(count)
+    }
+
+    /// Watch for new events.
     pub async fn watch(&self) {
-        info!("Starting event log watcher for {:?}", self.log_path);
+        match &self.backend {
+            EventStoreBackend::Jsonl(path) => self.watch_jsonl(path.clone()).await,
+            EventStoreBackend::Sqlite(path) => self.watch_sqlite(path.clone()).await,
+        }
+    }
 
-        // Try to create a file watcher for instant notifications
-        let watcher_result = FileWatcher::new(self.log_path.clone());
+    async fn watch_jsonl(&self, log_path: PathBuf) {
+        info!("Starting JSONL event watcher for {:?}", log_path);
+
+        let watcher_result = FileWatcher::new(log_path.clone());
         let use_polling = watcher_result.is_err();
-
         if use_polling {
             warn!("File watcher unavailable, falling back to 100ms polling");
         } else {
@@ -172,14 +287,10 @@ impl EventStore {
         let mut watcher = watcher_result.ok();
 
         loop {
-            // Wait for file change - either via notify or polling
-            // Always use a timeout to ensure we check periodically even if notify misses events
             if let Some(ref mut w) = watcher {
-                // Use notify with timeout fallback
                 let timeout_duration = tokio::time::Duration::from_millis(500);
                 match tokio::time::timeout(timeout_duration, w.next()).await {
                     Ok(Some(WatchEvent::Modified)) | Ok(Some(WatchEvent::Created)) => {
-                        // File changed via notify, process immediately
                         debug!("File change detected via notify");
                     }
                     Ok(Some(WatchEvent::Removed)) => {
@@ -193,22 +304,17 @@ impl EventStore {
                         continue;
                     }
                     Ok(None) => {
-                        // Watcher closed, fall back to polling
                         warn!("File watcher closed, falling back to polling");
                         watcher = None;
                         continue;
                     }
-                    Err(_) => {
-                        // Timeout - check for events anyway (notify might have missed them)
-                        // This is the fallback polling mechanism
-                    }
+                    Err(_) => {}
                 }
             } else {
-                // Pure polling fallback
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
 
-            if let Err(e) = self.check_for_new_events().await {
+            if let Err(e) = self.check_for_new_jsonl_events(&log_path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     warn!("Error checking event log: {}", e);
                 }
@@ -216,12 +322,24 @@ impl EventStore {
         }
     }
 
-    async fn check_for_new_events(&self) -> std::io::Result<()> {
-        if !self.log_path.exists() {
+    async fn watch_sqlite(&self, db_path: PathBuf) {
+        info!("Starting SQLite event poller for {:?}", db_path);
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if let Err(e) = self.check_for_new_sqlite_events(&db_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Error checking sqlite event log: {}", e);
+                }
+            }
+        }
+    }
+
+    async fn check_for_new_jsonl_events(&self, log_path: &Path) -> std::io::Result<()> {
+        if !log_path.exists() {
             return Ok(());
         }
 
-        let metadata = tokio::fs::metadata(&self.log_path).await?;
+        let metadata = tokio::fs::metadata(log_path).await?;
         let current_size = metadata.len();
 
         let file_position = {
@@ -231,7 +349,10 @@ impl EventStore {
 
         // Handle file truncation/recreation - reset position if file shrunk
         let effective_position = if current_size < file_position {
-            debug!("Log file was truncated/recreated, resetting position from {} to 0", file_position);
+            debug!(
+                "Log file was truncated/recreated, resetting position from {} to 0",
+                file_position
+            );
             let mut inner = self.inner.write();
             inner.file_position = 0;
             inner.events.clear(); // Clear stale events
@@ -243,7 +364,7 @@ impl EventStore {
         };
 
         // Read new content
-        let content = tokio::fs::read_to_string(&self.log_path).await?;
+        let content = tokio::fs::read_to_string(log_path).await?;
 
         // Process lines after the effective position
         let mut bytes_read = 0u64;
@@ -273,21 +394,54 @@ impl EventStore {
         Ok(())
     }
 
+    async fn check_for_new_sqlite_events(&self, db_path: &Path) -> std::io::Result<()> {
+        if !db_path.exists() {
+            return Ok(());
+        }
+
+        let cursor = {
+            let inner = self.inner.read();
+            inner.sqlite_seq
+        };
+
+        let db_path = db_path.to_path_buf();
+        let rows = tokio::task::spawn_blocking(move || read_sqlite_events(&db_path, Some(cursor)))
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))??;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut last_seq = cursor;
+        for (seq, event) in rows {
+            last_seq = seq;
+            let _ = self.event_tx.send(event.clone());
+            self.add_event(event);
+        }
+
+        let mut inner = self.inner.write();
+        inner.sqlite_seq = last_seq;
+
+        Ok(())
+    }
+
     fn add_event(&self, event: WrapEvent) {
         let mut inner = self.inner.write();
 
         // Update agent stats
         let agent_key = event.agent.name.clone();
-        let stats = inner.agents.entry(agent_key.clone()).or_insert_with(|| {
-            AgentStats {
+        let stats = inner
+            .agents
+            .entry(agent_key.clone())
+            .or_insert_with(|| AgentStats {
                 name: event.agent.name.clone(),
                 version: event.agent.version.clone(),
                 detected_from: format!("{:?}", event.agent.detected_from),
                 event_count: 0,
                 last_seen: event.timestamp.to_rfc3339(),
                 servers: Vec::new(),
-            }
-        });
+            });
 
         stats.event_count += 1;
         stats.last_seen = event.timestamp.to_rfc3339();
@@ -324,16 +478,98 @@ impl EventStore {
     }
 }
 
+fn read_sqlite_events(
+    db_path: &Path,
+    since_seq: Option<i64>,
+) -> std::io::Result<Vec<(i64, WrapEvent)>> {
+    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    ensure_wrap_events_schema(&conn)?;
+
+    let mut events = Vec::new();
+    if let Some(cursor) = since_seq {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT seq, event_json
+                FROM wrap_events
+                WHERE seq > ?1
+                ORDER BY seq ASC
+                "#,
+            )
+            .map_err(to_io_err)?;
+
+        let rows = stmt
+            .query_map([cursor], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_err)?;
+
+        for row in rows {
+            let (seq, json) = row.map_err(to_io_err)?;
+            if let Ok(mut event) = serde_json::from_str::<WrapEvent>(&json) {
+                event.seq = Some(seq);
+                events.push((seq, event));
+            }
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT seq, event_json
+                FROM wrap_events
+                ORDER BY seq ASC
+                "#,
+            )
+            .map_err(to_io_err)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_err)?;
+
+        for row in rows {
+            let (seq, json) = row.map_err(to_io_err)?;
+            if let Ok(mut event) = serde_json::from_str::<WrapEvent>(&json) {
+                event.seq = Some(seq);
+                events.push((seq, event));
+            }
+        }
+    }
+
+    Ok(events)
+}
+
+fn ensure_wrap_events_schema(conn: &Connection) -> std::io::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS wrap_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            event_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .map_err(to_io_err)?;
+    Ok(())
+}
+
+fn to_io_err(error: rusqlite::Error) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use soth_core::types::{AgentInfo, DetectionSource, WrapDirection};
+    use soth_core::EventLogger;
     use tempfile::tempdir;
 
     fn make_event(agent_name: &str, server: &str) -> WrapEvent {
         let agent = AgentInfo::new(agent_name, DetectionSource::McpInitialize);
-        WrapEvent::new("sess-123", server, WrapDirection::In, agent)
-            .with_method("tools/call")
+        WrapEvent::new("sess-123", server, WrapDirection::In, agent).with_method("tools/call")
     }
 
     #[test]
@@ -361,7 +597,11 @@ mod tests {
         let agents = store.get_agents();
         assert_eq!(agents.total_agents, 2);
 
-        let claude = agents.agents.iter().find(|a| a.name == "Claude Desktop").unwrap();
+        let claude = agents
+            .agents
+            .iter()
+            .find(|a| a.name == "Claude Desktop")
+            .unwrap();
         assert_eq!(claude.event_count, 2);
         assert_eq!(claude.servers.len(), 2);
     }
@@ -393,5 +633,45 @@ mod tests {
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.agent.name, "Test Agent");
+    }
+
+    #[tokio::test]
+    async fn test_load_initial_from_sqlite() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let logger = EventLogger::new(db_path.clone()).unwrap();
+        logger.log(&make_event("Claude Desktop", "postgres"));
+        logger.log(&make_event("Cursor", "filesystem"));
+        logger.close();
+
+        let store = EventStore::new(db_path);
+        let count = store.load_initial().await.unwrap();
+        assert_eq!(count, 2);
+
+        let summary = store.get_events(10);
+        assert_eq!(summary.total_events, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_events_since_seq_sqlite() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let logger = EventLogger::new(db_path.clone()).unwrap();
+        logger.log(&make_event("Claude Desktop", "postgres"));
+        logger.log(&make_event("Cursor", "filesystem"));
+        logger.log(&make_event("Windsurf", "git"));
+        logger.close();
+
+        let store = EventStore::new(db_path);
+        store.load_initial().await.unwrap();
+
+        let replay = store.get_events_since_seq(1, 10);
+        assert_eq!(replay.events.len(), 2);
+        assert!(replay
+            .events
+            .iter()
+            .all(|event| event.seq.map(|seq| seq > 1).unwrap_or(false)));
     }
 }

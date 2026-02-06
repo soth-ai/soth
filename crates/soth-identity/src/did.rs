@@ -120,7 +120,10 @@ impl Did {
         let decoded = base58_decode(&self.identifier[1..])?;
 
         // Verify and strip multicodec prefix
-        if decoded.len() < 2 || decoded[0] != ED25519_MULTICODEC_PREFIX[0] || decoded[1] != ED25519_MULTICODEC_PREFIX[1] {
+        if decoded.len() < 2
+            || decoded[0] != ED25519_MULTICODEC_PREFIX[0]
+            || decoded[1] != ED25519_MULTICODEC_PREFIX[1]
+        {
             return Err(SothError::InvalidDid(
                 "Invalid multicodec prefix (expected Ed25519 0xed01)".to_string(),
             ));

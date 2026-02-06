@@ -96,7 +96,10 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             println!("   - {error}");
         }
         println!();
-        return Err(anyhow::anyhow!("Configuration has {} error(s)", errors.len()));
+        return Err(anyhow::anyhow!(
+            "Configuration has {} error(s)",
+            errors.len()
+        ));
     }
 
     println!("✓ Configuration is valid");
@@ -109,15 +112,30 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
         println!("  Transport:   {}", config.server.transport);
         println!("  Listen:      {}", config.server.listen.socket_addr());
         println!("  Identity:    {}", config.identity.mode);
-        println!("  Policy:      {} ({})",
-            if config.policy.enabled { "enabled" } else { "disabled" },
+        println!(
+            "  Policy:      {} ({})",
+            if config.policy.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             config.policy.mode
         );
-        println!("  PII detect:  {}",
-            if config.observe.pii_detection { "enabled" } else { "disabled" }
+        println!(
+            "  PII detect:  {}",
+            if config.observe.pii_detection {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
-        println!("  Budget:      {}",
-            if config.budget.enabled { "enabled" } else { "disabled" }
+        println!(
+            "  Budget:      {}",
+            if config.budget.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
 
         // Cache config
@@ -125,7 +143,10 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
         println!("Cache Configuration:");
         println!("  Enabled:      {}", config.policy.cache.enabled);
         println!("  L1 TTL:       {:?}", config.policy.cache.l1_ttl);
-        println!("  L2 TTL:       {:?}", config.policy.cache.effective_l2_ttl());
+        println!(
+            "  L2 TTL:       {:?}",
+            config.policy.cache.effective_l2_ttl()
+        );
         println!("  L1 Max:       {}", config.policy.cache.l1_max_entries);
         println!("  L2 Max:       {}", config.policy.cache.l2_max_entries);
     }
@@ -137,7 +158,9 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
 fn validate_server(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
     let transport = &config.server.transport;
     if !["stdio", "sse", "http"].contains(&transport.as_str()) {
-        errors.push(format!("Invalid transport '{transport}' (valid: stdio, sse, http)"));
+        errors.push(format!(
+            "Invalid transport '{transport}' (valid: stdio, sse, http)"
+        ));
     }
 
     if transport != "stdio" {
@@ -183,7 +206,9 @@ fn validate_upstream(config: &SothConfig, warnings: &mut Vec<String>, errors: &m
 fn validate_identity(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
     let mode = &config.identity.mode;
     if !["disabled", "optional", "required"].contains(&mode.as_str()) {
-        errors.push(format!("Invalid identity mode '{mode}' (valid: disabled, optional, required)"));
+        errors.push(format!(
+            "Invalid identity mode '{mode}' (valid: disabled, optional, required)"
+        ));
     }
 
     if mode == "required" && config.identity.key_path.is_none() {
@@ -199,7 +224,9 @@ fn validate_policy(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut
 
     let mode = &config.policy.mode;
     if !["audit", "enforce"].contains(&mode.as_str()) {
-        errors.push(format!("Invalid policy mode '{mode}' (valid: audit, enforce)"));
+        errors.push(format!(
+            "Invalid policy mode '{mode}' (valid: audit, enforce)"
+        ));
     }
 
     // Cache validation
@@ -213,7 +240,7 @@ fn validate_policy(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut
 }
 
 /// Validate observe configuration
-fn validate_observe(config: &SothConfig, warnings: &mut Vec<String>, _errors: &mut [String]) {
+fn validate_observe(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
     if !config.observe.enabled {
         warnings.push("Observe is disabled, no logging/PII detection will occur".to_string());
     }
@@ -224,6 +251,14 @@ fn validate_observe(config: &SothConfig, warnings: &mut Vec<String>, _errors: &m
 
     if config.observe.buffer_size == 0 {
         warnings.push("Observe buffer_size is 0, logging may be synchronous".to_string());
+    }
+
+    let backend = config.observe.storage.backend.to_lowercase();
+    if !["local", "jsonl", "sqlite"].contains(&backend.as_str()) {
+        errors.push(format!(
+            "Invalid observe.storage.backend '{}' (valid: local, jsonl, sqlite)",
+            config.observe.storage.backend
+        ));
     }
 }
 

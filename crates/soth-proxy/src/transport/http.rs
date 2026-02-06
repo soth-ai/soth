@@ -4,7 +4,7 @@
 
 use super::{AsyncMessageHandler, Transport, TransportConfig};
 use crate::error::ProxyError;
-use crate::protocol::{JsonRpcMessage, JsonRpcResponse, JsonRpcError, RequestId};
+use crate::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
 use async_trait::async_trait;
 use axum::{
     extract::State,
@@ -187,7 +187,9 @@ async fn handle_batch(
 #[async_trait]
 impl Transport for HttpTransport {
     async fn start(&mut self, cancel: CancellationToken) -> Result<(), ProxyError> {
-        let handler = self.handler.take()
+        let handler = self
+            .handler
+            .take()
             .ok_or_else(|| ProxyError::Transport("No handler set".to_string()))?;
 
         let state = Arc::new(HttpState {
@@ -235,7 +237,9 @@ impl Transport for HttpTransport {
 
     async fn send(&self, _message: JsonRpcMessage) -> Result<(), ProxyError> {
         // HTTP is request/response only; can't push messages
-        Err(ProxyError::Transport("HTTP transport doesn't support push".to_string()))
+        Err(ProxyError::Transport(
+            "HTTP transport doesn't support push".to_string(),
+        ))
     }
 
     fn set_handler(&mut self, handler: AsyncMessageHandler) {

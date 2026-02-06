@@ -15,11 +15,6 @@ import {
   Cpu,
   CloudArrowUp,
   Robot,
-  CaretRight,
-  CaretDown,
-  CheckCircle,
-  XCircle,
-  Clock,
   Stack,
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
@@ -32,7 +27,6 @@ import {
   createClusters,
   type LogEntry,
   type Filters,
-  type EventSource,
   type EventCluster,
   type DisplayItem,
 } from "@/store/observability";
@@ -95,14 +89,10 @@ function getLatencyColor(ms: number) {
 // Cluster Row Component
 const ClusterRow = memo(function ClusterRow({
   cluster,
-  isExpanded,
-  onToggle,
 }: {
   cluster: EventCluster;
-  isExpanded: boolean;
-  onToggle: () => void;
 }) {
-  const { selectedLogId, selectLog } = useObservabilityStore();
+  const { selectedLogId, selectedLogPart, selectLog } = useObservabilityStore();
   const highlightPii = useSettingsStore((state) => state.highlightPii);
   const highlightErrors = useSettingsStore((state) => state.highlightErrors);
   const [isHovered, setIsHovered] = useState(false);
@@ -110,90 +100,95 @@ const ClusterRow = memo(function ClusterRow({
 
   const source = sourceConfig[cluster.source] || sourceConfig.mcp;
   const isPending = !cluster.response;
+  const singleLine = useCallback((value: string) => value.replace(/\s+/g, " ").trim(), []);
+  const requestSummary = useMemo(
+    () => singleLine(getLogSummary(cluster.request)),
+    [cluster.request, singleLine]
+  );
+  const responseSummary = useMemo(
+    () => (cluster.response ? singleLine(getLogSummary(cluster.response)) : "pending response"),
+    [cluster.response, singleLine]
+  );
 
   // Apply highlight settings
   const showErrorHighlight = highlightErrors && (cluster.hasError || cluster.policyDenied);
   const showPiiHighlight = highlightPii && cluster.hasPii;
 
-  const handleClick = useCallback(() => {
-    selectLog(cluster.request.id);
-  }, [selectLog, cluster.request.id]);
-
-  const handleToggle = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation();
-    onToggle();
-  }, [onToggle]);
-
   const handleCopy = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
+    const parseMaybeJson = (raw: string) => {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return raw;
+      }
+    };
     const content = cluster.response
-      ? JSON.stringify({ request: JSON.parse(cluster.request.content), response: JSON.parse(cluster.response.content) }, null, 2)
+      ? JSON.stringify(
+          {
+            request: parseMaybeJson(cluster.request.content),
+            response: parseMaybeJson(cluster.response.content),
+          },
+          null,
+          2
+        )
       : cluster.request.content;
     navigator.clipboard.writeText(content);
     toast.success("Copied to clipboard", { duration: 2000 });
   }, [cluster]);
 
+  const responseTargetId = cluster.response?.id || cluster.request.id;
+  const isSameIdPair = !!cluster.response && cluster.request.id === cluster.response.id;
+  const requestIsSelected = isSameIdPair
+    ? selectedLogId === cluster.request.id && selectedLogPart !== "response"
+    : selectedLogId === cluster.request.id;
+  const responseIsSelected = isSameIdPair
+    ? selectedLogId === cluster.request.id && selectedLogPart === "response"
+    : selectedLogId === responseTargetId;
+
+  const rowClass = "flex items-center gap-3 px-4 h-8 overflow-hidden";
+  const sourceChipClass =
+    "inline-flex items-center justify-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border w-[56px] flex-shrink-0";
+  const methodChipClass =
+    "inline-flex items-center px-1.5 py-0.5 rounded-md text-xs font-mono font-medium min-w-[120px] max-w-[180px] flex-shrink-0 truncate";
+  const badgeSlotClass = "flex items-center justify-end gap-1.5 w-[168px] flex-shrink-0";
+
   return (
     <div
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
       className={cn(
-        "border-b border-border transition-all",
-        isSelected && "bg-accent/10"
+        "group border-b border-border border-l-2 transition-colors",
+        isSelected && "border-l-accent bg-accent/10",
+        showErrorHighlight && !isSelected && "border-l-red-500 bg-red-500/5",
+        showPiiHighlight && !showErrorHighlight && !isSelected && "border-l-orange-500 bg-orange-500/5",
+        !isSelected && !showErrorHighlight && !showPiiHighlight && "border-l-transparent"
       )}
     >
-      {/* Cluster Header */}
+      {/* Request Row */}
       <div
-        onClick={handleClick}
-        onMouseEnter={() => setIsHovered(true)}
-        onMouseLeave={() => setIsHovered(false)}
+        onClick={() => selectLog(cluster.request.id, isSameIdPair ? "request" : null)}
         className={cn(
-          "group relative flex items-center gap-3 px-4 h-10 cursor-pointer transition-all duration-150",
-          "hover:bg-muted/40",
-          isSelected && "border-l-2 border-l-accent",
-          showErrorHighlight && !isSelected && "border-l-2 border-l-red-500 bg-red-500/5",
-          showPiiHighlight && !showErrorHighlight && !isSelected && "border-l-2 border-l-orange-500 bg-orange-500/5",
-          !isSelected && !showErrorHighlight && !showPiiHighlight && "border-l-2 border-l-transparent"
+          rowClass,
+          "cursor-pointer hover:bg-muted/35",
+          requestIsSelected && "bg-accent/20"
         )}
       >
-        {/* Expand/Collapse Toggle */}
-        <button
-          onClick={handleToggle}
-          className="flex-shrink-0 p-0.5 rounded hover:bg-muted transition-colors"
-        >
-          {isExpanded ? (
-            <CaretDown className="w-3.5 h-3.5 text-muted-foreground" weight="bold" />
-          ) : (
-            <CaretRight className="w-3.5 h-3.5 text-muted-foreground" weight="bold" />
-          )}
-        </button>
-
-        {/* Status Icon */}
-        <div className="flex-shrink-0">
-          {isPending ? (
-            <Clock className="w-4 h-4 text-amber-500 animate-pulse" weight="duotone" />
-          ) : cluster.hasError ? (
-            <XCircle className="w-4 h-4 text-red-500" weight="fill" />
-          ) : (
-            <CheckCircle className="w-4 h-4 text-emerald-500" weight="fill" />
-          )}
+        <div className="w-4 flex items-center justify-center flex-shrink-0">
+          <div className="w-2 h-2 rounded-full bg-cyan-500" />
         </div>
 
-        {/* Timestamp */}
-        <span className="text-xs text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums">
-          {formatTimestamp(cluster.timestamp)}
+        <span className="text-xs text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap">
+          {formatTimestamp(cluster.request.timestamp)}
         </span>
 
-        {/* Source Chip */}
-        <span
-          className={cn(
-            "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border flex-shrink-0",
-            source.color
-          )}
-        >
+        <ArrowDown className="w-3.5 h-3.5 text-cyan-500 flex-shrink-0" weight="bold" />
+
+        <span className={cn(sourceChipClass, source.color)}>
           <source.icon className="w-3 h-3" weight="duotone" />
           {source.label}
         </span>
 
-        {/* Agent */}
         <span
           className="text-xs text-muted-foreground w-24 truncate flex-shrink-0"
           title={cluster.request.agent.name}
@@ -201,21 +196,136 @@ const ClusterRow = memo(function ClusterRow({
           {cluster.request.agent.name}
         </span>
 
-        {/* Method Badge */}
         <span
           className={cn(
-            "inline-flex items-center px-2 py-0.5 rounded-md text-xs font-mono font-medium flex-shrink-0 min-w-[140px] max-w-[200px] truncate",
-            cluster.hasError
-              ? "bg-red-500/20 text-red-500 border border-red-500/30"
-              : "bg-secondary text-secondary-foreground border border-border"
+            methodChipClass,
+            "bg-secondary text-secondary-foreground border border-border",
+            cluster.policyDenied && "bg-red-500/20 text-red-500 border-red-500/30"
           )}
           title={cluster.method}
         >
-          {truncate(cluster.method, 22)}
+          {truncate(cluster.method, 20)}
         </span>
 
-        {/* Badges */}
-        <div className="flex items-center gap-1.5 flex-shrink-0">
+        <span
+          className="text-xs text-cyan-500/90 truncate font-mono flex-1 min-w-0 whitespace-nowrap"
+          title={requestSummary}
+        >
+          {truncate(requestSummary, 90)}
+        </span>
+
+        <span className="text-xs font-mono tabular-nums text-right w-16 flex-shrink-0 text-cyan-500/80">
+          {cluster.request.token_count ? `${cluster.request.token_count}t` : ""}
+        </span>
+
+        <div className={badgeSlotClass}>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleCopy}
+            className={cn(
+              "h-6 w-6 p-0 bg-secondary border border-border hover:bg-muted transition-opacity",
+              isHovered ? "opacity-100" : "opacity-0 pointer-events-none"
+            )}
+            title="Copy request + response JSON"
+          >
+            <Copy className="w-3 h-3 text-muted-foreground" />
+          </Button>
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-500">
+            REQUEST
+          </span>
+        </div>
+      </div>
+
+      {/* Response Row */}
+      <div
+        onClick={() => selectLog(responseTargetId, isSameIdPair ? "response" : null)}
+        className={cn(
+          rowClass,
+          "cursor-pointer border-t border-border/60 hover:bg-muted/35",
+          responseIsSelected && "bg-accent/20"
+        )}
+      >
+        <div className="w-4 flex items-center justify-center flex-shrink-0">
+          <div
+            className={cn(
+              "w-2 h-2 rounded-full",
+              isPending
+                ? "bg-amber-500 animate-pulse"
+                : cluster.hasError
+                ? "bg-red-500"
+                : "bg-emerald-500"
+            )}
+          />
+        </div>
+
+        <span className="text-xs text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap">
+          {formatTimestamp(cluster.response?.timestamp || cluster.timestamp)}
+        </span>
+
+        <ArrowUp
+          className={cn(
+            "w-3.5 h-3.5 flex-shrink-0",
+            isPending
+              ? "text-amber-500"
+              : cluster.hasError
+              ? "text-red-500"
+              : "text-emerald-500"
+          )}
+          weight="bold"
+        />
+
+        <span className={cn(sourceChipClass, source.color)}>
+          <source.icon className="w-3 h-3" weight="duotone" />
+          {source.label}
+        </span>
+
+        <span
+          className="text-xs text-muted-foreground w-24 truncate flex-shrink-0"
+          title={cluster.response?.agent.name || cluster.request.agent.name}
+        >
+          {cluster.response?.agent.name || cluster.request.agent.name}
+        </span>
+
+        <span
+          className={cn(
+            methodChipClass,
+            "border",
+            isPending
+              ? "bg-amber-500/10 text-amber-500 border-amber-500/30"
+              : cluster.hasError
+              ? "bg-red-500/20 text-red-500 border-red-500/30"
+              : "bg-emerald-500/10 text-emerald-500 border-emerald-500/30"
+          )}
+          title={cluster.method}
+        >
+          {truncate(cluster.method, 20)}
+        </span>
+
+        <span
+          className={cn(
+            "text-xs truncate font-mono flex-1 min-w-0 whitespace-nowrap",
+            isPending
+              ? "text-amber-500"
+              : cluster.hasError
+              ? "text-red-500/90"
+              : "text-emerald-500/90"
+          )}
+          title={responseSummary}
+        >
+          {truncate(responseSummary, 90)}
+        </span>
+
+        <span
+          className={cn(
+            "text-xs font-mono tabular-nums text-right w-16 flex-shrink-0",
+            cluster.latency !== null ? getLatencyColor(cluster.latency) : "text-amber-500"
+          )}
+        >
+          {cluster.latency !== null ? formatLatency(cluster.latency) : "pending"}
+        </span>
+
+        <div className={badgeSlotClass}>
           {cluster.policyDenied && (
             <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-500/20 text-red-500">
               DENIED
@@ -226,103 +336,11 @@ const ClusterRow = memo(function ClusterRow({
               PII
             </span>
           )}
-        </div>
-
-        {/* Spacer */}
-        <div className="flex-1" />
-
-        {/* Latency */}
-        {cluster.latency !== null && (
-          <span
-            className={cn(
-              "text-xs font-mono font-semibold flex-shrink-0 tabular-nums",
-              getLatencyColor(cluster.latency)
-            )}
-          >
-            {formatLatency(cluster.latency)}
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500">
+            RESPONSE
           </span>
-        )}
-        {isPending && (
-          <span className="text-xs text-amber-500 font-medium">pending...</span>
-        )}
-
-        {/* Copy Button */}
-        {isHovered && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleCopy}
-            className="h-6 w-6 p-0 bg-secondary border border-border hover:bg-muted"
-            title="Copy JSON"
-          >
-            <Copy className="w-3 h-3 text-muted-foreground" />
-          </Button>
-        )}
-      </div>
-
-      {/* Expanded Content */}
-      {isExpanded && (
-        <div className="bg-muted/20 border-t border-border">
-          {/* Request */}
-          <NestedLogRow log={cluster.request} label="Request" />
-          {/* Response */}
-          {cluster.response && (
-            <NestedLogRow log={cluster.response} label="Response" />
-          )}
         </div>
-      )}
-    </div>
-  );
-});
-
-// Nested Log Row (shown when cluster is expanded)
-const NestedLogRow = memo(function NestedLogRow({
-  log,
-  label,
-}: {
-  log: LogEntry;
-  label: string;
-}) {
-  const { selectedLogId, selectLog } = useObservabilityStore();
-  const isSelected = selectedLogId === log.id;
-
-  return (
-    <div
-      onClick={() => selectLog(log.id)}
-      className={cn(
-        "flex items-center gap-3 pl-12 pr-4 h-8 cursor-pointer transition-colors",
-        "hover:bg-muted/40",
-        isSelected && "bg-accent/20"
-      )}
-    >
-      {/* Label */}
-      <span className={cn(
-        "text-[10px] font-medium uppercase tracking-wide w-16",
-        label === "Request" ? "text-cyan-500" : "text-emerald-500"
-      )}>
-        {label}
-      </span>
-
-      {/* Direction */}
-      <div className="flex-shrink-0">
-        {log.direction === "in" ? (
-          <ArrowDown className="w-3 h-3 text-cyan-500" weight="bold" />
-        ) : (
-          <ArrowUp className="w-3 h-3 text-emerald-500" weight="bold" />
-        )}
       </div>
-
-      {/* Summary */}
-      <span className="text-xs text-muted-foreground flex-1 truncate font-mono">
-        {truncate(getLogSummary(log), 80)}
-      </span>
-
-      {/* Tokens */}
-      {log.token_count !== undefined && log.token_count > 0 && (
-        <span className="text-[10px] font-mono text-amber-500 tabular-nums">
-          {log.token_count >= 1000 ? `${(log.token_count / 1000).toFixed(1)}k` : log.token_count} tokens
-        </span>
-      )}
     </div>
   );
 });
@@ -392,7 +410,6 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
       ref={rowRef}
       tabIndex={isSelected ? 0 : -1}
       role="button"
-      aria-selected={isSelected}
       onClick={() => selectLog(log.id)}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
@@ -538,7 +555,6 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
 export function MessageStream() {
   const logs = useObservabilityStore((state) => state.logs);
   const filters = useObservabilityStore((state) => state.filters);
-  const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
   const isLive = useObservabilityStore((state) => state.isLive);
   const isConnected = useObservabilityStore((state) => state.isConnected);
   const setFilters = useObservabilityStore((state) => state.setFilters);
@@ -546,8 +562,6 @@ export function MessageStream() {
   const setIsLive = useObservabilityStore((state) => state.setIsLive);
   const clusteringEnabled = useObservabilityStore((state) => state.clusteringEnabled);
   const setClusteringEnabled = useObservabilityStore((state) => state.setClusteringEnabled);
-  const expandedClusters = useObservabilityStore((state) => state.expandedClusters);
-  const toggleCluster = useObservabilityStore((state) => state.toggleCluster);
 
   const filteredLogs = useMemo(() => filterLogs(logs, filters), [logs, filters]);
   const allLogs = logs;
@@ -640,18 +654,11 @@ export function MessageStream() {
   const renderItem = useCallback(
     (index: number, item: DisplayItem) => {
       if (item.type === "cluster") {
-        return (
-          <ClusterRow
-            key={item.cluster.id}
-            cluster={item.cluster}
-            isExpanded={expandedClusters.has(item.cluster.id)}
-            onToggle={() => toggleCluster(item.cluster.id)}
-          />
-        );
+        return <ClusterRow key={item.cluster.id} cluster={item.cluster} />;
       }
       return <LogRow key={item.log.id} log={item.log} />;
     },
-    [expandedClusters, toggleCluster]
+    []
   );
 
   return (

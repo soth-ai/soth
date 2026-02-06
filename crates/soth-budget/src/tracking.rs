@@ -253,7 +253,14 @@ mod tests {
     fn test_spend_tracker() {
         let tracker = SpendTracker::new();
 
-        tracker.record("session-1", Some("agent-1"), "gpt-4o", 1000, 500, Some("tools/call"));
+        tracker.record(
+            "session-1",
+            Some("agent-1"),
+            "gpt-4o",
+            1000,
+            500,
+            Some("tools/call"),
+        );
         tracker.record("session-1", Some("agent-1"), "gpt-4o", 2000, 1000, None);
 
         let total = tracker.total_spend();

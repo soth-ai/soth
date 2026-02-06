@@ -28,7 +28,10 @@ pub fn render(frame: &mut Frame, area: Rect) {
         key_line("h/j/k/l", "Navigate panels / scroll (vim-style)", theme),
         key_line("Arrow keys", "Navigate panels / scroll", theme),
         Line::from(""),
-        Line::from(Span::styled("Scrolling (Events/Agents tabs)", theme.bold_style())),
+        Line::from(Span::styled(
+            "Scrolling (Events/Agents tabs)",
+            theme.bold_style(),
+        )),
         Line::from(""),
         key_line("j / Down", "Scroll down", theme),
         key_line("k / Up", "Scroll up", theme),

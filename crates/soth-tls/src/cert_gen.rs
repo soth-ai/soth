@@ -2,8 +2,8 @@
 
 use crate::error::{Result, TlsError};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    IsCa, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 use std::time::Duration;
 use tracing::debug;
@@ -58,8 +58,7 @@ impl CertGenerator {
         ];
 
         // Generate keypair
-        let key_pair = KeyPair::generate()
-            .map_err(|e| TlsError::key_generation(e.to_string()))?;
+        let key_pair = KeyPair::generate().map_err(|e| TlsError::key_generation(e.to_string()))?;
 
         // Generate certificate
         let cert = params
@@ -101,8 +100,7 @@ impl CertGenerator {
         })?)];
 
         // Generate keypair for the domain cert
-        let key_pair = KeyPair::generate()
-            .map_err(|e| TlsError::key_generation(e.to_string()))?;
+        let key_pair = KeyPair::generate().map_err(|e| TlsError::key_generation(e.to_string()))?;
 
         // Sign with CA
         let cert = params
@@ -158,18 +156,14 @@ impl CertGenerator {
         params.subject_alt_names = sans;
 
         // Generate keypair
-        let key_pair = KeyPair::generate()
-            .map_err(|e| TlsError::key_generation(e.to_string()))?;
+        let key_pair = KeyPair::generate().map_err(|e| TlsError::key_generation(e.to_string()))?;
 
         // Sign with CA
         let cert = params
             .signed_by(&key_pair, ca_cert, ca_key)
             .map_err(|e| TlsError::cert_generation(e.to_string()))?;
 
-        debug!(
-            "Generated multi-domain certificate: {:?}",
-            domains
-        );
+        debug!("Generated multi-domain certificate: {:?}", domains);
 
         let cert_der = cert.der().to_vec();
         let key_der = key_pair.serialize_der();

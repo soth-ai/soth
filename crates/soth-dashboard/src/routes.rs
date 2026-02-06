@@ -1,11 +1,10 @@
 //! API routes for the dashboard
 
-use crate::event_store::{AgentsSummary, EventsSummary, EventStore};
+use crate::event_store::{AgentsSummary, EventStore, EventsSummary};
 use crate::state::{
-    AdvancedBudgetMetrics, BudgetMetrics, DashboardState, IdentityMetrics,
-    ObserveMetrics, PolicyMetrics, ProxyMetrics,
+    AdvancedBudgetMetrics, BudgetMetrics, DashboardState, IdentityMetrics, ObserveMetrics,
+    PolicyMetrics, ProxyMetrics,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::websocket::event_stream_handler;
 use axum::{
     extract::{Query, State},
@@ -14,6 +13,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Wrapper response for API endpoints
@@ -22,6 +22,16 @@ pub struct ApiResponse<T> {
     pub timestamp: String,
     pub uptime_secs: u64,
     pub data: T,
+}
+
+/// Combined dashboard snapshot payload.
+#[derive(Serialize)]
+pub struct DashboardSnapshot {
+    pub identity: IdentityMetrics,
+    pub policy: PolicyMetrics,
+    pub observe: ObserveMetrics,
+    pub budget: BudgetMetrics,
+    pub proxy: ProxyMetrics,
 }
 
 impl<T> ApiResponse<T> {
@@ -85,6 +95,7 @@ pub fn api_router(state: DashboardState) -> Router {
 pub fn api_router_with_events(state: AppState) -> Router {
     let mut router = Router::new()
         // API endpoints
+        .route("/api/snapshot", get(get_snapshot))
         .route("/api/identity", get(get_identity))
         .route("/api/policy", get(get_policy))
         .route("/api/observe", get(get_observe))
@@ -111,7 +122,7 @@ pub fn api_router_with_events(state: AppState) -> Router {
             "/api/events/stream",
             get({
                 let events = events.clone();
-                move |ws| event_stream_handler(ws, State(events.clone()))
+                move |ws, query| event_stream_handler(ws, State(events.clone()), query)
             }),
         );
     }
@@ -119,11 +130,26 @@ pub fn api_router_with_events(state: AppState) -> Router {
     router.with_state(state)
 }
 
+/// Get combined dashboard snapshot in one request.
+async fn get_snapshot(State(state): State<AppState>) -> Json<ApiResponse<DashboardSnapshot>> {
+    Json(ApiResponse::new(
+        &state.dashboard,
+        DashboardSnapshot {
+            identity: state.dashboard.identity(),
+            policy: state.dashboard.policy(),
+            observe: state.dashboard.observe(),
+            budget: state.dashboard.budget(),
+            proxy: state.dashboard.proxy(),
+        },
+    ))
+}
+
 /// Query parameters for events endpoint
 #[derive(Deserialize)]
 pub struct EventsQuery {
     #[serde(default = "default_limit")]
     pub limit: usize,
+    pub since_seq: Option<i64>,
 }
 
 fn default_limit() -> usize {
@@ -132,7 +158,10 @@ fn default_limit() -> usize {
 
 /// Get identity metrics
 async fn get_identity(State(state): State<AppState>) -> Json<ApiResponse<IdentityMetrics>> {
-    Json(ApiResponse::new(&state.dashboard, state.dashboard.identity()))
+    Json(ApiResponse::new(
+        &state.dashboard,
+        state.dashboard.identity(),
+    ))
 }
 
 /// Get policy metrics
@@ -142,7 +171,10 @@ async fn get_policy(State(state): State<AppState>) -> Json<ApiResponse<PolicyMet
 
 /// Get observe metrics
 async fn get_observe(State(state): State<AppState>) -> Json<ApiResponse<ObserveMetrics>> {
-    Json(ApiResponse::new(&state.dashboard, state.dashboard.observe()))
+    Json(ApiResponse::new(
+        &state.dashboard,
+        state.dashboard.observe(),
+    ))
 }
 
 /// Get budget metrics
@@ -156,8 +188,13 @@ async fn get_proxy(State(state): State<AppState>) -> Json<ApiResponse<ProxyMetri
 }
 
 /// Get advanced budget metrics (for Developer and CFO views)
-async fn get_advanced_budget(State(state): State<AppState>) -> Json<ApiResponse<AdvancedBudgetMetrics>> {
-    Json(ApiResponse::new(&state.dashboard, state.dashboard.advanced_budget()))
+async fn get_advanced_budget(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<AdvancedBudgetMetrics>> {
+    Json(ApiResponse::new(
+        &state.dashboard,
+        state.dashboard.advanced_budget(),
+    ))
 }
 
 /// Get recent events
@@ -166,7 +203,11 @@ async fn get_events(
     Query(query): Query<EventsQuery>,
 ) -> Json<ApiResponse<EventsSummary>> {
     let summary = if let Some(ref events) = state.events {
-        events.get_events(query.limit)
+        if let Some(since_seq) = query.since_seq {
+            events.get_events_since_seq(since_seq, query.limit)
+        } else {
+            events.get_events(query.limit)
+        }
     } else {
         EventsSummary {
             total_events: 0,
@@ -232,13 +273,19 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         let metrics_output = renderer();
         (
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
             metrics_output,
         )
     } else {
         (
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
             "# No metrics configured\n".to_string(),
         )
     }
@@ -319,7 +366,13 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_endpoint() {
         let state = DashboardState::new();
-        state.record_proxy_request("openai", "api.openai.com", "POST", "/v1/chat/completions");
+        state.record_proxy_request(
+            Some("req-openai-route-test"),
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+        );
 
         let app = api_router(state);
         let (status, body) = make_request(app, "/api/proxy").await;

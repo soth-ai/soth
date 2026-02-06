@@ -96,10 +96,14 @@ fn serialize_number(n: &serde_json::Number) -> Result<String> {
     if let Some(f) = n.as_f64() {
         // Check for special values
         if f.is_nan() {
-            return Err(SothError::Internal("NaN is not allowed in canonical JSON".to_string()));
+            return Err(SothError::Internal(
+                "NaN is not allowed in canonical JSON".to_string(),
+            ));
         }
         if f.is_infinite() {
-            return Err(SothError::Internal("Infinity is not allowed in canonical JSON".to_string()));
+            return Err(SothError::Internal(
+                "Infinity is not allowed in canonical JSON".to_string(),
+            ));
         }
 
         // Normalize negative zero
@@ -233,7 +237,10 @@ mod tests {
     fn test_canonicalize_object() {
         // Keys should be sorted
         let obj = json!({"z": 1, "a": 2, "m": 3});
-        assert_eq!(canonicalize_value(&obj).unwrap(), "{\"a\":2,\"m\":3,\"z\":1}");
+        assert_eq!(
+            canonicalize_value(&obj).unwrap(),
+            "{\"a\":2,\"m\":3,\"z\":1}"
+        );
     }
 
     #[test]

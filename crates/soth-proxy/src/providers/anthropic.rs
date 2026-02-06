@@ -59,7 +59,10 @@ impl AiProvider for AnthropicProvider {
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_u64());
 
-        let model = json.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+        let model = json
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string());
 
         Some(ProviderUsage {
             input_tokens,
@@ -96,9 +99,17 @@ impl AiProvider for AnthropicProvider {
                 let json: serde_json::Value = serde_json::from_str(&data).ok()?;
                 if let Some(message) = json.get("message") {
                     if let Some(usage) = message.get("usage") {
-                        let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let cached = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64());
-                        let model = message.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+                        let input = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cached = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64());
+                        let model = message
+                            .get("model")
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string());
                         return Some(SseEvent::Usage(ProviderUsage {
                             input_tokens: input,
                             output_tokens: 0,
@@ -125,7 +136,10 @@ impl AiProvider for AnthropicProvider {
                 // Contains output usage
                 let json: serde_json::Value = serde_json::from_str(&data).ok()?;
                 if let Some(usage) = json.get("usage") {
-                    let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let output = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     return Some(SseEvent::Usage(ProviderUsage {
                         input_tokens: 0, // Input was in message_start
                         output_tokens: output,
@@ -172,8 +186,7 @@ mod tests {
     fn test_extract_model() {
         let provider = AnthropicProvider::new();
         let body = r#"{"model": "claude-3-5-sonnet-20241022", "messages": []}"#;
-        let request = HttpRequest::new("POST", "/v1/messages")
-            .with_body(body.as_bytes().to_vec());
+        let request = HttpRequest::new("POST", "/v1/messages").with_body(body.as_bytes().to_vec());
 
         assert_eq!(
             provider.extract_model(&request),

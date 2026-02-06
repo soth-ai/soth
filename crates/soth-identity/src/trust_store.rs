@@ -71,11 +71,7 @@ impl TrustStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let content: String = self
-            .trusted
-            .iter()
-            .map(|s| format!("{s}\n"))
-            .collect();
+        let content: String = self.trusted.iter().map(|s| format!("{s}\n")).collect();
 
         std::fs::write(&self.path, content)?;
         Ok(())

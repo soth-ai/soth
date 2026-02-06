@@ -39,7 +39,11 @@ impl OpaWasmRuntime {
     }
 
     /// Compile Rego to Wasm (requires external OPA binary)
-    pub fn compile_rego(&self, rego_path: impl AsRef<Path>, output_path: impl AsRef<Path>) -> Result<()> {
+    pub fn compile_rego(
+        &self,
+        rego_path: impl AsRef<Path>,
+        output_path: impl AsRef<Path>,
+    ) -> Result<()> {
         let rego_path = rego_path.as_ref();
         let output_path = output_path.as_ref();
 
@@ -75,9 +79,11 @@ impl OpaWasmRuntime {
         // 1. Serialize input to JSON
         // 2. Call the Wasm module
         // 3. Parse the result
-
-        // For now, return a default allow
-        Ok(PolicyDecision::allow())
+        //
+        // Fail closed here so placeholder runtime cannot silently allow traffic.
+        Err(SothError::Policy(
+            "OPA Wasm evaluation is not implemented in this runtime".to_string(),
+        ))
     }
 
     /// Check if the runtime is ready

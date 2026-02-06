@@ -43,8 +43,8 @@ observe:
   log_responses: true
   tamper_proof: true
   storage:
-    backend: "local"
-    path: "./logs/"
+    backend: "sqlite"
+    path: "./logs/observations.db"
 
 # Budget configuration
 budget:

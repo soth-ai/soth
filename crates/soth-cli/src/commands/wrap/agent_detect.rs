@@ -26,9 +26,11 @@ pub fn detect_from_initialize(params: &Value) -> Option<AgentInfo> {
 pub fn detect_from_env() -> Option<AgentInfo> {
     // Claude Code
     if std::env::var("CLAUDE_CODE_ENTRY_POINT").is_ok() {
-        return Some(AgentInfo::new("Claude Code", DetectionSource::Environment).with_version(
-            std::env::var("CLAUDE_CODE_VERSION").unwrap_or_else(|_| "unknown".to_string()),
-        ));
+        return Some(
+            AgentInfo::new("Claude Code", DetectionSource::Environment).with_version(
+                std::env::var("CLAUDE_CODE_VERSION").unwrap_or_else(|_| "unknown".to_string()),
+            ),
+        );
     }
 
     // Check for Claude Code session
@@ -55,7 +57,10 @@ pub fn detect_from_env() -> Option<AgentInfo> {
     if std::env::var("VSCODE_PID").is_ok() {
         // Check for Copilot specifically
         if std::env::var("GITHUB_COPILOT_SESSION").is_ok() {
-            return Some(AgentInfo::new("GitHub Copilot", DetectionSource::Environment));
+            return Some(AgentInfo::new(
+                "GitHub Copilot",
+                DetectionSource::Environment,
+            ));
         }
         return Some(AgentInfo::new("VS Code", DetectionSource::Environment));
     }

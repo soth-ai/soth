@@ -2,4 +2,4 @@
 
 mod writer;
 
-pub use writer::{AsyncWriter, ObservationLogger};
+pub use writer::{AsyncWriter, LoggerConfig, ObservationLogger};

@@ -21,6 +21,11 @@ pub enum EventSource {
 /// An event captured during a wrap session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrapEvent {
+    /// Monotonic SQLite sequence cursor when sourced from DB-backed event logs.
+    /// Absent for JSONL/newly-created in-memory events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+
     /// Unique event ID
     pub id: String,
 
@@ -125,6 +130,7 @@ impl WrapEvent {
         agent: AgentInfo,
     ) -> Self {
         Self {
+            seq: None,
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
             session_id: session_id.into(),
@@ -198,14 +204,20 @@ impl WrapEvent {
     /// Set request content (for paired events)
     pub fn with_request(mut self, content: impl Into<String>, preview: impl Into<String>) -> Self {
         self.request_content = Some(content.into());
-        self.request_preview = Some(preview.into());
+        let preview = preview.into();
+        if !preview.is_empty() {
+            self.request_preview = Some(preview);
+        }
         self
     }
 
     /// Set response content (for paired events)
     pub fn with_response(mut self, content: impl Into<String>, preview: impl Into<String>) -> Self {
         self.response_content = Some(content.into());
-        self.response_preview = Some(preview.into());
+        let preview = preview.into();
+        if !preview.is_empty() {
+            self.response_preview = Some(preview);
+        }
         self
     }
 
@@ -349,8 +361,8 @@ mod tests {
 
     #[test]
     fn test_wrap_event_creation() {
-        let agent = AgentInfo::new("Claude Code", DetectionSource::McpInitialize)
-            .with_version("1.0.0");
+        let agent =
+            AgentInfo::new("Claude Code", DetectionSource::McpInitialize).with_version("1.0.0");
         let event = WrapEvent::new("session-1", "postgres", WrapDirection::In, agent)
             .with_method("tools/call")
             .with_tool_name("query")
@@ -366,8 +378,7 @@ mod tests {
 
     #[test]
     fn test_agent_info() {
-        let agent = AgentInfo::new("Cursor", DetectionSource::Environment)
-            .with_version("0.42.0");
+        let agent = AgentInfo::new("Cursor", DetectionSource::Environment).with_version("0.42.0");
 
         assert_eq!(agent.name, "Cursor");
         assert_eq!(agent.version, Some("0.42.0".to_string()));

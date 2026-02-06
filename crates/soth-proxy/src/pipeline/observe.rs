@@ -92,11 +92,7 @@ impl ObserveLayer {
     }
 
     /// Create observation event from request
-    fn create_request_event(
-        &self,
-        ctx: &RequestContext,
-        req: &JsonRpcRequest,
-    ) -> ObservationEvent {
+    fn create_request_event(&self, ctx: &RequestContext, req: &JsonRpcRequest) -> ObservationEvent {
         let event_type = if req.method.starts_with("notifications/") {
             EventType::Notification
         } else {
@@ -128,15 +124,10 @@ impl ObserveLayer {
             0
         };
 
-        ObservationEvent::new(
-            &ctx.session_id,
-            Direction::In,
-            event_type,
-            content_str,
-        )
-        .with_method(&req.method)
-        .with_token_count(token_count)
-        .with_pii(pii_detected, pii_types)
+        ObservationEvent::new(&ctx.session_id, Direction::In, event_type, content_str)
+            .with_method(&req.method)
+            .with_token_count(token_count)
+            .with_pii(pii_detected, pii_types)
     }
 
     /// Create observation event from response
@@ -175,14 +166,9 @@ impl ObserveLayer {
             0
         };
 
-        ObservationEvent::new(
-            &ctx.session_id,
-            Direction::Out,
-            event_type,
-            content_str,
-        )
-        .with_token_count(token_count)
-        .with_pii(pii_detected, pii_types)
+        ObservationEvent::new(&ctx.session_id, Direction::Out, event_type, content_str)
+            .with_token_count(token_count)
+            .with_pii(pii_detected, pii_types)
     }
 
     /// Log an event

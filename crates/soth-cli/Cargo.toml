@@ -13,7 +13,7 @@ path = "src/main.rs"
 soth-core = { workspace = true }
 soth-identity = { workspace = true }
 soth-policy = { workspace = true }
-soth-observe = { workspace = true }
+soth-observe = { workspace = true, features = ["sqlite"] }
 soth-budget = { workspace = true }
 soth-proxy = { workspace = true }
 soth-dashboard = { workspace = true }
@@ -34,6 +34,7 @@ x509-parser = { workspace = true }
 hex = "0.4"
 dirs = "5.0"
 reqwest = { workspace = true }
+rusqlite = { workspace = true }
 
 # CLI styling
 owo-colors = "4.0"

@@ -171,7 +171,9 @@ impl McpCostAttributor {
             accumulated_output_tokens: 0,
         };
 
-        self.pending_calls.write().insert(correlation_id.clone(), pending);
+        self.pending_calls
+            .write()
+            .insert(correlation_id.clone(), pending);
 
         // Update session activity
         if let Some(session) = self.sessions.write().get_mut(session_id) {
@@ -213,7 +215,10 @@ impl McpCostAttributor {
             drop(pending); // Release pending lock before acquiring sessions lock
             if let Some(session) = self.sessions.write().get_mut(&attribution.session_id) {
                 session.total_cost += cost;
-                *session.tool_costs.entry(attribution.tool_name.clone()).or_default() += cost;
+                *session
+                    .tool_costs
+                    .entry(attribution.tool_name.clone())
+                    .or_default() += cost;
                 session.last_activity = Utc::now();
             }
 
@@ -252,7 +257,13 @@ impl McpCostAttributor {
         if let Some(call) = recent_call {
             let correlation_id = call.correlation_id.clone();
             drop(pending);
-            return self.attribute_inference(&correlation_id, model, input_tokens, output_tokens, cost);
+            return self.attribute_inference(
+                &correlation_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cost,
+            );
         }
 
         None
@@ -264,7 +275,10 @@ impl McpCostAttributor {
 
         // Update session tool call count
         if let Some(session) = self.sessions.write().get_mut(&call.session_id) {
-            *session.tool_call_counts.entry(call.tool_name.clone()).or_default() += 1;
+            *session
+                .tool_call_counts
+                .entry(call.tool_name.clone())
+                .or_default() += 1;
         }
 
         Some(call.accumulated_cost)
@@ -272,7 +286,10 @@ impl McpCostAttributor {
 
     /// Get cost breakdown for a session
     pub fn get_session_costs(&self, session_id: &str) -> Option<HashMap<String, f64>> {
-        self.sessions.read().get(session_id).map(|s| s.tool_costs.clone())
+        self.sessions
+            .read()
+            .get(session_id)
+            .map(|s| s.tool_costs.clone())
     }
 
     /// Get aggregate cost by tool across all sessions
@@ -291,21 +308,27 @@ impl McpCostAttributor {
 
         let mut entries: Vec<ToolCostEntry> = tool_totals
             .into_iter()
-            .map(|((tool_name, server_name), (total_cost, call_count))| ToolCostEntry {
-                tool_name,
-                server_name,
-                total_cost,
-                call_count,
-                avg_cost_per_call: if call_count > 0 {
-                    total_cost / call_count as f64
-                } else {
-                    0.0
+            .map(
+                |((tool_name, server_name), (total_cost, call_count))| ToolCostEntry {
+                    tool_name,
+                    server_name,
+                    total_cost,
+                    call_count,
+                    avg_cost_per_call: if call_count > 0 {
+                        total_cost / call_count as f64
+                    } else {
+                        0.0
+                    },
                 },
-            })
+            )
             .collect();
 
         // Sort by total cost descending
-        entries.sort_by(|a, b| b.total_cost.partial_cmp(&a.total_cost).unwrap_or(std::cmp::Ordering::Equal));
+        entries.sort_by(|a, b| {
+            b.total_cost
+                .partial_cmp(&a.total_cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         entries
     }
@@ -319,7 +342,9 @@ impl McpCostAttributor {
     /// Cleanup old pending calls
     pub fn cleanup_stale(&self) {
         let cutoff = Utc::now() - self.max_pending_age;
-        self.pending_calls.write().retain(|_, call| call.started_at > cutoff);
+        self.pending_calls
+            .write()
+            .retain(|_, call| call.started_at > cutoff);
     }
 
     /// Get total attributed cost across all sessions

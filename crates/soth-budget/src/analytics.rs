@@ -7,9 +7,8 @@
 
 use chrono::{Duration, Utc};
 use soth_core::types::budget::{
-    AnomalySeverity, AnomalyType, CostAnomaly, CostRecommendation,
-    DailyTrendPoint, EffortLevel, ProviderCostBreakdown, ModelCostEntry,
-    RecommendationType,
+    AnomalySeverity, AnomalyType, CostAnomaly, CostRecommendation, DailyTrendPoint, EffortLevel,
+    ModelCostEntry, ProviderCostBreakdown, RecommendationType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,7 +39,10 @@ impl CostAnalytics {
     }
 
     /// Get cost breakdown by provider
-    pub fn get_provider_breakdown(&self, days: u32) -> Result<HashMap<String, ProviderCostBreakdown>> {
+    pub fn get_provider_breakdown(
+        &self,
+        days: u32,
+    ) -> Result<HashMap<String, ProviderCostBreakdown>> {
         let since = Utc::now() - Duration::days(days as i64);
         let provider_data = self.storage.get_cost_by_provider(since)?;
         let model_data = self.storage.get_spend_by_model(since)?;
@@ -49,14 +51,17 @@ impl CostAnalytics {
 
         // Aggregate provider-level data
         for (provider, cost, input_tokens, output_tokens, requests) in provider_data {
-            breakdown.insert(provider, ProviderCostBreakdown {
-                total_cost: cost,
-                total_tokens: input_tokens + output_tokens,
-                input_tokens,
-                output_tokens,
-                request_count: requests,
-                model_breakdown: HashMap::new(),
-            });
+            breakdown.insert(
+                provider,
+                ProviderCostBreakdown {
+                    total_cost: cost,
+                    total_tokens: input_tokens + output_tokens,
+                    input_tokens,
+                    output_tokens,
+                    request_count: requests,
+                    model_breakdown: HashMap::new(),
+                },
+            );
         }
 
         // Add model breakdown
@@ -64,14 +69,21 @@ impl CostAnalytics {
             let provider = self.detect_provider_from_model(&model);
             if let Some(pb) = breakdown.get_mut(&provider) {
                 let requests = pb.request_count; // Approximation
-                pb.model_breakdown.insert(model.clone(), ModelCostEntry {
-                    model_name: model,
-                    cost,
-                    input_tokens: tokens / 2, // Approximation
-                    output_tokens: tokens / 2,
-                    request_count: requests,
-                    avg_cost_per_request: if requests > 0 { cost / requests as f64 } else { 0.0 },
-                });
+                pb.model_breakdown.insert(
+                    model.clone(),
+                    ModelCostEntry {
+                        model_name: model,
+                        cost,
+                        input_tokens: tokens / 2, // Approximation
+                        output_tokens: tokens / 2,
+                        request_count: requests,
+                        avg_cost_per_request: if requests > 0 {
+                            cost / requests as f64
+                        } else {
+                            0.0
+                        },
+                    },
+                );
             }
         }
 
@@ -94,9 +106,12 @@ impl CostAnalytics {
         }
 
         // Calculate historical averages
-        let historical_avg_cost: f64 = historical_trend.iter().map(|d| d.cost).sum::<f64>()
-            / historical_trend.len() as f64;
-        let historical_avg_tokens: f64 = historical_trend.iter().map(|d| d.tokens as f64).sum::<f64>()
+        let historical_avg_cost: f64 =
+            historical_trend.iter().map(|d| d.cost).sum::<f64>() / historical_trend.len() as f64;
+        let historical_avg_tokens: f64 = historical_trend
+            .iter()
+            .map(|d| d.tokens as f64)
+            .sum::<f64>()
             / historical_trend.len() as f64;
 
         // Check for cost spike
@@ -141,7 +156,9 @@ impl CostAnalytics {
 
             // Check for usage spike
             if historical_avg_tokens > 0.0 {
-                let token_deviation = ((recent.tokens as f64 - historical_avg_tokens) / historical_avg_tokens) * 100.0;
+                let token_deviation = ((recent.tokens as f64 - historical_avg_tokens)
+                    / historical_avg_tokens)
+                    * 100.0;
 
                 if token_deviation > 200.0 {
                     anomalies.push(CostAnomaly {
@@ -180,10 +197,7 @@ impl CostAnalytics {
                     id: Uuid::new_v4().to_string(),
                     anomaly_type: AnomalyType::NewModel,
                     severity: AnomalySeverity::Info,
-                    description: format!(
-                        "New model detected: '{}' with ${:.2} spend",
-                        model, cost
-                    ),
+                    description: format!("New model detected: '{}' with ${:.2} spend", model, cost),
                     detected_at: Utc::now(),
                     current_value: *cost,
                     expected_value: 0.0,
@@ -211,7 +225,8 @@ impl CostAnalytics {
             let model_lower = model.to_lowercase();
 
             // Expensive models that could potentially use cheaper alternatives
-            if (model_lower.contains("opus") || model_lower.contains("gpt-4") && !model_lower.contains("mini"))
+            if (model_lower.contains("opus")
+                || model_lower.contains("gpt-4") && !model_lower.contains("mini"))
                 && *cost > 10.0
             {
                 let cheaper_alternative = if model_lower.contains("opus") {
@@ -329,7 +344,8 @@ impl CostAnalytics {
 
         // Sort by estimated savings (highest first)
         recommendations.sort_by(|a, b| {
-            b.estimated_savings.partial_cmp(&a.estimated_savings)
+            b.estimated_savings
+                .partial_cmp(&a.estimated_savings)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -436,8 +452,17 @@ mod tests {
         let analytics = CostAnalytics::new(storage);
 
         assert_eq!(analytics.detect_provider_from_model("gpt-4o"), "openai");
-        assert_eq!(analytics.detect_provider_from_model("claude-sonnet-4"), "anthropic");
-        assert_eq!(analytics.detect_provider_from_model("gemini-1.5-pro"), "google");
-        assert_eq!(analytics.detect_provider_from_model("unknown-model"), "unknown");
+        assert_eq!(
+            analytics.detect_provider_from_model("claude-sonnet-4"),
+            "anthropic"
+        );
+        assert_eq!(
+            analytics.detect_provider_from_model("gemini-1.5-pro"),
+            "google"
+        );
+        assert_eq!(
+            analytics.detect_provider_from_model("unknown-model"),
+            "unknown"
+        );
     }
 }

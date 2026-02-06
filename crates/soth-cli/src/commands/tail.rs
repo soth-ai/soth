@@ -1,17 +1,20 @@
 //! Tail command - Stream live events
 //!
 //! Enhanced version with filtering by agent, server, tool, and output formats.
-//! Uses notify-based file watching for instant event detection (<10ms latency).
+//! Uses notify-based watching for JSONL and polling for SQLite backends.
 
 use crate::style;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use owo_colors::OwoColorize;
+use rusqlite::Connection;
+use soth_core::event_logger::{default_event_log_read_path, is_sqlite_event_log_path};
 use soth_core::types::WrapEvent;
 use soth_core::watch::{FileWatcher, WatchEvent};
-use std::path::PathBuf;
+use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tracing::{debug, info};
 
 /// Arguments for the tail command
@@ -56,9 +59,7 @@ pub struct TailArgs {
 
 /// Get the default log path
 fn get_log_path() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    Ok(home.join(".soth").join("logs").join("events.jsonl"))
+    default_event_log_read_path().context("Could not resolve default event log path")
 }
 
 /// Run tail command
@@ -74,7 +75,7 @@ pub async fn run(args: TailArgs) -> Result<()> {
 
     info!("Tailing events from {:?}", log_path);
 
-    // Show historical events if requested
+    // Show historical events if requested.
     if args.last > 0 {
         show_historical_events(&log_path, &args).await?;
         println!();
@@ -87,16 +88,24 @@ pub async fn run(args: TailArgs) -> Result<()> {
     );
     println!();
 
-    // Print header for compact format
+    // Print header for compact format.
     if args.format == "compact" {
         print_compact_header();
     }
 
-    // Skip to end of file - we only want new events
+    if is_sqlite_event_log_path(&log_path) {
+        tail_sqlite(log_path, &args).await?;
+    } else {
+        tail_jsonl(log_path, &args).await?;
+    }
+
+    Ok(())
+}
+
+async fn tail_jsonl(log_path: PathBuf, args: &TailArgs) -> Result<()> {
     let metadata = tokio::fs::metadata(&log_path).await?;
     let mut position = metadata.len();
 
-    // Create file watcher for instant notifications
     let watcher_result = FileWatcher::new(log_path.clone());
     let use_polling = watcher_result.is_err();
 
@@ -107,19 +116,18 @@ pub async fn run(args: TailArgs) -> Result<()> {
     }
 
     let mut watcher = watcher_result.ok();
+    let mut waiting_for_recreation = false;
     let mut line = String::new();
 
     loop {
-        // Wait for file change - either via notify or polling
         if let Some(ref mut w) = watcher {
-            // Use notify for instant detection
             tokio::select! {
                 event = w.next() => {
                     match event {
-                        Some(WatchEvent::Modified) | Some(WatchEvent::Created) => {
-                            // File changed, process new content
-                        }
+                        Some(WatchEvent::Modified) | Some(WatchEvent::Created) => {}
                         Some(WatchEvent::Removed) => {
+                            waiting_for_recreation = true;
+                            position = 0;
                             style::warning("Log file removed, waiting for recreation...");
                             continue;
                         }
@@ -128,7 +136,6 @@ pub async fn run(args: TailArgs) -> Result<()> {
                             continue;
                         }
                         None => {
-                            // Watcher closed
                             break;
                         }
                     }
@@ -138,7 +145,6 @@ pub async fn run(args: TailArgs) -> Result<()> {
                 }
             }
         } else {
-            // Fallback to polling
             tokio::select! {
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
                 _ = tokio::signal::ctrl_c() => {
@@ -147,40 +153,57 @@ pub async fn run(args: TailArgs) -> Result<()> {
             }
         }
 
-        // Check for new content
         let current_metadata = match tokio::fs::metadata(&log_path).await {
-            Ok(m) => m,
-            Err(_) => continue, // File may have been removed temporarily
+            Ok(m) => {
+                if waiting_for_recreation {
+                    style::info("Log file recreated, tailing from the start.");
+                    waiting_for_recreation = false;
+                }
+                m
+            }
+            Err(_) => {
+                if !waiting_for_recreation {
+                    style::warning("Log file unavailable, waiting for recreation...");
+                    waiting_for_recreation = true;
+                }
+                position = 0;
+                continue;
+            }
         };
 
+        let (normalized_position, reset_position) =
+            normalize_tail_position(position, current_metadata.len());
+        if reset_position {
+            style::warning("Log file was truncated, tail position reset.");
+        }
+        position = normalized_position;
+
         if current_metadata.len() > position {
-            // Reopen and read new content
             let file = File::open(&log_path).await?;
             let mut reader = BufReader::new(file);
-
-            // Skip to position
-            let mut skipped = 0u64;
+            reader.seek(SeekFrom::Start(position)).await?;
+            let mut next_position = position;
             loop {
                 line.clear();
                 match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        skipped += n as u64;
-                        if skipped <= position {
-                            continue;
+                        let candidate_position = next_position + n as u64;
+                        if !line.ends_with('\n') {
+                            break;
                         }
 
-                        // Try to parse as WrapEvent first, fall back to generic JSON
                         if let Ok(event) = serde_json::from_str::<WrapEvent>(&line) {
-                            if matches_filters(&event, &args) {
+                            if matches_filters(&event, args) {
                                 format_event(&event, &args.format);
                             }
                         } else if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-                            // Legacy format
-                            if matches_legacy_filters(&event, &args) {
+                            if matches_legacy_filters(&event, args) {
                                 format_legacy_event(&event, &args.format);
                             }
                         }
+
+                        next_position = candidate_position;
                     }
                     Err(e) => {
                         style::error(&format!("Read error: {e}"));
@@ -189,7 +212,46 @@ pub async fn run(args: TailArgs) -> Result<()> {
                 }
             }
 
-            position = current_metadata.len();
+            position = next_position;
+        }
+    }
+
+    Ok(())
+}
+
+async fn tail_sqlite(log_path: PathBuf, args: &TailArgs) -> Result<()> {
+    let mut cursor = latest_sqlite_seq(&log_path).await?;
+    let mut waiting_for_recreation = false;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
+        }
+
+        if !log_path.exists() {
+            if !waiting_for_recreation {
+                style::warning("Log database unavailable, waiting for recreation...");
+                waiting_for_recreation = true;
+            }
+            cursor = 0;
+            continue;
+        }
+
+        if waiting_for_recreation {
+            style::info("Log database available again.");
+            waiting_for_recreation = false;
+            cursor = latest_sqlite_seq(&log_path).await?;
+        }
+
+        let rows = read_sqlite_events_since(&log_path, cursor).await?;
+        for (seq, event) in rows {
+            cursor = seq;
+            if matches_filters(&event, args) {
+                format_event(&event, &args.format);
+            }
         }
     }
 
@@ -209,11 +271,26 @@ fn print_compact_header() {
     println!("{}", "\u{2500}".repeat(70).dimmed());
 }
 
+fn normalize_tail_position(position: u64, current_len: u64) -> (u64, bool) {
+    if current_len < position {
+        (0, true)
+    } else {
+        (position, false)
+    }
+}
+
 async fn show_historical_events(log_path: &PathBuf, args: &TailArgs) -> Result<()> {
+    if is_sqlite_event_log_path(log_path) {
+        show_historical_events_sqlite(log_path, args).await
+    } else {
+        show_historical_events_jsonl(log_path, args).await
+    }
+}
+
+async fn show_historical_events_jsonl(log_path: &PathBuf, args: &TailArgs) -> Result<()> {
     let content = tokio::fs::read_to_string(log_path).await?;
     let lines: Vec<&str> = content.lines().collect();
 
-    // Collect matching events
     let mut events: Vec<WrapEvent> = Vec::new();
     for line in lines.iter().rev() {
         if let Ok(event) = serde_json::from_str::<WrapEvent>(line) {
@@ -226,9 +303,32 @@ async fn show_historical_events(log_path: &PathBuf, args: &TailArgs) -> Result<(
         }
     }
 
-    // Print in chronological order
     events.reverse();
+    print_historical_events(&events, args);
+    Ok(())
+}
 
+async fn show_historical_events_sqlite(log_path: &PathBuf, args: &TailArgs) -> Result<()> {
+    let path = log_path.clone();
+    let events = tokio::task::spawn_blocking(move || query_all_sqlite_events_desc(path.as_path()))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load historical sqlite events: {e}"))??;
+
+    let mut filtered = Vec::new();
+    for event in events {
+        if matches_filters(&event, args) {
+            filtered.push(event);
+            if filtered.len() >= args.last {
+                break;
+            }
+        }
+    }
+
+    print_historical_events(&filtered, args);
+    Ok(())
+}
+
+fn print_historical_events(events: &[WrapEvent], args: &TailArgs) {
     style::subtitle(&format!("Last {} events", events.len()));
 
     if args.format == "compact" {
@@ -236,10 +336,117 @@ async fn show_historical_events(log_path: &PathBuf, args: &TailArgs) -> Result<(
     }
 
     for event in events {
-        format_event(&event, &args.format);
+        format_event(event, &args.format);
+    }
+}
+
+async fn latest_sqlite_seq(path: &Path) -> Result<i64> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = open_wrap_events_db(path.as_path())?;
+        let seq = conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM wrap_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(to_anyhow_db_err)?;
+        Ok::<i64, anyhow::Error>(seq)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to query sqlite sequence: {e}"))?
+}
+
+async fn read_sqlite_events_since(path: &Path, cursor: i64) -> Result<Vec<(i64, WrapEvent)>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || query_sqlite_events_since(path.as_path(), cursor))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read sqlite events: {e}"))?
+}
+
+#[cfg(test)]
+fn query_last_sqlite_events(path: &Path, limit: usize) -> Result<Vec<WrapEvent>> {
+    let mut events = query_all_sqlite_events_desc(path)?;
+    events.truncate(limit);
+    events.reverse();
+    Ok(events)
+}
+
+fn query_all_sqlite_events_desc(path: &Path) -> Result<Vec<WrapEvent>> {
+    let conn = open_wrap_events_db(path)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT event_json
+            FROM wrap_events
+            ORDER BY seq DESC
+            "#,
+        )
+        .map_err(to_anyhow_db_err)?;
+
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(to_anyhow_db_err)?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let json = row.map_err(to_anyhow_db_err)?;
+        if let Ok(event) = serde_json::from_str::<WrapEvent>(&json) {
+            events.push(event);
+        }
     }
 
-    Ok(())
+    Ok(events)
+}
+
+fn query_sqlite_events_since(path: &Path, cursor: i64) -> Result<Vec<(i64, WrapEvent)>> {
+    let conn = open_wrap_events_db(path)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT seq, event_json
+            FROM wrap_events
+            WHERE seq > ?1
+            ORDER BY seq ASC
+            "#,
+        )
+        .map_err(to_anyhow_db_err)?;
+
+    let rows = stmt
+        .query_map([cursor], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(to_anyhow_db_err)?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let (seq, json) = row.map_err(to_anyhow_db_err)?;
+        if let Ok(event) = serde_json::from_str::<WrapEvent>(&json) {
+            events.push((seq, event));
+        }
+    }
+
+    Ok(events)
+}
+
+fn open_wrap_events_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).map_err(to_anyhow_db_err)?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS wrap_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            event_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .map_err(to_anyhow_db_err)?;
+
+    Ok(conn)
+}
+
+fn to_anyhow_db_err(error: rusqlite::Error) -> anyhow::Error {
+    anyhow::anyhow!(error.to_string())
 }
 
 fn matches_filters(event: &WrapEvent, args: &TailArgs) -> bool {
@@ -263,14 +470,23 @@ fn matches_filters(event: &WrapEvent, args: &TailArgs) -> bool {
 
     // Agent filter
     if let Some(ref agent) = args.agent {
-        if !event.agent.name.to_lowercase().contains(&agent.to_lowercase()) {
+        if !event
+            .agent
+            .name
+            .to_lowercase()
+            .contains(&agent.to_lowercase())
+        {
             return false;
         }
     }
 
     // Server filter
     if let Some(ref server) = args.server {
-        if !event.server_name.to_lowercase().contains(&server.to_lowercase()) {
+        if !event
+            .server_name
+            .to_lowercase()
+            .contains(&server.to_lowercase())
+        {
             return false;
         }
     }
@@ -339,7 +555,7 @@ fn format_compact(event: &WrapEvent) {
 
     // Direction with colored arrow
     let dir = match event.direction {
-        soth_core::types::WrapDirection::In => "\u{2192}".cyan().to_string(),  // →
+        soth_core::types::WrapDirection::In => "\u{2192}".cyan().to_string(), // →
         soth_core::types::WrapDirection::Out => "\u{2190}".green().to_string(), // ←
     };
 
@@ -371,7 +587,10 @@ fn format_compact(event: &WrapEvent) {
 
     // PII indicator
     let pii = if event.pii_detected {
-        format!(" {}", format!("[PII: {}]", event.pii_types.join(",")).yellow())
+        format!(
+            " {}",
+            format!("[PII: {}]", event.pii_types.join(",")).yellow()
+        )
     } else {
         String::new()
     };
@@ -395,7 +614,7 @@ fn format_verbose(event: &WrapEvent) {
         event.timestamp.format("%H:%M:%S").to_string().dimmed(),
         style::CIRCLE_FILLED.cyan(),
         event.agent.name.bold(),
-match event.direction {
+        match event.direction {
             soth_core::types::WrapDirection::In => "\u{2192}".cyan().to_string(),
             soth_core::types::WrapDirection::Out => "\u{2190}".green().to_string(),
         },
@@ -427,18 +646,10 @@ match event.direction {
 
     match event.policy_allowed {
         Some(true) => {
-            println!(
-                "  {}: {} ALLOW",
-                "Policy".dimmed(),
-                style::CHECK.green()
-            );
+            println!("  {}: {} ALLOW", "Policy".dimmed(), style::CHECK.green());
         }
         Some(false) => {
-            println!(
-                "  {}: {} DENY",
-                "Policy".dimmed(),
-                style::CROSS.red()
-            );
+            println!("  {}: {} DENY", "Policy".dimmed(), style::CROSS.red());
             if let Some(ref reason) = event.policy_reason {
                 println!("           {}", reason.red());
             }
@@ -483,10 +694,7 @@ fn format_legacy_event(event: &serde_json::Value, format: &str) {
                 .get("direction")
                 .and_then(|d| d.as_str())
                 .unwrap_or("?");
-            let method = event
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("-");
+            let method = event.get("method").and_then(|m| m.as_str()).unwrap_or("-");
 
             let time = timestamp.split('T').nth(1).unwrap_or(timestamp);
             let time = time.split('.').next().unwrap_or(time);
@@ -505,6 +713,8 @@ fn format_legacy_event(event: &serde_json::Value, format: &str) {
 mod tests {
     use super::*;
     use soth_core::types::{AgentInfo, DetectionSource, WrapDirection};
+    use soth_core::EventLogger;
+    use tempfile::tempdir;
 
     fn make_event() -> WrapEvent {
         let agent = AgentInfo::new("Claude Code", DetectionSource::McpInitialize);
@@ -568,5 +778,55 @@ mod tests {
 
         args.tool = Some("delete".to_string());
         assert!(!matches_filters(&event, &args));
+    }
+
+    #[test]
+    fn test_normalize_tail_position_resets_after_truncate() {
+        let (position, reset) = normalize_tail_position(1024, 100);
+        assert_eq!(position, 0);
+        assert!(reset);
+    }
+
+    #[test]
+    fn test_normalize_tail_position_keeps_position_when_growing() {
+        let (position, reset) = normalize_tail_position(100, 1024);
+        assert_eq!(position, 100);
+        assert!(!reset);
+    }
+
+    #[test]
+    fn test_query_sqlite_events_since() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let logger = EventLogger::new(db_path.clone()).unwrap();
+        logger.log(&make_event().with_method("tools/list"));
+        logger.log(&make_event().with_method("tools/call"));
+        logger.close();
+
+        let rows = query_sqlite_events_since(&db_path, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].0 < rows[1].0);
+
+        let latest_seq = rows[1].0;
+        let no_rows = query_sqlite_events_since(&db_path, latest_seq).unwrap();
+        assert!(no_rows.is_empty());
+    }
+
+    #[test]
+    fn test_query_last_sqlite_events() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let logger = EventLogger::new(db_path.clone()).unwrap();
+        logger.log(&make_event().with_method("method-1"));
+        logger.log(&make_event().with_method("method-2"));
+        logger.log(&make_event().with_method("method-3"));
+        logger.close();
+
+        let events = query_last_sqlite_events(&db_path, 2).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].method.as_deref(), Some("method-2"));
+        assert_eq!(events[1].method.as_deref(), Some("method-3"));
     }
 }

@@ -34,9 +34,8 @@ pub struct RecordedSession {
 impl RecordedSession {
     /// Get session duration in milliseconds
     pub fn duration_ms(&self) -> Option<u64> {
-        self.ended_at.map(|end| {
-            (end - self.started_at).num_milliseconds().max(0) as u64
-        })
+        self.ended_at
+            .map(|end| (end - self.started_at).num_milliseconds().max(0) as u64)
     }
 
     /// Get message count
@@ -46,7 +45,10 @@ impl RecordedSession {
 
     /// Get messages by direction
     pub fn messages_by_direction(&self, direction: MessageDirection) -> Vec<&RecordedMessage> {
-        self.messages.iter().filter(|m| m.direction == direction).collect()
+        self.messages
+            .iter()
+            .filter(|m| m.direction == direction)
+            .collect()
     }
 
     /// Get messages by method
@@ -478,8 +480,7 @@ impl SessionStorage {
         let content = std::fs::read_to_string(path)
             .map_err(|e| SessionRecordError::Storage(format!("Failed to read session: {e}")))?;
 
-        serde_json::from_str(&content)
-            .map_err(|e| SessionRecordError::Serialization(e.to_string()))
+        serde_json::from_str(&content).map_err(|e| SessionRecordError::Serialization(e.to_string()))
     }
 
     /// List all available sessions
@@ -623,7 +624,9 @@ mod tests {
             .await
             .unwrap();
 
-        recorder.set_agent_info("Claude".to_string(), Some("1.0".to_string())).await;
+        recorder
+            .set_agent_info("Claude".to_string(), Some("1.0".to_string()))
+            .await;
         recorder.add_tag("test".to_string()).await;
 
         let session = recorder.finalize().await.unwrap();

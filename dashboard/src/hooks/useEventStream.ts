@@ -1,29 +1,44 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { WrapEvent } from "@/types";
+import { buildWsUrl } from "@/lib/endpoints";
 
 const MAX_EVENTS = 200;
 
 interface UseEventStreamOptions {
   enabled?: boolean;
   maxEvents?: number;
+  sinceSeq?: number | null;
+  onEvent?: (event: WrapEvent) => void;
 }
 
 interface UseEventStreamResult {
   events: WrapEvent[];
   isConnected: boolean;
   error: string | null;
+  lastSeq: number | null;
   clearEvents: () => void;
 }
 
 export function useEventStream(
   options: UseEventStreamOptions = {}
 ): UseEventStreamResult {
-  const { enabled = true, maxEvents = MAX_EVENTS } = options;
+  const { enabled = true, maxEvents = MAX_EVENTS, sinceSeq = null, onEvent } = options;
   const [events, setEvents] = useState<WrapEvent[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastSeq, setLastSeq] = useState<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const sinceSeqRef = useRef<number | null>(sinceSeq);
+  const onEventRef = useRef<typeof onEvent>(onEvent);
+
+  useEffect(() => {
+    sinceSeqRef.current = sinceSeq;
+  }, [sinceSeq]);
+
+  useEffect(() => {
+    onEventRef.current = onEvent;
+  }, [onEvent]);
 
   const clearEvents = useCallback(() => {
     setEvents([]);
@@ -36,10 +51,12 @@ export function useEventStream(
 
     const connect = () => {
       try {
-        // Use the same host but with WebSocket protocol
-        const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        // Connect to the Rust API backend (port 3001)
-        const wsUrl = `${wsProtocol}//localhost:3001/api/events/stream`;
+        const params = new URLSearchParams();
+        if (sinceSeqRef.current !== null) {
+          params.set("since_seq", String(sinceSeqRef.current));
+        }
+        const query = params.toString();
+        const wsUrl = `${buildWsUrl("/api/events/stream")}${query ? `?${query}` : ""}`;
 
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
@@ -52,15 +69,43 @@ export function useEventStream(
 
         ws.onmessage = (event) => {
           try {
-            const wrapEvent: WrapEvent = JSON.parse(event.data);
+            const payload = JSON.parse(event.data) as
+              | { type?: string; event?: WrapEvent }
+              | WrapEvent;
+            const wrapEvent =
+              typeof payload === "object" &&
+              payload !== null &&
+              "type" in payload &&
+              payload.type === "event"
+                ? payload.event
+                : (payload as WrapEvent);
+
+            if (!wrapEvent?.id) {
+              return;
+            }
+
+            if (typeof wrapEvent.seq === "number") {
+              setLastSeq((prev) => {
+                const next = prev === null ? wrapEvent.seq! : Math.max(prev, wrapEvent.seq!);
+                sinceSeqRef.current = next;
+                return next;
+              });
+            }
+
             setEvents((prev) => {
-              // Add to front, limit size
-              const updated = [wrapEvent, ...prev];
-              if (updated.length > maxEvents) {
-                return updated.slice(0, maxEvents);
+              if (prev.some((existing) => existing.id === wrapEvent.id)) {
+                return prev;
               }
+
+              // Keep oldest -> newest ordering
+              const updated = [...prev, wrapEvent];
+              if (updated.length > maxEvents) {
+                return updated.slice(updated.length - maxEvents);
+              }
+
               return updated;
             });
+            onEventRef.current?.(wrapEvent);
           } catch (e) {
             console.error("Failed to parse event:", e);
           }
@@ -103,6 +148,7 @@ export function useEventStream(
     events,
     isConnected,
     error,
+    lastSeq,
     clearEvents,
   };
 }

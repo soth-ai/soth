@@ -8,9 +8,34 @@ Real-time metrics dashboard for the SOTH edge proxy.
 - **TanStack Query** - Data fetching with auto-refresh
 - **Tailwind CSS v4** - Styling
 - **Radix UI** - Accessible primitives
+- **shadcn/ui (configured)** - Canonical UI primitive workflow
 - **Phosphor Icons** - Icon set
 
 ## Development
+
+### Backend Endpoint Configuration
+
+By default, the dashboard uses same-origin `/api` for HTTP and same-origin `/api/events/stream` for WebSocket.
+In local dev on port `3002`, WebSocket defaults to `ws://localhost:3001`.
+
+Override these when your API/WS endpoint is not same-origin:
+
+```bash
+# .env.local
+NEXT_PUBLIC_SOTH_API_BASE=http://localhost:3001/api
+NEXT_PUBLIC_SOTH_WS_BASE=ws://localhost:3001
+```
+
+### UI Primitive Workflow (shadcn)
+
+This dashboard is now configured for shadcn (`components.json`).
+
+- Add a new shadcn component:
+  ```bash
+  npm run ui:add -- button
+  ```
+- Generated components should live in `src/components/ui`.
+- Keep performance-critical stream/panel views custom; use shadcn primitives for shared controls/surfaces.
 
 ### With MCP Proxy
 

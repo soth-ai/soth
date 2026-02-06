@@ -138,14 +138,12 @@ impl RateLimiter {
         }
 
         // Check per-key limit
-        let entry = self.buckets
-            .entry(key.to_string())
-            .or_insert_with(|| {
-                Mutex::new(TokenBucket::new(
-                    self.config.requests_per_second,
-                    self.config.burst_size,
-                ))
-            });
+        let entry = self.buckets.entry(key.to_string()).or_insert_with(|| {
+            Mutex::new(TokenBucket::new(
+                self.config.requests_per_second,
+                self.config.burst_size,
+            ))
+        });
         let mut bucket = entry.lock();
 
         if bucket.try_acquire() {
@@ -168,7 +166,8 @@ impl RateLimiter {
             };
         }
 
-        let available = self.buckets
+        let available = self
+            .buckets
             .get(key)
             .map(|b| b.lock().available())
             .unwrap_or(self.config.burst_size as f64);
@@ -177,7 +176,7 @@ impl RateLimiter {
             available,
             limit: self.config.burst_size as f64,
             reset_in: Duration::from_secs_f64(
-                (self.config.burst_size as f64 - available) / self.config.requests_per_second
+                (self.config.burst_size as f64 - available) / self.config.requests_per_second,
             ),
         }
     }
@@ -185,9 +184,8 @@ impl RateLimiter {
     /// Clean up old buckets that haven't been used recently
     pub fn cleanup(&self, max_age: Duration) {
         let cutoff = Instant::now() - max_age;
-        self.buckets.retain(|_, bucket| {
-            bucket.lock().last_refill > cutoff
-        });
+        self.buckets
+            .retain(|_, bucket| bucket.lock().last_refill > cutoff);
     }
 
     /// Get current configuration

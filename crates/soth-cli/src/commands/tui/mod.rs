@@ -3,8 +3,8 @@
 //! Provides real-time monitoring of proxy traffic, policy decisions,
 //! PII detections, and budget tracking in the terminal.
 
-mod app;
 mod api;
+mod app;
 mod event;
 mod theme;
 mod ui;

@@ -37,7 +37,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::raw("Active Conn.   "),
-            Span::styled(format_number(metrics.active_connections), theme.info_style()),
+            Span::styled(
+                format_number(metrics.active_connections),
+                theme.info_style(),
+            ),
         ]),
     ];
 
@@ -67,7 +70,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::raw("Cost: "),
-        Span::styled(format_currency(metrics.total_cost_usd), theme.success_style()),
+        Span::styled(
+            format_currency(metrics.total_cost_usd),
+            theme.success_style(),
+        ),
     ]));
 
     let content = Paragraph::new(lines);

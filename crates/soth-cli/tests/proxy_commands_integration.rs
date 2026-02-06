@@ -11,8 +11,8 @@
 
 use soth_core::config::SothConfig;
 use std::collections::HashMap;
-use tempfile::NamedTempFile;
 use std::io::Write;
+use tempfile::NamedTempFile;
 
 // ============================================================================
 // METRICS COMMAND TESTS
@@ -152,7 +152,10 @@ fn test_connections_display_logic() {
 fn test_truncate_string() {
     assert_eq!(truncate("short", 10), "short");
     assert_eq!(truncate("exactly_ten", 11), "exactly_ten");
-    assert_eq!(truncate("this_is_a_very_long_string", 15), "this_is_a_ve...");
+    assert_eq!(
+        truncate("this_is_a_very_long_string", 15),
+        "this_is_a_ve..."
+    );
     assert_eq!(truncate("abc", 3), "abc");
     assert_eq!(truncate("abcd", 3), "...");
 }
@@ -246,9 +249,15 @@ soth_proxy_rate_limited_total{provider="openai",key="user-3"} 20
     let limits = parse_rate_limits(prometheus_text);
 
     assert_eq!(limits.len(), 3);
-    assert!(limits.iter().any(|(p, k, c)| p == "openai" && k == "user-1" && *c == 10));
-    assert!(limits.iter().any(|(p, k, c)| p == "anthropic" && k == "user-2" && *c == 5));
-    assert!(limits.iter().any(|(p, k, c)| p == "openai" && k == "user-3" && *c == 20));
+    assert!(limits
+        .iter()
+        .any(|(p, k, c)| p == "openai" && k == "user-1" && *c == 10));
+    assert!(limits
+        .iter()
+        .any(|(p, k, c)| p == "anthropic" && k == "user-2" && *c == 5));
+    assert!(limits
+        .iter()
+        .any(|(p, k, c)| p == "openai" && k == "user-3" && *c == 20));
 }
 
 /// Test rate limit aggregation
@@ -361,7 +370,10 @@ production:
     assert!(config.production.rate_limit.enabled);
     assert_eq!(config.production.rate_limit.requests_per_second, 100.0);
     assert_eq!(config.production.rate_limit.burst_size, 200);
-    assert_eq!(config.production.rate_limit.global_requests_per_second, 1000.0);
+    assert_eq!(
+        config.production.rate_limit.global_requests_per_second,
+        1000.0
+    );
     assert_eq!(config.production.rate_limit.global_burst_size, 2000);
 }
 

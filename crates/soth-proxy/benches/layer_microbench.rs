@@ -249,11 +249,11 @@ fn bench_pii_patterns(c: &mut Criterion) {
         ("email_only", "Contact: user@example.com"),
         ("phone_only", "Phone: (212) 555-1234"),
         ("ssn_only", "SSN: 123-45-6789"),
+        ("credit_card", "Card: 4111-1111-1111-1111 expires 12/25"),
         (
-            "credit_card",
-            "Card: 4111-1111-1111-1111 expires 12/25",
+            "no_pii",
+            "Hello world, this is a test message with no sensitive data",
         ),
-        ("no_pii", "Hello world, this is a test message with no sensitive data"),
         (
             "mixed_pii",
             "User john.doe@example.com called from (212) 555-1234",
@@ -261,15 +261,11 @@ fn bench_pii_patterns(c: &mut Criterion) {
     ];
 
     for (name, content) in test_cases {
-        group.bench_with_input(
-            BenchmarkId::new("detect", name),
-            &content,
-            |b, content| {
-                b.iter(|| {
-                    let _ = black_box(detector.detect(content));
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("detect", name), &content, |b, content| {
+            b.iter(|| {
+                let _ = black_box(detector.detect(content));
+            })
+        });
 
         group.bench_with_input(
             BenchmarkId::new("contains_pii", name),

@@ -129,7 +129,9 @@ impl CertificateAuthority {
                 if let Ok(s) = attr.as_str() {
                     if attr.attr_type() == &x509_parser::oid_registry::OID_X509_COMMON_NAME {
                         dn.push(rcgen::DnType::CommonName, s);
-                    } else if attr.attr_type() == &x509_parser::oid_registry::OID_X509_ORGANIZATION_NAME {
+                    } else if attr.attr_type()
+                        == &x509_parser::oid_registry::OID_X509_ORGANIZATION_NAME
+                    {
                         dn.push(rcgen::DnType::OrganizationName, s);
                     }
                 }
@@ -179,9 +181,9 @@ impl CertificateAuthority {
         }
 
         // Generate new certificate
-        let (cert_der, key_der) = self
-            .generator
-            .generate_domain_cert(domain, &self.ca_cert, &self.ca_key)?;
+        let (cert_der, key_der) =
+            self.generator
+                .generate_domain_cert(domain, &self.ca_cert, &self.ca_key)?;
 
         // Cache it
         self.cache
@@ -201,7 +203,9 @@ impl CertificateAuthority {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
-            .map_err(|e| TlsError::cert_generation(format!("Failed to build ServerConfig: {}", e)))?;
+            .map_err(|e| {
+                TlsError::cert_generation(format!("Failed to build ServerConfig: {}", e))
+            })?;
 
         Ok(Arc::new(config))
     }

@@ -4,11 +4,14 @@
 
 use super::{AsyncMessageHandler, Transport, TransportConfig};
 use crate::error::ProxyError;
-use crate::protocol::{JsonRpcMessage, JsonRpcResponse, JsonRpcError, RequestId};
+use crate::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
 use async_trait::async_trait;
 use axum::{
-    extract::{State, Path},
-    response::{sse::{Event, Sse}, IntoResponse, Response},
+    extract::{Path, State},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
@@ -190,10 +193,7 @@ async fn process_message(
     let msg = match JsonRpcMessage::parse(body) {
         Ok(m) => m,
         Err(e) => {
-            return Json(JsonRpcResponse::error(
-                RequestId::Null,
-                e,
-            )).into_response();
+            return Json(JsonRpcResponse::error(RequestId::Null, e)).into_response();
         }
     };
 
@@ -220,19 +220,20 @@ async fn process_message(
             // No response (notification was handled)
             Json(serde_json::json!({"status": "accepted"})).into_response()
         }
-        Err(_) => {
-            Json(JsonRpcResponse::error(
-                RequestId::Null,
-                JsonRpcError::internal_error(),
-            )).into_response()
-        }
+        Err(_) => Json(JsonRpcResponse::error(
+            RequestId::Null,
+            JsonRpcError::internal_error(),
+        ))
+        .into_response(),
     }
 }
 
 #[async_trait]
 impl Transport for SseTransport {
     async fn start(&mut self, cancel: CancellationToken) -> Result<(), ProxyError> {
-        let handler = self.handler.take()
+        let handler = self
+            .handler
+            .take()
             .ok_or_else(|| ProxyError::Transport("No handler set".to_string()))?;
 
         let state = Arc::new(SseState {
