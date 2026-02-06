@@ -471,6 +471,96 @@ const HEADERS_TO_STRIP: &[&str] = &[
     "x-cluster-client-ip",
 ];
 
+/// Keep cookie header under a conservative size to avoid upstream 431 responses.
+const CHATGPT_MAX_COOKIE_HEADER_BYTES: usize = 3500;
+
+fn chatgpt_cookie_priority(name: &str) -> u8 {
+    match name {
+        // NextAuth/Auth.js session and csrf cookies (highest priority for login state)
+        "__Secure-next-auth.session-token" => 0,
+        "__Host-next-auth.csrf-token" => 0,
+        "__Secure-next-auth.callback-url" => 1,
+        "__Secure-authjs.session-token" => 0,
+        "__Host-authjs.csrf-token" => 0,
+        "__Secure-authjs.callback-url" => 1,
+        // OpenAI account identifiers
+        "_account" | "_puid" | "oai-did" => 1,
+        // Cloudflare access checks
+        "__cf_bm" | "cf_clearance" => 1,
+        _ => {
+            if name.starts_with("__Secure-") || name.starts_with("__Host-") {
+                return 2;
+            }
+            if name.starts_with("oai-") || name.starts_with("__cf") || name.starts_with("cf_") {
+                return 3;
+            }
+            if name.contains("session") || name.contains("token") || name.contains("auth") {
+                return 4;
+            }
+            10
+        }
+    }
+}
+
+fn trim_cookie_header_for_chatgpt(cookie_str: &str, max_bytes: usize) -> Option<String> {
+    let parts: Vec<&str> = cookie_str
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    // Deduplicate by name while keeping the last seen value (browser semantics).
+    let mut by_name: HashMap<String, (usize, String)> = HashMap::new();
+    for (idx, raw_part) in parts.iter().enumerate() {
+        let (name, value) = match raw_part.split_once('=') {
+            Some((name, value)) => (name.trim(), value.trim()),
+            None => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        by_name.insert(name.to_string(), (idx, value.to_string()));
+    }
+
+    if by_name.is_empty() {
+        return None;
+    }
+
+    let mut ranked: Vec<(u8, usize, String)> = by_name
+        .into_iter()
+        .map(|(name, (idx, value))| {
+            let prio = chatgpt_cookie_priority(&name);
+            (prio, idx, format!("{}={}", name, value))
+        })
+        .collect();
+    ranked.sort_by_key(|(prio, idx, _)| (*prio, *idx));
+
+    let mut kept = Vec::new();
+    let mut total_len = 0usize;
+
+    for (_, _, item) in ranked {
+        let next_len = if kept.is_empty() {
+            item.len()
+        } else {
+            total_len + 2 + item.len()
+        };
+        if next_len <= max_bytes {
+            total_len = next_len;
+            kept.push(item);
+        }
+    }
+
+    if kept.is_empty() {
+        return None;
+    }
+
+    Some(kept.join("; "))
+}
+
 /// Sanitize request headers to prevent 431 errors and WebSocket issues
 /// Only applies aggressive cookie trimming for ChatGPT (which has large cookies)
 fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str) {
@@ -501,43 +591,51 @@ fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str) {
         headers.remove("dnt");
         headers.remove("priority");
 
-        // Only trim cookies for ChatGPT (they have huge cookies that cause 431)
+        // Trim cookies for ChatGPT (they can exceed upstream header limits and trigger 431).
         if let Some(cookie_val) = headers.get("cookie").cloned() {
             if let Ok(cookie_str) = cookie_val.to_str() {
                 let original_len = cookie_str.len();
+                if let Some(trimmed) =
+                    trim_cookie_header_for_chatgpt(cookie_str, CHATGPT_MAX_COOKIE_HEADER_BYTES)
+                {
+                    let trimmed_len = trimmed.len();
+                    if trimmed_len < original_len {
+                        if let Ok(new_val) = hyper::header::HeaderValue::from_str(&trimmed) {
+                            headers.remove("cookie");
+                            headers.insert("cookie", new_val);
+                            debug!(
+                                before = original_len,
+                                after = trimmed_len,
+                                saved = original_len - trimmed_len,
+                                max = CHATGPT_MAX_COOKIE_HEADER_BYTES,
+                                "ChatGPT cookie trimming"
+                            );
+                        }
+                    }
+                } else {
+                    // If parsing failed, remove malformed cookie header rather than forwarding an oversized header.
+                    headers.remove("cookie");
+                    debug!(
+                        before = original_len,
+                        "Dropped malformed ChatGPT cookie header"
+                    );
+                }
+            }
+        }
 
-                // Keep only essential cookies for ChatGPT auth
-                let essential_cookies: Vec<&str> = cookie_str
-                    .split("; ")
-                    .filter(|c| {
-                        let name = c.split('=').next().unwrap_or("");
-                        // Essential ChatGPT/OpenAI auth cookies
-                        name.starts_with("__Secure")
-                            || name.starts_with("__Host")
-                            || name.starts_with("__cf")
-                            || name.starts_with("cf_")
-                            || name == "_puid"
-                            || name == "_account"
-                            || name.starts_with("oai-")
-                            || name.contains("session")
-                            || name.contains("token")
-                            || name.contains("auth")
-                    })
-                    .collect();
-
-                let trimmed = essential_cookies.join("; ");
-                let trimmed_len = trimmed.len();
-
-                if trimmed_len < original_len {
-                    if let Ok(new_val) = hyper::header::HeaderValue::from_str(&trimmed) {
+        // Safety pass: if cookie is still too large, cap harder to avoid 431.
+        if let Some(cookie_val) = headers.get("cookie").cloned() {
+            if let Ok(cookie_str) = cookie_val.to_str() {
+                if cookie_str.len() > CHATGPT_MAX_COOKIE_HEADER_BYTES {
+                    if let Some(trimmed) =
+                        trim_cookie_header_for_chatgpt(cookie_str, CHATGPT_MAX_COOKIE_HEADER_BYTES)
+                    {
+                        if let Ok(new_val) = hyper::header::HeaderValue::from_str(&trimmed) {
+                            headers.remove("cookie");
+                            headers.insert("cookie", new_val);
+                        }
+                    } else {
                         headers.remove("cookie");
-                        headers.insert("cookie", new_val);
-                        debug!(
-                            before = original_len,
-                            after = trimmed_len,
-                            saved = original_len - trimmed_len,
-                            "ChatGPT cookie trimming"
-                        );
                     }
                 }
             }
@@ -1999,5 +2097,58 @@ mod tests {
 
         let decoded = try_decompress(&compressed, None);
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_trim_cookie_header_for_chatgpt_keeps_auth_under_limit() {
+        let mut cookies = vec![
+            "__Secure-next-auth.session-token=primary-session-token-value".to_string(),
+            "__Host-next-auth.csrf-token=csrf-token".to_string(),
+            "_account=acct-123".to_string(),
+            "cf_clearance=cf-token".to_string(),
+        ];
+
+        for i in 0..80 {
+            cookies.push(format!("experiment_{}={}", i, "x".repeat(120)));
+        }
+
+        let raw = cookies.join("; ");
+        let trimmed = trim_cookie_header_for_chatgpt(&raw, CHATGPT_MAX_COOKIE_HEADER_BYTES)
+            .expect("expected cookie trimming result");
+
+        assert!(trimmed.len() <= CHATGPT_MAX_COOKIE_HEADER_BYTES);
+        assert!(trimmed.contains("__Secure-next-auth.session-token="));
+        assert!(trimmed.contains("__Host-next-auth.csrf-token="));
+    }
+
+    #[test]
+    fn test_sanitize_request_headers_trims_chatgpt_cookie_header() {
+        let mut req = Request::builder()
+            .uri("https://chatgpt.com/backend-api/conversation")
+            .header("host", "chatgpt.com")
+            .body(())
+            .unwrap();
+
+        let mut cookie_parts = vec![
+            "__Secure-next-auth.session-token=session-token-value".to_string(),
+            "__Host-next-auth.csrf-token=csrf-value".to_string(),
+        ];
+        for i in 0..100 {
+            cookie_parts.push(format!("noise_{}={}", i, "y".repeat(100)));
+        }
+        req.headers_mut().insert(
+            "cookie",
+            hyper::header::HeaderValue::from_str(&cookie_parts.join("; ")).unwrap(),
+        );
+
+        sanitize_request_headers(&mut req, "chatgpt.com");
+
+        let cookie = req
+            .headers()
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(!cookie.is_empty());
+        assert!(cookie.len() <= CHATGPT_MAX_COOKIE_HEADER_BYTES);
     }
 }
