@@ -473,6 +473,11 @@ const HEADERS_TO_STRIP: &[&str] = &[
 
 /// Keep cookie header very small to avoid strict upstream 431 limits.
 const CHATGPT_MAX_COOKIE_HEADER_BYTES: usize = 1800;
+/// Second-pass cap when total header budget is still too high.
+const CHATGPT_STRICT_COOKIE_HEADER_BYTES: usize = 900;
+/// Chat UI upstreams can be stricter than generic HTTP servers.
+const CHAT_UI_STRICT_TOTAL_HEADER_BYTES: usize = 5200;
+const CHAT_UI_MAX_TOTAL_HEADER_BYTES: usize = 3000;
 
 fn is_chat_ui_host(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
@@ -576,120 +581,207 @@ fn trim_cookie_header_for_chatgpt(cookie_str: &str, max_bytes: usize) -> Option<
     Some(kept.join("; "))
 }
 
-/// Sanitize request headers to prevent 431 errors and WebSocket issues
-/// Only applies aggressive cookie trimming for ChatGPT (which has large cookies)
-fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str) {
-    let headers = req.headers_mut();
-    let is_chatgpt = is_chat_ui_host(host);
+fn header_size_bytes(headers: &hyper::HeaderMap) -> usize {
+    headers
+        .iter()
+        .map(|(k, v)| k.as_str().len() + v.len() + 4)
+        .sum()
+}
 
-    // Remove known problematic headers
-    for header_name in HEADERS_TO_STRIP {
-        headers.remove(*header_name);
+fn is_required_chat_ui_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "user-agent"
+            | "accept"
+            | "accept-encoding"
+            | "content-type"
+            | "content-length"
+            | "authorization"
+            | "cookie"
+            | "connection"
+            | "upgrade"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-protocol"
+            | "origin"
+            | "referer"
+            | "accept-language"
+    ) || name.starts_with("x-openai-")
+        || name.starts_with("openai-")
+}
+
+fn reduce_chat_ui_headers_for_budget<T>(req: &mut Request<T>, path: &str) {
+    let headers = req.headers_mut();
+    let is_backend_api = path.contains("/backend-api/");
+
+    if !is_backend_api && header_size_bytes(headers) <= CHAT_UI_STRICT_TOTAL_HEADER_BYTES {
+        return;
     }
 
-    // Remove WebSocket compression extension to prevent "Reserved bits are non-zero" errors
-    headers.remove("sec-websocket-extensions");
+    // Keep only a narrow allowlist of headers needed for auth + websocket + request semantics.
+    let names: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
+    for name in names {
+        if !is_required_chat_ui_header(&name) {
+            headers.remove(name.as_str());
+        }
+    }
 
-    // Remove Client Hints headers (only for ChatGPT to reduce header size)
-    if is_chatgpt {
-        headers.remove("sec-ch-ua");
-        headers.remove("sec-ch-ua-mobile");
-        headers.remove("sec-ch-ua-platform");
-        headers.remove("sec-ch-ua-platform-version");
-        headers.remove("sec-ch-ua-model");
-        headers.remove("sec-ch-ua-full-version-list");
-        headers.remove("sec-ch-ua-arch");
-        headers.remove("sec-ch-ua-bitness");
-        headers.remove("sec-ch-prefers-color-scheme");
-        headers.remove("sec-ch-prefers-reduced-motion");
-        headers.remove("upgrade-insecure-requests");
-        headers.remove("dnt");
-        headers.remove("priority");
-
-        // Trim cookies for ChatGPT (they can exceed upstream header limits and trigger 431).
-        if let Some(cookie_val) = headers.get("cookie").cloned() {
-            if let Ok(cookie_str) = cookie_val.to_str() {
-                let original_len = cookie_str.len();
-                if let Some(trimmed) =
-                    trim_cookie_header_for_chatgpt(cookie_str, CHATGPT_MAX_COOKIE_HEADER_BYTES)
-                {
-                    let trimmed_len = trimmed.len();
-                    if trimmed_len < original_len {
-                        if let Ok(new_val) = hyper::header::HeaderValue::from_str(&trimmed) {
-                            headers.remove("cookie");
-                            headers.insert("cookie", new_val);
-                            debug!(
-                                before = original_len,
-                                after = trimmed_len,
-                                saved = original_len - trimmed_len,
-                                max = CHATGPT_MAX_COOKIE_HEADER_BYTES,
-                                "ChatGPT cookie trimming"
-                            );
-                        }
-                    }
-                } else {
-                    // If parsing failed, remove malformed cookie header rather than forwarding an oversized header.
+    // Re-trim cookie with stricter cap.
+    if let Some(cookie_val) = headers.get("cookie").cloned() {
+        if let Ok(cookie_str) = cookie_val.to_str() {
+            if let Some(trimmed) =
+                trim_cookie_header_for_chatgpt(cookie_str, CHATGPT_STRICT_COOKIE_HEADER_BYTES)
+            {
+                if let Ok(new_val) = hyper::header::HeaderValue::from_str(&trimmed) {
                     headers.remove("cookie");
-                    debug!(
-                        before = original_len,
-                        "Dropped malformed ChatGPT cookie header"
-                    );
+                    headers.insert("cookie", new_val);
                 }
+            } else {
+                headers.remove("cookie");
             }
         }
+    }
 
-        // Safety pass: if cookie is still too large, cap harder to avoid 431.
-        if let Some(cookie_val) = headers.get("cookie").cloned() {
-            if let Ok(cookie_str) = cookie_val.to_str() {
-                if cookie_str.len() > CHATGPT_MAX_COOKIE_HEADER_BYTES {
+    // If still too big, remove low-priority browser context headers.
+    if header_size_bytes(headers) > CHAT_UI_MAX_TOTAL_HEADER_BYTES {
+        for header_name in ["referer", "origin", "accept-language"] {
+            headers.remove(header_name);
+        }
+    }
+
+    // Backend API requests with bearer auth do not need cookie for upstream auth.
+    // Dropping it aggressively prevents cookie-driven 431s on strict edge servers.
+    if path.contains("/backend-api/") && headers.contains_key("authorization") {
+        headers.remove("cookie");
+    }
+
+    // Absolute last resort.
+    if header_size_bytes(headers) > CHAT_UI_MAX_TOTAL_HEADER_BYTES {
+        headers.remove("cookie");
+    }
+}
+
+/// Sanitize request headers to prevent 431 errors and WebSocket issues
+/// Only applies aggressive cookie trimming for ChatGPT (which has large cookies)
+fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path: &str) {
+    let is_chatgpt = is_chat_ui_host(host);
+
+    {
+        let headers = req.headers_mut();
+
+        // Remove known problematic headers
+        for header_name in HEADERS_TO_STRIP {
+            headers.remove(*header_name);
+        }
+
+        // Remove WebSocket compression extension to prevent "Reserved bits are non-zero" errors
+        headers.remove("sec-websocket-extensions");
+
+        // Remove Client Hints headers (only for ChatGPT to reduce header size)
+        if is_chatgpt {
+            // Backend API requests with bearer auth do not require cookies for upstream auth.
+            if path.contains("/backend-api/") && headers.contains_key("authorization") {
+                headers.remove("cookie");
+            }
+
+            headers.remove("sec-ch-ua");
+            headers.remove("sec-ch-ua-mobile");
+            headers.remove("sec-ch-ua-platform");
+            headers.remove("sec-ch-ua-platform-version");
+            headers.remove("sec-ch-ua-model");
+            headers.remove("sec-ch-ua-full-version-list");
+            headers.remove("sec-ch-ua-arch");
+            headers.remove("sec-ch-ua-bitness");
+            headers.remove("sec-ch-prefers-color-scheme");
+            headers.remove("sec-ch-prefers-reduced-motion");
+            headers.remove("upgrade-insecure-requests");
+            headers.remove("dnt");
+            headers.remove("priority");
+
+            // Trim cookies for ChatGPT (they can exceed upstream header limits and trigger 431).
+            if let Some(cookie_val) = headers.get("cookie").cloned() {
+                if let Ok(cookie_str) = cookie_val.to_str() {
+                    let original_len = cookie_str.len();
                     if let Some(trimmed) =
                         trim_cookie_header_for_chatgpt(cookie_str, CHATGPT_MAX_COOKIE_HEADER_BYTES)
                     {
-                        if let Ok(new_val) = hyper::header::HeaderValue::from_str(&trimmed) {
-                            headers.remove("cookie");
-                            headers.insert("cookie", new_val);
+                        let trimmed_len = trimmed.len();
+                        if trimmed_len < original_len {
+                            if let Ok(new_val) = hyper::header::HeaderValue::from_str(&trimmed) {
+                                headers.remove("cookie");
+                                headers.insert("cookie", new_val);
+                                debug!(
+                                    before = original_len,
+                                    after = trimmed_len,
+                                    saved = original_len - trimmed_len,
+                                    max = CHATGPT_MAX_COOKIE_HEADER_BYTES,
+                                    "ChatGPT cookie trimming"
+                                );
+                            }
                         }
                     } else {
+                        // If parsing failed, remove malformed cookie header rather than forwarding an oversized header.
                         headers.remove("cookie");
+                        debug!(
+                            before = original_len,
+                            "Dropped malformed ChatGPT cookie header"
+                        );
                     }
                 }
             }
-        }
 
-        // If headers are still large, drop optional browser-only headers before forwarding.
-        let mut total_size: usize = headers
-            .iter()
-            .map(|(k, v)| k.as_str().len() + v.len() + 4)
-            .sum();
-        if total_size > 7600 {
-            for header_name in [
-                "referer",
-                "origin",
-                "accept-language",
-                "sec-fetch-site",
-                "sec-fetch-mode",
-                "sec-fetch-dest",
-                "sec-fetch-user",
-            ] {
-                headers.remove(header_name);
+            // Safety pass: if cookie is still too large, cap harder to avoid 431.
+            if let Some(cookie_val) = headers.get("cookie").cloned() {
+                if let Ok(cookie_str) = cookie_val.to_str() {
+                    if cookie_str.len() > CHATGPT_MAX_COOKIE_HEADER_BYTES {
+                        if let Some(trimmed) = trim_cookie_header_for_chatgpt(
+                            cookie_str,
+                            CHATGPT_MAX_COOKIE_HEADER_BYTES,
+                        ) {
+                            if let Ok(new_val) = hyper::header::HeaderValue::from_str(&trimmed) {
+                                headers.remove("cookie");
+                                headers.insert("cookie", new_val);
+                            }
+                        } else {
+                            headers.remove("cookie");
+                        }
+                    }
+                }
             }
-            total_size = headers
-                .iter()
-                .map(|(k, v)| k.as_str().len() + v.len() + 4)
-                .sum();
-        }
 
-        // Last resort for chat UI: if still too large, drop cookie entirely to avoid 431.
-        if total_size > 7600 {
-            headers.remove("cookie");
+            // If headers are still large, drop optional browser-only headers before forwarding.
+            let mut total_size = header_size_bytes(headers);
+            if total_size > 7600 {
+                for header_name in [
+                    "referer",
+                    "origin",
+                    "accept-language",
+                    "sec-fetch-site",
+                    "sec-fetch-mode",
+                    "sec-fetch-dest",
+                    "sec-fetch-user",
+                ] {
+                    headers.remove(header_name);
+                }
+                total_size = header_size_bytes(headers);
+            }
+
+            // Last resort for chat UI: if still too large, drop cookie entirely to avoid 431.
+            if total_size > 7600 {
+                headers.remove("cookie");
+            }
         }
     }
 
+    // Final strict budget pass for chat UI hosts.
+    if is_chatgpt {
+        reduce_chat_ui_headers_for_budget(req, path);
+    }
+
     // Calculate final header size and warn if still large
-    let total_size: usize = headers
-        .iter()
-        .map(|(k, v)| k.as_str().len() + v.len() + 4)
-        .sum();
+    let headers = req.headers();
+    let total_size = header_size_bytes(headers);
 
     if total_size > 8000 {
         let mut sizes: Vec<(String, usize)> = headers
@@ -1389,6 +1481,18 @@ impl HttpHandler for AiProxyHandler {
                     );
                 }
 
+                // Dedicated visibility for Chat UI backend calls (used to debug 431 issues).
+                if is_chat_ui_host(&host) && display_path.contains("/backend-api/") {
+                    info!(
+                        provider = provider,
+                        host = %host,
+                        path = %display_path,
+                        method = %http_method,
+                        should_log = should_log,
+                        "Chat UI backend API request"
+                    );
+                }
+
                 #[cfg(feature = "dashboard")]
                 if let Some(ref dashboard) = dashboard {
                     if should_log {
@@ -1433,7 +1537,7 @@ impl HttpHandler for AiProxyHandler {
             // Only aggressive cookie trimming for ChatGPT (other providers keep all cookies)
             let (parts, body) = req.into_parts();
             let mut sanitized_req = Request::from_parts(parts, body);
-            sanitize_request_headers(&mut sanitized_req, &host);
+            sanitize_request_headers(&mut sanitized_req, &host, &path);
 
             RequestOrResponse::Request(sanitized_req)
         }
@@ -2212,7 +2316,7 @@ mod tests {
             hyper::header::HeaderValue::from_str(&cookie_parts.join("; ")).unwrap(),
         );
 
-        sanitize_request_headers(&mut req, "chatgpt.com");
+        sanitize_request_headers(&mut req, "chatgpt.com", "/backend-api/conversation");
 
         let cookie = req
             .headers()
@@ -2243,7 +2347,7 @@ mod tests {
             hyper::header::HeaderValue::from_str(&cookie_parts.join("; ")).unwrap(),
         );
 
-        sanitize_request_headers(&mut req, "chat.openai.com");
+        sanitize_request_headers(&mut req, "chat.openai.com", "/backend-api/conversation");
 
         let cookie = req
             .headers()
@@ -2252,6 +2356,63 @@ mod tests {
             .unwrap_or("");
         assert!(!cookie.is_empty());
         assert!(cookie.len() <= CHATGPT_MAX_COOKIE_HEADER_BYTES);
+    }
+
+    #[test]
+    fn test_sanitize_request_headers_reduces_total_budget_for_backend_api() {
+        let mut req = Request::builder()
+            .uri("https://chatgpt.com/backend-api/codex/responses")
+            .header("host", "chatgpt.com")
+            .header("authorization", "Bearer test-token")
+            .header("origin", "https://chatgpt.com")
+            .header("referer", "https://chatgpt.com/")
+            .body(())
+            .unwrap();
+
+        let mut cookie_parts = vec![
+            "__Secure-next-auth.session-token=session-token-value".to_string(),
+            "__Host-next-auth.csrf-token=csrf-value".to_string(),
+        ];
+        for i in 0..180 {
+            cookie_parts.push(format!("noise_{}={}", i, "q".repeat(120)));
+        }
+        req.headers_mut().insert(
+            "cookie",
+            hyper::header::HeaderValue::from_str(&cookie_parts.join("; ")).unwrap(),
+        );
+        req.headers_mut().insert(
+            "x-debug-big-header",
+            hyper::header::HeaderValue::from_str(&"x".repeat(4096)).unwrap(),
+        );
+
+        sanitize_request_headers(&mut req, "chatgpt.com", "/backend-api/codex/responses");
+
+        let total_size = header_size_bytes(req.headers());
+        assert!(total_size <= CHAT_UI_STRICT_TOTAL_HEADER_BYTES + 400);
+        assert!(req.headers().get("x-debug-big-header").is_none());
+        assert!(req.headers().get("cookie").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_request_headers_drops_cookie_for_backend_api_with_auth() {
+        let mut req = Request::builder()
+            .uri("https://chatgpt.com/backend-api/f/conversation")
+            .header("host", "chatgpt.com")
+            .header("authorization", "Bearer test-token")
+            .body(())
+            .unwrap();
+
+        req.headers_mut().insert(
+            "cookie",
+            hyper::header::HeaderValue::from_static(
+                "__Secure-next-auth.session-token=abc; __Host-next-auth.csrf-token=def",
+            ),
+        );
+
+        sanitize_request_headers(&mut req, "chatgpt.com", "/backend-api/f/conversation");
+
+        assert!(req.headers().get("authorization").is_some());
+        assert!(req.headers().get("cookie").is_none());
     }
 
     #[test]
