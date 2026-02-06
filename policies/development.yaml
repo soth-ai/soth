@@ -1,0 +1,43 @@
+# Development SOTH Policy
+# Permissive policy for local development
+# DO NOT USE IN PRODUCTION
+
+name: development
+description: Permissive policy for local development and testing
+version: "1.0"
+
+rules:
+  # ============================================
+  # STILL BLOCK TRULY DANGEROUS TOOLS
+  # Even in dev, some things should be blocked
+  # ============================================
+
+  - name: block_catastrophic
+    description: Block tools that could cause catastrophic damage
+    conditions:
+      method: "tools/call"
+      tool:
+        in:
+          - "format_disk"
+          - "rm_rf"
+          - "drop_all_databases"
+    action: deny
+    message: "This tool is blocked even in development mode"
+
+  # ============================================
+  # LOGGING FOR DEBUGGING
+  # ============================================
+
+  - name: log_all_for_debug
+    description: Log everything for debugging
+    conditions: {}
+    action: log
+
+  # ============================================
+  # ALLOW ALMOST EVERYTHING
+  # ============================================
+
+  - name: allow_all
+    description: Allow all requests in development
+    conditions: {}
+    action: allow

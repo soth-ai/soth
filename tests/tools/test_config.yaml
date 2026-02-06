@@ -1,0 +1,31 @@
+# Test configuration for SOTH test harness
+version: "1.0"
+
+server:
+  transport: "stdio"
+
+# Use the mock MCP server for testing (build it first with: cd tests/tools/mock_mcp_server && cargo build)
+upstream:
+  command: "./tests/tools/mock_mcp_server/target/debug/mock-mcp-server"
+  args: []
+
+observe:
+  enabled: true
+  pii_detection: true
+  log_requests: true
+  log_responses: true
+
+policy:
+  enabled: true
+  mode: "enforce"
+  cache:
+    enabled: true
+    l1_ttl: "10s"
+    l2_ttl: "5m"
+
+budget:
+  enabled: false
+
+logging:
+  level: "debug"
+  format: "text"

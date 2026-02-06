@@ -1,0 +1,105 @@
+# Strict SOTH Policy
+# Use this policy when security is paramount
+# All operations require verified identity
+
+name: strict
+description: Strict security policy requiring identity for all operations
+version: "1.0"
+
+rules:
+  # ============================================
+  # BLOCKED - No exceptions
+  # ============================================
+
+  - name: block_shell_tools
+    description: Block all shell/command execution tools
+    conditions:
+      method: "tools/call"
+      tool:
+        matches: ".*(shell|exec|command|system|eval|run).*"
+    action: deny
+    message: "Shell and command execution tools are blocked"
+
+  - name: block_network_tools
+    description: Block network access tools
+    conditions:
+      method: "tools/call"
+      tool:
+        matches: ".*(http|fetch|curl|wget|request|socket).*"
+    action: deny
+    message: "Network access tools are blocked"
+
+  # ============================================
+  # IDENTITY REQUIRED FOR EVERYTHING
+  # ============================================
+
+  - name: require_identity_all_tools
+    description: Require identity for all tool calls
+    conditions:
+      method: "tools/call"
+      identity_verified: false
+    action: deny
+    message: "Verified identity required for all tool operations"
+
+  - name: require_identity_all_resources
+    description: Require identity for all resource access
+    conditions:
+      method: "resources/read"
+      identity_verified: false
+    action: deny
+    message: "Verified identity required for resource access"
+
+  - name: require_identity_sampling
+    description: Require identity for LLM sampling
+    conditions:
+      method: "sampling/createMessage"
+      identity_verified: false
+    action: deny
+    message: "Verified identity required for LLM access"
+
+  # ============================================
+  # STRICT RATE LIMITING
+  # ============================================
+
+  - name: strict_rate_limit_tools
+    description: Strict rate limiting for tools
+    conditions:
+      method: "tools/call"
+    action: rate_limit
+    rate_limit:
+      requests: 20
+      window_seconds: 60
+
+  - name: strict_rate_limit_sampling
+    description: Very strict rate limiting for sampling
+    conditions:
+      method: "sampling/createMessage"
+    action: rate_limit
+    rate_limit:
+      requests: 5
+      window_seconds: 60
+
+  # ============================================
+  # LOG EVERYTHING
+  # ============================================
+
+  - name: log_all_requests
+    description: Log all requests for audit
+    conditions: {}
+    action: log
+
+  # ============================================
+  # ALLOW REMAINING (with identity)
+  # ============================================
+
+  - name: allow_with_identity
+    description: Allow requests with verified identity
+    conditions:
+      identity_verified: true
+    action: allow
+
+  - name: deny_default
+    description: Deny by default
+    conditions: {}
+    action: deny
+    message: "Request denied by default policy"

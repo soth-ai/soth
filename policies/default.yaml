@@ -1,0 +1,113 @@
+# Default SOTH Policy
+# This policy provides sensible defaults for MCP traffic control
+
+name: default
+description: Default safety policy for MCP traffic
+version: "1.0"
+
+rules:
+  # ============================================
+  # BLOCKED TOOLS
+  # These tools are never allowed
+  # ============================================
+
+  - name: block_dangerous_tools
+    description: Block tools that could execute arbitrary code or commands
+    conditions:
+      method: "tools/call"
+      tool:
+        in:
+          - "shell_exec"
+          - "system_command"
+          - "exec"
+          - "eval"
+          - "run_command"
+          - "execute_code"
+    action: deny
+    message: "This tool is blocked for security reasons"
+
+  - name: block_destructive_operations
+    description: Block tools that could cause data loss
+    conditions:
+      method: "tools/call"
+      tool:
+        in:
+          - "delete_all"
+          - "drop_database"
+          - "format_disk"
+          - "rm_rf"
+    action: deny
+    message: "Destructive operations are not allowed"
+
+  # ============================================
+  # IDENTITY REQUIREMENTS
+  # Require verified identity for sensitive operations
+  # ============================================
+
+  - name: require_identity_for_write
+    description: Require verified identity for write operations
+    conditions:
+      method: "tools/call"
+      tool:
+        matches: "^(write|create|update|delete|modify).*"
+      identity_verified: false
+    action: deny
+    message: "Verified identity required for write operations"
+
+  - name: require_identity_for_sampling
+    description: Require identity for LLM sampling requests
+    conditions:
+      method: "sampling/createMessage"
+      identity_verified: false
+    action: deny
+    message: "Verified identity required for LLM requests"
+
+  # ============================================
+  # RATE LIMITING
+  # Prevent abuse through excessive requests
+  # ============================================
+
+  - name: rate_limit_tools
+    description: Rate limit tool calls
+    conditions:
+      method: "tools/call"
+    action: rate_limit
+    rate_limit:
+      requests: 100
+      window_seconds: 60
+
+  - name: rate_limit_sampling
+    description: Rate limit sampling requests (more restrictive)
+    conditions:
+      method: "sampling/createMessage"
+    action: rate_limit
+    rate_limit:
+      requests: 10
+      window_seconds: 60
+
+  # ============================================
+  # LOGGING
+  # Log specific operations for audit
+  # ============================================
+
+  - name: log_all_tool_calls
+    description: Log all tool calls for audit trail
+    conditions:
+      method: "tools/call"
+    action: log
+
+  - name: log_resource_access
+    description: Log resource access
+    conditions:
+      method: "resources/read"
+    action: log
+
+  # ============================================
+  # DEFAULT ALLOW
+  # Allow everything else
+  # ============================================
+
+  - name: allow_default
+    description: Allow all other requests
+    conditions: {}
+    action: allow

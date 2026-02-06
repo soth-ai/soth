@@ -1,0 +1,70 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+
+# Debug
+*.dSYM/
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.local
+
+# SOTH specific
+.soth/
+logs/
+*.log
+
+# Node.js (dashboard)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+dashboard/build/
+dashboard/dist/
+dashboard/.env
+dashboard/.env.local
+dashboard/*.tsbuildinfo
+dashboard/next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test artifacts
+*.profraw
+coverage/
+lcov.info
+
+# Certificates (generated)
+*.pem
+*.crt
+*.key
+!tests/fixtures/**/*.pem
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Documentation (generated)
+docs/

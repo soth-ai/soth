@@ -1,0 +1,34 @@
+[package]
+name = "soth-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "TLS certificate management for SOTH forward proxy"
+
+[dependencies]
+soth-core = { workspace = true }
+
+# TLS
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
+webpki-roots = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Utilities
+dashmap = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+time = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

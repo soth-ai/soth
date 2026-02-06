@@ -1,0 +1,163 @@
+# SOTH Configuration Example
+# Copy this file to soth.yaml and customize for your environment
+version: "1.0"
+
+# Server configuration
+server:
+  listen:
+    address: "127.0.0.1"
+    port: 3000
+  transport: "stdio"  # Options: stdio | sse | http
+
+# Upstream MCP server configuration
+# This is the server that SOTH proxies requests to
+upstream:
+  command: "npx"
+  args:
+    - "-y"
+    - "@modelcontextprotocol/server-filesystem"
+    - "/tmp"
+  # Alternative: spawn a custom server
+  # command: "python"
+  # args: ["-m", "my_mcp_server"]
+
+# Identity configuration
+# Controls cryptographic identity verification for agents
+identity:
+  mode: "optional"  # Options: disabled | optional | required
+  key_path: "~/.soth/identity.pem"
+  trust_store_path: "~/.soth/trust_store"
+
+# Policy configuration
+# Controls request filtering and access control
+policy:
+  enabled: true
+  mode: "enforce"  # Options: audit | enforce
+  policy_dir: "policies"
+  data_file: null  # Optional: path to JSON data file for policy evaluation
+  cache:
+    enabled: true
+    l1_ttl: "10s"           # L1 cache TTL (exact match, short-lived)
+    l2_ttl: "5m"            # L2 cache TTL (pattern match, longer-lived). Defaults to 30x l1_ttl
+    l1_max_entries: 10000   # Maximum L1 cache entries
+    l2_max_entries: 1000    # Maximum L2 cache entries
+
+# Observation configuration
+# Controls logging and monitoring
+observe:
+  enabled: true
+  pii_detection: true      # Detect and redact PII in logs
+  log_requests: true       # Log inbound requests
+  log_responses: true      # Log outbound responses
+  tamper_proof: true       # Enable Merkle tree verification
+  storage:
+    backend: "local"       # Options: local | sqlite
+    path: "./logs/"
+
+# Budget configuration
+# Controls spend tracking and limits
+budget:
+  enabled: true
+  storage_path: "./budget.db"
+  limits:
+    # Global budget applies to all traffic
+    - scope: "global"
+      daily: 50.00
+      weekly: null
+      monthly: 500.00
+    # Per-agent budgets (uncomment to enable)
+    # - scope: "per_agent"
+    #   agent_id: "agent-1"
+    #   daily: 10.00
+  alerts:
+    - threshold_percent: 50
+      action: "notify"    # Log an info message
+    - threshold_percent: 80
+      action: "warn"      # Log a warning
+    - threshold_percent: 100
+      action: "block"     # Block requests
+
+# Dashboard configuration
+# Real-time metrics dashboard with 4 panels
+dashboard:
+  enabled: true
+  port: 3001  # Dashboard will be available at http://localhost:3001
+
+# Forward Proxy configuration
+# HTTP/HTTPS proxy for intercepting AI provider traffic (OpenAI, Anthropic, Google)
+forward_proxy:
+  enabled: false           # Set to true to enable the forward proxy
+  port: 8080               # Port for the proxy to listen on
+  address: "127.0.0.1"     # Bind address (use 0.0.0.0 for all interfaces)
+  request_timeout: "5m"    # Timeout for AI requests (streaming can be long)
+
+  # CA certificate configuration (for TLS MITM)
+  ca:
+    cert_path: "~/.soth/ca/ca.crt"
+    key_path: "~/.soth/ca/ca.key"
+    cert_validity: "24h"   # Generated cert validity
+    cache_ttl: "1h"        # Certificate cache TTL
+    cache_max: 10000       # Maximum cached certificates
+
+  # Connection pool settings
+  pool:
+    max_connections_per_host: 10
+    idle_timeout: "90s"
+    connect_timeout: "10s"
+
+  # Host filtering (whitelist mode by default)
+  hosts:
+    allow:
+      - "api.openai.com"
+      - "api.anthropic.com"
+      - "generativelanguage.googleapis.com"
+    # block: []            # Use blacklist mode instead (allow empty, block specified)
+
+# Production hardening configuration
+# Rate limiting, circuit breakers, and connection management
+production:
+  # Rate limiting
+  rate_limit:
+    enabled: false                   # Enable to protect against abuse
+    requests_per_second: 100         # Per-key limit
+    burst_size: 200                  # Burst capacity
+    global_requests_per_second: 1000 # Global limit
+    global_burst_size: 2000          # Global burst
+
+  # Circuit breaker (upstream protection)
+  circuit_breaker:
+    enabled: true                    # Enabled by default
+    failure_threshold: 5             # Failures before opening
+    open_duration: "30s"             # Time before half-open
+    success_threshold: 3             # Successes to close
+    failure_window: "60s"            # Window for counting failures
+
+  # Health check endpoints
+  health:
+    enabled: true
+    liveness_path: "/healthz"
+    readiness_path: "/readyz"
+    metrics_path: "/metrics"
+
+  # Connection limits
+  connection_limits:
+    max_total_connections: 1000
+    max_connections_per_host: 100
+    idle_timeout: "90s"
+    connect_timeout: "10s"
+    request_timeout: "5m"            # 5 minutes for AI requests
+    tls_timeout: "10s"
+
+# Logging configuration
+logging:
+  level: "info"           # Options: debug | info | warn | error
+  format: "text"          # Options: text | json
+  output: "stderr"        # Options: stdout | stderr | file
+  # file_path: "./soth.log"  # Required when output = file
+
+# Model pricing overrides (optional)
+# Add custom models or override default pricing
+# pricing:
+#   - model: "custom-model"
+#     input_per_million: 10.0
+#     output_per_million: 30.0

@@ -1,0 +1,22 @@
+# Test config: PII detection disabled
+# Expected: No PII detection/redaction occurs
+version: "1.0"
+
+server:
+  transport: "stdio"
+
+upstream:
+  command: "echo"
+  args: ["test"]
+
+observe:
+  enabled: true
+  pii_detection: false  # <-- PII detection disabled
+  log_requests: true
+  log_responses: true
+
+policy:
+  enabled: false
+
+budget:
+  enabled: false

@@ -1,0 +1,22 @@
+[package]
+name = "soth-policy"
+description = "OPA Wasm policy evaluation for SOTH"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soth-core = { workspace = true }
+wasmtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+dashmap = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

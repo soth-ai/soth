@@ -1,0 +1,27 @@
+# Test config: Custom cache TTLs
+# Expected: Cache uses l1_ttl=30s, l2_ttl=2m
+version: "1.0"
+
+server:
+  transport: "stdio"
+
+upstream:
+  command: "echo"
+  args: ["test"]
+
+observe:
+  enabled: true
+  pii_detection: true
+
+policy:
+  enabled: true
+  mode: "enforce"
+  cache:
+    enabled: true
+    l1_ttl: "30s"       # Custom L1 TTL (default is 10s)
+    l2_ttl: "2m"        # Custom L2 TTL (default is 30x L1 = 5m)
+    l1_max_entries: 5000
+    l2_max_entries: 500
+
+budget:
+  enabled: false

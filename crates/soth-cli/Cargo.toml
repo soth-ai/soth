@@ -1,0 +1,57 @@
+[package]
+name = "soth-cli"
+description = "CLI entry point for SOTH edge proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "soth"
+path = "src/main.rs"
+
+[dependencies]
+soth-core = { workspace = true }
+soth-identity = { workspace = true }
+soth-policy = { workspace = true }
+soth-observe = { workspace = true }
+soth-budget = { workspace = true }
+soth-proxy = { workspace = true }
+soth-dashboard = { workspace = true }
+soth-tls = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+x509-parser = { workspace = true }
+hex = "0.4"
+dirs = "5.0"
+reqwest = { workspace = true }
+
+# CLI styling
+owo-colors = "4.0"
+comfy-table = "7.0"
+indicatif = "0.17"
+console = "0.15"
+
+# TUI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# System utilities
+which = "6.0"
+
+# File watching
+notify = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+soth-test-utils = { path = "../soth-test-utils" }
+criterion = { version = "0.5", features = ["async_tokio"] }

@@ -1,0 +1,253 @@
+// API Response wrapper
+export interface ApiResponse<T> {
+  timestamp: string;
+  uptime_secs: number;
+  data: T;
+}
+
+// Identity Panel
+export interface DidEntry {
+  did: string;
+  verified: boolean;
+  last_seen: string;
+}
+
+export interface IdentityMetrics {
+  total_verifications: number;
+  successful: number;
+  failed: number;
+  unique_dids: number;
+  recent_dids: DidEntry[];
+}
+
+// Policy Panel
+export interface DenialEntry {
+  timestamp: string;
+  method: string;
+  tool: string | null;
+  reason: string;
+}
+
+export interface PolicyMetrics {
+  evaluations: number;
+  allowed: number;
+  denied: number;
+  cache_hits: number;
+  cache_misses: number;
+  recent_denials: DenialEntry[];
+}
+
+// Observe Panel
+export interface ObserveMetrics {
+  requests: number;
+  responses: number;
+  pii_detections: number;
+  pii_by_type: Record<string, number>;
+}
+
+// Budget Panel
+export interface BudgetAlert {
+  level: "info" | "warning" | "error";
+  message: string;
+}
+
+export interface BudgetMetrics {
+  total_tokens: number;
+  total_cost_usd: number;
+  daily_limit_usd: number | null;
+  cost_by_model: Record<string, number>;
+  alerts: BudgetAlert[];
+}
+
+// ============================================================================
+// Advanced Budget Analytics Types
+// ============================================================================
+
+export interface AdvancedBudgetMetrics {
+  // Basic metrics
+  total_tokens: number;
+  total_cost_usd: number;
+  daily_limit_usd: number | null;
+  cost_by_model: Record<string, number>;
+  alerts: BudgetAlert[];
+
+  // Provider breakdown
+  cost_by_provider: Record<string, ProviderCostBreakdown>;
+
+  // MCP tool costs
+  cost_by_tool: ToolCostEntry[];
+
+  // Team/project allocation
+  cost_by_tag: Record<string, Record<string, number>>;
+
+  // Daily trend (last 30 days)
+  daily_trend: DailyTrendPoint[];
+
+  // Cost anomalies
+  anomalies: CostAnomalyEntry[];
+
+  // Recommendations
+  recommendations: RecommendationEntry[];
+
+  // Request type breakdown
+  cost_by_request_type: Record<string, number>;
+}
+
+export interface ProviderCostBreakdown {
+  total_cost: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  request_count: number;
+  model_breakdown: Record<string, ModelCostEntry>;
+}
+
+export interface ModelCostEntry {
+  model_name: string;
+  cost: number;
+  input_tokens: number;
+  output_tokens: number;
+  request_count: number;
+  avg_cost_per_request: number;
+}
+
+export interface ToolCostEntry {
+  tool_name: string;
+  server_name: string;
+  total_cost: number;
+  call_count: number;
+  avg_cost_per_call: number;
+}
+
+export interface DailyTrendPoint {
+  date: string;
+  cost: number;
+  tokens: number;
+  requests: number;
+  by_provider: Record<string, number>;
+}
+
+export interface CostAnomalyEntry {
+  id: string;
+  anomaly_type: "cost_spike" | "usage_spike" | "new_model" | "unusual_time" | "budget_approaching";
+  severity: "info" | "warning" | "critical";
+  description: string;
+  detected_at: string;
+  current_value: number;
+  expected_value: number;
+}
+
+export interface RecommendationEntry {
+  id: string;
+  recommendation_type: "model_downgrade" | "prompt_caching" | "batch_requests" | "reduce_output_tokens";
+  title: string;
+  description: string;
+  estimated_savings: number;
+  effort: "low" | "medium" | "high";
+}
+
+export interface ModelPricingEntry {
+  model_id: string;
+  model_name: string;
+  provider: string;
+  input_cost_per_million: number;
+  output_cost_per_million: number;
+  cache_read_cost_per_million: number | null;
+  cache_write_cost_per_million: number | null;
+  supports_vision: boolean;
+  supports_tools: boolean;
+  context_window: number;
+  max_output_tokens: number | null;
+}
+
+// Health
+export interface HealthResponse {
+  status: string;
+  uptime_secs: number;
+  event_store_enabled?: boolean;
+}
+
+// Wrap Events (from soth wrap)
+export interface WrapEvent {
+  id: string;
+  timestamp: string;
+  session_id: string;
+  server_name: string;
+  direction: "in" | "out";
+  method?: string;
+  tool_name?: string;
+  content_preview?: string;
+  agent: AgentInfo;
+  policy_allowed?: boolean;
+  policy_reason?: string;
+  pii_detected: boolean;
+  pii_types: string[];
+  token_count?: number;
+  cost_usd?: number;
+  latency_ms?: number;
+}
+
+export interface AgentInfo {
+  name: string;
+  version?: string;
+  detected_from: string;
+}
+
+// Agent statistics
+export interface AgentStats {
+  name: string;
+  version?: string;
+  detected_from: string;
+  event_count: number;
+  last_seen: string;
+  servers: string[];
+}
+
+export interface AgentsSummary {
+  total_agents: number;
+  agents: AgentStats[];
+}
+
+export interface EventsSummary {
+  total_events: number;
+  events: WrapEvent[];
+}
+
+// Proxy Panel
+export interface ProviderTokens {
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface ProxyRequestEntry {
+  timestamp: string;
+  provider: string;
+  host: string;
+  method: string;
+  path: string;
+  status_code: number | null;
+  latency_ms: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost_usd: number | null;
+  model: string | null;
+}
+
+export interface ProxyStatus {
+  enabled: boolean;
+  listen_address: string | null;
+  ca_installed: boolean;
+}
+
+export interface ProxyMetrics {
+  total_requests: number;
+  total_responses: number;
+  active_connections: number;
+  requests_by_provider: Record<string, number>;
+  tokens_by_provider: Record<string, ProviderTokens>;
+  cost_by_provider: Record<string, number>;
+  total_tokens: number;
+  total_cost_usd: number;
+  recent_requests: ProxyRequestEntry[];
+  status: ProxyStatus;
+}

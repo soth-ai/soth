@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SOTH Dashboard</title>
+  <style>
+    :root {
+      --bg: #050505;
+      --card: #0c0c0c;
+      --border: #282828;
+      --text: #f2f2f2;
+      --text-muted: #8a8a8a;
+      --accent: #58a6ff;
+      --success: #16a34a;
+      --warning: #ca8a04;
+      --error: #dc2626;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    header {
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--card);
+    }
+    header h1 { font-size: 18px; font-weight: 600; }
+    header h1 span { color: var(--accent); }
+    .status { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .status-dot.online { background: var(--success); }
+    .status-dot.offline { background: var(--error); }
+    .banner {
+      padding: 12px 24px;
+      background: var(--accent);
+      color: var(--bg);
+      font-size: 13px;
+      text-align: center;
+    }
+    .banner a { color: inherit; font-weight: 600; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      padding: 24px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .panel-header {
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .panel-content { padding: 16px; }
+    .metric {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .metric:last-child { border-bottom: none; }
+    .metric-label { color: var(--text-muted); }
+    .metric-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .success { color: var(--success); }
+    .warning { color: var(--warning); }
+    .error { color: var(--error); }
+    .loading { color: var(--text-muted); font-style: italic; }
+    .subsection { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+    .subsection h4 { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+    .list-item {
+      padding: 6px 8px;
+      background: var(--bg);
+      border-radius: 4px;
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+    footer {
+      text-align: center;
+      padding: 24px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span>SOTH</span> Dashboard</h1>
+    <div class="status">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">Connecting...</span>
+      <span id="uptime" style="margin-left: 16px;"></span>
+    </div>
+  </header>
+
+  <div class="banner">
+    For the full React dashboard experience: <code>cd dashboard && npm install && npm run dev</code>
+    <a href="http://localhost:3002" target="_blank">Open React Dashboard</a>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="panel-header">Identity</div>
+      <div class="panel-content" id="identity"><span class="loading">Loading...</span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">Policy</div>
+      <div class="panel-content" id="policy"><span class="loading">Loading...</span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">Observe</div>
+      <div class="panel-content" id="observe"><span class="loading">Loading...</span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">Budget</div>
+      <div class="panel-content" id="budget"><span class="loading">Loading...</span></div>
+    </div>
+  </div>
+
+  <footer>Auto-refreshing every 2 seconds &bull; Lightweight fallback UI</footer>
+
+  <script>
+    function formatNum(n) {
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return n.toLocaleString();
+    }
+    function formatCost(n) { return '$' + n.toFixed(4); }
+    function formatUptime(s) {
+      if (s < 60) return s + 's';
+      if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+      return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+    }
+
+    const render = {
+      identity: d => `
+        <div class="metric"><span class="metric-label">Verifications</span><span class="metric-value">${formatNum(d.total_verifications)}</span></div>
+        <div class="metric"><span class="metric-label">Successful</span><span class="metric-value success">${formatNum(d.successful)}</span></div>
+        <div class="metric"><span class="metric-label">Failed</span><span class="metric-value${d.failed > 0 ? ' error' : ''}">${formatNum(d.failed)}</span></div>
+        <div class="metric"><span class="metric-label">Unique DIDs</span><span class="metric-value">${formatNum(d.unique_dids)}</span></div>
+        ${d.recent_dids?.length > 0 ? `<div class="subsection"><h4>Recent DIDs</h4>${d.recent_dids.slice(0,3).map(e =>
+          `<div class="list-item mono">${e.verified ? '✓' : '✗'} ${e.did.substring(0,32)}...</div>`).join('')}</div>` : ''}`,
+
+      policy: d => {
+        const total = d.cache_hits + d.cache_misses;
+        const rate = total > 0 ? ((d.cache_hits / total) * 100).toFixed(1) : '0.0';
+        return `
+        <div class="metric"><span class="metric-label">Evaluations</span><span class="metric-value">${formatNum(d.evaluations)}</span></div>
+        <div class="metric"><span class="metric-label">Allowed</span><span class="metric-value success">${formatNum(d.allowed)}</span></div>
+        <div class="metric"><span class="metric-label">Denied</span><span class="metric-value${d.denied > 0 ? ' error' : ''}">${formatNum(d.denied)}</span></div>
+        <div class="metric"><span class="metric-label">Cache Hit Rate</span><span class="metric-value">${rate}%</span></div>
+        ${d.recent_denials?.length > 0 ? `<div class="subsection"><h4>Recent Denials</h4>${d.recent_denials.slice(0,2).map(e =>
+          `<div class="list-item mono"><strong>${e.method}</strong> - ${e.reason}</div>`).join('')}</div>` : ''}`;
+      },
+
+      observe: d => {
+        const pii = Object.entries(d.pii_by_type || {}).sort((a,b) => b[1] - a[1]).slice(0, 3);
+        return `
+        <div class="metric"><span class="metric-label">Requests</span><span class="metric-value">${formatNum(d.requests)}</span></div>
+        <div class="metric"><span class="metric-label">Responses</span><span class="metric-value">${formatNum(d.responses)}</span></div>
+        <div class="metric"><span class="metric-label">PII Detections</span><span class="metric-value${d.pii_detections > 0 ? ' warning' : ''}">${formatNum(d.pii_detections)}</span></div>
+        ${pii.length > 0 ? `<div class="subsection"><h4>PII by Type</h4>${pii.map(([t,c]) =>
+          `<div class="metric"><span class="metric-label">${t}</span><span class="metric-value warning">${formatNum(c)}</span></div>`).join('')}</div>` : ''}`;
+      },
+
+      budget: d => {
+        const models = Object.entries(d.cost_by_model || {}).sort((a,b) => b[1] - a[1]).slice(0, 3);
+        const pct = d.daily_limit_usd ? ((d.total_cost_usd / d.daily_limit_usd) * 100).toFixed(1) : null;
+        return `
+        <div class="metric"><span class="metric-label">Total Tokens</span><span class="metric-value">${formatNum(d.total_tokens)}</span></div>
+        <div class="metric"><span class="metric-label">Total Cost</span><span class="metric-value">${formatCost(d.total_cost_usd)}</span></div>
+        ${d.daily_limit_usd ? `<div class="metric"><span class="metric-label">Daily Limit</span><span class="metric-value">${formatCost(d.daily_limit_usd)}</span></div>
+        <div class="metric"><span class="metric-label">Usage</span><span class="metric-value${pct > 80 ? ' error' : pct > 50 ? ' warning' : ' success'}">${pct}%</span></div>` : ''}
+        ${models.length > 0 ? `<div class="subsection"><h4>Cost by Model</h4>${models.map(([m,c]) =>
+          `<div class="metric"><span class="metric-label mono">${m}</span><span class="metric-value">${formatCost(c)}</span></div>`).join('')}</div>` : ''}
+        ${d.alerts?.length > 0 ? d.alerts.map(a => `<div class="list-item ${a.level}">${a.message}</div>`).join('') : ''}`;
+      }
+    };
+
+    let connected = false;
+    async function refresh() {
+      for (const p of ['identity', 'policy', 'observe', 'budget']) {
+        try {
+          const r = await fetch(`/api/${p}`);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const j = await r.json();
+          document.getElementById(p).innerHTML = render[p](j.data);
+          if (!connected) {
+            connected = true;
+            document.getElementById('status-dot').className = 'status-dot online';
+            document.getElementById('status-text').textContent = 'Connected';
+          }
+          document.getElementById('uptime').textContent = 'Uptime: ' + formatUptime(j.uptime_secs);
+        } catch (e) {
+          connected = false;
+          document.getElementById('status-dot').className = 'status-dot offline';
+          document.getElementById('status-text').textContent = 'Disconnected';
+          document.getElementById(p).innerHTML = `<span class="loading error">Error: ${e.message}</span>`;
+        }
+      }
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
