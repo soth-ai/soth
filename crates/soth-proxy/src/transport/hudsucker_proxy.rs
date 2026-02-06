@@ -432,16 +432,6 @@ impl Default for ProxyEnforcer {
     }
 }
 
-/// Safely truncate a string to max_chars characters without splitting UTF-8
-fn safe_truncate(s: &str, max_chars: usize) -> String {
-    let truncated: String = s.chars().take(max_chars).collect();
-    if truncated.len() < s.len() {
-        format!("{}...", truncated)
-    } else {
-        truncated
-    }
-}
-
 /// Headers to remove from proxied requests to prevent 431 errors
 /// These headers can accumulate or cause issues when passing through a MITM proxy
 const HEADERS_TO_STRIP: &[&str] = &[
@@ -999,6 +989,25 @@ fn decode_body_for_logging(bytes: &[u8], encoding: Option<&str>) -> String {
     String::from_utf8_lossy(&decoded).to_string()
 }
 
+fn empty_response_placeholder(method: &str, path: &str, status: u16, is_sse: bool) -> String {
+    if is_sse {
+        return format!(
+            "[no SSE payload captured for {} {} (HTTP {})]",
+            method, path, status
+        );
+    }
+    if path.to_ascii_lowercase().contains("/backend-api/codex/responses") {
+        return format!(
+            "[no HTTP response body captured for {} {} (HTTP {}) - Codex output may be streamed via WebSocket]",
+            method, path, status
+        );
+    }
+    format!(
+        "[no HTTP response body captured for {} {} (HTTP {})]",
+        method, path, status
+    )
+}
+
 /// AI-aware HTTP handler for hudsucker
 #[derive(Clone)]
 pub struct AiProxyHandler {
@@ -1083,8 +1092,8 @@ impl AiProxyHandler {
             .unwrap_or_default()
     }
 
-    /// Detect agent/client from User-Agent header
-    fn detect_agent<T>(req: &Request<T>) -> Option<&'static str> {
+    /// Detect agent/client from User-Agent header.
+    fn detect_agent_from_user_agent<T>(req: &Request<T>) -> Option<&'static str> {
         let ua = req
             .headers()
             .get("user-agent")
@@ -1093,7 +1102,9 @@ impl AiProxyHandler {
 
         let ua_lower = ua.to_lowercase();
 
-        if ua_lower.contains("claude-code") || ua_lower.contains("claude_code") {
+        if ua_lower.contains("openai-codex") || ua_lower.contains("codex/") {
+            Some("codex")
+        } else if ua_lower.contains("claude-code") || ua_lower.contains("claude_code") {
             Some("claude-code")
         } else if ua_lower.contains("cursor") {
             Some("cursor")
@@ -1125,14 +1136,85 @@ impl AiProxyHandler {
         }
     }
 
+    fn is_codex_path(path: &str) -> bool {
+        let path_lower = path.to_ascii_lowercase();
+        path_lower.contains("/backend-api/codex/")
+            || path_lower.starts_with("/codex")
+            || path_lower.contains("/codex/")
+    }
+
+    fn is_codex_model(model: &str) -> bool {
+        model.to_ascii_lowercase().contains("codex")
+    }
+
+    fn is_chatgpt_web_host(host: &str) -> bool {
+        host.contains("chatgpt.com")
+            || host == "chat.openai.com"
+            || host.ends_with(".chat.openai.com")
+    }
+
+    fn is_claude_web_host(host: &str) -> bool {
+        if !(host == "claude.ai" || host.ends_with(".claude.ai")) {
+            return false;
+        }
+        !host.starts_with("api.") && !host.contains(".api.")
+    }
+
+    /// Apply host/path/model heuristics to derive the final agent tag.
+    /// This upgrades generic OpenAI/ChatGPT tags to `codex` when context proves it.
+    fn detect_agent_with_context(
+        ua_agent: Option<&'static str>,
+        host: &str,
+        path: &str,
+        model: Option<&str>,
+    ) -> Option<&'static str> {
+        let host_lower = host.to_ascii_lowercase();
+        let is_chatgpt_web_host = Self::is_chatgpt_web_host(&host_lower);
+        let is_claude_web_host = Self::is_claude_web_host(&host_lower);
+
+        if is_chatgpt_web_host && Self::is_codex_path(path) {
+            return Some("codex");
+        }
+
+        if let Some(model_name) = model {
+            if Self::is_codex_model(model_name) {
+                return Some("codex");
+            }
+        }
+
+        if ua_agent.is_none() && is_chatgpt_web_host {
+            return Some("chatgpt");
+        }
+        if ua_agent.is_none() && is_claude_web_host {
+            return Some("claude");
+        }
+
+        ua_agent
+    }
+
     /// Detect AI provider from host
     fn detect_provider(host: &str) -> Option<&'static str> {
-        if host.contains("openai.com")
+        let host = host.to_ascii_lowercase();
+
+        // ChatGPT web/agent surfaces
+        if Self::is_chatgpt_web_host(&host) {
+            Some("chatgpt")
+        // Claude web/agent surfaces
+        } else if Self::is_claude_web_host(&host) {
+            Some("claude")
+        // OpenAI API inference endpoints
+        } else if host == "api.openai.com"
+            || host.ends_with(".api.openai.com")
             || host.contains("openai.azure.com")
-            || host.contains("chatgpt.com")
         {
             Some("openai")
-        } else if host.contains("anthropic.com") || host.contains("claude.ai") {
+        // Anthropic inference endpoints
+        } else if host == "api.claude.ai"
+            || host.ends_with(".api.claude.ai")
+            || host == "api.anthropic.com"
+            || host.ends_with(".api.anthropic.com")
+            || host.contains("anthropic.com")
+        {
             Some("anthropic")
         } else if host.contains("googleapis.com")
             && (host.contains("aiplatform") || host.contains("generativelanguage"))
@@ -1167,16 +1249,19 @@ impl AiProxyHandler {
     /// Agent apps: chatgpt.com, claude.ai (web/desktop apps)
     /// Direct API: api.openai.com, api.anthropic.com (programmatic access)
     fn is_agent_app(host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+
         // OpenAI/ChatGPT web apps (chat.openai.com, chatgpt.com)
         // Exclude api.openai.com which is direct API
-        if host.contains("openai.com") || host.contains("chatgpt.com") {
-            return !host.starts_with("api.") && !host.contains(".api.");
+        if Self::is_chatgpt_web_host(&host) {
+            return true;
         }
+
         // Claude web/desktop app (claude.ai)
-        // Exclude api.anthropic.com which is direct API
-        if host.contains("anthropic.com") || host.contains("claude.ai") {
-            return !host.starts_with("api.") && !host.contains(".api.");
+        if Self::is_claude_web_host(&host) {
+            return true;
         }
+
         // Perplexity web app
         if host.contains("perplexity.ai") {
             return !host.starts_with("api.") && !host.contains(".api.");
@@ -1191,6 +1276,11 @@ impl AiProxyHandler {
     /// Check if a request should be logged for observability
     /// Uses blacklist approach: include everything EXCEPT obvious non-inference content
     fn should_log_request(path: &str, method: &str) -> bool {
+        // CONNECT is transport setup, not an application request.
+        if method.eq_ignore_ascii_case("CONNECT") {
+            return false;
+        }
+
         let path_lower = path.to_lowercase();
 
         // POST requests to AI providers are almost always inference - include them
@@ -1267,6 +1357,7 @@ impl HttpHandler for AiProxyHandler {
         let uri = req.uri().clone();
         let path = uri.path().to_string();
         let http_method = req.method().to_string();
+        let is_connect = req.method() == hyper::Method::CONNECT;
 
         debug!(
             full_uri = %uri,
@@ -1277,7 +1368,7 @@ impl HttpHandler for AiProxyHandler {
         );
         let is_blocked = self.is_blocked(&host);
         let provider = Self::detect_provider(&host);
-        let agent = Self::detect_agent(&req);
+        let ua_agent = Self::detect_agent_from_user_agent(&req);
         let enforcer = self.enforcer.clone();
         let session_id = self.session_id.clone();
         let did_header = enforcer.as_ref().map(|e| e.did_header().to_string());
@@ -1371,88 +1462,93 @@ impl HttpHandler for AiProxyHandler {
                 debug!("Skipping body inspection");
                 (None, None, req)
             };
+            let agent = Self::detect_agent_with_context(ua_agent, &host, &path, model.as_deref());
 
-            if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
-                let enforcement = enforcer.enforce_request(
-                    &session_id,
-                    provider,
-                    &host,
-                    &http_method,
-                    &path,
-                    model.as_deref(),
-                    body_content.as_deref(),
-                    agent,
-                    identity_did.as_deref(),
-                    identity_signature.as_deref(),
-                );
+            if !is_connect {
+                if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
+                    let enforcement = enforcer.enforce_request(
+                        &session_id,
+                        provider,
+                        &host,
+                        &http_method,
+                        &path,
+                        model.as_deref(),
+                        body_content.as_deref(),
+                        agent,
+                        identity_did.as_deref(),
+                        identity_signature.as_deref(),
+                    );
 
-                match enforcement {
-                    Ok(identity_result) =>
-                    {
-                        #[cfg(feature = "dashboard")]
-                        if let Some(ref dashboard) = dashboard {
-                            if let Some(ref did) = identity_result.did {
-                                dashboard.record_identity_verification(
-                                    did,
-                                    identity_result.identity_verified,
-                                );
-                            }
-                            if let Some(ref version) = identity_result.policy_version {
-                                dashboard.set_policy_active_version(version.clone());
-                            }
-                            if enforcer.policy_mode != ProxyPolicyMode::Disabled {
-                                dashboard.record_policy_evaluation(true, None);
+                    match enforcement {
+                        Ok(identity_result) =>
+                        {
+                            #[cfg(feature = "dashboard")]
+                            if let Some(ref dashboard) = dashboard {
+                                if let Some(ref did) = identity_result.did {
+                                    dashboard.record_identity_verification(
+                                        did,
+                                        identity_result.identity_verified,
+                                    );
+                                }
+                                if let Some(ref version) = identity_result.policy_version {
+                                    dashboard.set_policy_active_version(version.clone());
+                                }
+                                if enforcer.policy_mode != ProxyPolicyMode::Disabled {
+                                    dashboard.record_policy_evaluation(true, None);
+                                }
                             }
                         }
-                    }
-                    Err((status, reason, policy_version)) => {
-                        warn!(
-                            status = status,
-                            provider = provider,
-                            host = %host,
-                            path = %path,
-                            reason = %reason,
-                            "Proxy request denied by enforcement"
-                        );
+                        Err((status, reason, policy_version)) => {
+                            warn!(
+                                status = status,
+                                provider = provider,
+                                host = %host,
+                                path = %path,
+                                reason = %reason,
+                                "Proxy request denied by enforcement"
+                            );
 
-                        #[cfg(feature = "dashboard")]
-                        if let Some(ref dashboard) = dashboard {
-                            if let Some(ref did) = identity_did {
-                                dashboard.record_identity_verification(did, false);
+                            #[cfg(feature = "dashboard")]
+                            if let Some(ref dashboard) = dashboard {
+                                if let Some(ref did) = identity_did {
+                                    dashboard.record_identity_verification(did, false);
+                                }
+                                if let Some(ref version) = policy_version {
+                                    dashboard.set_policy_active_version(version.clone());
+                                }
+                                if enforcer.policy_mode != ProxyPolicyMode::Disabled {
+                                    dashboard.record_policy_evaluation(
+                                        false,
+                                        Some(DenialEntry {
+                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                            method: format!("{} {}", http_method, path),
+                                            tool: Some(format!("{provider}:{path}")),
+                                            reason: reason.clone(),
+                                        }),
+                                    );
+                                }
                             }
-                            if let Some(ref version) = policy_version {
-                                dashboard.set_policy_active_version(version.clone());
-                            }
-                            if enforcer.policy_mode != ProxyPolicyMode::Disabled {
-                                dashboard.record_policy_evaluation(
-                                    false,
-                                    Some(DenialEntry {
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                        method: format!("{} {}", http_method, path),
-                                        tool: Some(format!("{provider}:{path}")),
-                                        reason: reason.clone(),
-                                    }),
-                                );
-                            }
+
+                            let response_body = serde_json::json!({
+                                "error": reason,
+                                "status": status,
+                            });
+                            return RequestOrResponse::Response(
+                                Response::builder()
+                                    .status(status)
+                                    .header("content-type", "application/json")
+                                    .body(Body::from(Full::new(response_body.to_string().into())))
+                                    .unwrap(),
+                            );
                         }
-
-                        let response_body = serde_json::json!({
-                            "error": reason,
-                            "status": status,
-                        });
-                        return RequestOrResponse::Response(
-                            Response::builder()
-                                .status(status)
-                                .header("content-type", "application/json")
-                                .body(Body::from(Full::new(response_body.to_string().into())))
-                                .unwrap(),
-                        );
                     }
                 }
             }
 
             // Log AI traffic (only inference endpoints, not images/tracking/etc)
-            if let Some(provider) = provider {
+            if is_connect {
+                debug!(host = %host, "CONNECT handshake (skipping AI request logging)");
+            } else if let Some(provider) = provider {
                 let display_path = if path.is_empty() || path == "/" {
                     // For tunneled requests, path might be empty
                     "/".to_string()
@@ -1589,10 +1685,14 @@ impl HttpHandler for AiProxyHandler {
             };
 
             let latency_ms = pending.started_at.elapsed().as_millis() as u64;
+            let is_codex_response_path = pending
+                .path
+                .to_ascii_lowercase()
+                .contains("/backend-api/codex/responses");
 
             // For JSON responses, capture the body for logging (with decompression)
-            // For SSE, use stream tee to forward immediately while accumulating for logging
-            let (body_content, res) = if is_json && !is_sse {
+            // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
+            let (body_content, res, logged_in_stream) = if is_json && !is_sse && !is_codex_response_path {
                 let (parts, body) = res.into_parts();
                 match body.collect().await {
                     Ok(collected) => {
@@ -1603,15 +1703,15 @@ impl HttpHandler for AiProxyHandler {
                         // Return original bytes to client (they handle decompression)
                         let new_body = Body::from(Full::new(bytes));
                         let res = Response::from_parts(parts, new_body);
-                        (Some(body_str), res)
+                        (Some(body_str), res, false)
                     }
                     Err(_) => {
                         let res = Response::from_parts(parts, Body::empty());
-                        (None, res)
+                        (None, res, false)
                     }
                 }
-            } else if is_sse {
-                // SSE streaming: tee the stream to forward chunks immediately while accumulating
+            } else if is_sse || is_codex_response_path {
+                // Streaming response: tee to forward chunks immediately while accumulating
                 let (parts, body) = res.into_parts();
 
                 // Create channels for the accumulated content
@@ -1624,6 +1724,7 @@ impl HttpHandler for AiProxyHandler {
                 let log_pending = pending.clone();
                 let log_latency_ms = latency_ms;
                 let log_content_encoding = content_encoding.clone();
+                let log_is_sse = is_sse;
 
                 // Create a tee stream that yields frames while accumulating data
                 let tee_stream = stream! {
@@ -1643,7 +1744,7 @@ impl HttpHandler for AiProxyHandler {
                                 yield Ok(frame);
                             }
                             Some(Err(e)) => {
-                                warn!(error = %e, "SSE stream error");
+                                warn!(error = %e, "Response stream error");
                                 break;
                             }
                             None => {
@@ -1654,7 +1755,7 @@ impl HttpHandler for AiProxyHandler {
                     }
 
                     // Stream ended - decompress and log the accumulated content
-                    let content = {
+                    let raw_content = {
                         let acc = accumulated_clone.lock();
                         let raw_bytes = acc.clone();
                         let raw_len = raw_bytes.len();
@@ -1663,26 +1764,27 @@ impl HttpHandler for AiProxyHandler {
                         debug!(
                             encoding = ?log_content_encoding,
                             raw_bytes = raw_len,
-                            "Decompressing SSE response"
+                            "Decompressing streamed response"
                         );
 
                         // Decode using header/magic decompression + binary guard
                         decode_body_for_logging(&raw_bytes, log_content_encoding.as_deref())
+                    };
+                    let content = if raw_content.trim().is_empty() {
+                        empty_response_placeholder(
+                            &log_pending.method,
+                            &log_pending.path,
+                            status,
+                            log_is_sse,
+                        )
+                    } else {
+                        raw_content
                     };
 
                     if let Some(ref logger) = log_event_logger {
                         let agent_name = log_pending.agent.unwrap_or(log_pending.provider);
                         let agent_info = AgentInfo::new(agent_name, DetectionSource::Environment);
                         let method_str = format!("{} {}", log_pending.method, log_pending.path);
-
-                        // Create request preview
-                        let request_preview = log_pending.request_content
-                            .as_ref()
-                            .map(|b| safe_truncate(b, 300))
-                            .unwrap_or_else(|| format!("{} {}", log_pending.method, log_pending.path));
-
-                        // Create response preview (more for SSE)
-                        let response_preview = safe_truncate(&content, 500);
 
                         let source = if log_pending.is_agent_app { EventSource::AgentApp } else { EventSource::AiProxy };
                         let mut event = WrapEvent::new(&log_session_id, &log_pending.host, WrapDirection::Out, agent_info)
@@ -1694,19 +1796,27 @@ impl HttpHandler for AiProxyHandler {
 
                         // Add paired request/response content
                         if let Some(ref req_body) = log_pending.request_content {
-                            event = event.with_request(req_body.clone(), request_preview.clone());
+                            event = event.with_request(req_body.clone(), "");
                         }
-                        event = event.with_response(content, response_preview.clone());
+                        event = event.with_response(content.clone(), "");
+                        // Keep content populated for legacy inspectors that still read `content`.
+                        event = event.with_content(content);
 
-                        // Also set content_preview for backward compatibility
-                        event = event.with_content_preview(format!("→ {} | ← {} (SSE)", request_preview, response_preview));
+                        // Keep compact row summary; full payload is in request_content/response_content.
+                        event = event.with_content_preview(format!(
+                            "→ {} {} | ← {} {}",
+                            log_pending.method,
+                            log_pending.path,
+                            if log_is_sse { "SSE" } else { "STREAM" },
+                            status
+                        ));
 
                         if let Some(ref m) = log_pending.model {
                             event = event.with_model(m.clone());
                         }
 
                         logger.log(&event);
-                        debug!("Logged paired SSE request/response");
+                        debug!("Logged paired streamed request/response");
                     }
                 };
 
@@ -1715,11 +1825,11 @@ impl HttpHandler for AiProxyHandler {
                 let new_body = Body::from(stream_body);
                 let res = Response::from_parts(parts, new_body);
 
-                // Return None for body_content - the SSE logging happens in the stream
-                (None, res)
+                // Return None for body_content - stream logging happens in tee stream.
+                (None, res, true)
             } else {
                 // Non-JSON, non-SSE - pass through without buffering
-                (None, res)
+                (None, res, false)
             };
 
             info!(
@@ -1746,25 +1856,12 @@ impl HttpHandler for AiProxyHandler {
                 );
             }
 
-            // Log paired request/response event (skip SSE - it logs in the stream tee)
-            if !is_sse {
+            // Log paired request/response event (streamed responses are logged in tee stream)
+            if !logged_in_stream {
                 if let Some(ref logger) = event_logger {
                     let agent_name = pending.agent.unwrap_or(pending.provider);
                     let agent_info = AgentInfo::new(agent_name, DetectionSource::Environment);
                     let method_str = format!("{} {}", pending.method, pending.path);
-
-                    // Create request preview
-                    let request_preview = pending
-                        .request_content
-                        .as_ref()
-                        .map(|b| safe_truncate(b, 300))
-                        .unwrap_or_else(|| format!("{} {}", pending.method, pending.path));
-
-                    // Create response preview
-                    let response_preview = body_content
-                        .as_ref()
-                        .map(|b| safe_truncate(b, 300))
-                        .unwrap_or_else(|| format!("HTTP {}", status));
 
                     let source = if pending.is_agent_app {
                         EventSource::AgentApp
@@ -1785,18 +1882,34 @@ impl HttpHandler for AiProxyHandler {
 
                     // Add paired request/response content
                     if let Some(ref req_body) = pending.request_content {
-                        event = event.with_request(req_body.clone(), request_preview.clone());
+                        event = event.with_request(req_body.clone(), "");
                     }
-                    if let Some(ref resp_body) = body_content {
-                        event = event.with_response(resp_body.clone(), response_preview.clone());
+                    let normalized_response = body_content
+                        .as_ref()
+                        .filter(|resp| !resp.trim().is_empty())
+                        .cloned()
+                        .or_else(|| {
+                            if pending.request_content.is_some() || pending.method == "POST" {
+                                Some(empty_response_placeholder(
+                                    &pending.method,
+                                    &pending.path,
+                                    status,
+                                    false,
+                                ))
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(resp_body) = normalized_response {
+                        event = event.with_response(resp_body.clone(), "");
                         // Also set content field for Inspector backward compatibility
-                        event = event.with_content(resp_body.clone());
+                        event = event.with_content(resp_body);
                     }
 
-                    // Also set content_preview for backward compatibility
+                    // Keep compact row summary; full payload is in request_content/response_content.
                     event = event.with_content_preview(format!(
-                        "→ {} | ← {}",
-                        request_preview, response_preview
+                        "→ {} {} | ← HTTP {}",
+                        pending.method, pending.path, status
                     ));
 
                     // Add model if we had it from request
@@ -1868,59 +1981,42 @@ impl WebSocketHandler for AiWebSocketHandler {
         let event_logger = self.event_logger.clone();
         let session_id = self.session_id.clone();
 
-        // Extract host and direction from context
-        let (host, direction) = match ctx {
+        // Extract host/path and direction from context
+        let (host, ws_path, direction) = match ctx {
             WebSocketContext::ClientToServer { dst, .. } => {
                 let h = dst.host().unwrap_or("unknown").to_string();
-                (h, WrapDirection::In)
+                let p = dst.path().to_string();
+                (h, p, WrapDirection::In)
             }
             WebSocketContext::ServerToClient { src, .. } => {
                 let h = src.host().unwrap_or("unknown").to_string();
-                (h, WrapDirection::Out)
+                let p = src.path().to_string();
+                (h, p, WrapDirection::Out)
             }
         };
 
         // Detect provider from host
-        let provider = if host.contains("openai.com")
-            || host.contains("openai.azure.com")
-            || host.contains("chatgpt.com")
-        {
-            "openai"
-        } else if host.contains("anthropic.com") || host.contains("claude.ai") {
-            "anthropic"
-        } else if host.contains("googleapis.com") {
-            "google"
-        } else {
-            "unknown"
-        };
+        let provider = AiProxyHandler::detect_provider(&host).unwrap_or("unknown");
 
-        // Determine if this is an agent app (chatgpt.com, claude.ai, chat.openai.com) or direct API
-        // Agent apps: web/desktop clients (chatgpt.com, chat.openai.com, claude.ai)
-        // Direct API: api.openai.com, api.anthropic.com (programmatic access)
-        let is_agent_app = {
-            let h = host.as_str();
-            if h.contains("openai.com") || h.contains("chatgpt.com") {
-                !h.starts_with("api.") && !h.contains(".api.")
-            } else if h.contains("anthropic.com") || h.contains("claude.ai") {
-                !h.starts_with("api.") && !h.contains(".api.")
-            } else if h.contains("perplexity.ai") {
-                !h.starts_with("api.") && !h.contains(".api.")
-            } else {
-                h.contains("aistudio.google.com") || h.contains("makersuite.google.com")
-            }
-        };
+        let is_agent_app = AiProxyHandler::is_agent_app(&host);
+        let ws_agent = AiProxyHandler::detect_agent_with_context(None, &host, &ws_path, None)
+            .unwrap_or("websocket");
 
         async move {
             match &msg {
                 Message::Text(text) => {
-                    info!(host = %host, provider = provider, len = text.len(), "WebSocket text message");
+                    info!(
+                        host = %host,
+                        path = %ws_path,
+                        provider = provider,
+                        agent = ws_agent,
+                        len = text.len(),
+                        "WebSocket text message"
+                    );
 
                     // Log WebSocket message for observability
                     if let Some(ref logger) = event_logger {
-                        let agent_info = AgentInfo::new("websocket", DetectionSource::Environment);
-
-                        // Create content preview (first 300 chars)
-                        let content_preview = safe_truncate(text, 300);
+                        let agent_info = AgentInfo::new(ws_agent, DetectionSource::Environment);
 
                         let source = if is_agent_app {
                             EventSource::AgentApp
@@ -1928,12 +2024,17 @@ impl WebSocketHandler for AiWebSocketHandler {
                             EventSource::AiProxy
                         };
 
+                        let method = if ws_path == "/" {
+                            "WebSocket".to_string()
+                        } else {
+                            format!("WebSocket {}", ws_path)
+                        };
+
                         let event = WrapEvent::new(&session_id, &host, direction, agent_info)
                             .with_source(source)
                             .with_provider(provider)
-                            .with_method("WebSocket")
-                            .with_content(text.to_string())
-                            .with_content_preview(content_preview);
+                            .with_method(method)
+                            .with_content(text.to_string());
                         logger.log(&event);
                     }
                 }
@@ -2100,6 +2201,19 @@ mod tests {
     #[test]
     fn test_detect_provider() {
         assert_eq!(
+            AiProxyHandler::detect_provider("chatgpt.com"),
+            Some("chatgpt")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("chat.openai.com"),
+            Some("chatgpt")
+        );
+        assert_eq!(AiProxyHandler::detect_provider("claude.ai"), Some("claude"));
+        assert_eq!(
+            AiProxyHandler::detect_provider("app.claude.ai"),
+            Some("claude")
+        );
+        assert_eq!(
             AiProxyHandler::detect_provider("api.openai.com"),
             Some("openai")
         );
@@ -2112,11 +2226,11 @@ mod tests {
             Some("anthropic")
         );
         assert_eq!(
-            AiProxyHandler::detect_provider("claude.ai"),
+            AiProxyHandler::detect_provider("api.claude.ai"),
             Some("anthropic")
         );
         assert_eq!(
-            AiProxyHandler::detect_provider("api.claude.ai"),
+            AiProxyHandler::detect_provider("anthropic.com"),
             Some("anthropic")
         );
         assert_eq!(
@@ -2137,6 +2251,113 @@ mod tests {
         );
         assert_eq!(AiProxyHandler::detect_provider("google.com"), None);
         assert_eq!(AiProxyHandler::detect_provider("example.com"), None);
+    }
+
+    #[test]
+    fn test_detect_agent_from_user_agent_codex() {
+        let req = Request::builder()
+            .uri("https://chatgpt.com/backend-api/codex/responses")
+            .header("user-agent", "OpenAI-Codex/1.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            AiProxyHandler::detect_agent_from_user_agent(&req),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_with_context_promotes_codex_path() {
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(
+                Some("chatgpt"),
+                "chatgpt.com",
+                "/backend-api/codex/responses",
+                None
+            ),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_with_context_promotes_codex_model() {
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(
+                Some("chatgpt"),
+                "chatgpt.com",
+                "/backend-api/f/conversation",
+                Some("gpt-5.3-codex")
+            ),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_with_context_promotes_codex_model_on_api_openai() {
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(
+                Some("chatgpt"),
+                "api.openai.com",
+                "/v1/responses",
+                Some("gpt-5.3-codex")
+            ),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_with_context_defaults_chatgpt_when_ua_missing() {
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(
+                None,
+                "chatgpt.com",
+                "/backend-api/f/conversation",
+                None
+            ),
+            Some("chatgpt")
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_with_context_defaults_claude_when_ua_missing() {
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(
+                None,
+                "claude.ai",
+                "/api/organizations",
+                None
+            ),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn test_is_agent_app_classification() {
+        assert!(AiProxyHandler::is_agent_app("chatgpt.com"));
+        assert!(AiProxyHandler::is_agent_app("claude.ai"));
+        assert!(!AiProxyHandler::is_agent_app("api.openai.com"));
+        assert!(!AiProxyHandler::is_agent_app("api.anthropic.com"));
+        assert!(!AiProxyHandler::is_agent_app("api.claude.ai"));
+        assert!(!AiProxyHandler::is_agent_app("anthropic.com"));
+    }
+
+    #[test]
+    fn test_should_log_request_skips_connect() {
+        assert!(!AiProxyHandler::should_log_request("/", "CONNECT"));
+    }
+
+    #[test]
+    fn test_empty_response_placeholder_http() {
+        let placeholder = empty_response_placeholder("POST", "/backend-api/codex/responses", 200, false);
+        assert!(placeholder.contains("no HTTP response body captured"));
+        assert!(placeholder.contains("POST /backend-api/codex/responses"));
+    }
+
+    #[test]
+    fn test_empty_response_placeholder_sse() {
+        let placeholder = empty_response_placeholder("POST", "/v1/messages", 200, true);
+        assert!(placeholder.contains("no SSE payload captured"));
+        assert!(placeholder.contains("POST /v1/messages"));
     }
 
     #[test]

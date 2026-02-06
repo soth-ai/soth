@@ -7,6 +7,8 @@ import {
   Check,
   FileJs,
   ArrowRight,
+  ArrowUp,
+  ArrowDown,
   WarningCircle,
   Terminal,
   ShieldSlash,
@@ -129,8 +131,10 @@ function WhyThisMatters({
 export function Inspector() {
   const logs = useObservabilityStore((state) => state.logs);
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
+  const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
   const selectLog = useObservabilityStore((state) => state.selectLog);
   const [copied, setCopied] = useState(false);
+  const [activeTab, setActiveTab] = useState<"request" | "response">("request");
 
   // Memoize selected log lookup
   const selectedLog = useMemo(
@@ -138,9 +142,31 @@ export function Inspector() {
     [logs, selectedLogId]
   );
 
+  const hasPairedContent = useMemo(
+    () => !!(selectedLog?.request_content || selectedLog?.response_content),
+    [selectedLog]
+  );
+
+  const getEmptyResponsePlaceholder = useCallback(() => {
+    if (!selectedLog) return "[no response body captured]";
+    const method = selectedLog.method || "request";
+    const status = selectedLog.status_code ?? "unknown";
+    if (method.toLowerCase().includes("/backend-api/codex/responses")) {
+      return `[no HTTP response body captured for ${method} (HTTP ${status}) - Codex output may be streamed via WebSocket]`;
+    }
+    return `[no HTTP response body captured for ${method} (HTTP ${status})]`;
+  }, [selectedLog]);
+
+  const displayContent = useMemo(() => {
+    if (!selectedLog) return "";
+    if (!hasPairedContent) return selectedLog.content;
+    if (activeTab === "request") return selectedLog.request_content || "";
+    return selectedLog.response_content || getEmptyResponsePlaceholder();
+  }, [selectedLog, hasPairedContent, activeTab, getEmptyResponsePlaceholder]);
+
   const editorPayload = useMemo(
-    () => decodeEditorContent(selectedLog?.content),
-    [selectedLog?.content]
+    () => decodeEditorContent(displayContent),
+    [displayContent]
   );
   const isJsonEditor = editorPayload.language === "json";
 
@@ -164,13 +190,27 @@ export function Inspector() {
   // Reset copied state when selection changes
   useEffect(() => {
     setCopied(false);
-  }, [selectedLog?.id]);
+    if (!selectedLog) return;
+    if (!hasPairedContent) {
+      setActiveTab("request");
+      return;
+    }
+    if (selectedLogPart === "request") {
+      setActiveTab("request");
+      return;
+    }
+    if (selectedLogPart === "response") {
+      setActiveTab("response");
+      return;
+    }
+    setActiveTab(selectedLog.response_content ? "response" : "request");
+  }, [selectedLog, selectedLogPart, hasPairedContent, selectedLog?.response_content]);
 
   const handleCopy = useCallback(async () => {
     if (!selectedLog) return;
 
     try {
-      await navigator.clipboard.writeText(selectedLog.content);
+      await navigator.clipboard.writeText(displayContent);
       setCopied(true);
       toast.success("JSON copied to clipboard", { duration: 2000 });
       setTimeout(() => setCopied(false), 2000);
@@ -178,7 +218,7 @@ export function Inspector() {
       console.error("Failed to copy:", err);
       toast.error("Failed to copy to clipboard", { duration: 3000 });
     }
-  }, [selectedLog]);
+  }, [selectedLog, displayContent]);
 
   const handleJumpToRequest = useCallback(() => {
     if (correlatedRequest) {
@@ -192,6 +232,12 @@ export function Inspector() {
     if (ms >= 200) return "text-amber-500";
     return "text-emerald-500";
   };
+
+  const effectiveDirection = hasPairedContent
+    ? activeTab === "response"
+      ? "out"
+      : "in"
+    : selectedLog?.direction;
 
   return (
     <div className="flex flex-col h-full bg-background border-l border-border">
@@ -211,6 +257,34 @@ export function Inspector() {
         </div>
         {selectedLog && (
           <div className="flex items-center gap-2">
+            {hasPairedContent && (
+              <div className="flex items-center rounded-md border border-border overflow-hidden">
+                <button
+                  onClick={() => setActiveTab("request")}
+                  className={cn(
+                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors",
+                    activeTab === "request"
+                      ? "bg-cyan-500/20 text-cyan-500"
+                      : "text-muted-foreground hover:bg-muted"
+                  )}
+                >
+                  <ArrowDown className="w-3 h-3" weight="bold" />
+                  Request
+                </button>
+                <button
+                  onClick={() => setActiveTab("response")}
+                  className={cn(
+                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors border-l border-border",
+                    activeTab === "response"
+                      ? "bg-emerald-500/20 text-emerald-500"
+                      : "text-muted-foreground hover:bg-muted"
+                  )}
+                >
+                  <ArrowUp className="w-3 h-3" weight="bold" />
+                  Response
+                </button>
+              </div>
+            )}
             {/* Copy button */}
             <Button
               variant="ghost"
@@ -300,10 +374,10 @@ export function Inspector() {
               <span
                 className={cn(
                   "inline-flex items-center px-1.5 py-0.5 rounded-md font-mono font-medium bg-secondary border border-border",
-                  selectedLog.direction === "in" ? "text-cyan-500" : "text-emerald-500"
+                  effectiveDirection === "in" ? "text-cyan-500" : "text-emerald-500"
                 )}
               >
-                {selectedLog.direction === "in" ? "Incoming" : "Outgoing"}
+                {effectiveDirection === "in" ? "Incoming" : "Outgoing"}
               </span>
             </div>
             <div className="flex items-center justify-between text-xs">
