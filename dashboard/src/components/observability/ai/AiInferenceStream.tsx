@@ -25,6 +25,10 @@ import {
 import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import {
+  OBSERVABILITY_SCROLL_SEEK_CONFIG,
+  OBSERVABILITY_VIRTUOSO_COMPONENTS,
+} from "@/components/observability/ScrollSeekPlaceholder";
 
 // Helper function to filter AI proxy logs
 function filterAiLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
@@ -35,7 +39,14 @@ function filterAiLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
     if (filters.sessionId && log.session_id !== filters.sessionId) return false;
     if (filters.searchText) {
       const search = filters.searchText.toLowerCase();
-      const matchesContent = log.content.toLowerCase().includes(search);
+      const searchableContent = (
+        log.request_preview ||
+        log.response_preview ||
+        log.content_preview ||
+        log.content ||
+        ""
+      ).slice(0, 2048);
+      const matchesContent = searchableContent.toLowerCase().includes(search);
       const matchesProvider = log.provider?.toLowerCase().includes(search);
       const matchesModel = log.model?.toLowerCase().includes(search);
       const matchesMethod = log.method?.toLowerCase().includes(search);
@@ -58,6 +69,18 @@ function filterAiLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
 interface AiLogRowProps {
   log: LogEntry;
   index: number;
+}
+
+const PREVIEW_DECODE_LIMIT = 4096;
+
+function decodePreviewText(preview?: string, raw?: string): string {
+  if (preview && preview.length > 0) {
+    return decodeSmartDisplayText(preview);
+  }
+  if (!raw) {
+    return "";
+  }
+  return decodeSmartDisplayText(raw.slice(0, PREVIEW_DECODE_LIMIT));
 }
 
 // Helper functions
@@ -92,7 +115,9 @@ const getStatusCodeColor = (code: number) => {
 };
 
 const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
-  const { selectedLogId, selectedLogPart, selectLog } = useObservabilityStore();
+  const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
+  const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
+  const selectLog = useObservabilityStore((state) => state.selectLog);
   const [isHovered, setIsHovered] = useState(false);
   const isSelected = selectedLogId === log.id;
   const rowRef = useRef<HTMLDivElement>(null);
@@ -110,20 +135,22 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
   // Scroll into view when selected
   useEffect(() => {
     if (isSelected && rowRef.current) {
-      rowRef.current.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      rowRef.current.scrollIntoView({ block: "nearest", behavior: "auto" });
     }
   }, [isSelected]);
 
   // Parse method for display
   const displayMethod = log.method?.split(" ").slice(0, 2).join(" ") || "request";
   const requestPreview = useMemo(
-    () => decodeSmartDisplayText(log.request_content || log.request_preview || ""),
-    [log.request_content, log.request_preview]
+    () => decodePreviewText(log.request_preview, log.request_content),
+    [log.request_preview, log.request_content]
   );
   const responsePreview = useMemo(
     () => {
       const raw = log.response_content || log.response_preview || "";
-      if (raw) return decodeSmartDisplayText(raw);
+      if (raw) {
+        return decodePreviewText(log.response_preview, log.response_content);
+      }
 
       const method = log.method || "request";
       const status = log.status_code ?? "unknown";
@@ -132,11 +159,11 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
       }
       return `[no HTTP response body captured for ${method} (HTTP ${status})]`;
     },
-    [log.response_content, log.response_preview, log.method, log.status_code]
+    [log.response_preview, log.response_content, log.method, log.status_code]
   );
   const contentPreview = useMemo(
-    () => decodeSmartDisplayText(log.content || log.content_preview || ""),
-    [log.content, log.content_preview]
+    () => decodePreviewText(log.content_preview, log.content),
+    [log.content_preview, log.content]
   );
 
   // For paired events, render two connected rows
@@ -206,7 +233,7 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
           </span>
 
           {/* Request Preview */}
-          <span className="text-xs text-cyan-600 dark:text-cyan-400 flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+          <span className="text-xs text-cyan-600 dark:text-cyan-400 flex-1 min-w-0 font-mono overflow-hidden whitespace-nowrap">
             {requestPreview}
           </span>
 
@@ -268,7 +295,7 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
           </span>
 
           {/* Response Preview */}
-          <span className="text-xs text-emerald-600 dark:text-emerald-400 flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+          <span className="text-xs text-emerald-600 dark:text-emerald-400 flex-1 min-w-0 font-mono overflow-hidden whitespace-nowrap">
             {responsePreview}
           </span>
 
@@ -407,7 +434,7 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
       )}
 
       {/* Content Preview */}
-      <span className="text-xs text-muted-foreground flex-1 min-w-0 font-mono overflow-x-auto whitespace-nowrap">
+      <span className="text-xs text-muted-foreground flex-1 min-w-0 font-mono overflow-hidden whitespace-nowrap">
         {contentPreview}
       </span>
 
@@ -512,7 +539,7 @@ export function AiInferenceStream() {
     if (isLive && filteredLogs.length > 0) {
       virtuosoRef.current?.scrollToIndex({
         index: filteredLogs.length - 1,
-        behavior: "smooth",
+        behavior: "auto",
       });
     }
   }, [filteredLogs.length, isLive]);
@@ -551,7 +578,7 @@ export function AiInferenceStream() {
               selectLog(nextLog.id);
               virtuosoRef.current?.scrollToIndex({
                 index: currentIndex + 1,
-                behavior: "smooth",
+                behavior: "auto",
                 align: "center",
               });
             }
@@ -563,7 +590,7 @@ export function AiInferenceStream() {
               selectLog(prevLog.id);
               virtuosoRef.current?.scrollToIndex({
                 index: currentIndex - 1,
-                behavior: "smooth",
+                behavior: "auto",
                 align: "center",
               });
             }
@@ -605,18 +632,18 @@ export function AiInferenceStream() {
     if (newState && filteredLogs.length > 0) {
       virtuosoRef.current?.scrollToIndex({
         index: filteredLogs.length - 1,
-        behavior: "smooth",
+        behavior: "auto",
       });
     }
   };
 
   return (
-    <div className="flex flex-col h-full bg-background">
+    <div className="flex flex-col h-full bg-background rounded-b-[12px] border-x border-b border-dashed border-border overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-card">
         <div className="flex items-center gap-3">
-          <h2 className="text-sm font-semibold text-foreground">AI Inference Stream</h2>
-          <span className="text-xs text-muted-foreground bg-muted px-2 py-0.5 rounded-md border border-border">
+          <h2 className="text-[24px] font-normal text-foreground">AI Inference Stream</h2>
+          <span className="soth-chip-text text-muted-foreground bg-muted px-2 py-0.5 rounded-md border border-dashed border-border">
             {filteredLogs.length}
             {hasActiveFilters && ` / ${allAiLogs.length}`}
           </span>
@@ -662,7 +689,7 @@ export function AiInferenceStream() {
               placeholder="Search... (Cmd+K)"
               value={searchValue}
               onChange={(e) => setSearchValue(e.target.value)}
-              className="pl-8 pr-8 h-8 text-xs bg-background border-border focus:border-accent/50 focus:ring-1 focus:ring-accent/30"
+              className="pl-8 pr-8 h-8 text-[16px] focus:border-accent/50 focus:ring-1 focus:ring-accent/30"
             />
             {searchValue && (
               <Button
@@ -733,16 +760,20 @@ export function AiInferenceStream() {
           <Virtuoso
             ref={virtuosoRef}
             data={filteredLogs}
-            itemContent={(index, log) => <AiLogRow key={log.id} log={log} index={index} />}
+            components={OBSERVABILITY_VIRTUOSO_COMPONENTS}
+            computeItemKey={(index, log) => log.id}
+            itemContent={(index, log) => <AiLogRow log={log} index={index} />}
+            scrollSeekConfiguration={OBSERVABILITY_SCROLL_SEEK_CONFIG}
             followOutput={(isAtBottom) => {
               if (!isAtBottom && isLive) {
                 setIsLive(false);
               }
-              return isLive && isAtBottom ? "smooth" : false;
+              return isLive && isAtBottom ? true : false;
             }}
             className="scrollbar-thin"
-            increaseViewportBy={200}
-            overscan={10}
+            defaultItemHeight={32}
+            increaseViewportBy={120}
+            overscan={6}
           />
         )}
       </div>

@@ -40,7 +40,7 @@ interface SettingsState extends DashboardSettings {
 
 const defaultSettings: DashboardSettings = {
   // Display
-  theme: 'system',
+  theme: 'dark',
   compactMode: false,
   showTimestamps: true,
   timestampFormat: 'relative',
@@ -48,7 +48,7 @@ const defaultSettings: DashboardSettings = {
   // Observability
   defaultClusteringEnabled: true,
   autoScrollEnabled: true,
-  maxLogRetention: 10000,
+  maxLogRetention: 3000,
   highlightPii: true,
   highlightErrors: true,
 

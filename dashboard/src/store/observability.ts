@@ -7,12 +7,12 @@ const getMaxLogRetention = () => {
     const stored = localStorage.getItem('soth-dashboard-settings');
     if (stored) {
       const parsed = JSON.parse(stored);
-      return parsed.state?.maxLogRetention ?? 10000;
+      return parsed.state?.maxLogRetention ?? 3000;
     }
   } catch {
     // Ignore
   }
-  return 10000;
+  return 3000;
 };
 
 // Event source type
@@ -122,6 +122,7 @@ interface ObservabilityState {
 
   // Logs
   logs: LogEntry[];
+  logIds: Set<string>;
   addLog: (log: LogEntry) => void;
   hydrateLogPayload: (
     id: string,
@@ -646,17 +647,28 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
 
   // Logs
   logs: [],
+  logIds: new Set<string>(),
   addLog: (log) =>
     set((state) => {
-      if (state.logs.some((existing) => existing.id === log.id)) {
+      if (state.logIds.has(log.id)) {
         return state;
       }
 
       // Limit logs based on settings
       const maxLogs = getMaxLogRetention();
-      const newLogs = [...state.logs, log];
-      while (newLogs.length > maxLogs) {
-        newLogs.shift();
+      let newLogs = [...state.logs, log];
+      const newLogIds = new Set(state.logIds);
+      newLogIds.add(log.id);
+
+      const overflow = Math.max(0, newLogs.length - maxLogs);
+      if (overflow > 0) {
+        for (let i = 0; i < overflow; i++) {
+          const removed = newLogs[i];
+          if (removed) {
+            newLogIds.delete(removed.id);
+          }
+        }
+        newLogs = newLogs.slice(overflow);
       }
 
       // Update session message count
@@ -666,7 +678,7 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
           : s
       );
 
-      return { logs: newLogs, sessions };
+      return { logs: newLogs, logIds: newLogIds, sessions };
     }),
   hydrateLogPayload: (id, part, content) =>
     set((state) => {
@@ -688,7 +700,8 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
 
       return updated ? { logs } : state;
     }),
-  clearLogs: () => set({ logs: [], selectedLogId: null, selectedLogPart: null }),
+  clearLogs: () =>
+    set({ logs: [], logIds: new Set<string>(), selectedLogId: null, selectedLogPart: null }),
 
   // Selection
   selectedLogId: null,
@@ -736,7 +749,8 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
       // Search text
       if (filters.searchText) {
         const search = filters.searchText.toLowerCase();
-        const matchesContent = log.content.toLowerCase().includes(search);
+        const searchableContent = (log.content_preview || log.content || "").slice(0, 2048);
+        const matchesContent = searchableContent.toLowerCase().includes(search);
         const matchesMethod = log.method?.toLowerCase().includes(search);
         const matchesToolName = log.tool_name?.toLowerCase().includes(search);
         const matchesServer = log.server_name.toLowerCase().includes(search);
@@ -950,14 +964,6 @@ export type DisplayItem =
   | { type: 'cluster'; cluster: EventCluster }
   | { type: 'log'; log: LogEntry };
 
-function extractRpcId(log: LogEntry): string | null {
-  const parsed = parseLogMessage(log);
-  if (parsed?.id === undefined || parsed?.id === null) {
-    return null;
-  }
-  return String(parsed.id);
-}
-
 export function hasPairedPayload(log: LogEntry): boolean {
   return !!(
     log.request_content ||
@@ -1056,41 +1062,82 @@ function findCodexWebsocketResponse(
   return null;
 }
 
-function isRequestLike(log: LogEntry): boolean {
-  if (isPrePairedAiEvent(log)) {
-    return false;
-  }
-  if (log.direction !== 'in') {
-    return false;
-  }
-  if (log.method) {
-    return true;
-  }
-  const parsed = parseLogMessage(log);
-  return !!parsed?.method;
-}
-
-function isResponseLike(log: LogEntry): boolean {
-  if (log.direction !== 'out') {
-    return false;
-  }
-  if (isPrePairedAiEvent(log)) {
-    return false;
-  }
-  if (log.source === 'ai_proxy' || log.source === 'agent_app') {
-    return false;
-  }
-  const parsed = parseLogMessage(log);
-  if (!parsed) {
-    return true;
-  }
-  return parsed.result !== undefined || parsed.error !== undefined || !parsed.method;
-}
-
 // Create clusters from logs
 export function createClusters(logs: LogEntry[]): DisplayItem[] {
   const items: DisplayItem[] = [];
   const usedResponseIds = new Set<string>();
+  const parsedCache = new Map<string, ParsedMessage | null>();
+  const pendingByRpc = new Map<string, number[]>();
+  const pendingFallback = new Map<string, number[]>();
+
+  const getParsed = (log: LogEntry): ParsedMessage | null => {
+    if (parsedCache.has(log.id)) {
+      return parsedCache.get(log.id) ?? null;
+    }
+    const parsed = parseLogMessage(log);
+    parsedCache.set(log.id, parsed);
+    return parsed;
+  };
+
+  const getRpcId = (log: LogEntry): string | null => {
+    const parsed = getParsed(log);
+    if (parsed?.id === undefined || parsed?.id === null) {
+      return null;
+    }
+    return String(parsed.id);
+  };
+
+  const baseKey = (log: LogEntry): string =>
+    `${log.source}|${log.session_id}|${log.server_name}`;
+
+  const rpcKey = (log: LogEntry, rpcId: string): string =>
+    `${baseKey(log)}|${rpcId}`;
+
+  const enqueuePending = (map: Map<string, number[]>, key: string, index: number): void => {
+    const queue = map.get(key);
+    if (queue) {
+      queue.push(index);
+      return;
+    }
+    map.set(key, [index]);
+  };
+
+  const dequeuePending = (map: Map<string, number[]>, key: string): number | undefined => {
+    const queue = map.get(key);
+    if (!queue || queue.length === 0) {
+      return undefined;
+    }
+
+    while (queue.length > 0) {
+      const index = queue.shift();
+      if (index === undefined) {
+        continue;
+      }
+      const item = items[index];
+      if (item?.type === 'cluster' && !item.cluster.response) {
+        if (queue.length === 0) {
+          map.delete(key);
+        }
+        return index;
+      }
+    }
+
+    map.delete(key);
+    return undefined;
+  };
+
+  const removePendingIndex = (map: Map<string, number[]>, key: string, index: number): void => {
+    const queue = map.get(key);
+    if (!queue || queue.length === 0) {
+      return;
+    }
+    const filtered = queue.filter((entry) => entry !== index);
+    if (filtered.length === 0) {
+      map.delete(key);
+      return;
+    }
+    map.set(key, filtered);
+  };
 
   const buildEmptyResponsePlaceholder = (log: LogEntry): string => {
     const method = log.method || 'request';
@@ -1143,55 +1190,12 @@ export function createClusters(logs: LogEntry[]): DisplayItem[] {
     }
   };
 
-  const findMatchingResponse = (requestIndex: number, request: LogEntry): LogEntry | null => {
-    const requestRpcId = extractRpcId(request);
-    const isMcp = request.source === 'mcp';
-
-    for (let j = requestIndex + 1; j < logs.length; j++) {
-      const candidate = logs[j];
-      if (usedResponseIds.has(candidate.id)) {
-        continue;
-      }
-      if (!isResponseLike(candidate)) {
-        continue;
-      }
-      if (candidate.source !== request.source) {
-        continue;
-      }
-      if (candidate.session_id !== request.session_id) {
-        continue;
-      }
-      if (candidate.server_name !== request.server_name) {
-        continue;
-      }
-
-      const candidateRpcId = extractRpcId(candidate);
-
-      // Strongest pairing: same JSON-RPC id.
-      if (requestRpcId && candidateRpcId) {
-        if (requestRpcId === candidateRpcId) {
-          return candidate;
-        }
-        continue;
-      }
-
-      // MCP fallback: pair to the next outgoing message in same session/server.
-      if (isMcp) {
-        return candidate;
-      }
-
-      // Generic fallback for sparse/legacy events with no ids.
-      if (!requestRpcId && !candidateRpcId) {
-        return candidate;
-      }
-    }
-
-    return null;
-  };
-
-  // Process logs to find request/response pairs
+  // Process logs in a single pass and pair responses in O(1) average time.
   for (let i = 0; i < logs.length; i++) {
     const log = logs[i];
+    if (usedResponseIds.has(log.id)) {
+      continue;
+    }
 
     // AI/Agent rows may already contain paired request/response payloads in a single event.
     // Render them as coupled rows to match MCP request/response clustering behavior.
@@ -1205,6 +1209,7 @@ export function createClusters(logs: LogEntry[]): DisplayItem[] {
       if (isCodexRequestWithMissingResponse(log)) {
         correlatedWsResponse = findCodexWebsocketResponse(logs, i, log, usedResponseIds);
         if (correlatedWsResponse) {
+          usedResponseIds.add(correlatedWsResponse.id);
           response = {
             ...response,
             timestamp: correlatedWsResponse.timestamp,
@@ -1238,16 +1243,24 @@ export function createClusters(logs: LogEntry[]): DisplayItem[] {
       continue;
     }
 
-    const parsed = parseLogMessage(log);
-    if (isRequestLike(log)) {
-      const matchingResponse = findMatchingResponse(i, log);
-      if (matchingResponse) {
-        usedResponseIds.add(matchingResponse.id);
-      }
+    const parsed = getParsed(log);
+    const rpcId = getRpcId(log);
+    const base = baseKey(log);
 
-      // Create cluster
-      const latency = matchingResponse ? calculateLatency(log, matchingResponse) : null;
-      const responseParsed = matchingResponse ? parseLogMessage(matchingResponse) : null;
+    const requestLike = (() => {
+      if (isPrePairedAiEvent(log)) {
+        return false;
+      }
+      if (log.direction !== 'in') {
+        return false;
+      }
+      if (log.method) {
+        return true;
+      }
+      return !!parsed?.method;
+    })();
+
+    if (requestLike) {
       const method = log.tool_name
         ? `${log.method || parsed?.method || 'request'}/${log.tool_name}`
         : log.method || parsed?.method || 'request';
@@ -1255,23 +1268,91 @@ export function createClusters(logs: LogEntry[]): DisplayItem[] {
       const cluster: EventCluster = {
         id: `cluster-${log.id}`,
         request: log,
-        response: matchingResponse,
+        response: null,
         method,
-        latency,
+        latency: null,
         hasError:
-          (matchingResponse?.status_code !== undefined && matchingResponse.status_code >= 400) ||
           (log.status_code !== undefined && log.status_code >= 400) ||
-          matchingResponse?.policy_allowed === false ||
-          responseParsed?.error !== undefined,
-        hasPii: log.pii_detected || (matchingResponse?.pii_detected ?? false),
-        policyDenied: log.policy_allowed === false || matchingResponse?.policy_allowed === false,
+          log.policy_allowed === false,
+        hasPii: log.pii_detected,
+        policyDenied: log.policy_allowed === false,
         timestamp: log.timestamp,
         source: log.source,
       };
 
+      const itemIndex = items.length;
       items.push({ type: 'cluster', cluster });
-    } else if (!usedResponseIds.has(log.id)) {
-      // Standalone log (not part of a cluster)
+
+      if (rpcId) {
+        enqueuePending(pendingByRpc, rpcKey(log, rpcId), itemIndex);
+      }
+      if (log.source === 'mcp' || !rpcId) {
+        enqueuePending(pendingFallback, base, itemIndex);
+      }
+
+      continue;
+    }
+
+    const responseLike = (() => {
+      if (log.direction !== 'out') {
+        return false;
+      }
+      if (isPrePairedAiEvent(log)) {
+        return false;
+      }
+      if (log.source === 'ai_proxy' || log.source === 'agent_app') {
+        return false;
+      }
+      if (!parsed) {
+        return true;
+      }
+      return parsed.result !== undefined || parsed.error !== undefined || !parsed.method;
+    })();
+
+    if (responseLike) {
+      let matchIndex: number | undefined;
+      if (rpcId) {
+        matchIndex = dequeuePending(pendingByRpc, rpcKey(log, rpcId));
+      }
+      if (matchIndex === undefined) {
+        matchIndex = dequeuePending(pendingFallback, base);
+      }
+
+      if (matchIndex === undefined) {
+        items.push({ type: 'log', log });
+        continue;
+      }
+
+      const matched = items[matchIndex];
+      if (!matched || matched.type !== 'cluster') {
+        items.push({ type: 'log', log });
+        continue;
+      }
+
+      const request = matched.cluster.request;
+      const requestRpcId = getRpcId(request);
+      if (requestRpcId) {
+        removePendingIndex(pendingByRpc, rpcKey(request, requestRpcId), matchIndex);
+      }
+      if (request.source === 'mcp' || !requestRpcId) {
+        removePendingIndex(pendingFallback, baseKey(request), matchIndex);
+      }
+
+      matched.cluster.response = log;
+      matched.cluster.latency = calculateLatency(request, log);
+      matched.cluster.hasError =
+        matched.cluster.hasError ||
+        ((log.status_code !== undefined && log.status_code >= 400) ||
+          log.policy_allowed === false ||
+          parsed?.error !== undefined);
+      matched.cluster.hasPii = matched.cluster.hasPii || log.pii_detected;
+      matched.cluster.policyDenied =
+        matched.cluster.policyDenied || log.policy_allowed === false;
+
+      continue;
+    }
+
+    if (!usedResponseIds.has(log.id)) {
       items.push({ type: 'log', log });
     }
   }

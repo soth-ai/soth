@@ -34,6 +34,10 @@ import { cn, formatTimestamp, formatLatency, truncate } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useSettingsStore } from "@/store/settings";
+import {
+  OBSERVABILITY_SCROLL_SEEK_CONFIG,
+  OBSERVABILITY_VIRTUOSO_COMPONENTS,
+} from "@/components/observability/ScrollSeekPlaceholder";
 
 // Helper function to filter logs
 function filterLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
@@ -42,7 +46,8 @@ function filterLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
     if (filters.sessionId && log.session_id !== filters.sessionId) return false;
     if (filters.searchText) {
       const search = filters.searchText.toLowerCase();
-      const matchesContent = log.content.toLowerCase().includes(search);
+      const searchableContent = (log.content_preview || log.content || "").slice(0, 2048);
+      const matchesContent = searchableContent.toLowerCase().includes(search);
       const matchesMethod = log.method?.toLowerCase().includes(search);
       const matchesToolName = log.tool_name?.toLowerCase().includes(search);
       const matchesServer = log.server_name.toLowerCase().includes(search);
@@ -86,13 +91,75 @@ function getLatencyColor(ms: number) {
   return "text-muted-foreground/70";
 }
 
+interface ClusterRowProps {
+  cluster: EventCluster;
+  selectedLogId: string | null;
+  selectedLogPart: "request" | "response" | null;
+  selectLog: (id: string | null, part?: "request" | "response" | null) => void;
+}
+
+function isClusterRequestSelected(
+  cluster: EventCluster,
+  selectedLogId: string | null,
+  selectedLogPart: "request" | "response" | null
+): boolean {
+  const isSameIdPair = !!cluster.response && cluster.request.id === cluster.response.id;
+  return isSameIdPair
+    ? selectedLogId === cluster.request.id && selectedLogPart !== "response"
+    : selectedLogId === cluster.request.id;
+}
+
+function isClusterResponseSelected(
+  cluster: EventCluster,
+  selectedLogId: string | null,
+  selectedLogPart: "request" | "response" | null
+): boolean {
+  const responseTargetId = cluster.response?.id || cluster.request.id;
+  const isSameIdPair = !!cluster.response && cluster.request.id === cluster.response.id;
+  return isSameIdPair
+    ? selectedLogId === cluster.request.id && selectedLogPart === "response"
+    : selectedLogId === responseTargetId;
+}
+
+function areClusterRowPropsEqual(prev: ClusterRowProps, next: ClusterRowProps): boolean {
+  if (prev.cluster !== next.cluster) {
+    return false;
+  }
+
+  const prevReqSelected = isClusterRequestSelected(
+    prev.cluster,
+    prev.selectedLogId,
+    prev.selectedLogPart
+  );
+  const nextReqSelected = isClusterRequestSelected(
+    next.cluster,
+    next.selectedLogId,
+    next.selectedLogPart
+  );
+  if (prevReqSelected !== nextReqSelected) {
+    return false;
+  }
+
+  const prevRespSelected = isClusterResponseSelected(
+    prev.cluster,
+    prev.selectedLogId,
+    prev.selectedLogPart
+  );
+  const nextRespSelected = isClusterResponseSelected(
+    next.cluster,
+    next.selectedLogId,
+    next.selectedLogPart
+  );
+  return prevRespSelected === nextRespSelected;
+}
+
 // Cluster Row Component
 const ClusterRow = memo(function ClusterRow({
   cluster,
-}: {
-  cluster: EventCluster;
-}) {
-  const { selectedLogId, selectedLogPart, selectLog } = useObservabilityStore();
+  selectedLogId,
+  selectedLogPart,
+  selectLog,
+}: ClusterRowProps) {
   const highlightPii = useSettingsStore((state) => state.highlightPii);
   const highlightErrors = useSettingsStore((state) => state.highlightErrors);
   const [isHovered, setIsHovered] = useState(false);
@@ -139,12 +206,8 @@ const ClusterRow = memo(function ClusterRow({
 
   const responseTargetId = cluster.response?.id || cluster.request.id;
   const isSameIdPair = !!cluster.response && cluster.request.id === cluster.response.id;
-  const requestIsSelected = isSameIdPair
-    ? selectedLogId === cluster.request.id && selectedLogPart !== "response"
-    : selectedLogId === cluster.request.id;
-  const responseIsSelected = isSameIdPair
-    ? selectedLogId === cluster.request.id && selectedLogPart === "response"
-    : selectedLogId === responseTargetId;
+  const requestIsSelected = isClusterRequestSelected(cluster, selectedLogId, selectedLogPart);
+  const responseIsSelected = isClusterResponseSelected(cluster, selectedLogId, selectedLogPart);
 
   const rowClass = "flex items-center gap-3 px-4 h-8 overflow-hidden";
   const sourceChipClass =
@@ -343,11 +406,13 @@ const ClusterRow = memo(function ClusterRow({
       </div>
     </div>
   );
-});
+}, areClusterRowPropsEqual);
 
 // Standalone Log Row (for non-clustered items)
 const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
-  const { selectedLogId, selectLog, logs } = useObservabilityStore();
+  const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
+  const selectLog = useObservabilityStore((state) => state.selectLog);
+  const logs = useObservabilityStore((state) => state.logs);
   const highlightPii = useSettingsStore((state) => state.highlightPii);
   const highlightErrors = useSettingsStore((state) => state.highlightErrors);
   const [isHovered, setIsHovered] = useState(false);
@@ -358,7 +423,10 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
   const isStderrMessage = log.message_type === "stderr";
   const isNonJsonRpc = isRawMessage || isStderrMessage;
 
-  const parsed = isNonJsonRpc ? null : parseLogMessage(log);
+  const parsed = useMemo(
+    () => (isNonJsonRpc ? null : parseLogMessage(log)),
+    [isNonJsonRpc, log]
+  );
   const isError = parsed?.error !== undefined || isStderrMessage || log.policy_allowed === false;
 
   // Apply highlight settings
@@ -366,23 +434,33 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
   const showPiiHighlight = highlightPii && log.pii_detected;
   const isRequest = parsed?.method !== undefined && !parsed.result && !parsed.error;
 
-  const correlatedRequest = (parsed?.result !== undefined || parsed?.error !== undefined) && !parsed?.method
-    ? findCorrelatedRequest(log, logs)
-    : null;
-  const actualLatency = correlatedRequest ? calculateLatency(correlatedRequest, log) : null;
+  const correlatedRequest = useMemo(
+    () =>
+      (parsed?.result !== undefined || parsed?.error !== undefined) && !parsed?.method
+        ? findCorrelatedRequest(log, logs)
+        : null,
+    [parsed, log, logs]
+  );
+  const correlatedRequestMethod = useMemo(
+    () => (correlatedRequest ? parseLogMessage(correlatedRequest)?.method : undefined),
+    [correlatedRequest]
+  );
+  const actualLatency = useMemo(
+    () => (correlatedRequest ? calculateLatency(correlatedRequest, log) : null),
+    [correlatedRequest, log]
+  );
   const displayLatency = actualLatency ?? log.latency_ms;
 
-  const method = isStderrMessage
-    ? "stderr"
-    : isRawMessage
-    ? "raw"
-    : log.tool_name
-    ? `${log.method}/${log.tool_name}`
-    : parsed?.method ||
-      (correlatedRequest ? parseLogMessage(correlatedRequest)?.method || "response" : "response");
+  const method = useMemo(() => {
+    if (isStderrMessage) return "stderr";
+    if (isRawMessage) return "raw";
+    if (log.tool_name) return `${log.method}/${log.tool_name}`;
+    return parsed?.method || correlatedRequestMethod || "response";
+  }, [isStderrMessage, isRawMessage, log.tool_name, log.method, parsed, correlatedRequestMethod]);
 
   const rpcId = parsed?.id;
   const source = sourceConfig[log.source] || sourceConfig.mcp;
+  const summary = useMemo(() => truncate(getLogSummary(log), 60), [log]);
 
   const handleCopyJson = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
@@ -401,7 +479,7 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
 
   useEffect(() => {
     if (isSelected && rowRef.current) {
-      rowRef.current.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      rowRef.current.scrollIntoView({ block: "nearest", behavior: "auto" });
     }
   }, [isSelected]);
 
@@ -488,7 +566,7 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
 
       {/* Summary */}
       <span className="text-xs text-muted-foreground flex-1 truncate font-mono">
-        {truncate(getLogSummary(log), 60)}
+        {summary}
       </span>
 
       {/* Policy indicator */}
@@ -555,6 +633,8 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
 export function MessageStream() {
   const logs = useObservabilityStore((state) => state.logs);
   const filters = useObservabilityStore((state) => state.filters);
+  const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
+  const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
   const isLive = useObservabilityStore((state) => state.isLive);
   const isConnected = useObservabilityStore((state) => state.isConnected);
   const setFilters = useObservabilityStore((state) => state.setFilters);
@@ -595,7 +675,7 @@ export function MessageStream() {
     if (isLive && displayItems.length > 0) {
       virtuosoRef.current?.scrollToIndex({
         index: displayItems.length - 1,
-        behavior: "smooth",
+        behavior: "auto",
       });
     }
   }, [displayItems.length, isLive]);
@@ -645,7 +725,7 @@ export function MessageStream() {
     if (newState && displayItems.length > 0) {
       virtuosoRef.current?.scrollToIndex({
         index: displayItems.length - 1,
-        behavior: "smooth",
+        behavior: "auto",
       });
     }
   };
@@ -654,20 +734,27 @@ export function MessageStream() {
   const renderItem = useCallback(
     (index: number, item: DisplayItem) => {
       if (item.type === "cluster") {
-        return <ClusterRow key={item.cluster.id} cluster={item.cluster} />;
+        return (
+          <ClusterRow
+            cluster={item.cluster}
+            selectedLogId={selectedLogId}
+            selectedLogPart={selectedLogPart}
+            selectLog={selectLog}
+          />
+        );
       }
-      return <LogRow key={item.log.id} log={item.log} />;
+      return <LogRow log={item.log} />;
     },
-    []
+    [selectedLogId, selectedLogPart, selectLog]
   );
 
   return (
-    <div className="flex flex-col h-full bg-background">
+    <div className="flex flex-col h-full bg-background rounded-b-[12px] border-x border-b border-dashed border-border overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-card">
         <div className="flex items-center gap-3">
-          <h2 className="text-sm font-semibold text-foreground">Message Stream</h2>
-          <span className="text-xs text-muted-foreground bg-muted px-2 py-0.5 rounded-md border border-border">
+          <h2 className="text-[24px] font-normal text-foreground">Message Stream</h2>
+          <span className="soth-chip-text text-muted-foreground bg-muted px-2 py-0.5 rounded-md border border-dashed border-border">
             {displayItems.length}
             {hasActiveFilters && ` / ${allLogs.length}`}
           </span>
@@ -728,7 +815,7 @@ export function MessageStream() {
               placeholder="Search... (⌘K)"
               value={searchValue}
               onChange={(e) => setSearchValue(e.target.value)}
-              className="pl-8 pr-8 h-8 text-xs bg-background border-border focus:border-accent/50 focus:ring-1 focus:ring-accent/30"
+              className="pl-8 pr-8 h-8 text-[16px] focus:border-accent/50 focus:ring-1 focus:ring-accent/30"
             />
             {searchValue && (
               <Button
@@ -805,16 +892,22 @@ export function MessageStream() {
           <Virtuoso
             ref={virtuosoRef}
             data={displayItems}
+            components={OBSERVABILITY_VIRTUOSO_COMPONENTS}
+            computeItemKey={(index, item) =>
+              item.type === "cluster" ? item.cluster.id : item.log.id
+            }
             itemContent={renderItem}
+            scrollSeekConfiguration={OBSERVABILITY_SCROLL_SEEK_CONFIG}
             followOutput={(isAtBottom) => {
               if (!isAtBottom && isLive) {
                 setIsLive(false);
               }
-              return isLive && isAtBottom ? "smooth" : false;
+              return isLive && isAtBottom ? true : false;
             }}
             className="scrollbar-thin"
-            increaseViewportBy={200}
-            overscan={10}
+            defaultItemHeight={32}
+            increaseViewportBy={120}
+            overscan={6}
           />
         )}
       </div>

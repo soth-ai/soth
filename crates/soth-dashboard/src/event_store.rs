@@ -151,7 +151,7 @@ impl EventStore {
         let capped_limit = limit.min(5_000);
         match &self.backend {
             EventStoreBackend::Sqlite(path) => {
-                let rows = read_sqlite_events(path, Some(since_seq)).unwrap_or_default();
+                let rows = read_sqlite_events(path, Some(since_seq), None).unwrap_or_default();
                 let total_events = self.inner.read().events.len();
 
                 let mut events: Vec<WrapEvent> = rows.into_iter().map(|(_, event)| event).collect();
@@ -266,7 +266,9 @@ impl EventStore {
 
         let db_path = db_path.to_path_buf();
         let query_path = db_path.clone();
-        let rows = tokio::task::spawn_blocking(move || read_sqlite_events(&query_path, None))
+        let rows = tokio::task::spawn_blocking(move || {
+            read_sqlite_events(&query_path, None, Some(MAX_EVENTS))
+        })
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))??;
 
@@ -427,7 +429,7 @@ impl EventStore {
         };
 
         let db_path = db_path.to_path_buf();
-        let rows = tokio::task::spawn_blocking(move || read_sqlite_events(&db_path, Some(cursor)))
+        let rows = tokio::task::spawn_blocking(move || read_sqlite_events(&db_path, Some(cursor), None))
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))??;
 
@@ -503,6 +505,7 @@ impl EventStore {
 fn read_sqlite_events(
     db_path: &Path,
     since_seq: Option<i64>,
+    initial_limit: Option<usize>,
 ) -> std::io::Result<Vec<(i64, WrapEvent)>> {
     let conn = Connection::open(db_path).map_err(to_io_err)?;
     ensure_wrap_events_schema(&conn)?;
@@ -522,6 +525,36 @@ fn read_sqlite_events(
 
         let rows = stmt
             .query_map([cursor], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_err)?;
+
+        for row in rows {
+            let (seq, json) = row.map_err(to_io_err)?;
+            if let Ok(mut event) = serde_json::from_str::<WrapEvent>(&json) {
+                event.seq = Some(seq);
+                events.push((seq, event));
+            }
+        }
+    } else if let Some(limit) = initial_limit {
+        let bounded_limit = limit.max(1) as i64;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT seq, event_json
+                FROM (
+                    SELECT seq, event_json
+                    FROM wrap_events
+                    ORDER BY seq DESC
+                    LIMIT ?1
+                )
+                ORDER BY seq ASC
+                "#,
+            )
+            .map_err(to_io_err)?;
+
+        let rows = stmt
+            .query_map([bounded_limit], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(to_io_err)?;

@@ -171,7 +171,7 @@ export function AiCommandBar({ sourceFilter }: AiCommandBarProps) {
   ];
 
   return (
-    <div className="flex items-center gap-3 px-4 py-2.5 bg-card/50 border-b border-border">
+    <div className="flex items-center gap-3 px-4 py-2.5 bg-card/50 border border-dashed border-border rounded-t-[12px]">
       {/* Quick Filters */}
       <div className="flex items-center gap-1.5">
         <Funnel className="w-3.5 h-3.5 text-muted-foreground mr-1" weight="duotone" />
