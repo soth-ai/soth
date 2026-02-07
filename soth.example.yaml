@@ -105,13 +105,14 @@ forward_proxy:
     idle_timeout: "90s"
     connect_timeout: "10s"
 
-  # Host filtering (whitelist mode by default)
+  # Host filtering
   hosts:
-    allow:
+    mode: "selective"   # selective | discovery
+    intercept:
       - "api.openai.com"
       - "api.anthropic.com"
       - "generativelanguage.googleapis.com"
-    # block: []            # Use blacklist mode instead (allow empty, block specified)
+    block: []
 
 # Production hardening configuration
 # Rate limiting, circuit breakers, and connection management

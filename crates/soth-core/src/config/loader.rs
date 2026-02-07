@@ -46,8 +46,8 @@ fn apply_env_overrides(config: &mut SothConfig) {
     if let Ok(addr) = std::env::var("SOTH_FORWARD_PROXY_ADDRESS") {
         config.forward_proxy.address = addr;
     }
-    if let Ok(port) = std::env::var("SOTH_FORWARD_PROXY_PORT")
-        .or_else(|_| std::env::var("SOTH_PROXY_PORT"))
+    if let Ok(port) =
+        std::env::var("SOTH_FORWARD_PROXY_PORT").or_else(|_| std::env::var("SOTH_PROXY_PORT"))
     {
         if let Ok(p) = port.parse() {
             config.forward_proxy.port = p;

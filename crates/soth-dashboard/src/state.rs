@@ -465,8 +465,10 @@ impl DashboardState {
             proxy.active_connections -= 1;
         }
 
-        // Update tokens by provider
-        if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
+        // Update tokens by provider (accept partial usage if one side is missing).
+        let input = input_tokens.unwrap_or(0);
+        let output = output_tokens.unwrap_or(0);
+        if input > 0 || output > 0 {
             let tokens = proxy
                 .tokens_by_provider
                 .entry(provider.to_string())

@@ -344,7 +344,8 @@ struct CargoTestEvent {
     #[serde(rename = "type")]
     event_type: String,
     name: Option<String>,
-    event: Option<String>,
+    #[serde(rename = "event")]
+    _event: Option<String>,
     #[serde(rename = "exec_time")]
     exec_time: Option<f64>,
     result: Option<String>,

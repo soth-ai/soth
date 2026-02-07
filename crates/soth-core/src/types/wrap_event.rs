@@ -124,6 +124,14 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_count: Option<u64>,
 
+    /// Input/prompt tokens for AI responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+
+    /// Output/completion tokens for AI responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+
     /// Estimated cost in USD
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
@@ -169,6 +177,8 @@ impl WrapEvent {
             pii_detected: false,
             pii_types: Vec::new(),
             token_count: None,
+            input_tokens: None,
+            output_tokens: None,
             cost_usd: None,
             latency_ms: None,
         }
@@ -259,6 +269,14 @@ impl WrapEvent {
     /// Set token count
     pub fn with_tokens(mut self, count: u64) -> Self {
         self.token_count = Some(count);
+        self
+    }
+
+    /// Set input/output usage and derived total token count
+    pub fn with_usage_tokens(mut self, input_tokens: u64, output_tokens: u64) -> Self {
+        self.input_tokens = Some(input_tokens);
+        self.output_tokens = Some(output_tokens);
+        self.token_count = Some(input_tokens + output_tokens);
         self
     }
 
@@ -421,5 +439,16 @@ mod tests {
         let parsed: WrapEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.session_id, "sess-123");
         assert_eq!(parsed.direction, WrapDirection::Out);
+    }
+
+    #[test]
+    fn test_usage_tokens_sets_total() {
+        let agent = AgentInfo::new("Claude Desktop", DetectionSource::McpInitialize);
+        let event = WrapEvent::new("sess-usage", "api.anthropic.com", WrapDirection::Out, agent)
+            .with_usage_tokens(120, 45);
+
+        assert_eq!(event.input_tokens, Some(120));
+        assert_eq!(event.output_tokens, Some(45));
+        assert_eq!(event.token_count, Some(165));
     }
 }

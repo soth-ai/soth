@@ -197,6 +197,8 @@ export interface WrapEvent {
   pii_detected: boolean;
   pii_types: string[];
   token_count?: number;
+  input_tokens?: number;
+  output_tokens?: number;
   cost_usd?: number;
   latency_ms?: number;
 }

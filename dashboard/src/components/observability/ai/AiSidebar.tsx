@@ -21,7 +21,11 @@ import {
   CurrencyDollar,
 } from "@phosphor-icons/react";
 import { format } from "date-fns";
-import { useObservabilityStore, type LogEntry } from "@/store/observability";
+import {
+  useObservabilityStore,
+  getLogTokenCount,
+  type LogEntry,
+} from "@/store/observability";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -62,7 +66,7 @@ function computeAiMetrics(logs: LogEntry[]) {
   const costByProvider: Record<string, number> = {};
 
   aiLogs.forEach((log) => {
-    const tokens = log.token_count || 0;
+    const tokens = getLogTokenCount(log);
     const cost = log.cost_usd || 0;
     totalTokens += tokens;
     totalCost += cost;

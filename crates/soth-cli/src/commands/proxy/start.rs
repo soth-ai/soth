@@ -1,20 +1,15 @@
 //! Start forward proxy command
 
+use crate::commands::enforcement;
 use crate::style;
 use owo_colors::OwoColorize;
-use soth_budget::BudgetTracker;
-use soth_core::config::{load_config, SothConfig};
+use soth_core::config::{load_config, HostFilterMode, SothConfig};
 use soth_core::EventLogger;
 use soth_dashboard::server::DashboardServer;
 use soth_dashboard::DashboardState;
-use soth_identity::TrustStore;
-use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine, PolicyLoader};
 use soth_proxy::metrics;
-use soth_proxy::transport::hudsucker_proxy::{
-    self, ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode,
-};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use soth_proxy::transport::hudsucker_proxy;
+use std::path::PathBuf;
 
 /// Expand tilde in path
 fn expand_path(path: &PathBuf) -> PathBuf {
@@ -26,102 +21,6 @@ fn expand_path(path: &PathBuf) -> PathBuf {
         }
     }
     path.clone()
-}
-
-fn resolve_trust_store_file(path: &Path) -> PathBuf {
-    if path.extension().is_some() {
-        path.to_path_buf()
-    } else {
-        path.join("trust_store")
-    }
-}
-
-fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer> {
-    let identity_mode = match config.identity.mode.as_str() {
-        "disabled" => ProxyIdentityMode::Disabled,
-        "required" => ProxyIdentityMode::Required,
-        _ => ProxyIdentityMode::Optional,
-    };
-
-    let mut trusted_dids: HashSet<String> = HashSet::new();
-    for did in &config.identity.allowed_dids {
-        trusted_dids.insert(did.clone());
-    }
-
-    if let Some(path) = &config.identity.trust_store_path {
-        let trust_store_file = resolve_trust_store_file(path);
-        if trust_store_file.exists() {
-            let store = TrustStore::new(&trust_store_file)?;
-            for did in store.list() {
-                trusted_dids.insert(did.to_string());
-            }
-        }
-    }
-
-    let mut enforcer = ProxyEnforcer::new()
-        .with_identity_mode(identity_mode, trusted_dids)
-        .with_identity_headers("X-Agent-DID", "X-Agent-Signature");
-
-    if config.policy.enabled {
-        let policy_mode = match config.policy.mode.as_str() {
-            "audit" => ProxyPolicyMode::Audit,
-            "enforce" => ProxyPolicyMode::Enforce,
-            _ => ProxyPolicyMode::Enforce,
-        };
-        let cache_config: PolicyCacheConfig = config.policy.cache.clone().into();
-        let engine = PolicyEngine::with_cache_config(cache_config);
-
-        if let Some(data_file) = &config.policy.data_file {
-            let data = match data_file.extension().and_then(|e| e.to_str()) {
-                Some("yaml") | Some("yml") => PolicyLoader::load_policy_data_yaml(data_file)?,
-                _ => PolicyLoader::load_policy_data(data_file)?,
-            };
-            engine.set_policy_data(data)?;
-        }
-
-        if let Some(policy_dir) = &config.policy.policy_dir {
-            let mut modules = std::collections::HashMap::new();
-
-            if policy_dir.exists() {
-                if let Ok(rego_modules) = PolicyLoader::load_rego_dir(policy_dir) {
-                    modules.extend(rego_modules);
-                }
-                if let Ok(yaml_modules) = PolicyLoader::load_yaml_dir(policy_dir) {
-                    modules.extend(yaml_modules);
-                }
-            }
-
-            if !modules.is_empty() {
-                engine.load_modules(modules)?;
-            }
-        }
-
-        enforcer = enforcer.with_policy(policy_mode, engine);
-    }
-
-    if config.budget.enabled {
-        let tracker = BudgetTracker::new();
-        for limit in &config.budget.limits {
-            match limit.scope.as_str() {
-                "global" => tracker.set_global_budget(limit.daily, limit.weekly, limit.monthly),
-                "per_agent" => {
-                    if let Some(agent_id) = &limit.agent_id {
-                        tracker.set_agent_budget(
-                            agent_id,
-                            limit.daily,
-                            limit.weekly,
-                            limit.monthly,
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        enforcer = enforcer.with_budget(tracker, true, "gpt-4o");
-    }
-
-    Ok(enforcer)
 }
 
 /// Run the start command
@@ -185,23 +84,56 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
 
     style::kv("Mode", "hudsucker");
     style::kv("Listen address", &proxy_config.socket_addr().to_string());
+    style::kv("Host filter mode", &proxy_config.hosts.mode.to_string());
     style::kv("CA certificate", &ca_cert_path.display().to_string());
     println!();
 
     // Show AI intercept domains
-    style::subtitle("AI Traffic Interception");
+    style::subtitle("Traffic Interception");
     let intercept_count = proxy_config.hosts.intercept.len();
-    if intercept_count > 0 {
-        // Show first few domains
-        for host in proxy_config.hosts.intercept.iter().take(5) {
-            println!("  {} {}", style::CIRCLE_FILLED.cyan(), host);
-        }
-        if intercept_count > 5 {
+    match proxy_config.hosts.mode {
+        HostFilterMode::Discovery => {
             println!(
-                "  {} ... and {} more domains",
-                style::CIRCLE_FILLED.dimmed(),
-                intercept_count - 5
+                "  {} Discovery mode: intercept all non-local hosts (except blocked hosts).",
+                style::CIRCLE_FILLED.cyan()
             );
+            if intercept_count > 0 {
+                println!(
+                    "  {} {} configured seed domains retained",
+                    style::CIRCLE_FILLED.dimmed(),
+                    intercept_count
+                );
+                for host in proxy_config.hosts.intercept.iter().take(5) {
+                    println!("  {} {}", style::CIRCLE_FILLED.dimmed(), host);
+                }
+                if intercept_count > 5 {
+                    println!(
+                        "  {} ... and {} more seed domains",
+                        style::CIRCLE_FILLED.dimmed(),
+                        intercept_count - 5
+                    );
+                }
+            }
+        }
+        HostFilterMode::Selective => {
+            if intercept_count > 0 {
+                // Show first few domains
+                for host in proxy_config.hosts.intercept.iter().take(5) {
+                    println!("  {} {}", style::CIRCLE_FILLED.cyan(), host);
+                }
+                if intercept_count > 5 {
+                    println!(
+                        "  {} ... and {} more domains",
+                        style::CIRCLE_FILLED.dimmed(),
+                        intercept_count - 5
+                    );
+                }
+            } else {
+                println!(
+                    "  {} No intercept domains configured; traffic will mostly tunnel.",
+                    style::CIRCLE_FILLED.dimmed()
+                );
+            }
         }
     }
     println!();
@@ -243,12 +175,24 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
         "Proxy ready on {}",
         proxy_config.socket_addr().to_string().bold()
     ));
-    println!(
-        "{} AI traffic → {} | Other traffic → {}",
-        style::INFO,
-        "MITM intercept".cyan(),
-        "blind tunnel".dimmed()
-    );
+    match proxy_config.hosts.mode {
+        HostFilterMode::Discovery => {
+            println!(
+                "{} Discovery mode → {} | Local traffic → {}",
+                style::INFO,
+                "MITM intercept".cyan(),
+                "blind tunnel".dimmed()
+            );
+        }
+        HostFilterMode::Selective => {
+            println!(
+                "{} AI traffic → {} | Other traffic → {}",
+                style::INFO,
+                "MITM intercept".cyan(),
+                "blind tunnel".dimmed()
+            );
+        }
+    }
     println!(
         "{} Press {} to stop",
         style::CIRCLE_FILLED.dimmed(),
@@ -266,7 +210,7 @@ async fn run_hudsucker_proxy(
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
 ) -> anyhow::Result<()> {
-    let enforcer = build_proxy_enforcer(config)?;
+    let enforcer = enforcement::build_proxy_enforcer(config)?;
 
     // Create dashboard state for metrics
     let dashboard_state = DashboardState::new();

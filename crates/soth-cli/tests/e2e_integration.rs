@@ -873,7 +873,7 @@ async fn test_debug_with_arc_multiple() {
 
     // Assert second call passed
     match result2 {
-        Ok(Some(JsonRpcMessage::Request(req))) => {
+        Ok(Some(JsonRpcMessage::Request(_req))) => {
             println!("SUCCESS: Second call passed through");
         }
         Ok(Some(JsonRpcMessage::Response(resp))) => {

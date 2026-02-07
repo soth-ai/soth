@@ -209,6 +209,10 @@ impl Layer for BudgetLayer {
                     // Count output tokens and record spend
                     let content = serde_json::to_value(resp).unwrap_or_default();
                     let output_tokens = core::estimate_mcp_tokens(&content);
+                    ctx.metadata.insert(
+                        "budget_output_tokens".to_string(),
+                        serde_json::json!(output_tokens),
+                    );
 
                     // Get input tokens and model from context
                     let input_tokens = ctx

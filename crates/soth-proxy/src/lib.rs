@@ -27,7 +27,9 @@ pub mod transport;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerResult};
 pub use error::{ProxyError, Result};
-pub use pipeline::{BudgetLayer, IdentityLayer, ObserveLayer, Pipeline, PipelineBuilder, PolicyLayer};
+pub use pipeline::{
+    BudgetLayer, IdentityLayer, ObserveLayer, Pipeline, PipelineBuilder, PolicyLayer,
+};
 pub use protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 pub use rate_limit::{RateLimitConfig, RateLimitResult, RateLimiter};
 pub use router::Router;

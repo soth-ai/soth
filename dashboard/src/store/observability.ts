@@ -67,6 +67,8 @@ export interface LogEntry {
   pii_detected: boolean;
   pii_types: string[];
   token_count?: number;
+  input_tokens?: number;
+  output_tokens?: number;
   cost_usd?: number;
   latency_ms?: number;
   // Computed fields
@@ -332,6 +334,23 @@ export function getLogPath(log: LogEntry): string | undefined {
   }
 
   return undefined;
+}
+
+export function getLogTokenCount(log: Pick<LogEntry, "token_count" | "input_tokens" | "output_tokens">): number {
+  if (typeof log.token_count === "number" && Number.isFinite(log.token_count) && log.token_count > 0) {
+    return log.token_count;
+  }
+
+  const inputTokens =
+    typeof log.input_tokens === "number" && Number.isFinite(log.input_tokens)
+      ? Math.max(0, log.input_tokens)
+      : 0;
+  const outputTokens =
+    typeof log.output_tokens === "number" && Number.isFinite(log.output_tokens)
+      ? Math.max(0, log.output_tokens)
+      : 0;
+
+  return inputTokens + outputTokens;
 }
 
 function normalizeInline(text: string): string {
@@ -987,7 +1006,7 @@ export function computeLogMetrics(logs: LogEntry[]) {
   const tokensByMethod: Record<string, number> = {};
 
   logs.forEach((log) => {
-    const tokens = log.token_count || 0;
+    const tokens = getLogTokenCount(log);
     totalTokens += tokens;
     if (log.direction === 'in') {
       tokensToServer += tokens;

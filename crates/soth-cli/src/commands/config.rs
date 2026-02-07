@@ -5,7 +5,7 @@
 
 use crate::ConfigCommands;
 use anyhow::{Context, Result};
-use soth_core::config::SothConfig;
+use soth_core::config::{HostFilterMode, SothConfig};
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::info;
@@ -119,6 +119,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             "  Intercept:   {} hosts",
             config.forward_proxy.hosts.intercept.len()
         );
+        println!("  Host mode:   {}", config.forward_proxy.hosts.mode);
         println!(
             "  Block:       {} hosts",
             config.forward_proxy.hosts.block.len()
@@ -181,10 +182,20 @@ fn validate_forward_proxy(
         errors.push("forward_proxy.port cannot be 0".to_string());
     }
     if proxy.port < 1024 {
-        warnings.push(format!("Port {} may require elevated privileges", proxy.port));
+        warnings.push(format!(
+            "Port {} may require elevated privileges",
+            proxy.port
+        ));
     }
-    if proxy.hosts.intercept.is_empty() {
-        warnings.push("No intercept host patterns configured; traffic will mostly tunnel".to_string());
+    if proxy.hosts.mode == HostFilterMode::Selective && proxy.hosts.intercept.is_empty() {
+        warnings
+            .push("No intercept host patterns configured; traffic will mostly tunnel".to_string());
+    }
+    if proxy.hosts.mode == HostFilterMode::Discovery {
+        warnings.push(
+            "Host mode is discovery; all non-local hosts will be MITM intercepted (higher CPU/memory usage)"
+                .to_string(),
+        );
     }
 }
 

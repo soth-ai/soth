@@ -11,7 +11,12 @@ import {
   CurrencyDollar,
   Lightning,
 } from "@phosphor-icons/react";
-import { useObservabilityStore, computeLogMetrics, type EventSource } from "@/store/observability";
+import {
+  useObservabilityStore,
+  computeLogMetrics,
+  getLogTokenCount,
+  type EventSource,
+} from "@/store/observability";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -58,7 +63,7 @@ export function AiCommandBar({ sourceFilter }: AiCommandBarProps) {
       if ((log.latency_ms ?? 0) >= 2000) slowRequests++;
       if (log.status_code && log.status_code >= 400) errors++;
       if (log.cost_usd) totalCost += log.cost_usd;
-      if (log.token_count) totalTokens += log.token_count;
+      totalTokens += getLogTokenCount(log);
       if (log.provider) {
         providers.set(log.provider, (providers.get(log.provider) || 0) + 1);
       }

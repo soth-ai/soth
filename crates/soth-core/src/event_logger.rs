@@ -563,5 +563,4 @@ mod tests {
         assert_eq!(String::from_utf8(request_payload).unwrap(), large_request);
         assert_eq!(String::from_utf8(response_payload).unwrap(), large_response);
     }
-
 }

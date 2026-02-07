@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod budget;
 pub mod config;
+pub mod enforcement;
 pub mod identity;
 pub mod init;
 pub mod install;

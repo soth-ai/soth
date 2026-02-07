@@ -53,10 +53,6 @@ use soth_core::EventLogger;
 #[derive(Debug, Deserialize)]
 struct AiRequestBody {
     model: Option<String>,
-    #[serde(default)]
-    messages: Vec<serde_json::Value>,
-    #[serde(default)]
-    prompt: Option<String>,
 }
 
 /// Pending request info for correlating with responses
@@ -834,6 +830,7 @@ fn render_decoded_body_for_logging(decoded: &[u8], encoding: Option<&str>) -> St
     String::from_utf8_lossy(decoded).to_string()
 }
 
+#[cfg(test)]
 fn decode_body_for_logging(bytes: &[u8], encoding: Option<&str>) -> String {
     let decoded = try_decompress(bytes, encoding);
     render_decoded_body_for_logging(&decoded, encoding)

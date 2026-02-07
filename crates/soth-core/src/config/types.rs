@@ -770,8 +770,14 @@ impl Default for PoolConfig {
 /// Host filtering configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostFilterConfig {
+    /// Host filtering mode:
+    /// - selective: intercept configured hosts and tunnel the rest (default)
+    /// - discovery: intercept all non-local hosts to discover new MCP/AI domains
+    #[serde(default)]
+    pub mode: HostFilterMode,
+
     /// Hosts to intercept with full MITM (TLS termination + inspection)
-    /// Default: AI provider domains
+    /// Default: AI + MCP service domains
     #[serde(default = "default_intercept_hosts")]
     pub intercept: Vec<String>,
 
@@ -780,8 +786,28 @@ pub struct HostFilterConfig {
     pub block: Vec<String>,
 }
 
+/// Host filtering mode for forward proxy interception
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostFilterMode {
+    /// Intercept configured hosts only; blind tunnel everything else.
+    #[default]
+    Selective,
+    /// Intercept all non-local hosts (useful for discovery).
+    Discovery,
+}
+
+impl std::fmt::Display for HostFilterMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Selective => write!(f, "selective"),
+            Self::Discovery => write!(f, "discovery"),
+        }
+    }
+}
+
 fn default_intercept_hosts() -> Vec<String> {
-    vec![
+    let mut hosts = vec![
         // ===== OpenAI / ChatGPT =====
         "api.openai.com".to_string(),
         "*.openai.azure.com".to_string(), // Azure OpenAI
@@ -946,12 +972,213 @@ fn default_intercept_hosts() -> Vec<String> {
         "*.baichuan-ai.com".to_string(), // Baichuan
         "*.01.ai".to_string(),           // Yi (01.AI)
         "*.deepseek.com".to_string(),    // DeepSeek
+    ];
+
+    // Extend with high-signal MCP service domains used by common connectors.
+    hosts.extend(default_mcp_service_hosts());
+    dedupe_hosts(hosts)
+}
+
+fn default_mcp_service_hosts() -> Vec<String> {
+    vec![
+        // ===== Source Control / Code Hosting =====
+        "api.github.com".to_string(),
+        "github.com".to_string(),
+        "uploads.github.com".to_string(),
+        "raw.githubusercontent.com".to_string(),
+        "objects.githubusercontent.com".to_string(),
+        "codeload.github.com".to_string(),
+        "*.githubusercontent.com".to_string(),
+        "api.gitlab.com".to_string(),
+        "gitlab.com".to_string(),
+        "*.gitlab.com".to_string(),
+        "api.bitbucket.org".to_string(),
+        "bitbucket.org".to_string(),
+        "api.atlassian.com".to_string(),
+        "*.atlassian.net".to_string(),
+        "api.azure.dev".to_string(),
+        "dev.azure.com".to_string(),
+        "*.visualstudio.com".to_string(),
+        // ===== Project / Knowledge Tools =====
+        "api.linear.app".to_string(),
+        "linear.app".to_string(),
+        "*.linear.app".to_string(),
+        "api.notion.com".to_string(),
+        "www.notion.so".to_string(),
+        "*.notion.so".to_string(),
+        "api.asana.com".to_string(),
+        "app.asana.com".to_string(),
+        "*.asana.com".to_string(),
+        "api.clickup.com".to_string(),
+        "app.clickup.com".to_string(),
+        "*.clickup.com".to_string(),
+        "api.monday.com".to_string(),
+        "*.monday.com".to_string(),
+        "api.airtable.com".to_string(),
+        "airtable.com".to_string(),
+        "*.airtable.com".to_string(),
+        "api.trello.com".to_string(),
+        "trello.com".to_string(),
+        "*.trello.com".to_string(),
+        "api.todoist.com".to_string(),
+        "todoist.com".to_string(),
+        "*.todoist.com".to_string(),
+        "api.coda.io".to_string(),
+        "coda.io".to_string(),
+        "*.coda.io".to_string(),
+        // ===== Chat / Collaboration =====
+        "slack.com".to_string(),
+        "api.slack.com".to_string(),
+        "*.slack.com".to_string(),
+        "hooks.slack.com".to_string(),
+        "discord.com".to_string(),
+        "*.discord.com".to_string(),
+        "api.intercom.io".to_string(),
+        "app.intercom.com".to_string(),
+        "*.intercom.io".to_string(),
+        "api.twilio.com".to_string(),
+        "*.twilio.com".to_string(),
+        // ===== Google Workspace =====
+        "www.googleapis.com".to_string(),
+        "drive.googleapis.com".to_string(),
+        "docs.googleapis.com".to_string(),
+        "sheets.googleapis.com".to_string(),
+        "calendar.googleapis.com".to_string(),
+        "gmail.googleapis.com".to_string(),
+        "people.googleapis.com".to_string(),
+        "admin.googleapis.com".to_string(),
+        "script.googleapis.com".to_string(),
+        "storage.googleapis.com".to_string(),
+        // ===== Microsoft 365 =====
+        "graph.microsoft.com".to_string(),
+        "login.microsoftonline.com".to_string(),
+        "outlook.office.com".to_string(),
+        "*.sharepoint.com".to_string(),
+        "*.office.com".to_string(),
+        "*.office365.com".to_string(),
+        // ===== File Storage / Docs =====
+        "api.dropboxapi.com".to_string(),
+        "content.dropboxapi.com".to_string(),
+        "www.dropbox.com".to_string(),
+        "api.box.com".to_string(),
+        "upload.box.com".to_string(),
+        "*.box.com".to_string(),
+        "api.figma.com".to_string(),
+        "*.figma.com".to_string(),
+        "api.canva.com".to_string(),
+        "*.canva.com".to_string(),
+        // ===== Payments / CRM / Support =====
+        "api.stripe.com".to_string(),
+        "dashboard.stripe.com".to_string(),
+        "*.stripe.com".to_string(),
+        "api.hubapi.com".to_string(),
+        "app.hubspot.com".to_string(),
+        "*.hubspot.com".to_string(),
+        "login.salesforce.com".to_string(),
+        "*.salesforce.com".to_string(),
+        "api.zendesk.com".to_string(),
+        "*.zendesk.com".to_string(),
+        "api.shopify.com".to_string(),
+        "partners.shopify.com".to_string(),
+        "*.myshopify.com".to_string(),
+        "*.shopify.com".to_string(),
+        // ===== Cloud / Deploy / Infra =====
+        "api.cloudflare.com".to_string(),
+        "dash.cloudflare.com".to_string(),
+        "*.workers.dev".to_string(),
+        "api.vercel.com".to_string(),
+        "vercel.com".to_string(),
+        "*.vercel.app".to_string(),
+        "api.netlify.com".to_string(),
+        "app.netlify.com".to_string(),
+        "*.netlify.app".to_string(),
+        "api.render.com".to_string(),
+        "dashboard.render.com".to_string(),
+        "api.fly.io".to_string(),
+        "fly.io".to_string(),
+        "api.railway.app".to_string(),
+        "railway.app".to_string(),
+        "api.heroku.com".to_string(),
+        "*.herokuapp.com".to_string(),
+        // ===== Data / Observability =====
+        "api.supabase.com".to_string(),
+        "*.supabase.co".to_string(),
+        "*.supabase.com".to_string(),
+        "api.planetscale.com".to_string(),
+        "*.planetscale.com".to_string(),
+        "api.neon.tech".to_string(),
+        "console.neon.tech".to_string(),
+        "*.neon.tech".to_string(),
+        "cloud.mongodb.com".to_string(),
+        "*.mongodb.net".to_string(),
+        "api.segment.io".to_string(),
+        "app.segment.com".to_string(),
+        "*.segment.io".to_string(),
+        "api.datadoghq.com".to_string(),
+        "app.datadoghq.com".to_string(),
+        "*.datadoghq.com".to_string(),
+        "api.newrelic.com".to_string(),
+        "one.newrelic.com".to_string(),
+        "*.newrelic.com".to_string(),
+        "api.sentry.io".to_string(),
+        "sentry.io".to_string(),
+        "*.sentry.io".to_string(),
+        // ===== MCP Middleware / Automation =====
+        "api.pipedream.com".to_string(),
+        "*.pipedream.net".to_string(),
+        "api.composio.dev".to_string(),
+        "*.composio.dev".to_string(),
+        "api.browserbase.com".to_string(),
+        "*.browserbase.com".to_string(),
+        "api.firecrawl.dev".to_string(),
+        "*.firecrawl.dev".to_string(),
+        "api.scrapfly.io".to_string(),
+        "*.scrapfly.io".to_string(),
+        "api.zyte.com".to_string(),
+        "*.zyte.com".to_string(),
+        "api.resend.com".to_string(),
+        "resend.com".to_string(),
+        "api.postmarkapp.com".to_string(),
+        "*.postmarkapp.com".to_string(),
+        "api.mailgun.net".to_string(),
+        "*.mailgun.net".to_string(),
+        "api.sendgrid.com".to_string(),
+        "*.sendgrid.com".to_string(),
+        "api.n8n.io".to_string(),
+        "n8n.io".to_string(),
+        "*.n8n.cloud".to_string(),
+        "api.zapier.com".to_string(),
+        "zapier.com".to_string(),
+        "*.zapier.com".to_string(),
+        "api.make.com".to_string(),
+        "www.make.com".to_string(),
+        "*.integromat.com".to_string(),
+        "api.retool.com".to_string(),
+        "retool.com".to_string(),
+        "*.retool.com".to_string(),
+        // ===== Identity / Auth Backends Common in MCP Connectors =====
+        "api.okta.com".to_string(),
+        "*.okta.com".to_string(),
+        "api.auth0.com".to_string(),
+        "*.auth0.com".to_string(),
     ]
+}
+
+fn dedupe_hosts(hosts: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(hosts.len());
+    let mut deduped = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        if seen.insert(host.clone()) {
+            deduped.push(host);
+        }
+    }
+    deduped
 }
 
 impl Default for HostFilterConfig {
     fn default() -> Self {
         Self {
+            mode: HostFilterMode::default(),
             intercept: default_intercept_hosts(),
             block: Vec::new(),
         }
@@ -1041,11 +1268,16 @@ impl HostFilterConfig {
             return HostAction::Block;
         }
 
-        // Intercept configured AI domains; tunnel everything else.
-        if self.should_intercept(host) {
-            HostAction::Intercept
-        } else {
-            HostAction::Tunnel
+        match self.mode {
+            HostFilterMode::Discovery => HostAction::Intercept,
+            HostFilterMode::Selective => {
+                // Intercept configured host patterns; tunnel everything else.
+                if self.should_intercept(host) {
+                    HostAction::Intercept
+                } else {
+                    HostAction::Tunnel
+                }
+            }
         }
     }
 }
@@ -1452,6 +1684,7 @@ upstream:
     fn test_host_filter_intercept_and_tunnel() {
         use super::HostAction;
         let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
             intercept: vec!["api.openai.com".to_string()],
             block: vec![],
         };
@@ -1459,13 +1692,17 @@ upstream:
             filter.action_for_host("api.openai.com"),
             HostAction::Intercept
         );
-        assert_eq!(filter.action_for_host("api.example.com"), HostAction::Tunnel);
+        assert_eq!(
+            filter.action_for_host("api.example.com"),
+            HostAction::Tunnel
+        );
     }
 
     #[test]
     fn test_host_filter_blacklist() {
         use super::HostAction;
         let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
             intercept: vec![],
             block: vec!["blocked.com".to_string()],
         };
@@ -1477,6 +1714,7 @@ upstream:
     fn test_host_filter_default_selective() {
         use super::HostAction;
         let filter = HostFilterConfig::default();
+        assert_eq!(filter.mode, HostFilterMode::Selective);
 
         // AI domains should be intercepted
         assert_eq!(
@@ -1498,12 +1736,12 @@ upstream:
             HostAction::Tunnel
         );
         assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
-
     }
 
     #[test]
     fn test_host_filter_intercept() {
         let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
             intercept: vec![
                 "api.openai.com".to_string(),
                 "*.openai.azure.com".to_string(),
@@ -1519,6 +1757,7 @@ upstream:
     #[test]
     fn test_host_filter_wildcard_patterns() {
         let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
             intercept: vec![
                 "api.openai.com".to_string(),          // Exact
                 "*.openai.azure.com".to_string(),      // Prefix wildcard
@@ -1610,7 +1849,7 @@ upstream:
         // Non-AI domains should NOT be intercepted (tunneled instead)
         let non_ai_domains = vec![
             "google.com",
-            "github.com",
+            "example.org",
             "stackoverflow.com",
             "example.com",
         ];
@@ -1625,9 +1864,105 @@ upstream:
     }
 
     #[test]
+    fn test_default_mcp_domain_seed_coverage() {
+        let mcp_hosts = default_mcp_service_hosts();
+        assert!(
+            mcp_hosts.len() >= 100,
+            "Expected >=100 MCP service hosts, got {}",
+            mcp_hosts.len()
+        );
+        assert!(
+            mcp_hosts.contains(&"api.github.com".to_string()),
+            "api.github.com should be in MCP seed list"
+        );
+        assert!(
+            mcp_hosts.contains(&"api.slack.com".to_string()),
+            "api.slack.com should be in MCP seed list"
+        );
+        assert!(
+            mcp_hosts.contains(&"api.notion.com".to_string()),
+            "api.notion.com should be in MCP seed list"
+        );
+    }
+
+    #[test]
+    fn test_default_host_filter_tunnels_unknown_mcp_hosts() {
+        let filter = HostFilterConfig::default();
+
+        // Unknown hosts are tunneled by default. For HTTPS CONNECT, this means we
+        // cannot inspect payloads on those hosts unless they are explicitly listed.
+        assert_eq!(
+            filter.action_for_host("custom-mcp.example.com"),
+            HostAction::Tunnel
+        );
+        assert_eq!(
+            filter.action_for_host("mcp.partner.internal"),
+            HostAction::Tunnel
+        );
+    }
+
+    #[test]
+    fn test_default_host_filter_intercepts_known_claude_mcp_hosts() {
+        let filter = HostFilterConfig::default();
+
+        // Claude/Anthropic app transport domains are included in default intercept list.
+        assert_eq!(
+            filter.action_for_host("a-api.anthropic.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            filter.action_for_host("statsig.anthropic.com"),
+            HostAction::Intercept
+        );
+    }
+
+    #[test]
+    fn test_host_filter_catch_all_pattern_intercepts_non_local_hosts() {
+        let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
+            intercept: vec!["*".to_string()],
+            block: vec![],
+        };
+
+        assert_eq!(
+            filter.action_for_host("custom-mcp.example.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            filter.action_for_host("unlisted.vendor.tld"),
+            HostAction::Intercept
+        );
+
+        // Local addresses still bypass interception.
+        assert_eq!(filter.action_for_host("localhost"), HostAction::Tunnel);
+        assert_eq!(filter.action_for_host("127.0.0.1"), HostAction::Tunnel);
+    }
+
+    #[test]
+    fn test_host_filter_discovery_mode_intercepts_unknown_non_local_hosts() {
+        let filter = HostFilterConfig {
+            mode: HostFilterMode::Discovery,
+            intercept: vec![],
+            block: vec!["malware.com".to_string()],
+        };
+
+        assert_eq!(
+            filter.action_for_host("custom-mcp.example.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            filter.action_for_host("unlisted.vendor.tld"),
+            HostAction::Intercept
+        );
+        assert_eq!(filter.action_for_host("malware.com"), HostAction::Block);
+        assert_eq!(filter.action_for_host("localhost"), HostAction::Tunnel);
+    }
+
+    #[test]
     fn test_host_filter_block() {
         use super::HostAction;
         let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
             intercept: vec!["api.openai.com".to_string()],
             block: vec!["malware.com".to_string(), "*.bad.com".to_string()],
         };
@@ -1725,6 +2060,39 @@ forward_proxy:
         // Other hosts tunneled by default
         assert_eq!(
             config.forward_proxy.hosts.action_for_host("other.com"),
+            HostAction::Tunnel
+        );
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_yaml_discovery_mode() {
+        use super::HostAction;
+        let yaml = r#"
+forward_proxy:
+  enabled: true
+  hosts:
+    mode: "discovery"
+    block:
+      - "blocked.example"
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.forward_proxy.hosts.mode, HostFilterMode::Discovery);
+        assert_eq!(
+            config
+                .forward_proxy
+                .hosts
+                .action_for_host("unknown.example"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            config
+                .forward_proxy
+                .hosts
+                .action_for_host("blocked.example"),
+            HostAction::Block
+        );
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("localhost"),
             HostAction::Tunnel
         );
     }
@@ -1884,6 +2252,7 @@ production:
 
         // Even if localhost is in the block list, it should still tunnel
         let filter_with_block = HostFilterConfig {
+            mode: HostFilterMode::Selective,
             intercept: vec![],
             block: vec!["localhost".to_string(), "127.0.0.1".to_string()],
         };

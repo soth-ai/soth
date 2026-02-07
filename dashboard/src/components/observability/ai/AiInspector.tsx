@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import {
   useObservabilityStore,
   decodeEditorContent,
+  getLogTokenCount,
   hasPairedPayload,
 } from "@/store/observability";
 import { fetchEventPayload } from "@/lib/event-payload";
@@ -370,7 +371,7 @@ export function AiInspector() {
 
             {/* Performance metrics */}
             {(selectedLog.latency_ms !== undefined ||
-              selectedLog.token_count !== undefined ||
+              getLogTokenCount(selectedLog) > 0 ||
               selectedLog.cost_usd !== undefined) && (
               <div className="pt-2 mt-2 border-t border-border space-y-2">
                 <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">
@@ -394,14 +395,14 @@ export function AiInspector() {
                   </div>
                 )}
 
-                {selectedLog.token_count !== undefined && selectedLog.token_count > 0 && (
+                {getLogTokenCount(selectedLog) > 0 && (
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-muted-foreground font-medium flex items-center gap-1.5">
                       <Coins className="w-3 h-3" weight="fill" />
                       Tokens
                     </span>
                     <span className="font-mono text-amber-500 tabular-nums">
-                      {selectedLog.token_count.toLocaleString()}
+                      {getLogTokenCount(selectedLog).toLocaleString()}
                     </span>
                   </div>
                 )}

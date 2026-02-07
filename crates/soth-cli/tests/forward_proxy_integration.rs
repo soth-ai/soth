@@ -1,6 +1,6 @@
 //! Integration tests for forward proxy functionality
 
-use soth_core::config::{ForwardProxyConfig, HostFilterConfig};
+use soth_core::config::{ForwardProxyConfig, HostFilterConfig, HostFilterMode};
 use soth_proxy::providers::{HttpRequest, ProviderRegistry};
 use soth_tls::CertificateAuthority;
 use std::time::Duration;
@@ -75,6 +75,7 @@ fn test_host_filter_intercept_list() {
     use soth_core::HostAction;
 
     let filter = HostFilterConfig {
+        mode: HostFilterMode::Selective,
         intercept: vec![
             "api.openai.com".to_string(),
             "api.anthropic.com".to_string(),
@@ -101,6 +102,7 @@ fn test_host_filter_selective() {
     use soth_core::HostAction;
 
     let filter = HostFilterConfig {
+        mode: HostFilterMode::Selective,
         intercept: vec![
             "api.openai.com".to_string(),
             "api.anthropic.com".to_string(),

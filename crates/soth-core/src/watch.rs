@@ -2,9 +2,10 @@
 //!
 //! Provides instant filesystem notifications instead of polling.
 
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -44,8 +45,9 @@ pub enum WatchEvent {
 /// reducing latency from ~100ms to <10ms.
 pub struct FileWatcher {
     rx: mpsc::UnboundedReceiver<WatchEvent>,
-    // Keep the watcher alive
-    _watcher: RecommendedWatcher,
+    // Keep whichever watcher backend is active alive.
+    _recommended_watcher: Option<RecommendedWatcher>,
+    _poll_watcher: Option<PollWatcher>,
 }
 
 impl FileWatcher {
@@ -74,12 +76,31 @@ impl FileWatcher {
 
         let (std_tx, std_rx) = std_mpsc::channel::<Result<Event, notify::Error>>();
 
-        let mut watcher = RecommendedWatcher::new(std_tx, Config::default())
-            .map_err(WatchError::CreateWatcher)?;
+        let use_poll_backend = cfg!(test)
+            || std::env::var("SOTH_WATCH_USE_POLL")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false);
 
-        watcher
-            .watch(&watch_path, RecursiveMode::NonRecursive)
-            .map_err(WatchError::WatchPath)?;
+        let (recommended_watcher, poll_watcher) = if use_poll_backend {
+            let config = Config::default()
+                .with_poll_interval(Duration::from_millis(100))
+                .with_compare_contents(true);
+            let mut watcher =
+                PollWatcher::new(std_tx.clone(), config).map_err(WatchError::CreateWatcher)?;
+            watcher
+                .watch(&watch_path, RecursiveMode::NonRecursive)
+                .map_err(WatchError::WatchPath)?;
+            debug!("Using PollWatcher backend");
+            (None, Some(watcher))
+        } else {
+            let mut watcher = RecommendedWatcher::new(std_tx, Config::default())
+                .map_err(WatchError::CreateWatcher)?;
+            watcher
+                .watch(&watch_path, RecursiveMode::NonRecursive)
+                .map_err(WatchError::WatchPath)?;
+            debug!("Using RecommendedWatcher backend");
+            (Some(watcher), None)
+        };
 
         debug!(
             "Started watching directory: {:?} for file: {:?}",
@@ -145,7 +166,8 @@ impl FileWatcher {
 
         Ok(Self {
             rx,
-            _watcher: watcher,
+            _recommended_watcher: recommended_watcher,
+            _poll_watcher: poll_watcher,
         })
     }
 

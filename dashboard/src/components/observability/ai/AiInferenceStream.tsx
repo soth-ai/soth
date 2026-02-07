@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import {
   useObservabilityStore,
   decodeSmartDisplayText,
+  getLogTokenCount,
   hasPairedPayload,
   getLogPath,
   matchesServerFilter,
@@ -469,14 +470,14 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
       )}
 
       {/* Token count */}
-      {log.token_count !== undefined && log.token_count > 0 && (
+      {getLogTokenCount(log) > 0 && (
         <span
           className="text-[10px] font-mono flex-shrink-0 px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 tabular-nums"
-          title={`${log.token_count.toLocaleString()} tokens`}
+          title={`${getLogTokenCount(log).toLocaleString()} tokens`}
         >
-          {log.token_count >= 1000
-            ? `${(log.token_count / 1000).toFixed(1)}k`
-            : log.token_count}
+          {getLogTokenCount(log) >= 1000
+            ? `${(getLogTokenCount(log) / 1000).toFixed(1)}k`
+            : getLogTokenCount(log)}
         </span>
       )}
 

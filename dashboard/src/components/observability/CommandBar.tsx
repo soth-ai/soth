@@ -13,7 +13,12 @@ import {
   CloudArrowUp,
   CurrencyDollar,
 } from "@phosphor-icons/react";
-import { useObservabilityStore, computeLogMetrics, type EventSource } from "@/store/observability";
+import {
+  useObservabilityStore,
+  computeLogMetrics,
+  getLogTokenCount,
+  type EventSource,
+} from "@/store/observability";
 import { Button } from "@/components/ui/button";
 import { PresetDropdown } from "./PresetDropdown";
 import { cn } from "@/lib/utils";
@@ -75,7 +80,7 @@ export function CommandBar() {
       if (log.pii_detected) piiDetected++;
       if ((log.latency_ms ?? 0) >= 1000) slowRequests++;
       if (log.cost_usd) totalCost += log.cost_usd;
-      if (log.token_count) totalTokens += log.token_count;
+      totalTokens += getLogTokenCount(log);
       try {
         const parsed = JSON.parse(log.content);
         if (parsed.error) errors++;

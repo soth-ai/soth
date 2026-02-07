@@ -22,6 +22,7 @@ import { toast } from "sonner";
 import {
   useObservabilityStore,
   decodeEditorContent,
+  getLogTokenCount,
   hasPairedPayload,
   parseLogMessage,
   findCorrelatedRequest,
@@ -89,12 +90,13 @@ function WhyThisMatters({
     });
   }
 
-  if (log.token_count && log.token_count > 10000) {
+  const tokenCount = getLogTokenCount(log);
+  if (tokenCount > 10000) {
     insights.push({
       icon: CurrencyDollar,
       color: "text-warning",
       title: "High Resource Usage",
-      description: `${log.token_count.toLocaleString()} tokens consumed in a single transaction.`,
+      description: `${tokenCount.toLocaleString()} tokens consumed in a single transaction.`,
     });
   }
 
@@ -431,8 +433,8 @@ export function Inspector() {
                   <span className="text-muted-foreground/70">|</span>
                   <span className="text-muted-foreground uppercase tracking-[0.08em]">Tokens</span>
                   <span className="font-mono tabular-nums text-warning">
-                    {selectedLog.token_count !== undefined && selectedLog.token_count > 0
-                      ? selectedLog.token_count.toLocaleString()
+                    {getLogTokenCount(selectedLog) > 0
+                      ? getLogTokenCount(selectedLog).toLocaleString()
                       : "0"}
                   </span>
                 </div>

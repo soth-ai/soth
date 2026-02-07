@@ -14,6 +14,7 @@ forward_proxy:
   address: "127.0.0.1"
   port: 8080
   hosts:
+    mode: "selective"  # selective | discovery
     intercept:
       - "api.openai.com"
       - "api.anthropic.com"

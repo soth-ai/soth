@@ -7,12 +7,16 @@
 
 pub mod agent_detect;
 
+use crate::commands::enforcement;
 use anyhow::{Context, Result};
 use clap::Args;
+use soth_core::config::{load_config, SothConfig};
 use soth_core::types::{AgentInfo, DetectionSource, WrapDirection, WrapEvent};
 use soth_core::{
     generate_session_name, EventLogger, MessageDirection, SessionRecorder, SessionStorage,
 };
+use soth_proxy::pipeline::middleware::RequestContext as PipelineRequestContext;
+use soth_proxy::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,6 +53,10 @@ pub struct WrapArgs {
     #[arg(long)]
     pub session_name: Option<String>,
 
+    /// Continue forwarding original traffic when enforcement runtime errors occur
+    #[arg(long)]
+    pub fail_open: bool,
+
     /// Command and arguments to wrap (after --)
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
@@ -60,15 +68,31 @@ struct WrapSession {
     server_name: String,
     agent: RwLock<AgentInfo>,
     event_logger: Option<EventLogger>,
-    request_contexts: RwLock<std::collections::HashMap<String, RequestContext>>,
+    request_contexts: RwLock<std::collections::HashMap<String, WrapRequestContext>>,
+    enforcement: Option<Arc<WrapEnforcement>>,
+    fail_open: bool,
     /// Session recorder for full message capture (optional)
     recorder: Option<Arc<SessionRecorder>>,
 }
 
-struct RequestContext {
+struct WrapRequestContext {
     started_at: Instant,
     method: Option<String>,
     tool_name: Option<String>,
+    pipeline_ctx: Option<PipelineRequestContext>,
+}
+
+struct WrapEnforcement {
+    runtime: enforcement::WrapEnforcementRuntime,
+}
+
+struct InboundProcessResult {
+    forward_to_server: Option<String>,
+    immediate_response_to_client: Option<String>,
+}
+
+struct OutboundProcessResult {
+    forward_to_client: Option<String>,
 }
 
 impl WrapSession {
@@ -76,6 +100,8 @@ impl WrapSession {
         server_name: String,
         agent: AgentInfo,
         event_logger: Option<EventLogger>,
+        enforcement: Option<Arc<WrapEnforcement>>,
+        fail_open: bool,
         record: bool,
         session_name: Option<String>,
     ) -> Result<Self> {
@@ -100,6 +126,8 @@ impl WrapSession {
             server_name,
             agent: RwLock::new(agent),
             event_logger,
+            enforcement,
+            fail_open,
             request_contexts: RwLock::new(std::collections::HashMap::new()),
             recorder,
         })
@@ -145,19 +173,21 @@ impl WrapSession {
         id: &str,
         method: Option<&str>,
         tool_name: Option<&str>,
+        pipeline_ctx: Option<PipelineRequestContext>,
     ) {
         let mut contexts = self.request_contexts.write().await;
         contexts.insert(
             id.to_string(),
-            RequestContext {
+            WrapRequestContext {
                 started_at: Instant::now(),
                 method: method.map(ToOwned::to_owned),
                 tool_name: tool_name.map(ToOwned::to_owned),
+                pipeline_ctx,
             },
         );
     }
 
-    async fn take_request_context(&self, id: &str) -> Option<RequestContext> {
+    async fn take_request_context(&self, id: &str) -> Option<WrapRequestContext> {
         let mut contexts = self.request_contexts.write().await;
         contexts.remove(id)
     }
@@ -185,28 +215,174 @@ impl WrapSession {
     }
 }
 
+fn load_wrap_config(path: Option<&PathBuf>) -> Result<SothConfig> {
+    if let Some(path) = path {
+        return load_config(path).context("Failed to load wrap config");
+    }
+
+    let default_paths = ["soth.yaml", "soth.yml", ".soth.yaml", "~/.soth/soth.yaml"];
+    for path in default_paths {
+        let expanded = if path.starts_with("~/") {
+            dirs::home_dir()
+                .map(|h| h.join(&path[2..]))
+                .unwrap_or_else(|| PathBuf::from(path))
+        } else {
+            PathBuf::from(path)
+        };
+        if expanded.exists() {
+            return load_config(&expanded).context("Failed to load wrap config");
+        }
+    }
+
+    Ok(SothConfig::default())
+}
+
+fn extract_request_id_for_error(msg: &serde_json::Value) -> Option<RequestId> {
+    let id = msg.get("id")?;
+    if id.is_null() {
+        return Some(RequestId::Null);
+    }
+    if let Some(num) = id.as_i64() {
+        return Some(RequestId::Number(num));
+    }
+    if let Some(s) = id.as_str() {
+        return Some(RequestId::String(s.to_string()));
+    }
+    None
+}
+
+fn extract_context_id(id: &serde_json::Value) -> Option<String> {
+    if let Some(num) = id.as_i64() {
+        return Some(num.to_string());
+    }
+    if let Some(s) = id.as_str() {
+        return Some(s.to_string());
+    }
+    None
+}
+
+fn extract_metadata_value(root: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+    let key_lower = key.to_ascii_lowercase();
+    let key_underscore = key_lower.replace('-', "_");
+    let key_dash = key_underscore.replace('_', "-");
+
+    let keys = [
+        key,
+        key_lower.as_str(),
+        key_underscore.as_str(),
+        key_dash.as_str(),
+    ];
+    let candidates = [
+        root.get("meta"),
+        root.get("_meta"),
+        root.get("metadata"),
+        root.get("params").and_then(|p| p.get("meta")),
+        root.get("params").and_then(|p| p.get("_meta")),
+        root.get("params").and_then(|p| p.get("metadata")),
+        root.get("params").and_then(|p| p.get("headers")),
+        Some(root),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        for k in keys {
+            if let Some(v) = candidate.get(k) {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
+
+fn enrich_identity_metadata(
+    parsed: &serde_json::Value,
+    did_key: &str,
+    signature_key: &str,
+    ctx: &mut PipelineRequestContext,
+) {
+    if let Some(did) = extract_metadata_value(parsed, did_key) {
+        ctx.metadata.insert(did_key.to_string(), did);
+    }
+    if let Some(sig) = extract_metadata_value(parsed, signature_key) {
+        ctx.metadata.insert(signature_key.to_string(), sig);
+    }
+}
+
+fn apply_enforcement_metadata(event: &mut WrapEvent, ctx: &PipelineRequestContext) {
+    if let Some(action) = ctx.metadata.get("policy_action").and_then(|v| v.as_str()) {
+        let reason = ctx
+            .metadata
+            .get("policy_reason")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+        let allowed = !action.eq_ignore_ascii_case("deny");
+        event.policy_allowed = Some(allowed);
+        event.policy_reason = reason;
+    }
+
+    let input_tokens = ctx
+        .metadata
+        .get("budget_input_tokens")
+        .and_then(|v| v.as_u64());
+    let output_tokens = ctx
+        .metadata
+        .get("budget_output_tokens")
+        .and_then(|v| v.as_u64());
+    if let (Some(input_tokens), Some(output_tokens)) = (input_tokens, output_tokens) {
+        event.input_tokens = Some(input_tokens);
+        event.output_tokens = Some(output_tokens);
+        event.token_count = Some(input_tokens + output_tokens);
+    } else if let Some(input_tokens) = input_tokens {
+        event.token_count = Some(input_tokens);
+    }
+
+    if let Some(cost) = ctx.metadata.get("budget_cost").and_then(|v| v.as_f64()) {
+        event.cost_usd = Some(cost);
+    }
+}
+
 /// Run the wrap command
 pub async fn run(args: WrapArgs) -> Result<()> {
-    if args.command.is_empty() {
+    let WrapArgs {
+        name,
+        agent,
+        config,
+        no_log,
+        record,
+        session_name,
+        command,
+        fail_open,
+    } = args;
+
+    if command.is_empty() {
         anyhow::bail!("No command specified. Usage: soth wrap -- <command> [args...]");
     }
 
-    let (cmd, cmd_args) = (&args.command[0], &args.command[1..]);
+    let (cmd, cmd_args) = (&command[0], &command[1..]);
 
     // Derive server name
-    let server_name = args
-        .name
-        .unwrap_or_else(|| derive_server_name(cmd, cmd_args));
+    let server_name = name.unwrap_or_else(|| derive_server_name(cmd, cmd_args));
 
     // Get initial agent info
-    let initial_agent = if let Some(ref agent_name) = args.agent {
+    let initial_agent = if let Some(ref agent_name) = agent {
         AgentInfo::new(agent_name.clone(), DetectionSource::CommandLine)
     } else {
         agent_detect::detect_agent()
     };
 
+    let config = load_wrap_config(config.as_ref())?;
+    let enforcement = enforcement::build_wrap_enforcement_runtime(&config)?
+        .map(|runtime| Arc::new(WrapEnforcement { runtime }));
+    if enforcement.is_some() {
+        info!(
+            "Wrap enforcement enabled (identity_mode={}, policy_enabled={}, budget_enabled={})",
+            config.identity.mode, config.policy.enabled, config.budget.enabled
+        );
+    } else {
+        info!("Wrap enforcement disabled (identity/policy/budget all off)");
+    }
+
     // Set up log path
-    let event_logger = if args.no_log {
+    let event_logger = if no_log {
         None
     } else {
         Some(EventLogger::with_default_path().context("Failed to initialize event logger")?)
@@ -216,15 +392,17 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         server_name.clone(),
         initial_agent,
         event_logger,
-        args.record,
-        args.session_name,
+        enforcement,
+        fail_open,
+        record,
+        session_name,
     )?);
 
     info!(
         "Wrapping server '{}' (session: {}{})",
         server_name,
         session.session_id,
-        if args.record { ", recording" } else { "" }
+        if record { ", recording" } else { "" }
     );
 
     // Spawn the upstream MCP server
@@ -239,8 +417,9 @@ pub async fn run(args: WrapArgs) -> Result<()> {
 
     // Task: Read from our stdin, process, send to server
     let session_clone = session.clone();
+    let from_server_tx_clone = from_server_tx.clone();
     let stdin_task = tokio::spawn(async move {
-        read_from_stdin(session_clone, to_server_tx).await;
+        read_from_stdin(session_clone, to_server_tx, from_server_tx_clone).await;
     });
 
     // Task: Write to server stdin
@@ -355,7 +534,11 @@ fn spawn_server(cmd: &str, args: &[String]) -> Result<Child> {
         .with_context(|| format!("Failed to spawn server: {} {:?}", cmd, args))
 }
 
-async fn read_from_stdin(session: Arc<WrapSession>, tx: mpsc::Sender<String>) {
+async fn read_from_stdin(
+    session: Arc<WrapSession>,
+    to_server_tx: mpsc::Sender<String>,
+    to_client_tx: mpsc::Sender<String>,
+) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut line = String::new();
@@ -373,12 +556,18 @@ async fn read_from_stdin(session: Arc<WrapSession>, tx: mpsc::Sender<String>) {
                     continue;
                 }
 
-                // Process the message
-                process_inbound_message(&session, trimmed).await;
+                let result = process_inbound_message(&session, trimmed).await;
 
-                // Forward to server
-                if tx.send(line.clone()).await.is_err() {
-                    break;
+                if let Some(immediate) = result.immediate_response_to_client {
+                    if to_client_tx.send(format!("{}\n", immediate)).await.is_err() {
+                        break;
+                    }
+                }
+
+                if let Some(forward) = result.forward_to_server {
+                    if to_server_tx.send(format!("{}\n", forward)).await.is_err() {
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -421,12 +610,12 @@ async fn read_from_child(
                     continue;
                 }
 
-                // Process the message
-                process_outbound_message(&session, trimmed).await;
+                let result = process_outbound_message(&session, trimmed).await;
 
-                // Forward to our stdout via channel
-                if tx.send(format!("{}\n", trimmed)).await.is_err() {
-                    break;
+                if let Some(forward) = result.forward_to_client {
+                    if tx.send(format!("{}\n", forward)).await.is_err() {
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -450,8 +639,10 @@ async fn write_to_stdout(mut rx: mpsc::Receiver<String>) {
     }
 }
 
-async fn process_inbound_message(session: &WrapSession, content: &str) {
+async fn process_inbound_message(session: &WrapSession, content: &str) -> InboundProcessResult {
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
+    let mut forward_content = Some(content.to_string());
+    let mut immediate_response_to_client = None;
 
     let agent = session.agent.read().await.clone();
     let mut event = WrapEvent::new(
@@ -464,6 +655,7 @@ async fn process_inbound_message(session: &WrapSession, content: &str) {
     if let Ok(msg) = &parsed {
         let mut request_method: Option<&str> = None;
         let mut request_tool_name: Option<&str> = None;
+        let mut pipeline_ctx = None;
 
         // Extract method
         if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
@@ -493,16 +685,85 @@ async fn process_inbound_message(session: &WrapSession, content: &str) {
             }
         }
 
+        if let Some(ref enforcement) = session.enforcement {
+            if let Ok(jsonrpc_msg) = JsonRpcMessage::from_json_str(content) {
+                if matches!(jsonrpc_msg, JsonRpcMessage::Request(_)) {
+                    let mut req_ctx = PipelineRequestContext::new(session.session_id.clone());
+                    req_ctx.agent_id = Some(event.agent.name.clone());
+                    enrich_identity_metadata(
+                        msg,
+                        &enforcement.runtime.did_metadata_key,
+                        &enforcement.runtime.signature_metadata_key,
+                        &mut req_ctx,
+                    );
+
+                    match enforcement
+                        .runtime
+                        .pipeline
+                        .process(&mut req_ctx, jsonrpc_msg)
+                        .await
+                    {
+                        Ok(Some(JsonRpcMessage::Request(req))) => {
+                            if let Ok(serialized) = serde_json::to_string(&req) {
+                                forward_content = Some(serialized);
+                            }
+                            apply_enforcement_metadata(&mut event, &req_ctx);
+                            pipeline_ctx = Some(req_ctx);
+                        }
+                        Ok(Some(JsonRpcMessage::Response(resp))) => {
+                            forward_content = None;
+                            if let Ok(serialized) = serde_json::to_string(&resp) {
+                                immediate_response_to_client = Some(serialized.clone());
+                            }
+                            apply_enforcement_metadata(&mut event, &req_ctx);
+                            event = event.with_policy(
+                                false,
+                                Some("Request denied by enforcement".to_string()),
+                            );
+                            pipeline_ctx = Some(req_ctx);
+                        }
+                        Ok(None) => {
+                            forward_content = None;
+                            apply_enforcement_metadata(&mut event, &req_ctx);
+                            pipeline_ctx = Some(req_ctx);
+                        }
+                        Err(e) => {
+                            error!("Wrap enforcement error (request): {}", e);
+                            if !session.fail_open {
+                                forward_content = None;
+                                if let Some(id) = extract_request_id_for_error(msg) {
+                                    let response = JsonRpcResponse::error(
+                                        id,
+                                        JsonRpcError::new(
+                                            -32603,
+                                            format!("Enforcement runtime error: {}", e),
+                                        ),
+                                    );
+                                    if let Ok(serialized) = serde_json::to_string(&response) {
+                                        immediate_response_to_client = Some(serialized);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Record request time for latency calculation
-        if let Some(id) = msg.get("id") {
-            let id_str = match id {
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::String(s) => s.clone(),
-                _ => "unknown".to_string(),
-            };
-            session
-                .record_request_context(&id_str, request_method, request_tool_name)
-                .await;
+        if forward_content.is_some() {
+            if let Some(id) = msg.get("id") {
+                if let Some(id_str) = extract_context_id(id) {
+                    session
+                        .record_request_context(
+                            &id_str,
+                            request_method,
+                            request_tool_name,
+                            pipeline_ctx,
+                        )
+                        .await;
+                }
+            }
         }
 
         // Add full content and preview
@@ -522,10 +783,16 @@ async fn process_inbound_message(session: &WrapSession, content: &str) {
         event.method.as_deref().unwrap_or("-"),
         event.tool_name.as_deref().unwrap_or("")
     );
+
+    InboundProcessResult {
+        forward_to_server: forward_content,
+        immediate_response_to_client,
+    }
 }
 
-async fn process_outbound_message(session: &WrapSession, content: &str) {
+async fn process_outbound_message(session: &WrapSession, content: &str) -> OutboundProcessResult {
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
+    let mut forward_content = Some(content.to_string());
 
     let agent = session.agent.read().await.clone();
     let mut event = WrapEvent::new(
@@ -542,18 +809,45 @@ async fn process_outbound_message(session: &WrapSession, content: &str) {
         if is_response {
             // Calculate latency
             if let Some(id) = msg.get("id") {
-                let id_str = match id {
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => "unknown".to_string(),
-                };
-                if let Some(ctx) = session.take_request_context(&id_str).await {
-                    event = event.with_latency(ctx.started_at.elapsed().as_millis() as u64);
-                    if let Some(method) = ctx.method.as_deref() {
-                        event = event.with_method(method);
-                    }
-                    if let Some(tool_name) = ctx.tool_name.as_deref() {
-                        event = event.with_tool_name(tool_name);
+                if let Some(id_str) = extract_context_id(id) {
+                    if let Some(mut ctx) = session.take_request_context(&id_str).await {
+                        event = event.with_latency(ctx.started_at.elapsed().as_millis() as u64);
+                        if let Some(method) = ctx.method.as_deref() {
+                            event = event.with_method(method);
+                        }
+                        if let Some(tool_name) = ctx.tool_name.as_deref() {
+                            event = event.with_tool_name(tool_name);
+                        }
+                        if let (Some(enforcement), Some(pipeline_ctx)) =
+                            (session.enforcement.as_ref(), ctx.pipeline_ctx.as_mut())
+                        {
+                            if let Ok(jsonrpc_msg) = JsonRpcMessage::from_json_str(content) {
+                                match enforcement
+                                    .runtime
+                                    .pipeline
+                                    .process(pipeline_ctx, jsonrpc_msg)
+                                    .await
+                                {
+                                    Ok(Some(JsonRpcMessage::Response(resp))) => {
+                                        if let Ok(serialized) = serde_json::to_string(&resp) {
+                                            forward_content = Some(serialized);
+                                        }
+                                        apply_enforcement_metadata(&mut event, pipeline_ctx);
+                                    }
+                                    Ok(Some(JsonRpcMessage::Request(_))) => {}
+                                    Ok(None) => {
+                                        forward_content = None;
+                                        apply_enforcement_metadata(&mut event, pipeline_ctx);
+                                    }
+                                    Err(e) => {
+                                        error!("Wrap enforcement error (response): {}", e);
+                                        if !session.fail_open {
+                                            forward_content = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -586,6 +880,10 @@ async fn process_outbound_message(session: &WrapSession, content: &str) {
         event.method.as_deref().unwrap_or("response"),
         event.latency_ms.unwrap_or(0)
     );
+
+    OutboundProcessResult {
+        forward_to_client: forward_content,
+    }
 }
 
 fn derive_server_name(cmd: &str, args: &[String]) -> String {
@@ -640,6 +938,8 @@ fn truncate_content(content: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soth_proxy::pipeline::middleware::RequestContext as PipelineCtx;
+    use serde_json::json;
 
     #[test]
     fn test_derive_server_name_npx() {
@@ -685,5 +985,56 @@ mod tests {
             truncate_content("this is a longer string", 10),
             "this is a ..."
         );
+    }
+
+    #[test]
+    fn test_extract_metadata_value_from_nested_meta() {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    "X-Agent-DID": "did:key:z6MkTest",
+                    "X-Agent-Signature": { "algorithm": "Ed25519", "value": "abc", "signer": "did:key:z6MkTest", "created": "2026-02-07T00:00:00Z" }
+                }
+            },
+            "id": 1
+        });
+
+        assert_eq!(
+            extract_metadata_value(&payload, "X-Agent-DID")
+                .and_then(|v| v.as_str().map(ToOwned::to_owned)),
+            Some("did:key:z6MkTest".to_string())
+        );
+        assert!(extract_metadata_value(&payload, "X-Agent-Signature").is_some());
+    }
+
+    #[test]
+    fn test_apply_enforcement_metadata_updates_event() {
+        let mut event = WrapEvent::new(
+            "session-1",
+            "server",
+            WrapDirection::Out,
+            AgentInfo::new("test-agent", DetectionSource::CommandLine),
+        );
+        let mut ctx = PipelineCtx::new("session-1");
+        ctx.metadata
+            .insert("policy_action".to_string(), json!("Deny"));
+        ctx.metadata
+            .insert("policy_reason".to_string(), json!("blocked"));
+        ctx.metadata
+            .insert("budget_input_tokens".to_string(), json!(10));
+        ctx.metadata
+            .insert("budget_output_tokens".to_string(), json!(5));
+        ctx.metadata.insert("budget_cost".to_string(), json!(0.42));
+
+        apply_enforcement_metadata(&mut event, &ctx);
+
+        assert_eq!(event.policy_allowed, Some(false));
+        assert_eq!(event.policy_reason, Some("blocked".to_string()));
+        assert_eq!(event.input_tokens, Some(10));
+        assert_eq!(event.output_tokens, Some(5));
+        assert_eq!(event.token_count, Some(15));
+        assert_eq!(event.cost_usd, Some(0.42));
     }
 }

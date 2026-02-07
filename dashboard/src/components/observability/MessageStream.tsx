@@ -25,6 +25,7 @@ import {
   findCorrelatedRequest,
   calculateLatency,
   getLogSummary,
+  getLogTokenCount,
   createClusters,
   getLogPath,
   matchesServerFilter,
@@ -212,6 +213,7 @@ const ClusterRow = memo(function ClusterRow({
   const isSameIdPair = !!cluster.response && cluster.request.id === cluster.response.id;
   const requestIsSelected = isClusterRequestSelected(cluster, selectedLogId, selectedLogPart);
   const responseIsSelected = isClusterResponseSelected(cluster, selectedLogId, selectedLogPart);
+  const requestTokenCount = getLogTokenCount(cluster.request);
 
   const rowClass = "flex items-center gap-3 px-4 h-8 overflow-hidden transition-all duration-200 group/row";
   const sourceChipClass =
@@ -286,7 +288,7 @@ const ClusterRow = memo(function ClusterRow({
         </span>
 
         <span className="text-[10px] font-mono tabular-nums text-right w-12 flex-shrink-0 text-cyan-500/60 font-bold">
-          {cluster.request.token_count ? `${cluster.request.token_count}t` : ""}
+          {requestTokenCount > 0 ? `${requestTokenCount}t` : ""}
         </span>
 
         <div className={badgeSlotClass}>
@@ -461,6 +463,7 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
     [correlatedRequest, log]
   );
   const displayLatency = actualLatency ?? log.latency_ms;
+  const logTokenCount = getLogTokenCount(log);
 
   const method = useMemo(() => {
     if (isStderrMessage) return "stderr";
@@ -598,14 +601,14 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
       )}
 
       {/* Token count */}
-      {log.token_count !== undefined && log.token_count > 0 && (
+      {logTokenCount > 0 && (
         <span
           className="text-[10px] font-mono flex-shrink-0 px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 tabular-nums"
-          title={`${log.token_count.toLocaleString()} tokens`}
+          title={`${logTokenCount.toLocaleString()} tokens`}
         >
-          {log.token_count >= 1000
-            ? `${(log.token_count / 1000).toFixed(1)}k`
-            : log.token_count}
+          {logTokenCount >= 1000
+            ? `${(logTokenCount / 1000).toFixed(1)}k`
+            : logTokenCount}
         </span>
       )}
 

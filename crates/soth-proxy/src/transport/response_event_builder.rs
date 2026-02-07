@@ -117,11 +117,10 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
     if let Some(model) = input.usage_meta.model.as_deref().or(input.fallback_model) {
         event = event.with_model(model.to_string());
     }
-    if let (Some(input_tokens), Some(output_tokens)) = (
-        input.usage_meta.input_tokens,
-        input.usage_meta.output_tokens,
-    ) {
-        event = event.with_tokens(input_tokens + output_tokens);
+    let input_tokens = input.usage_meta.input_tokens.unwrap_or(0);
+    let output_tokens = input.usage_meta.output_tokens.unwrap_or(0);
+    if input_tokens > 0 || output_tokens > 0 {
+        event = event.with_usage_tokens(input_tokens, output_tokens);
     }
     if let Some(cost) = input.usage_meta.cost_usd {
         event = event.with_cost(cost);
