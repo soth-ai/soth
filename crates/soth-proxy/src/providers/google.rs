@@ -71,6 +71,9 @@ impl AiProvider for GoogleProvider {
             input_tokens,
             output_tokens,
             cached_tokens,
+            cache_read_tokens: cached_tokens,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
             model: None, // Model not usually in response
         })
     }
@@ -101,6 +104,9 @@ impl AiProvider for GoogleProvider {
                     input_tokens: input,
                     output_tokens: output,
                     cached_tokens: cached,
+                    cache_read_tokens: cached,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
                     model: None,
                 }));
             }

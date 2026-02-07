@@ -17,8 +17,15 @@ pub struct ProviderUsage {
     pub input_tokens: u64,
     /// Output/completion tokens
     pub output_tokens: u64,
-    /// Cached tokens (Anthropic)
+    /// Cached tokens legacy alias (kept for backward compatibility).
+    /// Prefer `cache_read_tokens` / `cache_write_tokens`.
     pub cached_tokens: Option<u64>,
+    /// Prompt cache read tokens (cache hits)
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt cache write tokens (cache creation)
+    pub cache_write_tokens: Option<u64>,
+    /// Reasoning output tokens (OpenAI responses/completions_details)
+    pub reasoning_tokens: Option<u64>,
     /// Model used
     pub model: Option<String>,
 }
@@ -30,6 +37,9 @@ impl ProviderUsage {
             input_tokens,
             output_tokens,
             cached_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
             model: None,
         }
     }
@@ -37,6 +47,26 @@ impl ProviderUsage {
     /// Add cached tokens
     pub fn with_cached(mut self, cached: u64) -> Self {
         self.cached_tokens = Some(cached);
+        self.cache_read_tokens = Some(cached);
+        self
+    }
+
+    /// Add cache read tokens
+    pub fn with_cache_read(mut self, cached: u64) -> Self {
+        self.cached_tokens = Some(cached);
+        self.cache_read_tokens = Some(cached);
+        self
+    }
+
+    /// Add cache write tokens
+    pub fn with_cache_write(mut self, cached: u64) -> Self {
+        self.cache_write_tokens = Some(cached);
+        self
+    }
+
+    /// Add reasoning tokens
+    pub fn with_reasoning_tokens(mut self, tokens: u64) -> Self {
+        self.reasoning_tokens = Some(tokens);
         self
     }
 
@@ -205,6 +235,9 @@ mod tests {
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.total_tokens(), 150);
         assert_eq!(usage.cached_tokens, Some(25));
+        assert_eq!(usage.cache_read_tokens, Some(25));
+        assert_eq!(usage.cache_write_tokens, None);
+        assert_eq!(usage.reasoning_tokens, None);
         assert_eq!(usage.model, Some("gpt-4o".to_string()));
     }
 

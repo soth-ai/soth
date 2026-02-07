@@ -16,9 +16,10 @@ use hudsucker::{
     tokio_tungstenite::tungstenite::Message,
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse, WebSocketContext, WebSocketHandler,
 };
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use soth_budget::{BudgetTracker, TokenCounter};
+use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
 use soth_core::types::policy::PolicyInputBuilder;
 use soth_identity::{signing::verify_bytes, signing::SignatureBlock, Did};
 use soth_policy::PolicyEngine;
@@ -34,6 +35,16 @@ use tracing::{debug, info, warn};
 use soth_dashboard::{DashboardState, DenialEntry};
 
 use crate::error::ProxyError;
+use crate::providers::ProviderRegistry;
+use crate::transport::host_fingerprint;
+use crate::transport::response_event_builder::{
+    build_paired_response_event, empty_response_placeholder, normalize_response_content,
+    ResponseEventInput, ResponseKind,
+};
+use crate::transport::usage_enrichment::{
+    build_http_request_for_provider, extract_usage_meta_from_decoded_payload,
+    resolve_provider_parser, ResponseUsageMeta,
+};
 use soth_core::config::{ForwardProxyConfig, HostAction, HostFilterConfig};
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
@@ -82,6 +93,32 @@ fn request_id_from_ctx(ctx: &HttpContext) -> u64 {
     // Use the context's internal connection/request tracking
     // Hash the pointer address as a simple unique ID
     ctx as *const _ as u64
+}
+
+const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
+const STREAM_CAPTURE_INITIAL_CAPACITY: usize = 64 * 1024;
+const STREAM_BUFFER_POOL_MAX_BUFFERS: usize = 32;
+
+static STREAM_BUFFER_POOL: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn acquire_stream_buffer() -> Vec<u8> {
+    let mut pool = STREAM_BUFFER_POOL.lock();
+    if let Some(mut buffer) = pool.pop() {
+        buffer.clear();
+        return buffer;
+    }
+    Vec::with_capacity(STREAM_CAPTURE_INITIAL_CAPACITY)
+}
+
+fn release_stream_buffer(mut buffer: Vec<u8>) {
+    if buffer.capacity() > STREAM_CAPTURE_MAX_BYTES {
+        return;
+    }
+    buffer.clear();
+    let mut pool = STREAM_BUFFER_POOL.lock();
+    if pool.len() < STREAM_BUFFER_POOL_MAX_BUFFERS {
+        pool.push(buffer);
+    }
 }
 
 /// Identity verification mode for proxy enforcement.
@@ -975,37 +1012,28 @@ fn try_decompress(bytes: &[u8], encoding: Option<&str>) -> Vec<u8> {
     bytes.to_vec()
 }
 
-fn decode_body_for_logging(bytes: &[u8], encoding: Option<&str>) -> String {
-    let decoded = try_decompress(bytes, encoding);
-    if let Ok(text) = String::from_utf8(decoded.clone()) {
-        if let Some(marker) = maybe_binary_placeholder(&decoded, encoding) {
+fn render_decoded_body_for_logging(decoded: &[u8], encoding: Option<&str>) -> String {
+    if let Ok(text) = std::str::from_utf8(decoded) {
+        if let Some(marker) = maybe_binary_placeholder(decoded, encoding) {
             return marker;
         }
-        return text;
+        return text.to_string();
     }
-    if let Some(marker) = maybe_binary_placeholder(&decoded, encoding) {
+    if let Some(marker) = maybe_binary_placeholder(decoded, encoding) {
         return marker;
     }
-    String::from_utf8_lossy(&decoded).to_string()
+    String::from_utf8_lossy(decoded).to_string()
 }
 
-fn empty_response_placeholder(method: &str, path: &str, status: u16, is_sse: bool) -> String {
-    if is_sse {
-        return format!(
-            "[no SSE payload captured for {} {} (HTTP {})]",
-            method, path, status
-        );
-    }
-    if path.to_ascii_lowercase().contains("/backend-api/codex/responses") {
-        return format!(
-            "[no HTTP response body captured for {} {} (HTTP {}) - Codex output may be streamed via WebSocket]",
-            method, path, status
-        );
-    }
-    format!(
-        "[no HTTP response body captured for {} {} (HTTP {})]",
-        method, path, status
-    )
+fn decode_body_for_logging(bytes: &[u8], encoding: Option<&str>) -> String {
+    let decoded = try_decompress(bytes, encoding);
+    render_decoded_body_for_logging(&decoded, encoding)
+}
+
+fn decode_payload_for_logging(bytes: &[u8], encoding: Option<&str>) -> (Vec<u8>, String) {
+    let decoded = try_decompress(bytes, encoding);
+    let rendered = render_decoded_body_for_logging(&decoded, encoding);
+    (decoded, rendered)
 }
 
 /// AI-aware HTTP handler for hudsucker
@@ -1024,6 +1052,10 @@ pub struct AiProxyHandler {
     pending_requests: PendingRequests,
     /// Optional enforcement runtime for identity/policy/budget checks
     enforcer: Option<Arc<ProxyEnforcer>>,
+    /// Provider parser registry
+    provider_registry: Arc<ProviderRegistry>,
+    /// LiteLLM-style pricing catalog
+    pricing_catalog: Arc<PricingCatalog>,
 }
 
 impl AiProxyHandler {
@@ -1036,6 +1068,8 @@ impl AiProxyHandler {
             session_id: uuid::Uuid::new_v4().to_string(),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             enforcer: None,
+            provider_registry: Arc::new(ProviderRegistry::new()),
+            pricing_catalog: Arc::new(PricingCatalog::with_defaults()),
         }
     }
 
@@ -1136,30 +1170,6 @@ impl AiProxyHandler {
         }
     }
 
-    fn is_codex_path(path: &str) -> bool {
-        let path_lower = path.to_ascii_lowercase();
-        path_lower.contains("/backend-api/codex/")
-            || path_lower.starts_with("/codex")
-            || path_lower.contains("/codex/")
-    }
-
-    fn is_codex_model(model: &str) -> bool {
-        model.to_ascii_lowercase().contains("codex")
-    }
-
-    fn is_chatgpt_web_host(host: &str) -> bool {
-        host.contains("chatgpt.com")
-            || host == "chat.openai.com"
-            || host.ends_with(".chat.openai.com")
-    }
-
-    fn is_claude_web_host(host: &str) -> bool {
-        if !(host == "claude.ai" || host.ends_with(".claude.ai")) {
-            return false;
-        }
-        !host.starts_with("api.") && !host.contains(".api.")
-    }
-
     /// Apply host/path/model heuristics to derive the final agent tag.
     /// This upgrades generic OpenAI/ChatGPT tags to `codex` when context proves it.
     fn detect_agent_with_context(
@@ -1168,109 +1178,19 @@ impl AiProxyHandler {
         path: &str,
         model: Option<&str>,
     ) -> Option<&'static str> {
-        let host_lower = host.to_ascii_lowercase();
-        let is_chatgpt_web_host = Self::is_chatgpt_web_host(&host_lower);
-        let is_claude_web_host = Self::is_claude_web_host(&host_lower);
-
-        if is_chatgpt_web_host && Self::is_codex_path(path) {
-            return Some("codex");
-        }
-
-        if let Some(model_name) = model {
-            if Self::is_codex_model(model_name) {
-                return Some("codex");
-            }
-        }
-
-        if ua_agent.is_none() && is_chatgpt_web_host {
-            return Some("chatgpt");
-        }
-        if ua_agent.is_none() && is_claude_web_host {
-            return Some("claude");
-        }
-
-        ua_agent
+        host_fingerprint::detect_agent_with_context(ua_agent, host, path, model)
     }
 
     /// Detect AI provider from host
     fn detect_provider(host: &str) -> Option<&'static str> {
-        let host = host.to_ascii_lowercase();
-
-        // ChatGPT web/agent surfaces
-        if Self::is_chatgpt_web_host(&host) {
-            Some("chatgpt")
-        // Claude web/agent surfaces
-        } else if Self::is_claude_web_host(&host) {
-            Some("claude")
-        // OpenAI API inference endpoints
-        } else if host == "api.openai.com"
-            || host.ends_with(".api.openai.com")
-            || host.contains("openai.azure.com")
-        {
-            Some("openai")
-        // Anthropic inference endpoints
-        } else if host == "api.claude.ai"
-            || host.ends_with(".api.claude.ai")
-            || host == "api.anthropic.com"
-            || host.ends_with(".api.anthropic.com")
-            || host.contains("anthropic.com")
-        {
-            Some("anthropic")
-        } else if host.contains("googleapis.com")
-            && (host.contains("aiplatform") || host.contains("generativelanguage"))
-        {
-            Some("google")
-        } else if host.contains("cohere.") {
-            Some("cohere")
-        } else if host.contains("mistral.ai") {
-            Some("mistral")
-        } else if host.contains("groq.com") {
-            Some("groq")
-        } else if host.contains("together.xyz") {
-            Some("together")
-        } else if host.contains("perplexity.ai") {
-            Some("perplexity")
-        } else if host.contains("replicate.com") {
-            Some("replicate")
-        } else if host.contains("huggingface.co") {
-            Some("huggingface")
-        } else if host.contains("fireworks.ai") {
-            Some("fireworks")
-        } else if host.contains("x.ai") {
-            Some("xai")
-        } else if host.contains("bedrock") && host.contains("amazonaws.com") {
-            Some("bedrock")
-        } else {
-            None
-        }
+        host_fingerprint::detect_provider(host)
     }
 
     /// Check if host is an agent app (end-user application) vs direct API
     /// Agent apps: chatgpt.com, claude.ai (web/desktop apps)
     /// Direct API: api.openai.com, api.anthropic.com (programmatic access)
     fn is_agent_app(host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-
-        // OpenAI/ChatGPT web apps (chat.openai.com, chatgpt.com)
-        // Exclude api.openai.com which is direct API
-        if Self::is_chatgpt_web_host(&host) {
-            return true;
-        }
-
-        // Claude web/desktop app (claude.ai)
-        if Self::is_claude_web_host(&host) {
-            return true;
-        }
-
-        // Perplexity web app
-        if host.contains("perplexity.ai") {
-            return !host.starts_with("api.") && !host.contains(".api.");
-        }
-        // Google AI Studio
-        if host.contains("aistudio.google.com") || host.contains("makersuite.google.com") {
-            return true;
-        }
-        false
+        host_fingerprint::is_agent_app(host)
     }
 
     /// Check if a request should be logged for observability
@@ -1401,6 +1321,7 @@ impl HttpHandler for AiProxyHandler {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_lowercase());
         let should_inspect_body = is_post && provider.is_some(); // Always inspect AI POST requests
+        let provider_registry = self.provider_registry.clone();
 
         debug!(
             is_post = is_post,
@@ -1433,8 +1354,8 @@ impl HttpHandler for AiProxyHandler {
                     Ok(collected) => {
                         let bytes = collected.to_bytes();
                         let body_len = bytes.len();
-                        let body_str =
-                            decode_body_for_logging(&bytes, request_content_encoding.as_deref());
+                        let (decoded_bytes, body_str) =
+                            decode_payload_for_logging(&bytes, request_content_encoding.as_deref());
 
                         debug!(
                             body_len = body_len,
@@ -1442,10 +1363,25 @@ impl HttpHandler for AiProxyHandler {
                             "Captured request body"
                         );
 
-                        // Extract model from request body
-                        let model = serde_json::from_str::<AiRequestBody>(&body_str)
-                            .ok()
-                            .and_then(|b| b.model);
+                        // Extract model from provider-specific schema first, then fallback to generic JSON.
+                        let model = provider
+                            .and_then(|provider_name| {
+                                resolve_provider_parser(&provider_registry, &host, provider_name)
+                            })
+                            .and_then(|parser| {
+                                let request = build_http_request_for_provider(
+                                    &http_method,
+                                    &path,
+                                    &parts.headers,
+                                    Some(decoded_bytes.clone()),
+                                );
+                                parser.extract_model(&request)
+                            })
+                            .or_else(|| {
+                                serde_json::from_slice::<AiRequestBody>(&decoded_bytes)
+                                    .ok()
+                                    .and_then(|b| b.model)
+                            });
 
                         // Reconstruct request with body
                         let new_body = Body::from(Full::new(bytes));
@@ -1649,6 +1585,8 @@ impl HttpHandler for AiProxyHandler {
         let event_logger = self.event_logger.clone();
         let session_id = self.session_id.clone();
         let request_id = request_id_from_ctx(ctx);
+        let provider_registry = self.provider_registry.clone();
+        let pricing_catalog = self.pricing_catalog.clone();
 
         #[cfg(feature = "dashboard")]
         let dashboard = self.dashboard.clone();
@@ -1689,17 +1627,32 @@ impl HttpHandler for AiProxyHandler {
                 .path
                 .to_ascii_lowercase()
                 .contains("/backend-api/codex/responses");
+            let mut response_usage = ResponseUsageMeta::default();
 
             // For JSON responses, capture the body for logging (with decompression)
             // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
-            let (body_content, res, logged_in_stream) = if is_json && !is_sse && !is_codex_response_path {
+            let (body_content, res, logged_in_stream) = if is_json
+                && !is_sse
+                && !is_codex_response_path
+            {
                 let (parts, body) = res.into_parts();
                 match body.collect().await {
                     Ok(collected) => {
                         let bytes = collected.to_bytes();
 
-                        // Decode for logging (decompression + binary guard)
-                        let body_str = decode_body_for_logging(&bytes, content_encoding.as_deref());
+                        let (decoded_bytes, body_str) =
+                            decode_payload_for_logging(&bytes, content_encoding.as_deref());
+
+                        response_usage = extract_usage_meta_from_decoded_payload(
+                            &provider_registry,
+                            &pricing_catalog,
+                            pending.provider,
+                            &pending.host,
+                            &decoded_bytes,
+                            false,
+                            pending.model.as_deref(),
+                        );
+
                         // Return original bytes to client (they handle decompression)
                         let new_body = Body::from(Full::new(bytes));
                         let res = Response::from_parts(parts, new_body);
@@ -1714,8 +1667,8 @@ impl HttpHandler for AiProxyHandler {
                 // Streaming response: tee to forward chunks immediately while accumulating
                 let (parts, body) = res.into_parts();
 
-                // Create channels for the accumulated content
-                let accumulated = Arc::new(Mutex::new(Vec::<u8>::with_capacity(64 * 1024)));
+                // Use pooled buffer to reduce repeated allocations on high-throughput streams.
+                let accumulated = Arc::new(Mutex::new(Some(acquire_stream_buffer())));
                 let accumulated_clone = accumulated.clone();
 
                 // Capture logging context for the spawned task
@@ -1725,6 +1678,10 @@ impl HttpHandler for AiProxyHandler {
                 let log_latency_ms = latency_ms;
                 let log_content_encoding = content_encoding.clone();
                 let log_is_sse = is_sse;
+                let log_provider_registry = provider_registry.clone();
+                let log_pricing_catalog = pricing_catalog.clone();
+                #[cfg(feature = "dashboard")]
+                let log_dashboard = dashboard.clone();
 
                 // Create a tee stream that yields frames while accumulating data
                 let tee_stream = stream! {
@@ -1734,10 +1691,14 @@ impl HttpHandler for AiProxyHandler {
                             Some(Ok(frame)) => {
                                 // Clone data for accumulation if it's a data frame
                                 if let Some(data) = frame.data_ref() {
-                                    let mut acc = accumulated_clone.lock();
-                                    // Limit accumulation to prevent memory issues (max 1MB)
-                                    if acc.len() < 1024 * 1024 {
-                                        acc.extend_from_slice(data);
+                                    let mut guard = accumulated_clone.lock();
+                                    if let Some(ref mut acc) = *guard {
+                                        // Limit accumulation to prevent memory issues.
+                                        if acc.len() < STREAM_CAPTURE_MAX_BYTES {
+                                            let remaining = STREAM_CAPTURE_MAX_BYTES - acc.len();
+                                            let write_len = remaining.min(data.len());
+                                            acc.extend_from_slice(&data[..write_len]);
+                                        }
                                     }
                                 }
                                 // Yield the original frame immediately to client
@@ -1755,11 +1716,12 @@ impl HttpHandler for AiProxyHandler {
                     }
 
                     // Stream ended - decompress and log the accumulated content
-                    let raw_content = {
-                        let acc = accumulated_clone.lock();
-                        let raw_bytes = acc.clone();
+                    let (decoded_bytes, raw_content) = {
+                        let raw_bytes = {
+                            let mut guard = accumulated_clone.lock();
+                            guard.take().unwrap_or_default()
+                        };
                         let raw_len = raw_bytes.len();
-                        drop(acc); // Release lock before decompression
 
                         debug!(
                             encoding = ?log_content_encoding,
@@ -1767,53 +1729,73 @@ impl HttpHandler for AiProxyHandler {
                             "Decompressing streamed response"
                         );
 
-                        // Decode using header/magic decompression + binary guard
-                        decode_body_for_logging(&raw_bytes, log_content_encoding.as_deref())
+                        // Decode once and reuse decoded bytes for usage extraction.
+                        let decoded = decode_payload_for_logging(&raw_bytes, log_content_encoding.as_deref());
+                        release_stream_buffer(raw_bytes);
+                        decoded
                     };
-                    let content = if raw_content.trim().is_empty() {
+                    let usage_meta = extract_usage_meta_from_decoded_payload(
+                        &log_provider_registry,
+                        &log_pricing_catalog,
+                        log_pending.provider,
+                        &log_pending.host,
+                        &decoded_bytes,
+                        log_is_sse,
+                        log_pending.model.as_deref(),
+                    );
+                    let content = normalize_response_content(
+                        Some(raw_content.as_str()),
+                        log_pending.request_content.as_deref(),
+                        &log_pending.method,
+                        &log_pending.path,
+                        status,
+                        log_is_sse,
+                        true,
+                    )
+                    .unwrap_or_else(|| {
                         empty_response_placeholder(
                             &log_pending.method,
                             &log_pending.path,
                             status,
                             log_is_sse,
                         )
-                    } else {
-                        raw_content
-                    };
+                    });
+
+                    #[cfg(feature = "dashboard")]
+                    if let Some(ref dashboard) = log_dashboard {
+                        let request_id_str = log_pending.request_id.to_string();
+                        dashboard.record_proxy_response(
+                            Some(&request_id_str),
+                            log_pending.provider,
+                            status,
+                            log_latency_ms,
+                            usage_meta
+                                .model
+                                .as_deref()
+                                .or(log_pending.model.as_deref()),
+                            usage_meta.input_tokens,
+                            usage_meta.output_tokens,
+                            usage_meta.cost_usd,
+                        );
+                    }
 
                     if let Some(ref logger) = log_event_logger {
-                        let agent_name = log_pending.agent.unwrap_or(log_pending.provider);
-                        let agent_info = AgentInfo::new(agent_name, DetectionSource::Environment);
-                        let method_str = format!("{} {}", log_pending.method, log_pending.path);
-
-                        let source = if log_pending.is_agent_app { EventSource::AgentApp } else { EventSource::AiProxy };
-                        let mut event = WrapEvent::new(&log_session_id, &log_pending.host, WrapDirection::Out, agent_info)
-                            .with_source(source)
-                            .with_provider(log_pending.provider)
-                            .with_method(method_str)
-                            .with_status_code(status)
-                            .with_latency(log_latency_ms);
-
-                        // Add paired request/response content
-                        if let Some(ref req_body) = log_pending.request_content {
-                            event = event.with_request(req_body.clone(), "");
-                        }
-                        event = event.with_response(content.clone(), "");
-                        // Keep content populated for legacy inspectors that still read `content`.
-                        event = event.with_content(content);
-
-                        // Keep compact row summary; full payload is in request_content/response_content.
-                        event = event.with_content_preview(format!(
-                            "→ {} {} | ← {} {}",
-                            log_pending.method,
-                            log_pending.path,
-                            if log_is_sse { "SSE" } else { "STREAM" },
-                            status
-                        ));
-
-                        if let Some(ref m) = log_pending.model {
-                            event = event.with_model(m.clone());
-                        }
+                        let event = build_paired_response_event(ResponseEventInput {
+                            session_id: &log_session_id,
+                            host: &log_pending.host,
+                            provider: log_pending.provider,
+                            agent: log_pending.agent,
+                            method: &log_pending.method,
+                            path: &log_pending.path,
+                            is_agent_app: log_pending.is_agent_app,
+                            status,
+                            latency_ms: log_latency_ms,
+                            request_content: log_pending.request_content.as_deref(),
+                            response_content: Some(content),
+                            usage_meta: &usage_meta,
+                            fallback_model: log_pending.model.as_deref(),
+                            response_kind: ResponseKind::Stream { is_sse: log_is_sse },
+                        });
 
                         logger.log(&event);
                         debug!("Logged paired streamed request/response");
@@ -1842,81 +1824,50 @@ impl HttpHandler for AiProxyHandler {
             );
 
             #[cfg(feature = "dashboard")]
-            if let Some(ref dashboard) = dashboard {
-                let request_id_str = pending.request_id.to_string();
-                dashboard.record_proxy_response(
-                    Some(&request_id_str),
-                    pending.provider,
-                    status,
-                    latency_ms,
-                    pending.model.as_deref(),
-                    None, // input_tokens
-                    None, // output_tokens
-                    None, // cost_usd
-                );
+            if !logged_in_stream {
+                if let Some(ref dashboard) = dashboard {
+                    let request_id_str = pending.request_id.to_string();
+                    dashboard.record_proxy_response(
+                        Some(&request_id_str),
+                        pending.provider,
+                        status,
+                        latency_ms,
+                        response_usage.model.as_deref().or(pending.model.as_deref()),
+                        response_usage.input_tokens,
+                        response_usage.output_tokens,
+                        response_usage.cost_usd,
+                    );
+                }
             }
 
             // Log paired request/response event (streamed responses are logged in tee stream)
             if !logged_in_stream {
                 if let Some(ref logger) = event_logger {
-                    let agent_name = pending.agent.unwrap_or(pending.provider);
-                    let agent_info = AgentInfo::new(agent_name, DetectionSource::Environment);
-                    let method_str = format!("{} {}", pending.method, pending.path);
-
-                    let source = if pending.is_agent_app {
-                        EventSource::AgentApp
-                    } else {
-                        EventSource::AiProxy
-                    };
-                    let mut event = WrapEvent::new(
-                        &session_id,
-                        pending.host.clone(),
-                        WrapDirection::Out,
-                        agent_info,
-                    )
-                    .with_source(source)
-                    .with_provider(pending.provider)
-                    .with_method(method_str)
-                    .with_status_code(status)
-                    .with_latency(latency_ms);
-
-                    // Add paired request/response content
-                    if let Some(ref req_body) = pending.request_content {
-                        event = event.with_request(req_body.clone(), "");
-                    }
-                    let normalized_response = body_content
-                        .as_ref()
-                        .filter(|resp| !resp.trim().is_empty())
-                        .cloned()
-                        .or_else(|| {
-                            if pending.request_content.is_some() || pending.method == "POST" {
-                                Some(empty_response_placeholder(
-                                    &pending.method,
-                                    &pending.path,
-                                    status,
-                                    false,
-                                ))
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(resp_body) = normalized_response {
-                        event = event.with_response(resp_body.clone(), "");
-                        // Also set content field for Inspector backward compatibility
-                        event = event.with_content(resp_body);
-                    }
-
-                    // Keep compact row summary; full payload is in request_content/response_content.
-                    event = event.with_content_preview(format!(
-                        "→ {} {} | ← HTTP {}",
-                        pending.method, pending.path, status
-                    ));
-
-                    // Add model if we had it from request
-                    if let Some(ref m) = pending.model {
-                        event = event.with_model(m.clone());
-                    }
-
+                    let normalized_response = normalize_response_content(
+                        body_content.as_deref(),
+                        pending.request_content.as_deref(),
+                        &pending.method,
+                        &pending.path,
+                        status,
+                        false,
+                        false,
+                    );
+                    let event = build_paired_response_event(ResponseEventInput {
+                        session_id: &session_id,
+                        host: &pending.host,
+                        provider: pending.provider,
+                        agent: pending.agent,
+                        method: &pending.method,
+                        path: &pending.path,
+                        is_agent_app: pending.is_agent_app,
+                        status,
+                        latency_ms,
+                        request_content: pending.request_content.as_deref(),
+                        response_content: normalized_response,
+                        usage_meta: &response_usage,
+                        fallback_model: pending.model.as_deref(),
+                        response_kind: ResponseKind::Http,
+                    });
                     logger.log(&event);
                 }
             }
@@ -2249,6 +2200,38 @@ mod tests {
             AiProxyHandler::detect_provider("bedrock.us-east-1.amazonaws.com"),
             Some("bedrock")
         );
+        assert_eq!(
+            AiProxyHandler::detect_provider("api2.cursor.sh"),
+            Some("cursor")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("api3.cursor.sh"),
+            Some("cursor")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("enterprise.githubcopilot.com"),
+            Some("github-copilot")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("server.codeium.com"),
+            Some("windsurf")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("cloud.zed.dev"),
+            Some("zed")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("api.jetbrains.ai"),
+            Some("junie")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("codewhisperer.us-east-1.amazonaws.com"),
+            Some("amazon-q")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("statsig.anthropic.com"),
+            Some("claude-code")
+        );
         assert_eq!(AiProxyHandler::detect_provider("google.com"), None);
         assert_eq!(AiProxyHandler::detect_provider("example.com"), None);
     }
@@ -2332,9 +2315,60 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_agent_with_context_domain_fallbacks() {
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(None, "api2.cursor.sh", "/", None),
+            Some("cursor")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(
+                None,
+                "enterprise.githubcopilot.com",
+                "/",
+                None
+            ),
+            Some("github-copilot")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(None, "server.codeium.com", "/", None),
+            Some("windsurf")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(None, "cloud.zed.dev", "/", None),
+            Some("zed")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(None, "api.jetbrains.ai", "/", None),
+            Some("junie")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(
+                None,
+                "codewhisperer.us-east-1.amazonaws.com",
+                "/",
+                None
+            ),
+            Some("amazon-q")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(None, "statsig.anthropic.com", "/", None),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
     fn test_is_agent_app_classification() {
         assert!(AiProxyHandler::is_agent_app("chatgpt.com"));
         assert!(AiProxyHandler::is_agent_app("claude.ai"));
+        assert!(AiProxyHandler::is_agent_app("api2.cursor.sh"));
+        assert!(AiProxyHandler::is_agent_app("enterprise.githubcopilot.com"));
+        assert!(AiProxyHandler::is_agent_app("server.codeium.com"));
+        assert!(AiProxyHandler::is_agent_app("cloud.zed.dev"));
+        assert!(AiProxyHandler::is_agent_app("api.jetbrains.ai"));
+        assert!(AiProxyHandler::is_agent_app(
+            "codewhisperer.us-east-1.amazonaws.com"
+        ));
+        assert!(AiProxyHandler::is_agent_app("statsig.anthropic.com"));
         assert!(!AiProxyHandler::is_agent_app("api.openai.com"));
         assert!(!AiProxyHandler::is_agent_app("api.anthropic.com"));
         assert!(!AiProxyHandler::is_agent_app("api.claude.ai"));
@@ -2348,7 +2382,8 @@ mod tests {
 
     #[test]
     fn test_empty_response_placeholder_http() {
-        let placeholder = empty_response_placeholder("POST", "/backend-api/codex/responses", 200, false);
+        let placeholder =
+            empty_response_placeholder("POST", "/backend-api/codex/responses", 200, false);
         assert!(placeholder.contains("no HTTP response body captured"));
         assert!(placeholder.contains("POST /backend-api/codex/responses"));
     }

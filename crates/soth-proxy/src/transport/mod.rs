@@ -6,11 +6,14 @@
 //! - HTTP: HTTP POST for simple integrations
 //! - Streamable HTTP: MCP 2025-03-26 spec compliant HTTP with SSE streaming
 
+pub mod host_fingerprint;
 pub mod http;
 pub mod hudsucker_proxy;
+pub mod response_event_builder;
 pub mod sse;
 pub mod stdio;
 pub mod streamable_http;
+pub mod usage_enrichment;
 
 use async_trait::async_trait;
 use serde_json::Value;

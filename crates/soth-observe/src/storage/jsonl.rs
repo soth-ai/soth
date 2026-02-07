@@ -21,10 +21,7 @@ impl JsonlStorage {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         Ok(Self {
             writer: Mutex::new(BufWriter::new(file)),
@@ -122,8 +119,14 @@ mod tests {
 
         // Write events
         let storage = JsonlStorage::new(&path).unwrap();
-        let event1 = ObservationEvent::new("session-1", Direction::In, EventType::Request, "content 1");
-        let event2 = ObservationEvent::new("session-1", Direction::Out, EventType::Response, "content 2");
+        let event1 =
+            ObservationEvent::new("session-1", Direction::In, EventType::Request, "content 1");
+        let event2 = ObservationEvent::new(
+            "session-1",
+            Direction::Out,
+            EventType::Response,
+            "content 2",
+        );
 
         storage.write(&event1).unwrap();
         storage.write(&event2).unwrap();

@@ -92,7 +92,10 @@ impl PiiRedactor {
             offset += length_diff;
         }
 
-        RedactionResult { text: result, redactions }
+        RedactionResult {
+            text: result,
+            redactions,
+        }
     }
 
     /// Redact PII in a JSON value (recursive)

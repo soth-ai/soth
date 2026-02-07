@@ -1,9 +1,9 @@
 //! Merkle tree module
 
+mod log;
 mod proof;
 mod tree;
-mod log;
 
+pub use log::TransparencyLog;
 pub use proof::MerkleProof;
 pub use tree::MerkleTree;
-pub use log::TransparencyLog;

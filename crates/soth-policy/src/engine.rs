@@ -130,10 +130,7 @@ impl PolicyEngine {
 
     /// Get current active policy version.
     pub fn active_policy_version(&self) -> String {
-        format!(
-            "v{}",
-            self.active_policy_version.load(Ordering::Relaxed)
-        )
+        format!("v{}", self.active_policy_version.load(Ordering::Relaxed))
     }
 
     fn bump_policy_version(&self) {

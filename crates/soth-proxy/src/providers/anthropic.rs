@@ -53,10 +53,19 @@ impl AiProvider for AnthropicProvider {
         let json: serde_json::Value = serde_json::from_slice(body).ok()?;
 
         let usage = json.get("usage")?;
-        let input_tokens = usage.get("input_tokens")?.as_u64()?;
-        let output_tokens = usage.get("output_tokens")?.as_u64()?;
-        let cached_tokens = usage
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_read_tokens = usage
             .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64());
+        let cache_write_tokens = usage
+            .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64());
 
         let model = json
@@ -67,7 +76,10 @@ impl AiProvider for AnthropicProvider {
         Some(ProviderUsage {
             input_tokens,
             output_tokens,
-            cached_tokens,
+            cached_tokens: cache_read_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens: None,
             model,
         })
     }
@@ -103,8 +115,11 @@ impl AiProvider for AnthropicProvider {
                             .get("input_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        let cached = usage
+                        let cache_read_tokens = usage
                             .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64());
+                        let cache_write_tokens = usage
+                            .get("cache_creation_input_tokens")
                             .and_then(|v| v.as_u64());
                         let model = message
                             .get("model")
@@ -113,7 +128,10 @@ impl AiProvider for AnthropicProvider {
                         return Some(SseEvent::Usage(ProviderUsage {
                             input_tokens: input,
                             output_tokens: 0,
-                            cached_tokens: cached,
+                            cached_tokens: cache_read_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
+                            reasoning_tokens: None,
                             model,
                         }));
                     }
@@ -144,6 +162,9 @@ impl AiProvider for AnthropicProvider {
                         input_tokens: 0, // Input was in message_start
                         output_tokens: output,
                         cached_tokens: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        reasoning_tokens: None,
                         model: None,
                     }));
                 }
@@ -203,7 +224,8 @@ mod tests {
             "usage": {
                 "input_tokens": 100,
                 "output_tokens": 50,
-                "cache_read_input_tokens": 25
+                "cache_read_input_tokens": 25,
+                "cache_creation_input_tokens": 10
             }
         }"#;
 
@@ -211,6 +233,8 @@ mod tests {
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.cached_tokens, Some(25));
+        assert_eq!(usage.cache_read_tokens, Some(25));
+        assert_eq!(usage.cache_write_tokens, Some(10));
         assert_eq!(usage.model, Some("claude-3-5-sonnet-20241022".to_string()));
     }
 

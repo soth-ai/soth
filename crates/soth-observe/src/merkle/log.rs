@@ -54,8 +54,9 @@ impl TransparencyLog {
             let stored: StoredLog = serde_json::from_str(&content)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-            let tree = MerkleTree::from_serializable(&stored.tree)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid tree"))?;
+            let tree = MerkleTree::from_serializable(&stored.tree).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid tree")
+            })?;
 
             Ok(Self {
                 tree,
@@ -72,7 +73,12 @@ impl TransparencyLog {
     }
 
     /// Append data to the log
-    pub fn append(&mut self, data: &[u8], entry_type: impl Into<String>, metadata: Option<serde_json::Value>) -> LogEntry {
+    pub fn append(
+        &mut self,
+        data: &[u8],
+        entry_type: impl Into<String>,
+        metadata: Option<serde_json::Value>,
+    ) -> LogEntry {
         let data_hash = Self::hash_data(data);
         let sequence = self.entries.len() as u64;
 
@@ -97,7 +103,11 @@ impl TransparencyLog {
     }
 
     /// Append a JSON value to the log
-    pub fn append_json(&mut self, value: &serde_json::Value, entry_type: impl Into<String>) -> LogEntry {
+    pub fn append_json(
+        &mut self,
+        value: &serde_json::Value,
+        entry_type: impl Into<String>,
+    ) -> LogEntry {
         let data = serde_json::to_vec(value).unwrap_or_default();
         self.append(&data, entry_type, None)
     }
@@ -159,7 +169,11 @@ impl TransparencyLog {
     }
 
     /// Get consistency proof between two tree sizes
-    pub fn get_consistency_proof(&self, old_size: usize, new_size: usize) -> Option<ConsistencyProof> {
+    pub fn get_consistency_proof(
+        &self,
+        old_size: usize,
+        new_size: usize,
+    ) -> Option<ConsistencyProof> {
         if old_size > new_size || new_size > self.entries.len() {
             return None;
         }
