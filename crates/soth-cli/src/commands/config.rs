@@ -62,11 +62,8 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
-    // Validate server section
-    validate_server(&config, &mut warnings, &mut errors);
-
-    // Validate upstream section
-    validate_upstream(&config, &mut warnings, &mut errors);
+    // Validate forward proxy section
+    validate_forward_proxy(&config, &mut warnings, &mut errors);
 
     // Validate identity section
     validate_identity(&config, &mut warnings, &mut errors);
@@ -109,8 +106,23 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
         println!();
         println!("Configuration Summary:");
         println!("  Version:     {}", config.version);
-        println!("  Transport:   {}", config.server.transport);
-        println!("  Listen:      {}", config.server.listen.socket_addr());
+        println!(
+            "  Forward:     {} ({})",
+            if config.forward_proxy.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            config.forward_proxy.socket_addr()
+        );
+        println!(
+            "  Intercept:   {} hosts",
+            config.forward_proxy.hosts.intercept.len()
+        );
+        println!(
+            "  Block:       {} hosts",
+            config.forward_proxy.hosts.block.len()
+        );
         println!("  Identity:    {}", config.identity.mode);
         println!(
             "  Policy:      {} ({})",
@@ -154,51 +166,25 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Validate server configuration
-fn validate_server(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
-    let transport = &config.server.transport;
-    if !["stdio", "sse", "http"].contains(&transport.as_str()) {
-        errors.push(format!(
-            "Invalid transport '{transport}' (valid: stdio, sse, http)"
-        ));
+/// Validate forward proxy configuration
+fn validate_forward_proxy(
+    config: &SothConfig,
+    warnings: &mut Vec<String>,
+    errors: &mut Vec<String>,
+) {
+    let proxy = &config.forward_proxy;
+
+    if proxy.address.trim().is_empty() {
+        errors.push("forward_proxy.address cannot be empty".to_string());
     }
-
-    if transport != "stdio" {
-        if config.server.listen.port == 0 {
-            errors.push("Listen port cannot be 0 for SSE/HTTP transport".to_string());
-        }
-        if config.server.listen.port < 1024 && config.server.listen.port > 0 {
-            warnings.push(format!(
-                "Port {} requires root privileges",
-                config.server.listen.port
-            ));
-        }
+    if proxy.port == 0 {
+        errors.push("forward_proxy.port cannot be 0".to_string());
     }
-
-    if config.server.max_connections == 0 {
-        warnings.push("max_connections is 0, no connections will be accepted".to_string());
+    if proxy.port < 1024 {
+        warnings.push(format!("Port {} may require elevated privileges", proxy.port));
     }
-}
-
-/// Validate upstream configuration
-fn validate_upstream(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
-    let has_command = config.upstream.command.is_some();
-    let has_url = config.upstream.url.is_some();
-
-    if !has_command && !has_url {
-        errors.push("Upstream must have either 'command' or 'url' configured".to_string());
-    }
-
-    if has_command && has_url {
-        warnings.push("Both 'command' and 'url' specified for upstream; 'command' will be used for stdio transport".to_string());
-    }
-
-    if config.server.transport == "stdio" && !has_command {
-        errors.push("stdio transport requires upstream 'command' to be set".to_string());
-    }
-
-    if (config.server.transport == "sse" || config.server.transport == "http") && !has_url {
-        warnings.push("SSE/HTTP transport may require upstream 'url' to be set".to_string());
+    if proxy.hosts.intercept.is_empty() {
+        warnings.push("No intercept host patterns configured; traffic will mostly tunnel".to_string());
     }
 }
 
