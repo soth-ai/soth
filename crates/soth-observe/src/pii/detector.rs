@@ -181,7 +181,11 @@ impl PiiDetector {
         for cap in PATTERNS.ip_address.find_iter(text) {
             // Skip common non-PII IPs
             let ip = cap.as_str();
-            if ip == "127.0.0.1" || ip == "0.0.0.0" || ip.starts_with("192.168.") || ip.starts_with("10.") {
+            if ip == "127.0.0.1"
+                || ip == "0.0.0.0"
+                || ip.starts_with("192.168.")
+                || ip.starts_with("10.")
+            {
                 continue;
             }
 

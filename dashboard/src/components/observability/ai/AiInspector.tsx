@@ -15,7 +15,12 @@ import {
   ArrowDown,
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
-import { useObservabilityStore, decodeEditorContent } from "@/store/observability";
+import {
+  useObservabilityStore,
+  decodeEditorContent,
+  hasPairedPayload,
+} from "@/store/observability";
+import { fetchEventPayload } from "@/lib/event-payload";
 import { Button } from "@/components/ui/button";
 import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
 
@@ -25,6 +30,7 @@ export function AiInspector() {
   const logs = useObservabilityStore((state) => state.logs);
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
   const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
+  const hydrateLogPayload = useObservabilityStore((state) => state.hydrateLogPayload);
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<TabType>("request");
 
@@ -36,7 +42,7 @@ export function AiInspector() {
 
   // Check if this is a paired request/response event
   const hasPairedContent = useMemo(() => {
-    return !!(selectedLog?.request_content || selectedLog?.response_content);
+    return selectedLog ? hasPairedPayload(selectedLog) : false;
   }, [selectedLog]);
 
   const getEmptyResponsePlaceholder = useCallback(() => {
@@ -62,12 +68,76 @@ export function AiInspector() {
       return;
     }
     // Default to response tab for paired events, request otherwise.
-    if (selectedLog?.response_content) {
+    if (
+      selectedLog?.response_content ||
+      selectedLog?.response_preview ||
+      selectedLog?.response_content_ref
+    ) {
       setActiveTab("response");
     } else {
       setActiveTab("request");
     }
-  }, [selectedLog?.id, selectedLog?.response_content, selectedLogPart]);
+  }, [
+    selectedLog?.id,
+    selectedLog?.response_content,
+    selectedLog?.response_preview,
+    selectedLog?.response_content_ref,
+    selectedLogPart,
+  ]);
+
+  useEffect(() => {
+    if (!selectedLog) return;
+
+    let partToLoad: "request" | "response" | "content" | null = null;
+    if (hasPairedContent) {
+      if (activeTab === "request" && !selectedLog.request_content && selectedLog.request_content_ref) {
+        partToLoad = "request";
+      } else if (
+        activeTab === "response" &&
+        !selectedLog.response_content &&
+        selectedLog.response_content_ref
+      ) {
+        partToLoad = "response";
+      }
+    } else if (
+      selectedLog.content_ref &&
+      (selectedLog.content.length === 0 ||
+        selectedLog.content === (selectedLog.content_preview || ""))
+    ) {
+      partToLoad = "content";
+    }
+    if (!partToLoad) return;
+
+    let cancelled = false;
+    const loadPayload = async () => {
+      try {
+        const fullContent = await fetchEventPayload(selectedLog.id, partToLoad!);
+        if (!cancelled && fullContent) {
+          hydrateLogPayload(selectedLog.id, partToLoad!, fullContent);
+        }
+      } catch (error) {
+        console.warn("Failed to lazy-load event payload", error);
+      }
+    };
+
+    loadPayload();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedLog,
+    activeTab,
+    hasPairedContent,
+    hydrateLogPayload,
+    selectedLog?.id,
+    selectedLog?.content,
+    selectedLog?.content_ref,
+    selectedLog?.content_preview,
+    selectedLog?.request_content,
+    selectedLog?.request_content_ref,
+    selectedLog?.response_content,
+    selectedLog?.response_content_ref,
+  ]);
 
   const handleCopy = useCallback(async () => {
     if (!selectedLog) return;
@@ -100,8 +170,8 @@ export function AiInspector() {
 
     if (hasPairedContent) {
       const content = activeTab === "request"
-        ? (selectedLog.request_content || "")
-        : (selectedLog.response_content || getEmptyResponsePlaceholder());
+        ? (selectedLog.request_content || selectedLog.request_preview || "")
+        : (selectedLog.response_content || selectedLog.response_preview || getEmptyResponsePlaceholder());
       return decodeEditorContent(content);
     }
 

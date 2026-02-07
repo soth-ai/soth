@@ -121,6 +121,15 @@ impl SseStreamParser {
                 if usage.cached_tokens.is_some() {
                     self.usage.cached_tokens = usage.cached_tokens;
                 }
+                if usage.cache_read_tokens.is_some() {
+                    self.usage.cache_read_tokens = usage.cache_read_tokens;
+                }
+                if usage.cache_write_tokens.is_some() {
+                    self.usage.cache_write_tokens = usage.cache_write_tokens;
+                }
+                if usage.reasoning_tokens.is_some() {
+                    self.usage.reasoning_tokens = usage.reasoning_tokens;
+                }
                 if usage.model.is_some() {
                     self.usage.model.clone_from(&usage.model);
                 }

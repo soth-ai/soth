@@ -1,0 +1,131 @@
+//! Shared response event assembly for proxy observability rows.
+
+use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
+
+use crate::transport::usage_enrichment::ResponseUsageMeta;
+
+#[derive(Debug, Clone, Copy)]
+pub enum ResponseKind {
+    Http,
+    Stream { is_sse: bool },
+}
+
+impl ResponseKind {
+    fn preview_suffix(self, status: u16) -> String {
+        match self {
+            Self::Http => format!("HTTP {status}"),
+            Self::Stream { is_sse: true } => format!("SSE {status}"),
+            Self::Stream { is_sse: false } => format!("STREAM {status}"),
+        }
+    }
+}
+
+pub struct ResponseEventInput<'a> {
+    pub session_id: &'a str,
+    pub host: &'a str,
+    pub provider: &'a str,
+    pub agent: Option<&'a str>,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub is_agent_app: bool,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub request_content: Option<&'a str>,
+    pub response_content: Option<String>,
+    pub usage_meta: &'a ResponseUsageMeta,
+    pub fallback_model: Option<&'a str>,
+    pub response_kind: ResponseKind,
+}
+
+pub fn empty_response_placeholder(method: &str, path: &str, status: u16, is_sse: bool) -> String {
+    if is_sse {
+        return format!(
+            "[no SSE payload captured for {} {} (HTTP {})]",
+            method, path, status
+        );
+    }
+    if path
+        .to_ascii_lowercase()
+        .contains("/backend-api/codex/responses")
+    {
+        return format!(
+            "[no HTTP response body captured for {} {} (HTTP {}) - Codex output may be streamed via WebSocket]",
+            method, path, status
+        );
+    }
+    format!(
+        "[no HTTP response body captured for {} {} (HTTP {})]",
+        method, path, status
+    )
+}
+
+pub fn normalize_response_content(
+    response_content: Option<&str>,
+    request_content: Option<&str>,
+    method: &str,
+    path: &str,
+    status: u16,
+    is_sse: bool,
+    always_placeholder_on_empty: bool,
+) -> Option<String> {
+    response_content
+        .filter(|resp| !resp.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            if always_placeholder_on_empty || request_content.is_some() || method == "POST" {
+                Some(empty_response_placeholder(method, path, status, is_sse))
+            } else {
+                None
+            }
+        })
+}
+
+pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
+    let agent_name = input.agent.unwrap_or(input.provider);
+    let agent_info = AgentInfo::new(agent_name, DetectionSource::Environment);
+    let method_str = format!("{} {}", input.method, input.path);
+    let source = if input.is_agent_app {
+        EventSource::AgentApp
+    } else {
+        EventSource::AiProxy
+    };
+
+    let mut event = WrapEvent::new(input.session_id, input.host, WrapDirection::Out, agent_info)
+        .with_source(source)
+        .with_provider(input.provider)
+        .with_method(method_str)
+        .with_status_code(input.status)
+        .with_latency(input.latency_ms);
+
+    if let Some(request_body) = input.request_content {
+        event = event.with_request(request_body.to_string(), "");
+    }
+    if let Some(response_body) = input.response_content {
+        event = event.with_response(response_body.clone(), "");
+        // Keep content populated for legacy inspectors that still read `content`.
+        event = event.with_content(response_body);
+    }
+
+    // Keep compact row summary; full payload is in request_content/response_content.
+    event = event.with_content_preview(format!(
+        "→ {} {} | ← {}",
+        input.method,
+        input.path,
+        input.response_kind.preview_suffix(input.status)
+    ));
+
+    if let Some(model) = input.usage_meta.model.as_deref().or(input.fallback_model) {
+        event = event.with_model(model.to_string());
+    }
+    if let (Some(input_tokens), Some(output_tokens)) = (
+        input.usage_meta.input_tokens,
+        input.usage_meta.output_tokens,
+    ) {
+        event = event.with_tokens(input_tokens + output_tokens);
+    }
+    if let Some(cost) = input.usage_meta.cost_usd {
+        event = event.with_cost(cost);
+    }
+
+    event
+}

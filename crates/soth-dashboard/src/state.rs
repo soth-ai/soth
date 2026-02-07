@@ -467,7 +467,10 @@ impl DashboardState {
 
         // Update tokens by provider
         if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
-            let tokens = proxy.tokens_by_provider.entry(provider.to_string()).or_default();
+            let tokens = proxy
+                .tokens_by_provider
+                .entry(provider.to_string())
+                .or_default();
             tokens.input_tokens += input;
             tokens.output_tokens += output;
             proxy.total_tokens += input + output;

@@ -3,9 +3,8 @@
 use crate::event_store::EventStore;
 use axum::{
     extract::{
-        Query,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
     response::IntoResponse,
 };

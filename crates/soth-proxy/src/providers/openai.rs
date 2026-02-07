@@ -50,57 +50,103 @@ impl AiProvider for OpenAiProvider {
     fn extract_usage(&self, body: &[u8]) -> Option<ProviderUsage> {
         let json: serde_json::Value = serde_json::from_slice(body).ok()?;
 
-        let usage = json.get("usage")?;
-        let input_tokens = usage.get("prompt_tokens")?.as_u64()?;
-        let output_tokens = usage.get("completion_tokens")?.as_u64()?;
+        // OpenAI supports multiple response schemas:
+        // 1) Chat Completions: usage.prompt_tokens / usage.completion_tokens
+        // 2) Responses API: usage.input_tokens / usage.output_tokens
+        // 3) Nested response wrappers: response.usage / response.model
+        let usage = json
+            .get("usage")
+            .or_else(|| json.get("response").and_then(|r| r.get("usage")))?;
+
+        let input_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .or_else(|| usage.get("input_tokens").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .or_else(|| usage.get("output_tokens").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        let cache_read_tokens = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(|v| v.as_u64())
+            });
+        let cache_write_tokens = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cache_creation_tokens"))
+                    .and_then(|v| v.as_u64())
+            });
+        let reasoning_tokens = usage
+            .get("completion_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                usage
+                    .get("output_tokens_details")
+                    .and_then(|d| d.get("reasoning_tokens"))
+                    .and_then(|v| v.as_u64())
+            });
 
         let model = json
             .get("model")
+            .or_else(|| json.get("response").and_then(|r| r.get("model")))
             .and_then(|m| m.as_str())
             .map(|s| s.to_string());
 
         Some(ProviderUsage {
             input_tokens,
             output_tokens,
-            cached_tokens: None,
+            cached_tokens: cache_read_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
             model,
         })
     }
 
     fn parse_sse_chunk(&self, chunk: &str) -> Option<SseEvent> {
-        // OpenAI SSE format: "data: {...}\n\n" or "data: [DONE]\n\n"
+        // OpenAI SSE formats:
+        // - Chat Completions: data: {...} / data: [DONE]
+        // - Responses API: event: response.* + data: {...}
         let chunk = chunk.trim();
-
-        if !chunk.starts_with("data: ") {
-            return None;
+        let mut event_type: Option<&str> = None;
+        let mut data_line: Option<&str> = None;
+        for line in chunk.lines() {
+            let line = line.trim();
+            if let Some(evt) = line.strip_prefix("event: ") {
+                event_type = Some(evt.trim());
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                data_line = Some(data.trim());
+            }
         }
+        let data = data_line?;
 
-        let data = &chunk[6..]; // Skip "data: "
-
-        if data == "[DONE]" {
+        if data == "[DONE]" || event_type == Some("done") {
             return Some(SseEvent::Done);
         }
 
         // Try to parse as JSON
         let json: serde_json::Value = serde_json::from_str(data).ok()?;
 
-        // Check for usage (appears in final chunk with stream_options)
-        if let Some(usage) = json.get("usage") {
-            if let (Some(input), Some(output)) = (
-                usage.get("prompt_tokens").and_then(|v| v.as_u64()),
-                usage.get("completion_tokens").and_then(|v| v.as_u64()),
-            ) {
-                let model = json
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string());
-                return Some(SseEvent::Usage(ProviderUsage {
-                    input_tokens: input,
-                    output_tokens: output,
-                    cached_tokens: None,
-                    model,
-                }));
+        // Usage chunks appear in final chunk with stream_options/include_usage
+        if let Some(usage) = self.extract_usage(data.as_bytes()) {
+            if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                return Some(SseEvent::Usage(usage));
             }
+        }
+
+        if event_type == Some("response.completed") {
+            return Some(SseEvent::Done);
         }
 
         // Check for content in choices
@@ -113,6 +159,26 @@ impl AiProvider for OpenAiProvider {
                         }
                     }
                 }
+            }
+        }
+
+        // OpenAI Responses API content delta
+        if let Some(delta) = json.get("delta").and_then(|d| d.as_str()) {
+            if !delta.is_empty() {
+                return Some(SseEvent::Content(delta.to_string()));
+            }
+        }
+        if let Some(text) = json
+            .get("output_text")
+            .and_then(|d| d.as_str())
+            .or_else(|| {
+                json.get("response")
+                    .and_then(|r| r.get("output_text"))
+                    .and_then(|d| d.as_str())
+            })
+        {
+            if !text.is_empty() {
+                return Some(SseEvent::Content(text.to_string()));
             }
         }
 
@@ -180,6 +246,32 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_usage_responses_api() {
+        let provider = OpenAiProvider::new();
+        let body = r#"{
+            "id": "resp_123",
+            "model": "gpt-5",
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "prompt_tokens_details": {
+                    "cached_tokens": 30
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": 12
+                }
+            }
+        }"#;
+
+        let usage = provider.extract_usage(body.as_bytes()).unwrap();
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.cache_read_tokens, Some(30));
+        assert_eq!(usage.reasoning_tokens, Some(12));
+        assert_eq!(usage.model, Some("gpt-5".to_string()));
+    }
+
+    #[test]
     fn test_parse_sse_content() {
         let provider = OpenAiProvider::new();
         let chunk = r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#;
@@ -213,6 +305,33 @@ mod tests {
                 assert_eq!(usage.output_tokens, 5);
             }
             _ => panic!("Expected Usage event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sse_usage_responses_event() {
+        let provider = OpenAiProvider::new();
+        let chunk = r#"event: response.completed
+data: {"response":{"model":"gpt-5","usage":{"input_tokens":11,"output_tokens":7}}}"#;
+
+        match provider.parse_sse_chunk(chunk) {
+            Some(SseEvent::Usage(usage)) => {
+                assert_eq!(usage.input_tokens, 11);
+                assert_eq!(usage.output_tokens, 7);
+            }
+            _ => panic!("Expected Usage event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sse_responses_delta() {
+        let provider = OpenAiProvider::new();
+        let chunk = r#"event: response.output_text.delta
+data: {"delta":"Hello"}"#;
+
+        match provider.parse_sse_chunk(chunk) {
+            Some(SseEvent::Content(text)) => assert_eq!(text, "Hello"),
+            _ => panic!("Expected Content event"),
         }
     }
 

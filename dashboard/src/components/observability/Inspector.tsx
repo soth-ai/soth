@@ -22,12 +22,14 @@ import { toast } from "sonner";
 import {
   useObservabilityStore,
   decodeEditorContent,
+  hasPairedPayload,
   parseLogMessage,
   findCorrelatedRequest,
   calculateLatency,
   type LogEntry,
   type ParsedMessage,
 } from "@/store/observability";
+import { fetchEventPayload } from "@/lib/event-payload";
 import { Button } from "@/components/ui/button";
 import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
 
@@ -133,6 +135,7 @@ export function Inspector() {
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
   const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
   const selectLog = useObservabilityStore((state) => state.selectLog);
+  const hydrateLogPayload = useObservabilityStore((state) => state.hydrateLogPayload);
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<"request" | "response">("request");
 
@@ -143,7 +146,7 @@ export function Inspector() {
   );
 
   const hasPairedContent = useMemo(
-    () => !!(selectedLog?.request_content || selectedLog?.response_content),
+    () => (selectedLog ? hasPairedPayload(selectedLog) : false),
     [selectedLog]
   );
 
@@ -160,8 +163,14 @@ export function Inspector() {
   const displayContent = useMemo(() => {
     if (!selectedLog) return "";
     if (!hasPairedContent) return selectedLog.content;
-    if (activeTab === "request") return selectedLog.request_content || "";
-    return selectedLog.response_content || getEmptyResponsePlaceholder();
+    if (activeTab === "request") {
+      return selectedLog.request_content || selectedLog.request_preview || "";
+    }
+    return (
+      selectedLog.response_content ||
+      selectedLog.response_preview ||
+      getEmptyResponsePlaceholder()
+    );
   }, [selectedLog, hasPairedContent, activeTab, getEmptyResponsePlaceholder]);
 
   const editorPayload = useMemo(
@@ -203,8 +212,73 @@ export function Inspector() {
       setActiveTab("response");
       return;
     }
-    setActiveTab(selectedLog.response_content ? "response" : "request");
-  }, [selectedLog, selectedLogPart, hasPairedContent, selectedLog?.response_content]);
+    setActiveTab(
+      selectedLog.response_content || selectedLog.response_preview || selectedLog.response_content_ref
+        ? "response"
+        : "request"
+    );
+  }, [
+    selectedLog,
+    selectedLogPart,
+    hasPairedContent,
+    selectedLog?.response_content,
+    selectedLog?.response_preview,
+    selectedLog?.response_content_ref,
+  ]);
+
+  useEffect(() => {
+    if (!selectedLog) return;
+
+    let partToLoad: "request" | "response" | "content" | null = null;
+    if (hasPairedContent) {
+      if (activeTab === "request" && !selectedLog.request_content && selectedLog.request_content_ref) {
+        partToLoad = "request";
+      } else if (
+        activeTab === "response" &&
+        !selectedLog.response_content &&
+        selectedLog.response_content_ref
+      ) {
+        partToLoad = "response";
+      }
+    } else if (
+      selectedLog.content_ref &&
+      (selectedLog.content.length === 0 ||
+        selectedLog.content === (selectedLog.content_preview || ""))
+    ) {
+      partToLoad = "content";
+    }
+
+    if (!partToLoad) return;
+
+    let cancelled = false;
+    const loadPayload = async () => {
+      try {
+        const fullContent = await fetchEventPayload(selectedLog.id, partToLoad!);
+        if (!cancelled && fullContent) {
+          hydrateLogPayload(selectedLog.id, partToLoad!, fullContent);
+        }
+      } catch (error) {
+        console.warn("Failed to lazy-load event payload", error);
+      }
+    };
+
+    loadPayload();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedLog,
+    activeTab,
+    hasPairedContent,
+    hydrateLogPayload,
+    selectedLog?.id,
+    selectedLog?.content,
+    selectedLog?.content_ref,
+    selectedLog?.request_content,
+    selectedLog?.request_content_ref,
+    selectedLog?.response_content,
+    selectedLog?.response_content_ref,
+  ]);
 
   const handleCopy = useCallback(async () => {
     if (!selectedLog) return;

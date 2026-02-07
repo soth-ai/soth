@@ -813,6 +813,7 @@ fn default_intercept_hosts() -> Vec<String> {
         "bedrock-runtime.*.amazonaws.com".to_string(),
         // ===== Microsoft/GitHub =====
         "api.githubcopilot.com".to_string(),
+        "*.githubcopilot.com".to_string(),
         "copilot-proxy.githubusercontent.com".to_string(),
         "*.ingest.monitor.azure.com".to_string(), // Azure AI telemetry
         // ===== Mistral =====
@@ -882,10 +883,16 @@ fn default_intercept_hosts() -> Vec<String> {
         "api.reka.ai".to_string(),
         // ===== Code Completion Tools =====
         "api2.cursor.sh".to_string(),
+        "api3.cursor.sh".to_string(),
         "*.cursor.sh".to_string(),
         "api.vercel.ai".to_string(),
         "*.tabnine.com".to_string(),
+        "cloud.zed.dev".to_string(),
+        "*.zed.dev".to_string(),
         "*.codeium.com".to_string(),
+        "api.jetbrains.ai".to_string(),
+        "*.jetbrains.ai".to_string(),
+        "codewhisperer.*.amazonaws.com".to_string(),
         "*.sourcegraph.com".to_string(), // Cody
         // ===== Inference Platforms =====
         "*.modal.com".to_string(),
@@ -1603,8 +1610,16 @@ upstream:
             // AWS Bedrock
             "bedrock.us-east-1.amazonaws.com",
             "bedrock-runtime.us-west-2.amazonaws.com",
+            // Amazon Q / CodeWhisperer
+            "codewhisperer.us-east-1.amazonaws.com",
             // GitHub Copilot
             "api.githubcopilot.com",
+            "enterprise.githubcopilot.com",
+            // Cursor / Windsurf / Zed / Junie
+            "api2.cursor.sh",
+            "server.codeium.com",
+            "cloud.zed.dev",
+            "api.jetbrains.ai",
             // Mistral
             "api.mistral.ai",
             // Cohere
