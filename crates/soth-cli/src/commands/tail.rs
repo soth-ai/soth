@@ -1,21 +1,17 @@
 //! Tail command - Stream live events
 //!
 //! Enhanced version with filtering by agent, server, tool, and output formats.
-//! Uses notify-based watching for JSONL and polling for SQLite backends.
+//! Uses polling against SQLite event storage.
 
 use crate::style;
 use anyhow::{Context, Result};
 use clap::Args;
 use owo_colors::OwoColorize;
 use rusqlite::Connection;
-use soth_core::event_logger::{default_event_log_read_path, is_sqlite_event_log_path};
+use soth_core::event_logger::default_event_log_write_path;
 use soth_core::types::WrapEvent;
-use soth_core::watch::{FileWatcher, WatchEvent};
-use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
-use tracing::{debug, info};
+use tracing::info;
 
 /// Arguments for the tail command
 #[derive(Args, Debug)]
@@ -59,7 +55,7 @@ pub struct TailArgs {
 
 /// Get the default log path
 fn get_log_path() -> Result<PathBuf> {
-    default_event_log_read_path().context("Could not resolve default event log path")
+    default_event_log_write_path().context("Could not resolve default event log path")
 }
 
 /// Run tail command
@@ -93,128 +89,7 @@ pub async fn run(args: TailArgs) -> Result<()> {
         print_compact_header();
     }
 
-    if is_sqlite_event_log_path(&log_path) {
-        tail_sqlite(log_path, &args).await?;
-    } else {
-        tail_jsonl(log_path, &args).await?;
-    }
-
-    Ok(())
-}
-
-async fn tail_jsonl(log_path: PathBuf, args: &TailArgs) -> Result<()> {
-    let metadata = tokio::fs::metadata(&log_path).await?;
-    let mut position = metadata.len();
-
-    let watcher_result = FileWatcher::new(log_path.clone());
-    let use_polling = watcher_result.is_err();
-
-    if use_polling {
-        style::warning("Using polling mode (file watcher unavailable)");
-    } else {
-        debug!("Using notify-based file watching for instant events");
-    }
-
-    let mut watcher = watcher_result.ok();
-    let mut waiting_for_recreation = false;
-    let mut line = String::new();
-
-    loop {
-        if let Some(ref mut w) = watcher {
-            tokio::select! {
-                event = w.next() => {
-                    match event {
-                        Some(WatchEvent::Modified) | Some(WatchEvent::Created) => {}
-                        Some(WatchEvent::Removed) => {
-                            waiting_for_recreation = true;
-                            position = 0;
-                            style::warning("Log file removed, waiting for recreation...");
-                            continue;
-                        }
-                        Some(WatchEvent::Error(e)) => {
-                            style::warning(&format!("Watch error: {e}"));
-                            continue;
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    break;
-                }
-            }
-        } else {
-            tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
-                _ = tokio::signal::ctrl_c() => {
-                    break;
-                }
-            }
-        }
-
-        let current_metadata = match tokio::fs::metadata(&log_path).await {
-            Ok(m) => {
-                if waiting_for_recreation {
-                    style::info("Log file recreated, tailing from the start.");
-                    waiting_for_recreation = false;
-                }
-                m
-            }
-            Err(_) => {
-                if !waiting_for_recreation {
-                    style::warning("Log file unavailable, waiting for recreation...");
-                    waiting_for_recreation = true;
-                }
-                position = 0;
-                continue;
-            }
-        };
-
-        let (normalized_position, reset_position) =
-            normalize_tail_position(position, current_metadata.len());
-        if reset_position {
-            style::warning("Log file was truncated, tail position reset.");
-        }
-        position = normalized_position;
-
-        if current_metadata.len() > position {
-            let file = File::open(&log_path).await?;
-            let mut reader = BufReader::new(file);
-            reader.seek(SeekFrom::Start(position)).await?;
-            let mut next_position = position;
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let candidate_position = next_position + n as u64;
-                        if !line.ends_with('\n') {
-                            break;
-                        }
-
-                        if let Ok(event) = serde_json::from_str::<WrapEvent>(&line) {
-                            if matches_filters(&event, args) {
-                                format_event(&event, &args.format);
-                            }
-                        } else if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-                            if matches_legacy_filters(&event, args) {
-                                format_legacy_event(&event, &args.format);
-                            }
-                        }
-
-                        next_position = candidate_position;
-                    }
-                    Err(e) => {
-                        style::error(&format!("Read error: {e}"));
-                        break;
-                    }
-                }
-            }
-
-            position = next_position;
-        }
-    }
+    tail_sqlite(log_path, &args).await?;
 
     Ok(())
 }
@@ -271,41 +146,8 @@ fn print_compact_header() {
     println!("{}", "\u{2500}".repeat(70).dimmed());
 }
 
-fn normalize_tail_position(position: u64, current_len: u64) -> (u64, bool) {
-    if current_len < position {
-        (0, true)
-    } else {
-        (position, false)
-    }
-}
-
 async fn show_historical_events(log_path: &PathBuf, args: &TailArgs) -> Result<()> {
-    if is_sqlite_event_log_path(log_path) {
-        show_historical_events_sqlite(log_path, args).await
-    } else {
-        show_historical_events_jsonl(log_path, args).await
-    }
-}
-
-async fn show_historical_events_jsonl(log_path: &PathBuf, args: &TailArgs) -> Result<()> {
-    let content = tokio::fs::read_to_string(log_path).await?;
-    let lines: Vec<&str> = content.lines().collect();
-
-    let mut events: Vec<WrapEvent> = Vec::new();
-    for line in lines.iter().rev() {
-        if let Ok(event) = serde_json::from_str::<WrapEvent>(line) {
-            if matches_filters(&event, args) {
-                events.push(event);
-                if events.len() >= args.last {
-                    break;
-                }
-            }
-        }
-    }
-
-    events.reverse();
-    print_historical_events(&events, args);
-    Ok(())
+    show_historical_events_sqlite(log_path, args).await
 }
 
 async fn show_historical_events_sqlite(log_path: &PathBuf, args: &TailArgs) -> Result<()> {
@@ -515,24 +357,6 @@ fn matches_filters(event: &WrapEvent, args: &TailArgs) -> bool {
     true
 }
 
-fn matches_legacy_filters(event: &serde_json::Value, args: &TailArgs) -> bool {
-    // Session filter
-    if let Some(ref session) = args.session {
-        if event.get("session_id").and_then(|s| s.as_str()) != Some(session) {
-            return false;
-        }
-    }
-
-    // Method filter
-    if let Some(ref method) = args.method {
-        if event.get("method").and_then(|m| m.as_str()) != Some(method) {
-            return false;
-        }
-    }
-
-    true
-}
-
 fn format_event(event: &WrapEvent, format: &str) {
     match format {
         "json" => {
@@ -677,38 +501,6 @@ fn format_verbose(event: &WrapEvent) {
     }
 }
 
-fn format_legacy_event(event: &serde_json::Value, format: &str) {
-    match format {
-        "json" => {
-            if let Ok(json) = serde_json::to_string(event) {
-                println!("{}", json);
-            }
-        }
-        _ => {
-            // Simple text format for legacy events
-            let timestamp = event
-                .get("timestamp")
-                .and_then(|t| t.as_str())
-                .unwrap_or("-");
-            let direction = event
-                .get("direction")
-                .and_then(|d| d.as_str())
-                .unwrap_or("?");
-            let method = event.get("method").and_then(|m| m.as_str()).unwrap_or("-");
-
-            let time = timestamp.split('T').nth(1).unwrap_or(timestamp);
-            let time = time.split('.').next().unwrap_or(time);
-
-            let arrow = if direction == "in" {
-                "\u{2192}".cyan().to_string()
-            } else {
-                "\u{2190}".green().to_string()
-            };
-            println!("{} {} {}", time.dimmed(), arrow, method);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,20 +570,6 @@ mod tests {
 
         args.tool = Some("delete".to_string());
         assert!(!matches_filters(&event, &args));
-    }
-
-    #[test]
-    fn test_normalize_tail_position_resets_after_truncate() {
-        let (position, reset) = normalize_tail_position(1024, 100);
-        assert_eq!(position, 0);
-        assert!(reset);
-    }
-
-    #[test]
-    fn test_normalize_tail_position_keeps_position_when_growing() {
-        let (position, reset) = normalize_tail_position(100, 1024);
-        assert_eq!(position, 100);
-        assert!(!reset);
     }
 
     #[test]
