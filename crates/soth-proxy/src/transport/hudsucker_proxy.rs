@@ -18,6 +18,10 @@ use hudsucker::{
 };
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use rmcp::model::{
+    CustomNotification as RmcpCustomNotification, CustomRequest as RmcpCustomRequest,
+    JsonRpcMessage as RmcpJsonRpcMessage,
+};
 use serde::Deserialize;
 use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
 use soth_core::types::policy::PolicyInputBuilder;
@@ -36,6 +40,7 @@ use soth_dashboard::{DashboardState, DenialEntry};
 
 use crate::error::ProxyError;
 use crate::providers::ProviderRegistry;
+use crate::protocol::mcp::methods as mcp_methods;
 use crate::transport::host_fingerprint;
 use crate::transport::response_event_builder::{
     build_paired_response_event, empty_response_placeholder, normalize_response_content,
@@ -49,14 +54,8 @@ use soth_core::config::{ForwardProxyConfig, HostAction, HostFilterConfig};
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
 
-/// Minimal JSON-RPC request structure for detection
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: Option<String>,
-    method: Option<String>,
-    #[serde(default)]
-    id: Option<serde_json::Value>,
-}
+type RmcpWireJsonRpcMessage =
+    RmcpJsonRpcMessage<RmcpCustomRequest, serde_json::Value, RmcpCustomNotification>;
 
 /// AI request body structure for model extraction
 #[derive(Debug, Deserialize)]
@@ -72,10 +71,11 @@ struct AiRequestBody {
 #[derive(Debug, Clone)]
 struct PendingRequest {
     request_id: u64,
+    event_id: String,
     host: String,
     path: String,
     method: String,
-    provider: &'static str,
+    provider: Option<&'static str>,
     agent: Option<&'static str>,
     model: Option<String>,
     started_at: Instant,
@@ -83,6 +83,10 @@ struct PendingRequest {
     request_content: Option<String>,
     /// Whether this is traffic from an agent app (chatgpt.com, claude.ai) vs direct API
     is_agent_app: bool,
+    /// JSON-RPC MCP method (when this request is identified as MCP traffic)
+    mcp_method: Option<String>,
+    /// Whether this pending request should be emitted as MCP source.
+    is_mcp_jsonrpc: bool,
 }
 
 /// Thread-safe store for pending requests
@@ -93,6 +97,113 @@ fn request_id_from_ctx(ctx: &HttpContext) -> u64 {
     // Use the context's internal connection/request tracking
     // Hash the pointer address as a simple unique ID
     ctx as *const _ as u64
+}
+
+fn mcp_path_hint(path: &str) -> bool {
+    let path_lower = path.to_ascii_lowercase();
+    path_lower.contains("/mcp") || path_lower.contains("/jsonrpc")
+}
+
+fn is_likely_mcp_method(method: &str) -> bool {
+    matches!(
+        method,
+        mcp_methods::INITIALIZE
+            | mcp_methods::INITIALIZED
+            | mcp_methods::PING
+            | mcp_methods::CANCELLED
+            | mcp_methods::PROGRESS
+            | mcp_methods::TOOLS_LIST
+            | mcp_methods::TOOLS_CALL
+            | mcp_methods::RESOURCES_LIST
+            | mcp_methods::RESOURCES_READ
+            | mcp_methods::RESOURCES_SUBSCRIBE
+            | mcp_methods::RESOURCES_UNSUBSCRIBE
+            | mcp_methods::RESOURCES_UPDATED
+            | mcp_methods::RESOURCES_LIST_CHANGED
+            | mcp_methods::PROMPTS_LIST
+            | mcp_methods::PROMPTS_GET
+            | mcp_methods::PROMPTS_LIST_CHANGED
+            | mcp_methods::LOGGING_SET_LEVEL
+            | mcp_methods::LOGGING_MESSAGE
+            | mcp_methods::SAMPLING_CREATE_MESSAGE
+    ) || method.starts_with("tools/")
+        || method.starts_with("resources/")
+        || method.starts_with("prompts/")
+        || method.starts_with("notifications/")
+        || method.starts_with("sampling/")
+        || method.starts_with("roots/")
+        || method.starts_with("tasks/")
+        || method.starts_with("completion/")
+        || method.starts_with("elicitation/")
+        || method.starts_with("logging/")
+}
+
+fn extract_mcp_request_method_from_json(
+    value: serde_json::Value,
+    path_hint_is_mcp: bool,
+) -> Option<String> {
+    match serde_json::from_value::<RmcpWireJsonRpcMessage>(value).ok()? {
+        RmcpWireJsonRpcMessage::Request(req) => {
+            if is_likely_mcp_method(&req.request.method) || path_hint_is_mcp {
+                Some(req.request.method)
+            } else {
+                None
+            }
+        }
+        RmcpWireJsonRpcMessage::Notification(notification) => {
+            if is_likely_mcp_method(&notification.notification.method) || path_hint_is_mcp {
+                Some(notification.notification.method)
+            } else {
+                None
+            }
+        }
+        RmcpWireJsonRpcMessage::Response(_) | RmcpWireJsonRpcMessage::Error(_) => None,
+    }
+}
+
+fn extract_mcp_request_method(payload: &str, path: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let path_hint_is_mcp = mcp_path_hint(path);
+    match value {
+        serde_json::Value::Object(_) => extract_mcp_request_method_from_json(value, path_hint_is_mcp),
+        serde_json::Value::Array(items) => {
+            let mut methods = Vec::new();
+            for item in items {
+                if let Some(method) = extract_mcp_request_method_from_json(item, path_hint_is_mcp)
+                {
+                    methods.push(method);
+                }
+            }
+            if methods.is_empty() {
+                None
+            } else if methods.len() == 1 {
+                methods.into_iter().next()
+            } else {
+                Some(format!("batch:{} (+{})", methods[0], methods.len() - 1))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_jsonrpc_response_for_mcp(payload: &str, path: &str) -> bool {
+    if !mcp_path_hint(path) {
+        return false;
+    }
+    let value: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let items: Vec<serde_json::Value> = match value {
+        serde_json::Value::Array(values) => values,
+        other => vec![other],
+    };
+    items.into_iter().any(|item| {
+        matches!(
+            serde_json::from_value::<RmcpWireJsonRpcMessage>(item),
+            Ok(RmcpWireJsonRpcMessage::Response(_)) | Ok(RmcpWireJsonRpcMessage::Error(_))
+        )
+    })
 }
 
 const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
@@ -1320,8 +1431,10 @@ impl HttpHandler for AiProxyHandler {
             .get("content-encoding")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_lowercase());
-        let should_inspect_body = is_post && provider.is_some(); // Always inspect AI POST requests
+        // Inspect POST JSON requests too so JSON-RPC MCP traffic can be tagged as source=mcp.
+        let should_inspect_body = is_post && (provider.is_some() || is_json);
         let provider_registry = self.provider_registry.clone();
+        let event_logger = self.event_logger.clone();
 
         debug!(
             is_post = is_post,
@@ -1399,6 +1512,13 @@ impl HttpHandler for AiProxyHandler {
                 (None, None, req)
             };
             let agent = Self::detect_agent_with_context(ua_agent, &host, &path, model.as_deref());
+            let mcp_request_method = if !is_connect {
+                body_content
+                    .as_deref()
+                    .and_then(|content| extract_mcp_request_method(content, &path))
+            } else {
+                None
+            };
 
             if !is_connect {
                 if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
@@ -1546,21 +1666,72 @@ impl HttpHandler for AiProxyHandler {
                         request_id,
                         PendingRequest {
                             request_id,
+                            event_id: uuid::Uuid::new_v4().to_string(),
                             host: host.clone(),
                             path: display_path.clone(),
                             method: http_method.clone(),
-                            provider,
+                            provider: Some(provider),
                             agent,
                             model: model.clone(),
                             started_at: Instant::now(),
                             request_content: body_content,
                             is_agent_app: Self::is_agent_app(&host),
+                            mcp_method: None,
+                            is_mcp_jsonrpc: false,
                         },
                     );
                 }
 
                 // Note: We don't log request events separately anymore.
                 // Instead, we log a paired request/response event when the response arrives.
+            } else if let Some(mcp_method) = mcp_request_method {
+                info!(
+                    host = %host,
+                    path = %path,
+                    method = %http_method,
+                    mcp_method = %mcp_method,
+                    "MCP JSON-RPC request"
+                );
+
+                if let Some(ref logger) = event_logger {
+                    let mcp_agent = AgentInfo::new(
+                        agent.unwrap_or("mcp"),
+                        DetectionSource::Environment,
+                    );
+                    let mut event = WrapEvent::new(
+                        &session_id,
+                        &host,
+                        WrapDirection::In,
+                        mcp_agent,
+                    )
+                    .with_source(EventSource::Mcp)
+                    .with_method(mcp_method.clone());
+                    if let Some(ref request_body) = body_content {
+                        event = event.with_content(request_body.clone());
+                    }
+                    event = event.with_content_preview(format!("→ {} {}", http_method, path));
+                    logger.log(&event);
+                }
+
+                let mut pending = pending_requests.lock();
+                pending.insert(
+                    request_id,
+                    PendingRequest {
+                        request_id,
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        host: host.clone(),
+                        path: path.clone(),
+                        method: http_method.clone(),
+                        provider: None,
+                        agent,
+                        model: None,
+                        started_at: Instant::now(),
+                        request_content: None,
+                        is_agent_app: false,
+                        mcp_method: Some(mcp_method),
+                        is_mcp_jsonrpc: true,
+                    },
+                );
             } else {
                 debug!(host = %host, path = %path, "Request (non-AI)");
             }
@@ -1623,11 +1794,97 @@ impl HttpHandler for AiProxyHandler {
             };
 
             let latency_ms = pending.started_at.elapsed().as_millis() as u64;
+            if pending.is_mcp_jsonrpc {
+                let (body_content, res) = if is_json {
+                    let (parts, body) = res.into_parts();
+                    match body.collect().await {
+                        Ok(collected) => {
+                            let bytes = collected.to_bytes();
+                            let (_, body_str) =
+                                decode_payload_for_logging(&bytes, content_encoding.as_deref());
+                            let new_body = Body::from(Full::new(bytes));
+                            let res = Response::from_parts(parts, new_body);
+                            (Some(body_str), res)
+                        }
+                        Err(_) => {
+                            let res = Response::from_parts(parts, Body::empty());
+                            (None, res)
+                        }
+                    }
+                } else {
+                    (None, res)
+                };
+
+                if let Some(ref logger) = event_logger {
+                    let mcp_agent =
+                        AgentInfo::new(pending.agent.unwrap_or("mcp"), DetectionSource::Environment);
+                    let method_name = pending
+                        .mcp_method
+                        .clone()
+                        .unwrap_or_else(|| format!("{} {}", pending.method, pending.path));
+                    let response_payload = body_content.unwrap_or_else(|| {
+                        format!(
+                            "[no JSON-RPC response body captured for {} {} (HTTP {})]",
+                            pending.method, pending.path, status
+                        )
+                    });
+
+                    let mut event = WrapEvent::new(
+                        &session_id,
+                        &pending.host,
+                        WrapDirection::Out,
+                        mcp_agent,
+                    )
+                    .with_source(EventSource::Mcp)
+                    .with_method(method_name.clone())
+                    .with_status_code(status)
+                    .with_latency(latency_ms)
+                    .with_content(response_payload);
+                    event.id = pending.event_id.clone();
+                    event = event.with_content_preview(format!("← {} (HTTP {})", method_name, status));
+                    logger.log(&event);
+                }
+
+                return res;
+            }
+
+            let provider = pending.provider.unwrap_or("unknown");
             let is_codex_response_path = pending
                 .path
                 .to_ascii_lowercase()
                 .contains("/backend-api/codex/responses");
             let mut response_usage = ResponseUsageMeta::default();
+
+            // Streamed responses can be long-lived and may get dropped before completion.
+            // Emit a placeholder row immediately, then overwrite by ID when stream capture finishes.
+            if is_sse || is_codex_response_path {
+                if let Some(ref logger) = event_logger {
+                    let placeholder = empty_response_placeholder(
+                        &pending.method,
+                        &pending.path,
+                        status,
+                        is_sse,
+                    );
+                    let mut event = build_paired_response_event(ResponseEventInput {
+                        session_id: &session_id,
+                        host: &pending.host,
+                        provider,
+                        agent: pending.agent,
+                        method: &pending.method,
+                        path: &pending.path,
+                        is_agent_app: pending.is_agent_app,
+                        status,
+                        latency_ms,
+                        request_content: pending.request_content.as_deref(),
+                        response_content: Some(placeholder),
+                        usage_meta: &response_usage,
+                        fallback_model: pending.model.as_deref(),
+                        response_kind: ResponseKind::Stream { is_sse },
+                    });
+                    event.id = pending.event_id.clone();
+                    logger.log(&event);
+                }
+            }
 
             // For JSON responses, capture the body for logging (with decompression)
             // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
@@ -1646,7 +1903,7 @@ impl HttpHandler for AiProxyHandler {
                         response_usage = extract_usage_meta_from_decoded_payload(
                             &provider_registry,
                             &pricing_catalog,
-                            pending.provider,
+                            provider,
                             &pending.host,
                             &decoded_bytes,
                             false,
@@ -1678,6 +1935,7 @@ impl HttpHandler for AiProxyHandler {
                 let log_latency_ms = latency_ms;
                 let log_content_encoding = content_encoding.clone();
                 let log_is_sse = is_sse;
+                let log_event_id = pending.event_id.clone();
                 let log_provider_registry = provider_registry.clone();
                 let log_pricing_catalog = pricing_catalog.clone();
                 #[cfg(feature = "dashboard")]
@@ -1737,7 +1995,7 @@ impl HttpHandler for AiProxyHandler {
                     let usage_meta = extract_usage_meta_from_decoded_payload(
                         &log_provider_registry,
                         &log_pricing_catalog,
-                        log_pending.provider,
+                        provider,
                         &log_pending.host,
                         &decoded_bytes,
                         log_is_sse,
@@ -1766,7 +2024,7 @@ impl HttpHandler for AiProxyHandler {
                         let request_id_str = log_pending.request_id.to_string();
                         dashboard.record_proxy_response(
                             Some(&request_id_str),
-                            log_pending.provider,
+                            provider,
                             status,
                             log_latency_ms,
                             usage_meta
@@ -1780,10 +2038,10 @@ impl HttpHandler for AiProxyHandler {
                     }
 
                     if let Some(ref logger) = log_event_logger {
-                        let event = build_paired_response_event(ResponseEventInput {
+                        let mut event = build_paired_response_event(ResponseEventInput {
                             session_id: &log_session_id,
                             host: &log_pending.host,
-                            provider: log_pending.provider,
+                            provider,
                             agent: log_pending.agent,
                             method: &log_pending.method,
                             path: &log_pending.path,
@@ -1796,6 +2054,7 @@ impl HttpHandler for AiProxyHandler {
                             fallback_model: log_pending.model.as_deref(),
                             response_kind: ResponseKind::Stream { is_sse: log_is_sse },
                         });
+                        event.id = log_event_id.clone();
 
                         logger.log(&event);
                         debug!("Logged paired streamed request/response");
@@ -1815,7 +2074,7 @@ impl HttpHandler for AiProxyHandler {
             };
 
             info!(
-                provider = pending.provider,
+                provider = provider,
                 host = %pending.host,
                 path = %pending.path,
                 status = status,
@@ -1829,7 +2088,7 @@ impl HttpHandler for AiProxyHandler {
                     let request_id_str = pending.request_id.to_string();
                     dashboard.record_proxy_response(
                         Some(&request_id_str),
-                        pending.provider,
+                        provider,
                         status,
                         latency_ms,
                         response_usage.model.as_deref().or(pending.model.as_deref()),
@@ -1852,10 +2111,10 @@ impl HttpHandler for AiProxyHandler {
                         false,
                         false,
                     );
-                    let event = build_paired_response_event(ResponseEventInput {
+                    let mut event = build_paired_response_event(ResponseEventInput {
                         session_id: &session_id,
                         host: &pending.host,
-                        provider: pending.provider,
+                        provider,
                         agent: pending.agent,
                         method: &pending.method,
                         path: &pending.path,
@@ -1868,6 +2127,7 @@ impl HttpHandler for AiProxyHandler {
                         fallback_model: pending.model.as_deref(),
                         response_kind: ResponseKind::Http,
                     });
+                    event.id = pending.event_id.clone();
                     logger.log(&event);
                 }
             }
@@ -1956,6 +2216,27 @@ impl WebSocketHandler for AiWebSocketHandler {
         async move {
             match &msg {
                 Message::Text(text) => {
+                    let mcp_method = extract_mcp_request_method(text, &ws_path);
+                    let is_mcp_response = mcp_method.is_none()
+                        && is_jsonrpc_response_for_mcp(text, &ws_path);
+                    let (source, ws_method) = if let Some(method) = mcp_method {
+                        (EventSource::Mcp, method)
+                    } else if is_mcp_response {
+                        (EventSource::Mcp, "response".to_string())
+                    } else {
+                        let source = if is_agent_app {
+                            EventSource::AgentApp
+                        } else {
+                            EventSource::AiProxy
+                        };
+                        let method = if ws_path == "/" {
+                            "WebSocket".to_string()
+                        } else {
+                            format!("WebSocket {}", ws_path)
+                        };
+                        (source, method)
+                    };
+
                     info!(
                         host = %host,
                         path = %ws_path,
@@ -1969,22 +2250,10 @@ impl WebSocketHandler for AiWebSocketHandler {
                     if let Some(ref logger) = event_logger {
                         let agent_info = AgentInfo::new(ws_agent, DetectionSource::Environment);
 
-                        let source = if is_agent_app {
-                            EventSource::AgentApp
-                        } else {
-                            EventSource::AiProxy
-                        };
-
-                        let method = if ws_path == "/" {
-                            "WebSocket".to_string()
-                        } else {
-                            format!("WebSocket {}", ws_path)
-                        };
-
                         let event = WrapEvent::new(&session_id, &host, direction, agent_info)
                             .with_source(source)
                             .with_provider(provider)
-                            .with_method(method)
+                            .with_method(ws_method)
                             .with_content(text.to_string());
                         logger.log(&event);
                     }
@@ -2150,6 +2419,44 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_mcp_request_method_with_rmcp_request() {
+        let payload = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        assert_eq!(
+            extract_mcp_request_method(payload, "/streamable-http"),
+            Some("tools/list".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_mcp_request_method_with_rmcp_notification() {
+        let payload = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert_eq!(
+            extract_mcp_request_method(payload, "/transport"),
+            Some("notifications/initialized".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_mcp_request_method_uses_path_hint_for_custom_jsonrpc_methods() {
+        let payload = r#"{"jsonrpc":"2.0","id":1,"method":"rpc.custom","params":{"x":1}}"#;
+        assert_eq!(
+            extract_mcp_request_method(payload, "/jsonrpc"),
+            Some("rpc.custom".to_string())
+        );
+        assert_eq!(extract_mcp_request_method(payload, "/api"), None);
+    }
+
+    #[test]
+    fn test_is_jsonrpc_response_for_mcp_detects_response_and_error() {
+        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}"#;
+
+        assert!(is_jsonrpc_response_for_mcp(response, "/mcp"));
+        assert!(is_jsonrpc_response_for_mcp(error, "/jsonrpc"));
+        assert!(!is_jsonrpc_response_for_mcp(response, "/api"));
+    }
+
+    #[test]
     fn test_detect_provider() {
         assert_eq!(
             AiProxyHandler::detect_provider("chatgpt.com"),
@@ -2175,6 +2482,18 @@ mod tests {
         assert_eq!(
             AiProxyHandler::detect_provider("api.anthropic.com"),
             Some("anthropic")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("a-api.anthropic.com"),
+            Some("claude")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("a-cdn.anthropic.com"),
+            Some("claude")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_provider("s-cdn.anthropic.com"),
+            Some("claude")
         );
         assert_eq!(
             AiProxyHandler::detect_provider("api.claude.ai"),
@@ -2369,6 +2688,9 @@ mod tests {
             "codewhisperer.us-east-1.amazonaws.com"
         ));
         assert!(AiProxyHandler::is_agent_app("statsig.anthropic.com"));
+        assert!(AiProxyHandler::is_agent_app("a-api.anthropic.com"));
+        assert!(AiProxyHandler::is_agent_app("a-cdn.anthropic.com"));
+        assert!(AiProxyHandler::is_agent_app("s-cdn.anthropic.com"));
         assert!(!AiProxyHandler::is_agent_app("api.openai.com"));
         assert!(!AiProxyHandler::is_agent_app("api.anthropic.com"));
         assert!(!AiProxyHandler::is_agent_app("api.claude.ai"));
