@@ -1,8 +1,9 @@
 //! Budget tracking layer
 
 use super::middleware::{error_response, get_request_id, Layer, LayerResult, RequestContext};
+use crate::enforcement::core;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
-use soth_budget::{BudgetTracker, CostCalculator, TokenCounter};
+use soth_budget::{BudgetTracker, CostCalculator};
 use soth_dashboard::{BudgetAlert, DashboardState};
 use std::future::Future;
 use std::pin::Pin;
@@ -127,24 +128,28 @@ impl BudgetLayer {
         output_tokens: u64,
     ) {
         let tracker = self.tracker.read().await;
-        let record = tracker.record_spend(
+        core::record_budget_spend(
+            &tracker,
             &ctx.session_id,
             ctx.agent_id.as_deref(),
             model,
             input_tokens,
             output_tokens,
         );
+        let estimated_cost =
+            self.calculator
+                .calculate_cost_tokens(model, input_tokens, output_tokens);
 
         debug!(
             "Recorded spend: session={} agent={:?} model={} cost=${:.4}",
-            ctx.session_id, ctx.agent_id, model, record.cost
+            ctx.session_id, ctx.agent_id, model, estimated_cost
         );
     }
 
     /// Check if budget is exceeded
     async fn is_budget_exceeded(&self, ctx: &RequestContext) -> bool {
         let tracker = self.tracker.read().await;
-        tracker.is_budget_exceeded(ctx.agent_id.as_deref())
+        core::is_budget_exceeded(&tracker, ctx.agent_id.as_deref())
     }
 }
 
@@ -186,7 +191,7 @@ impl Layer for BudgetLayer {
 
                     // Count input tokens
                     let content = serde_json::to_value(req).unwrap_or_default();
-                    let input_tokens = TokenCounter::count_mcp_context_tokens(&content);
+                    let input_tokens = core::estimate_mcp_tokens(&content);
 
                     ctx.metadata.insert(
                         "budget_input_tokens".to_string(),
@@ -203,7 +208,7 @@ impl Layer for BudgetLayer {
                 JsonRpcMessage::Response(resp) => {
                     // Count output tokens and record spend
                     let content = serde_json::to_value(resp).unwrap_or_default();
-                    let output_tokens = TokenCounter::count_mcp_context_tokens(&content);
+                    let output_tokens = core::estimate_mcp_tokens(&content);
 
                     // Get input tokens and model from context
                     let input_tokens = ctx

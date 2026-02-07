@@ -69,22 +69,20 @@ fn test_cert_cache() {
     assert_eq!(stats.expired, 0);
 }
 
-/// Test host filtering - whitelist mode
+/// Test host filtering - explicit intercept list
 #[test]
-fn test_host_filter_whitelist() {
+fn test_host_filter_intercept_list() {
     use soth_core::HostAction;
 
     let filter = HostFilterConfig {
-        intercept: vec![],
-        allow: vec![
+        intercept: vec![
             "api.openai.com".to_string(),
             "api.anthropic.com".to_string(),
         ],
         block: vec![],
-        mode: "whitelist".to_string(),
     };
 
-    // In whitelist mode, allowed hosts are intercepted, others blocked
+    // Configured hosts intercepted, others tunneled
     assert_eq!(
         filter.action_for_host("api.openai.com"),
         HostAction::Intercept
@@ -93,8 +91,8 @@ fn test_host_filter_whitelist() {
         filter.action_for_host("api.anthropic.com"),
         HostAction::Intercept
     );
-    assert_eq!(filter.action_for_host("malicious.com"), HostAction::Block);
-    assert_eq!(filter.action_for_host("example.com"), HostAction::Block);
+    assert_eq!(filter.action_for_host("malicious.com"), HostAction::Tunnel);
+    assert_eq!(filter.action_for_host("example.com"), HostAction::Tunnel);
 }
 
 /// Test host filtering - selective mode (default)
@@ -107,9 +105,7 @@ fn test_host_filter_selective() {
             "api.openai.com".to_string(),
             "api.anthropic.com".to_string(),
         ],
-        allow: vec![],
         block: vec!["blocked.com".to_string()],
-        mode: "selective".to_string(),
     };
 
     // AI domains intercepted
@@ -240,10 +236,21 @@ fn test_config_defaults() {
     assert_eq!(config.address, "127.0.0.1");
     assert_eq!(config.request_timeout, Duration::from_secs(300));
 
-    // Check default allowed hosts
-    assert!(config.hosts.is_allowed("api.openai.com"));
-    assert!(config.hosts.is_allowed("api.anthropic.com"));
-    assert!(config.hosts.is_allowed("generativelanguage.googleapis.com"));
+    // Check default host actions
+    assert_eq!(
+        config.hosts.action_for_host("api.openai.com"),
+        soth_core::HostAction::Intercept
+    );
+    assert_eq!(
+        config.hosts.action_for_host("api.anthropic.com"),
+        soth_core::HostAction::Intercept
+    );
+    assert_eq!(
+        config
+            .hosts
+            .action_for_host("generativelanguage.googleapis.com"),
+        soth_core::HostAction::Intercept
+    );
 }
 
 /// Test SNI extraction

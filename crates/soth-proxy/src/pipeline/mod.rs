@@ -8,14 +8,12 @@
 //! - Budget tracking
 
 pub mod budget;
-pub mod forward;
 pub mod identity;
 pub mod middleware;
 pub mod observe;
 pub mod policy;
 
 pub use budget::BudgetLayer;
-pub use forward::ForwardLayer;
 pub use identity::IdentityLayer;
 pub use middleware::{Pipeline, PipelineBuilder};
 pub use observe::ObserveLayer;
