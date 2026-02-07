@@ -1,6 +1,8 @@
 //! Shared response event assembly for proxy observability rows.
 
-use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
+use soth_core::types::{
+    AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
+};
 
 use crate::transport::usage_enrichment::ResponseUsageMeta;
 
@@ -35,6 +37,7 @@ pub struct ResponseEventInput<'a> {
     pub usage_meta: &'a ResponseUsageMeta,
     pub fallback_model: Option<&'a str>,
     pub response_kind: ResponseKind,
+    pub traffic_envelope: Option<TrafficEnvelope>,
 }
 
 pub fn empty_response_placeholder(method: &str, path: &str, status: u16, is_sse: bool) -> String {
@@ -96,6 +99,10 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
         .with_method(method_str)
         .with_status_code(input.status)
         .with_latency(input.latency_ms);
+
+    if let Some(envelope) = input.traffic_envelope {
+        event = event.with_traffic_envelope(envelope);
+    }
 
     if let Some(request_body) = input.request_content {
         event = event.with_request(request_body.to_string(), "");

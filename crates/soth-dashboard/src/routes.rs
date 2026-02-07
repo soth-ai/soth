@@ -1,6 +1,6 @@
 //! API routes for the dashboard
 
-use crate::event_store::{AgentsSummary, EventStore, EventsSummary};
+use crate::event_store::{AgentsSummary, EventStore, EventsSummary, StreamStats};
 use crate::state::{
     AdvancedBudgetMetrics, BudgetMetrics, DashboardState, IdentityMetrics, ObserveMetrics,
     PolicyMetrics, ProxyMetrics,
@@ -104,6 +104,7 @@ pub fn api_router_with_events(state: AppState) -> Router {
         .route("/api/health", get(get_health))
         .route("/api/events", get(get_events))
         .route("/api/events/:event_id/payload", get(get_event_payload))
+        .route("/api/events/stream/stats", get(get_event_stream_stats))
         .route("/api/agents", get(get_agents))
         // Advanced budget endpoints
         .route("/api/budget/advanced", get(get_advanced_budget))
@@ -273,6 +274,26 @@ async fn get_agents(State(state): State<AppState>) -> Json<ApiResponse<AgentsSum
     };
 
     Json(ApiResponse::new(&state.dashboard, summary))
+}
+
+/// Get websocket stream reliability/backpressure telemetry.
+async fn get_event_stream_stats(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<StreamStats>> {
+    let stats = if let Some(ref events) = state.events {
+        events.stream_stats()
+    } else {
+        StreamStats {
+            lagged_receivers: 0,
+            lagged_events: 0,
+            backfill_batches: 0,
+            backfilled_events: 0,
+            broadcast_send_failures: 0,
+            latest_seq: 0,
+        }
+    };
+
+    Json(ApiResponse::new(&state.dashboard, stats))
 }
 
 /// Health check response

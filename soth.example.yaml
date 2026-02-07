@@ -51,7 +51,7 @@ observe:
   log_responses: true      # Log outbound responses
   tamper_proof: true       # Enable Merkle tree verification
   storage:
-    backend: "sqlite"      # Options: local | sqlite
+    backend: "sqlite"      # Options: sqlite
     path: "./logs/observations.db"
 
 # Budget configuration
@@ -108,10 +108,14 @@ forward_proxy:
   # Host filtering
   hosts:
     mode: "selective"   # selective | discovery
-    intercept:
+    ai_inference:
       - "api.openai.com"
       - "api.anthropic.com"
       - "generativelanguage.googleapis.com"
+    mcp:
+      - "api.github.com"
+      - "api.notion.com"
+      - "slack.com"
     block: []
 
 # Production hardening configuration

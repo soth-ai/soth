@@ -10,6 +10,7 @@ use soth_core::event_logger::default_event_log_write_path;
 use soth_core::types::WrapEvent;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -26,6 +27,7 @@ pub struct EventStore {
     inner: Arc<RwLock<EventStoreInner>>,
     db_path: PathBuf,
     event_tx: broadcast::Sender<WrapEvent>,
+    stream_stats: Arc<StreamStatsInner>,
 }
 
 struct EventStoreInner {
@@ -35,6 +37,25 @@ struct EventStoreInner {
     agents: HashMap<String, AgentStats>,
     /// Last seen SQLite sequence number.
     sqlite_seq: i64,
+}
+
+#[derive(Default)]
+struct StreamStatsInner {
+    lagged_receivers: AtomicU64,
+    lagged_events: AtomicU64,
+    backfill_batches: AtomicU64,
+    backfilled_events: AtomicU64,
+    broadcast_send_failures: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamStats {
+    pub lagged_receivers: u64,
+    pub lagged_events: u64,
+    pub backfill_batches: u64,
+    pub backfilled_events: u64,
+    pub broadcast_send_failures: u64,
+    pub latest_seq: i64,
 }
 
 /// Statistics for a detected agent
@@ -82,6 +103,7 @@ impl EventStore {
             })),
             db_path: log_path,
             event_tx,
+            stream_stats: Arc::new(StreamStatsInner::default()),
         }
     }
 
@@ -99,6 +121,44 @@ impl EventStore {
     /// Subscribe to new events.
     pub fn subscribe(&self) -> broadcast::Receiver<WrapEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Current highest committed sqlite sequence observed by the store.
+    pub fn latest_seq(&self) -> i64 {
+        self.inner.read().sqlite_seq
+    }
+
+    /// Stream backpressure and replay telemetry counters.
+    pub fn stream_stats(&self) -> StreamStats {
+        StreamStats {
+            lagged_receivers: self.stream_stats.lagged_receivers.load(Ordering::Relaxed),
+            lagged_events: self.stream_stats.lagged_events.load(Ordering::Relaxed),
+            backfill_batches: self.stream_stats.backfill_batches.load(Ordering::Relaxed),
+            backfilled_events: self.stream_stats.backfilled_events.load(Ordering::Relaxed),
+            broadcast_send_failures: self
+                .stream_stats
+                .broadcast_send_failures
+                .load(Ordering::Relaxed),
+            latest_seq: self.latest_seq(),
+        }
+    }
+
+    pub fn record_stream_lagged(&self, lagged_events: u64) {
+        self.stream_stats
+            .lagged_receivers
+            .fetch_add(1, Ordering::Relaxed);
+        self.stream_stats
+            .lagged_events
+            .fetch_add(lagged_events, Ordering::Relaxed);
+    }
+
+    pub fn record_stream_backfill_batch(&self, events: u64) {
+        self.stream_stats
+            .backfill_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.stream_stats
+            .backfilled_events
+            .fetch_add(events, Ordering::Relaxed);
     }
 
     /// Get recent events.
@@ -241,7 +301,11 @@ impl EventStore {
         let mut last_seq = cursor;
         for (seq, event) in rows {
             last_seq = seq;
-            let _ = self.event_tx.send(event.clone());
+            if self.event_tx.send(event.clone()).is_err() {
+                self.stream_stats
+                    .broadcast_send_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.add_event(event);
         }
 
