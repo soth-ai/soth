@@ -3,7 +3,10 @@
 use std::collections::HashSet;
 
 use soth_budget::{BudgetTracker, TokenCounter};
-use soth_core::types::policy::{PolicyDecision, PolicyInput, PolicyInputBuilder};
+use soth_core::types::{
+    policy::{PolicyDecision, PolicyInput, PolicyInputBuilder},
+    TrafficEnvelope,
+};
 use soth_identity::{signing::verify_bytes, signing::SignatureBlock, Did};
 use soth_policy::PolicyEngine;
 
@@ -32,16 +35,7 @@ pub struct IdentityResult {
 }
 
 pub struct ProxyEnforcementInput<'a> {
-    pub session_id: &'a str,
-    pub provider: &'a str,
-    pub host: &'a str,
-    pub http_method: &'a str,
-    pub path: &'a str,
-    pub model: Option<&'a str>,
-    pub request_body: Option<&'a str>,
-    pub agent: Option<&'a str>,
-    pub did: Option<&'a str>,
-    pub signature: Option<&'a str>,
+    pub envelope: &'a TrafficEnvelope,
 }
 
 pub struct ProxyEnforcementConfig<'a> {
@@ -244,17 +238,17 @@ where
 }
 
 pub fn build_proxy_policy_input(
-    session_id: &str,
-    provider: &str,
-    host: &str,
-    http_method: &str,
-    path: &str,
-    model: Option<&str>,
-    agent: Option<&str>,
+    envelope: &TrafficEnvelope,
     identity: &IdentityResult,
 ) -> PolicyInput {
+    let provider = envelope.provider.as_deref().unwrap_or("unknown");
+    let host = envelope.host.as_deref().unwrap_or("unknown");
+    let http_method = envelope.method.as_str();
+    let path = envelope.path.as_deref().unwrap_or("/");
+    let model = envelope.model.as_deref();
+
     let mut builder = PolicyInputBuilder::new()
-        .session_id(session_id)
+        .session_id(&envelope.session_id)
         .method(format!("proxy/{}", http_method.to_lowercase()))
         .tool(format!("{provider}:{path}"))
         .arguments_json(serde_json::json!({
@@ -265,7 +259,7 @@ pub fn build_proxy_policy_input(
             "model": model,
         }));
 
-    if let Some(agent_id) = agent {
+    if let Some(agent_id) = envelope.agent.as_deref() {
         builder = builder.agent_id(agent_id);
     }
 
@@ -363,15 +357,23 @@ pub fn enforce_proxy_request(
     config: ProxyEnforcementConfig<'_>,
     input: ProxyEnforcementInput<'_>,
 ) -> Result<IdentityResult, (u16, String, Option<String>)> {
+    let envelope = input.envelope;
+
+    let host = envelope.host.as_deref().unwrap_or_default();
+    let method = envelope.method.as_str();
+    let path = envelope.path.as_deref().unwrap_or("/");
+    let did = envelope.did.as_deref();
+    let signature = envelope.signature.as_deref();
+
     let mut identity = match verify_proxy_identity(
         config.identity_mode,
         config.trusted_dids,
-        input.host,
-        input.http_method,
-        input.path,
-        input.request_body,
-        input.did,
-        input.signature,
+        host,
+        method,
+        path,
+        envelope.request_body.as_deref(),
+        did,
+        signature,
     ) {
         Ok(identity) => identity,
         Err(err) => {
@@ -380,7 +382,7 @@ pub fn enforce_proxy_request(
             }
             IdentityResult {
                 verified: false,
-                did: input.did.map(ToString::to_string),
+                did: did.map(ToString::to_string),
                 policy_version: None,
             }
         }
@@ -390,16 +392,16 @@ pub fn enforce_proxy_request(
         let agent_id = identity
             .did
             .as_deref()
-            .or(input.agent)
+            .or(envelope.agent.as_deref())
             .map(|s| s.to_string());
         if config.budget_block_on_exceeded && tracker.is_budget_exceeded(agent_id.as_deref()) {
             return Err((429, "Budget exceeded".to_string(), None));
         }
-        if let Some(body) = input.request_body {
+        if let Some(body) = envelope.request_body.as_deref() {
             let input_tokens = TokenCounter::estimate_tokens(body);
-            let effective_model = input.model.unwrap_or(config.default_model);
+            let effective_model = envelope.model.as_deref().unwrap_or(config.default_model);
             tracker.record_spend(
-                input.session_id,
+                &envelope.session_id,
                 agent_id.as_deref(),
                 effective_model,
                 input_tokens,
@@ -412,16 +414,7 @@ pub fn enforce_proxy_request(
         return Ok(identity);
     };
 
-    let policy_input = build_proxy_policy_input(
-        input.session_id,
-        input.provider,
-        input.host,
-        input.http_method,
-        input.path,
-        input.model,
-        input.agent,
-        &identity,
-    );
+    let policy_input = build_proxy_policy_input(envelope, &identity);
     let (decision, policy_version) = match evaluate_policy(engine, &policy_input) {
         Ok(v) => v,
         Err(err) => return Err((500, err, None)),

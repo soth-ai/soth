@@ -498,7 +498,7 @@ impl Default for ObserveConfig {
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Backend: local, sqlite
+    /// Backend: sqlite
     #[serde(default = "default_storage_backend")]
     pub backend: String,
 
@@ -771,15 +771,18 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostFilterConfig {
     /// Host filtering mode:
-    /// - selective: intercept configured hosts and tunnel the rest (default)
+    /// - selective: intercept configured AI/MCP hosts and tunnel the rest (default)
     /// - discovery: intercept all non-local hosts to discover new MCP/AI domains
     #[serde(default)]
     pub mode: HostFilterMode,
 
-    /// Hosts to intercept with full MITM (TLS termination + inspection)
-    /// Default: AI + MCP service domains
-    #[serde(default = "default_intercept_hosts")]
-    pub intercept: Vec<String>,
+    /// Hosts classified as AI inference/app traffic.
+    #[serde(default = "default_ai_inference_hosts")]
+    pub ai_inference: Vec<String>,
+
+    /// Hosts classified as MCP transport/service traffic.
+    #[serde(default = "default_mcp_service_hosts")]
+    pub mcp: Vec<String>,
 
     /// Blocked hosts - these are rejected with 403
     #[serde(default)]
@@ -806,8 +809,8 @@ impl std::fmt::Display for HostFilterMode {
     }
 }
 
-fn default_intercept_hosts() -> Vec<String> {
-    let mut hosts = vec![
+fn default_ai_inference_hosts() -> Vec<String> {
+    dedupe_hosts(vec![
         // ===== OpenAI / ChatGPT =====
         "api.openai.com".to_string(),
         "*.openai.azure.com".to_string(), // Azure OpenAI
@@ -972,11 +975,7 @@ fn default_intercept_hosts() -> Vec<String> {
         "*.baichuan-ai.com".to_string(), // Baichuan
         "*.01.ai".to_string(),           // Yi (01.AI)
         "*.deepseek.com".to_string(),    // DeepSeek
-    ];
-
-    // Extend with high-signal MCP service domains used by common connectors.
-    hosts.extend(default_mcp_service_hosts());
-    dedupe_hosts(hosts)
+    ])
 }
 
 fn default_mcp_service_hosts() -> Vec<String> {
@@ -1033,9 +1032,6 @@ fn default_mcp_service_hosts() -> Vec<String> {
         "hooks.slack.com".to_string(),
         "discord.com".to_string(),
         "*.discord.com".to_string(),
-        "api.intercom.io".to_string(),
-        "app.intercom.com".to_string(),
-        "*.intercom.io".to_string(),
         "api.twilio.com".to_string(),
         "*.twilio.com".to_string(),
         // ===== Google Workspace =====
@@ -1179,18 +1175,49 @@ impl Default for HostFilterConfig {
     fn default() -> Self {
         Self {
             mode: HostFilterMode::default(),
-            intercept: default_intercept_hosts(),
+            ai_inference: default_ai_inference_hosts(),
+            mcp: default_mcp_service_hosts(),
             block: Vec::new(),
         }
     }
 }
 
 impl HostFilterConfig {
-    /// Check if a host should be intercepted (full MITM)
-    pub fn should_intercept(&self, host: &str) -> bool {
-        self.intercept
+    fn matches_any(host: &str, patterns: &[String]) -> bool {
+        patterns
             .iter()
             .any(|pattern| Self::matches_pattern(host, pattern))
+    }
+
+    /// Check if host is in AI inference/app whitelist.
+    pub fn should_check_ai_inference(&self, host: &str) -> bool {
+        Self::matches_any(host, &self.ai_inference)
+    }
+
+    /// Check if host is in MCP whitelist.
+    pub fn should_check_mcp(&self, host: &str) -> bool {
+        if !self.mcp.is_empty() {
+            Self::matches_any(host, &self.mcp)
+        } else {
+            false
+        }
+    }
+
+    /// Number of unique host patterns that can trigger interception.
+    pub fn intercept_domain_count(&self) -> usize {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for host in &self.ai_inference {
+            seen.insert(host.as_str());
+        }
+        for host in &self.mcp {
+            seen.insert(host.as_str());
+        }
+        seen.len()
+    }
+
+    /// Check if a host should be intercepted (full MITM)
+    pub fn should_intercept(&self, host: &str) -> bool {
+        self.should_check_ai_inference(host) || self.should_check_mcp(host)
     }
 
     /// Check if a host is blocked (rejected with 403)
@@ -1685,7 +1712,8 @@ upstream:
         use super::HostAction;
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            intercept: vec!["api.openai.com".to_string()],
+            ai_inference: vec!["api.openai.com".to_string()],
+            mcp: vec![],
             block: vec![],
         };
         assert_eq!(
@@ -1703,7 +1731,8 @@ upstream:
         use super::HostAction;
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            intercept: vec![],
+            ai_inference: vec![],
+            mcp: vec![],
             block: vec!["blocked.com".to_string()],
         };
         assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Tunnel);
@@ -1742,10 +1771,11 @@ upstream:
     fn test_host_filter_intercept() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            intercept: vec![
+            ai_inference: vec![
                 "api.openai.com".to_string(),
                 "*.openai.azure.com".to_string(),
             ],
+            mcp: vec![],
             block: vec![],
         };
 
@@ -1758,12 +1788,13 @@ upstream:
     fn test_host_filter_wildcard_patterns() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            intercept: vec![
+            ai_inference: vec![
                 "api.openai.com".to_string(),          // Exact
                 "*.openai.azure.com".to_string(),      // Prefix wildcard
                 "bedrock.*.amazonaws.com".to_string(), // Middle wildcard
                 "*.huggingface.co".to_string(),        // Prefix wildcard
             ],
+            mcp: vec![],
             block: vec![],
         };
 
@@ -1886,6 +1917,22 @@ upstream:
     }
 
     #[test]
+    fn test_separate_ai_and_mcp_whitelists() {
+        let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
+            ai_inference: vec!["api.openai.com".to_string()],
+            mcp: vec!["api.github.com".to_string()],
+            block: vec![],
+        };
+
+        assert!(filter.should_check_ai_inference("api.openai.com"));
+        assert!(!filter.should_check_mcp("api.openai.com"));
+
+        assert!(filter.should_check_mcp("api.github.com"));
+        assert!(!filter.should_check_ai_inference("api.github.com"));
+    }
+
+    #[test]
     fn test_default_host_filter_tunnels_unknown_mcp_hosts() {
         let filter = HostFilterConfig::default();
 
@@ -1905,7 +1952,7 @@ upstream:
     fn test_default_host_filter_intercepts_known_claude_mcp_hosts() {
         let filter = HostFilterConfig::default();
 
-        // Claude/Anthropic app transport domains are included in default intercept list.
+        // Claude/Anthropic app transport domains are included in default host lists.
         assert_eq!(
             filter.action_for_host("a-api.anthropic.com"),
             HostAction::Intercept
@@ -1920,7 +1967,8 @@ upstream:
     fn test_host_filter_catch_all_pattern_intercepts_non_local_hosts() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            intercept: vec!["*".to_string()],
+            ai_inference: vec!["*".to_string()],
+            mcp: vec![],
             block: vec![],
         };
 
@@ -1942,7 +1990,8 @@ upstream:
     fn test_host_filter_discovery_mode_intercepts_unknown_non_local_hosts() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Discovery,
-            intercept: vec![],
+            ai_inference: vec![],
+            mcp: vec![],
             block: vec!["malware.com".to_string()],
         };
 
@@ -1963,7 +2012,8 @@ upstream:
         use super::HostAction;
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            intercept: vec!["api.openai.com".to_string()],
+            ai_inference: vec!["api.openai.com".to_string()],
+            mcp: vec![],
             block: vec!["malware.com".to_string(), "*.bad.com".to_string()],
         };
 
@@ -1988,7 +2038,7 @@ forward_proxy:
   port: 9090
   address: "0.0.0.0"
   hosts:
-    intercept:
+    ai_inference:
       - "api.openai.com"
       - "api.anthropic.com"
       - "*.openai.azure.com"
@@ -2034,14 +2084,14 @@ forward_proxy:
     }
 
     #[test]
-    fn test_parse_forward_proxy_yaml_intercept_only() {
+    fn test_parse_forward_proxy_yaml_ai_inference_only() {
         use super::HostAction;
         let yaml = r#"
 forward_proxy:
   enabled: true
   port: 9090
   hosts:
-    intercept:
+    ai_inference:
       - "api.openai.com"
       - "custom.api.com"
 "#;
@@ -2253,7 +2303,8 @@ production:
         // Even if localhost is in the block list, it should still tunnel
         let filter_with_block = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            intercept: vec![],
+            ai_inference: vec![],
+            mcp: vec![],
             block: vec!["localhost".to_string(), "127.0.0.1".to_string()],
         };
 

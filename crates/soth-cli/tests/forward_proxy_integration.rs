@@ -69,17 +69,18 @@ fn test_cert_cache() {
     assert_eq!(stats.expired, 0);
 }
 
-/// Test host filtering - explicit intercept list
+/// Test host filtering - explicit AI host list
 #[test]
-fn test_host_filter_intercept_list() {
+fn test_host_filter_ai_list() {
     use soth_core::HostAction;
 
     let filter = HostFilterConfig {
         mode: HostFilterMode::Selective,
-        intercept: vec![
+        ai_inference: vec![
             "api.openai.com".to_string(),
             "api.anthropic.com".to_string(),
         ],
+        mcp: vec![],
         block: vec![],
     };
 
@@ -103,10 +104,11 @@ fn test_host_filter_selective() {
 
     let filter = HostFilterConfig {
         mode: HostFilterMode::Selective,
-        intercept: vec![
+        ai_inference: vec![
             "api.openai.com".to_string(),
             "api.anthropic.com".to_string(),
         ],
+        mcp: vec![],
         block: vec!["blocked.com".to_string()],
     };
 
