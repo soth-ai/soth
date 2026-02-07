@@ -5,6 +5,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::traffic_envelope::TrafficEnvelope;
+
 /// Source of the event
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +46,10 @@ pub struct WrapEvent {
     /// Source of this event (MCP or AI Proxy)
     #[serde(default)]
     pub source: EventSource,
+
+    /// Canonical normalized ingress envelope for this event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic_envelope: Option<TrafficEnvelope>,
 
     /// AI provider name (for proxy traffic)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +167,7 @@ impl WrapEvent {
             server_name: server_name.into(),
             direction,
             source: EventSource::Mcp,
+            traffic_envelope: None,
             provider: None,
             model: None,
             method: None,
@@ -192,6 +199,12 @@ impl WrapEvent {
     /// Set the event source
     pub fn with_source(mut self, source: EventSource) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Attach canonical ingress envelope metadata.
+    pub fn with_traffic_envelope(mut self, envelope: TrafficEnvelope) -> Self {
+        self.traffic_envelope = Some(envelope);
         self
     }
 

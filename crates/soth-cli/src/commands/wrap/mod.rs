@@ -11,7 +11,7 @@ use crate::commands::enforcement;
 use anyhow::{Context, Result};
 use clap::Args;
 use soth_core::config::{load_config, SothConfig};
-use soth_core::types::{AgentInfo, DetectionSource, WrapDirection, WrapEvent};
+use soth_core::types::{AgentInfo, DetectionSource, TrafficEnvelope, WrapDirection, WrapEvent};
 use soth_core::{
     generate_session_name, EventLogger, MessageDirection, SessionRecorder, SessionStorage,
 };
@@ -80,6 +80,7 @@ struct WrapRequestContext {
     method: Option<String>,
     tool_name: Option<String>,
     pipeline_ctx: Option<PipelineRequestContext>,
+    envelope: Option<TrafficEnvelope>,
 }
 
 struct WrapEnforcement {
@@ -174,6 +175,7 @@ impl WrapSession {
         method: Option<&str>,
         tool_name: Option<&str>,
         pipeline_ctx: Option<PipelineRequestContext>,
+        envelope: Option<TrafficEnvelope>,
     ) {
         let mut contexts = self.request_contexts.write().await;
         contexts.insert(
@@ -183,6 +185,7 @@ impl WrapSession {
                 method: method.map(ToOwned::to_owned),
                 tool_name: tool_name.map(ToOwned::to_owned),
                 pipeline_ctx,
+                envelope,
             },
         );
     }
@@ -659,6 +662,7 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
         let mut request_method: Option<&str> = None;
         let mut request_tool_name: Option<&str> = None;
         let mut pipeline_ctx = None;
+        let request_id = msg.get("id").and_then(extract_context_id);
 
         // Extract method
         if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
@@ -688,11 +692,53 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
             }
         }
 
+        let did_key = session
+            .enforcement
+            .as_ref()
+            .map(|e| e.runtime.did_metadata_key.as_str())
+            .unwrap_or("X-Agent-DID");
+        let signature_key = session
+            .enforcement
+            .as_ref()
+            .map(|e| e.runtime.signature_metadata_key.as_str())
+            .unwrap_or("X-Agent-Signature");
+        let did = extract_metadata_value(msg, did_key)
+            .and_then(|value| value.as_str().map(ToString::to_string));
+        let signature = extract_metadata_value(msg, signature_key).map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| value.to_string())
+        });
+        let method_for_envelope = request_method.unwrap_or("unknown");
+        let envelope = TrafficEnvelope::mcp_stdio(
+            &session.session_id,
+            request_id.clone(),
+            method_for_envelope.to_string(),
+            Some(event.agent.name.as_str()),
+            did.as_deref(),
+            signature.as_deref(),
+            Some(content),
+        );
+        event = event.with_traffic_envelope(envelope.clone());
+        let traffic_envelope = Some(envelope);
+
         if let Some(ref enforcement) = session.enforcement {
             if let Ok(jsonrpc_msg) = JsonRpcMessage::from_json_str(content) {
                 if matches!(jsonrpc_msg, JsonRpcMessage::Request(_)) {
                     let mut req_ctx = PipelineRequestContext::new(session.session_id.clone());
                     req_ctx.agent_id = Some(event.agent.name.clone());
+                    if let Some(ref envelope) = traffic_envelope {
+                        if let Ok(value) = serde_json::to_value(envelope) {
+                            req_ctx
+                                .metadata
+                                .insert("traffic_envelope".to_string(), value);
+                        }
+                        req_ctx.metadata.insert(
+                            "traffic_envelope_id".to_string(),
+                            serde_json::json!(envelope.envelope_id.clone()),
+                        );
+                    }
                     enrich_identity_metadata(
                         msg,
                         &enforcement.runtime.did_metadata_key,
@@ -755,17 +801,16 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
 
         // Record request time for latency calculation
         if forward_content.is_some() {
-            if let Some(id) = msg.get("id") {
-                if let Some(id_str) = extract_context_id(id) {
-                    session
-                        .record_request_context(
-                            &id_str,
-                            request_method,
-                            request_tool_name,
-                            pipeline_ctx,
-                        )
-                        .await;
-                }
+            if let Some(id_str) = request_id.as_deref() {
+                session
+                    .record_request_context(
+                        id_str,
+                        request_method,
+                        request_tool_name,
+                        pipeline_ctx,
+                        traffic_envelope.clone(),
+                    )
+                    .await;
             }
         }
 
@@ -821,6 +866,9 @@ async fn process_outbound_message(session: &WrapSession, content: &str) -> Outbo
                         if let Some(tool_name) = ctx.tool_name.as_deref() {
                             event = event.with_tool_name(tool_name);
                         }
+                        if let Some(envelope) = ctx.envelope.clone() {
+                            event = event.with_traffic_envelope(envelope);
+                        }
                         if let (Some(enforcement), Some(pipeline_ctx)) =
                             (session.enforcement.as_ref(), ctx.pipeline_ctx.as_mut())
                         {
@@ -864,6 +912,21 @@ async fn process_outbound_message(session: &WrapSession, content: &str) -> Outbo
             if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
                 event = event.with_method(method);
             }
+        }
+
+        if event.traffic_envelope.is_none() {
+            let request_id = msg.get("id").and_then(extract_context_id);
+            let method = event.method.clone().unwrap_or_else(|| "response".to_string());
+            let envelope = TrafficEnvelope::mcp_stdio(
+                &session.session_id,
+                request_id,
+                method,
+                Some(event.agent.name.as_str()),
+                None,
+                None,
+                Some(content),
+            );
+            event = event.with_traffic_envelope(envelope);
         }
 
         // Add full content and preview

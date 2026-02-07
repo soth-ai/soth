@@ -90,7 +90,19 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
 
     // Show AI intercept domains
     style::subtitle("Traffic Interception");
-    let intercept_count = proxy_config.hosts.intercept.len();
+    let intercept_count = proxy_config.hosts.intercept_domain_count();
+    let mut intercept_hosts: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for host in proxy_config
+        .hosts
+        .ai_inference
+        .iter()
+        .chain(proxy_config.hosts.mcp.iter())
+    {
+        if seen.insert(host.clone()) {
+            intercept_hosts.push(host.clone());
+        }
+    }
     match proxy_config.hosts.mode {
         HostFilterMode::Discovery => {
             println!(
@@ -103,7 +115,7 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
                     style::CIRCLE_FILLED.dimmed(),
                     intercept_count
                 );
-                for host in proxy_config.hosts.intercept.iter().take(5) {
+                for host in intercept_hosts.iter().take(5) {
                     println!("  {} {}", style::CIRCLE_FILLED.dimmed(), host);
                 }
                 if intercept_count > 5 {
@@ -118,7 +130,7 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
         HostFilterMode::Selective => {
             if intercept_count > 0 {
                 // Show first few domains
-                for host in proxy_config.hosts.intercept.iter().take(5) {
+                for host in intercept_hosts.iter().take(5) {
                     println!("  {} {}", style::CIRCLE_FILLED.cyan(), host);
                 }
                 if intercept_count > 5 {
@@ -130,7 +142,7 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
                 }
             } else {
                 println!(
-                    "  {} No intercept domains configured; traffic will mostly tunnel.",
+                    "  {} No AI/MCP domains configured; traffic will mostly tunnel.",
                     style::CIRCLE_FILLED.dimmed()
                 );
             }
@@ -211,6 +223,9 @@ async fn run_hudsucker_proxy(
     ca_key_path: PathBuf,
 ) -> anyhow::Result<()> {
     let enforcer = enforcement::build_proxy_enforcer(config)?;
+    let _policy_reload_task = enforcer
+        .policy_engine()
+        .and_then(|engine| enforcement::spawn_policy_hot_reload(config, engine));
 
     // Create dashboard state for metrics
     let dashboard_state = DashboardState::new();

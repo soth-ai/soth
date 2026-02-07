@@ -45,8 +45,10 @@ use crate::transport::usage_enrichment::{
     build_http_request_for_provider, extract_usage_meta_from_decoded_payload,
     resolve_provider_parser, ResponseUsageMeta,
 };
-use soth_core::config::{ForwardProxyConfig, HostAction, HostFilterConfig};
-use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
+use soth_core::config::{ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode};
+use soth_core::types::{
+    AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
+};
 use soth_core::EventLogger;
 
 /// AI request body structure for model extraction
@@ -60,6 +62,7 @@ struct AiRequestBody {
 struct PendingRequest {
     request_id: u64,
     event_id: String,
+    envelope: Option<TrafficEnvelope>,
     host: String,
     path: String,
     method: String,
@@ -211,6 +214,10 @@ impl ProxyEnforcer {
         &self.signature_header
     }
 
+    pub fn policy_engine(&self) -> Option<Arc<PolicyEngine>> {
+        self.policy_engine.clone()
+    }
+
     fn core_identity_mode(&self) -> enforcement_core::IdentityMode {
         match self.identity_mode {
             ProxyIdentityMode::Disabled => enforcement_core::IdentityMode::Disabled,
@@ -227,6 +234,33 @@ impl ProxyEnforcer {
         }
     }
 
+    fn enforce_envelope(
+        &self,
+        envelope: &TrafficEnvelope,
+    ) -> Result<EnforcementResult, (u16, String, Option<String>)> {
+        let result = enforcement_core::enforce_proxy_request(
+            enforcement_core::ProxyEnforcementConfig {
+                identity_mode: self.core_identity_mode(),
+                trusted_dids: self.trusted_dids.as_ref(),
+                policy_mode: self.core_policy_mode(),
+                policy_engine: self.policy_engine.as_deref(),
+                budget_tracker: self.budget_tracker.as_deref(),
+                budget_block_on_exceeded: self.budget_block_on_exceeded,
+                default_model: &self.default_model,
+            },
+            enforcement_core::ProxyEnforcementInput {
+                envelope,
+            },
+        );
+        if let Err((_, ref reason, _)) = result {
+            if self.policy_mode == ProxyPolicyMode::Audit {
+                warn!("Policy audit violation: {}", reason);
+            }
+        }
+        result
+    }
+
+    #[allow(dead_code)]
     fn enforce_request(
         &self,
         session_id: &str,
@@ -240,35 +274,20 @@ impl ProxyEnforcer {
         did: Option<&str>,
         signature: Option<&str>,
     ) -> Result<EnforcementResult, (u16, String, Option<String>)> {
-        let result = enforcement_core::enforce_proxy_request(
-            enforcement_core::ProxyEnforcementConfig {
-                identity_mode: self.core_identity_mode(),
-                trusted_dids: self.trusted_dids.as_ref(),
-                policy_mode: self.core_policy_mode(),
-                policy_engine: self.policy_engine.as_deref(),
-                budget_tracker: self.budget_tracker.as_deref(),
-                budget_block_on_exceeded: self.budget_block_on_exceeded,
-                default_model: &self.default_model,
-            },
-            enforcement_core::ProxyEnforcementInput {
-                session_id,
-                provider,
-                host,
-                http_method,
-                path,
-                model,
-                request_body,
-                agent,
-                did,
-                signature,
-            },
+        let envelope = TrafficEnvelope::proxy(
+            session_id,
+            "legacy-request",
+            provider,
+            host,
+            http_method,
+            path,
+            model,
+            agent,
+            did,
+            signature,
+            request_body,
         );
-        if let Err((_, ref reason, _)) = result {
-            if self.policy_mode == ProxyPolicyMode::Audit {
-                warn!("Policy audit violation: {}", reason);
-            }
-        }
-        result
+        self.enforce_envelope(&envelope)
     }
 }
 
@@ -1097,7 +1116,14 @@ impl HttpHandler for AiProxyHandler {
             "Incoming request"
         );
         let is_blocked = self.is_blocked(&host);
-        let provider = Self::detect_provider(&host);
+        let host_is_ai_target = self.hosts.should_check_ai_inference(&host);
+        let host_is_mcp_target = self.hosts.should_check_mcp(&host);
+        let host_mode = self.hosts.mode;
+        let provider = if host_is_ai_target {
+            Self::detect_provider(&host).or(Some("inference"))
+        } else {
+            None
+        };
         let ua_agent = Self::detect_agent_from_user_agent(&req);
         let enforcer = self.enforcer.clone();
         let session_id = self.session_id.clone();
@@ -1130,8 +1156,11 @@ impl HttpHandler for AiProxyHandler {
             .get("content-encoding")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_lowercase());
-        // Inspect POST JSON requests too so JSON-RPC MCP traffic can be tagged as source=mcp.
-        let should_inspect_body = is_post && (provider.is_some() || is_json);
+        // Only inspect request bodies for relevant host classes (or discovery mode).
+        let should_inspect_body = is_post
+            && (host_is_ai_target
+                || host_is_mcp_target
+                || (host_mode == HostFilterMode::Discovery && is_json));
         let provider_registry = self.provider_registry.clone();
         let event_logger = self.event_logger.clone();
 
@@ -1211,7 +1240,9 @@ impl HttpHandler for AiProxyHandler {
                 (None, None, req)
             };
             let agent = Self::detect_agent_with_context(ua_agent, &host, &path, model.as_deref());
-            let mcp_request_method = if !is_connect {
+            let mcp_request_method = if !is_connect
+                && (host_is_mcp_target || host_mode == HostFilterMode::Discovery)
+            {
                 body_content
                     .as_deref()
                     .and_then(|content| extract_mcp_request_method(content, &path))
@@ -1223,18 +1254,20 @@ impl HttpHandler for AiProxyHandler {
 
             if !is_connect {
                 if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
-                    let enforcement = enforcer.enforce_request(
+                    let envelope = TrafficEnvelope::proxy(
                         &session_id,
+                        request_id.to_string(),
                         provider,
                         &host,
                         &http_method,
                         &path,
                         model.as_deref(),
-                        body_content.as_deref(),
                         agent,
                         identity_did.as_deref(),
                         identity_signature.as_deref(),
+                        body_content.as_deref(),
                     );
+                    let enforcement = enforcer.enforce_envelope(&envelope);
 
                     match enforcement {
                         Ok(identity_result) => {
@@ -1363,12 +1396,26 @@ impl HttpHandler for AiProxyHandler {
 
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
+                    let envelope = TrafficEnvelope::proxy(
+                        &session_id,
+                        request_id.to_string(),
+                        provider,
+                        &host,
+                        &http_method,
+                        &display_path,
+                        model.as_deref(),
+                        agent,
+                        identity_did.as_deref(),
+                        identity_signature.as_deref(),
+                        body_content.as_deref(),
+                    );
                     let mut pending = pending_requests.lock();
                     pending.insert(
                         request_id,
                         PendingRequest {
                             request_id,
                             event_id: uuid::Uuid::new_v4().to_string(),
+                            envelope: Some(envelope),
                             host: host.clone(),
                             path: display_path.clone(),
                             method: http_method.clone(),
@@ -1405,6 +1452,16 @@ impl HttpHandler for AiProxyHandler {
                         WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
                             .with_source(EventSource::Mcp)
                             .with_method(mcp_method.clone());
+                    let envelope = TrafficEnvelope::mcp_stdio(
+                        &session_id,
+                        Some(request_id.to_string()),
+                        mcp_method.clone(),
+                        agent,
+                        None,
+                        None,
+                        body_content.as_deref(),
+                    );
+                    event = event.with_traffic_envelope(envelope);
                     if let Some(ref request_body) = body_content {
                         event = event.with_content(request_body.clone());
                     }
@@ -1418,6 +1475,15 @@ impl HttpHandler for AiProxyHandler {
                     PendingRequest {
                         request_id,
                         event_id: uuid::Uuid::new_v4().to_string(),
+                        envelope: Some(TrafficEnvelope::mcp_stdio(
+                            &session_id,
+                            Some(request_id.to_string()),
+                            mcp_method.clone(),
+                            agent,
+                            None,
+                            None,
+                            body_content.as_deref(),
+                        )),
                         host: host.clone(),
                         path: path.clone(),
                         method: http_method.clone(),
@@ -1540,6 +1606,9 @@ impl HttpHandler for AiProxyHandler {
                             .with_status_code(status)
                             .with_latency(latency_ms)
                             .with_content(response_payload);
+                    if let Some(envelope) = pending.envelope.clone() {
+                        event = event.with_traffic_envelope(envelope);
+                    }
                     event.id = pending.event_id.clone();
                     event =
                         event.with_content_preview(format!("← {} (HTTP {})", method_name, status));
@@ -1583,6 +1652,7 @@ impl HttpHandler for AiProxyHandler {
                         usage_meta: &response_usage,
                         fallback_model: pending.model.as_deref(),
                         response_kind: ResponseKind::Stream { is_sse },
+                        traffic_envelope: pending.envelope.clone(),
                     });
                     event.id = pending.event_id.clone();
                     if let Some(allowed) = pending.policy_allowed {
@@ -1762,6 +1832,7 @@ impl HttpHandler for AiProxyHandler {
                             usage_meta: &usage_meta,
                             fallback_model: log_pending.model.as_deref(),
                             response_kind: ResponseKind::Stream { is_sse: log_is_sse },
+                            traffic_envelope: log_pending.envelope.clone(),
                         });
                         event.id = log_event_id.clone();
                         if let Some(allowed) = log_pending.policy_allowed {
@@ -1841,6 +1912,7 @@ impl HttpHandler for AiProxyHandler {
                         usage_meta: &response_usage,
                         fallback_model: pending.model.as_deref(),
                         response_kind: ResponseKind::Http,
+                        traffic_envelope: pending.envelope.clone(),
                     });
                     event.id = pending.event_id.clone();
                     if let Some(allowed) = pending.policy_allowed {
@@ -1893,13 +1965,20 @@ pub struct AiWebSocketHandler {
     event_logger: Option<Arc<EventLogger>>,
     /// Session ID
     session_id: String,
+    /// Host filter config for source classification.
+    hosts: Arc<HostFilterConfig>,
 }
 
 impl AiWebSocketHandler {
-    pub fn new(session_id: String, event_logger: Option<Arc<EventLogger>>) -> Self {
+    pub fn new(
+        session_id: String,
+        event_logger: Option<Arc<EventLogger>>,
+        hosts: Arc<HostFilterConfig>,
+    ) -> Self {
         Self {
             event_logger,
             session_id,
+            hosts,
         }
     }
 }
@@ -1916,6 +1995,7 @@ impl WebSocketHandler for AiWebSocketHandler {
     ) -> impl std::future::Future<Output = Option<Message>> + Send {
         let event_logger = self.event_logger.clone();
         let session_id = self.session_id.clone();
+        let hosts = self.hosts.clone();
 
         // Extract host/path and direction from context
         let (host, ws_path, direction) = match ctx {
@@ -1931,23 +2011,51 @@ impl WebSocketHandler for AiWebSocketHandler {
             }
         };
 
-        // Detect provider from host
-        let provider = AiProxyHandler::detect_provider(&host).unwrap_or("unknown");
+        let host_is_ai_target = hosts.should_check_ai_inference(&host);
+        let host_is_mcp_target = hosts.should_check_mcp(&host);
+        let is_discovery = hosts.mode == HostFilterMode::Discovery;
+        let provider = if host_is_ai_target {
+            AiProxyHandler::detect_provider(&host).unwrap_or("inference")
+        } else if host_is_mcp_target {
+            "mcp"
+        } else {
+            "unknown"
+        };
 
-        let is_agent_app = AiProxyHandler::is_agent_app(&host);
-        let ws_agent = AiProxyHandler::detect_agent_with_context(None, &host, &ws_path, None)
-            .unwrap_or("websocket");
+        let is_agent_app = host_is_ai_target && AiProxyHandler::is_agent_app(&host);
+        let detected_ws_agent =
+            AiProxyHandler::detect_agent_with_context(None, &host, &ws_path, None);
 
         async move {
             match &msg {
                 Message::Text(text) => {
-                    let mcp_method = extract_mcp_request_method(text, &ws_path);
-                    let is_mcp_response =
-                        mcp_method.is_none() && is_jsonrpc_response_for_mcp(text, &ws_path);
+                    let mcp_method = if host_is_mcp_target || is_discovery {
+                        extract_mcp_request_method(text, &ws_path)
+                    } else {
+                        None
+                    };
+                    let is_mcp_response = (host_is_mcp_target || is_discovery)
+                        && mcp_method.is_none()
+                        && is_jsonrpc_response_for_mcp(text);
+                    let is_actual_mcp = mcp_method.is_some() || is_mcp_response;
+
+                    // Keep MCP host seed list focused on JSON-RPC traffic only.
+                    // Non-MCP text frames on MCP hosts (for example Intercom pubsub noise)
+                    // should not be reclassified as AI inference.
+                    if host_is_mcp_target && !host_is_ai_target && !is_discovery && !is_actual_mcp {
+                        debug!(
+                            host = %host,
+                            path = %ws_path,
+                            len = text.len(),
+                            "Skipping non-MCP WebSocket text frame on MCP host"
+                        );
+                        return Some(msg);
+                    }
+
                     let event_shape = if let Some(method) = mcp_method {
-                        Some((EventSource::Mcp, method))
+                        Some((EventSource::Mcp, method, "mcp"))
                     } else if is_mcp_response {
-                        Some((EventSource::Mcp, "response".to_string()))
+                        Some((EventSource::Mcp, "response".to_string(), "mcp"))
                     } else if should_emit_non_mcp_ws_event(is_agent_app, provider) {
                         let source = if is_agent_app {
                             EventSource::AgentApp
@@ -1959,28 +2067,39 @@ impl WebSocketHandler for AiWebSocketHandler {
                         } else {
                             format!("WebSocket {}", ws_path)
                         };
-                        Some((source, method))
+                        Some((source, method, provider))
                     } else {
                         None
                     };
 
-                    if let Some((source, ws_method)) = event_shape {
+                    if let Some((source, ws_method, provider_for_event)) = event_shape {
                         info!(
                             host = %host,
                             path = %ws_path,
-                            provider = provider,
-                            agent = ws_agent,
+                            provider = provider_for_event,
+                            agent = detected_ws_agent.unwrap_or(provider_for_event),
                             len = text.len(),
                             "WebSocket text message"
                         );
 
                         // Log WebSocket message for observability
                         if let Some(ref logger) = event_logger {
-                            let agent_info = AgentInfo::new(ws_agent, DetectionSource::Environment);
+                            let resolved_agent = detected_ws_agent.unwrap_or_else(|| match source {
+                                EventSource::Mcp => "mcp",
+                                EventSource::AiProxy | EventSource::AgentApp => {
+                                    if provider_for_event == "unknown" {
+                                        "websocket"
+                                    } else {
+                                        provider_for_event
+                                    }
+                                }
+                            });
+                            let agent_info =
+                                AgentInfo::new(resolved_agent, DetectionSource::Environment);
 
                             let event = WrapEvent::new(&session_id, &host, direction, agent_info)
                                 .with_source(source)
-                                .with_provider(provider)
+                                .with_provider(provider_for_event)
                                 .with_method(ws_method)
                                 .with_content(text.to_string());
                             logger.log(&event);
@@ -2074,6 +2193,7 @@ where
 
     // Convert event_logger to Arc for sharing
     let event_logger_arc = event_logger.map(Arc::new);
+    let ws_hosts = Arc::new(config.hosts.clone());
 
     #[cfg(feature = "dashboard")]
     let handler = {
@@ -2103,10 +2223,10 @@ where
     };
 
     // Create WebSocket handler with event logger
-    let ws_handler = AiWebSocketHandler::new(session_id, event_logger_arc);
+    let ws_handler = AiWebSocketHandler::new(session_id, event_logger_arc, ws_hosts);
 
     info!("Starting hudsucker proxy on {}", listen_addr);
-    info!("  AI domains -> MITM intercept");
+    info!("  AI+MCP domains -> MITM intercept");
     info!("  Other domains -> blind tunnel");
 
     // ChatGPT web requests can carry extremely large sentinel/auth headers.
@@ -2172,23 +2292,21 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_mcp_request_method_uses_path_hint_for_custom_jsonrpc_methods() {
+    fn test_extract_mcp_request_method_rejects_custom_jsonrpc_methods_without_mcp_namespace() {
         let payload = r#"{"jsonrpc":"2.0","id":1,"method":"rpc.custom","params":{"x":1}}"#;
-        assert_eq!(
-            extract_mcp_request_method(payload, "/jsonrpc"),
-            Some("rpc.custom".to_string())
-        );
+        assert_eq!(extract_mcp_request_method(payload, "/jsonrpc"), None);
         assert_eq!(extract_mcp_request_method(payload, "/api"), None);
     }
 
     #[test]
     fn test_is_jsonrpc_response_for_mcp_detects_response_and_error() {
-        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
-        let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}"#;
+        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32803,"message":"resource not found"}}"#;
+        let generic = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
 
-        assert!(is_jsonrpc_response_for_mcp(response, "/mcp"));
-        assert!(is_jsonrpc_response_for_mcp(error, "/jsonrpc"));
-        assert!(!is_jsonrpc_response_for_mcp(response, "/api"));
+        assert!(is_jsonrpc_response_for_mcp(response));
+        assert!(is_jsonrpc_response_for_mcp(error));
+        assert!(!is_jsonrpc_response_for_mcp(generic));
     }
 
     #[test]

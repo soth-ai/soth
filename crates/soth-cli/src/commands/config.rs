@@ -116,8 +116,12 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             config.forward_proxy.socket_addr()
         );
         println!(
-            "  Intercept:   {} hosts",
-            config.forward_proxy.hosts.intercept.len()
+            "  AI hosts:    {}",
+            config.forward_proxy.hosts.ai_inference.len()
+        );
+        println!(
+            "  MCP hosts:   {}",
+            config.forward_proxy.hosts.mcp.len()
         );
         println!("  Host mode:   {}", config.forward_proxy.hosts.mode);
         println!(
@@ -187,9 +191,13 @@ fn validate_forward_proxy(
             proxy.port
         ));
     }
-    if proxy.hosts.mode == HostFilterMode::Selective && proxy.hosts.intercept.is_empty() {
-        warnings
-            .push("No intercept host patterns configured; traffic will mostly tunnel".to_string());
+    if proxy.hosts.mode == HostFilterMode::Selective
+        && proxy.hosts.ai_inference.is_empty()
+        && proxy.hosts.mcp.is_empty()
+    {
+        warnings.push(
+            "No AI/MCP host patterns configured; traffic will mostly tunnel".to_string(),
+        );
     }
     if proxy.hosts.mode == HostFilterMode::Discovery {
         warnings.push(
@@ -251,9 +259,9 @@ fn validate_observe(config: &SothConfig, warnings: &mut Vec<String>, errors: &mu
     }
 
     let backend = config.observe.storage.backend.to_lowercase();
-    if !["local", "jsonl", "sqlite"].contains(&backend.as_str()) {
+    if backend != "sqlite" {
         errors.push(format!(
-            "Invalid observe.storage.backend '{}' (valid: local, jsonl, sqlite)",
+            "Invalid observe.storage.backend '{}' (valid: sqlite)",
             config.observe.storage.backend
         ));
     }

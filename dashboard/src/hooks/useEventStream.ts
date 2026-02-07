@@ -30,6 +30,7 @@ export function useEventStream(
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const sinceSeqRef = useRef<number | null>(sinceSeq);
+  const lastAckSeqRef = useRef<number | null>(sinceSeq);
   const onEventRef = useRef<typeof onEvent>(onEvent);
 
   useEffect(() => {
@@ -70,42 +71,78 @@ export function useEventStream(
         ws.onmessage = (event) => {
           try {
             const payload = JSON.parse(event.data) as
-              | { type?: string; event?: WrapEvent }
+              | { type?: string; event?: WrapEvent; events?: WrapEvent[]; seq_end?: number }
               | WrapEvent;
-            const wrapEvent =
-              typeof payload === "object" &&
-              payload !== null &&
-              "type" in payload &&
-              payload.type === "event"
-                ? payload.event
-                : (payload as WrapEvent);
 
-            if (!wrapEvent?.id) {
+            const incomingEvents: WrapEvent[] =
+              typeof payload === "object" && payload !== null && "type" in payload
+                ? payload.type === "batch" && Array.isArray(payload.events)
+                  ? payload.events
+                  : payload.type === "event" && payload.event
+                  ? [payload.event]
+                  : []
+                : [(payload as WrapEvent)];
+
+            if (!incomingEvents.length) {
               return;
             }
 
-            if (typeof wrapEvent.seq === "number") {
-              setLastSeq((prev) => {
-                const next = prev === null ? wrapEvent.seq! : Math.max(prev, wrapEvent.seq!);
-                sinceSeqRef.current = next;
-                return next;
-              });
+            let maxSeqInFrame: number | null = null;
+            const validEvents = incomingEvents.filter((item) => item?.id);
+            if (!validEvents.length) {
+              return;
             }
 
             setEvents((prev) => {
-              if (prev.some((existing) => existing.id === wrapEvent.id)) {
-                return prev;
+              const updated = [...prev];
+              for (const wrapEvent of validEvents) {
+                const existingIndex = updated.findIndex(
+                  (existing) => existing.id === wrapEvent.id
+                );
+                if (existingIndex >= 0) {
+                  // Streamed proxy events reuse the same id: first placeholder, then final payload.
+                  // Replace in place so the UI reflects the latest body/metadata.
+                  updated[existingIndex] = wrapEvent;
+                  onEventRef.current?.(wrapEvent);
+                } else {
+                  updated.push(wrapEvent);
+                  onEventRef.current?.(wrapEvent);
+                }
+                if (typeof wrapEvent.seq === "number") {
+                  maxSeqInFrame =
+                    maxSeqInFrame === null
+                      ? wrapEvent.seq
+                      : Math.max(maxSeqInFrame, wrapEvent.seq);
+                }
               }
 
-              // Keep oldest -> newest ordering
-              const updated = [...prev, wrapEvent];
               if (updated.length > maxEvents) {
                 return updated.slice(updated.length - maxEvents);
               }
-
               return updated;
             });
-            onEventRef.current?.(wrapEvent);
+
+            if (maxSeqInFrame !== null) {
+              sinceSeqRef.current =
+                sinceSeqRef.current === null
+                  ? maxSeqInFrame
+                  : Math.max(sinceSeqRef.current, maxSeqInFrame);
+              setLastSeq(sinceSeqRef.current);
+
+              if (
+                ws.readyState === WebSocket.OPEN &&
+                (lastAckSeqRef.current === null ||
+                  sinceSeqRef.current > lastAckSeqRef.current)
+              ) {
+                ws.send(
+                  JSON.stringify({
+                    type: "ack",
+                    seq: sinceSeqRef.current,
+                  })
+                );
+                lastAckSeqRef.current = sinceSeqRef.current;
+              }
+            }
           } catch (e) {
             console.error("Failed to parse event:", e);
           }

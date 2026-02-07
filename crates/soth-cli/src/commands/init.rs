@@ -15,11 +15,12 @@ forward_proxy:
   port: 8080
   hosts:
     mode: "selective"  # selective | discovery
-    intercept:
+    ai_inference:
       - "api.openai.com"
       - "api.anthropic.com"
       - "chatgpt.com"
       - "*.chatgpt.com"
+    mcp: []
     block: []
 
 # Identity configuration

@@ -181,13 +181,22 @@ function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
     normalizePreview(wrapEvent.content_preview) ||
     JSON.stringify(wrapEvent, null, 2);
 
+  const normalizedSource =
+    wrapEvent.source === "ai_proxy" && wrapEvent.provider === "mcp"
+      ? "mcp"
+      : (wrapEvent.source || "mcp");
+  const normalizedAgent =
+    wrapEvent.agent?.name === "websocket" && wrapEvent.provider
+      ? { ...wrapEvent.agent, name: wrapEvent.provider }
+      : (wrapEvent.agent || { name: "Unknown", detected_from: "unknown" });
+
   return {
     id: wrapEvent.id,
     timestamp: wrapEvent.timestamp,
     session_id: wrapEvent.session_id,
     server_name: wrapEvent.server_name,
     direction: wrapEvent.direction,
-    source: wrapEvent.source || "mcp",
+    source: normalizedSource,
     provider: wrapEvent.provider,
     model: wrapEvent.model,
     method: wrapEvent.method,
@@ -202,7 +211,7 @@ function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
     response_content_ref: wrapEvent.response_content_ref,
     response_preview: normalizePreview(wrapEvent.response_preview),
     status_code: wrapEvent.status_code,
-    agent: wrapEvent.agent || { name: "Unknown", detected_from: "unknown" },
+    agent: normalizedAgent,
     policy_allowed: wrapEvent.policy_allowed,
     policy_reason: wrapEvent.policy_reason,
     pii_detected: wrapEvent.pii_detected || false,
