@@ -18,14 +18,8 @@ use hudsucker::{
 };
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rmcp::model::{
-    CustomNotification as RmcpCustomNotification, CustomRequest as RmcpCustomRequest,
-    JsonRpcMessage as RmcpJsonRpcMessage,
-};
 use serde::Deserialize;
-use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
-use soth_core::types::policy::PolicyInputBuilder;
-use soth_identity::{signing::verify_bytes, signing::SignatureBlock, Did};
+use soth_budget::{BudgetTracker, PricingCatalog};
 use soth_policy::PolicyEngine;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
@@ -38,10 +32,11 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "dashboard")]
 use soth_dashboard::{DashboardState, DenialEntry};
 
+use crate::enforcement::core as enforcement_core;
 use crate::error::ProxyError;
 use crate::providers::ProviderRegistry;
-use crate::protocol::mcp::methods as mcp_methods;
 use crate::transport::host_fingerprint;
+use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
 use crate::transport::response_event_builder::{
     build_paired_response_event, empty_response_placeholder, normalize_response_content,
     ResponseEventInput, ResponseKind,
@@ -53,9 +48,6 @@ use crate::transport::usage_enrichment::{
 use soth_core::config::{ForwardProxyConfig, HostAction, HostFilterConfig};
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
-
-type RmcpWireJsonRpcMessage =
-    RmcpJsonRpcMessage<RmcpCustomRequest, serde_json::Value, RmcpCustomNotification>;
 
 /// AI request body structure for model extraction
 #[derive(Debug, Deserialize)]
@@ -97,113 +89,6 @@ fn request_id_from_ctx(ctx: &HttpContext) -> u64 {
     // Use the context's internal connection/request tracking
     // Hash the pointer address as a simple unique ID
     ctx as *const _ as u64
-}
-
-fn mcp_path_hint(path: &str) -> bool {
-    let path_lower = path.to_ascii_lowercase();
-    path_lower.contains("/mcp") || path_lower.contains("/jsonrpc")
-}
-
-fn is_likely_mcp_method(method: &str) -> bool {
-    matches!(
-        method,
-        mcp_methods::INITIALIZE
-            | mcp_methods::INITIALIZED
-            | mcp_methods::PING
-            | mcp_methods::CANCELLED
-            | mcp_methods::PROGRESS
-            | mcp_methods::TOOLS_LIST
-            | mcp_methods::TOOLS_CALL
-            | mcp_methods::RESOURCES_LIST
-            | mcp_methods::RESOURCES_READ
-            | mcp_methods::RESOURCES_SUBSCRIBE
-            | mcp_methods::RESOURCES_UNSUBSCRIBE
-            | mcp_methods::RESOURCES_UPDATED
-            | mcp_methods::RESOURCES_LIST_CHANGED
-            | mcp_methods::PROMPTS_LIST
-            | mcp_methods::PROMPTS_GET
-            | mcp_methods::PROMPTS_LIST_CHANGED
-            | mcp_methods::LOGGING_SET_LEVEL
-            | mcp_methods::LOGGING_MESSAGE
-            | mcp_methods::SAMPLING_CREATE_MESSAGE
-    ) || method.starts_with("tools/")
-        || method.starts_with("resources/")
-        || method.starts_with("prompts/")
-        || method.starts_with("notifications/")
-        || method.starts_with("sampling/")
-        || method.starts_with("roots/")
-        || method.starts_with("tasks/")
-        || method.starts_with("completion/")
-        || method.starts_with("elicitation/")
-        || method.starts_with("logging/")
-}
-
-fn extract_mcp_request_method_from_json(
-    value: serde_json::Value,
-    path_hint_is_mcp: bool,
-) -> Option<String> {
-    match serde_json::from_value::<RmcpWireJsonRpcMessage>(value).ok()? {
-        RmcpWireJsonRpcMessage::Request(req) => {
-            if is_likely_mcp_method(&req.request.method) || path_hint_is_mcp {
-                Some(req.request.method)
-            } else {
-                None
-            }
-        }
-        RmcpWireJsonRpcMessage::Notification(notification) => {
-            if is_likely_mcp_method(&notification.notification.method) || path_hint_is_mcp {
-                Some(notification.notification.method)
-            } else {
-                None
-            }
-        }
-        RmcpWireJsonRpcMessage::Response(_) | RmcpWireJsonRpcMessage::Error(_) => None,
-    }
-}
-
-fn extract_mcp_request_method(payload: &str, path: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let path_hint_is_mcp = mcp_path_hint(path);
-    match value {
-        serde_json::Value::Object(_) => extract_mcp_request_method_from_json(value, path_hint_is_mcp),
-        serde_json::Value::Array(items) => {
-            let mut methods = Vec::new();
-            for item in items {
-                if let Some(method) = extract_mcp_request_method_from_json(item, path_hint_is_mcp)
-                {
-                    methods.push(method);
-                }
-            }
-            if methods.is_empty() {
-                None
-            } else if methods.len() == 1 {
-                methods.into_iter().next()
-            } else {
-                Some(format!("batch:{} (+{})", methods[0], methods.len() - 1))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn is_jsonrpc_response_for_mcp(payload: &str, path: &str) -> bool {
-    if !mcp_path_hint(path) {
-        return false;
-    }
-    let value: serde_json::Value = match serde_json::from_str(payload) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    let items: Vec<serde_json::Value> = match value {
-        serde_json::Value::Array(values) => values,
-        other => vec![other],
-    };
-    items.into_iter().any(|item| {
-        matches!(
-            serde_json::from_value::<RmcpWireJsonRpcMessage>(item),
-            Ok(RmcpWireJsonRpcMessage::Response(_)) | Ok(RmcpWireJsonRpcMessage::Error(_))
-        )
-    })
 }
 
 const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
@@ -262,12 +147,7 @@ pub struct ProxyEnforcer {
     default_model: String,
 }
 
-#[derive(Debug, Clone, Default)]
-struct EnforcementResult {
-    identity_verified: bool,
-    did: Option<String>,
-    policy_version: Option<String>,
-}
+type EnforcementResult = enforcement_core::IdentityResult;
 
 impl ProxyEnforcer {
     /// Create a default no-op enforcer.
@@ -331,169 +211,19 @@ impl ProxyEnforcer {
         &self.signature_header
     }
 
-    fn parse_signature(raw_signature: &str, did: &str) -> Result<SignatureBlock, String> {
-        let signature = match serde_json::from_str::<SignatureBlock>(raw_signature) {
-            Ok(block) => block,
-            Err(_) => SignatureBlock {
-                algorithm: "Ed25519".to_string(),
-                value: raw_signature.to_string(),
-                signer: did.to_string(),
-                created: chrono::Utc::now(),
-            },
-        };
-
-        if signature.algorithm != "Ed25519" {
-            return Err(format!(
-                "Unsupported signature algorithm: {}",
-                signature.algorithm
-            ));
-        }
-        if signature.signer != did {
-            return Err(format!(
-                "Signature signer mismatch: signer={}, did={}",
-                signature.signer, did
-            ));
-        }
-
-        Ok(signature)
-    }
-
-    fn canonical_request_bytes(
-        host: &str,
-        method: &str,
-        path: &str,
-        body: Option<&str>,
-    ) -> Result<Vec<u8>, String> {
-        let value = serde_json::json!({
-            "host": host,
-            "method": method,
-            "path": path,
-            "body": body.unwrap_or(""),
-        });
-        soth_identity::canonicalize_json(&value)
-            .map_err(|e| format!("Failed to canonicalize proxy request for signing: {e}"))
-    }
-
-    fn verify_identity(
-        &self,
-        host: &str,
-        method: &str,
-        path: &str,
-        body: Option<&str>,
-        did: Option<&str>,
-        signature: Option<&str>,
-    ) -> Result<EnforcementResult, String> {
-        if self.identity_mode == ProxyIdentityMode::Disabled {
-            return Ok(EnforcementResult::default());
-        }
-
-        match (did, signature) {
-            (None, None) => {
-                if self.identity_mode == ProxyIdentityMode::Required {
-                    Err("Identity required: missing DID and signature".to_string())
-                } else {
-                    Ok(EnforcementResult::default())
-                }
-            }
-            (Some(did), None) => {
-                if self.identity_mode == ProxyIdentityMode::Required {
-                    Err("Identity required: signature missing".to_string())
-                } else {
-                    Ok(EnforcementResult {
-                        identity_verified: false,
-                        did: Some(did.to_string()),
-                        policy_version: None,
-                    })
-                }
-            }
-            (None, Some(_)) => Err("Signature provided without DID".to_string()),
-            (Some(did), Some(signature)) => {
-                if !self.trusted_dids.contains(did) {
-                    return Err(format!("DID not in trust store: {did}"));
-                }
-
-                let parsed_did = Did::parse(did).map_err(|e| format!("Invalid DID: {e}"))?;
-                let keypair = parsed_did
-                    .to_key_pair()
-                    .map_err(|e| format!("Invalid DID key: {e}"))?;
-
-                let signature_block = Self::parse_signature(signature, did)?;
-                let canonical = Self::canonical_request_bytes(host, method, path, body)?;
-                let verified = verify_bytes(&canonical, &signature_block, &keypair)
-                    .map_err(|e| format!("Signature verification failed: {e}"))?;
-
-                if !verified {
-                    return Err(format!("Invalid signature for DID: {did}"));
-                }
-
-                Ok(EnforcementResult {
-                    identity_verified: true,
-                    did: Some(did.to_string()),
-                    policy_version: None,
-                })
-            }
+    fn core_identity_mode(&self) -> enforcement_core::IdentityMode {
+        match self.identity_mode {
+            ProxyIdentityMode::Disabled => enforcement_core::IdentityMode::Disabled,
+            ProxyIdentityMode::Optional => enforcement_core::IdentityMode::Optional,
+            ProxyIdentityMode::Required => enforcement_core::IdentityMode::Required,
         }
     }
 
-    fn evaluate_policy(
-        &self,
-        session_id: &str,
-        provider: &str,
-        host: &str,
-        http_method: &str,
-        path: &str,
-        model: Option<&str>,
-        agent: Option<&str>,
-        identity: &EnforcementResult,
-    ) -> Result<(bool, Option<String>, Option<String>), String> {
-        let Some(engine) = self.policy_engine.as_ref() else {
-            return Ok((true, None, None));
-        };
-
-        let mut builder = PolicyInputBuilder::new()
-            .session_id(session_id)
-            .method(format!("proxy/{}", http_method.to_lowercase()))
-            .tool(format!("{provider}:{path}"))
-            .arguments_json(serde_json::json!({
-                "provider": provider,
-                "host": host,
-                "method": http_method,
-                "path": path,
-                "model": model,
-            }));
-
-        if let Some(agent) = agent {
-            builder = builder.agent_id(agent);
-        }
-
-        if identity.identity_verified {
-            builder = builder.identity_verified(true);
-            if let Some(ref did) = identity.did {
-                builder = builder.identity_did(did);
-            }
-        }
-
-        let input = builder.build();
-        let result = engine
-            .evaluate(&input)
-            .map_err(|e| format!("Policy evaluation failed: {e}"))?;
-        let policy_version = Some(result.policy_version);
-        let decision = result.decision;
-
-        if decision.allow {
-            Ok((true, None, policy_version))
-        } else {
-            let reason = decision
-                .reason
-                .or_else(|| {
-                    if decision.violations.is_empty() {
-                        None
-                    } else {
-                        Some(decision.violations.join("; "))
-                    }
-                })
-                .unwrap_or_else(|| "Policy denied proxy request".to_string());
-            Ok((false, Some(reason), policy_version))
+    fn core_policy_mode(&self) -> enforcement_core::PolicyMode {
+        match self.policy_mode {
+            ProxyPolicyMode::Disabled => enforcement_core::PolicyMode::Disabled,
+            ProxyPolicyMode::Audit => enforcement_core::PolicyMode::Audit,
+            ProxyPolicyMode::Enforce => enforcement_core::PolicyMode::Enforce,
         }
     }
 
@@ -510,67 +240,35 @@ impl ProxyEnforcer {
         did: Option<&str>,
         signature: Option<&str>,
     ) -> Result<EnforcementResult, (u16, String, Option<String>)> {
-        let mut identity =
-            match self.verify_identity(host, http_method, path, request_body, did, signature) {
-                Ok(result) => result,
-                Err(err) => {
-                    if self.identity_mode == ProxyIdentityMode::Required {
-                        return Err((401, err, None));
-                    }
-                    warn!("Optional identity verification failed: {}", err);
-                    EnforcementResult {
-                        identity_verified: false,
-                        did: did.map(|s| s.to_string()),
-                        policy_version: None,
-                    }
-                }
-            };
-
-        if let Some(tracker) = self.budget_tracker.as_ref() {
-            let agent_id = identity.did.as_deref().or(agent).map(|s| s.to_string());
-
-            if self.budget_block_on_exceeded && tracker.is_budget_exceeded(agent_id.as_deref()) {
-                return Err((429, "Budget exceeded".to_string(), None));
-            }
-
-            if let Some(body) = request_body {
-                let input_tokens = TokenCounter::estimate_tokens(body);
-                let effective_model = model.unwrap_or(&self.default_model);
-                tracker.record_spend(
-                    session_id,
-                    agent_id.as_deref(),
-                    effective_model,
-                    input_tokens,
-                    0,
-                );
+        let result = enforcement_core::enforce_proxy_request(
+            enforcement_core::ProxyEnforcementConfig {
+                identity_mode: self.core_identity_mode(),
+                trusted_dids: self.trusted_dids.as_ref(),
+                policy_mode: self.core_policy_mode(),
+                policy_engine: self.policy_engine.as_deref(),
+                budget_tracker: self.budget_tracker.as_deref(),
+                budget_block_on_exceeded: self.budget_block_on_exceeded,
+                default_model: &self.default_model,
+            },
+            enforcement_core::ProxyEnforcementInput {
+                session_id,
+                provider,
+                host,
+                http_method,
+                path,
+                model,
+                request_body,
+                agent,
+                did,
+                signature,
+            },
+        );
+        if let Err((_, ref reason, _)) = result {
+            if self.policy_mode == ProxyPolicyMode::Audit {
+                warn!("Policy audit violation: {}", reason);
             }
         }
-
-        let (allowed, denial_reason, policy_version) = match self.evaluate_policy(
-            session_id,
-            provider,
-            host,
-            http_method,
-            path,
-            model,
-            agent,
-            &identity,
-        ) {
-            Ok(result) => result,
-            Err(err) => return Err((500, err, None)),
-        };
-        identity.policy_version = policy_version.clone();
-
-        if !allowed {
-            let reason = denial_reason.unwrap_or_else(|| "Policy denied".to_string());
-            match self.policy_mode {
-                ProxyPolicyMode::Enforce => return Err((403, reason, policy_version)),
-                ProxyPolicyMode::Audit => warn!("Policy audit violation: {}", reason),
-                ProxyPolicyMode::Disabled => {}
-            }
-        }
-
-        Ok(identity)
+        result
     }
 }
 
@@ -1543,7 +1241,7 @@ impl HttpHandler for AiProxyHandler {
                                 if let Some(ref did) = identity_result.did {
                                     dashboard.record_identity_verification(
                                         did,
-                                        identity_result.identity_verified,
+                                        identity_result.verified,
                                     );
                                 }
                                 if let Some(ref version) = identity_result.policy_version {
@@ -1694,18 +1392,12 @@ impl HttpHandler for AiProxyHandler {
                 );
 
                 if let Some(ref logger) = event_logger {
-                    let mcp_agent = AgentInfo::new(
-                        agent.unwrap_or("mcp"),
-                        DetectionSource::Environment,
-                    );
-                    let mut event = WrapEvent::new(
-                        &session_id,
-                        &host,
-                        WrapDirection::In,
-                        mcp_agent,
-                    )
-                    .with_source(EventSource::Mcp)
-                    .with_method(mcp_method.clone());
+                    let mcp_agent =
+                        AgentInfo::new(agent.unwrap_or("mcp"), DetectionSource::Environment);
+                    let mut event =
+                        WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
+                            .with_source(EventSource::Mcp)
+                            .with_method(mcp_method.clone());
                     if let Some(ref request_body) = body_content {
                         event = event.with_content(request_body.clone());
                     }
@@ -1816,8 +1508,10 @@ impl HttpHandler for AiProxyHandler {
                 };
 
                 if let Some(ref logger) = event_logger {
-                    let mcp_agent =
-                        AgentInfo::new(pending.agent.unwrap_or("mcp"), DetectionSource::Environment);
+                    let mcp_agent = AgentInfo::new(
+                        pending.agent.unwrap_or("mcp"),
+                        DetectionSource::Environment,
+                    );
                     let method_name = pending
                         .mcp_method
                         .clone()
@@ -1829,19 +1523,16 @@ impl HttpHandler for AiProxyHandler {
                         )
                     });
 
-                    let mut event = WrapEvent::new(
-                        &session_id,
-                        &pending.host,
-                        WrapDirection::Out,
-                        mcp_agent,
-                    )
-                    .with_source(EventSource::Mcp)
-                    .with_method(method_name.clone())
-                    .with_status_code(status)
-                    .with_latency(latency_ms)
-                    .with_content(response_payload);
+                    let mut event =
+                        WrapEvent::new(&session_id, &pending.host, WrapDirection::Out, mcp_agent)
+                            .with_source(EventSource::Mcp)
+                            .with_method(method_name.clone())
+                            .with_status_code(status)
+                            .with_latency(latency_ms)
+                            .with_content(response_payload);
                     event.id = pending.event_id.clone();
-                    event = event.with_content_preview(format!("← {} (HTTP {})", method_name, status));
+                    event =
+                        event.with_content_preview(format!("← {} (HTTP {})", method_name, status));
                     logger.log(&event);
                 }
 
@@ -1859,12 +1550,8 @@ impl HttpHandler for AiProxyHandler {
             // Emit a placeholder row immediately, then overwrite by ID when stream capture finishes.
             if is_sse || is_codex_response_path {
                 if let Some(ref logger) = event_logger {
-                    let placeholder = empty_response_placeholder(
-                        &pending.method,
-                        &pending.path,
-                        status,
-                        is_sse,
-                    );
+                    let placeholder =
+                        empty_response_placeholder(&pending.method, &pending.path, status, is_sse);
                     let mut event = build_paired_response_event(ResponseEventInput {
                         session_id: &session_id,
                         host: &pending.host,
@@ -2217,8 +1904,8 @@ impl WebSocketHandler for AiWebSocketHandler {
             match &msg {
                 Message::Text(text) => {
                     let mcp_method = extract_mcp_request_method(text, &ws_path);
-                    let is_mcp_response = mcp_method.is_none()
-                        && is_jsonrpc_response_for_mcp(text, &ws_path);
+                    let is_mcp_response =
+                        mcp_method.is_none() && is_jsonrpc_response_for_mcp(text, &ws_path);
                     let (source, ws_method) = if let Some(method) = mcp_method {
                         (EventSource::Mcp, method)
                     } else if is_mcp_response {
@@ -2749,7 +2436,7 @@ mod tests {
             ProxyEnforcer::new().with_identity_mode(ProxyIdentityMode::Required, trusted);
 
         let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
-        let canonical = ProxyEnforcer::canonical_request_bytes(
+        let canonical = enforcement_core::canonical_proxy_request_bytes(
             "api.openai.com",
             "POST",
             "/v1/chat/completions",
@@ -2773,7 +2460,7 @@ mod tests {
 
         assert!(result.is_ok());
         let identity = result.unwrap();
-        assert!(identity.identity_verified);
+        assert!(identity.verified);
         assert_eq!(identity.did, Some(did));
     }
 

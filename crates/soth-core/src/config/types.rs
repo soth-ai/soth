@@ -775,20 +775,9 @@ pub struct HostFilterConfig {
     #[serde(default = "default_intercept_hosts")]
     pub intercept: Vec<String>,
 
-    /// Allowed hosts (whitelist mode) - deprecated, use intercept instead
-    /// If non-empty, only these hosts are allowed (old behavior)
-    #[serde(default)]
-    pub allow: Vec<String>,
-
     /// Blocked hosts - these are rejected with 403
     #[serde(default)]
     pub block: Vec<String>,
-
-    /// Proxy mode: "selective" (default) or "whitelist" (legacy)
-    /// - selective: intercept AI domains, tunnel everything else
-    /// - whitelist: only allow listed hosts (old behavior)
-    #[serde(default = "default_proxy_mode")]
-    pub mode: String,
 }
 
 fn default_intercept_hosts() -> Vec<String> {
@@ -960,17 +949,11 @@ fn default_intercept_hosts() -> Vec<String> {
     ]
 }
 
-fn default_proxy_mode() -> String {
-    "selective".to_string()
-}
-
 impl Default for HostFilterConfig {
     fn default() -> Self {
         Self {
             intercept: default_intercept_hosts(),
-            allow: Vec::new(),
             block: Vec::new(),
-            mode: default_proxy_mode(),
         }
     }
 }
@@ -1018,17 +1001,6 @@ impl HostFilterConfig {
         false
     }
 
-    /// Check if a host is allowed (for legacy whitelist mode)
-    pub fn is_allowed(&self, host: &str) -> bool {
-        if self.mode == "whitelist" && !self.allow.is_empty() {
-            // Legacy whitelist mode: only allow listed hosts
-            self.allow.iter().any(|h| h == host)
-        } else {
-            // Selective mode: allow all except blocked
-            !self.is_blocked(host)
-        }
-    }
-
     /// Check if a host is a local address that should always be tunneled
     fn is_local_host(host: &str) -> bool {
         let host_lower = host.to_lowercase();
@@ -1069,16 +1041,7 @@ impl HostFilterConfig {
             return HostAction::Block;
         }
 
-        // In whitelist mode, check allow list
-        if self.mode == "whitelist" && !self.allow.is_empty() {
-            if self.allow.iter().any(|h| h == host) {
-                return HostAction::Intercept;
-            } else {
-                return HostAction::Block;
-            }
-        }
-
-        // In selective mode (default): intercept AI domains, tunnel rest
+        // Intercept configured AI domains; tunnel everything else.
         if self.should_intercept(host) {
             HostAction::Intercept
         } else {
@@ -1486,27 +1449,28 @@ upstream:
     }
 
     #[test]
-    fn test_host_filter_whitelist() {
+    fn test_host_filter_intercept_and_tunnel() {
+        use super::HostAction;
         let filter = HostFilterConfig {
-            intercept: vec![],
-            allow: vec!["api.openai.com".to_string()],
+            intercept: vec!["api.openai.com".to_string()],
             block: vec![],
-            mode: "whitelist".to_string(),
         };
-        assert!(filter.is_allowed("api.openai.com"));
-        assert!(!filter.is_allowed("api.example.com"));
+        assert_eq!(
+            filter.action_for_host("api.openai.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(filter.action_for_host("api.example.com"), HostAction::Tunnel);
     }
 
     #[test]
     fn test_host_filter_blacklist() {
+        use super::HostAction;
         let filter = HostFilterConfig {
             intercept: vec![],
-            allow: vec![],
             block: vec!["blocked.com".to_string()],
-            mode: "selective".to_string(),
         };
-        assert!(filter.is_allowed("api.openai.com"));
-        assert!(!filter.is_allowed("blocked.com"));
+        assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Tunnel);
+        assert_eq!(filter.action_for_host("blocked.com"), HostAction::Block);
     }
 
     #[test]
@@ -1535,9 +1499,6 @@ upstream:
         );
         assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
 
-        // All should be "allowed" in selective mode (not blocked)
-        assert!(filter.is_allowed("api.openai.com"));
-        assert!(filter.is_allowed("random.example.com"));
     }
 
     #[test]
@@ -1547,9 +1508,7 @@ upstream:
                 "api.openai.com".to_string(),
                 "*.openai.azure.com".to_string(),
             ],
-            allow: vec![],
             block: vec![],
-            mode: "selective".to_string(),
         };
 
         assert!(filter.should_intercept("api.openai.com"));
@@ -1566,9 +1525,7 @@ upstream:
                 "bedrock.*.amazonaws.com".to_string(), // Middle wildcard
                 "*.huggingface.co".to_string(),        // Prefix wildcard
             ],
-            allow: vec![],
             block: vec![],
-            mode: "selective".to_string(),
         };
 
         // Exact match
@@ -1672,9 +1629,7 @@ upstream:
         use super::HostAction;
         let filter = HostFilterConfig {
             intercept: vec!["api.openai.com".to_string()],
-            allow: vec![],
             block: vec!["malware.com".to_string(), "*.bad.com".to_string()],
-            mode: "selective".to_string(),
         };
 
         assert_eq!(filter.action_for_host("malware.com"), HostAction::Block);
@@ -1698,7 +1653,6 @@ forward_proxy:
   port: 9090
   address: "0.0.0.0"
   hosts:
-    mode: selective
     intercept:
       - "api.openai.com"
       - "api.anthropic.com"
@@ -1745,15 +1699,14 @@ forward_proxy:
     }
 
     #[test]
-    fn test_parse_forward_proxy_yaml_whitelist() {
+    fn test_parse_forward_proxy_yaml_intercept_only() {
         use super::HostAction;
         let yaml = r#"
 forward_proxy:
   enabled: true
   port: 9090
   hosts:
-    mode: whitelist
-    allow:
+    intercept:
       - "api.openai.com"
       - "custom.api.com"
 "#;
@@ -1769,10 +1722,10 @@ forward_proxy:
             HostAction::Intercept
         );
 
-        // Other hosts blocked (whitelist mode)
+        // Other hosts tunneled by default
         assert_eq!(
             config.forward_proxy.hosts.action_for_host("other.com"),
-            HostAction::Block
+            HostAction::Tunnel
         );
     }
 
@@ -1932,9 +1885,7 @@ production:
         // Even if localhost is in the block list, it should still tunnel
         let filter_with_block = HostFilterConfig {
             intercept: vec![],
-            allow: vec![],
             block: vec!["localhost".to_string(), "127.0.0.1".to_string()],
-            mode: "selective".to_string(),
         };
 
         assert_eq!(

@@ -1,14 +1,13 @@
 //! Event store - watches event logs and stores recent events for dashboard.
 //!
-//! Supports JSONL and SQLite wrap-event backends.
+//! Uses SQLite wrap-event storage.
 //! Provides real-time event streaming via broadcast channel.
 
 use parking_lot::RwLock;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use soth_core::event_logger::{default_event_log_read_path, is_sqlite_event_log_path};
+use soth_core::event_logger::default_event_log_write_path;
 use soth_core::types::WrapEvent;
-use soth_core::watch::{FileWatcher, WatchEvent};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,17 +20,11 @@ const MAX_EVENTS: usize = 1000;
 /// Maximum number of agents to track.
 const MAX_AGENTS: usize = 100;
 
-#[derive(Clone, Debug)]
-enum EventStoreBackend {
-    Jsonl(PathBuf),
-    Sqlite(PathBuf),
-}
-
 /// Event store that watches wrap events and provides real-time streaming.
 #[derive(Clone)]
 pub struct EventStore {
     inner: Arc<RwLock<EventStoreInner>>,
-    backend: EventStoreBackend,
+    db_path: PathBuf,
     event_tx: broadcast::Sender<WrapEvent>,
 }
 
@@ -40,8 +33,6 @@ struct EventStoreInner {
     events: VecDeque<WrapEvent>,
     /// Agent statistics.
     agents: HashMap<String, AgentStats>,
-    /// File position for JSONL watching.
-    file_position: u64,
     /// Last seen SQLite sequence number.
     sqlite_seq: i64,
 }
@@ -80,39 +71,29 @@ pub struct EventsSummary {
 impl EventStore {
     /// Create a new event store.
     ///
-    /// Backend is inferred from extension (`.db`, `.sqlite`, `.sqlite3` => sqlite).
     pub fn new(log_path: PathBuf) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        let backend = if is_sqlite_event_log_path(&log_path) {
-            EventStoreBackend::Sqlite(log_path)
-        } else {
-            EventStoreBackend::Jsonl(log_path)
-        };
 
         Self {
             inner: Arc::new(RwLock::new(EventStoreInner {
                 events: VecDeque::with_capacity(MAX_EVENTS),
                 agents: HashMap::new(),
-                file_position: 0,
                 sqlite_seq: 0,
             })),
-            backend,
+            db_path: log_path,
             event_tx,
         }
     }
 
-    /// Create with default log path (prefers `~/.soth/logs/events.db`, falls back to JSONL).
+    /// Create with default log path (`~/.soth/logs/events.db`).
     pub fn with_default_path() -> Option<Self> {
-        let log_path = default_event_log_read_path().ok()?;
+        let log_path = default_event_log_write_path().ok()?;
         Some(Self::new(log_path))
     }
 
     /// Path currently used by this store.
     pub fn path(&self) -> &Path {
-        match &self.backend {
-            EventStoreBackend::Jsonl(path) => path.as_path(),
-            EventStoreBackend::Sqlite(path) => path.as_path(),
-        }
+        self.db_path.as_path()
     }
 
     /// Subscribe to new events.
@@ -138,8 +119,7 @@ impl EventStore {
 
     /// Get events strictly newer than a sqlite sequence cursor.
     ///
-    /// For sqlite backends this queries durable storage (ordered ASC by sequence).
-    /// For JSONL backends this falls back to in-memory filtering when sequence data exists.
+    /// Queries durable storage (ordered ASC by sequence).
     pub fn get_events_since_seq(&self, since_seq: i64, limit: usize) -> EventsSummary {
         if limit == 0 {
             return EventsSummary {
@@ -149,42 +129,18 @@ impl EventStore {
         }
 
         let capped_limit = limit.min(5_000);
-        match &self.backend {
-            EventStoreBackend::Sqlite(path) => {
-                let rows = read_sqlite_events(path, Some(since_seq), None).unwrap_or_default();
-                let total_events = self.inner.read().events.len();
+        let rows = read_sqlite_events(&self.db_path, Some(since_seq), None).unwrap_or_default();
+        let total_events = self.inner.read().events.len();
 
-                let mut events: Vec<WrapEvent> = rows.into_iter().map(|(_, event)| event).collect();
-                if events.len() > capped_limit {
-                    let keep_from = events.len() - capped_limit;
-                    events = events.split_off(keep_from);
-                }
+        let mut events: Vec<WrapEvent> = rows.into_iter().map(|(_, event)| event).collect();
+        if events.len() > capped_limit {
+            let keep_from = events.len() - capped_limit;
+            events = events.split_off(keep_from);
+        }
 
-                EventsSummary {
-                    total_events,
-                    events,
-                }
-            }
-            EventStoreBackend::Jsonl(_) => {
-                let inner = self.inner.read();
-                let mut events: Vec<WrapEvent> = inner
-                    .events
-                    .iter()
-                    .rev()
-                    .filter(|event| event.seq.map(|seq| seq > since_seq).unwrap_or(false))
-                    .cloned()
-                    .collect();
-
-                if events.len() > capped_limit {
-                    let keep_from = events.len() - capped_limit;
-                    events = events.split_off(keep_from);
-                }
-
-                EventsSummary {
-                    total_events: inner.events.len(),
-                    events,
-                }
-            }
+        EventsSummary {
+            total_events,
+            events,
         }
     }
 
@@ -204,58 +160,14 @@ impl EventStore {
 
     /// Get a full payload body for a specific event and part.
     pub fn get_event_payload(&self, event_id: &str, part: &str) -> Option<String> {
-        match &self.backend {
-            EventStoreBackend::Sqlite(path) => read_sqlite_event_payload(path, event_id, part)
-                .ok()
-                .flatten(),
-            EventStoreBackend::Jsonl(_) => {
-                let inner = self.inner.read();
-                inner
-                    .events
-                    .iter()
-                    .find(|event| event.id == event_id)
-                    .and_then(|event| match part {
-                        "request" => event.request_content.clone(),
-                        "response" => event.response_content.clone(),
-                        "content" => event.content.clone(),
-                        _ => None,
-                    })
-            }
-        }
+        read_sqlite_event_payload(&self.db_path, event_id, part)
+            .ok()
+            .flatten()
     }
 
     /// Load initial events from storage.
     pub async fn load_initial(&self) -> std::io::Result<usize> {
-        match &self.backend {
-            EventStoreBackend::Jsonl(path) => self.load_initial_jsonl(path).await,
-            EventStoreBackend::Sqlite(path) => self.load_initial_sqlite(path).await,
-        }
-    }
-
-    async fn load_initial_jsonl(&self, log_path: &Path) -> std::io::Result<usize> {
-        if !log_path.exists() {
-            debug!("Event log does not exist yet: {:?}", log_path);
-            return Ok(0);
-        }
-
-        let content = tokio::fs::read_to_string(log_path).await?;
-        let mut count = 0;
-
-        for line in content.lines() {
-            if let Ok(event) = serde_json::from_str::<WrapEvent>(line) {
-                self.add_event(event);
-                count += 1;
-            }
-        }
-
-        // Update file position
-        {
-            let mut inner = self.inner.write();
-            inner.file_position = content.len() as u64;
-        }
-
-        info!("Loaded {} initial events from {:?}", count, log_path);
-        Ok(count)
+        self.load_initial_sqlite(&self.db_path).await
     }
 
     async fn load_initial_sqlite(&self, db_path: &Path) -> std::io::Result<usize> {
@@ -269,8 +181,8 @@ impl EventStore {
         let rows = tokio::task::spawn_blocking(move || {
             read_sqlite_events(&query_path, None, Some(MAX_EVENTS))
         })
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))??;
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))??;
 
         let mut count = 0usize;
         let mut last_seq = 0i64;
@@ -291,59 +203,7 @@ impl EventStore {
 
     /// Watch for new events.
     pub async fn watch(&self) {
-        match &self.backend {
-            EventStoreBackend::Jsonl(path) => self.watch_jsonl(path.clone()).await,
-            EventStoreBackend::Sqlite(path) => self.watch_sqlite(path.clone()).await,
-        }
-    }
-
-    async fn watch_jsonl(&self, log_path: PathBuf) {
-        info!("Starting JSONL event watcher for {:?}", log_path);
-
-        let watcher_result = FileWatcher::new(log_path.clone());
-        let use_polling = watcher_result.is_err();
-        if use_polling {
-            warn!("File watcher unavailable, falling back to 100ms polling");
-        } else {
-            info!("Using notify-based file watching for instant events");
-        }
-
-        let mut watcher = watcher_result.ok();
-
-        loop {
-            if let Some(ref mut w) = watcher {
-                let timeout_duration = tokio::time::Duration::from_millis(500);
-                match tokio::time::timeout(timeout_duration, w.next()).await {
-                    Ok(Some(WatchEvent::Modified)) | Ok(Some(WatchEvent::Created)) => {
-                        debug!("File change detected via notify");
-                    }
-                    Ok(Some(WatchEvent::Removed)) => {
-                        debug!("Log file removed, waiting for recreation...");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                    Ok(Some(WatchEvent::Error(e))) => {
-                        warn!("Watch error: {e}");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                    Ok(None) => {
-                        warn!("File watcher closed, falling back to polling");
-                        watcher = None;
-                        continue;
-                    }
-                    Err(_) => {}
-                }
-            } else {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-
-            if let Err(e) = self.check_for_new_jsonl_events(&log_path).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!("Error checking event log: {}", e);
-                }
-            }
-        }
+        self.watch_sqlite(self.db_path.clone()).await
     }
 
     async fn watch_sqlite(&self, db_path: PathBuf) {
@@ -358,66 +218,6 @@ impl EventStore {
         }
     }
 
-    async fn check_for_new_jsonl_events(&self, log_path: &Path) -> std::io::Result<()> {
-        if !log_path.exists() {
-            return Ok(());
-        }
-
-        let metadata = tokio::fs::metadata(log_path).await?;
-        let current_size = metadata.len();
-
-        let file_position = {
-            let inner = self.inner.read();
-            inner.file_position
-        };
-
-        // Handle file truncation/recreation - reset position if file shrunk
-        let effective_position = if current_size < file_position {
-            debug!(
-                "Log file was truncated/recreated, resetting position from {} to 0",
-                file_position
-            );
-            let mut inner = self.inner.write();
-            inner.file_position = 0;
-            inner.events.clear(); // Clear stale events
-            0u64 // Process from beginning
-        } else if current_size == file_position {
-            return Ok(()); // No new content
-        } else {
-            file_position
-        };
-
-        // Read new content
-        let content = tokio::fs::read_to_string(log_path).await?;
-
-        // Process lines after the effective position
-        let mut bytes_read = 0u64;
-        for line in content.lines() {
-            let line_bytes = line.len() as u64 + 1; // +1 for newline
-            bytes_read += line_bytes;
-
-            if bytes_read <= effective_position {
-                continue;
-            }
-
-            if let Ok(event) = serde_json::from_str::<WrapEvent>(line) {
-                // Broadcast to subscribers
-                let _ = self.event_tx.send(event.clone());
-
-                // Store in memory
-                self.add_event(event);
-            }
-        }
-
-        // Update position
-        {
-            let mut inner = self.inner.write();
-            inner.file_position = current_size;
-        }
-
-        Ok(())
-    }
-
     async fn check_for_new_sqlite_events(&self, db_path: &Path) -> std::io::Result<()> {
         if !db_path.exists() {
             return Ok(());
@@ -429,9 +229,10 @@ impl EventStore {
         };
 
         let db_path = db_path.to_path_buf();
-        let rows = tokio::task::spawn_blocking(move || read_sqlite_events(&db_path, Some(cursor), None))
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))??;
+        let rows =
+            tokio::task::spawn_blocking(move || read_sqlite_events(&db_path, Some(cursor), None))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))??;
 
         if rows.is_empty() {
             return Ok(());
@@ -700,7 +501,7 @@ mod tests {
     #[test]
     fn test_add_event() {
         let dir = tempdir().unwrap();
-        let store = EventStore::new(dir.path().join("events.jsonl"));
+        let store = EventStore::new(dir.path().join("events.db"));
 
         let event = make_event("Claude Desktop", "postgres");
         store.add_event(event);
@@ -713,7 +514,7 @@ mod tests {
     #[test]
     fn test_agent_stats() {
         let dir = tempdir().unwrap();
-        let store = EventStore::new(dir.path().join("events.jsonl"));
+        let store = EventStore::new(dir.path().join("events.db"));
 
         store.add_event(make_event("Claude Desktop", "postgres"));
         store.add_event(make_event("Claude Desktop", "filesystem"));
@@ -734,7 +535,7 @@ mod tests {
     #[test]
     fn test_event_limit() {
         let dir = tempdir().unwrap();
-        let store = EventStore::new(dir.path().join("events.jsonl"));
+        let store = EventStore::new(dir.path().join("events.db"));
 
         // Add more than MAX_EVENTS
         for i in 0..1100 {
@@ -748,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe() {
         let dir = tempdir().unwrap();
-        let store = EventStore::new(dir.path().join("events.jsonl"));
+        let store = EventStore::new(dir.path().join("events.db"));
 
         let mut rx = store.subscribe();
 

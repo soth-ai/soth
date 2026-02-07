@@ -19,6 +19,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info};
 
 /// Arguments for the wrap command
@@ -59,9 +60,15 @@ struct WrapSession {
     server_name: String,
     agent: RwLock<AgentInfo>,
     event_logger: Option<EventLogger>,
-    request_times: RwLock<std::collections::HashMap<String, Instant>>,
+    request_contexts: RwLock<std::collections::HashMap<String, RequestContext>>,
     /// Session recorder for full message capture (optional)
     recorder: Option<Arc<SessionRecorder>>,
+}
+
+struct RequestContext {
+    started_at: Instant,
+    method: Option<String>,
+    tool_name: Option<String>,
 }
 
 impl WrapSession {
@@ -93,7 +100,7 @@ impl WrapSession {
             server_name,
             agent: RwLock::new(agent),
             event_logger,
-            request_times: RwLock::new(std::collections::HashMap::new()),
+            request_contexts: RwLock::new(std::collections::HashMap::new()),
             recorder,
         })
     }
@@ -133,16 +140,26 @@ impl WrapSession {
         }
     }
 
-    async fn record_request_time(&self, id: &str) {
-        let mut times = self.request_times.write().await;
-        times.insert(id.to_string(), Instant::now());
+    async fn record_request_context(
+        &self,
+        id: &str,
+        method: Option<&str>,
+        tool_name: Option<&str>,
+    ) {
+        let mut contexts = self.request_contexts.write().await;
+        contexts.insert(
+            id.to_string(),
+            RequestContext {
+                started_at: Instant::now(),
+                method: method.map(ToOwned::to_owned),
+                tool_name: tool_name.map(ToOwned::to_owned),
+            },
+        );
     }
 
-    async fn get_latency(&self, id: &str) -> Option<u64> {
-        let times = self.request_times.read().await;
-        times
-            .get(id)
-            .map(|start| start.elapsed().as_millis() as u64)
+    async fn take_request_context(&self, id: &str) -> Option<RequestContext> {
+        let mut contexts = self.request_contexts.write().await;
+        contexts.remove(id)
     }
 
     /// Finalize the session recording and save to disk
@@ -242,22 +259,81 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         write_to_stdout(from_server_rx).await;
     });
 
-    // Wait for server to exit or any task to fail
+    let mut stdin_task = stdin_task;
+    let mut write_to_server_task = write_to_server_task;
+    let mut read_from_server_task = read_from_server_task;
+    let mut write_to_stdout_task = write_to_stdout_task;
+    let mut child_exited = false;
+    let mut stdin_joined = false;
+    let mut read_joined = false;
+
+    // Primary shutdown trigger. We intentionally do not stop immediately on
+    // stdin EOF; instead we let the upstream process flush responses.
     tokio::select! {
         status = child.wait() => {
+            child_exited = true;
             info!("Server process exited: {:?}", status);
         }
-        _ = stdin_task => {
-            debug!("Stdin task finished");
+        result = &mut stdin_task => {
+            stdin_joined = true;
+            if let Err(e) = result {
+                error!("Stdin task failed: {}", e);
+            } else {
+                debug!("Stdin task finished");
+            }
         }
-        _ = write_to_server_task => {
-            debug!("Write to server task finished");
+        result = &mut read_from_server_task => {
+            read_joined = true;
+            if let Err(e) = result {
+                error!("Read-from-server task failed: {}", e);
+            } else {
+                debug!("Read-from-server task finished");
+            }
         }
-        _ = read_from_server_task => {
-            debug!("Read from server task finished");
+    }
+
+    // If upstream is gone (or closed stdout), stop reading stdin so the channel
+    // to child writer closes and shutdown can complete.
+    if (child_exited || read_joined) && !stdin_joined {
+        stdin_task.abort();
+        let _ = stdin_task.await;
+    }
+
+    if !write_to_server_task.is_finished() {
+        if timeout(Duration::from_secs(2), &mut write_to_server_task)
+            .await
+            .is_err()
+        {
+            write_to_server_task.abort();
+            let _ = write_to_server_task.await;
         }
-        _ = write_to_stdout_task => {
-            debug!("Write to stdout task finished");
+    }
+
+    if !child_exited {
+        if timeout(Duration::from_secs(3), child.wait()).await.is_err() {
+            debug!("Server did not exit after stdin closed, terminating");
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+
+    if !read_joined {
+        if timeout(Duration::from_secs(2), &mut read_from_server_task)
+            .await
+            .is_err()
+        {
+            read_from_server_task.abort();
+            let _ = read_from_server_task.await;
+        }
+    }
+
+    if !write_to_stdout_task.is_finished() {
+        if timeout(Duration::from_secs(2), &mut write_to_stdout_task)
+            .await
+            .is_err()
+        {
+            write_to_stdout_task.abort();
+            let _ = write_to_stdout_task.await;
         }
     }
 
@@ -386,8 +462,12 @@ async fn process_inbound_message(session: &WrapSession, content: &str) {
     );
 
     if let Ok(msg) = &parsed {
+        let mut request_method: Option<&str> = None;
+        let mut request_tool_name: Option<&str> = None;
+
         // Extract method
         if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+            request_method = Some(method);
             event = event.with_method(method);
 
             // Handle initialize message - extract agent info
@@ -406,6 +486,7 @@ async fn process_inbound_message(session: &WrapSession, content: &str) {
             if method == "tools/call" {
                 if let Some(params) = msg.get("params") {
                     if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
+                        request_tool_name = Some(name);
                         event = event.with_tool_name(name);
                     }
                 }
@@ -419,7 +500,9 @@ async fn process_inbound_message(session: &WrapSession, content: &str) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => "unknown".to_string(),
             };
-            session.record_request_time(&id_str).await;
+            session
+                .record_request_context(&id_str, request_method, request_tool_name)
+                .await;
         }
 
         // Add full content and preview
@@ -464,13 +547,19 @@ async fn process_outbound_message(session: &WrapSession, content: &str) {
                     serde_json::Value::String(s) => s.clone(),
                     _ => "unknown".to_string(),
                 };
-                if let Some(latency) = session.get_latency(&id_str).await {
-                    event = event.with_latency(latency);
+                if let Some(ctx) = session.take_request_context(&id_str).await {
+                    event = event.with_latency(ctx.started_at.elapsed().as_millis() as u64);
+                    if let Some(method) = ctx.method.as_deref() {
+                        event = event.with_method(method);
+                    }
+                    if let Some(tool_name) = ctx.tool_name.as_deref() {
+                        event = event.with_tool_name(tool_name);
+                    }
                 }
             }
 
-            // Check for error
-            if msg.get("error").is_some() {
+            // If we could not correlate, still classify explicit errors.
+            if msg.get("error").is_some() && event.method.is_none() {
                 event = event.with_method("error");
             }
         } else {

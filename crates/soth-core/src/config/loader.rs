@@ -32,25 +32,26 @@ pub fn load_config_from_str(content: &str) -> Result<SothConfig> {
 
 /// Apply environment variable overrides to the configuration
 fn apply_env_overrides(config: &mut SothConfig) {
-    // Server overrides
+    // Forward proxy overrides
     if let Ok(addr) = std::env::var("SOTH_LISTEN_ADDRESS") {
-        config.server.listen.address = addr;
+        config.server.listen.address = addr.clone();
+        config.forward_proxy.address = addr;
     }
     if let Ok(port) = std::env::var("SOTH_LISTEN_PORT") {
         if let Ok(p) = port.parse() {
             config.server.listen.port = p;
+            config.forward_proxy.port = p;
         }
     }
-    if let Ok(transport) = std::env::var("SOTH_TRANSPORT") {
-        config.server.transport = transport;
+    if let Ok(addr) = std::env::var("SOTH_FORWARD_PROXY_ADDRESS") {
+        config.forward_proxy.address = addr;
     }
-
-    // Upstream overrides
-    if let Ok(url) = std::env::var("SOTH_UPSTREAM_URL") {
-        config.upstream.url = Some(url);
-    }
-    if let Ok(cmd) = std::env::var("SOTH_UPSTREAM_COMMAND") {
-        config.upstream.command = Some(cmd);
+    if let Ok(port) = std::env::var("SOTH_FORWARD_PROXY_PORT")
+        .or_else(|_| std::env::var("SOTH_PROXY_PORT"))
+    {
+        if let Ok(p) = port.parse() {
+            config.forward_proxy.port = p;
+        }
     }
 
     // Identity overrides

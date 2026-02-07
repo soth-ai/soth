@@ -1,9 +1,10 @@
 //! Identity verification layer
 
 use super::middleware::{error_response, get_request_id, Layer, LayerResult, RequestContext};
+use crate::enforcement::core;
 use crate::protocol::{JsonRpcError, JsonRpcMessage};
 use soth_dashboard::DashboardState;
-use soth_identity::{signing::verify_bytes, signing::SignatureBlock, Did, TrustStore};
+use soth_identity::TrustStore;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -95,56 +96,6 @@ impl IdentityLayer {
         store.is_trusted(did)
     }
 
-    fn canonical_message_bytes(message: &JsonRpcMessage) -> Result<Vec<u8>, String> {
-        let value = match message {
-            JsonRpcMessage::Request(req) => serde_json::to_value(req)
-                .map_err(|e| format!("Failed to serialize request for signing: {e}"))?,
-            JsonRpcMessage::Response(resp) => serde_json::to_value(resp)
-                .map_err(|e| format!("Failed to serialize response for signing: {e}"))?,
-        };
-
-        soth_identity::canonicalize_json(&value)
-            .map_err(|e| format!("Failed to canonicalize message for signing: {e}"))
-    }
-
-    fn parse_signature_block(
-        signature_value: serde_json::Value,
-        did: &str,
-    ) -> Result<SignatureBlock, String> {
-        let signature = if signature_value.is_object() {
-            serde_json::from_value::<SignatureBlock>(signature_value)
-                .map_err(|e| format!("Invalid signature block: {e}"))?
-        } else if let Some(sig_str) = signature_value.as_str() {
-            match serde_json::from_str::<SignatureBlock>(sig_str) {
-                Ok(block) => block,
-                Err(_) => SignatureBlock {
-                    algorithm: "Ed25519".to_string(),
-                    value: sig_str.to_string(),
-                    signer: did.to_string(),
-                    created: chrono::Utc::now(),
-                },
-            }
-        } else {
-            return Err("Signature metadata must be a string or object".to_string());
-        };
-
-        if signature.algorithm != "Ed25519" {
-            return Err(format!(
-                "Unsupported signature algorithm: {}",
-                signature.algorithm
-            ));
-        }
-
-        if signature.signer != did {
-            return Err(format!(
-                "Signature signer mismatch: signer={}, did={}",
-                signature.signer, did
-            ));
-        }
-
-        Ok(signature)
-    }
-
     /// Verify identity from message metadata
     async fn verify_identity(
         &self,
@@ -160,55 +111,24 @@ impl IdentityLayer {
 
         let signature = ctx.metadata.get(&self.config.signature_header).cloned();
 
-        match (did, signature) {
-            (Some(did), Some(signature)) => {
-                // Set DID before verification so failed attempts are still attributed.
-                ctx.agent_did = Some(did.clone());
-                ctx.identity_verified = false;
+        let store = self.trust_store.read().await;
+        let verification = core::verify_mcp_identity(
+            |candidate| store.is_trusted(candidate),
+            message,
+            did.as_deref(),
+            signature.as_ref(),
+        )?;
 
-                // Verify the signature
-                let store = self.trust_store.read().await;
+        ctx.agent_did = verification.did.clone();
+        ctx.identity_verified = verification.verified;
 
-                // Check if DID is trusted
-                if !store.is_trusted(&did) {
-                    return Err(format!("DID not in trust store: {did}"));
-                }
-
-                let signature = Self::parse_signature_block(signature, &did)?;
-                let canonical = Self::canonical_message_bytes(message)?;
-
-                // Decode public key from DID and verify
-                match Did::parse(&did) {
-                    Ok(parsed_did) => match parsed_did.to_key_pair() {
-                        Ok(keypair) => {
-                            let valid = verify_bytes(&canonical, &signature, &keypair)
-                                .map_err(|e| format!("Signature verification failed: {e}"))?;
-
-                            if !valid {
-                                return Err(format!("Invalid signature for DID: {did}"));
-                            }
-
-                            ctx.identity_verified = true;
-                            debug!("Identity verified for DID: {}", did);
-                            Ok(true)
-                        }
-                        Err(e) => Err(format!("Invalid DID key: {e}")),
-                    },
-                    Err(e) => Err(format!("Invalid DID: {e}")),
-                }
-            }
-            (Some(did), None) => {
-                // DID present but no signature - mark as unverified
-                ctx.agent_did = Some(did);
-                ctx.identity_verified = false;
-                Ok(false)
-            }
-            (None, Some(_)) => Err("Signature present without DID".to_string()),
-            (None, None) => {
-                // No identity information
-                Ok(false)
+        if verification.verified {
+            if let Some(ref did) = verification.did {
+                debug!("Identity verified for DID: {}", did);
             }
         }
+
+        Ok(verification.verified)
     }
 }
 
@@ -336,7 +256,7 @@ mod tests {
             Some(json!({"name": "test_tool", "arguments": {"x": 1}})),
             RequestId::Number(1),
         ));
-        let canonical = IdentityLayer::canonical_message_bytes(&msg).unwrap();
+        let canonical = core::canonical_jsonrpc_message_bytes(&msg).unwrap();
         let signature = keypair.sign_base64(&canonical).unwrap();
 
         let mut ctx = RequestContext::new("session-1")
@@ -402,7 +322,7 @@ mod tests {
             Some(json!({"name": "test_tool"})),
             RequestId::Number(1),
         ));
-        let canonical = IdentityLayer::canonical_message_bytes(&msg).unwrap();
+        let canonical = core::canonical_jsonrpc_message_bytes(&msg).unwrap();
         let signature_block = sign_bytes(&canonical, &other_keypair, &other_did).unwrap();
         let signature_json = serde_json::to_string(&signature_block).unwrap();
 

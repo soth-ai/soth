@@ -1,8 +1,9 @@
 //! Policy enforcement layer
 
 use super::middleware::{error_response, get_request_id, Layer, LayerResult, RequestContext};
+use crate::enforcement::core;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
-use soth_core::types::policy::{PolicyAction, PolicyDecision, PolicyInput, PolicyInputBuilder};
+use soth_core::types::policy::{PolicyAction, PolicyDecision};
 use soth_dashboard::{DashboardState, DenialEntry};
 use soth_policy::PolicyEngine;
 use std::future::Future;
@@ -81,59 +82,16 @@ impl PolicyLayer {
         self
     }
 
-    /// Build policy input from request context and message
-    fn build_policy_input(ctx: &RequestContext, req: &JsonRpcRequest) -> PolicyInput {
-        let mut builder = PolicyInputBuilder::new()
-            .session_id(&ctx.session_id)
-            .method(&req.method)
-            .timestamp(ctx.timestamp);
-
-        // Add agent info if available
-        if let Some(ref agent_id) = ctx.agent_id {
-            builder = builder.agent_id(agent_id);
-        }
-
-        // Add identity info
-        if ctx.identity_verified {
-            builder = builder.identity_verified(true);
-            if let Some(ref did) = ctx.agent_did {
-                builder = builder.identity_did(did);
-            }
-        }
-
-        // Extract tool/resource info from params
-        if let Some(ref params) = req.params {
-            // Tool call
-            if req.method == methods::TOOLS_CALL {
-                if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
-                    builder = builder.tool(name);
-                }
-                if let Some(args) = params.get("arguments") {
-                    builder = builder.arguments_json(args.clone());
-                }
-            }
-
-            // Resource read
-            if req.method == methods::RESOURCES_READ {
-                if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
-                    builder = builder.resource(uri);
-                }
-            }
-        }
-
-        builder.build()
-    }
-
     /// Evaluate policy for a request
     async fn evaluate_policy(
         &self,
         ctx: &RequestContext,
         req: &JsonRpcRequest,
     ) -> (PolicyDecision, String) {
-        let input = Self::build_policy_input(ctx, req);
+        let input = core::build_mcp_policy_input(ctx, req);
         let engine = self.engine.read().await;
-        match engine.evaluate(&input) {
-            Ok(result) => (result.decision, result.policy_version),
+        match core::evaluate_policy(&engine, &input) {
+            Ok((decision, policy_version)) => (decision, policy_version),
             Err(e) => {
                 warn!("Policy evaluation error: {}", e);
                 // On error, default to deny in enforce mode, allow otherwise
@@ -209,17 +167,7 @@ impl Layer for PolicyLayer {
                     LayerResult::Continue(message)
                 }
                 PolicyAction::Deny => {
-                    // Use reason if set, otherwise join violations, otherwise default
-                    let reason = decision
-                        .reason
-                        .or_else(|| {
-                            if !decision.violations.is_empty() {
-                                Some(decision.violations.join("; "))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| "Policy denied".to_string());
+                    let reason = core::decision_reason(&decision, "Policy denied");
 
                     // Record denial to dashboard
                     if let Some(ref dash) = self.dashboard {

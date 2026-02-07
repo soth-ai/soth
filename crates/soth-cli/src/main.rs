@@ -4,8 +4,8 @@
 //!   soth wrap -- <cmd>           - Wrap an MCP server for interception
 //!   soth install                 - Auto-configure MCP clients to use wrap
 //!   soth uninstall               - Remove wrap configuration
+//!   soth setup wizard            - Guided setup for proxy/wrap/shell
 //!   soth init                    - Initialize config and keys
-//!   soth start                   - Start the proxy
 //!   soth tui                     - Interactive TUI dashboard
 //!   soth identity generate       - Generate a new keypair
 //!   soth identity list           - List trusted agents
@@ -67,22 +67,17 @@ enum Commands {
     /// Show installation status
     Status,
 
+    /// Guided setup and health checks
+    Setup {
+        #[command(subcommand)]
+        action: commands::setup::SetupCommands,
+    },
+
     /// Initialize configuration and keys
     Init {
         /// Output directory
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
-    },
-
-    /// Start the proxy
-    Start {
-        /// Transport type (stdio, sse, http, streamable-http)
-        #[arg(short, long)]
-        transport: Option<String>,
-
-        /// Listen port (for SSE/HTTP/Streamable HTTP)
-        #[arg(short, long)]
-        port: Option<u16>,
     },
 
     /// HTTP/HTTPS forward proxy management
@@ -349,11 +344,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status => {
             commands::install::run_status().await?;
         }
+        Commands::Setup { action } => {
+            commands::setup::run(action).await?;
+        }
         Commands::Init { output } => {
             commands::init::run(output).await?;
-        }
-        Commands::Start { transport, port } => {
-            commands::start::run(cli.config, transport, port).await?;
         }
         Commands::Proxy { action } => {
             commands::proxy::run(action).await?;

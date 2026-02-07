@@ -9,7 +9,7 @@ pub mod install;
 pub mod policy;
 pub mod proxy;
 pub mod session;
-pub mod start;
+pub mod setup;
 pub mod tail;
 pub mod test;
 pub mod tui;

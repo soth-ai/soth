@@ -8,19 +8,18 @@ use tracing::info;
 const DEFAULT_CONFIG: &str = r#"# SOTH Configuration
 version: "1.0"
 
-server:
-  listen:
-    address: "127.0.0.1"
-    port: 3000
-  transport: "stdio"  # stdio | sse | http
-
-# Upstream MCP server configuration
-upstream:
-  command: "npx"
-  args:
-    - "-y"
-    - "@modelcontextprotocol/server-filesystem"
-    - "/tmp"
+# Forward proxy configuration
+forward_proxy:
+  enabled: true
+  address: "127.0.0.1"
+  port: 8080
+  hosts:
+    intercept:
+      - "api.openai.com"
+      - "api.anthropic.com"
+      - "chatgpt.com"
+      - "*.chatgpt.com"
+    block: []
 
 # Identity configuration
 identity:
@@ -165,9 +164,9 @@ pub async fn run(output: PathBuf) -> Result<()> {
 
     println!("\n✓ SOTH initialized successfully!");
     println!("\nNext steps:");
-    println!("  1. Edit soth.yaml to configure your upstream server");
+    println!("  1. Edit soth.yaml to configure forward_proxy hosts/settings");
     println!("  2. Generate an identity: soth identity generate");
-    println!("  3. Start the proxy: soth start");
+    println!("  3. Start the proxy: soth proxy start");
     println!();
 
     Ok(())
