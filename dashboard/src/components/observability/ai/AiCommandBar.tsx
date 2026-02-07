@@ -84,6 +84,7 @@ export function AiCommandBar({ sourceFilter }: AiCommandBarProps) {
   // Check which filters are active
   const hasActiveFilters = !!(
     filters.method ||
+    filters.path ||
     filters.direction ||
     filters.serverName ||
     filters.minLatencyMs ||

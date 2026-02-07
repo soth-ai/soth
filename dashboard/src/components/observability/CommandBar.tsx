@@ -94,6 +94,7 @@ export function CommandBar() {
   // Check which filters are active
   const hasActiveFilters = !!(
     filters.method ||
+    filters.path ||
     filters.direction ||
     filters.serverName ||
     filters.minLatencyMs ||
@@ -194,7 +195,7 @@ export function CommandBar() {
   };
 
   return (
-    <div className="flex items-center gap-3 px-4 py-2.5 bg-card/50 border border-dashed border-border rounded-t-[12px]">
+    <div className="flex items-center gap-2.5 px-3 py-2 bg-card/50 border border-dashed border-border rounded-t-[12px]">
       {/* Source Toggles */}
       <div className="flex items-center gap-1">
         {sourceToggles.map((source) => {
@@ -205,13 +206,13 @@ export function CommandBar() {
               key={source.id}
               onClick={() => handleSourceToggle(source.id)}
               className={cn(
-                "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all",
+                "inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium border transition-all",
                 isActive
                   ? colorClasses[colorKey].active
                   : cn("bg-transparent text-muted-foreground border-border", colorClasses[colorKey].inactive)
               )}
             >
-              <source.icon className="w-3.5 h-3.5" weight={isActive ? "fill" : "duotone"} />
+              <source.icon className="w-3 h-3" weight={isActive ? "fill" : "duotone"} />
               <span>{source.label}</span>
               <span
                 className={cn(
@@ -227,31 +228,31 @@ export function CommandBar() {
       </div>
 
       {/* Divider */}
-      <div className="h-6 w-px bg-border" />
+      <div className="h-5 w-px bg-border" />
 
       {/* Presets */}
       <PresetDropdown />
 
       {/* Divider */}
-      <div className="h-6 w-px bg-border" />
+      <div className="h-5 w-px bg-border" />
 
       {/* Quick Filters */}
       <div className="flex items-center gap-1">
-        <Funnel className="w-3.5 h-3.5 text-muted-foreground mr-1" weight="duotone" />
+        <Funnel className="w-3 h-3 text-muted-foreground mr-1" weight="duotone" />
         {quickFilters.map((filter) => (
           <button
             key={filter.id}
             onClick={filter.onClick}
             disabled={filter.count === 0}
             className={cn(
-              "inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium border transition-all",
+              "inline-flex items-center gap-1 px-1.5 py-1 rounded-lg text-[11px] font-medium border transition-all",
               "disabled:opacity-30 disabled:cursor-not-allowed",
               filter.isActive
                 ? colorClasses[filter.color].active
                 : cn("bg-transparent text-muted-foreground border-border", colorClasses[filter.color].inactive)
             )}
           >
-            <filter.icon className="w-3.5 h-3.5" weight={filter.isActive ? "fill" : "regular"} />
+            <filter.icon className="w-3 h-3" weight={filter.isActive ? "fill" : "regular"} />
             <span>{filter.label}</span>
             {filter.count > 0 && (
               <span
@@ -268,10 +269,10 @@ export function CommandBar() {
       </div>
 
       {/* Divider */}
-      <div className="h-6 w-px bg-border" />
+      <div className="h-5 w-px bg-border" />
 
       {/* Stats */}
-      <div className="flex items-center gap-3 text-xs">
+      <div className="flex items-center gap-2.5 text-[11px]">
         <div className="flex items-center gap-1.5 text-muted-foreground">
           <span className="font-mono font-bold tabular-nums text-foreground">{metrics.totalMessages}</span>
           <span>events</span>
@@ -284,12 +285,12 @@ export function CommandBar() {
         )}
         {counts.totalCost > 0 && (
           <div className="flex items-center gap-1.5">
-            <CurrencyDollar className="w-3.5 h-3.5 text-emerald-500" weight="duotone" />
+            <CurrencyDollar className="w-3 h-3 text-emerald-500" weight="duotone" />
             <span className="font-mono font-bold text-emerald-500 tabular-nums">${counts.totalCost.toFixed(4)}</span>
           </div>
         )}
         <div className="flex items-center gap-1.5">
-          <Robot className="w-3.5 h-3.5 text-muted-foreground" weight="duotone" />
+          <Robot className="w-3 h-3 text-muted-foreground" weight="duotone" />
           <span className="font-medium text-foreground tabular-nums">{counts.agentCount}</span>
         </div>
       </div>
@@ -304,7 +305,7 @@ export function CommandBar() {
             variant="ghost"
             size="sm"
             onClick={clearFilters}
-            className="h-7 px-2.5 text-xs text-muted-foreground hover:text-foreground"
+            className="h-6 px-2 text-[11px] text-muted-foreground hover:text-foreground"
           >
             Clear filters
           </Button>
@@ -313,9 +314,9 @@ export function CommandBar() {
           variant="ghost"
           size="sm"
           onClick={clearLogs}
-          className="h-7 px-2.5 text-xs text-muted-foreground hover:text-destructive"
+          className="h-6 px-2 text-[11px] text-muted-foreground hover:text-destructive"
         >
-          <ArrowsClockwise className="w-3.5 h-3.5 mr-1.5" />
+          <ArrowsClockwise className="w-3 h-3 mr-1.5" />
           Clear
         </Button>
       </div>

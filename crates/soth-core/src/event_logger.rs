@@ -341,7 +341,15 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>) {
                 }
                 return;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Time-based durability/visibility: flush partial batches regularly
+                // so low-traffic sessions still appear in observability promptly.
+                if !pending.is_empty() {
+                    if let Err(error) = flush_sqlite_events(&mut conn, &mut pending) {
+                        warn!("Failed to flush timed events: {}", error);
+                    }
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if let Err(error) = flush_sqlite_events(&mut conn, &mut pending) {
                     warn!("Failed to flush events during logger shutdown: {}", error);
@@ -599,6 +607,38 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM wrap_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_event_logger_sqlite_flushes_partial_batch_on_timeout() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path.clone()).unwrap();
+
+        let agent = AgentInfo::new("Test Agent", DetectionSource::CommandLine);
+        let event = WrapEvent::new("session-timeout", "test-server", WrapDirection::In, agent)
+            .with_method("POST /v1/messages");
+
+        logger.log(&event);
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(800);
+        let mut observed = 0i64;
+        while std::time::Instant::now() < deadline {
+            let conn = Connection::open(&path).unwrap();
+            observed = conn
+                .query_row("SELECT COUNT(*) FROM wrap_events", [], |row| row.get(0))
+                .unwrap_or(0);
+            if observed >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        logger.close();
+        assert!(
+            observed >= 1,
+            "expected timed flush to persist event without waiting for batch=64"
+        );
     }
 
     #[test]

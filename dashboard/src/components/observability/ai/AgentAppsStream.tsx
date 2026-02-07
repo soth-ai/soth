@@ -18,6 +18,9 @@ import {
   useObservabilityStore,
   decodeSmartDisplayText,
   hasPairedPayload,
+  getLogPath,
+  matchesServerFilter,
+  normalizeServerName,
   type LogEntry,
   type Filters,
 } from "@/store/observability";
@@ -62,8 +65,15 @@ function filterAgentLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
         return false;
       }
     }
-    // For agent traffic, filter by provider using serverName filter
-    if (filters.serverName && log.provider !== filters.serverName) return false;
+    // Accept either provider name (agent filter behavior) or host name (hot-host filters)
+    if (filters.serverName) {
+      const selected = normalizeServerName(filters.serverName);
+      const provider = normalizeServerName(log.provider);
+      const providerMatches = provider.length > 0 && provider === selected;
+      const hostMatches = matchesServerFilter(log.server_name, filters.serverName);
+      if (!providerMatches && !hostMatches) return false;
+    }
+    if (filters.path && getLogPath(log) !== filters.path) return false;
     if (filters.direction && log.direction !== filters.direction) return false;
     // For agent traffic, filter by model using method filter
     if (filters.method && log.model !== filters.method) return false;
@@ -563,6 +573,7 @@ export function AgentAppsStream() {
   const hasActiveFilters = !!(
     filters.searchText ||
     filters.method ||
+    filters.path ||
     filters.direction ||
     filters.serverName ||
     filters.minLatencyMs
@@ -674,10 +685,10 @@ export function AgentAppsStream() {
   return (
     <div className="flex flex-col h-full bg-background rounded-b-[12px] border-x border-b border-dashed border-border overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-card">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-card">
         <div className="flex items-center gap-3">
-          <h2 className="text-[24px] font-normal text-foreground">Agent Apps Stream</h2>
-          <span className="soth-chip-text text-muted-foreground bg-muted px-2 py-0.5 rounded-md border border-dashed border-border">
+          <h2 className="text-sm font-semibold text-foreground">Agent Apps Stream</h2>
+          <span className="text-[10px] font-semibold text-muted-foreground bg-muted px-1.5 py-0.5 rounded-md border border-dashed border-border uppercase tracking-wide">
             {filteredLogs.length}
             {hasActiveFilters && ` / ${allAgentLogs.length}`}
           </span>
@@ -686,7 +697,7 @@ export function AgentAppsStream() {
           {isLive && isConnected && (
             <div className="flex items-center gap-1.5 px-2 py-0.5 bg-purple-500/10 border border-purple-500/30 rounded-md">
               <div className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />
-              <span className="text-xs font-semibold text-purple-500 tracking-wide">
+              <span className="text-[10px] font-semibold text-purple-500 tracking-wide">
                 LIVE
               </span>
             </div>
@@ -698,9 +709,9 @@ export function AgentAppsStream() {
           <Button
             variant="ghost"
             size="sm"
-            onClick={toggleLive}
-            className={cn(
-              "h-8 px-3 border border-border",
+              onClick={toggleLive}
+              className={cn(
+              "h-7 px-2.5 border border-border",
               isLive
                 ? "text-purple-500 hover:bg-purple-500/10"
                 : "text-muted-foreground hover:bg-muted"
@@ -723,7 +734,7 @@ export function AgentAppsStream() {
               placeholder="Search... (Cmd+K)"
               value={searchValue}
               onChange={(e) => setSearchValue(e.target.value)}
-              className="pl-8 pr-8 h-8 text-[16px] focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/30"
+              className="pl-8 pr-8 h-8 text-xs focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/30"
             />
             {searchValue && (
               <Button

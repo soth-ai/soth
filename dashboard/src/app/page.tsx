@@ -120,7 +120,7 @@ export default function OverviewPage() {
   return (
     <div className="min-h-screen">
       {/* Page Header */}
-      <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 md:top-14 z-20">
+      <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-20">
         <div className="px-4 md:px-6 py-3 md:py-4 flex items-center justify-between">
           <div className="flex items-center gap-4 md:gap-6">
             <div className="flex items-center gap-1 md:gap-2">

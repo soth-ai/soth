@@ -16,6 +16,7 @@ import {
   CloudArrowUp,
   Robot,
   Stack,
+  Pulse,
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import {
@@ -25,6 +26,8 @@ import {
   calculateLatency,
   getLogSummary,
   createClusters,
+  getLogPath,
+  matchesServerFilter,
   type LogEntry,
   type Filters,
   type EventCluster,
@@ -58,7 +61,8 @@ function filterLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
     }
     if (filters.method && log.method !== filters.method) return false;
     if (filters.direction && log.direction !== filters.direction) return false;
-    if (filters.serverName && log.server_name !== filters.serverName) return false;
+    if (filters.serverName && !matchesServerFilter(log.server_name, filters.serverName)) return false;
+    if (filters.path && getLogPath(log) !== filters.path) return false;
     if (filters.minLatencyMs && log.latency_ms !== undefined) {
       if (log.latency_ms < filters.minLatencyMs) return false;
     }
@@ -192,13 +196,13 @@ const ClusterRow = memo(function ClusterRow({
     };
     const content = cluster.response
       ? JSON.stringify(
-          {
-            request: parseMaybeJson(cluster.request.content),
-            response: parseMaybeJson(cluster.response.content),
-          },
-          null,
-          2
-        )
+        {
+          request: parseMaybeJson(cluster.request.content),
+          response: parseMaybeJson(cluster.response.content),
+        },
+        null,
+        2
+      )
       : cluster.request.content;
     navigator.clipboard.writeText(content);
     toast.success("Copied to clipboard", { duration: 2000 });
@@ -209,23 +213,22 @@ const ClusterRow = memo(function ClusterRow({
   const requestIsSelected = isClusterRequestSelected(cluster, selectedLogId, selectedLogPart);
   const responseIsSelected = isClusterResponseSelected(cluster, selectedLogId, selectedLogPart);
 
-  const rowClass = "flex items-center gap-3 px-4 h-8 overflow-hidden";
+  const rowClass = "flex items-center gap-3 px-4 h-8 overflow-hidden transition-all duration-200 group/row";
   const sourceChipClass =
-    "inline-flex items-center justify-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border w-[56px] flex-shrink-0";
+    "inline-flex items-center justify-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold border w-[56px] flex-shrink-0 transition-opacity";
   const methodChipClass =
-    "inline-flex items-center px-1.5 py-0.5 rounded-md text-xs font-mono font-medium min-w-[120px] max-w-[180px] flex-shrink-0 truncate";
-  const badgeSlotClass = "flex items-center justify-end gap-1.5 w-[168px] flex-shrink-0";
+    "inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-mono font-semibold min-w-[110px] max-w-[160px] flex-shrink-0 truncate transition-all";
+  const badgeSlotClass = "flex items-center justify-end gap-1.5 w-[136px] flex-shrink-0";
 
   return (
     <div
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       className={cn(
-        "group border-b border-border border-l-2 transition-colors",
-        isSelected && "border-l-accent bg-accent/10",
-        showErrorHighlight && !isSelected && "border-l-red-500 bg-red-500/5",
-        showPiiHighlight && !showErrorHighlight && !isSelected && "border-l-orange-500 bg-orange-500/5",
-        !isSelected && !showErrorHighlight && !showPiiHighlight && "border-l-transparent"
+        "group border-b border-border/50 border-l-2 transition-all duration-300",
+        isSelected ? "border-l-primary bg-primary/[0.03]" : "border-l-transparent hover:bg-muted/[0.08]",
+        showErrorHighlight && !isSelected && "border-l-destructive bg-destructive/[0.02]",
+        showPiiHighlight && !showErrorHighlight && !isSelected && "border-l-warning bg-warning/[0.02]"
       )}
     >
       {/* Request Row */}
@@ -233,27 +236,32 @@ const ClusterRow = memo(function ClusterRow({
         onClick={() => selectLog(cluster.request.id, isSameIdPair ? "request" : null)}
         className={cn(
           rowClass,
-          "cursor-pointer hover:bg-muted/35",
-          requestIsSelected && "bg-accent/20"
+          "cursor-pointer",
+          requestIsSelected && "bg-primary/[0.06] shadow-[inset_0_0_12px_-4px_rgba(217,119,87,0.1)]"
         )}
       >
         <div className="w-4 flex items-center justify-center flex-shrink-0">
-          <div className="w-2 h-2 rounded-full bg-cyan-500" />
+          <div className={cn(
+            "w-1.5 h-1.5 rounded-full transition-all duration-300 shadow-[0_0_8px_rgba(34,211,238,0.4)]",
+            requestIsSelected ? "bg-primary scale-125" : "bg-cyan-500"
+          )} />
         </div>
 
-        <span className="text-xs text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap">
+        <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap opacity-60 group-hover/row:opacity-100 transition-opacity">
           {formatTimestamp(cluster.request.timestamp)}
         </span>
 
-        <ArrowDown className="w-3.5 h-3.5 text-cyan-500 flex-shrink-0" weight="bold" />
+        <ArrowDown className="w-3.5 h-3.5 text-cyan-500/70 flex-shrink-0" weight="bold" />
 
-        <span className={cn(sourceChipClass, source.color)}>
-          <source.icon className="w-3 h-3" weight="duotone" />
+        <span
+          className={cn(sourceChipClass, source.color, "group-hover/row:opacity-100 opacity-80")}
+        >
+          <source.icon className="w-3.5 h-3.5" weight="duotone" />
           {source.label}
         </span>
 
         <span
-          className="text-xs text-muted-foreground w-24 truncate flex-shrink-0"
+          className="text-[10px] font-medium text-muted-foreground w-24 truncate flex-shrink-0"
           title={cluster.request.agent.name}
         >
           {cluster.request.agent.name}
@@ -262,22 +270,22 @@ const ClusterRow = memo(function ClusterRow({
         <span
           className={cn(
             methodChipClass,
-            "bg-secondary text-secondary-foreground border border-border",
-            cluster.policyDenied && "bg-red-500/20 text-red-500 border-red-500/30"
+            "bg-secondary/40 text-secondary-foreground border border-border/30",
+            cluster.policyDenied && "bg-destructive/10 text-destructive border-destructive/20"
           )}
           title={cluster.method}
         >
-          {truncate(cluster.method, 20)}
+          {truncate(cluster.method, 22)}
         </span>
 
         <span
-          className="text-xs text-cyan-500/90 truncate font-mono flex-1 min-w-0 whitespace-nowrap"
+          className="text-[11px] text-cyan-500/80 truncate font-mono flex-1 min-w-0 tracking-tight"
           title={requestSummary}
         >
-          {truncate(requestSummary, 90)}
+          {requestSummary}
         </span>
 
-        <span className="text-xs font-mono tabular-nums text-right w-16 flex-shrink-0 text-cyan-500/80">
+        <span className="text-[10px] font-mono tabular-nums text-right w-12 flex-shrink-0 text-cyan-500/60 font-bold">
           {cluster.request.token_count ? `${cluster.request.token_count}t` : ""}
         </span>
 
@@ -287,15 +295,15 @@ const ClusterRow = memo(function ClusterRow({
             size="sm"
             onClick={handleCopy}
             className={cn(
-              "h-6 w-6 p-0 bg-secondary border border-border hover:bg-muted transition-opacity",
-              isHovered ? "opacity-100" : "opacity-0 pointer-events-none"
+              "h-6 w-6 p-0 bg-background/50 border border-border/50 hover:bg-muted transition-all duration-300",
+              isHovered ? "opacity-100 translate-x-0" : "opacity-0 translate-x-1 pointer-events-none"
             )}
-            title="Copy request + response JSON"
+            title="Copy Context"
           >
             <Copy className="w-3 h-3 text-muted-foreground" />
           </Button>
-          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-500">
-            REQUEST
+          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-cyan-500/10 text-cyan-500 border border-cyan-500/20 tracking-wider">
+            REQ
           </span>
         </div>
       </div>
@@ -305,24 +313,25 @@ const ClusterRow = memo(function ClusterRow({
         onClick={() => selectLog(responseTargetId, isSameIdPair ? "response" : null)}
         className={cn(
           rowClass,
-          "cursor-pointer border-t border-border/60 hover:bg-muted/35",
-          responseIsSelected && "bg-accent/20"
+          "cursor-pointer border-t border-border/30",
+          responseIsSelected && "bg-primary/[0.06] shadow-[inset_0_0_12px_-4px_rgba(217,119,87,0.1)]"
         )}
       >
         <div className="w-4 flex items-center justify-center flex-shrink-0">
           <div
             className={cn(
-              "w-2 h-2 rounded-full",
+              "w-1.5 h-1.5 rounded-full transition-all duration-300",
               isPending
-                ? "bg-amber-500 animate-pulse"
+                ? "bg-warning animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.5)]"
                 : cluster.hasError
-                ? "bg-red-500"
-                : "bg-emerald-500"
+                  ? "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.5)]"
+                  : "bg-success shadow-[0_0_8px_rgba(16,185,129,0.5)]",
+              responseIsSelected && "scale-125"
             )}
           />
         </div>
 
-        <span className="text-xs text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap">
+        <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap opacity-60 group-hover/row:opacity-100 transition-opacity">
           {formatTimestamp(cluster.response?.timestamp || cluster.timestamp)}
         </span>
 
@@ -330,21 +339,23 @@ const ClusterRow = memo(function ClusterRow({
           className={cn(
             "w-3.5 h-3.5 flex-shrink-0",
             isPending
-              ? "text-amber-500"
+              ? "text-warning"
               : cluster.hasError
-              ? "text-red-500"
-              : "text-emerald-500"
+                ? "text-destructive"
+                : "text-success"
           )}
           weight="bold"
         />
 
-        <span className={cn(sourceChipClass, source.color)}>
-          <source.icon className="w-3 h-3" weight="duotone" />
+        <span
+          className={cn(sourceChipClass, source.color, "group-hover/row:opacity-100 opacity-80")}
+        >
+          <source.icon className="w-3.5 h-3.5" weight="duotone" />
           {source.label}
         </span>
 
         <span
-          className="text-xs text-muted-foreground w-24 truncate flex-shrink-0"
+          className="text-[10px] font-medium text-muted-foreground w-24 truncate flex-shrink-0"
           title={cluster.response?.agent.name || cluster.request.agent.name}
         >
           {cluster.response?.agent.name || cluster.request.agent.name}
@@ -355,34 +366,34 @@ const ClusterRow = memo(function ClusterRow({
             methodChipClass,
             "border",
             isPending
-              ? "bg-amber-500/10 text-amber-500 border-amber-500/30"
+              ? "bg-warning/10 text-warning border-warning/20"
               : cluster.hasError
-              ? "bg-red-500/20 text-red-500 border-red-500/30"
-              : "bg-emerald-500/10 text-emerald-500 border-emerald-500/30"
+                ? "bg-destructive/10 text-destructive border-destructive/20"
+                : "bg-success/10 text-success border-success/20"
           )}
           title={cluster.method}
         >
-          {truncate(cluster.method, 20)}
+          {truncate(cluster.method, 22)}
         </span>
 
         <span
           className={cn(
-            "text-xs truncate font-mono flex-1 min-w-0 whitespace-nowrap",
+            "text-[11px] truncate font-mono flex-1 min-w-0 tracking-tight",
             isPending
-              ? "text-amber-500"
+              ? "text-warning"
               : cluster.hasError
-              ? "text-red-500/90"
-              : "text-emerald-500/90"
+                ? "text-destructive/90"
+                : "text-success/90"
           )}
           title={responseSummary}
         >
-          {truncate(responseSummary, 90)}
+          {responseSummary}
         </span>
 
         <span
           className={cn(
-            "text-xs font-mono tabular-nums text-right w-16 flex-shrink-0",
-            cluster.latency !== null ? getLatencyColor(cluster.latency) : "text-amber-500"
+            "text-[10px] font-mono tabular-nums text-right w-12 flex-shrink-0 font-bold",
+            cluster.latency !== null ? getLatencyColor(cluster.latency) : "text-warning"
           )}
         >
           {cluster.latency !== null ? formatLatency(cluster.latency) : "pending"}
@@ -390,17 +401,17 @@ const ClusterRow = memo(function ClusterRow({
 
         <div className={badgeSlotClass}>
           {cluster.policyDenied && (
-            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-500/20 text-red-500">
+            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20">
               DENIED
             </span>
           )}
           {cluster.hasPii && (
-            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-orange-500/20 text-orange-500">
+            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-warning/10 text-warning border border-warning/20">
               PII
             </span>
           )}
-          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500">
-            RESPONSE
+          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500 border border-emerald-500/20 tracking-wider">
+            RES
           </span>
         </div>
       </div>
@@ -492,55 +503,52 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       className={cn(
-        "group relative flex items-center gap-3 px-4 h-8 cursor-pointer border-b border-border transition-all duration-150",
-        "hover:bg-muted/40",
-        isSelected && "border-l-2 border-l-accent bg-muted/60",
-        showErrorHighlight && !isSelected && "border-l-2 border-l-red-500 bg-red-500/5",
-        showPiiHighlight && !showErrorHighlight && !isSelected && "border-l-2 border-l-orange-500 bg-orange-500/5",
-        !isSelected && !showErrorHighlight && !showPiiHighlight && "border-l-2 border-l-transparent",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+        "group/row relative flex items-center gap-3 px-4 h-8 cursor-pointer border-b border-border/50 transition-all duration-300",
+        isSelected ? "border-l-2 border-l-primary bg-primary/[0.03]" : "border-l-2 border-l-transparent hover:bg-muted/[0.08]",
+        showErrorHighlight && !isSelected && "border-l-2 border-l-destructive bg-destructive/[0.02]",
+        showPiiHighlight && !showErrorHighlight && !isSelected && "border-l-2 border-l-warning bg-warning/[0.02]",
+        "focus-visible:outline-none"
       )}
     >
       {/* Status Dot */}
-      <div className="flex-shrink-0">
+      <div className="w-4 flex items-center justify-center flex-shrink-0">
         <div
           className={cn(
-            "w-2 h-2 rounded-full transition-all",
+            "w-1.5 h-1.5 rounded-full transition-all duration-300",
             getStatusColor(),
-            isSelected && "ring-2 ring-accent/50"
+            isSelected && "scale-125 shadow-[0_0_8px_rgba(217,119,87,0.4)]"
           )}
         />
       </div>
 
       {/* Timestamp */}
-      <span className="text-xs text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums">
+      <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums opacity-60 group-hover/row:opacity-100 transition-opacity">
         {formatTimestamp(log.timestamp)}
       </span>
 
       {/* Direction Icon */}
       <div className="flex-shrink-0">
         {log.direction === "in" ? (
-          <ArrowDown className="w-3 h-3 text-muted-foreground" weight="bold" />
+          <ArrowDown className="w-3.5 h-3.5 text-cyan-500/70" weight="bold" />
         ) : (
-          <ArrowUp className="w-3 h-3 text-muted-foreground" weight="bold" />
+          <ArrowUp className="w-3.5 h-3.5 text-success/70" weight="bold" />
         )}
       </div>
 
       {/* Source Type Chip */}
       <span
         className={cn(
-          "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border flex-shrink-0",
+          "inline-flex items-center justify-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold border w-[56px] flex-shrink-0 transition-opacity opacity-80 group-hover/row:opacity-100",
           source.color
         )}
-        title={`Source: ${log.source}`}
       >
-        <source.icon className="w-3 h-3" weight="duotone" />
+        <source.icon className="w-3.5 h-3.5" weight="duotone" />
         {source.label}
       </span>
 
       {/* Agent */}
       <span
-        className="text-xs text-muted-foreground w-24 truncate flex-shrink-0"
+        className="text-[10px] font-medium text-muted-foreground w-24 truncate flex-shrink-0"
         title={log.agent.name}
       >
         {log.agent.name}
@@ -549,18 +557,18 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
       {/* Method Badge */}
       <span
         className={cn(
-          "inline-flex items-center px-1.5 py-0.5 rounded-md text-xs font-mono font-medium flex-shrink-0 min-w-[120px] max-w-[180px] truncate",
+          "inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-mono font-semibold min-w-[110px] max-w-[160px] flex-shrink-0 truncate transition-all",
           isStderrMessage
-            ? "bg-red-500/20 text-red-500 border border-red-500/30"
+            ? "bg-destructive/10 text-destructive border-destructive/20"
             : isRawMessage
-            ? "bg-amber-500/20 text-amber-500 border border-amber-500/30"
-            : "bg-secondary text-secondary-foreground border border-border"
+              ? "bg-warning/10 text-warning border-warning/20"
+              : "bg-secondary/40 text-secondary-foreground border border-border/30"
         )}
         title={method}
       >
-        {truncate(method, 20)}
+        {truncate(method, 22)}
         {rpcId !== undefined && (
-          <span className="text-muted-foreground ml-1.5">#{String(rpcId)}</span>
+          <span className="text-muted-foreground/60 ml-1.5 text-[10px]">#{String(rpcId)}</span>
         )}
       </span>
 
@@ -661,6 +669,7 @@ export function MessageStream() {
   const hasActiveFilters = !!(
     filters.searchText ||
     filters.method ||
+    filters.path ||
     filters.direction ||
     filters.serverName ||
     filters.minLatencyMs ||
@@ -751,80 +760,88 @@ export function MessageStream() {
   return (
     <div className="flex flex-col h-full bg-background rounded-b-[12px] border-x border-b border-dashed border-border overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-card">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-border/50 bg-secondary/30 backdrop-blur-md sticky top-0 z-10">
         <div className="flex items-center gap-3">
-          <h2 className="text-[24px] font-normal text-foreground">Message Stream</h2>
-          <span className="soth-chip-text text-muted-foreground bg-muted px-2 py-0.5 rounded-md border border-dashed border-border">
-            {displayItems.length}
-            {hasActiveFilters && ` / ${allLogs.length}`}
-          </span>
-
-          {/* Live Indicator */}
-          {isLive && isConnected && (
-            <div className="flex items-center gap-1.5 px-2 py-0.5 bg-emerald-500/10 border border-emerald-500/30 rounded-md">
-              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-xs font-semibold text-emerald-500 tracking-wide">LIVE</span>
-            </div>
-          )}
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-primary/10 border border-primary/20">
+            <Pulse className="w-3.5 h-3.5 text-primary" weight="duotone" />
+            <span className="text-[10px] font-bold text-primary tracking-wider uppercase">Live Stream</span>
+          </div>
+          <div className="h-4 w-[1px] bg-border/50 mx-1" />
+          <div className="flex items-center gap-3 text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
+            <span>{displayItems.length} Events</span>
+            {hasActiveFilters && (
+              <span className="text-primary/70 bg-primary/5 px-1.5 py-0.5 rounded">Filtered</span>
+            )}
+          </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          {/* Clustering Toggle */}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setClusteringEnabled(!clusteringEnabled)}
-            className={cn(
-              "h-8 px-3 border border-border gap-1.5",
-              clusteringEnabled
-                ? "text-accent bg-accent/10 border-accent/30"
-                : "text-muted-foreground hover:bg-muted"
-            )}
-            title={clusteringEnabled ? "Disable clustering" : "Enable clustering"}
-          >
-            <Stack className="w-4 h-4" weight={clusteringEnabled ? "fill" : "regular"} />
-            <span className="text-xs">Cluster</span>
-          </Button>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center bg-secondary/40 rounded-lg border border-border/50 p-0.5">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setClusteringEnabled(true)}
+              className={cn(
+                "h-6 px-2.5 text-[9px] font-bold rounded-md transition-all",
+                clusteringEnabled ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              CLUSTERED
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setClusteringEnabled(false)}
+              className={cn(
+                "h-6 px-2.5 text-[9px] font-bold rounded-md transition-all",
+                !clusteringEnabled ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              RAW
+            </Button>
+          </div>
 
-          {/* Live/Pause Toggle */}
           <Button
             variant="ghost"
             size="sm"
             onClick={toggleLive}
             className={cn(
-              "h-8 px-3 border border-border",
-              isLive
-                ? "text-emerald-500 hover:bg-emerald-500/10"
-                : "text-muted-foreground hover:bg-muted"
+              "h-7 px-2.5 gap-1.5 border border-border/50 rounded-lg hover:bg-muted transition-all",
+              isLive ? "text-success bg-success/5 border-success/20" : "text-muted-foreground focus:ring-0"
             )}
-            title={isLive ? "Pause auto-scroll" : "Resume auto-scroll"}
           >
             {isLive ? (
-              <Pause className="w-4 h-4" weight="fill" />
+              <>
+                <div className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />
+                <span className="text-[9px] font-bold">PAUSE</span>
+              </>
             ) : (
-              <Play className="w-4 h-4" weight="fill" />
+              <>
+                <div className="w-1.5 h-1.5 rounded-full bg-muted-foreground" />
+                <span className="text-[9px] font-bold text-foreground">RESUME</span>
+              </>
             )}
           </Button>
 
           {/* Search Input */}
           <div className="relative w-64">
-            <MagnifyingGlass className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+            <MagnifyingGlass className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground/60" />
             <Input
               ref={searchInputRef}
               type="text"
-              placeholder="Search... (⌘K)"
+              placeholder="Filter logs... (⌘K)"
               value={searchValue}
               onChange={(e) => setSearchValue(e.target.value)}
-              className="pl-8 pr-8 h-8 text-[16px] focus:border-accent/50 focus:ring-1 focus:ring-accent/30"
+              className="pl-8 pr-8 h-8 bg-secondary/40 border-border/50 text-xs focus:border-primary/50 focus:ring-primary/20 transition-all rounded-lg"
             />
             {searchValue && (
               <Button
                 variant="ghost"
                 size="sm"
                 onClick={handleClearSearch}
-                className="absolute right-0.5 top-1/2 -translate-y-1/2 h-7 w-7 p-0 hover:bg-muted"
+                className="absolute right-1 top-1/2 -translate-y-1/2 h-6 w-6 p-0 hover:bg-muted"
               >
-                <X className="w-3.5 h-3.5 text-muted-foreground" />
+                <X className="w-3 h-3 text-muted-foreground" />
               </Button>
             )}
           </div>

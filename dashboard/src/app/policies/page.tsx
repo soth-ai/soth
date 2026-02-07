@@ -141,7 +141,7 @@ export default function PoliciesPage() {
   return (
     <div className="min-h-screen">
       {/* Page Header */}
-      <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 md:top-14 z-10">
+      <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-10">
         <div className="px-4 md:px-6 py-3 md:py-4 flex items-center justify-between">
           <div className="flex items-center gap-2 md:gap-3">
             <div className="h-7 w-7 md:h-8 md:w-8 rounded-lg bg-accent/10 flex items-center justify-center">
