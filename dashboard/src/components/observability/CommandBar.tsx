@@ -194,7 +194,7 @@ export function CommandBar() {
   };
 
   return (
-    <div className="flex items-center gap-3 px-4 py-2.5 bg-card/50 border-b border-border">
+    <div className="flex items-center gap-3 px-4 py-2.5 bg-card/50 border border-dashed border-border rounded-t-[12px]">
       {/* Source Toggles */}
       <div className="flex items-center gap-1">
         {sourceToggles.map((source) => {

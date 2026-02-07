@@ -16,7 +16,7 @@ import type { ApiResponse, EventsSummary, WrapEvent } from "@/types";
 import { cn } from "@/lib/utils";
 
 type MobilePanel = "stream" | "inspector" | "filters";
-const BOOTSTRAP_LIMIT = 500;
+const BOOTSTRAP_LIMIT = 250;
 
 function normalizePayload(value: unknown): string {
   if (typeof value === "string") {

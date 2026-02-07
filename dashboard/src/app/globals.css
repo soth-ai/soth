@@ -3,12 +3,18 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
   --color-card: var(--card);
   --color-card-hover: var(--card-hover);
   --color-card-foreground: var(--card-foreground);
   --color-muted: var(--muted);
   --color-muted-hover: var(--muted-hover);
   --color-muted-foreground: var(--muted-foreground);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
   --color-border: var(--border);
   --color-border-hover: var(--border-hover);
   --color-success: var(--success);
@@ -20,68 +26,85 @@
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --font-sans: var(--font-geist-sans);
+  --font-display: var(--font-gafata);
   --font-mono: var(--font-geist-mono);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
 }
 
-/* DARK THEME (Default - OLED optimized) */
+/* DARK THEME (Terminal Ops) */
 :root {
-  --font-geist-sans: "Avenir Next", "Segoe UI", "SF Pro Text", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  --font-geist-mono: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --background: #050505;
-  --foreground: #F2F2F2;
+  --font-geist-sans: "Geist", "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-geist-mono: "Geist Mono", "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-gafata: "Gafata", var(--font-geist-sans);
 
-  --card: #0c0c0c;
-  --card-hover: #131313;
-  --card-foreground: #F2F2F2;
+  --background: #000000;
+  --foreground: #ffffff;
 
-  --muted: #1f1f1f;
-  --muted-hover: #262626;
-  --muted-foreground: #8a8a8a;
+  --primary: #653626;
+  --primary-foreground: #ffffff;
+  --secondary: #161616;
+  --secondary-foreground: #f3f3f3;
 
-  --accent: #58a6ff;
-  --accent-foreground: #050505;
+  --card: #0e0e0e;
+  --card-hover: #0e0e0e;
+  --card-foreground: #ffffff;
 
-  --destructive: #dc2626;
-  --destructive-foreground: #F2F2F2;
-  --success: #16a34a;
-  --success-foreground: #F2F2F2;
-  --warning: #ca8a04;
-  --warning-foreground: #050505;
+  --muted: #161616;
+  --muted-hover: #1e1e1e;
+  --muted-foreground: #9f9f9f;
 
-  --border: #282828;
-  --border-hover: #424242;
+  --accent: #653626;
+  --accent-foreground: #ffffff;
 
-  --radius: 0.625rem;
+  --destructive: #c74646;
+  --destructive-foreground: #ffffff;
+  --success: #d97757;
+  --success-foreground: #0e0e0e;
+  --warning: #d97757;
+  --warning-foreground: #0e0e0e;
+
+  --input: #212121;
+  --ring: #d97757;
+  --border: #3a271f;
+  --border-hover: #653626;
+
+  --radius: 0.75rem;
 }
 
-/* LIGHT THEME */
+/* LIGHT THEME (fallback only) */
 :root.light, .light {
-  --background: #FBFBFC;
-  --foreground: #0C0F16;
+  --background: #faf8f6;
+  --foreground: #1b130f;
 
-  --card: #FFFFFF;
-  --card-hover: #F4F6F8;
-  --card-foreground: #0C0F16;
+  --primary: #653626;
+  --primary-foreground: #fff8f3;
+  --secondary: #ede8e4;
+  --secondary-foreground: #241913;
 
-  --muted: #F4F6F8;
-  --muted-hover: #E8EBEF;
-  --muted-foreground: rgba(12, 15, 22, 0.62);
+  --card: #fffdfb;
+  --card-hover: #fffdfb;
+  --card-foreground: #1b130f;
 
-  --accent: #2F6BFF;
-  --accent-foreground: #FFFFFF;
+  --muted: #f1ece8;
+  --muted-hover: #e9e2dc;
+  --muted-foreground: #705e56;
 
-  --destructive: #EF4E4E;
-  --destructive-foreground: #FFFFFF;
-  --success: #12B981;
-  --success-foreground: #FFFFFF;
-  --warning: #F4B740;
-  --warning-foreground: #0C0F16;
+  --accent: #653626;
+  --accent-foreground: #ffffff;
 
-  --border: rgba(12, 15, 22, 0.10);
-  --border-hover: rgba(12, 15, 22, 0.16);
+  --destructive: #b53c3c;
+  --destructive-foreground: #ffffff;
+  --success: #d97757;
+  --success-foreground: #1b130f;
+  --warning: #d97757;
+  --warning-foreground: #1b130f;
+
+  --input: #ffffff;
+  --ring: #653626;
+  --border: #cdbeb5;
+  --border-hover: #a78777;
 }
 
 * {
@@ -92,10 +115,45 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  font-size: 14px;
-  line-height: 1.6;
+  font-size: 20px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: normal;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: geometricPrecision;
+}
+
+h1, .soth-page-title {
+  font-family: var(--font-display), var(--font-sans), sans-serif;
+  font-size: 32px;
+  line-height: normal;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+h2, h3, .soth-section-title {
+  font-family: var(--font-display), var(--font-sans), sans-serif;
+  font-size: 24px;
+  line-height: normal;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.soth-body-text {
+  font-size: 20px;
+  line-height: normal;
+}
+
+code, pre, kbd, .soth-code-text {
+  font-size: 16px;
+  line-height: normal;
+}
+
+.soth-chip-text {
+  font-size: 16px;
+  line-height: normal;
+  letter-spacing: 0;
 }
 
 /* Scrollbar */
@@ -167,11 +225,11 @@ body {
 }
 
 .animate-fade-in {
-  animation: fade-in 0.2s ease-out;
+  animation: fade-in 0.2s ease-in-out;
 }
 
 .animate-slide-up {
-  animation: slide-up 0.3s ease-out;
+  animation: slide-up 0.3s ease-in-out;
 }
 
 .animate-pulse-subtle {
@@ -190,11 +248,11 @@ body {
 }
 
 .animate-slide-in-right {
-  animation: slide-in-right 0.25s ease-out;
+  animation: slide-in-right 0.25s ease-in-out;
 }
 
 .animate-slide-in-left {
-  animation: slide-in-left 0.25s ease-out;
+  animation: slide-in-left 0.25s ease-in-out;
 }
 
 /* Safe area for mobile notches/home indicators */

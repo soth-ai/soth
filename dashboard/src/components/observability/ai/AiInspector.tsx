@@ -21,6 +21,7 @@ import {
   hasPairedPayload,
 } from "@/store/observability";
 import { fetchEventPayload } from "@/lib/event-payload";
+import { defineSothMonacoTheme, SOTH_MONACO_THEME } from "@/lib/monaco-theme";
 import { Button } from "@/components/ui/button";
 import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
 
@@ -187,6 +188,10 @@ export function AiInspector() {
     return "text-emerald-500";
   };
 
+  const handleMonacoBeforeMount = useCallback((monaco: unknown) => {
+    defineSothMonacoTheme(monaco as Parameters<typeof defineSothMonacoTheme>[0]);
+  }, []);
+
   // Get provider color
   const getProviderColor = (provider: string) => {
     switch (provider.toLowerCase()) {
@@ -206,12 +211,12 @@ export function AiInspector() {
   };
 
   return (
-    <div className="flex flex-col h-full bg-background border-l border-border">
+    <div className="flex flex-col h-full bg-background border-l border-dashed border-border">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-card">
         <div className="flex items-center gap-2">
           <CloudArrowUp className="w-4 h-4 text-accent" weight="duotone" />
-          <h2 className="text-sm font-semibold text-foreground">Request Inspector</h2>
+          <h2 className="text-[24px] font-normal text-foreground">Request Inspector</h2>
         </div>
         {selectedLog && (
           <div className="flex items-center gap-2">
@@ -221,7 +226,7 @@ export function AiInspector() {
                 <button
                   onClick={() => setActiveTab("request")}
                   className={cn(
-                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors",
+                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors duration-150 ease-in-out",
                     activeTab === "request"
                       ? "bg-cyan-500/20 text-cyan-500"
                       : "text-muted-foreground hover:bg-muted"
@@ -233,7 +238,7 @@ export function AiInspector() {
                 <button
                   onClick={() => setActiveTab("response")}
                   className={cn(
-                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors border-l border-border",
+                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors duration-150 ease-in-out border-l border-border",
                     activeTab === "response"
                       ? "bg-emerald-500/20 text-emerald-500"
                       : "text-muted-foreground hover:bg-muted"
@@ -422,12 +427,13 @@ export function AiInspector() {
               height="100%"
               language={editorPayload.language}
               value={editorPayload.content}
-              theme="vs-dark"
+              theme={SOTH_MONACO_THEME}
+              beforeMount={handleMonacoBeforeMount}
               options={{
                 readOnly: true,
                 minimap: { enabled: false },
-                fontSize: 12,
-                fontFamily: "JetBrains Mono, Geist Mono, monospace",
+                fontSize: 16,
+                fontFamily: "Geist Mono, JetBrains Mono, monospace",
                 lineNumbers: "on",
                 scrollBeyondLastLine: false,
                 automaticLayout: true,
