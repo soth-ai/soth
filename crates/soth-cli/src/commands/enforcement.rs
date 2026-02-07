@@ -3,8 +3,10 @@
 use anyhow::Context;
 use soth_budget::BudgetTracker;
 use soth_core::config::SothConfig;
+use soth_core::types::policy::PolicyData;
 use soth_identity::TrustStore;
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine, PolicyLoader};
+use soth_proxy::metrics;
 use soth_proxy::pipeline::budget::{BudgetConfig, BudgetLayer};
 use soth_proxy::pipeline::identity::{IdentityConfig, IdentityLayer, IdentityMode};
 use soth_proxy::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
@@ -54,18 +56,17 @@ fn build_policy_engine(config: &SothConfig) -> anyhow::Result<Option<PolicyEngin
 
     let cache_config: PolicyCacheConfig = config.policy.cache.clone().into();
     let engine = PolicyEngine::with_cache_config(cache_config);
+    let mut policy_data = PolicyData::default();
+    let mut modules = std::collections::HashMap::new();
 
     if let Some(data_file) = &config.policy.data_file {
-        let data = match data_file.extension().and_then(|e| e.to_str()) {
+        policy_data = match data_file.extension().and_then(|e| e.to_str()) {
             Some("yaml") | Some("yml") => PolicyLoader::load_policy_data_yaml(data_file)?,
             _ => PolicyLoader::load_policy_data(data_file)?,
         };
-        engine.set_policy_data(data)?;
     }
 
     if let Some(policy_dir) = &config.policy.policy_dir {
-        let mut modules = std::collections::HashMap::new();
-
         if policy_dir.exists() {
             if let Ok(rego_modules) = PolicyLoader::load_rego_dir(policy_dir) {
                 modules.extend(rego_modules);
@@ -74,18 +75,24 @@ fn build_policy_engine(config: &SothConfig) -> anyhow::Result<Option<PolicyEngin
                 modules.extend(yaml_modules);
             }
         }
-
-        if !modules.is_empty() {
-            engine.load_modules(modules)?;
+    }
+    match engine.reload_artifacts(modules, policy_data) {
+        Ok(version) => {
+            metrics::record_policy_reload(true);
+            metrics::set_policy_active_version(&version);
+        }
+        Err(err) => {
+            metrics::record_policy_reload(false);
+            return Err(err.into());
         }
     }
 
     Ok(Some(engine))
 }
 
-fn build_budget_tracker(config: &SothConfig) -> Option<BudgetTracker> {
+fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTracker>> {
     if !config.budget.enabled {
-        return None;
+        return Ok(None);
     }
 
     let tracker = BudgetTracker::new();
@@ -93,15 +100,27 @@ fn build_budget_tracker(config: &SothConfig) -> Option<BudgetTracker> {
         match limit.scope.as_str() {
             "global" => tracker.set_global_budget(limit.daily, limit.weekly, limit.monthly),
             "per_agent" => {
-                if let Some(agent_id) = &limit.agent_id {
-                    tracker.set_agent_budget(agent_id, limit.daily, limit.weekly, limit.monthly);
-                }
+                let agent_id = limit.agent_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("budget limit scope=per_agent requires agent_id")
+                })?;
+                tracker.set_agent_budget(agent_id, limit.daily, limit.weekly, limit.monthly);
             }
-            _ => {}
+            "per_session" => {
+                tracker.set_session_budget(limit.daily, limit.weekly, limit.monthly);
+            }
+            "per_model" => {
+                let model = limit.model.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("budget limit scope=per_model requires model")
+                })?;
+                tracker.set_model_budget(model, limit.daily, limit.weekly, limit.monthly);
+            }
+            other => {
+                return Err(anyhow::anyhow!("unsupported budget limit scope: {other}"));
+            }
         }
     }
 
-    Some(tracker)
+    Ok(Some(tracker))
 }
 
 pub fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer> {
@@ -126,7 +145,7 @@ pub fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer
         enforcer = enforcer.with_policy(policy_mode, engine);
     }
 
-    if let Some(tracker) = build_budget_tracker(config) {
+    if let Some(tracker) = build_budget_tracker(config)? {
         enforcer = enforcer.with_budget(tracker, true, "gpt-4o");
     }
 
@@ -180,7 +199,7 @@ pub fn build_wrap_enforcement_runtime(
         pipeline_builder = pipeline_builder.layer(layer);
     }
 
-    if let Some(tracker) = build_budget_tracker(config) {
+    if let Some(tracker) = build_budget_tracker(config)? {
         enabled = true;
         let layer = BudgetLayer::with_tracker(
             BudgetConfig {

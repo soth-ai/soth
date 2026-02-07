@@ -318,6 +318,9 @@ fn apply_enforcement_metadata(event: &mut WrapEvent, ctx: &PipelineRequestContex
         event.policy_allowed = Some(allowed);
         event.policy_reason = reason;
     }
+    if let Some(policy_version) = ctx.metadata.get("policy_version").and_then(|v| v.as_str()) {
+        event.policy_version = Some(policy_version.to_string());
+    }
 
     let input_tokens = ctx
         .metadata
@@ -938,8 +941,8 @@ fn truncate_content(content: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soth_proxy::pipeline::middleware::RequestContext as PipelineCtx;
     use serde_json::json;
+    use soth_proxy::pipeline::middleware::RequestContext as PipelineCtx;
 
     #[test]
     fn test_derive_server_name_npx() {
@@ -1023,6 +1026,8 @@ mod tests {
         ctx.metadata
             .insert("policy_reason".to_string(), json!("blocked"));
         ctx.metadata
+            .insert("policy_version".to_string(), json!("v12"));
+        ctx.metadata
             .insert("budget_input_tokens".to_string(), json!(10));
         ctx.metadata
             .insert("budget_output_tokens".to_string(), json!(5));
@@ -1032,6 +1037,7 @@ mod tests {
 
         assert_eq!(event.policy_allowed, Some(false));
         assert_eq!(event.policy_reason, Some("blocked".to_string()));
+        assert_eq!(event.policy_version, Some("v12".to_string()));
         assert_eq!(event.input_tokens, Some(10));
         assert_eq!(event.output_tokens, Some(5));
         assert_eq!(event.token_count, Some(15));

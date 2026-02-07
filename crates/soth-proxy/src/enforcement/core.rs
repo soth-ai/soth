@@ -3,10 +3,12 @@
 use std::collections::HashSet;
 
 use soth_budget::{BudgetTracker, TokenCounter};
+use soth_core::types::budget::BudgetScope;
 use soth_core::types::policy::{PolicyDecision, PolicyInput, PolicyInputBuilder};
 use soth_identity::{signing::verify_bytes, signing::SignatureBlock, Did};
 use soth_policy::PolicyEngine;
 
+use crate::metrics;
 use crate::pipeline::middleware::RequestContext;
 use crate::protocol::{methods, JsonRpcMessage, JsonRpcRequest};
 
@@ -359,6 +361,15 @@ pub fn record_budget_spend(
     tracker.record_spend(session_id, agent_id, model, input_tokens, output_tokens);
 }
 
+fn budget_scope_label(scope: BudgetScope) -> &'static str {
+    match scope {
+        BudgetScope::Global => "global",
+        BudgetScope::PerAgent => "per_agent",
+        BudgetScope::PerSession => "per_session",
+        BudgetScope::PerModel => "per_model",
+    }
+}
+
 pub fn enforce_proxy_request(
     config: ProxyEnforcementConfig<'_>,
     input: ProxyEnforcementInput<'_>,
@@ -392,8 +403,18 @@ pub fn enforce_proxy_request(
             .as_deref()
             .or(input.agent)
             .map(|s| s.to_string());
-        if config.budget_block_on_exceeded && tracker.is_budget_exceeded(agent_id.as_deref()) {
-            return Err((429, "Budget exceeded".to_string(), None));
+        metrics::record_budget_check("request");
+        if config.budget_block_on_exceeded {
+            if let Some(scope) =
+                tracker.first_exceeded_scope(input.session_id, agent_id.as_deref(), input.model)
+            {
+                metrics::record_budget_block(budget_scope_label(scope));
+                return Err((
+                    429,
+                    format!("Budget exceeded ({})", budget_scope_label(scope)),
+                    None,
+                ));
+            }
         }
         if let Some(body) = input.request_body {
             let input_tokens = TokenCounter::estimate_tokens(body);
@@ -422,10 +443,30 @@ pub fn enforce_proxy_request(
         input.agent,
         &identity,
     );
+    let eval_start = std::time::Instant::now();
     let (decision, policy_version) = match evaluate_policy(engine, &policy_input) {
         Ok(v) => v,
-        Err(err) => return Err((500, err, None)),
+        Err(err) => {
+            let active_version = engine.active_policy_version();
+            metrics::record_policy_evaluation("error", eval_start.elapsed());
+            metrics::set_policy_active_version(&active_version);
+            match config.policy_mode {
+                PolicyMode::Enforce => {
+                    return Err((
+                        403,
+                        format!("Policy evaluation failed (enforce mode): {err}"),
+                        Some(active_version),
+                    ));
+                }
+                PolicyMode::Audit | PolicyMode::Disabled => {
+                    identity.policy_version = Some(active_version);
+                    return Ok(identity);
+                }
+            }
+        }
     };
+    metrics::record_policy_evaluation("success", eval_start.elapsed());
+    metrics::set_policy_active_version(&policy_version);
     let policy_version = Some(policy_version);
     identity.policy_version = policy_version.clone();
 

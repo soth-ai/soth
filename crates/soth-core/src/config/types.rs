@@ -550,7 +550,7 @@ pub struct BudgetConfig {
 /// Budget limit configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetLimit {
-    /// Scope: global, per_agent, per_session
+    /// Scope: global, per_agent, per_session, per_model
     pub scope: String,
 
     /// Daily limit in USD
@@ -564,6 +564,9 @@ pub struct BudgetLimit {
 
     /// Agent ID (for per_agent scope)
     pub agent_id: Option<String>,
+
+    /// Model ID (for per_model scope)
+    pub model: Option<String>,
 }
 
 /// Alert configuration
