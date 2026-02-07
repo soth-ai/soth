@@ -52,77 +52,75 @@ function WhyThisMatters({
 }) {
   const insights: Insight[] = [];
 
-  // Policy denied
   if (log.policy_allowed === false) {
     insights.push({
       icon: ShieldSlash,
-      color: "text-red-500",
-      title: "Request blocked by policy",
-      description: log.policy_reason
-        ? `Reason: ${log.policy_reason}`
-        : "This request was denied by your security policy. Check your policy rules to ensure this is expected behavior.",
+      color: "text-destructive",
+      title: "Policy Violation",
+      description: log.policy_reason || "Access to this resource was blocked by security policy.",
     });
   }
 
-  // PII detected
-  if (log.pii_detected && log.pii_types.length > 0) {
+  if (log.pii_detected) {
     insights.push({
       icon: Eye,
-      color: "text-orange-500",
-      title: "Personal data detected",
-      description: `Found ${log.pii_types.join(", ")} in this message. Consider masking sensitive data or reviewing your data handling policies.`,
+      color: "text-warning",
+      title: "Sensitive Data Found",
+      description: `Detected: ${log.pii_types.join(", ")}. Content has been audited.`,
     });
   }
 
-  // Slow response
   const effectiveLatency = latency ?? log.latency_ms ?? 0;
   if (effectiveLatency >= 1000) {
     insights.push({
       icon: Timer,
-      color: "text-amber-500",
-      title: "Slow response time",
-      description: `This operation took ${(effectiveLatency / 1000).toFixed(1)}s. Consider optimizing the tool or checking for upstream issues.`,
+      color: "text-warning",
+      title: "Performance Bottleneck",
+      description: `Operation latancy (${(effectiveLatency / 1000).toFixed(1)}s) exceeds safety threshold.`,
     });
   }
 
-  // Error response
   if (parsed?.error) {
     insights.push({
       icon: XCircle,
-      color: "text-red-500",
-      title: "Error response",
-      description: `Error ${parsed.error.code}: ${parsed.error.message}. This may indicate a problem with the MCP server or tool.`,
+      color: "text-destructive",
+      title: "System Error",
+      description: `[${parsed.error.code}] ${parsed.error.message}`,
     });
   }
 
-  // High token count
   if (log.token_count && log.token_count > 10000) {
     insights.push({
       icon: CurrencyDollar,
-      color: "text-amber-500",
-      title: "High token usage",
-      description: `This message used ${log.token_count.toLocaleString()} tokens. Consider optimizing prompts or responses to reduce costs.`,
+      color: "text-warning",
+      title: "High Resource Usage",
+      description: `${log.token_count.toLocaleString()} tokens consumed in a single transaction.`,
     });
   }
 
-  // No insights - show success state
-  if (insights.length === 0) {
-    return null;
-  }
+  if (insights.length === 0) return null;
 
   return (
-    <div className="px-4 py-3 bg-muted/20 border-b border-border">
-      <div className="flex items-center gap-1.5 mb-2 text-xs">
-        <Lightbulb className="w-3.5 h-3.5 text-accent" weight="duotone" />
-        <span className="font-semibold text-foreground">Why This Matters</span>
+    <div className="mx-3 my-1.5 rounded-md border border-primary/20 bg-primary/5">
+      <div className="flex items-center gap-1.5 border-b border-primary/15 px-2 py-1">
+        <Lightbulb className="w-3.5 h-3.5 text-primary" weight="fill" />
+        <h3 className="text-[8px] font-semibold text-foreground tracking-[0.08em] uppercase">
+          Insights
+        </h3>
       </div>
-      <div className="space-y-2">
+      <div className="space-y-1 px-2 py-1.5">
         {insights.map((insight, i) => (
-          <div key={i} className="flex items-start gap-2">
-            <insight.icon className={cn("w-4 h-4 mt-0.5 flex-shrink-0", insight.color)} weight="fill" />
+          <div key={i} className="flex gap-1.5">
+            <div className={cn("mt-0.5", insight.color)}>
+              <insight.icon className="w-3 h-3" weight="fill" />
+            </div>
             <div className="flex-1 min-w-0">
-              <p className={cn("text-xs font-medium", insight.color)}>{insight.title}</p>
-              <p className="text-xs text-muted-foreground mt-0.5">{insight.description}</p>
+              <p className={cn("text-[9px] font-semibold leading-tight", insight.color)}>
+                {insight.title}
+              </p>
+              <p className="text-[9px] text-muted-foreground leading-tight mt-0.5">
+                {insight.description}
+              </p>
             </div>
           </div>
         ))}
@@ -319,67 +317,72 @@ export function Inspector() {
     : selectedLog?.direction;
 
   return (
-    <div className="flex flex-col h-full bg-background border-l border-dashed border-border">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-card">
-        <div className="flex items-center gap-2">
-          {isStderrMessage ? (
-            <WarningCircle className="w-4 h-4 text-red-500" weight="fill" />
-          ) : showRawUi ? (
-            <Terminal className="w-4 h-4 text-amber-500" weight="duotone" />
-          ) : (
-            <FileJs className="w-4 h-4 text-accent" weight="duotone" />
-          )}
-          <h2 className="text-[24px] font-normal text-foreground">
-            {isStderrMessage ? "Stderr Output" : showRawUi ? "Raw Output" : "Inspector"}
-          </h2>
+    <div className="flex flex-col h-full bg-background border-l border-border/50 font-sans">
+      <div className="flex items-center justify-between px-2.5 py-1 border-b border-border/50 bg-secondary/30 backdrop-blur-md sticky top-0 z-10">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <div className="w-5 h-5 rounded border border-primary/20 bg-primary/10 flex items-center justify-center shrink-0">
+            {isStderrMessage ? (
+              <WarningCircle className="w-3 h-3 text-destructive" weight="fill" />
+            ) : showRawUi ? (
+              <Terminal className="w-3 h-3 text-warning" weight="duotone" />
+            ) : (
+              <FileJs className="w-3 h-3 text-primary" weight="duotone" />
+            )}
+          </div>
+          <div className="min-w-0">
+            <h2 className="text-[8px] font-semibold text-foreground tracking-[0.08em] uppercase">
+              {isStderrMessage ? "Stderr Output" : showRawUi ? "Raw Data" : "Event Inspector"}
+            </h2>
+            <p className="text-[8px] text-muted-foreground font-medium tracking-[0.02em] truncate">
+              {selectedLog?.server_name} • {selectedLog?.agent.name}
+            </p>
+          </div>
         </div>
         {selectedLog && (
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 shrink-0">
             {hasPairedContent && (
-              <div className="flex items-center rounded-md border border-border overflow-hidden">
+              <div className="flex items-center gap-1">
                 <button
                   onClick={() => setActiveTab("request")}
                   className={cn(
-                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors duration-150 ease-in-out",
+                    "inline-flex h-5 items-center gap-1 rounded-md border px-1.5 text-[8px] font-semibold uppercase tracking-[0.06em] transition-colors",
                     activeTab === "request"
-                      ? "bg-cyan-500/20 text-cyan-500"
-                      : "text-muted-foreground hover:bg-muted"
+                      ? "border-primary/35 bg-primary/15 text-primary"
+                      : "border-border/50 bg-secondary/25 text-muted-foreground hover:text-foreground"
                   )}
                 >
-                  <ArrowDown className="w-3 h-3" weight="bold" />
-                  Request
+                  <ArrowDown className="w-2.5 h-2.5" weight="bold" />
+                  Req
                 </button>
                 <button
                   onClick={() => setActiveTab("response")}
                   className={cn(
-                    "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors duration-150 ease-in-out border-l border-border",
+                    "inline-flex h-5 items-center gap-1 rounded-md border px-1.5 text-[8px] font-semibold uppercase tracking-[0.06em] transition-colors",
                     activeTab === "response"
-                      ? "bg-emerald-500/20 text-emerald-500"
-                      : "text-muted-foreground hover:bg-muted"
+                      ? "border-success/35 bg-success/15 text-success"
+                      : "border-border/50 bg-secondary/25 text-muted-foreground hover:text-foreground"
                   )}
                 >
-                  <ArrowUp className="w-3 h-3" weight="bold" />
-                  Response
+                  <ArrowUp className="w-2.5 h-2.5" weight="bold" />
+                  Res
                 </button>
               </div>
             )}
-            {/* Copy button */}
             <Button
               variant="ghost"
               size="sm"
               onClick={handleCopy}
-              className="h-8 px-3 border border-border hover:bg-muted"
+              className="h-5 px-1.5 border border-border/50 bg-secondary/20 hover:bg-muted font-semibold text-[8px] gap-1 rounded-md"
             >
               {copied ? (
                 <>
-                  <Check className="w-3.5 h-3.5 mr-2 text-emerald-500" />
-                  <span className="text-xs text-emerald-500">Copied</span>
+                  <Check className="w-2.5 h-2.5 text-success" weight="bold" />
+                  <span className="text-success">Done</span>
                 </>
               ) : (
                 <>
-                  <Copy className="w-3.5 h-3.5 mr-2 text-muted-foreground" />
-                  <span className="text-xs text-foreground">Copy</span>
+                  <Copy className="w-2.5 h-2.5 text-muted-foreground" weight="bold" />
+                  <span>Copy</span>
                 </>
               )}
             </Button>
@@ -390,153 +393,92 @@ export function Inspector() {
       {/* Content */}
       {selectedLog ? (
         <div className="flex flex-col flex-1 overflow-hidden">
-          {/* Metadata */}
-          <div className="px-4 py-3 bg-muted/40 border-b border-border space-y-2">
-            {/* WarningCircle banners */}
-            {isStderrMessage && (
-              <div className="flex items-center gap-2 px-3 py-2 bg-red-500/10 border border-red-500/30 rounded-md mb-2">
-                <WarningCircle className="w-4 h-4 text-red-500 flex-shrink-0" weight="fill" />
-                <span className="text-xs text-red-500">
-                  This is stderr output from the MCP server (errors, warnings, tracebacks)
-                </span>
-              </div>
-            )}
-            {showRawUi && (
-              <div className="flex items-center gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-md mb-2">
-                <Terminal className="w-4 h-4 text-amber-500 flex-shrink-0" weight="duotone" />
-                <span className="text-xs text-amber-500">
-                  This is raw stdout output (non-JSON-RPC data)
-                </span>
-              </div>
-            )}
-            {selectedLog.policy_allowed === false && (
-              <div className="flex items-center gap-2 px-3 py-2 bg-red-500/10 border border-red-500/30 rounded-md mb-2">
-                <ShieldSlash className="w-4 h-4 text-red-500 flex-shrink-0" weight="fill" />
-                <span className="text-xs text-red-500">
-                  Policy denied: {selectedLog.policy_reason || "No reason provided"}
-                </span>
-              </div>
-            )}
-            {selectedLog.pii_detected && (
-              <div className="flex items-center gap-2 px-3 py-2 bg-orange-500/10 border border-orange-500/30 rounded-md mb-2">
-                <Eye className="w-4 h-4 text-orange-500 flex-shrink-0" weight="fill" />
-                <span className="text-xs text-orange-500">
-                  PII detected: {selectedLog.pii_types.join(", ")}
-                </span>
-              </div>
-            )}
-
-            {/* Metadata rows */}
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-muted-foreground font-medium">Timestamp</span>
-              <span className="font-mono text-foreground tabular-nums">
-                {formatTimestamp(selectedLog.timestamp)}
-              </span>
-            </div>
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-muted-foreground font-medium">Type</span>
-              <span
-                className={cn(
-                  "inline-flex items-center px-1.5 py-0.5 rounded-md font-mono font-medium border",
-                  isStderrMessage
-                    ? "bg-red-500/20 text-red-500 border-red-500/30"
-                    : isRawMessage
-                    ? "bg-amber-500/20 text-amber-500 border-amber-500/30"
-                    : "bg-secondary text-secondary-foreground border-border"
-                )}
-              >
-                {isStderrMessage ? "stderr" : isRawMessage ? "raw" : "json-rpc"}
-              </span>
-            </div>
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-muted-foreground font-medium">Direction</span>
-              <span
-                className={cn(
-                  "inline-flex items-center px-1.5 py-0.5 rounded-md font-mono font-medium bg-secondary border border-border",
-                  effectiveDirection === "in" ? "text-cyan-500" : "text-emerald-500"
-                )}
-              >
-                {effectiveDirection === "in" ? "Incoming" : "Outgoing"}
-              </span>
-            </div>
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-muted-foreground font-medium">Server</span>
-              <span className="font-mono text-foreground">{selectedLog.server_name}</span>
-            </div>
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-muted-foreground font-medium">Agent</span>
-              <span className="font-mono text-foreground">{selectedLog.agent.name}</span>
-            </div>
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-muted-foreground font-medium">Session</span>
-              <span
-                className="font-mono text-muted-foreground text-[11px] truncate max-w-[180px]"
-                title={selectedLog.session_id}
-              >
-                ...{selectedLog.session_id.slice(-12)}
-              </span>
-            </div>
-
-            {/* Latency */}
-            {(latency !== null || selectedLog.latency_ms !== undefined) && (
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground font-medium">
-                  {latency !== null ? "Round-trip Latency" : "Latency"}
-                </span>
-                <span
-                  className={cn(
-                    "font-mono font-semibold tabular-nums",
-                    getLatencyColor(latency ?? selectedLog.latency_ms ?? 0)
-                  )}
-                >
-                  {formatLatency(latency ?? selectedLog.latency_ms ?? 0)}
-                </span>
-              </div>
-            )}
-
-            {/* Token count */}
-            {selectedLog.token_count !== undefined && selectedLog.token_count > 0 && (
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground font-medium">Tokens</span>
-                <span className="font-mono text-amber-500 tabular-nums">
-                  {selectedLog.token_count.toLocaleString()}
-                </span>
-              </div>
-            )}
-
-            {/* Correlated Request Info */}
-            {correlatedRequest && (
-              <div className="pt-2 mt-2 border-t border-border">
-                <div className="flex items-center justify-between text-xs mb-2">
-                  <span className="text-muted-foreground font-medium">Correlated Request</span>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={handleJumpToRequest}
-                    className="h-7 px-3 text-xs border border-border hover:bg-muted"
+          <div className="flex-shrink-0 overflow-y-auto max-h-[38%] border-b border-border/50 bg-secondary/10">
+            <div className="px-3 py-2 space-y-1.5">
+              <div className="rounded-md border border-border/50 bg-secondary/20 px-2 py-1.5">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[9px]">
+                  <span className="text-muted-foreground uppercase tracking-[0.08em]">Time</span>
+                  <span className="font-mono text-foreground tabular-nums">
+                    {formatTimestamp(selectedLog.timestamp)}
+                  </span>
+                  <span className="text-muted-foreground/70">|</span>
+                  <span
+                    className={cn(
+                      "inline-flex items-center rounded border px-1 py-0.5 text-[8px] font-semibold uppercase tracking-[0.06em]",
+                      isStderrMessage
+                        ? "bg-destructive/10 text-destructive border-destructive/20"
+                        : isRawMessage
+                          ? "bg-warning/10 text-warning border-warning/20"
+                          : "bg-primary/10 text-primary border-primary/20"
+                    )}
                   >
-                    <ArrowRight className="w-3.5 h-3.5 mr-1.5 text-accent" />
-                    <span className="text-foreground">Jump</span>
-                  </Button>
-                </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-muted-foreground">Request ID</span>
-                  <span className="font-mono text-foreground">#{String(parsed?.id)}</span>
-                </div>
-                <div className="flex items-center justify-between text-xs mt-1">
-                  <span className="text-muted-foreground">Method</span>
-                  <span className="inline-flex items-center px-1.5 py-0.5 rounded-md font-mono text-[11px] font-medium bg-secondary text-cyan-500 border border-border">
-                    {parseLogMessage(correlatedRequest)?.method}
+                    {isStderrMessage ? "stderr" : isRawMessage ? "raw" : "json-rpc"}
+                  </span>
+                  <span className="text-muted-foreground/70">|</span>
+                  <span className="text-muted-foreground uppercase tracking-[0.08em]">Latency</span>
+                  {(latency !== null || selectedLog.latency_ms !== undefined) ? (
+                    <span
+                      className={cn(
+                        "font-mono font-semibold tabular-nums",
+                        getLatencyColor(latency ?? selectedLog.latency_ms ?? 0)
+                      )}
+                    >
+                      {formatLatency(latency ?? selectedLog.latency_ms ?? 0)}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">N/A</span>
+                  )}
+                  <span className="text-muted-foreground/70">|</span>
+                  <span className="text-muted-foreground uppercase tracking-[0.08em]">Tokens</span>
+                  <span className="font-mono tabular-nums text-warning">
+                    {selectedLog.token_count !== undefined && selectedLog.token_count > 0
+                      ? selectedLog.token_count.toLocaleString()
+                      : "0"}
                   </span>
                 </div>
               </div>
-            )}
+
+              <div className="rounded-md border border-border/50 bg-secondary/20 px-2 py-1.5 space-y-1">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[9px]">
+                  <span className="text-muted-foreground uppercase tracking-[0.08em]">Direction</span>
+                  <span
+                    className={cn(
+                      "font-semibold uppercase tracking-[0.08em]",
+                      effectiveDirection === "in" ? "text-cyan-500" : "text-success"
+                    )}
+                  >
+                    {effectiveDirection === "in" ? "Inbound" : "Outbound"}
+                  </span>
+                  <span className="text-muted-foreground/70">|</span>
+                  <span className="text-muted-foreground uppercase tracking-[0.08em]">Session</span>
+                  <span className="font-mono text-foreground" title={selectedLog.session_id}>
+                    {selectedLog.session_id.slice(0, 8)}...{selectedLog.session_id.slice(-8)}
+                  </span>
+                </div>
+                {correlatedRequest && (
+                  <div className="flex items-center justify-between gap-2 border-t border-border/40 pt-1 text-[9px]">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span className="text-muted-foreground uppercase tracking-[0.08em]">Paired</span>
+                      <span className="font-mono text-muted-foreground">#{String(parsed?.id)}</span>
+                      <span className="font-mono text-primary truncate">
+                        {parseLogMessage(correlatedRequest)?.method}
+                      </span>
+                    </div>
+                    <button
+                      onClick={handleJumpToRequest}
+                      className="inline-flex h-5 items-center gap-1 rounded-md border border-primary/30 bg-primary/10 px-1.5 text-[8px] font-semibold uppercase tracking-[0.06em] text-primary hover:bg-primary/15 transition-colors"
+                    >
+                      <ArrowRight className="w-2.5 h-2.5" weight="bold" />
+                      Jump
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <WhyThisMatters log={selectedLog} parsed={parsed} latency={latency} />
           </div>
 
-          {/* Why This Matters Section */}
-          <WhyThisMatters log={selectedLog} parsed={parsed} latency={latency} />
-
-          {/* Monaco Editor */}
           <div className="flex-1 overflow-hidden">
             <Editor
               height="100%"
@@ -547,7 +489,7 @@ export function Inspector() {
               options={{
                 readOnly: true,
                 minimap: { enabled: false },
-                fontSize: 16,
+                fontSize: 12,
                 fontFamily: "Geist Mono, JetBrains Mono, monospace",
                 lineNumbers: "on",
                 scrollBeyondLastLine: false,
@@ -562,8 +504,8 @@ export function Inspector() {
                   horizontalScrollbarSize: 6,
                 },
                 padding: {
-                  top: 16,
-                  bottom: 16,
+                  top: 12,
+                  bottom: 12,
                 },
               }}
             />
@@ -575,7 +517,7 @@ export function Inspector() {
             <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-muted/50 flex items-center justify-center">
               <FileJs className="w-6 h-6 text-muted-foreground/50" weight="duotone" />
             </div>
-            <p className="text-sm text-foreground font-medium mb-1">Select a message</p>
+            <p className="text-xs text-foreground font-medium mb-1">Select a message</p>
             <p className="text-xs text-muted-foreground">
               Click any message in the stream to view its full JSON content, metadata, and
               latency info.

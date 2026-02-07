@@ -14,6 +14,7 @@ import { useEventStream } from "@/hooks/useEventStream";
 import { buildApiUrl } from "@/lib/endpoints";
 import type { ApiResponse, EventsSummary, WrapEvent } from "@/types";
 import { cn } from "@/lib/utils";
+import { motion, AnimatePresence } from "framer-motion";
 
 type MobilePanel = "stream" | "inspector" | "filters";
 const BOOTSTRAP_LIMIT = 250;
@@ -165,7 +166,7 @@ export default function ObservabilityPage() {
   // Mobile Layout
   if (isMobile) {
     return (
-      <div className="h-[calc(100vh-3.5rem-4rem)] bg-background text-foreground overflow-hidden flex flex-col">
+      <div className="h-[100dvh] bg-background text-foreground overflow-hidden flex flex-col">
         {/* Mobile Tab Bar */}
         <div className="flex items-center border-b border-border bg-card">
           <button
@@ -236,39 +237,51 @@ export default function ObservabilityPage() {
 
   // Desktop Layout
   return (
-    <div className="h-[calc(100vh-3.5rem)] bg-background text-foreground overflow-hidden flex flex-col">
-      {/* Unified Layout */}
+    <div className="h-[100dvh] bg-background text-foreground overflow-hidden flex flex-col relative">
+      {/* Premium Controls Floating Bar (Optional, but let's integrate into unified layout) */}
+
       <PanelGroup direction="horizontal" className="flex-1">
         {/* Left Sidebar - Metrics & Filters */}
         <Panel
-          defaultSize={18}
-          minSize={15}
+          defaultSize={15}
+          minSize={10}
           maxSize={25}
-          className="min-w-[220px]"
+          collapsible={true}
+          className="min-w-[180px] transition-all duration-300 ease-in-out"
         >
           <Sidebar />
         </Panel>
 
-        <PanelResizeHandle className="w-1.5 bg-border hover:bg-accent/50 transition-colors data-[resize-handle-active]:bg-accent" />
+        <PanelResizeHandle className="group relative w-px bg-border hover:bg-accent/50 transition-colors data-[resize-handle-active]:bg-primary">
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center">
+            <div className="w-1.5 h-8 rounded-full bg-border group-hover:bg-primary/50 transition-colors" />
+          </div>
+        </PanelResizeHandle>
 
         {/* Center - Command Bar + Unified Stream */}
-        <Panel defaultSize={52} minSize={35}>
-          <div className="flex flex-col h-full">
+        <Panel defaultSize={60} minSize={30}>
+          <div className="flex flex-col h-full bg-card/30 backdrop-blur-sm border-x border-border/50">
             <CommandBar />
             <div className="flex-1 overflow-hidden">
-              <MessageStream />
+              <div className="h-full scrollbar-thin scrollbar-thumb-border scrollbar-track-transparent">
+                <MessageStream />
+              </div>
             </div>
           </div>
         </Panel>
 
-        <PanelResizeHandle className="w-1.5 bg-border hover:bg-accent/50 transition-colors data-[resize-handle-active]:bg-accent" />
+        <PanelResizeHandle className="group relative w-px bg-border hover:bg-accent/50 transition-colors data-[resize-handle-active]:bg-primary">
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center">
+            <div className="w-1.5 h-8 rounded-full bg-border group-hover:bg-primary/50 transition-colors" />
+          </div>
+        </PanelResizeHandle>
 
         {/* Right - Inspector */}
         <Panel
-          defaultSize={30}
-          minSize={25}
+          defaultSize={25}
+          minSize={20}
           maxSize={45}
-          className="min-w-[350px]"
+          className="min-w-[300px]"
         >
           <Inspector />
         </Panel>

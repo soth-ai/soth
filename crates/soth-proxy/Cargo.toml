@@ -48,6 +48,7 @@ rustls-pemfile = "2"
 flate2 = "1.0"
 brotli = "7"
 zstd = "0.13"
+rmcp = "0.14.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -102,6 +102,7 @@ export interface Session {
 export interface Filters {
   searchText?: string;
   method?: string;
+  path?: string;
   direction?: 'in' | 'out';
   minLatencyMs?: number;
   serverName?: string;
@@ -152,6 +153,10 @@ interface ObservabilityState {
   // Auto-scroll
   isLive: boolean;
   setIsLive: (live: boolean) => void;
+
+  // View Settings
+  isCompactMode: boolean;
+  toggleCompactMode: () => void;
 
   // Clustering
   clusteringEnabled: boolean;
@@ -284,6 +289,49 @@ export function calculateLatency(
   } catch {
     return null;
   }
+}
+
+export function normalizeServerName(value?: string): string {
+  return (value || '').trim().toLowerCase();
+}
+
+export function matchesServerFilter(serverName: string | undefined, filterValue: string): boolean {
+  const server = normalizeServerName(serverName);
+  const selected = normalizeServerName(filterValue);
+  if (!server || !selected) {
+    return false;
+  }
+  return server === selected || server.endsWith(`.${selected}`);
+}
+
+export function getLogHost(log: LogEntry): string | undefined {
+  const host = normalizeServerName(log.server_name);
+  return host || undefined;
+}
+
+export function getLogPath(log: LogEntry): string | undefined {
+  const method = (log.method || '').trim();
+  if (!method) {
+    return undefined;
+  }
+
+  const tokenMatch = method.match(/^(?:[A-Z]+|WebSocket)\s+([^\s|]+)/i);
+  const token = tokenMatch?.[1] || method;
+
+  if (token.startsWith('/')) {
+    return token.split('?')[0] || undefined;
+  }
+
+  if (token.startsWith('http://') || token.startsWith('https://')) {
+    try {
+      const parsed = new URL(token);
+      return parsed.pathname || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  return undefined;
 }
 
 function normalizeInline(text: string): string {
@@ -651,7 +699,14 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
   addLog: (log) =>
     set((state) => {
       if (state.logIds.has(log.id)) {
-        return state;
+        const index = state.logs.findIndex((entry) => entry.id === log.id);
+        if (index === -1) {
+          return state;
+        }
+
+        const logs = [...state.logs];
+        logs[index] = log;
+        return { logs };
       }
 
       // Limit logs based on settings
@@ -730,6 +785,14 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
       filters: id ? { ...get().filters, sessionId: id } : get().filters,
     }),
 
+  // Auto-scroll
+  isLive: true,
+  setIsLive: (live) => set({ isLive: live }),
+
+  // View Settings
+  isCompactMode: false,
+  toggleCompactMode: () => set((state) => ({ isCompactMode: !state.isCompactMode })),
+
   // Filters
   filters: {},
   setFilters: (newFilters) =>
@@ -771,13 +834,13 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
       }
 
       // Server name filter
-      if (filters.serverName) {
-        const server = (log.server_name || '').toLowerCase();
-        const selected = filters.serverName.toLowerCase();
-        const matchesServer = server === selected || server.endsWith(`.${selected}`);
-        if (!matchesServer) {
-          return false;
-        }
+      if (filters.serverName && !matchesServerFilter(log.server_name, filters.serverName)) {
+        return false;
+      }
+
+      // Path filter
+      if (filters.path && getLogPath(log) !== filters.path) {
+        return false;
       }
 
       // Latency filter
@@ -817,10 +880,6 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
       return true;
     });
   },
-
-  // Auto-scroll
-  isLive: true,
-  setIsLive: (live) => set({ isLive: live }),
 
   // Clustering
   clusteringEnabled: true,
@@ -896,9 +955,24 @@ export function computeLogMetrics(logs: LogEntry[]) {
 
   // Unique methods with counts
   const methodCounts = new Map<string, number>();
+  const hostCounts = new Map<string, number>();
+  const pathCounts = new Map<string, number>();
   logs.forEach((log) => {
-    if (log.method) {
+    const isRawOrStderrMessage =
+      log.message_type === 'raw' ||
+      log.message_type === 'stderr' ||
+      log.method === 'raw' ||
+      log.method === 'stderr';
+    if (log.method && !isRawOrStderrMessage) {
       methodCounts.set(log.method, (methodCounts.get(log.method) || 0) + 1);
+    }
+    const host = getLogHost(log);
+    if (host) {
+      hostCounts.set(host, (hostCounts.get(host) || 0) + 1);
+    }
+    const path = getLogPath(log);
+    if (path) {
+      pathCounts.set(path, (pathCounts.get(path) || 0) + 1);
     }
   });
 
@@ -920,7 +994,12 @@ export function computeLogMetrics(logs: LogEntry[]) {
     } else {
       tokensFromServer += tokens;
     }
-    if (log.method) {
+    const isRawOrStderrMessage =
+      log.message_type === 'raw' ||
+      log.message_type === 'stderr' ||
+      log.method === 'raw' ||
+      log.method === 'stderr';
+    if (log.method && !isRawOrStderrMessage) {
       tokensByMethod[log.method] = (tokensByMethod[log.method] || 0) + tokens;
     }
   });
@@ -932,10 +1011,15 @@ export function computeLogMetrics(logs: LogEntry[]) {
   return {
     totalMessages: logs.length,
     messagesPerSecond: recentLogs.length,
-    methodCounts: Array.from(methodCounts.entries()).map(([method, count]) => ({
-      method,
-      count,
-    })),
+    methodCounts: Array.from(methodCounts.entries())
+      .map(([method, count]) => ({ method, count }))
+      .sort((a, b) => b.count - a.count),
+    hostCounts: Array.from(hostCounts.entries())
+      .map(([host, count]) => ({ host, count }))
+      .sort((a, b) => b.count - a.count),
+    pathCounts: Array.from(pathCounts.entries())
+      .map(([path, count]) => ({ path, count }))
+      .sort((a, b) => b.count - a.count),
     incomingCount,
     outgoingCount,
     totalTokens,

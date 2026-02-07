@@ -33,127 +33,158 @@
   --radius-lg: var(--radius);
 }
 
-/* DARK THEME (Terminal Ops) */
+/* PREMIUM SOTH BRAND THEME (Modern Midnight) */
 :root {
   --font-geist-sans: "Geist", "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   --font-geist-mono: "Geist Mono", "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --font-gafata: "Gafata", var(--font-geist-sans);
+  --font-gafata: "Outfit", "Gaegu", var(--font-geist-sans);
 
+  /* Soth.ai Official Palette */
   --background: #000000;
   --foreground: #ffffff;
 
-  --primary: #653626;
+  --primary: #D97757;
+  /* Official Soth Coral/Orange */
   --primary-foreground: #ffffff;
-  --secondary: #161616;
-  --secondary-foreground: #f3f3f3;
+  --secondary: #171717;
+  /* Official Soth Secondary Background */
+  --secondary-foreground: #D9D9D9;
 
-  --card: #0e0e0e;
-  --card-hover: #0e0e0e;
+  --card: #0A0A0A;
+  --card-hover: #1F1F1F;
   --card-foreground: #ffffff;
 
-  --muted: #161616;
-  --muted-hover: #1e1e1e;
-  --muted-foreground: #9f9f9f;
+  --muted: #171717;
+  --muted-hover: #1F1F1F;
+  --muted-foreground: #6B6B6B;
 
-  --accent: #653626;
+  --accent: #D97757;
   --accent-foreground: #ffffff;
 
-  --destructive: #c74646;
+  --destructive: #EF4444;
   --destructive-foreground: #ffffff;
-  --success: #d97757;
-  --success-foreground: #0e0e0e;
-  --warning: #d97757;
-  --warning-foreground: #0e0e0e;
+  --success: #10B981;
+  --success-foreground: #ffffff;
+  --warning: #F59E0B;
+  --warning-foreground: #ffffff;
 
-  --input: #212121;
-  --ring: #d97757;
-  --border: #3a271f;
-  --border-hover: #653626;
+  --input: #0D0D0D;
+  --ring: #D97757;
+  --border: #262626;
+  --border-hover: #333333;
 
   --radius: 0.75rem;
+
+  /* Glassmorphism Presets */
+  --glass-bg: rgba(10, 10, 10, 0.7);
+  --glass-border: rgba(217, 119, 87, 0.1);
+  /* Subtle primary-tinted border */
+  --glass-blur: 16px;
 }
 
-/* LIGHT THEME (fallback only) */
-:root.light, .light {
-  --background: #faf8f6;
-  --foreground: #1b130f;
+/* LIGHT THEME (Official Colors) */
+:root.light,
+.light {
+  --background: #FAF9F5;
+  /* Official Soth Cream Background */
+  --foreground: #111111;
 
-  --primary: #653626;
-  --primary-foreground: #fff8f3;
-  --secondary: #ede8e4;
-  --secondary-foreground: #241913;
+  --primary: #D97757;
+  --primary-foreground: #ffffff;
+  --secondary: #EDEBE4;
+  --secondary-foreground: #111111;
 
-  --card: #fffdfb;
-  --card-hover: #fffdfb;
-  --card-foreground: #1b130f;
+  --card: #ffffff;
+  --card-hover: #f1f5f9;
+  --card-foreground: #111111;
 
-  --muted: #f1ece8;
-  --muted-hover: #e9e2dc;
-  --muted-foreground: #705e56;
+  --muted: #EDEBE4;
+  --muted-hover: #E2E0D6;
+  --muted-foreground: #64748b;
 
-  --accent: #653626;
+  --accent: #D97757;
   --accent-foreground: #ffffff;
 
-  --destructive: #b53c3c;
+  --destructive: #EF4444;
   --destructive-foreground: #ffffff;
-  --success: #d97757;
-  --success-foreground: #1b130f;
-  --warning: #d97757;
-  --warning-foreground: #1b130f;
+  --success: #10B981;
+  --success-foreground: #ffffff;
+  --warning: #F59E0B;
+  --warning-foreground: #ffffff;
 
   --input: #ffffff;
-  --ring: #653626;
-  --border: #cdbeb5;
-  --border-hover: #a78777;
+  --ring: #D97757;
+  --border: #E2E0D6;
+  --border-hover: #D6D4C8;
 }
 
 * {
   border-color: var(--border);
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease-in-out;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  font-size: 20px;
+  font-size: 14px;
   font-weight: 400;
-  letter-spacing: 0;
-  line-height: normal;
+  letter-spacing: -0.0125em;
+  line-height: 1.625;
+  /* Premium loose leading */
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: geometricPrecision;
 }
 
-h1, .soth-page-title {
-  font-family: var(--font-display), var(--font-sans), sans-serif;
-  font-size: 32px;
-  line-height: normal;
-  font-weight: 400;
-  letter-spacing: 0;
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
 }
 
-h2, h3, .soth-section-title {
-  font-family: var(--font-display), var(--font-sans), sans-serif;
-  font-size: 24px;
-  line-height: normal;
+h1,
+.soth-page-title {
+  font-family: var(--font-sans), sans-serif;
+  font-size: 28px;
+  line-height: 1.1;
   font-weight: 400;
-  letter-spacing: 0;
+  letter-spacing: -0.04em;
+  /* Tight tracking for headings */
+}
+
+h2,
+h3,
+.soth-section-title {
+  font-family: var(--font-sans), sans-serif;
+  font-size: 18px;
+  line-height: 1.25;
+  font-weight: 500;
+  letter-spacing: -0.02em;
 }
 
 .soth-body-text {
-  font-size: 20px;
-  line-height: normal;
+  font-size: 14px;
+  line-height: 1.625;
 }
 
-code, pre, kbd, .soth-code-text {
-  font-size: 16px;
-  line-height: normal;
+code,
+pre,
+kbd,
+.soth-code-text {
+  font-family: var(--font-mono), monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
 }
 
 .soth-chip-text {
-  font-size: 16px;
-  line-height: normal;
-  letter-spacing: 0;
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
 
 /* Scrollbar */
@@ -177,8 +208,13 @@ code, pre, kbd, .soth-code-text {
 
 /* Animations */
 @keyframes fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
 @keyframes slide-up {
@@ -186,6 +222,7 @@ code, pre, kbd, .soth-code-text {
     opacity: 0;
     transform: translateY(8px);
   }
+
   to {
     opacity: 1;
     transform: translateY(0);
@@ -193,13 +230,25 @@ code, pre, kbd, .soth-code-text {
 }
 
 @keyframes pulse-subtle {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.6;
+  }
 }
 
 @keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
+  0% {
+    background-position: -200% 0;
+  }
+
+  100% {
+    background-position: 200% 0;
+  }
 }
 
 @keyframes slide-in-right {
@@ -207,6 +256,7 @@ code, pre, kbd, .soth-code-text {
     opacity: 0;
     transform: translateX(100%);
   }
+
   to {
     opacity: 1;
     transform: translateX(0);
@@ -218,6 +268,7 @@ code, pre, kbd, .soth-code-text {
     opacity: 0;
     transform: translateX(-100%);
   }
+
   to {
     opacity: 1;
     transform: translateX(0);
@@ -237,12 +288,10 @@ code, pre, kbd, .soth-code-text {
 }
 
 .animate-shimmer {
-  background: linear-gradient(
-    90deg,
-    var(--muted) 0%,
-    var(--border) 50%,
-    var(--muted) 100%
-  );
+  background: linear-gradient(90deg,
+      var(--muted) 0%,
+      var(--border) 50%,
+      var(--muted) 100%);
   background-size: 200% 100%;
   animation: shimmer 1.5s ease-in-out infinite;
 }
@@ -273,10 +322,21 @@ code, pre, kbd, .soth-code-text {
 }
 
 /* Stagger animations */
-.stagger-1 { animation-delay: 0ms; }
-.stagger-2 { animation-delay: 50ms; }
-.stagger-3 { animation-delay: 100ms; }
-.stagger-4 { animation-delay: 150ms; }
+.stagger-1 {
+  animation-delay: 0ms;
+}
+
+.stagger-2 {
+  animation-delay: 50ms;
+}
+
+.stagger-3 {
+  animation-delay: 100ms;
+}
+
+.stagger-4 {
+  animation-delay: 150ms;
+}
 
 /* Live indicator */
 .live-dot {
@@ -295,7 +355,10 @@ code, pre, kbd, .soth-code-text {
 
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+
+  *,
+  *::before,
+  *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;

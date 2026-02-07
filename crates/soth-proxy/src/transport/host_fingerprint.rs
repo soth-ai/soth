@@ -25,6 +25,15 @@ pub fn is_claude_web_host(host: &str) -> bool {
     !host.starts_with("api.") && !host.contains(".api.")
 }
 
+fn is_claude_agent_edge_host(host: &str) -> bool {
+    host == "a-api.anthropic.com"
+        || host.ends_with(".a-api.anthropic.com")
+        || host == "a-cdn.anthropic.com"
+        || host.ends_with(".a-cdn.anthropic.com")
+        || host == "s-cdn.anthropic.com"
+        || host.ends_with(".s-cdn.anthropic.com")
+}
+
 fn is_cursor_host(host: &str) -> bool {
     host == "api2.cursor.sh" || host == "api3.cursor.sh" || host.ends_with(".cursor.sh")
 }
@@ -65,6 +74,7 @@ pub fn detect_agent_with_context(
     let host_lower = host.to_ascii_lowercase();
     let is_chatgpt_web = is_chatgpt_web_host(&host_lower);
     let is_claude_web = is_claude_web_host(&host_lower);
+    let is_claude_edge = is_claude_agent_edge_host(&host_lower);
 
     if is_chatgpt_web && is_codex_path(path) {
         return Some("codex");
@@ -101,7 +111,7 @@ pub fn detect_agent_with_context(
     if ua_agent.is_none() && is_chatgpt_web {
         return Some("chatgpt");
     }
-    if ua_agent.is_none() && is_claude_web {
+    if ua_agent.is_none() && (is_claude_web || is_claude_edge) {
         return Some("claude");
     }
 
@@ -116,7 +126,7 @@ pub fn detect_provider(host: &str) -> Option<&'static str> {
     if is_chatgpt_web_host(&host) {
         Some("chatgpt")
     // Claude web/agent surfaces
-    } else if is_claude_web_host(&host) {
+    } else if is_claude_web_host(&host) || is_claude_agent_edge_host(&host) {
         Some("claude")
     } else if is_cursor_host(&host) {
         Some("cursor")
@@ -143,7 +153,7 @@ pub fn detect_provider(host: &str) -> Option<&'static str> {
         || host.ends_with(".api.claude.ai")
         || host == "api.anthropic.com"
         || host.ends_with(".api.anthropic.com")
-        || host.contains("anthropic.com")
+        || host == "anthropic.com"
     {
         Some("anthropic")
     } else if host.contains("googleapis.com")
@@ -187,7 +197,7 @@ pub fn is_agent_app(host: &str) -> bool {
     }
 
     // Claude web/desktop app (claude.ai).
-    if is_claude_web_host(&host) {
+    if is_claude_web_host(&host) || is_claude_agent_edge_host(&host) {
         return true;
     }
 
