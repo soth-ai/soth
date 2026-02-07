@@ -46,11 +46,14 @@ export interface LogEntry {
   method?: string;
   tool_name?: string;
   content: string; // Full JSON content
+  content_ref?: string;
   content_preview?: string;
   // Paired request/response content (for AI proxy)
   request_content?: string;
+  request_content_ref?: string;
   request_preview?: string;
   response_content?: string;
+  response_content_ref?: string;
   response_preview?: string;
   // HTTP status code (for AI proxy responses)
   status_code?: number;
@@ -120,6 +123,11 @@ interface ObservabilityState {
   // Logs
   logs: LogEntry[];
   addLog: (log: LogEntry) => void;
+  hydrateLogPayload: (
+    id: string,
+    part: "request" | "response" | "content",
+    content: string
+  ) => void;
   clearLogs: () => void;
 
   // Selection
@@ -660,6 +668,26 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
 
       return { logs: newLogs, sessions };
     }),
+  hydrateLogPayload: (id, part, content) =>
+    set((state) => {
+      let updated = false;
+      const logs = state.logs.map((log) => {
+        if (log.id !== id) {
+          return log;
+        }
+
+        updated = true;
+        if (part === "request") {
+          return { ...log, request_content: content };
+        }
+        if (part === "response") {
+          return { ...log, response_content: content };
+        }
+        return { ...log, content };
+      });
+
+      return updated ? { logs } : state;
+    }),
   clearLogs: () => set({ logs: [], selectedLogId: null, selectedLogPart: null }),
 
   // Selection
@@ -930,10 +958,21 @@ function extractRpcId(log: LogEntry): string | null {
   return String(parsed.id);
 }
 
+export function hasPairedPayload(log: LogEntry): boolean {
+  return !!(
+    log.request_content ||
+    log.response_content ||
+    log.request_preview ||
+    log.response_preview ||
+    log.request_content_ref ||
+    log.response_content_ref
+  );
+}
+
 function isPrePairedAiEvent(log: LogEntry): boolean {
   return (
     (log.source === 'ai_proxy' || log.source === 'agent_app') &&
-    (!!log.request_content || !!log.response_content)
+    hasPairedPayload(log)
   );
 }
 

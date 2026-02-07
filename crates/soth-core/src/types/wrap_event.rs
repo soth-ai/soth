@@ -65,6 +65,10 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 
+    /// External payload reference for full content when moved out of event_json.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_ref: Option<String>,
+
     /// Truncated content preview for large payloads
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_preview: Option<String>,
@@ -73,6 +77,10 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_content: Option<String>,
 
+    /// External payload reference for full request content when moved out of event_json.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_content_ref: Option<String>,
+
     /// Request preview (for paired request/response events)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_preview: Option<String>,
@@ -80,6 +88,10 @@ pub struct WrapEvent {
     /// Response content (for paired request/response events)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_content: Option<String>,
+
+    /// External payload reference for full response content when moved out of event_json.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_content_ref: Option<String>,
 
     /// Response preview (for paired request/response events)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,10 +154,13 @@ impl WrapEvent {
             method: None,
             tool_name: None,
             content: None,
+            content_ref: None,
             content_preview: None,
             request_content: None,
+            request_content_ref: None,
             request_preview: None,
             response_content: None,
+            response_content_ref: None,
             response_preview: None,
             status_code: None,
             agent,

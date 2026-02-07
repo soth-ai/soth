@@ -202,6 +202,28 @@ impl EventStore {
         }
     }
 
+    /// Get a full payload body for a specific event and part.
+    pub fn get_event_payload(&self, event_id: &str, part: &str) -> Option<String> {
+        match &self.backend {
+            EventStoreBackend::Sqlite(path) => read_sqlite_event_payload(path, event_id, part)
+                .ok()
+                .flatten(),
+            EventStoreBackend::Jsonl(_) => {
+                let inner = self.inner.read();
+                inner
+                    .events
+                    .iter()
+                    .find(|event| event.id == event_id)
+                    .and_then(|event| match part {
+                        "request" => event.request_content.clone(),
+                        "response" => event.response_content.clone(),
+                        "content" => event.content.clone(),
+                        _ => None,
+                    })
+            }
+        }
+    }
+
     /// Load initial events from storage.
     pub async fn load_initial(&self) -> std::io::Result<usize> {
         match &self.backend {
@@ -550,10 +572,80 @@ fn ensure_wrap_events_schema(conn: &Connection) -> std::io::Result<()> {
             timestamp TEXT NOT NULL,
             event_json TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS wrap_event_payloads (
+            event_id TEXT NOT NULL,
+            payload_kind TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (event_id, payload_kind)
+        );
         "#,
     )
     .map_err(to_io_err)?;
     Ok(())
+}
+
+fn read_sqlite_event_payload(
+    db_path: &Path,
+    event_id: &str,
+    part: &str,
+) -> std::io::Result<Option<String>> {
+    let payload_kind = match part {
+        "request" | "response" | "content" => part,
+        _ => return Ok(None),
+    };
+
+    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    ensure_wrap_events_schema(&conn)?;
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT payload
+            FROM wrap_event_payloads
+            WHERE event_id = ?1 AND payload_kind = ?2
+            LIMIT 1
+            "#,
+        )
+        .map_err(to_io_err)?;
+
+    let blob_row = stmt.query_row([event_id, payload_kind], |row| row.get::<_, Vec<u8>>(0));
+    match blob_row {
+        Ok(bytes) => {
+            let decoded = String::from_utf8_lossy(&bytes).to_string();
+            return Ok(Some(decoded));
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(error) => return Err(to_io_err(error)),
+    }
+
+    let mut fallback_stmt = conn
+        .prepare(
+            r#"
+            SELECT event_json
+            FROM wrap_events
+            WHERE id = ?1
+            LIMIT 1
+            "#,
+        )
+        .map_err(to_io_err)?;
+
+    let event_json = fallback_stmt.query_row([event_id], |row| row.get::<_, String>(0));
+    match event_json {
+        Ok(json) => {
+            let event = serde_json::from_str::<WrapEvent>(&json)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            Ok(match payload_kind {
+                "request" => event.request_content,
+                "response" => event.response_content,
+                "content" => event.content,
+                _ => None,
+            })
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(to_io_err(error)),
+    }
 }
 
 fn to_io_err(error: rusqlite::Error) -> std::io::Error {
@@ -673,5 +765,29 @@ mod tests {
             .events
             .iter()
             .all(|event| event.seq.map(|seq| seq > 1).unwrap_or(false)));
+    }
+
+    #[tokio::test]
+    async fn test_get_event_payload_sqlite() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let logger = EventLogger::new(db_path.clone()).unwrap();
+
+        let agent = AgentInfo::new("Claude Desktop", DetectionSource::McpInitialize);
+        let request_body = "x".repeat(20 * 1024);
+        let event = WrapEvent::new("sess-123", "postgres", WrapDirection::In, agent)
+            .with_source(soth_core::types::EventSource::AiProxy)
+            .with_method("POST /v1/chat/completions")
+            .with_request(request_body.clone(), "");
+
+        let event_id = event.id.clone();
+        logger.log(&event);
+        logger.close();
+
+        let store = EventStore::new(db_path);
+        store.load_initial().await.unwrap();
+
+        let payload = store.get_event_payload(&event_id, "request");
+        assert_eq!(payload.as_deref(), Some(request_body.as_str()));
     }
 }

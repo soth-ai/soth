@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import {
   useObservabilityStore,
   decodeSmartDisplayText,
+  hasPairedPayload,
   type LogEntry,
   type Filters,
 } from "@/store/observability";
@@ -97,7 +98,7 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
   const rowRef = useRef<HTMLDivElement>(null);
 
   const isError = log.policy_allowed === false;
-  const isPairedEvent = !!(log.request_content || log.response_content);
+  const isPairedEvent = hasPairedPayload(log);
 
   // Copy JSON to clipboard
   const handleCopyJson = useCallback((e: React.MouseEvent, content: string) => {
@@ -214,7 +215,7 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
             <Button
               variant="ghost"
               size="sm"
-              onClick={(e) => handleCopyJson(e, log.request_content || "")}
+              onClick={(e) => handleCopyJson(e, log.request_content || log.request_preview || "")}
               className="h-6 w-6 p-0 bg-secondary border border-border hover:bg-muted"
               title="Copy request"
             >
@@ -290,7 +291,7 @@ const AiLogRow = memo(function AiLogRow({ log, index }: AiLogRowProps) {
             <Button
               variant="ghost"
               size="sm"
-              onClick={(e) => handleCopyJson(e, log.response_content || responsePreview || "")}
+              onClick={(e) => handleCopyJson(e, log.response_content || log.response_preview || responsePreview || "")}
               className="h-6 w-6 p-0 bg-secondary border border-border hover:bg-muted"
               title="Copy response"
             >

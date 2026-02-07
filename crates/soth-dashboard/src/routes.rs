@@ -7,7 +7,7 @@ use crate::state::{
 };
 use crate::websocket::event_stream_handler;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -103,6 +103,7 @@ pub fn api_router_with_events(state: AppState) -> Router {
         .route("/api/proxy", get(get_proxy))
         .route("/api/health", get(get_health))
         .route("/api/events", get(get_events))
+        .route("/api/events/:event_id/payload", get(get_event_payload))
         .route("/api/agents", get(get_agents))
         // Advanced budget endpoints
         .route("/api/budget/advanced", get(get_advanced_budget))
@@ -154,6 +155,18 @@ pub struct EventsQuery {
 
 fn default_limit() -> usize {
     100
+}
+
+#[derive(Deserialize)]
+pub struct EventPayloadQuery {
+    pub part: String,
+}
+
+#[derive(Serialize)]
+pub struct EventPayloadData {
+    pub event_id: String,
+    pub part: String,
+    pub content: String,
 }
 
 /// Get identity metrics
@@ -216,6 +229,36 @@ async fn get_events(
     };
 
     Json(ApiResponse::new(&state.dashboard, summary))
+}
+
+/// Get full payload body for an event part (request|response|content).
+async fn get_event_payload(
+    State(state): State<AppState>,
+    Path(event_id): Path<String>,
+    Query(query): Query<EventPayloadQuery>,
+) -> Json<ApiResponse<EventPayloadData>> {
+    let requested_part = query.part.to_ascii_lowercase();
+    let part = match requested_part.as_str() {
+        "request" | "response" | "content" => requested_part,
+        _ => "content".to_string(),
+    };
+
+    let content = if let Some(ref events) = state.events {
+        events
+            .get_event_payload(&event_id, &part)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    Json(ApiResponse::new(
+        &state.dashboard,
+        EventPayloadData {
+            event_id,
+            part,
+            content,
+        },
+    ))
 }
 
 /// Get agent statistics

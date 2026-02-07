@@ -182,10 +182,13 @@ export interface WrapEvent {
   method?: string;
   tool_name?: string;
   content?: string;
+  content_ref?: string;
   content_preview?: string;
   request_content?: string;
+  request_content_ref?: string;
   request_preview?: string;
   response_content?: string;
+  response_content_ref?: string;
   response_preview?: string;
   status_code?: number;
   agent: AgentInfo;
