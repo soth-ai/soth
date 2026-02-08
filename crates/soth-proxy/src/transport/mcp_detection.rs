@@ -20,7 +20,7 @@ fn is_jsonrpc_v2(value: &serde_json::Value) -> bool {
 fn is_likely_mcp_method(method: &str) -> bool {
     matches!(
         method,
-            mcp_methods::INITIALIZE
+        mcp_methods::INITIALIZE
             | mcp_methods::INITIALIZED
             | mcp_methods::CANCELLED
             | mcp_methods::PROGRESS
@@ -85,9 +85,7 @@ fn should_accept_mcp_method(method: &str, params: Option<&serde_json::Value>) ->
     is_likely_mcp_method(method)
 }
 
-fn extract_mcp_request_method_from_json(
-    value: serde_json::Value,
-) -> Option<String> {
+fn extract_mcp_request_method_from_json(value: serde_json::Value) -> Option<String> {
     if !is_jsonrpc_v2(&value) {
         return None;
     }
@@ -96,13 +94,11 @@ fn extract_mcp_request_method_from_json(
             should_accept_mcp_method(&req.request.method, req.request.params.as_ref())
                 .then_some(req.request.method)
         }
-        RmcpWireJsonRpcMessage::Notification(notification) => {
-            should_accept_mcp_method(
-                &notification.notification.method,
-                notification.notification.params.as_ref(),
-            )
-                .then_some(notification.notification.method)
-        }
+        RmcpWireJsonRpcMessage::Notification(notification) => should_accept_mcp_method(
+            &notification.notification.method,
+            notification.notification.params.as_ref(),
+        )
+        .then_some(notification.notification.method),
         RmcpWireJsonRpcMessage::Response(_) | RmcpWireJsonRpcMessage::Error(_) => None,
     }
 }
@@ -196,8 +192,7 @@ mod tests {
 
     #[test]
     fn test_initialize_requires_mcp_params_shape_without_path_hints() {
-        let init_payload =
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"1.0.0"}}}"#;
+        let init_payload = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"1.0.0"}}}"#;
         assert_eq!(
             extract_mcp_request_method(init_payload, "/pubsub"),
             Some("initialize".to_string())
@@ -221,8 +216,7 @@ mod tests {
             Some("notifications/initialized".to_string())
         );
 
-        let initialized_bad =
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"unexpected":true}}"#;
+        let initialized_bad = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"unexpected":true}}"#;
         assert_eq!(extract_mcp_request_method(initialized_bad, "/ws"), None);
     }
 

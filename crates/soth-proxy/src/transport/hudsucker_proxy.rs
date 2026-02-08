@@ -248,9 +248,7 @@ impl ProxyEnforcer {
                 budget_block_on_exceeded: self.budget_block_on_exceeded,
                 default_model: &self.default_model,
             },
-            enforcement_core::ProxyEnforcementInput {
-                envelope,
-            },
+            enforcement_core::ProxyEnforcementInput { envelope },
         );
         if let Err((_, ref reason, _)) = result {
             if self.policy_mode == ProxyPolicyMode::Audit {
@@ -2301,7 +2299,8 @@ mod tests {
     #[test]
     fn test_is_jsonrpc_response_for_mcp_detects_response_and_error() {
         let response = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32803,"message":"resource not found"}}"#;
+        let error =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32803,"message":"resource not found"}}"#;
         let generic = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
 
         assert!(is_jsonrpc_response_for_mcp(response));

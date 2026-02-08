@@ -1,6 +1,8 @@
 //! API routes for the dashboard
 
-use crate::event_store::{AgentsSummary, EventStore, EventsSummary, StreamStats};
+use crate::event_store::{
+    AgentsSummary, ClustersSummary, EventStore, EventsSummary, RollupsSummary, StreamStats,
+};
 use crate::state::{
     AdvancedBudgetMetrics, BudgetMetrics, DashboardState, IdentityMetrics, ObserveMetrics,
     PolicyMetrics, ProxyMetrics,
@@ -103,6 +105,8 @@ pub fn api_router_with_events(state: AppState) -> Router {
         .route("/api/proxy", get(get_proxy))
         .route("/api/health", get(get_health))
         .route("/api/events", get(get_events))
+        .route("/api/clusters", get(get_clusters))
+        .route("/api/rollups", get(get_rollups))
         .route("/api/events/:event_id/payload", get(get_event_payload))
         .route("/api/events/stream/stats", get(get_event_stream_stats))
         .route("/api/agents", get(get_agents))
@@ -154,8 +158,25 @@ pub struct EventsQuery {
     pub since_seq: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub struct ClustersQuery {
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    pub since_seq: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct RollupsQuery {
+    #[serde(default = "default_rollup_limit")]
+    pub limit: usize,
+}
+
 fn default_limit() -> usize {
     100
+}
+
+fn default_rollup_limit() -> usize {
+    240
 }
 
 #[derive(Deserialize)]
@@ -232,6 +253,44 @@ async fn get_events(
     Json(ApiResponse::new(&state.dashboard, summary))
 }
 
+/// Get materialized request/response clusters.
+async fn get_clusters(
+    State(state): State<AppState>,
+    Query(query): Query<ClustersQuery>,
+) -> Json<ApiResponse<ClustersSummary>> {
+    let summary = if let Some(ref events) = state.events {
+        if let Some(since_seq) = query.since_seq {
+            events.get_clusters_since_seq(since_seq, query.limit)
+        } else {
+            events.get_clusters(query.limit)
+        }
+    } else {
+        ClustersSummary {
+            total_clusters: 0,
+            clusters: Vec::new(),
+        }
+    };
+
+    Json(ApiResponse::new(&state.dashboard, summary))
+}
+
+/// Get materialized minute rollups.
+async fn get_rollups(
+    State(state): State<AppState>,
+    Query(query): Query<RollupsQuery>,
+) -> Json<ApiResponse<RollupsSummary>> {
+    let summary = if let Some(ref events) = state.events {
+        events.get_rollups_1m(query.limit)
+    } else {
+        RollupsSummary {
+            total_rows: 0,
+            rows: Vec::new(),
+        }
+    };
+
+    Json(ApiResponse::new(&state.dashboard, summary))
+}
+
 /// Get full payload body for an event part (request|response|content).
 async fn get_event_payload(
     State(state): State<AppState>,
@@ -277,9 +336,7 @@ async fn get_agents(State(state): State<AppState>) -> Json<ApiResponse<AgentsSum
 }
 
 /// Get websocket stream reliability/backpressure telemetry.
-async fn get_event_stream_stats(
-    State(state): State<AppState>,
-) -> Json<ApiResponse<StreamStats>> {
+async fn get_event_stream_stats(State(state): State<AppState>) -> Json<ApiResponse<StreamStats>> {
     let stats = if let Some(ref events) = state.events {
         events.stream_stats()
     } else {
@@ -474,6 +531,28 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"total_agents\":0"));
+    }
+
+    #[tokio::test]
+    async fn test_clusters_endpoint_no_store() {
+        let state = DashboardState::new();
+        let app = api_router(state);
+        let (status, body) = make_request(app, "/api/clusters").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"total_clusters\":0"));
+        assert!(body.contains("\"clusters\":[]"));
+    }
+
+    #[tokio::test]
+    async fn test_rollups_endpoint_no_store() {
+        let state = DashboardState::new();
+        let app = api_router(state);
+        let (status, body) = make_request(app, "/api/rollups").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"total_rows\":0"));
+        assert!(body.contains("\"rows\":[]"));
     }
 
     #[tokio::test]

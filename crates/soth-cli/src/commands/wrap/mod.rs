@@ -916,7 +916,10 @@ async fn process_outbound_message(session: &WrapSession, content: &str) -> Outbo
 
         if event.traffic_envelope.is_none() {
             let request_id = msg.get("id").and_then(extract_context_id);
-            let method = event.method.clone().unwrap_or_else(|| "response".to_string());
+            let method = event
+                .method
+                .clone()
+                .unwrap_or_else(|| "response".to_string());
             let envelope = TrafficEnvelope::mcp_stdio(
                 &session.session_id,
                 request_id,

@@ -11,8 +11,8 @@ use axum::{
 use futures::{sink::SinkExt, stream::SplitSink, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use soth_core::types::WrapEvent;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info};
 
 /// WebSocket message wrapper for frontend compatibility
@@ -196,7 +196,11 @@ async fn send_events_in_batches(
         offset = end;
 
         let seq_start = batch.iter().find_map(|event| event.seq).unwrap_or(0);
-        let seq_end = batch.iter().rev().find_map(|event| event.seq).unwrap_or(seq_start);
+        let seq_end = batch
+            .iter()
+            .rev()
+            .find_map(|event| event.seq)
+            .unwrap_or(seq_start);
 
         let wrapped = WsMessage::Batch {
             seq_start,

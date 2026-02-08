@@ -4,10 +4,10 @@
 //! Provides real-time event streaming via broadcast channel.
 
 use parking_lot::RwLock;
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use soth_core::event_logger::default_event_log_write_path;
-use soth_core::types::WrapEvent;
+use soth_core::types::{EventSource, WrapDirection, WrapEvent};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,6 +87,53 @@ pub struct AgentsSummary {
 pub struct EventsSummary {
     pub total_events: usize,
     pub events: Vec<WrapEvent>,
+}
+
+/// Materialized request/response cluster row.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterRow {
+    pub cluster_id: String,
+    pub request_event_id: String,
+    pub response_event_id: Option<String>,
+    pub request_seq: i64,
+    pub response_seq: Option<i64>,
+    pub timestamp: String,
+    pub source: String,
+    pub provider: Option<String>,
+    pub agent: Option<String>,
+    pub method: Option<String>,
+    pub status_code: Option<u16>,
+    pub latency_ms: Option<u64>,
+    pub policy_allowed: Option<bool>,
+    pub pii_detected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClustersSummary {
+    pub total_clusters: usize,
+    pub clusters: Vec<ClusterRow>,
+}
+
+/// Materialized minute rollup row.
+#[derive(Debug, Clone, Serialize)]
+pub struct RollupRow {
+    pub bucket_start: String,
+    pub source: String,
+    pub provider: Option<String>,
+    pub agent: Option<String>,
+    pub total_events: u64,
+    pub requests: u64,
+    pub responses: u64,
+    pub error_events: u64,
+    pub pii_events: u64,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RollupsSummary {
+    pub total_rows: usize,
+    pub rows: Vec<RollupRow>,
 }
 
 impl EventStore {
@@ -204,6 +251,37 @@ impl EventStore {
         }
     }
 
+    /// Get materialized clusters (newest first).
+    pub fn get_clusters(&self, limit: usize) -> ClustersSummary {
+        let capped_limit = limit.clamp(1, 5_000);
+        let rows = read_sqlite_clusters(&self.db_path, None, capped_limit).unwrap_or_default();
+        ClustersSummary {
+            total_clusters: read_sqlite_cluster_total(&self.db_path).unwrap_or(rows.len()),
+            clusters: rows,
+        }
+    }
+
+    /// Get clusters with request sequence strictly newer than cursor.
+    pub fn get_clusters_since_seq(&self, since_seq: i64, limit: usize) -> ClustersSummary {
+        let capped_limit = limit.clamp(1, 5_000);
+        let rows =
+            read_sqlite_clusters(&self.db_path, Some(since_seq), capped_limit).unwrap_or_default();
+        ClustersSummary {
+            total_clusters: read_sqlite_cluster_total(&self.db_path).unwrap_or(rows.len()),
+            clusters: rows,
+        }
+    }
+
+    /// Get minute rollups (newest buckets first).
+    pub fn get_rollups_1m(&self, limit: usize) -> RollupsSummary {
+        let capped_limit = limit.clamp(1, 10_000);
+        let rows = read_sqlite_rollups_1m(&self.db_path, capped_limit).unwrap_or_default();
+        RollupsSummary {
+            total_rows: read_sqlite_rollup_total(&self.db_path).unwrap_or(rows.len()),
+            rows,
+        }
+    }
+
     /// Get agent statistics.
     pub fn get_agents(&self) -> AgentsSummary {
         let inner = self.inner.read();
@@ -257,6 +335,18 @@ impl EventStore {
             inner.sqlite_seq = last_seq;
         }
 
+        let projection_path = db_path.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || project_sqlite_events(&projection_path))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+        {
+            warn!(
+                "Failed to update event projections during bootstrap: {}",
+                error
+            );
+        }
+
         info!("Loaded {} initial events from {:?}", count, db_path);
         Ok(count)
     }
@@ -288,11 +378,12 @@ impl EventStore {
             inner.sqlite_seq
         };
 
-        let db_path = db_path.to_path_buf();
-        let rows =
-            tokio::task::spawn_blocking(move || read_sqlite_events(&db_path, Some(cursor), None))
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))??;
+        let query_path = db_path.to_path_buf();
+        let rows = tokio::task::spawn_blocking(move || {
+            read_sqlite_events(&query_path, Some(cursor), None)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))??;
 
         if rows.is_empty() {
             return Ok(());
@@ -309,8 +400,19 @@ impl EventStore {
             self.add_event(event);
         }
 
-        let mut inner = self.inner.write();
-        inner.sqlite_seq = last_seq;
+        {
+            let mut inner = self.inner.write();
+            inner.sqlite_seq = last_seq;
+        }
+
+        let projection_path = db_path.to_path_buf();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || project_sqlite_events(&projection_path))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+        {
+            warn!("Failed to update event projections: {}", error);
+        }
 
         Ok(())
     }
@@ -460,6 +562,539 @@ fn read_sqlite_events(
     Ok(events)
 }
 
+fn read_sqlite_cluster_total(db_path: &Path) -> std::io::Result<usize> {
+    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    ensure_wrap_events_schema(&conn)?;
+    let count = conn
+        .query_row("SELECT COUNT(*) FROM event_clusters", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(to_io_err)?;
+    Ok(count.max(0) as usize)
+}
+
+fn read_sqlite_rollup_total(db_path: &Path) -> std::io::Result<usize> {
+    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    ensure_wrap_events_schema(&conn)?;
+    let count = conn
+        .query_row("SELECT COUNT(*) FROM rollups_1m", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(to_io_err)?;
+    Ok(count.max(0) as usize)
+}
+
+fn read_sqlite_clusters(
+    db_path: &Path,
+    since_seq: Option<i64>,
+    limit: usize,
+) -> std::io::Result<Vec<ClusterRow>> {
+    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    ensure_wrap_events_schema(&conn)?;
+    let mut rows_out = Vec::new();
+
+    if let Some(cursor) = since_seq {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT cluster_id, request_event_id, response_event_id, request_seq, response_seq,
+                       timestamp, source, provider, agent, method, status_code, latency_ms,
+                       policy_allowed, pii_detected
+                FROM event_clusters
+                WHERE request_seq > ?1
+                ORDER BY request_seq DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(to_io_err)?;
+
+        let rows = stmt
+            .query_map(params![cursor, limit as i64], |row| {
+                Ok(ClusterRow {
+                    cluster_id: row.get(0)?,
+                    request_event_id: row.get(1)?,
+                    response_event_id: row.get(2)?,
+                    request_seq: row.get(3)?,
+                    response_seq: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    source: row.get(6)?,
+                    provider: row.get(7)?,
+                    agent: row.get(8)?,
+                    method: row.get(9)?,
+                    status_code: row.get(10)?,
+                    latency_ms: row.get(11)?,
+                    policy_allowed: row.get(12)?,
+                    pii_detected: row.get::<_, i64>(13)? != 0,
+                })
+            })
+            .map_err(to_io_err)?;
+
+        for row in rows {
+            rows_out.push(row.map_err(to_io_err)?);
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT cluster_id, request_event_id, response_event_id, request_seq, response_seq,
+                       timestamp, source, provider, agent, method, status_code, latency_ms,
+                       policy_allowed, pii_detected
+                FROM event_clusters
+                ORDER BY request_seq DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(to_io_err)?;
+
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok(ClusterRow {
+                    cluster_id: row.get(0)?,
+                    request_event_id: row.get(1)?,
+                    response_event_id: row.get(2)?,
+                    request_seq: row.get(3)?,
+                    response_seq: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    source: row.get(6)?,
+                    provider: row.get(7)?,
+                    agent: row.get(8)?,
+                    method: row.get(9)?,
+                    status_code: row.get(10)?,
+                    latency_ms: row.get(11)?,
+                    policy_allowed: row.get(12)?,
+                    pii_detected: row.get::<_, i64>(13)? != 0,
+                })
+            })
+            .map_err(to_io_err)?;
+
+        for row in rows {
+            rows_out.push(row.map_err(to_io_err)?);
+        }
+    }
+
+    Ok(rows_out)
+}
+
+fn read_sqlite_rollups_1m(db_path: &Path, limit: usize) -> std::io::Result<Vec<RollupRow>> {
+    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    ensure_wrap_events_schema(&conn)?;
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT bucket_start, source, provider, agent, total_events, requests, responses,
+                   error_events, pii_events, total_tokens, total_cost_usd
+            FROM rollups_1m
+            ORDER BY bucket_start DESC
+            LIMIT ?1
+            "#,
+        )
+        .map_err(to_io_err)?;
+
+    let rows = stmt
+        .query_map([limit as i64], |row| {
+            Ok(RollupRow {
+                bucket_start: row.get(0)?,
+                source: row.get(1)?,
+                provider: row.get(2)?,
+                agent: row.get(3)?,
+                total_events: row.get::<_, i64>(4)?.max(0) as u64,
+                requests: row.get::<_, i64>(5)?.max(0) as u64,
+                responses: row.get::<_, i64>(6)?.max(0) as u64,
+                error_events: row.get::<_, i64>(7)?.max(0) as u64,
+                pii_events: row.get::<_, i64>(8)?.max(0) as u64,
+                total_tokens: row.get::<_, i64>(9)?.max(0) as u64,
+                total_cost_usd: row.get::<_, f64>(10)?,
+            })
+        })
+        .map_err(to_io_err)?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(to_io_err)?);
+    }
+    Ok(result)
+}
+
+fn project_sqlite_events(db_path: &Path) -> std::io::Result<i64> {
+    let mut conn = Connection::open(db_path).map_err(to_io_err)?;
+    ensure_wrap_events_schema(&conn)?;
+    let tx = conn.transaction().map_err(to_io_err)?;
+
+    let mut projected_seq: i64 = tx
+        .query_row(
+            "SELECT value FROM projection_meta WHERE key = 'last_projected_seq'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_io_err)?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let mut queued_rows: Vec<(i64, String)> = Vec::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                r#"
+                SELECT seq, event_json
+                FROM wrap_events
+                WHERE seq > ?1
+                ORDER BY seq ASC
+                "#,
+            )
+            .map_err(to_io_err)?;
+
+        let rows = stmt
+            .query_map([projected_seq], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_err)?;
+
+        for row in rows {
+            queued_rows.push(row.map_err(to_io_err)?);
+        }
+    }
+
+    for (seq, event_json) in queued_rows {
+        let Ok(event) = serde_json::from_str::<WrapEvent>(&event_json) else {
+            continue;
+        };
+
+        update_rollup_1m(&tx, &event)?;
+        project_pair_cluster_for_event(&tx, seq, &event)?;
+        projected_seq = seq.max(projected_seq);
+    }
+
+    tx.execute(
+        r#"
+        INSERT INTO projection_meta (key, value, updated_at)
+        VALUES ('last_projected_seq', ?1, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = CURRENT_TIMESTAMP
+        "#,
+        [projected_seq.to_string()],
+    )
+    .map_err(to_io_err)?;
+
+    tx.commit().map_err(to_io_err)?;
+    Ok(projected_seq)
+}
+
+fn event_source_label(source: EventSource) -> &'static str {
+    match source {
+        EventSource::Mcp => "mcp",
+        EventSource::AiProxy => "ai_proxy",
+        EventSource::AgentApp => "agent_app",
+    }
+}
+
+fn has_paired_payload(event: &WrapEvent) -> bool {
+    event.request_content.is_some()
+        || event.request_content_ref.is_some()
+        || event.request_preview.is_some()
+        || event.response_content.is_some()
+        || event.response_content_ref.is_some()
+        || event.response_preview.is_some()
+}
+
+fn event_request_key(event: &WrapEvent) -> String {
+    if let Some(request_id) = event
+        .traffic_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.request_id.as_ref())
+        .filter(|value| !value.is_empty())
+    {
+        return format!("rid:{request_id}");
+    }
+
+    let method = event
+        .method
+        .as_deref()
+        .unwrap_or("request")
+        .to_ascii_lowercase();
+    format!(
+        "fb:{}|{}|{}|{}",
+        event_source_label(event.source),
+        event.session_id,
+        event.server_name,
+        method
+    )
+}
+
+fn parse_rfc3339_to_ms(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+fn update_rollup_1m(tx: &rusqlite::Transaction<'_>, event: &WrapEvent) -> std::io::Result<()> {
+    let bucket_start = event.timestamp.format("%Y-%m-%dT%H:%M:00Z").to_string();
+    let source = event_source_label(event.source);
+    let provider = event.provider.as_deref().unwrap_or("unknown");
+    let agent = event.agent.name.as_str();
+    let requests = if event.direction == WrapDirection::In {
+        1_i64
+    } else {
+        0_i64
+    };
+    let responses = if event.direction == WrapDirection::Out {
+        1_i64
+    } else {
+        0_i64
+    };
+    let error_events = if event.status_code.map(|code| code >= 400).unwrap_or(false)
+        || event.policy_allowed == Some(false)
+    {
+        1_i64
+    } else {
+        0_i64
+    };
+    let pii_events = if event.pii_detected { 1_i64 } else { 0_i64 };
+    let total_tokens = event
+        .token_count
+        .or_else(|| Some(event.input_tokens.unwrap_or(0) + event.output_tokens.unwrap_or(0)))
+        .unwrap_or(0) as i64;
+    let total_cost = event.cost_usd.unwrap_or(0.0_f64);
+
+    tx.execute(
+        r#"
+        INSERT INTO rollups_1m (
+            bucket_start, source, provider, agent, total_events,
+            requests, responses, error_events, pii_events, total_tokens, total_cost_usd
+        )
+        VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(bucket_start, source, provider, agent) DO UPDATE SET
+            total_events = total_events + 1,
+            requests = requests + excluded.requests,
+            responses = responses + excluded.responses,
+            error_events = error_events + excluded.error_events,
+            pii_events = pii_events + excluded.pii_events,
+            total_tokens = total_tokens + excluded.total_tokens,
+            total_cost_usd = total_cost_usd + excluded.total_cost_usd
+        "#,
+        params![
+            bucket_start,
+            source,
+            provider,
+            agent,
+            requests,
+            responses,
+            error_events,
+            pii_events,
+            total_tokens,
+            total_cost
+        ],
+    )
+    .map_err(to_io_err)?;
+
+    Ok(())
+}
+
+fn upsert_cluster_pair(
+    tx: &rusqlite::Transaction<'_>,
+    cluster_id: &str,
+    request_event_id: &str,
+    response_event_id: Option<&str>,
+    request_seq: i64,
+    response_seq: Option<i64>,
+    request_event: &WrapEvent,
+    response_event: &WrapEvent,
+) -> std::io::Result<()> {
+    let source = event_source_label(request_event.source);
+    let provider = request_event
+        .provider
+        .as_deref()
+        .or(response_event.provider.as_deref())
+        .unwrap_or("unknown");
+    let method = request_event
+        .method
+        .as_deref()
+        .or(response_event.method.as_deref())
+        .unwrap_or("request");
+    let agent = request_event.agent.name.as_str();
+    let status_code = response_event.status_code.map(i64::from);
+    let latency_ms = response_seq.and_then(|_| {
+        let req_ms = parse_rfc3339_to_ms(&request_event.timestamp.to_rfc3339())?;
+        let rsp_ms = parse_rfc3339_to_ms(&response_event.timestamp.to_rfc3339())?;
+        Some((rsp_ms - req_ms).max(0))
+    });
+    let policy_allowed = response_event
+        .policy_allowed
+        .or(request_event.policy_allowed)
+        .map(|value| if value { 1_i64 } else { 0_i64 });
+    let pii_detected = if request_event.pii_detected || response_event.pii_detected {
+        1_i64
+    } else {
+        0_i64
+    };
+    let timestamp = request_event.timestamp.to_rfc3339();
+
+    tx.execute(
+        r#"
+        INSERT OR REPLACE INTO event_pairs (
+            pair_id, request_event_id, response_event_id, request_seq, response_seq,
+            session_id, source, server_name, method, tool_name, provider, agent,
+            status_code, latency_ms, pii_detected, policy_allowed, timestamp
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        "#,
+        params![
+            cluster_id,
+            request_event_id,
+            response_event_id,
+            request_seq,
+            response_seq,
+            request_event.session_id.as_str(),
+            source,
+            request_event.server_name.as_str(),
+            method,
+            request_event.tool_name.as_deref(),
+            provider,
+            agent,
+            status_code,
+            latency_ms,
+            pii_detected,
+            policy_allowed,
+            timestamp,
+        ],
+    )
+    .map_err(to_io_err)?;
+
+    tx.execute(
+        r#"
+        INSERT OR REPLACE INTO event_clusters (
+            cluster_id, request_event_id, response_event_id, request_seq, response_seq,
+            timestamp, source, provider, agent, method, status_code, latency_ms,
+            policy_allowed, pii_detected
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+        params![
+            cluster_id,
+            request_event_id,
+            response_event_id,
+            request_seq,
+            response_seq,
+            timestamp,
+            source,
+            provider,
+            agent,
+            method,
+            status_code,
+            latency_ms,
+            policy_allowed,
+            pii_detected,
+        ],
+    )
+    .map_err(to_io_err)?;
+
+    Ok(())
+}
+
+fn project_pair_cluster_for_event(
+    tx: &rusqlite::Transaction<'_>,
+    seq: i64,
+    event: &WrapEvent,
+) -> std::io::Result<()> {
+    if has_paired_payload(event) {
+        let cluster_id = format!("pair:self:{}", event.id);
+        upsert_cluster_pair(
+            tx,
+            &cluster_id,
+            &event.id,
+            Some(&event.id),
+            seq,
+            Some(seq),
+            event,
+            event,
+        )?;
+        return Ok(());
+    }
+
+    let request_key = event_request_key(event);
+    match event.direction {
+        WrapDirection::In => {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO event_pending_requests (
+                    request_key, request_event_id, request_seq, session_id, source, server_name,
+                    method, tool_name, provider, agent, timestamp
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    request_key,
+                    event.id.as_str(),
+                    seq,
+                    event.session_id.as_str(),
+                    event_source_label(event.source),
+                    event.server_name.as_str(),
+                    event.method.as_deref(),
+                    event.tool_name.as_deref(),
+                    event.provider.as_deref(),
+                    event.agent.name.as_str(),
+                    event.timestamp.to_rfc3339(),
+                ],
+            )
+            .map_err(to_io_err)?;
+        }
+        WrapDirection::Out => {
+            let pending = tx
+                .query_row(
+                    r#"
+                    SELECT request_event_id, request_seq
+                    FROM event_pending_requests
+                    WHERE request_key = ?1
+                    LIMIT 1
+                    "#,
+                    [&request_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(to_io_err)?;
+
+            if let Some((request_event_id, request_seq)) = pending {
+                let request_event_json: Option<String> = tx
+                    .query_row(
+                        "SELECT event_json FROM wrap_events WHERE id = ?1 LIMIT 1",
+                        [&request_event_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(to_io_err)?;
+
+                if let Some(request_event_json) = request_event_json {
+                    if let Ok(request_event) =
+                        serde_json::from_str::<WrapEvent>(&request_event_json)
+                    {
+                        let cluster_id = format!("pair:{}", request_event_id);
+                        upsert_cluster_pair(
+                            tx,
+                            &cluster_id,
+                            &request_event_id,
+                            Some(&event.id),
+                            request_seq,
+                            Some(seq),
+                            &request_event,
+                            event,
+                        )?;
+                    }
+                }
+
+                tx.execute(
+                    "DELETE FROM event_pending_requests WHERE request_key = ?1",
+                    [&request_key],
+                )
+                .map_err(to_io_err)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_wrap_events_schema(conn: &Connection) -> std::io::Result<()> {
     conn.execute_batch(
         r#"
@@ -478,6 +1113,83 @@ fn ensure_wrap_events_schema(conn: &Connection) -> std::io::Result<()> {
             created_at TEXT NOT NULL,
             PRIMARY KEY (event_id, payload_kind)
         );
+
+        CREATE TABLE IF NOT EXISTS projection_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS event_pending_requests (
+            request_key TEXT PRIMARY KEY,
+            request_event_id TEXT NOT NULL,
+            request_seq INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            server_name TEXT NOT NULL,
+            method TEXT,
+            tool_name TEXT,
+            provider TEXT,
+            agent TEXT,
+            timestamp TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS event_pairs (
+            pair_id TEXT PRIMARY KEY,
+            request_event_id TEXT NOT NULL,
+            response_event_id TEXT,
+            request_seq INTEGER NOT NULL,
+            response_seq INTEGER,
+            session_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            server_name TEXT NOT NULL,
+            method TEXT,
+            tool_name TEXT,
+            provider TEXT,
+            agent TEXT,
+            status_code INTEGER,
+            latency_ms INTEGER,
+            pii_detected INTEGER NOT NULL DEFAULT 0,
+            policy_allowed INTEGER,
+            timestamp TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS event_clusters (
+            cluster_id TEXT PRIMARY KEY,
+            request_event_id TEXT NOT NULL,
+            response_event_id TEXT,
+            request_seq INTEGER NOT NULL,
+            response_seq INTEGER,
+            timestamp TEXT NOT NULL,
+            source TEXT NOT NULL,
+            provider TEXT,
+            agent TEXT,
+            method TEXT,
+            status_code INTEGER,
+            latency_ms INTEGER,
+            policy_allowed INTEGER,
+            pii_detected INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS rollups_1m (
+            bucket_start TEXT NOT NULL,
+            source TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            total_events INTEGER NOT NULL DEFAULT 0,
+            requests INTEGER NOT NULL DEFAULT 0,
+            responses INTEGER NOT NULL DEFAULT 0,
+            error_events INTEGER NOT NULL DEFAULT 0,
+            pii_events INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            total_cost_usd REAL NOT NULL DEFAULT 0.0,
+            PRIMARY KEY (bucket_start, source, provider, agent)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_pairs_request_seq ON event_pairs(request_seq DESC);
+        CREATE INDEX IF NOT EXISTS idx_event_pairs_session ON event_pairs(session_id, request_seq DESC);
+        CREATE INDEX IF NOT EXISTS idx_event_clusters_request_seq ON event_clusters(request_seq DESC);
+        CREATE INDEX IF NOT EXISTS idx_rollups_1m_bucket ON rollups_1m(bucket_start DESC);
         "#,
     )
     .map_err(to_io_err)?;
@@ -553,7 +1265,9 @@ fn to_io_err(error: rusqlite::Error) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soth_core::types::{AgentInfo, DetectionSource, WrapDirection};
+    use soth_core::types::{
+        AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection,
+    };
     use soth_core::EventLogger;
     use tempfile::tempdir;
 
@@ -687,5 +1401,136 @@ mod tests {
 
         let payload = store.get_event_payload(&event_id, "request");
         assert_eq!(payload.as_deref(), Some(request_body.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_projection_rebuild_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let logger = EventLogger::new(db_path.clone()).unwrap();
+
+        let agent = AgentInfo::new("Projection Agent", DetectionSource::McpInitialize);
+
+        let request_body =
+            r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello"}]}"#;
+        let response_body = r#"{"id":"msg_123","content":[{"type":"text","text":"hi"}]}"#;
+
+        let request = WrapEvent::new(
+            "sess-projection",
+            "api.anthropic.com",
+            WrapDirection::In,
+            agent.clone(),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_provider("anthropic")
+        .with_model("claude-sonnet-4")
+        .with_method("POST /v1/messages")
+        .with_content(request_body)
+        .with_traffic_envelope(TrafficEnvelope::proxy(
+            "sess-projection",
+            "req-proj-1",
+            "anthropic",
+            "api.anthropic.com",
+            "POST",
+            "/v1/messages",
+            Some("claude-sonnet-4"),
+            Some("claude"),
+            None,
+            None,
+            Some(request_body),
+        ));
+
+        let response = WrapEvent::new(
+            "sess-projection",
+            "api.anthropic.com",
+            WrapDirection::Out,
+            agent.clone(),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_provider("anthropic")
+        .with_model("claude-sonnet-4")
+        .with_method("POST /v1/messages")
+        .with_content(response_body)
+        .with_status_code(200)
+        .with_usage_tokens(12, 8)
+        .with_cost(0.0024)
+        .with_latency(155)
+        .with_traffic_envelope(TrafficEnvelope::proxy(
+            "sess-projection",
+            "req-proj-1",
+            "anthropic",
+            "api.anthropic.com",
+            "POST",
+            "/v1/messages",
+            Some("claude-sonnet-4"),
+            Some("claude"),
+            None,
+            None,
+            Some(request_body),
+        ));
+
+        let paired = WrapEvent::new(
+            "sess-projection-2",
+            "api.openai.com",
+            WrapDirection::In,
+            agent,
+        )
+        .with_source(EventSource::AiProxy)
+        .with_provider("openai")
+        .with_model("gpt-5")
+        .with_method("POST /v1/chat/completions")
+        .with_request(
+            r#"{"model":"gpt-5","messages":[{"role":"user","content":"ping"}]}"#,
+            "",
+        )
+        .with_response(
+            r#"{"id":"chatcmpl_123","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#,
+            "",
+        )
+        .with_usage_tokens(20, 10)
+        .with_cost(0.01)
+        .with_latency(90);
+
+        logger.log(&request);
+        logger.log(&response);
+        logger.log(&paired);
+        logger.close();
+
+        let store = EventStore::new(db_path.clone());
+        store.load_initial().await.unwrap();
+
+        let clusters_before = store.get_clusters(32);
+        let rollups_before = store.get_rollups_1m(64);
+        let cluster_total_before = read_sqlite_cluster_total(&db_path).unwrap();
+        let rollup_total_before = read_sqlite_rollup_total(&db_path).unwrap();
+        let rollup_events_before: u64 =
+            rollups_before.rows.iter().map(|row| row.total_events).sum();
+        let rollup_tokens_before: u64 =
+            rollups_before.rows.iter().map(|row| row.total_tokens).sum();
+
+        assert_eq!(cluster_total_before, 2);
+        assert_eq!(clusters_before.total_clusters, 2);
+        assert_eq!(rollup_events_before, 3);
+        assert_eq!(rollup_tokens_before, 50);
+        assert!(rollup_total_before >= 2);
+
+        let projected_seq = project_sqlite_events(&db_path).unwrap();
+        assert!(projected_seq >= 3);
+
+        let clusters_after = store.get_clusters(32);
+        let rollups_after = store.get_rollups_1m(64);
+        let cluster_total_after = read_sqlite_cluster_total(&db_path).unwrap();
+        let rollup_total_after = read_sqlite_rollup_total(&db_path).unwrap();
+        let rollup_events_after: u64 = rollups_after.rows.iter().map(|row| row.total_events).sum();
+        let rollup_tokens_after: u64 = rollups_after.rows.iter().map(|row| row.total_tokens).sum();
+
+        assert_eq!(cluster_total_after, cluster_total_before);
+        assert_eq!(rollup_total_after, rollup_total_before);
+        assert_eq!(
+            clusters_after.total_clusters,
+            clusters_before.total_clusters
+        );
+        assert_eq!(rollup_events_after, rollup_events_before);
+        assert_eq!(rollup_tokens_after, rollup_tokens_before);
     }
 }
