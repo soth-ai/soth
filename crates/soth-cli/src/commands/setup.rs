@@ -5,11 +5,13 @@
 
 use crate::commands;
 use crate::commands::proxy::ProxyCommands;
+use crate::cli_config;
 use crate::style;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use soth_core::config::SothConfig;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -17,8 +19,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:8080";
-const DEFAULT_CA_DIR: &str = "~/.soth/ca";
 const WIZARD_BEGIN_MARKER: &str = "# >>> SOTH Setup Wizard >>>";
 const WIZARD_END_MARKER: &str = "# <<< SOTH Setup Wizard <<<";
 
@@ -177,7 +177,7 @@ struct SetupTransaction {
 }
 
 impl SetupTransaction {
-    fn start(preflight: &PreflightContext, fail_mode: &FailMode) -> Result<Self> {
+    fn start(preflight: &PreflightContext, fail_mode: &FailMode, proxy_url: &str) -> Result<Self> {
         let setup_id = Uuid::new_v4().to_string();
         let dir = preflight.setups_dir.join(&setup_id);
         let backups_dir = dir.join("backups");
@@ -193,7 +193,7 @@ impl SetupTransaction {
             status: SetupStatus::InProgress,
             error: None,
             fail_mode: fail_mode.to_string(),
-            proxy_url: DEFAULT_PROXY_URL.to_string(),
+            proxy_url: proxy_url.to_string(),
             shell: preflight.shell.clone(),
             shell_file: preflight
                 .shell_file
@@ -310,16 +310,27 @@ impl SetupTransaction {
     }
 }
 
-pub async fn run(action: SetupCommands) -> Result<()> {
+fn proxy_url(config: &SothConfig) -> String {
+    format!("http://{}", config.forward_proxy.socket_addr())
+}
+
+pub async fn run(action: SetupCommands, global_config_path: Option<PathBuf>) -> Result<()> {
+    let config = cli_config::load_effective_config(global_config_path.as_ref(), None)?;
     match action {
-        SetupCommands::Wizard(args) => run_wizard(args).await,
-        SetupCommands::Doctor => run_doctor().await,
-        SetupCommands::Rollback { setup_id, yes } => run_rollback(setup_id, yes).await,
-        SetupCommands::Uninstall { yes } => run_uninstall(yes).await,
+        SetupCommands::Wizard(args) => run_wizard(args, &config, global_config_path).await,
+        SetupCommands::Doctor => run_doctor(&config, global_config_path).await,
+        SetupCommands::Rollback { setup_id, yes } => {
+            run_rollback(setup_id, yes, &config, global_config_path).await
+        }
+        SetupCommands::Uninstall { yes } => run_uninstall(yes, &config, global_config_path).await,
     }
 }
 
-async fn run_wizard(args: WizardArgs) -> Result<()> {
+async fn run_wizard(
+    args: WizardArgs,
+    config: &SothConfig,
+    global_config_path: Option<PathBuf>,
+) -> Result<()> {
     if args.non_interactive && !args.yes {
         bail!("--non-interactive requires --yes");
     }
@@ -327,11 +338,16 @@ async fn run_wizard(args: WizardArgs) -> Result<()> {
         bail!("--only-mcp-config requires at least one --mcp-config PATH");
     }
 
-    let preflight = run_preflight(args.shell.clone())?;
+    let preflight = run_preflight(args.shell.clone(), config)?;
+    let proxy_url = proxy_url(config);
     let mut tx = if args.dry_run {
         None
     } else {
-        Some(SetupTransaction::start(&preflight, &args.fail_mode)?)
+        Some(SetupTransaction::start(
+            &preflight,
+            &args.fail_mode,
+            &proxy_url,
+        )?)
     };
     let setup_id = tx
         .as_ref()
@@ -341,7 +357,7 @@ async fn run_wizard(args: WizardArgs) -> Result<()> {
     style::header("SOTH Setup Wizard");
     style::kv("Mode", if args.dry_run { "dry-run" } else { "apply" });
     style::kv("Shell", &preflight.shell);
-    style::kv("Proxy", DEFAULT_PROXY_URL);
+    style::kv("Proxy", &proxy_url);
     style::kv("Fail mode", &args.fail_mode.to_string());
     if !args.mcp_config.is_empty() {
         style::kv("Extra MCP configs", &args.mcp_config.len().to_string());
@@ -358,7 +374,16 @@ async fn run_wizard(args: WizardArgs) -> Result<()> {
         return Ok(());
     }
 
-    let outcome = run_wizard_steps(&args, &preflight, &setup_id, &mut tx).await;
+    let outcome = run_wizard_steps(
+        &args,
+        &preflight,
+        &proxy_url,
+        setup_id.as_str(),
+        &mut tx,
+        global_config_path,
+        config,
+    )
+    .await;
 
     match outcome {
         Ok(()) => {
@@ -403,8 +428,11 @@ async fn run_wizard(args: WizardArgs) -> Result<()> {
 async fn run_wizard_steps(
     args: &WizardArgs,
     preflight: &PreflightContext,
+    proxy_url: &str,
     setup_id: &str,
     tx: &mut Option<SetupTransaction>,
+    global_config_path: Option<PathBuf>,
+    config: &SothConfig,
 ) -> Result<()> {
     style::step(1, 5, "Ensuring CA certificate");
     let ca_exists = preflight.ca_cert_path.exists() && preflight.ca_key_path.exists();
@@ -417,10 +445,15 @@ async fn run_wizard_steps(
             transaction.ensure_backup(&preflight.ca_cert_path)?;
             transaction.ensure_backup(&preflight.ca_key_path)?;
         }
+        let ca_output_dir = preflight
+            .ca_cert_path
+            .parent()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
         commands::proxy::run(ProxyCommands::SetupCa {
             no_trust: false,
-            output: DEFAULT_CA_DIR.to_string(),
-        })
+            output: Some(ca_output_dir),
+        }, global_config_path.clone())
         .await?;
         if let Some(ref mut transaction) = tx {
             transaction.set_step_ca_generated()?;
@@ -434,7 +467,13 @@ async fn run_wizard_steps(
     } else if args.dry_run {
         style::step_done(2, 5, "Would enable system proxy");
     } else {
-        commands::proxy::run(ProxyCommands::On { port: Some(8080) }).await?;
+        commands::proxy::run(
+            ProxyCommands::On {
+                port: Some(config.forward_proxy.port),
+            },
+            global_config_path.clone(),
+        )
+        .await?;
         if let Some(ref mut transaction) = tx {
             transaction.set_step_proxy_enabled()?;
         }
@@ -501,7 +540,7 @@ async fn run_wizard_steps(
             if let Some(ref mut transaction) = tx {
                 transaction.ensure_backup(shell_file)?;
             }
-            upsert_managed_shell_block(shell_file, &preflight.shell, DEFAULT_PROXY_URL)?;
+            upsert_managed_shell_block(shell_file, &preflight.shell, proxy_url)?;
             if let Some(ref mut transaction) = tx {
                 transaction.set_step_shell_env_written()?;
             }
@@ -524,7 +563,7 @@ async fn run_wizard_steps(
             setup_id: setup_id.to_string(),
             created_at: Utc::now().to_rfc3339(),
             wizard_version: 1,
-            proxy_url: DEFAULT_PROXY_URL.to_string(),
+            proxy_url: proxy_url.to_string(),
             shell: preflight.shell.clone(),
             shell_file: preflight
                 .shell_file
@@ -544,8 +583,8 @@ async fn run_wizard_steps(
     Ok(())
 }
 
-async fn run_doctor() -> Result<()> {
-    let preflight = run_preflight(None)?;
+async fn run_doctor(config: &SothConfig, global_config_path: Option<PathBuf>) -> Result<()> {
+    let preflight = run_preflight(None, config)?;
 
     style::header("SOTH Setup Doctor");
 
@@ -596,7 +635,14 @@ async fn run_doctor() -> Result<()> {
 
     println!();
     style::subtitle("Proxy Status");
-    if let Err(error) = commands::proxy::run(ProxyCommands::Status).await {
+    if let Err(error) = commands::proxy::run(
+        ProxyCommands::Status {
+            config: None,
+        },
+        global_config_path,
+    )
+    .await
+    {
         style::warning(&format!("Proxy status command failed: {error}"));
         healthy = false;
     }
@@ -620,8 +666,13 @@ async fn run_doctor() -> Result<()> {
     bail!("setup doctor reported unhealthy state")
 }
 
-async fn run_rollback(setup_id: Option<String>, yes: bool) -> Result<()> {
-    let preflight = run_preflight(None)?;
+async fn run_rollback(
+    setup_id: Option<String>,
+    yes: bool,
+    config: &SothConfig,
+    global_config_path: Option<PathBuf>,
+) -> Result<()> {
+    let preflight = run_preflight(None, config)?;
     let resolved_setup_id = resolve_setup_id(setup_id, &preflight.state_path)?;
     let manifest_path = manifest_path_for_setup(&preflight, &resolved_setup_id);
     let mut manifest = read_manifest(&manifest_path).with_context(|| {
@@ -644,7 +695,7 @@ async fn run_rollback(setup_id: Option<String>, yes: bool) -> Result<()> {
     restore_backup_entries(&manifest.backups)?;
 
     if manifest.steps.proxy_enabled {
-        if let Err(error) = commands::proxy::run(ProxyCommands::Off).await {
+        if let Err(error) = commands::proxy::run(ProxyCommands::Off, global_config_path.clone()).await {
             style::warning(&format!("Failed to disable proxy during rollback: {error}"));
         }
     }
@@ -659,8 +710,12 @@ async fn run_rollback(setup_id: Option<String>, yes: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_uninstall(yes: bool) -> Result<()> {
-    let preflight = run_preflight(None)?;
+async fn run_uninstall(
+    yes: bool,
+    config: &SothConfig,
+    global_config_path: Option<PathBuf>,
+) -> Result<()> {
+    let preflight = run_preflight(None, config)?;
 
     style::header("SOTH Setup Uninstall");
     if !yes && !prompt_yes_no("Remove setup-managed configuration?", false)? {
@@ -669,14 +724,18 @@ async fn run_uninstall(yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    run_uninstall_internal(&preflight, true).await?;
+    run_uninstall_internal(&preflight, true, global_config_path).await?;
     style::success("Uninstall completed.");
     style::footer();
     Ok(())
 }
 
-async fn run_uninstall_internal(preflight: &PreflightContext, remove_state: bool) -> Result<()> {
-    if let Err(error) = commands::proxy::run(ProxyCommands::Off).await {
+async fn run_uninstall_internal(
+    preflight: &PreflightContext,
+    remove_state: bool,
+    global_config_path: Option<PathBuf>,
+) -> Result<()> {
+    if let Err(error) = commands::proxy::run(ProxyCommands::Off, global_config_path).await {
         style::warning(&format!("Failed to disable proxy: {error}"));
     }
 
@@ -702,20 +761,21 @@ async fn run_uninstall_internal(preflight: &PreflightContext, remove_state: bool
     Ok(())
 }
 
-fn run_preflight(shell_override: Option<String>) -> Result<PreflightContext> {
+fn run_preflight(shell_override: Option<String>, config: &SothConfig) -> Result<PreflightContext> {
     let home = dirs::home_dir().context("home directory not found")?;
 
     let shell = detect_shell(shell_override);
     let shell_file = shell_rc_path(&home, &shell);
     let state_path = home.join(".soth").join("setup-state.json");
-    let ca_dir = home.join(".soth").join("ca");
+    let ca_cert_path = cli_config::expand_tilde(&config.forward_proxy.ca.cert_path);
+    let ca_key_path = cli_config::expand_tilde(&config.forward_proxy.ca.key_path);
     let setups_dir = home.join(".soth").join("setups");
 
     Ok(PreflightContext {
         shell,
         shell_file,
-        ca_cert_path: ca_dir.join("ca.crt"),
-        ca_key_path: ca_dir.join("ca.key"),
+        ca_cert_path,
+        ca_key_path,
         state_path,
         setups_dir,
     })

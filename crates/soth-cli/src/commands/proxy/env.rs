@@ -1,19 +1,15 @@
 //! Environment variable output command
 
-/// Expand tilde in path
-fn expand_path(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]).display().to_string();
-        }
-    }
-    path.to_string()
-}
+use crate::cli_config;
+use std::path::PathBuf;
 
 /// Run the env command
-pub async fn run(shell: &str, ca_only: bool) -> anyhow::Result<()> {
-    let ca_path = expand_path("~/.soth/ca/ca.crt");
-    let proxy_addr = "http://127.0.0.1:8080";
+pub async fn run(shell: &str, ca_only: bool, config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    let ca_path = cli_config::expand_tilde(&config.forward_proxy.ca.cert_path)
+        .display()
+        .to_string();
+    let proxy_addr = format!("http://{}", config.forward_proxy.socket_addr());
 
     if ca_only {
         println!("{}", ca_path);
@@ -26,6 +22,8 @@ pub async fn run(shell: &str, ca_only: bool) -> anyhow::Result<()> {
             println!("export HTTPS_PROXY={}", proxy_addr);
             println!("export http_proxy={}", proxy_addr);
             println!("export https_proxy={}", proxy_addr);
+            println!("export NO_PROXY=localhost,127.0.0.1,::1");
+            println!("export no_proxy=localhost,127.0.0.1,::1");
             println!("export SSL_CERT_FILE={}", ca_path);
             println!("export REQUESTS_CA_BUNDLE={}", ca_path);
             println!("export NODE_EXTRA_CA_CERTS={}", ca_path);
@@ -36,6 +34,8 @@ pub async fn run(shell: &str, ca_only: bool) -> anyhow::Result<()> {
             println!("set -gx HTTPS_PROXY {}", proxy_addr);
             println!("set -gx http_proxy {}", proxy_addr);
             println!("set -gx https_proxy {}", proxy_addr);
+            println!("set -gx NO_PROXY localhost,127.0.0.1,::1");
+            println!("set -gx no_proxy localhost,127.0.0.1,::1");
             println!("set -gx SSL_CERT_FILE {}", ca_path);
             println!("set -gx REQUESTS_CA_BUNDLE {}", ca_path);
             println!("set -gx NODE_EXTRA_CA_CERTS {}", ca_path);
@@ -44,6 +44,7 @@ pub async fn run(shell: &str, ca_only: bool) -> anyhow::Result<()> {
         "powershell" | "pwsh" => {
             println!("$env:HTTP_PROXY = \"{}\"", proxy_addr);
             println!("$env:HTTPS_PROXY = \"{}\"", proxy_addr);
+            println!("$env:NO_PROXY = \"localhost,127.0.0.1,::1\"");
             println!("$env:SSL_CERT_FILE = \"{}\"", ca_path);
             println!("$env:REQUESTS_CA_BUNDLE = \"{}\"", ca_path);
             println!("$env:NODE_EXTRA_CA_CERTS = \"{}\"", ca_path);
@@ -52,6 +53,7 @@ pub async fn run(shell: &str, ca_only: bool) -> anyhow::Result<()> {
         "cmd" => {
             println!("set HTTP_PROXY={}", proxy_addr);
             println!("set HTTPS_PROXY={}", proxy_addr);
+            println!("set NO_PROXY=localhost,127.0.0.1,::1");
             println!("set SSL_CERT_FILE={}", ca_path);
             println!("set REQUESTS_CA_BUNDLE={}", ca_path);
             println!("set NODE_EXTRA_CA_CERTS={}", ca_path);

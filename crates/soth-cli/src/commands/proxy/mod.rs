@@ -13,6 +13,7 @@
 //! - `soth proxy circuit` - Circuit breaker status
 //! - `soth proxy rate-limit` - Rate limit status
 
+use crate::cli_config;
 mod ca_info;
 mod circuit;
 mod connections;
@@ -36,7 +37,7 @@ pub enum ProxyCommands {
     /// AI traffic (OpenAI, Anthropic, Google) will be intercepted for
     /// inspection. All other traffic tunnels through without inspection.
     On {
-        /// Proxy port (default: 8080)
+        /// Proxy port override (uses configured port when omitted)
         #[arg(short, long)]
         port: Option<u16>,
     },
@@ -50,9 +51,9 @@ pub enum ProxyCommands {
         #[arg(long)]
         no_trust: bool,
 
-        /// Output directory for CA files
-        #[arg(long, default_value = "~/.soth/ca")]
-        output: String,
+        /// Output directory for CA files (defaults to config CA directory)
+        #[arg(long)]
+        output: Option<String>,
     },
 
     /// Start the forward proxy
@@ -75,13 +76,25 @@ pub enum ProxyCommands {
         /// Only show CA cert path (for --cacert)
         #[arg(long)]
         ca_only: bool,
+
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
 
     /// Show proxy status
-    Status,
+    Status {
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 
     /// Show CA certificate information
-    CaInfo,
+    CaInfo {
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 
     /// Show Prometheus metrics from running proxy
     Metrics {
@@ -138,21 +151,45 @@ pub enum CircuitAction {
 }
 
 /// Run proxy command
-pub async fn run(cmd: ProxyCommands) -> anyhow::Result<()> {
+pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::Result<()> {
     match cmd {
-        ProxyCommands::On { port } => system::enable(port).await,
+        ProxyCommands::On { port } => {
+            let selected_port = if port.is_some() {
+                port
+            } else {
+                let config = cli_config::load_effective_config(None, global_config.as_ref())?;
+                Some(config.forward_proxy.port)
+            };
+            system::enable(selected_port).await
+        }
         ProxyCommands::Off => system::disable().await,
-        ProxyCommands::SetupCa { no_trust, output } => setup_ca::run(output, no_trust).await,
-        ProxyCommands::Start { port, config } => start::run(port, config).await,
-        ProxyCommands::Env { shell, ca_only } => env::run(&shell, ca_only).await,
-        ProxyCommands::Status => status::run().await,
-        ProxyCommands::CaInfo => ca_info::run().await,
-        ProxyCommands::Metrics { config, raw } => metrics::run(config, raw).await,
-        ProxyCommands::Connections { config } => connections::run(config).await,
+        ProxyCommands::SetupCa { no_trust, output } => {
+            setup_ca::run(output, no_trust, global_config.clone()).await
+        }
+        ProxyCommands::Start { port, config } => {
+            start::run(port, config.or(global_config.clone())).await
+        }
+        ProxyCommands::Env {
+            shell,
+            ca_only,
+            config,
+        } => env::run(&shell, ca_only, config.or(global_config.clone())).await,
+        ProxyCommands::Status { config } => status::run(config.or(global_config.clone())).await,
+        ProxyCommands::CaInfo { config } => ca_info::run(config.or(global_config.clone())).await,
+        ProxyCommands::Metrics { config, raw } => {
+            metrics::run(config.or(global_config.clone()), raw).await
+        }
+        ProxyCommands::Connections { config } => {
+            connections::run(config.or(global_config.clone())).await
+        }
         ProxyCommands::Circuit { action } => match action {
-            CircuitAction::Status { config } => circuit::run_status(config).await,
-            CircuitAction::Reset { host, config } => circuit::run_reset(host, config).await,
+            CircuitAction::Status { config } => {
+                circuit::run_status(config.or(global_config.clone())).await
+            }
+            CircuitAction::Reset { host, config } => {
+                circuit::run_reset(host, config.or(global_config.clone())).await
+            }
         },
-        ProxyCommands::RateLimit { config } => ratelimit::run(config).await,
+        ProxyCommands::RateLimit { config } => ratelimit::run(config.or(global_config)).await,
     }
 }

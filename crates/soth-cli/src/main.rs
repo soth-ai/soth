@@ -17,21 +17,23 @@
 //!   soth tail                    - Stream live events
 //!   soth audit verify            - Verify Merkle audit trail
 
+mod cli_config;
 mod commands;
+mod logging;
 pub mod style;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{fmt, prelude::*};
 
 /// SOTH - Edge proxy for AI agent traffic
 #[derive(Parser)]
 #[command(name = "soth")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Config file path
-    #[arg(short, long, default_value = "soth.yaml")]
-    config: PathBuf,
+    /// Global config file path (applies to all commands)
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
     /// Enable verbose output
     #[arg(short, long)]
@@ -319,20 +321,24 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
-    let filter = if cli.verbose {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"))
-    } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
-    };
+    let filter = logging::default_log_filter(cli.verbose);
+    let use_ansi = logging::use_ansi_colors();
 
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(
+            fmt::layer()
+                .event_format(logging::SothLogFormatter::new(use_ansi))
+                .with_ansi(use_ansi),
+        )
         .with(filter)
         .init();
 
     // Execute command
     match cli.command {
-        Commands::Wrap(args) => {
+        Commands::Wrap(mut args) => {
+            if args.config.is_none() {
+                args.config = cli.config.clone();
+            }
             commands::wrap::run(args).await?;
         }
         Commands::Install { target, dry_run } => {
@@ -345,13 +351,13 @@ async fn main() -> anyhow::Result<()> {
             commands::install::run_status().await?;
         }
         Commands::Setup { action } => {
-            commands::setup::run(action).await?;
+            commands::setup::run(action, cli.config.clone()).await?;
         }
         Commands::Init { output } => {
             commands::init::run(output).await?;
         }
         Commands::Proxy { action } => {
-            commands::proxy::run(action).await?;
+            commands::proxy::run(action, cli.config.clone()).await?;
         }
         Commands::Identity { action } => {
             commands::identity::run(action).await?;
@@ -372,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
             commands::audit::run(action).await?;
         }
         Commands::Config { action } => {
-            commands::config::run(cli.config, action).await?;
+            commands::config::run(cli.config.clone(), action).await?;
         }
         Commands::Test(args) => {
             commands::test::run(args).await?;

@@ -2,28 +2,15 @@
 //!
 //! Displays Prometheus metrics from the running proxy/dashboard.
 
+use crate::cli_config;
 use crate::style;
 use comfy_table::Cell;
 use owo_colors::OwoColorize;
-use soth_core::config::load_config;
 use std::path::PathBuf;
 
 /// Run the metrics command
 pub async fn run(config_path: Option<PathBuf>, raw: bool) -> anyhow::Result<()> {
-    // Load config to get dashboard port
-    let config = if let Some(path) = config_path {
-        load_config(path)?
-    } else {
-        let default_paths = ["soth.yaml", "soth.yml", ".soth.yaml"];
-        let mut loaded = None;
-        for path in default_paths {
-            if std::path::Path::new(path).exists() {
-                loaded = Some(load_config(path)?);
-                break;
-            }
-        }
-        loaded.unwrap_or_default()
-    };
+    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
 
     let port = config.dashboard.port;
     let url = format!("http://127.0.0.1:{}/metrics", port);

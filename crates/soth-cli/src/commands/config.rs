@@ -3,6 +3,7 @@
 //! Provides tools to validate YAML configs, show effective settings,
 //! and generate example configurations.
 
+use crate::cli_config;
 use crate::ConfigCommands;
 use anyhow::{Context, Result};
 use soth_core::config::{HostFilterMode, SothConfig};
@@ -11,14 +12,16 @@ use tokio::fs;
 use tracing::info;
 
 /// Run the config command
-pub async fn run(default_config: PathBuf, action: ConfigCommands) -> Result<()> {
+pub async fn run(global_config: Option<PathBuf>, action: ConfigCommands) -> Result<()> {
     match action {
         ConfigCommands::Validate { file, verbose } => {
-            let config_path = file.unwrap_or(default_config);
+            let config_path = cli_config::resolve_config_path(file.as_ref(), global_config.as_ref())
+                .unwrap_or_else(|| PathBuf::from("soth.yaml"));
             validate_config(&config_path, verbose).await?;
         }
         ConfigCommands::Show { format } => {
-            show_config(&default_config, &format).await?;
+            let selected = cli_config::resolve_config_path(None, global_config.as_ref());
+            show_config(selected.as_ref(), &format).await?;
         }
         ConfigCommands::Example { output } => {
             generate_example(output).await?;
@@ -280,12 +283,20 @@ fn validate_budget(config: &SothConfig, warnings: &mut Vec<String>, _errors: &mu
 }
 
 /// Show the effective configuration
-async fn show_config(config_path: &PathBuf, format: &str) -> Result<()> {
-    let config = if config_path.exists() {
-        let content = fs::read_to_string(config_path).await?;
-        serde_yaml::from_str::<SothConfig>(&content)?
+async fn show_config(config_path: Option<&PathBuf>, format: &str) -> Result<()> {
+    let config = if let Some(path) = config_path {
+        if path.exists() {
+            let content = fs::read_to_string(path).await?;
+            serde_yaml::from_str::<SothConfig>(&content)?
+        } else {
+            info!(
+                "Config file {} not found, showing defaults",
+                path.display()
+            );
+            SothConfig::default()
+        }
     } else {
-        info!("Config file not found, showing defaults");
+        info!("No config file selected, showing defaults");
         SothConfig::default()
     };
 

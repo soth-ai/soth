@@ -1,27 +1,18 @@
 //! Proxy status command
 
+use crate::cli_config;
 use crate::style;
 use comfy_table::Cell;
 use owo_colors::OwoColorize;
 use std::path::PathBuf;
 
-/// Expand tilde in path
-fn expand_path(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Run the status command
-pub async fn run() -> anyhow::Result<()> {
-    let ca_path = expand_path("~/.soth/ca");
-    let cert_path = ca_path.join("ca.crt");
-    let key_path = ca_path.join("ca.key");
+pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    let cert_path = cli_config::expand_tilde(&config.forward_proxy.ca.cert_path);
+    let key_path = cli_config::expand_tilde(&config.forward_proxy.ca.key_path);
 
-    style::header("Forward Proxy Status");
+    style::header("SOTH Proxy Status");
 
     // CA Certificate status
     style::subtitle("CA Certificate");
@@ -55,7 +46,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
         println!("{ca_table}");
     } else {
-        style::error("CA certificate not installed");
+        style::warning("CA certificate not installed");
         println!();
         style::info("Run the following to set up:");
         println!("  {}", "soth proxy setup-ca".bold());
@@ -65,13 +56,16 @@ pub async fn run() -> anyhow::Result<()> {
     println!();
     style::subtitle("Proxy Server");
 
-    let proxy_addr = "127.0.0.1:8080";
+    let proxy_addr = config.forward_proxy.socket_addr();
     let mut server_table = style::table();
     server_table.set_header(vec!["Property", "Value"]);
 
-    server_table.add_row(vec![Cell::new("Default Address"), Cell::new(proxy_addr)]);
+    server_table.add_row(vec![
+        Cell::new("Configured Address"),
+        Cell::new(proxy_addr.to_string().cyan().to_string()),
+    ]);
 
-    let running = tokio::net::TcpStream::connect(proxy_addr).await.is_ok();
+    let running = tokio::net::TcpStream::connect(proxy_addr.as_str()).await.is_ok();
     let status_display = if running {
         format!("{} Running", style::CIRCLE_FILLED.green())
     } else {
@@ -124,7 +118,7 @@ pub async fn run() -> anyhow::Result<()> {
     println!("{env_table}");
 
     println!();
-    style::info("To configure environment:");
+    style::info("To configure environment for this proxy:");
     println!("  {}", "eval $(soth proxy env)".bold());
 
     style::footer();
