@@ -75,12 +75,20 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let not_after_ts = not_after.unix_timestamp();
     let now_ts = now.timestamp();
     if not_after_ts < now_ts {
-        style::kv("Status", &"EXPIRED".red().bold().to_string());
+        style::kv(
+            "Status",
+            &format!("{} {}", style::CROSS.red(), "EXPIRED".red().bold()),
+        );
     } else {
         let days_left = (not_after_ts - now_ts) / 86400;
         style::kv(
             "Status",
-            &format!("{} ({} days remaining)", "valid".green(), days_left),
+            &format!(
+                "{} {} ({} days remaining)",
+                style::CHECK.green(),
+                "valid".green(),
+                days_left
+            ),
         );
     }
 
