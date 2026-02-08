@@ -863,6 +863,99 @@ fn decode_payload_for_logging(bytes: &[u8], encoding: Option<&str>) -> (Vec<u8>,
     (decoded, rendered)
 }
 
+fn is_gemini_bard_stream_path(path: &str) -> bool {
+    path.to_ascii_lowercase()
+        .contains("bardfrontendservice/streamgenerate")
+}
+
+fn update_longest_text(candidate: &str, longest: &mut Option<String>) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let should_replace = longest
+        .as_ref()
+        .map(|current| trimmed.len() > current.len())
+        .unwrap_or(true);
+
+    if should_replace {
+        *longest = Some(trimmed.to_string());
+    }
+}
+
+fn collect_bard_response_text(value: &serde_json::Value, longest: &mut Option<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            if let Some(id) = items.first().and_then(|v| v.as_str()) {
+                if id.starts_with("rc_") {
+                    if let Some(text_items) = items.get(1).and_then(|v| v.as_array()) {
+                        for text_item in text_items {
+                            if let Some(text) = text_item.as_str() {
+                                update_longest_text(text, longest);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for item in items {
+                collect_bard_response_text(item, longest);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_bard_response_text(item, longest);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_gemini_bard_stream_text(raw: &str) -> Option<String> {
+    let mut longest: Option<String> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(")]}'") {
+            continue;
+        }
+
+        if !trimmed.starts_with('[') {
+            // Batch framing length lines are numeric and can be ignored.
+            continue;
+        }
+
+        let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+
+        let Some(records) = wrapper.as_array() else {
+            continue;
+        };
+
+        for record in records {
+            let Some(entry) = record.as_array() else {
+                continue;
+            };
+            if entry.first().and_then(|v| v.as_str()) != Some("wrb.fr") {
+                continue;
+            }
+
+            let Some(inner_json) = entry.get(2).and_then(|v| v.as_str()) else {
+                continue;
+            };
+
+            let Ok(inner) = serde_json::from_str::<serde_json::Value>(inner_json) else {
+                continue;
+            };
+            collect_bard_response_text(&inner, &mut longest);
+        }
+    }
+
+    longest
+}
+
 /// AI-aware HTTP handler for hudsucker
 #[derive(Clone)]
 pub struct AiProxyHandler {
@@ -1697,11 +1790,12 @@ impl HttpHandler for AiProxyHandler {
                 .path
                 .to_ascii_lowercase()
                 .contains("/backend-api/codex/responses");
+            let is_gemini_bard_response_path = is_gemini_bard_stream_path(&pending.path);
             let mut response_usage = ResponseUsageMeta::default();
 
             // Streamed responses can be long-lived and may get dropped before completion.
             // Emit a placeholder row immediately, then overwrite by ID when stream capture finishes.
-            if is_sse || is_codex_response_path {
+            if is_sse || is_codex_response_path || is_gemini_bard_response_path {
                 if let Some(ref logger) = event_logger {
                     let placeholder =
                         empty_response_placeholder(&pending.method, &pending.path, status, is_sse);
@@ -1738,6 +1832,7 @@ impl HttpHandler for AiProxyHandler {
             let (body_content, res, logged_in_stream) = if is_json
                 && !is_sse
                 && !is_codex_response_path
+                && !is_gemini_bard_response_path
             {
                 let (parts, body) = res.into_parts();
                 match body.collect().await {
@@ -1767,7 +1862,7 @@ impl HttpHandler for AiProxyHandler {
                         (None, res, false)
                     }
                 }
-            } else if is_sse || is_codex_response_path {
+            } else if is_sse || is_codex_response_path || is_gemini_bard_response_path {
                 // Streaming response: tee to forward chunks immediately while accumulating
                 let (parts, body) = res.into_parts();
 
@@ -1848,8 +1943,13 @@ impl HttpHandler for AiProxyHandler {
                         log_is_sse,
                         log_pending.model.as_deref(),
                     );
+                    let response_text = if is_gemini_bard_stream_path(&log_pending.path) {
+                        extract_gemini_bard_stream_text(&raw_content).unwrap_or(raw_content)
+                    } else {
+                        raw_content
+                    };
                     let content = normalize_response_content(
-                        Some(raw_content.as_str()),
+                        Some(response_text.as_str()),
                         log_pending.request_content.as_deref(),
                         &log_pending.method,
                         &log_pending.path,
@@ -2801,6 +2901,22 @@ mod tests {
     #[test]
     fn test_should_log_request_skips_connect() {
         assert!(!AiProxyHandler::should_log_request("/", "CONNECT"));
+    }
+
+    #[test]
+    fn test_extract_gemini_bard_stream_text_prefers_latest_longest_chunk() {
+        let body = r#"
+)]}'
+160
+[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"I'm listening\"]]]]"]]
+220
+[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"I'm listening! Full answer\"]]]]"]]
+"#;
+
+        assert_eq!(
+            extract_gemini_bard_stream_text(body),
+            Some("I'm listening! Full answer".to_string())
+        );
     }
 
     #[test]
