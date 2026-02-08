@@ -965,7 +965,10 @@ impl AiProxyHandler {
 
         if ua_lower.contains("openai-codex") || ua_lower.contains("codex/") {
             Some("codex")
-        } else if ua_lower.contains("claude-code") || ua_lower.contains("claude_code") {
+        } else if ua_lower.contains("claude-code")
+            || ua_lower.contains("claude_code")
+            || ua_lower.contains("claude code")
+        {
             Some("claude-code")
         } else if ua_lower.contains("cursor") {
             Some("cursor")
@@ -989,23 +992,39 @@ impl AiProxyHandler {
             Some("claude")
         } else if ua_lower.contains("openai") || ua_lower.contains("chatgpt") {
             Some("chatgpt")
-        } else if !ua.is_empty() {
-            // Return first part of User-Agent as fallback
-            None
         } else {
+            // Unrecognized/non-empty User-Agent currently has no stable agent mapping.
             None
         }
     }
 
     /// Apply host/path/model heuristics to derive the final agent tag.
     /// This upgrades generic OpenAI/ChatGPT tags to `codex` when context proves it.
+    #[cfg(test)]
     fn detect_agent_with_context(
         ua_agent: Option<&'static str>,
         host: &str,
         path: &str,
         model: Option<&str>,
     ) -> Option<&'static str> {
-        host_fingerprint::detect_agent_with_context(ua_agent, host, path, model)
+        Self::detect_agent_with_context_gated(ua_agent, host, path, model, true)
+    }
+
+    /// Same as `detect_agent_with_context`, but can disable host-driven inference.
+    fn detect_agent_with_context_gated(
+        ua_agent: Option<&'static str>,
+        host: &str,
+        path: &str,
+        model: Option<&str>,
+        allow_host_inference: bool,
+    ) -> Option<&'static str> {
+        host_fingerprint::detect_agent_with_context_gated(
+            ua_agent,
+            host,
+            path,
+            model,
+            allow_host_inference,
+        )
     }
 
     /// Detect AI provider from host
@@ -1013,11 +1032,52 @@ impl AiProxyHandler {
         host_fingerprint::detect_provider(host)
     }
 
-    /// Check if host is an agent app (end-user application) vs direct API
-    /// Agent apps: chatgpt.com, claude.ai (web/desktop apps)
-    /// Direct API: api.openai.com, api.anthropic.com (programmatic access)
-    fn is_agent_app(host: &str) -> bool {
-        host_fingerprint::is_agent_app(host)
+    /// Resolve provider classification for HTTP request handling.
+    fn resolve_http_provider(
+        host: &str,
+        host_is_ai_target: bool,
+        host_mode: HostFilterMode,
+    ) -> Option<&'static str> {
+        let detected_provider = Self::detect_provider(host);
+        if host_is_ai_target {
+            detected_provider.or(Some("inference"))
+        } else if host_mode == HostFilterMode::Discovery {
+            // Discovery mode should still classify known AI providers even when host
+            // is not pre-seeded in ai_inference.
+            detected_provider
+        } else {
+            None
+        }
+    }
+
+    /// Resolve provider classification for WebSocket handling.
+    fn resolve_ws_provider(
+        host: &str,
+        host_is_ai_target: bool,
+        host_is_mcp_target: bool,
+        host_mode: HostFilterMode,
+    ) -> (&'static str, bool) {
+        let detected_provider = Self::detect_provider(host);
+        let is_discovered_ai_target =
+            host_mode == HostFilterMode::Discovery && detected_provider.is_some();
+        let provider = if host_is_ai_target {
+            detected_provider.unwrap_or("inference")
+        } else if is_discovered_ai_target {
+            // Discovery mode should still classify known providers outside the
+            // explicit host seed list.
+            detected_provider.unwrap_or("unknown")
+        } else if host_is_mcp_target {
+            "mcp"
+        } else {
+            "unknown"
+        };
+
+        (provider, is_discovered_ai_target)
+    }
+
+    /// Check if host is in the configured agent app domain class.
+    fn is_agent_app(hosts: &HostFilterConfig, host: &str) -> bool {
+        hosts.should_check_agent_app(host)
     }
 
     /// Check if a request should be logged for observability
@@ -1116,12 +1176,13 @@ impl HttpHandler for AiProxyHandler {
         let is_blocked = self.is_blocked(&host);
         let host_is_ai_target = self.hosts.should_check_ai_inference(&host);
         let host_is_mcp_target = self.hosts.should_check_mcp(&host);
+        let host_is_agent_target = Self::is_agent_app(&self.hosts, &host);
         let host_mode = self.hosts.mode;
-        let provider = if host_is_ai_target {
-            Self::detect_provider(&host).or(Some("inference"))
-        } else {
-            None
-        };
+        let provider = Self::resolve_http_provider(
+            &host,
+            host_is_ai_target || host_is_agent_target,
+            host_mode,
+        );
         let ua_agent = Self::detect_agent_from_user_agent(&req);
         let enforcer = self.enforcer.clone();
         let session_id = self.session_id.clone();
@@ -1156,7 +1217,7 @@ impl HttpHandler for AiProxyHandler {
             .map(|s| s.to_lowercase());
         // Only inspect request bodies for relevant host classes (or discovery mode).
         let should_inspect_body = is_post
-            && (host_is_ai_target
+            && ((host_is_ai_target || host_is_agent_target)
                 || host_is_mcp_target
                 || (host_mode == HostFilterMode::Discovery && is_json));
         let provider_registry = self.provider_registry.clone();
@@ -1237,16 +1298,21 @@ impl HttpHandler for AiProxyHandler {
                 debug!("Skipping body inspection");
                 (None, None, req)
             };
-            let agent = Self::detect_agent_with_context(ua_agent, &host, &path, model.as_deref());
-            let mcp_request_method = if !is_connect
-                && (host_is_mcp_target || host_mode == HostFilterMode::Discovery)
-            {
-                body_content
-                    .as_deref()
-                    .and_then(|content| extract_mcp_request_method(content, &path))
-            } else {
-                None
-            };
+            let agent = Self::detect_agent_with_context_gated(
+                ua_agent,
+                &host,
+                &path,
+                model.as_deref(),
+                host_is_agent_target || host_mode == HostFilterMode::Discovery,
+            );
+            let mcp_request_method =
+                if !is_connect && (host_is_mcp_target || host_mode == HostFilterMode::Discovery) {
+                    body_content
+                        .as_deref()
+                        .and_then(|content| extract_mcp_request_method(content, &path))
+                } else {
+                    None
+                };
             let mut policy_allowed = None;
             let mut policy_version = None;
 
@@ -1422,7 +1488,7 @@ impl HttpHandler for AiProxyHandler {
                             model: model.clone(),
                             started_at: Instant::now(),
                             request_content: body_content,
-                            is_agent_app: Self::is_agent_app(&host),
+                            is_agent_app: host_is_agent_target,
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
                             policy_allowed,
@@ -1450,13 +1516,15 @@ impl HttpHandler for AiProxyHandler {
                         WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
                             .with_source(EventSource::Mcp)
                             .with_method(mcp_method.clone());
-                    let envelope = TrafficEnvelope::mcp_stdio(
+                    let envelope = TrafficEnvelope::mcp_http(
                         &session_id,
                         Some(request_id.to_string()),
                         mcp_method.clone(),
+                        &host,
+                        &path,
                         agent,
-                        None,
-                        None,
+                        identity_did.as_deref(),
+                        identity_signature.as_deref(),
                         body_content.as_deref(),
                     );
                     event = event.with_traffic_envelope(envelope);
@@ -1473,13 +1541,15 @@ impl HttpHandler for AiProxyHandler {
                     PendingRequest {
                         request_id,
                         event_id: uuid::Uuid::new_v4().to_string(),
-                        envelope: Some(TrafficEnvelope::mcp_stdio(
+                        envelope: Some(TrafficEnvelope::mcp_http(
                             &session_id,
                             Some(request_id.to_string()),
                             mcp_method.clone(),
+                            &host,
+                            &path,
                             agent,
-                            None,
-                            None,
+                            identity_did.as_deref(),
+                            identity_signature.as_deref(),
                             body_content.as_deref(),
                         )),
                         host: host.clone(),
@@ -2011,18 +2081,23 @@ impl WebSocketHandler for AiWebSocketHandler {
 
         let host_is_ai_target = hosts.should_check_ai_inference(&host);
         let host_is_mcp_target = hosts.should_check_mcp(&host);
+        let host_is_agent_target = AiProxyHandler::is_agent_app(&hosts, &host);
         let is_discovery = hosts.mode == HostFilterMode::Discovery;
-        let provider = if host_is_ai_target {
-            AiProxyHandler::detect_provider(&host).unwrap_or("inference")
-        } else if host_is_mcp_target {
-            "mcp"
-        } else {
-            "unknown"
-        };
+        let (provider, _is_discovered_ai_target) = AiProxyHandler::resolve_ws_provider(
+            &host,
+            host_is_ai_target || host_is_agent_target,
+            host_is_mcp_target,
+            hosts.mode,
+        );
 
-        let is_agent_app = host_is_ai_target && AiProxyHandler::is_agent_app(&host);
-        let detected_ws_agent =
-            AiProxyHandler::detect_agent_with_context(None, &host, &ws_path, None);
+        let is_agent_app = host_is_agent_target;
+        let detected_ws_agent = AiProxyHandler::detect_agent_with_context_gated(
+            None,
+            &host,
+            &ws_path,
+            None,
+            host_is_agent_target || is_discovery,
+        );
 
         async move {
             match &msg {
@@ -2082,24 +2157,40 @@ impl WebSocketHandler for AiWebSocketHandler {
 
                         // Log WebSocket message for observability
                         if let Some(ref logger) = event_logger {
-                            let resolved_agent = detected_ws_agent.unwrap_or_else(|| match source {
-                                EventSource::Mcp => "mcp",
-                                EventSource::AiProxy | EventSource::AgentApp => {
-                                    if provider_for_event == "unknown" {
-                                        "websocket"
-                                    } else {
-                                        provider_for_event
+                            let resolved_agent =
+                                detected_ws_agent.unwrap_or_else(|| match source {
+                                    EventSource::Mcp => "mcp",
+                                    EventSource::AiProxy | EventSource::AgentApp => {
+                                        if provider_for_event == "unknown" {
+                                            "websocket"
+                                        } else {
+                                            provider_for_event
+                                        }
                                     }
-                                }
-                            });
+                                });
                             let agent_info =
                                 AgentInfo::new(resolved_agent, DetectionSource::Environment);
 
-                            let event = WrapEvent::new(&session_id, &host, direction, agent_info)
-                                .with_source(source)
-                                .with_provider(provider_for_event)
-                                .with_method(ws_method)
-                                .with_content(text.to_string());
+                            let mut event =
+                                WrapEvent::new(&session_id, &host, direction, agent_info)
+                                    .with_source(source)
+                                    .with_provider(provider_for_event)
+                                    .with_method(ws_method.clone())
+                                    .with_content(text.to_string());
+                            if matches!(source, EventSource::Mcp) {
+                                let envelope = TrafficEnvelope::mcp_http(
+                                    &session_id,
+                                    None::<String>,
+                                    ws_method.clone(),
+                                    &host,
+                                    &ws_path,
+                                    Some(resolved_agent),
+                                    None,
+                                    None,
+                                    Some(text.as_ref()),
+                                );
+                                event = event.with_traffic_envelope(envelope);
+                            }
                             logger.log(&event);
                         }
                     } else {
@@ -2318,6 +2409,10 @@ mod tests {
             AiProxyHandler::detect_provider("chat.openai.com"),
             Some("chatgpt")
         );
+        assert_eq!(
+            AiProxyHandler::detect_provider("gemini.google.com"),
+            Some("gemini")
+        );
         assert_eq!(AiProxyHandler::detect_provider("claude.ai"), Some("claude"));
         assert_eq!(
             AiProxyHandler::detect_provider("app.claude.ai"),
@@ -2403,8 +2498,70 @@ mod tests {
             AiProxyHandler::detect_provider("statsig.anthropic.com"),
             Some("claude-code")
         );
+        assert_eq!(AiProxyHandler::detect_provider("evilchatgpt.com"), None);
+        assert_eq!(
+            AiProxyHandler::detect_provider("foo.githubcopilot.com.evil.com"),
+            None
+        );
         assert_eq!(AiProxyHandler::detect_provider("google.com"), None);
         assert_eq!(AiProxyHandler::detect_provider("example.com"), None);
+    }
+
+    #[test]
+    fn test_resolve_http_provider_discovery_classifies_known_ai_host() {
+        assert_eq!(
+            AiProxyHandler::resolve_http_provider(
+                "chat.openai.com",
+                false,
+                HostFilterMode::Discovery
+            ),
+            Some("chatgpt")
+        );
+        assert_eq!(
+            AiProxyHandler::resolve_http_provider(
+                "gemini.google.com",
+                false,
+                HostFilterMode::Discovery
+            ),
+            Some("gemini")
+        );
+        assert_eq!(
+            AiProxyHandler::resolve_http_provider(
+                "unknown.example.com",
+                false,
+                HostFilterMode::Discovery
+            ),
+            None
+        );
+        assert_eq!(
+            AiProxyHandler::resolve_http_provider(
+                "chat.openai.com",
+                false,
+                HostFilterMode::Selective
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_ws_provider_discovery_classifies_known_ai_host() {
+        let (provider, discovered) = AiProxyHandler::resolve_ws_provider(
+            "chat.openai.com",
+            false,
+            false,
+            HostFilterMode::Discovery,
+        );
+        assert_eq!(provider, "chatgpt");
+        assert!(discovered);
+
+        let (provider, discovered) = AiProxyHandler::resolve_ws_provider(
+            "api.github.com",
+            false,
+            true,
+            HostFilterMode::Selective,
+        );
+        assert_eq!(provider, "mcp");
+        assert!(!discovered);
     }
 
     #[test]
@@ -2421,11 +2578,46 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_agent_from_user_agent_claude_code() {
+        let req = Request::builder()
+            .uri("https://api.anthropic.com/v1/messages")
+            .header("user-agent", "claude-code/1.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            AiProxyHandler::detect_agent_from_user_agent(&req),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_from_user_agent_claude_code_with_space() {
+        let req = Request::builder()
+            .uri("https://api.anthropic.com/v1/messages")
+            .header("user-agent", "Claude Code/1.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            AiProxyHandler::detect_agent_from_user_agent(&req),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
     fn test_detect_agent_with_context_promotes_codex_path() {
         assert_eq!(
             AiProxyHandler::detect_agent_with_context(
                 Some("chatgpt"),
                 "chatgpt.com",
+                "/backend-api/codex/responses",
+                None
+            ),
+            Some("codex")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(
+                Some("chatgpt"),
+                "chat.openai.com",
                 "/backend-api/codex/responses",
                 None
             ),
@@ -2486,6 +2678,48 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_agent_with_context_defaults_gemini_when_ua_missing() {
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(None, "gemini.google.com", "/app", None),
+            Some("gemini")
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_with_context_gated_disables_host_fallbacks() {
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context_gated(
+                None,
+                "gemini.google.com",
+                "/app",
+                None,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context_gated(
+                Some("chatgpt"),
+                "chatgpt.com",
+                "/backend-api/f/conversation",
+                None,
+                false
+            ),
+            Some("chatgpt")
+        );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context_gated(
+                None,
+                "api.openai.com",
+                "/v1/responses",
+                Some("gpt-5.3-codex"),
+                false
+            ),
+            Some("codex")
+        );
+    }
+
+    #[test]
     fn test_detect_agent_with_context_domain_fallbacks() {
         assert_eq!(
             AiProxyHandler::detect_agent_with_context(None, "api2.cursor.sh", "/", None),
@@ -2525,28 +2759,43 @@ mod tests {
             AiProxyHandler::detect_agent_with_context(None, "statsig.anthropic.com", "/", None),
             Some("claude-code")
         );
+        assert_eq!(
+            AiProxyHandler::detect_agent_with_context(None, "gemini.google.com", "/", None),
+            Some("gemini")
+        );
     }
 
     #[test]
     fn test_is_agent_app_classification() {
-        assert!(AiProxyHandler::is_agent_app("chatgpt.com"));
-        assert!(AiProxyHandler::is_agent_app("claude.ai"));
-        assert!(AiProxyHandler::is_agent_app("api2.cursor.sh"));
-        assert!(AiProxyHandler::is_agent_app("enterprise.githubcopilot.com"));
-        assert!(AiProxyHandler::is_agent_app("server.codeium.com"));
-        assert!(AiProxyHandler::is_agent_app("cloud.zed.dev"));
-        assert!(AiProxyHandler::is_agent_app("api.jetbrains.ai"));
+        let hosts = HostFilterConfig::default();
+        assert!(AiProxyHandler::is_agent_app(&hosts, "chatgpt.com"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "chat.openai.com"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "gemini.google.com"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "claude.ai"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "api2.cursor.sh"));
         assert!(AiProxyHandler::is_agent_app(
+            &hosts,
+            "enterprise.githubcopilot.com"
+        ));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "server.codeium.com"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "cloud.zed.dev"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "api.jetbrains.ai"));
+        assert!(AiProxyHandler::is_agent_app(
+            &hosts,
             "codewhisperer.us-east-1.amazonaws.com"
         ));
-        assert!(AiProxyHandler::is_agent_app("statsig.anthropic.com"));
-        assert!(AiProxyHandler::is_agent_app("a-api.anthropic.com"));
-        assert!(AiProxyHandler::is_agent_app("a-cdn.anthropic.com"));
-        assert!(AiProxyHandler::is_agent_app("s-cdn.anthropic.com"));
-        assert!(!AiProxyHandler::is_agent_app("api.openai.com"));
-        assert!(!AiProxyHandler::is_agent_app("api.anthropic.com"));
-        assert!(!AiProxyHandler::is_agent_app("api.claude.ai"));
-        assert!(!AiProxyHandler::is_agent_app("anthropic.com"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "statsig.anthropic.com"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "a-api.anthropic.com"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "a-cdn.anthropic.com"));
+        assert!(AiProxyHandler::is_agent_app(&hosts, "s-cdn.anthropic.com"));
+        assert!(!AiProxyHandler::is_agent_app(&hosts, "api.openai.com"));
+        assert!(!AiProxyHandler::is_agent_app(&hosts, "api.anthropic.com"));
+        assert!(!AiProxyHandler::is_agent_app(&hosts, "api.claude.ai"));
+        assert!(!AiProxyHandler::is_agent_app(&hosts, "anthropic.com"));
+        assert!(!AiProxyHandler::is_agent_app(
+            &hosts,
+            "foo.gemini.google.com.evil.com"
+        ));
     }
 
     #[test]

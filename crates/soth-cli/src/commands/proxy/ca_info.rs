@@ -12,7 +12,10 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let cert_path = cli_config::expand_tilde(&config.forward_proxy.ca.cert_path);
 
     if !cert_path.exists() {
-        style::warning(&format!("CA certificate not found at {}", cert_path.display()));
+        style::warning(&format!(
+            "CA certificate not found at {}",
+            cert_path.display()
+        ));
         style::info("Run: soth proxy setup-ca");
         return Ok(());
     }
@@ -94,7 +97,10 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     style::subtitle("Certificate");
     style::kv("Serial", &cert.serial.to_string());
-    style::kv("Public Key Algorithm", &cert.public_key().algorithm.algorithm.to_string());
+    style::kv(
+        "Public Key Algorithm",
+        &cert.public_key().algorithm.algorithm.to_string(),
+    );
     style::kv("Path", &cert_path.display().to_string());
     if let Ok(metadata) = std::fs::metadata(&cert_path) {
         style::kv("Size", &format!("{} bytes", metadata.len()));

@@ -64,6 +64,7 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
         .ai_inference
         .iter()
         .chain(proxy_config.hosts.mcp.iter())
+        .chain(proxy_config.hosts.agent_apps.iter())
     {
         if seen.insert(host.clone()) {
             intercept_hosts.push(host.clone());
@@ -101,9 +102,10 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
         proxy_config.socket_addr()
     );
     let rules_line = format!(
-        "AI:{}  MCP:{}  Total:{}",
+        "AI:{}  MCP:{}  Agent:{}  Total:{}",
         proxy_config.hosts.ai_inference.len(),
         proxy_config.hosts.mcp.len(),
+        proxy_config.hosts.agent_apps.len(),
         intercept_count
     );
     let dashboard_line = format!("{dashboard_display}   Events {event_logging_status}");

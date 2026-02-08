@@ -407,13 +407,11 @@ pub fn enforce_proxy_request(
             .map(|s| s.to_string());
         metrics::record_budget_check("request");
         if config.budget_block_on_exceeded {
-            if let Some(scope) =
-                tracker.first_exceeded_scope(
-                    &envelope.session_id,
-                    agent_id.as_deref(),
-                    envelope.model.as_deref(),
-                )
-            {
+            if let Some(scope) = tracker.first_exceeded_scope(
+                &envelope.session_id,
+                agent_id.as_deref(),
+                envelope.model.as_deref(),
+            ) {
                 metrics::record_budget_block(budget_scope_label(scope));
                 return Err((
                     429,
