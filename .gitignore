@@ -65,6 +65,7 @@ lcov.info
 *.tmp
 *.temp
 .cache/
+AGENTS.md.pre-agent-abstraction.backup
 
 # Documentation (generated)
 docs/

@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -20,6 +21,13 @@ const MAX_EVENTS: usize = 1000;
 
 /// Maximum number of agents to track.
 const MAX_AGENTS: usize = 100;
+
+/// Wait window for SQLite lock contention before failing a dashboard query/update.
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
+
+/// Projection retries for transient lock contention.
+const SQLITE_PROJECTION_MAX_RETRIES: usize = 3;
+const SQLITE_PROJECTION_RETRY_BASE_MS: u64 = 40;
 
 /// Event store that watches wrap events and provides real-time streaming.
 #[derive(Clone)]
@@ -474,7 +482,7 @@ fn read_sqlite_events(
     since_seq: Option<i64>,
     initial_limit: Option<usize>,
 ) -> std::io::Result<Vec<(i64, WrapEvent)>> {
-    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    let conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
 
     let mut events = Vec::new();
@@ -563,7 +571,7 @@ fn read_sqlite_events(
 }
 
 fn read_sqlite_cluster_total(db_path: &Path) -> std::io::Result<usize> {
-    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    let conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
     let count = conn
         .query_row("SELECT COUNT(*) FROM event_clusters", [], |row| {
@@ -574,7 +582,7 @@ fn read_sqlite_cluster_total(db_path: &Path) -> std::io::Result<usize> {
 }
 
 fn read_sqlite_rollup_total(db_path: &Path) -> std::io::Result<usize> {
-    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    let conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
     let count = conn
         .query_row("SELECT COUNT(*) FROM rollups_1m", [], |row| {
@@ -589,7 +597,7 @@ fn read_sqlite_clusters(
     since_seq: Option<i64>,
     limit: usize,
 ) -> std::io::Result<Vec<ClusterRow>> {
-    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    let conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
     let mut rows_out = Vec::new();
 
@@ -676,7 +684,7 @@ fn read_sqlite_clusters(
 }
 
 fn read_sqlite_rollups_1m(db_path: &Path, limit: usize) -> std::io::Result<Vec<RollupRow>> {
-    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    let conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
 
     let mut stmt = conn
@@ -717,7 +725,24 @@ fn read_sqlite_rollups_1m(db_path: &Path, limit: usize) -> std::io::Result<Vec<R
 }
 
 fn project_sqlite_events(db_path: &Path) -> std::io::Result<i64> {
-    let mut conn = Connection::open(db_path).map_err(to_io_err)?;
+    for retry in 0..=SQLITE_PROJECTION_MAX_RETRIES {
+        match project_sqlite_events_once(db_path) {
+            Ok(projected_seq) => return Ok(projected_seq),
+            Err(error) if retry < SQLITE_PROJECTION_MAX_RETRIES && is_sqlite_lock_error(&error) => {
+                let backoff_ms = SQLITE_PROJECTION_RETRY_BASE_MS * (retry as u64 + 1);
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::other(
+        "SQLite projection retry loop exited unexpectedly",
+    ))
+}
+
+fn project_sqlite_events_once(db_path: &Path) -> std::io::Result<i64> {
+    let mut conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
     let tx = conn.transaction().map_err(to_io_err)?;
 
@@ -1206,7 +1231,7 @@ fn read_sqlite_event_payload(
         _ => return Ok(None),
     };
 
-    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    let conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
 
     let mut stmt = conn
@@ -1260,6 +1285,20 @@ fn read_sqlite_event_payload(
 
 fn to_io_err(error: rusqlite::Error) -> std::io::Error {
     std::io::Error::other(error.to_string())
+}
+
+fn open_sqlite_connection(db_path: &Path) -> std::io::Result<Connection> {
+    let conn = Connection::open(db_path).map_err(to_io_err)?;
+    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+        .map_err(to_io_err)?;
+    Ok(conn)
+}
+
+fn is_sqlite_lock_error(error: &std::io::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database busy")
 }
 
 #[cfg(test)]
