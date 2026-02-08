@@ -15,8 +15,9 @@ use tracing::info;
 pub async fn run(global_config: Option<PathBuf>, action: ConfigCommands) -> Result<()> {
     match action {
         ConfigCommands::Validate { file, verbose } => {
-            let config_path = cli_config::resolve_config_path(file.as_ref(), global_config.as_ref())
-                .unwrap_or_else(|| PathBuf::from("soth.yaml"));
+            let config_path =
+                cli_config::resolve_config_path(file.as_ref(), global_config.as_ref())
+                    .unwrap_or_else(|| PathBuf::from("soth.yaml"));
             validate_config(&config_path, verbose).await?;
         }
         ConfigCommands::Show { format } => {
@@ -123,6 +124,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             config.forward_proxy.hosts.ai_inference.len()
         );
         println!("  MCP hosts:   {}", config.forward_proxy.hosts.mcp.len());
+        println!("  Agent hosts: {}", config.forward_proxy.hosts.agent_apps.len());
         println!("  Host mode:   {}", config.forward_proxy.hosts.mode);
         println!(
             "  Block:       {} hosts",
@@ -194,8 +196,11 @@ fn validate_forward_proxy(
     if proxy.hosts.mode == HostFilterMode::Selective
         && proxy.hosts.ai_inference.is_empty()
         && proxy.hosts.mcp.is_empty()
+        && proxy.hosts.agent_apps.is_empty()
     {
-        warnings.push("No AI/MCP host patterns configured; traffic will mostly tunnel".to_string());
+        warnings.push(
+            "No AI/MCP/Agent host patterns configured; traffic will mostly tunnel".to_string(),
+        );
     }
     if proxy.hosts.mode == HostFilterMode::Discovery {
         warnings.push(
@@ -289,10 +294,7 @@ async fn show_config(config_path: Option<&PathBuf>, format: &str) -> Result<()> 
             let content = fs::read_to_string(path).await?;
             serde_yaml::from_str::<SothConfig>(&content)?
         } else {
-            info!(
-                "Config file {} not found, showing defaults",
-                path.display()
-            );
+            info!("Config file {} not found, showing defaults", path.display());
             SothConfig::default()
         }
     } else {

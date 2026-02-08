@@ -3,6 +3,10 @@
 //! This module centralizes host/path/model fingerprinting used by the
 //! hudsucker transport hot path.
 
+fn host_eq_or_subdomain(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
 pub fn is_codex_path(path: &str) -> bool {
     let path_lower = path.to_ascii_lowercase();
     path_lower.contains("/backend-api/codex/")
@@ -15,7 +19,11 @@ pub fn is_codex_model(model: &str) -> bool {
 }
 
 pub fn is_chatgpt_web_host(host: &str) -> bool {
-    host.contains("chatgpt.com") || host == "chat.openai.com" || host.ends_with(".chat.openai.com")
+    host_eq_or_subdomain(host, "chatgpt.com") || host_eq_or_subdomain(host, "chat.openai.com")
+}
+
+pub fn is_gemini_web_host(host: &str) -> bool {
+    host_eq_or_subdomain(host, "gemini.google.com")
 }
 
 pub fn is_claude_web_host(host: &str) -> bool {
@@ -39,19 +47,19 @@ fn is_cursor_host(host: &str) -> bool {
 }
 
 fn is_copilot_host(host: &str) -> bool {
-    host.contains("githubcopilot.com") || host == "copilot-proxy.githubusercontent.com"
+    host_eq_or_subdomain(host, "githubcopilot.com") || host == "copilot-proxy.githubusercontent.com"
 }
 
 fn is_windsurf_host(host: &str) -> bool {
-    host == "server.codeium.com" || host.ends_with(".codeium.com")
+    host == "server.codeium.com" || host_eq_or_subdomain(host, "codeium.com")
 }
 
 fn is_zed_host(host: &str) -> bool {
-    host == "cloud.zed.dev" || host.ends_with(".zed.dev")
+    host == "cloud.zed.dev" || host_eq_or_subdomain(host, "zed.dev")
 }
 
 fn is_junie_host(host: &str) -> bool {
-    host == "api.jetbrains.ai" || host.ends_with(".jetbrains.ai")
+    host == "api.jetbrains.ai" || host_eq_or_subdomain(host, "jetbrains.ai")
 }
 
 fn is_amazon_q_host(host: &str) -> bool {
@@ -71,12 +79,25 @@ pub fn detect_agent_with_context(
     path: &str,
     model: Option<&str>,
 ) -> Option<&'static str> {
+    detect_agent_with_context_gated(ua_agent, host, path, model, true)
+}
+
+/// Same as `detect_agent_with_context`, but allows the caller to disable
+/// host-driven inference when a host is not in configured agent-app domains.
+pub fn detect_agent_with_context_gated(
+    ua_agent: Option<&'static str>,
+    host: &str,
+    path: &str,
+    model: Option<&str>,
+    allow_host_inference: bool,
+) -> Option<&'static str> {
     let host_lower = host.to_ascii_lowercase();
     let is_chatgpt_web = is_chatgpt_web_host(&host_lower);
+    let is_gemini_web = is_gemini_web_host(&host_lower);
     let is_claude_web = is_claude_web_host(&host_lower);
     let is_claude_edge = is_claude_agent_edge_host(&host_lower);
 
-    if is_chatgpt_web && is_codex_path(path) {
+    if allow_host_inference && is_chatgpt_web && is_codex_path(path) {
         return Some("codex");
     }
 
@@ -86,33 +107,38 @@ pub fn detect_agent_with_context(
         }
     }
 
-    if is_cursor_host(&host_lower) {
-        return Some("cursor");
-    }
-    if is_copilot_host(&host_lower) {
-        return Some("github-copilot");
-    }
-    if is_windsurf_host(&host_lower) {
-        return Some("windsurf");
-    }
-    if is_zed_host(&host_lower) {
-        return Some("zed");
-    }
-    if is_junie_host(&host_lower) {
-        return Some("junie");
-    }
-    if is_amazon_q_host(&host_lower) {
-        return Some("amazon-q");
-    }
-    if is_claude_code_host(&host_lower) {
-        return Some("claude-code");
-    }
+    if allow_host_inference {
+        if is_cursor_host(&host_lower) {
+            return Some("cursor");
+        }
+        if is_copilot_host(&host_lower) {
+            return Some("github-copilot");
+        }
+        if is_windsurf_host(&host_lower) {
+            return Some("windsurf");
+        }
+        if is_zed_host(&host_lower) {
+            return Some("zed");
+        }
+        if is_junie_host(&host_lower) {
+            return Some("junie");
+        }
+        if is_amazon_q_host(&host_lower) {
+            return Some("amazon-q");
+        }
+        if is_claude_code_host(&host_lower) {
+            return Some("claude-code");
+        }
 
-    if ua_agent.is_none() && is_chatgpt_web {
-        return Some("chatgpt");
-    }
-    if ua_agent.is_none() && (is_claude_web || is_claude_edge) {
-        return Some("claude");
+        if ua_agent.is_none() && is_chatgpt_web {
+            return Some("chatgpt");
+        }
+        if ua_agent.is_none() && is_gemini_web {
+            return Some("gemini");
+        }
+        if ua_agent.is_none() && (is_claude_web || is_claude_edge) {
+            return Some("claude");
+        }
     }
 
     ua_agent
@@ -125,6 +151,9 @@ pub fn detect_provider(host: &str) -> Option<&'static str> {
     // ChatGPT web/agent surfaces
     if is_chatgpt_web_host(&host) {
         Some("chatgpt")
+    // Gemini web/agent surfaces
+    } else if is_gemini_web_host(&host) {
+        Some("gemini")
     // Claude web/agent surfaces
     } else if is_claude_web_host(&host) || is_claude_agent_edge_host(&host) {
         Some("claude")
@@ -145,7 +174,7 @@ pub fn detect_provider(host: &str) -> Option<&'static str> {
     // OpenAI API inference endpoints
     } else if host == "api.openai.com"
         || host.ends_with(".api.openai.com")
-        || host.contains("openai.azure.com")
+        || host_eq_or_subdomain(&host, "openai.azure.com")
     {
         Some("openai")
     // Anthropic inference endpoints
@@ -186,13 +215,17 @@ pub fn detect_provider(host: &str) -> Option<&'static str> {
 }
 
 /// Check if host is an agent app (end-user application) vs direct API.
-/// Agent apps: chatgpt.com, claude.ai, editor-integrated coding agents.
+/// Agent apps: chatgpt.com, gemini.google.com, claude.ai, editor-integrated coding agents.
 pub fn is_agent_app(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
 
     // OpenAI/ChatGPT web apps (chat.openai.com, chatgpt.com)
     // Exclude api.openai.com which is direct API.
     if is_chatgpt_web_host(&host) {
+        return true;
+    }
+
+    if is_gemini_web_host(&host) {
         return true;
     }
 

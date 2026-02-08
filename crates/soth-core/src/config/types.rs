@@ -787,9 +787,29 @@ pub struct HostFilterConfig {
     #[serde(default = "default_mcp_service_hosts")]
     pub mcp: Vec<String>,
 
+    /// Hosts classified as agent app traffic (ChatGPT, Claude, Gemini web apps, IDE agents).
+    #[serde(default = "default_agent_app_hosts")]
+    pub agent_apps: Vec<String>,
+
+    /// Optional external domain-list files.
+    /// When set, each file replaces the corresponding inline list at load time.
+    #[serde(default)]
+    pub domain_files: HostDomainFilesConfig,
+
     /// Blocked hosts - these are rejected with 403
     #[serde(default)]
     pub block: Vec<String>,
+}
+
+/// Optional file paths for host domain classes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HostDomainFilesConfig {
+    /// YAML file for AI inference domains.
+    pub ai_inference: Option<PathBuf>,
+    /// YAML file for MCP domains.
+    pub mcp: Option<PathBuf>,
+    /// YAML file for agent app domains.
+    pub agent_apps: Option<PathBuf>,
 }
 
 /// Host filtering mode for forward proxy interception
@@ -817,6 +837,8 @@ fn default_ai_inference_hosts() -> Vec<String> {
         // ===== OpenAI / ChatGPT =====
         "api.openai.com".to_string(),
         "*.openai.azure.com".to_string(), // Azure OpenAI
+        "chat.openai.com".to_string(),    // Legacy ChatGPT web app
+        "*.chat.openai.com".to_string(),  // Legacy ChatGPT subdomains
         "chatgpt.com".to_string(),        // ChatGPT web app
         "*.chatgpt.com".to_string(),      // ChatGPT WebSocket (ws.chatgpt.com)
         // ===== Anthropic =====
@@ -825,9 +847,11 @@ fn default_ai_inference_hosts() -> Vec<String> {
         "claude.ai".to_string(),       // Claude Desktop app
         "*.claude.ai".to_string(),     // Claude Desktop WebSocket connections
         // ===== Google =====
+        "gemini.google.com".to_string(),   // Gemini web app
+        "*.gemini.google.com".to_string(), // Gemini web subdomains
         "generativelanguage.googleapis.com".to_string(), // Gemini API
-        "aiplatform.googleapis.com".to_string(),         // Vertex AI
-        "*-aiplatform.googleapis.com".to_string(),       // Regional
+        "aiplatform.googleapis.com".to_string(), // Vertex AI
+        "*-aiplatform.googleapis.com".to_string(), // Regional
         "*.aiplatform.googleapis.com".to_string(),
         // ===== AWS Bedrock =====
         "bedrock.*.amazonaws.com".to_string(),
@@ -1163,6 +1187,47 @@ fn default_mcp_service_hosts() -> Vec<String> {
     ]
 }
 
+fn default_agent_app_hosts() -> Vec<String> {
+    dedupe_hosts(vec![
+        // ===== OpenAI / ChatGPT =====
+        "chat.openai.com".to_string(),
+        "*.chat.openai.com".to_string(),
+        "chatgpt.com".to_string(),
+        "*.chatgpt.com".to_string(),
+        // ===== Google Gemini =====
+        "gemini.google.com".to_string(),
+        "*.gemini.google.com".to_string(),
+        // ===== Anthropic / Claude =====
+        "claude.ai".to_string(),
+        "*.claude.ai".to_string(),
+        "a-api.anthropic.com".to_string(),
+        "*.a-api.anthropic.com".to_string(),
+        "a-cdn.anthropic.com".to_string(),
+        "*.a-cdn.anthropic.com".to_string(),
+        "s-cdn.anthropic.com".to_string(),
+        "*.s-cdn.anthropic.com".to_string(),
+        "statsig.anthropic.com".to_string(),
+        // ===== IDE-native agents =====
+        "api2.cursor.sh".to_string(),
+        "api3.cursor.sh".to_string(),
+        "*.cursor.sh".to_string(),
+        "*.githubcopilot.com".to_string(),
+        "copilot-proxy.githubusercontent.com".to_string(),
+        "server.codeium.com".to_string(),
+        "*.codeium.com".to_string(),
+        "cloud.zed.dev".to_string(),
+        "*.zed.dev".to_string(),
+        "api.jetbrains.ai".to_string(),
+        "*.jetbrains.ai".to_string(),
+        "codewhisperer.*.amazonaws.com".to_string(),
+        // ===== Other web agent apps =====
+        "perplexity.ai".to_string(),
+        "*.perplexity.ai".to_string(),
+        "aistudio.google.com".to_string(),
+        "makersuite.google.com".to_string(),
+    ])
+}
+
 fn dedupe_hosts(hosts: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::with_capacity(hosts.len());
     let mut deduped = Vec::with_capacity(hosts.len());
@@ -1180,6 +1245,8 @@ impl Default for HostFilterConfig {
             mode: HostFilterMode::default(),
             ai_inference: default_ai_inference_hosts(),
             mcp: default_mcp_service_hosts(),
+            agent_apps: default_agent_app_hosts(),
+            domain_files: HostDomainFilesConfig::default(),
             block: Vec::new(),
         }
     }
@@ -1190,6 +1257,17 @@ impl HostFilterConfig {
         patterns
             .iter()
             .any(|pattern| Self::matches_pattern(host, pattern))
+    }
+
+    /// API endpoints that should stay in AI inference class even if they match
+    /// a broad agent-app wildcard.
+    fn is_ai_api_host(host: &str) -> bool {
+        host == "api.openai.com"
+            || host.ends_with(".api.openai.com")
+            || host == "api.anthropic.com"
+            || host.ends_with(".api.anthropic.com")
+            || host == "api.claude.ai"
+            || host.ends_with(".api.claude.ai")
     }
 
     /// Check if host is in AI inference/app whitelist.
@@ -1206,6 +1284,14 @@ impl HostFilterConfig {
         }
     }
 
+    /// Check if host is in agent app whitelist.
+    pub fn should_check_agent_app(&self, host: &str) -> bool {
+        if Self::is_ai_api_host(host) {
+            return false;
+        }
+        Self::matches_any(host, &self.agent_apps)
+    }
+
     /// Number of unique host patterns that can trigger interception.
     pub fn intercept_domain_count(&self) -> usize {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1215,12 +1301,17 @@ impl HostFilterConfig {
         for host in &self.mcp {
             seen.insert(host.as_str());
         }
+        for host in &self.agent_apps {
+            seen.insert(host.as_str());
+        }
         seen.len()
     }
 
     /// Check if a host should be intercepted (full MITM)
     pub fn should_intercept(&self, host: &str) -> bool {
-        self.should_check_ai_inference(host) || self.should_check_mcp(host)
+        self.should_check_ai_inference(host)
+            || self.should_check_mcp(host)
+            || self.should_check_agent_app(host)
     }
 
     /// Check if a host is blocked (rejected with 403)
@@ -1717,6 +1808,8 @@ upstream:
             mode: HostFilterMode::Selective,
             ai_inference: vec!["api.openai.com".to_string()],
             mcp: vec![],
+            agent_apps: vec![],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec![],
         };
         assert_eq!(
@@ -1736,6 +1829,8 @@ upstream:
             mode: HostFilterMode::Selective,
             ai_inference: vec![],
             mcp: vec![],
+            agent_apps: vec![],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec!["blocked.com".to_string()],
         };
         assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Tunnel);
@@ -1779,6 +1874,8 @@ upstream:
                 "*.openai.azure.com".to_string(),
             ],
             mcp: vec![],
+            agent_apps: vec![],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec![],
         };
 
@@ -1798,6 +1895,8 @@ upstream:
                 "*.huggingface.co".to_string(),        // Prefix wildcard
             ],
             mcp: vec![],
+            agent_apps: vec![],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec![],
         };
 
@@ -1830,10 +1929,13 @@ upstream:
         let ai_domains = vec![
             // OpenAI
             "api.openai.com",
+            "chat.openai.com",
+            "ws.chat.openai.com",
             "myinstance.openai.azure.com",
             // Anthropic
             "api.anthropic.com",
             // Google
+            "gemini.google.com",
             "generativelanguage.googleapis.com",
             "aiplatform.googleapis.com",
             "us-central1-aiplatform.googleapis.com",
@@ -1920,19 +2022,64 @@ upstream:
     }
 
     #[test]
+    fn test_default_agent_app_domain_seed_coverage() {
+        let agent_hosts = default_agent_app_hosts();
+        assert!(
+            agent_hosts.contains(&"chatgpt.com".to_string()),
+            "chatgpt.com should be in agent app seed list"
+        );
+        assert!(
+            agent_hosts.contains(&"claude.ai".to_string()),
+            "claude.ai should be in agent app seed list"
+        );
+        assert!(
+            agent_hosts.contains(&"gemini.google.com".to_string()),
+            "gemini.google.com should be in agent app seed list"
+        );
+    }
+
+    #[test]
     fn test_separate_ai_and_mcp_whitelists() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
             ai_inference: vec!["api.openai.com".to_string()],
             mcp: vec!["api.github.com".to_string()],
+            agent_apps: vec!["chatgpt.com".to_string()],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec![],
         };
 
         assert!(filter.should_check_ai_inference("api.openai.com"));
         assert!(!filter.should_check_mcp("api.openai.com"));
+        assert!(!filter.should_check_agent_app("api.openai.com"));
 
         assert!(filter.should_check_mcp("api.github.com"));
         assert!(!filter.should_check_ai_inference("api.github.com"));
+
+        assert!(filter.should_check_agent_app("chatgpt.com"));
+        assert!(!filter.should_check_mcp("chatgpt.com"));
+    }
+
+    #[test]
+    fn test_host_filter_intercepts_agent_app_hosts() {
+        let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
+            ai_inference: vec![],
+            mcp: vec![],
+            agent_apps: vec!["chatgpt.com".to_string()],
+            domain_files: HostDomainFilesConfig::default(),
+            block: vec![],
+        };
+
+        assert!(filter.should_intercept("chatgpt.com"));
+        assert!(!filter.should_intercept("api.openai.com"));
+    }
+
+    #[test]
+    fn test_agent_app_class_excludes_claude_api_host() {
+        let filter = HostFilterConfig::default();
+        assert!(!filter.should_check_agent_app("api.claude.ai"));
+        assert!(filter.should_check_agent_app("claude.ai"));
     }
 
     #[test]
@@ -1972,6 +2119,8 @@ upstream:
             mode: HostFilterMode::Selective,
             ai_inference: vec!["*".to_string()],
             mcp: vec![],
+            agent_apps: vec![],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec![],
         };
 
@@ -1995,6 +2144,8 @@ upstream:
             mode: HostFilterMode::Discovery,
             ai_inference: vec![],
             mcp: vec![],
+            agent_apps: vec![],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec!["malware.com".to_string()],
         };
 
@@ -2017,6 +2168,8 @@ upstream:
             mode: HostFilterMode::Selective,
             ai_inference: vec!["api.openai.com".to_string()],
             mcp: vec![],
+            agent_apps: vec![],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec!["malware.com".to_string(), "*.bad.com".to_string()],
         };
 
@@ -2113,6 +2266,30 @@ forward_proxy:
         // Other hosts tunneled by default
         assert_eq!(
             config.forward_proxy.hosts.action_for_host("other.com"),
+            HostAction::Tunnel
+        );
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_yaml_agent_apps_only() {
+        use super::HostAction;
+        let yaml = r#"
+forward_proxy:
+  enabled: true
+  hosts:
+    ai_inference: []
+    mcp: []
+    agent_apps:
+      - "chatgpt.com"
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("chatgpt.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("api.openai.com"),
             HostAction::Tunnel
         );
     }
@@ -2308,6 +2485,8 @@ production:
             mode: HostFilterMode::Selective,
             ai_inference: vec![],
             mcp: vec![],
+            agent_apps: vec![],
+            domain_files: HostDomainFilesConfig::default(),
             block: vec!["localhost".to_string(), "127.0.0.1".to_string()],
         };
 

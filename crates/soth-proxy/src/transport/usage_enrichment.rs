@@ -22,7 +22,7 @@ fn parser_fallback_host(provider: &str) -> Option<&'static str> {
     match provider {
         "openai" | "chatgpt" | "codex" | "github-copilot" => Some("api.openai.com"),
         "anthropic" | "claude" | "claude-code" => Some("api.anthropic.com"),
-        "google" => Some("generativelanguage.googleapis.com"),
+        "google" | "gemini" => Some("generativelanguage.googleapis.com"),
         _ => None,
     }
 }

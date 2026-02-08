@@ -1,6 +1,6 @@
 //! Integration tests for forward proxy functionality
 
-use soth_core::config::{ForwardProxyConfig, HostFilterConfig, HostFilterMode};
+use soth_core::config::{ForwardProxyConfig, HostDomainFilesConfig, HostFilterConfig, HostFilterMode};
 use soth_proxy::providers::{HttpRequest, ProviderRegistry};
 use soth_tls::CertificateAuthority;
 use std::time::Duration;
@@ -81,6 +81,8 @@ fn test_host_filter_ai_list() {
             "api.anthropic.com".to_string(),
         ],
         mcp: vec![],
+        agent_apps: vec![],
+        domain_files: HostDomainFilesConfig::default(),
         block: vec![],
     };
 
@@ -109,6 +111,8 @@ fn test_host_filter_selective() {
             "api.anthropic.com".to_string(),
         ],
         mcp: vec![],
+        agent_apps: vec![],
+        domain_files: HostDomainFilesConfig::default(),
         block: vec!["blocked.com".to_string()],
     };
 

@@ -93,34 +93,7 @@ pub fn detect_from_process_tree() -> Option<AgentInfo> {
         .trim()
         .to_lowercase();
 
-    // Match known agent processes
-    if parent_name.contains("claude") {
-        if parent_name.contains("desktop") || parent_name.contains("electron") {
-            return Some(AgentInfo::new(
-                "Claude Desktop",
-                DetectionSource::ProcessTree,
-            ));
-        }
-        return Some(AgentInfo::new("Claude", DetectionSource::ProcessTree));
-    }
-
-    if parent_name.contains("cursor") {
-        return Some(AgentInfo::new("Cursor", DetectionSource::ProcessTree));
-    }
-
-    if parent_name.contains("windsurf") || parent_name.contains("codeium") {
-        return Some(AgentInfo::new("Windsurf", DetectionSource::ProcessTree));
-    }
-
-    if parent_name.contains("zed") {
-        return Some(AgentInfo::new("Zed", DetectionSource::ProcessTree));
-    }
-
-    if parent_name.contains("code") {
-        return Some(AgentInfo::new("VS Code", DetectionSource::ProcessTree));
-    }
-
-    None
+    classify_process_name(&parent_name)
 }
 
 #[cfg(not(unix))]
@@ -132,6 +105,14 @@ pub fn detect_from_process_tree() -> Option<AgentInfo> {
 /// Normalize agent name for consistency
 fn normalize_agent_name(raw: &str) -> String {
     let lower = raw.to_lowercase();
+
+    if lower.contains("codex") {
+        return "Codex".to_string();
+    }
+
+    if lower.contains("chatgpt") {
+        return "ChatGPT".to_string();
+    }
 
     // Claude variants
     if lower.contains("claude") {
@@ -186,6 +167,47 @@ fn normalize_agent_name(raw: &str) -> String {
     raw.to_string()
 }
 
+fn classify_process_name(parent_name: &str) -> Option<AgentInfo> {
+    if parent_name.contains("codex") {
+        return Some(AgentInfo::new("Codex", DetectionSource::ProcessTree));
+    }
+
+    if parent_name.contains("claude") {
+        if parent_name.contains("desktop") || parent_name.contains("electron") {
+            return Some(AgentInfo::new(
+                "Claude Desktop",
+                DetectionSource::ProcessTree,
+            ));
+        }
+        if parent_name.contains("code") || parent_name.contains("cli") {
+            return Some(AgentInfo::new("Claude Code", DetectionSource::ProcessTree));
+        }
+        return Some(AgentInfo::new("Claude", DetectionSource::ProcessTree));
+    }
+
+    if parent_name.contains("cursor") {
+        return Some(AgentInfo::new("Cursor", DetectionSource::ProcessTree));
+    }
+
+    if parent_name.contains("windsurf") || parent_name.contains("codeium") {
+        return Some(AgentInfo::new("Windsurf", DetectionSource::ProcessTree));
+    }
+
+    if parent_name.contains("zed") {
+        return Some(AgentInfo::new("Zed", DetectionSource::ProcessTree));
+    }
+
+    if parent_name == "code"
+        || parent_name == "code-insiders"
+        || parent_name.contains("vscode")
+        || parent_name.contains("visual studio code")
+    {
+        return Some(AgentInfo::new("VS Code", DetectionSource::ProcessTree));
+    }
+
+    None
+}
+
 /// Try all detection methods in order of reliability
 pub fn detect_agent() -> AgentInfo {
     // 1. Environment is most reliable
@@ -208,6 +230,8 @@ mod tests {
 
     #[test]
     fn test_normalize_agent_name() {
+        assert_eq!(normalize_agent_name("OpenAI Codex"), "Codex");
+        assert_eq!(normalize_agent_name("chatgpt-desktop"), "ChatGPT");
         assert_eq!(normalize_agent_name("Claude Desktop"), "Claude Desktop");
         assert_eq!(normalize_agent_name("claude-desktop"), "Claude Desktop");
         assert_eq!(normalize_agent_name("Claude Code"), "Claude Code");
@@ -253,5 +277,29 @@ mod tests {
     fn test_detect_from_initialize_missing() {
         let params = serde_json::json!({});
         assert!(detect_from_initialize(&params).is_none());
+    }
+
+    #[test]
+    fn test_classify_process_name_codex_precedes_vscode() {
+        let agent = classify_process_name("codex").expect("expected codex classification");
+        assert_eq!(agent.name, "Codex");
+    }
+
+    #[test]
+    fn test_classify_process_name_vscode() {
+        let agent = classify_process_name("code").expect("expected vscode classification");
+        assert_eq!(agent.name, "VS Code");
+    }
+
+    #[test]
+    fn test_classify_process_name_claude_code() {
+        let agent =
+            classify_process_name("claude-code").expect("expected claude-code classification");
+        assert_eq!(agent.name, "Claude Code");
+    }
+
+    #[test]
+    fn test_classify_process_name_no_false_positive_for_xcode() {
+        assert!(classify_process_name("xcodebuild").is_none());
     }
 }

@@ -97,6 +97,35 @@ struct OutboundProcessResult {
     forward_to_client: Option<String>,
 }
 
+fn detection_source_rank(source: DetectionSource) -> u8 {
+    match source {
+        DetectionSource::CommandLine => 4,
+        DetectionSource::McpInitialize => 3,
+        DetectionSource::Environment => 2,
+        DetectionSource::ProcessTree => 1,
+        DetectionSource::Unknown => 0,
+    }
+}
+
+fn should_promote_agent(current: &AgentInfo, candidate: &AgentInfo) -> bool {
+    // Never override explicit operator input.
+    if matches!(current.detected_from, DetectionSource::CommandLine) {
+        return false;
+    }
+
+    let current_rank = detection_source_rank(current.detected_from);
+    let candidate_rank = detection_source_rank(candidate.detected_from);
+    if candidate_rank > current_rank {
+        return true;
+    }
+
+    // If we already trust initialize info, allow enrichments like version fill.
+    candidate_rank == current_rank
+        && matches!(candidate.detected_from, DetectionSource::McpInitialize)
+        && current.version.is_none()
+        && candidate.version.is_some()
+}
+
 impl WrapSession {
     fn new(
         server_name: String,
@@ -154,18 +183,16 @@ impl WrapSession {
 
     async fn update_agent(&self, agent: AgentInfo) {
         let mut current = self.agent.write().await;
-        // Only update if we have better detection
-        if matches!(current.detected_from, DetectionSource::Unknown)
-            || (matches!(current.detected_from, DetectionSource::Environment)
-                && matches!(agent.detected_from, DetectionSource::McpInitialize))
-        {
+        if should_promote_agent(&current, &agent) {
             *current = agent.clone();
         }
+        let effective_agent = current.clone();
+        drop(current);
 
         // Also update recorder's agent info
         if let Some(ref recorder) = self.recorder {
             recorder
-                .set_agent_info(agent.name.clone(), agent.version.clone())
+                .set_agent_info(effective_agent.name, effective_agent.version)
                 .await;
         }
     }
@@ -1091,5 +1118,28 @@ mod tests {
         assert_eq!(event.output_tokens, Some(5));
         assert_eq!(event.token_count, Some(15));
         assert_eq!(event.cost_usd, Some(0.42));
+    }
+
+    #[test]
+    fn test_should_promote_agent_process_tree_to_initialize() {
+        let current = AgentInfo::new("Claude", DetectionSource::ProcessTree);
+        let candidate =
+            AgentInfo::new("Claude Code", DetectionSource::McpInitialize).with_version("1.2.3");
+        assert!(should_promote_agent(&current, &candidate));
+    }
+
+    #[test]
+    fn test_should_not_promote_over_command_line_override() {
+        let current = AgentInfo::new("Manual Agent", DetectionSource::CommandLine);
+        let candidate = AgentInfo::new("Claude Code", DetectionSource::McpInitialize);
+        assert!(!should_promote_agent(&current, &candidate));
+    }
+
+    #[test]
+    fn test_should_promote_initialize_when_version_is_missing() {
+        let current = AgentInfo::new("Claude Code", DetectionSource::McpInitialize);
+        let candidate =
+            AgentInfo::new("Claude Code", DetectionSource::McpInitialize).with_version("1.2.3");
+        assert!(should_promote_agent(&current, &candidate));
     }
 }

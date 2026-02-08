@@ -127,4 +127,78 @@ impl TrafficEnvelope {
             request_body: request_body.map(ToString::to_string),
         }
     }
+
+    /// Create a normalized proxy envelope for MCP JSON-RPC over HTTP/WebSocket.
+    pub fn mcp_http(
+        session_id: impl Into<String>,
+        request_id: Option<impl Into<String>>,
+        method: impl Into<String>,
+        host: impl Into<String>,
+        path: impl Into<String>,
+        agent: Option<&str>,
+        did: Option<&str>,
+        signature: Option<&str>,
+        request_body: Option<&str>,
+    ) -> Self {
+        Self {
+            envelope_id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.into(),
+            request_id: request_id.map(|v| v.into()),
+            capture_source: CaptureSource::Proxy,
+            source: TrafficSource::McpHttp,
+            captured_at: Utc::now(),
+            method: method.into(),
+            provider: None,
+            host: Some(host.into()),
+            path: Some(path.into()),
+            model: None,
+            agent: agent.map(ToString::to_string),
+            did: did.map(ToString::to_string),
+            signature: signature.map(ToString::to_string),
+            request_body: request_body.map(ToString::to_string),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureSource, TrafficEnvelope, TrafficSource};
+
+    #[test]
+    fn test_mcp_stdio_envelope_shape() {
+        let envelope = TrafficEnvelope::mcp_stdio(
+            "session-1",
+            Some("request-1"),
+            "tools/list",
+            Some("cursor"),
+            None,
+            None,
+            Some("{\"jsonrpc\":\"2.0\"}"),
+        );
+
+        assert_eq!(envelope.capture_source, CaptureSource::Wrap);
+        assert_eq!(envelope.source, TrafficSource::McpStdio);
+        assert_eq!(envelope.host, None);
+        assert_eq!(envelope.path, None);
+    }
+
+    #[test]
+    fn test_mcp_http_envelope_shape() {
+        let envelope = TrafficEnvelope::mcp_http(
+            "session-1",
+            Some("request-1"),
+            "tools/list",
+            "api.github.com",
+            "/mcp",
+            Some("cursor"),
+            None,
+            None,
+            Some("{\"jsonrpc\":\"2.0\"}"),
+        );
+
+        assert_eq!(envelope.capture_source, CaptureSource::Proxy);
+        assert_eq!(envelope.source, TrafficSource::McpHttp);
+        assert_eq!(envelope.host.as_deref(), Some("api.github.com"));
+        assert_eq!(envelope.path.as_deref(), Some("/mcp"));
+    }
 }

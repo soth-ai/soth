@@ -44,10 +44,12 @@ pub fn resolve_config_path(
     discover_default_config_path()
 }
 
-pub fn load_effective_config(explicit: Option<&PathBuf>, global: Option<&PathBuf>) -> Result<SothConfig> {
+pub fn load_effective_config(
+    explicit: Option<&PathBuf>,
+    global: Option<&PathBuf>,
+) -> Result<SothConfig> {
     if let Some(path) = resolve_config_path(explicit, global) {
         return Ok(load_config(path)?);
     }
     Ok(SothConfig::default())
 }
-
