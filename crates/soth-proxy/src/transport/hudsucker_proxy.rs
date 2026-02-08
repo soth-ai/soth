@@ -19,7 +19,7 @@ use hudsucker::{
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use soth_budget::{BudgetTracker, PricingCatalog};
+use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
 use soth_policy::PolicyEngine;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
@@ -862,7 +862,6 @@ fn decode_payload_for_logging(bytes: &[u8], encoding: Option<&str>) -> (Vec<u8>,
     let rendered = render_decoded_body_for_logging(&decoded, encoding);
     (decoded, rendered)
 }
-
 fn is_gemini_bard_stream_path(path: &str) -> bool {
     path.to_ascii_lowercase()
         .contains("bardfrontendservice/streamgenerate")
@@ -954,6 +953,41 @@ fn extract_gemini_bard_stream_text(raw: &str) -> Option<String> {
     }
 
     longest
+}
+
+/// Record proxy spend using response usage as the primary source, with request-body
+/// token estimation as fallback when provider usage is unavailable.
+fn record_proxy_budget_spend(
+    tracker: &BudgetTracker,
+    session_id: &str,
+    pending: &PendingRequest,
+    usage_meta: &ResponseUsageMeta,
+) {
+    let input_tokens = usage_meta.input_tokens.unwrap_or_else(|| {
+        pending
+            .request_content
+            .as_deref()
+            .map(TokenCounter::estimate_tokens)
+            .unwrap_or(0)
+    });
+    let output_tokens = usage_meta.output_tokens.unwrap_or(0);
+
+    if input_tokens == 0 && output_tokens == 0 {
+        return;
+    }
+
+    let model = usage_meta
+        .model
+        .as_deref()
+        .or(pending.model.as_deref())
+        .unwrap_or("unknown");
+    let agent_id = pending
+        .envelope
+        .as_ref()
+        .and_then(|envelope| envelope.did.as_deref())
+        .or(pending.agent);
+
+    tracker.record_spend(session_id, agent_id, model, input_tokens, output_tokens);
 }
 
 /// AI-aware HTTP handler for hudsucker
@@ -1687,6 +1721,10 @@ impl HttpHandler for AiProxyHandler {
         let request_id = request_id_from_ctx(ctx);
         let provider_registry = self.provider_registry.clone();
         let pricing_catalog = self.pricing_catalog.clone();
+        let budget_tracker = self
+            .enforcer
+            .as_ref()
+            .and_then(|enforcer| enforcer.budget_tracker.clone());
 
         #[cfg(feature = "dashboard")]
         let dashboard = self.dashboard.clone();
@@ -1880,6 +1918,7 @@ impl HttpHandler for AiProxyHandler {
                 let log_event_id = pending.event_id.clone();
                 let log_provider_registry = provider_registry.clone();
                 let log_pricing_catalog = pricing_catalog.clone();
+                let log_budget_tracker = budget_tracker.clone();
                 #[cfg(feature = "dashboard")]
                 let log_dashboard = dashboard.clone();
 
@@ -1943,6 +1982,14 @@ impl HttpHandler for AiProxyHandler {
                         log_is_sse,
                         log_pending.model.as_deref(),
                     );
+                    if let Some(ref tracker) = log_budget_tracker {
+                        record_proxy_budget_spend(
+                            tracker,
+                            &log_session_id,
+                            &log_pending,
+                            &usage_meta,
+                        );
+                    }
                     let response_text = if is_gemini_bard_stream_path(&log_pending.path) {
                         extract_gemini_bard_stream_text(&raw_content).unwrap_or(raw_content)
                     } else {
@@ -2035,6 +2082,12 @@ impl HttpHandler for AiProxyHandler {
                 latency_ms = latency_ms,
                 "AI API response"
             );
+
+            if !logged_in_stream {
+                if let Some(ref tracker) = budget_tracker {
+                    record_proxy_budget_spend(tracker, &session_id, &pending, &response_usage);
+                }
+            }
 
             #[cfg(feature = "dashboard")]
             if !logged_in_stream {

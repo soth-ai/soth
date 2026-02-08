@@ -5,6 +5,7 @@ import type {
   PolicyMetrics,
   ObserveMetrics,
   BudgetMetrics,
+  BudgetPrimitives,
   AdvancedBudgetMetrics,
   ProxyMetrics,
   HealthResponse,
@@ -70,6 +71,14 @@ export function useAdvancedBudgetMetrics() {
     queryKey: ["budget", "advanced"],
     queryFn: () => fetchJson<ApiResponse<AdvancedBudgetMetrics>>("/budget/advanced"),
     refetchInterval: 5000,
+  });
+}
+
+export function useBudgetPrimitives() {
+  return useQuery({
+    queryKey: ["budget", "primitives"],
+    queryFn: () => fetchJson<ApiResponse<BudgetPrimitives>>("/budget/primitives"),
+    refetchInterval: 2000,
   });
 }
 
