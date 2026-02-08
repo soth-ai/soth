@@ -87,9 +87,9 @@ function buildTrend(requests: BudgetRequestPrimitive[]): TrendPoint[] {
     .slice(-24);
 }
 
-function buildBreakdownRows(
+function buildRequestBreakdownRows(
   requests: BudgetRequestPrimitive[],
-  mode: BreakdownMode
+  mode: Exclude<BreakdownMode, "provider">
 ): BreakdownRow[] {
   const grouped = new Map<
     string,
@@ -106,11 +106,9 @@ function buildBreakdownRows(
 
   for (const request of requests) {
     const key =
-      mode === "provider"
-        ? request.provider || "unknown"
-        : mode === "model"
-          ? request.model || "unknown"
-          : `${request.method} ${normalizePath(request.path)}`;
+      mode === "model"
+        ? request.model || "unknown"
+        : `${request.method} ${normalizePath(request.path)}`;
 
     const current = grouped.get(key) || {
       requests: 0,
@@ -148,6 +146,44 @@ function buildBreakdownRows(
       avgLatencyMs:
         value.latencyCount > 0 ? value.latencySum / value.latencyCount : null,
     }))
+    .sort((a, b) => b.totalCost - a.totalCost || b.totalTokens - a.totalTokens)
+    .slice(0, 50);
+}
+
+function buildProviderBreakdownRows(
+  primitives: BudgetPrimitives | undefined
+): BreakdownRow[] {
+  if (!primitives || primitives.provider_breakdown.length === 0) {
+    return [];
+  }
+
+  const latencyByProvider = new Map<string, { sum: number; count: number }>();
+  for (const request of primitives.recent_requests) {
+    if (typeof request.latency_ms !== "number") {
+      continue;
+    }
+    const key = request.provider || "unknown";
+    const current = latencyByProvider.get(key) || { sum: 0, count: 0 };
+    current.sum += request.latency_ms;
+    current.count += 1;
+    latencyByProvider.set(key, current);
+  }
+
+  return primitives.provider_breakdown
+    .map((provider) => {
+      const latency = latencyByProvider.get(provider.provider);
+      return {
+        key: provider.provider,
+        requests: provider.request_count,
+        inputTokens: provider.input_tokens,
+        outputTokens: provider.output_tokens,
+        totalTokens: provider.total_tokens,
+        totalCost: provider.total_cost_usd,
+        avgCost: provider.avg_cost_per_request,
+        avgLatencyMs:
+          latency && latency.count > 0 ? latency.sum / latency.count : null,
+      };
+    })
     .sort((a, b) => b.totalCost - a.totalCost || b.totalTokens - a.totalTokens)
     .slice(0, 50);
 }
@@ -356,8 +392,11 @@ export default function BudgetPage() {
     [primitives, advanced]
   );
   const breakdownRows = useMemo(
-    () => buildBreakdownRows(primitives?.recent_requests || [], breakdown),
-    [primitives?.recent_requests, breakdown]
+    () =>
+      breakdown === "provider"
+        ? buildProviderBreakdownRows(primitives)
+        : buildRequestBreakdownRows(primitives?.recent_requests || [], breakdown),
+    [primitives, primitives?.recent_requests, breakdown]
   );
 
   const utilization = primitives?.utilization_pct || 0;

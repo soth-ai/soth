@@ -23,6 +23,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { PresetDropdown } from "./PresetDropdown";
 import { buildApiUrl } from "@/lib/endpoints";
+import { useBudgetPrimitives } from "@/hooks/useDashboardData";
 import { cn } from "@/lib/utils";
 import type { ApiResponse, BudgetPrimitives } from "@/types";
 
@@ -50,6 +51,8 @@ export function CommandBar() {
   const setFilters = useObservabilityStore((state) => state.setFilters);
   const clearFilters = useObservabilityStore((state) => state.clearFilters);
   const clearLogs = useObservabilityStore((state) => state.clearLogs);
+  const { data: budgetPrimitivesResponse } = useBudgetPrimitives();
+  const budgetPrimitives = budgetPrimitivesResponse?.data;
   const [isExportingBudget, setIsExportingBudget] = useState(false);
 
   const handleExportBudget = async () => {
@@ -125,6 +128,15 @@ export function CommandBar() {
   }, [filteredBySource]);
 
   const metrics = useMemo(() => computeLogMetrics(filteredBySource), [filteredBySource]);
+  const useCanonicalBudgetSignals = !filters.source || filters.source === "ai_proxy";
+  const displayTotalTokens =
+    useCanonicalBudgetSignals && budgetPrimitives
+      ? budgetPrimitives.total_tokens
+      : counts.totalTokens;
+  const displayTotalCost =
+    useCanonicalBudgetSignals && budgetPrimitives
+      ? budgetPrimitives.total_cost_usd
+      : counts.totalCost;
 
   // Check which filters are active
   const hasActiveFilters = !!(
@@ -312,16 +324,16 @@ export function CommandBar() {
           <span className="font-mono font-bold tabular-nums text-foreground">{metrics.totalMessages}</span>
           <span>events</span>
         </div>
-        {counts.totalTokens > 0 && (
+        {displayTotalTokens > 0 && (
           <div className="flex items-center gap-1.5 text-purple-500">
-            <span className="font-mono font-medium tabular-nums">{(counts.totalTokens / 1000).toFixed(1)}k</span>
+            <span className="font-mono font-medium tabular-nums">{(displayTotalTokens / 1000).toFixed(1)}k</span>
             <span className="text-muted-foreground">tokens</span>
           </div>
         )}
-        {counts.totalCost > 0 && (
+        {displayTotalCost > 0 && (
           <div className="flex items-center gap-1.5">
             <CurrencyDollar className="w-3 h-3 text-emerald-500" weight="duotone" />
-            <span className="font-mono font-bold text-emerald-500 tabular-nums">${counts.totalCost.toFixed(4)}</span>
+            <span className="font-mono font-bold text-emerald-500 tabular-nums">${displayTotalCost.toFixed(4)}</span>
           </div>
         )}
         <div className="flex items-center gap-1.5">
