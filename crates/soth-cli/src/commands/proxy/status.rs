@@ -66,7 +66,9 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         Cell::new(proxy_addr.to_string().cyan().to_string()),
     ]);
 
-    let running = tokio::net::TcpStream::connect(proxy_addr.as_str()).await.is_ok();
+    let running = tokio::net::TcpStream::connect(proxy_addr.as_str())
+        .await
+        .is_ok();
     let status_display = if running {
         format!("{} Running", style::CHECK.green())
     } else {

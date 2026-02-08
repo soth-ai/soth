@@ -1,6 +1,7 @@
 //! Initialize command
 
 use anyhow::Result;
+use soth_core::config::HostFilterConfig;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::info;
@@ -15,12 +16,15 @@ forward_proxy:
   port: 8080
   hosts:
     mode: "selective"  # selective | discovery
-    ai_inference:
-      - "api.openai.com"
-      - "api.anthropic.com"
-      - "chatgpt.com"
-      - "*.chatgpt.com"
+    # Domain classes are loaded from dedicated files (recommended).
+    # If a file is configured, it replaces the corresponding inline list.
+    domain_files:
+      ai_inference: "./domains/ai_inference.yaml"
+      mcp: "./domains/mcp.yaml"
+      agent_apps: "./domains/agent_apps.yaml"
+    ai_inference: []
     mcp: []
+    agent_apps: []
     block: []
 
 # Identity configuration
@@ -121,6 +125,17 @@ rules:
     action: allow
 "#;
 
+fn render_domain_list(comment: &str, domains: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str(comment);
+    out.push('\n');
+    out.push_str("domains:\n");
+    for domain in domains {
+        out.push_str(&format!("  - \"{}\"\n", domain));
+    }
+    out
+}
+
 /// Run the init command
 pub async fn run(output: PathBuf) -> Result<()> {
     info!("Initializing SOTH in {:?}", output);
@@ -153,6 +168,33 @@ pub async fn run(output: PathBuf) -> Result<()> {
     fs::create_dir_all(&logs_dir).await?;
     info!("Created logs directory: {:?}", logs_dir);
 
+    // Create domain-list files from canonical defaults.
+    let default_hosts = HostFilterConfig::default();
+    let ai_domain_content =
+        render_domain_list("# AI inference/API domains", &default_hosts.ai_inference);
+    let mcp_domain_content =
+        render_domain_list("# MCP transport/service domains", &default_hosts.mcp);
+    let agent_domain_content =
+        render_domain_list("# Agent app domains (chat/web/IDE agents)", &default_hosts.agent_apps);
+
+    let domains_dir = output.join("domains");
+    fs::create_dir_all(&domains_dir).await?;
+    let ai_domains_path = domains_dir.join("ai_inference.yaml");
+    if !ai_domains_path.exists() {
+        fs::write(&ai_domains_path, ai_domain_content).await?;
+        info!("Created AI domain list: {:?}", ai_domains_path);
+    }
+    let mcp_domains_path = domains_dir.join("mcp.yaml");
+    if !mcp_domains_path.exists() {
+        fs::write(&mcp_domains_path, mcp_domain_content).await?;
+        info!("Created MCP domain list: {:?}", mcp_domains_path);
+    }
+    let agent_domains_path = domains_dir.join("agent_apps.yaml");
+    if !agent_domains_path.exists() {
+        fs::write(&agent_domains_path, agent_domain_content).await?;
+        info!("Created agent app domain list: {:?}", agent_domains_path);
+    }
+
     // Create .soth directory in home
     if let Some(home) = dirs::home_dir() {
         let soth_dir = home.join(".soth");
@@ -166,9 +208,10 @@ pub async fn run(output: PathBuf) -> Result<()> {
 
     println!("\n✓ SOTH initialized successfully!");
     println!("\nNext steps:");
-    println!("  1. Edit soth.yaml to configure forward_proxy hosts/settings");
-    println!("  2. Generate an identity: soth identity generate");
-    println!("  3. Start the proxy: soth proxy start");
+    println!("  1. Edit domains/*.yaml (ai_inference, mcp, agent_apps)");
+    println!("  2. Edit soth.yaml for runtime/proxy settings");
+    println!("  3. Generate an identity: soth identity generate");
+    println!("  4. Start the proxy: soth proxy start");
     println!();
 
     Ok(())

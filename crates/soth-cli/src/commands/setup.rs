@@ -3,9 +3,9 @@
 //! Provides guided setup orchestration for CA generation, proxy setup,
 //! MCP client wrapping, and shell environment configuration.
 
+use crate::cli_config;
 use crate::commands;
 use crate::commands::proxy::ProxyCommands;
-use crate::cli_config;
 use crate::style;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -450,10 +450,13 @@ async fn run_wizard_steps(
             .parent()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| ".".to_string());
-        commands::proxy::run(ProxyCommands::SetupCa {
-            no_trust: false,
-            output: Some(ca_output_dir),
-        }, global_config_path.clone())
+        commands::proxy::run(
+            ProxyCommands::SetupCa {
+                no_trust: false,
+                output: Some(ca_output_dir),
+            },
+            global_config_path.clone(),
+        )
         .await?;
         if let Some(ref mut transaction) = tx {
             transaction.set_step_ca_generated()?;
@@ -635,13 +638,8 @@ async fn run_doctor(config: &SothConfig, global_config_path: Option<PathBuf>) ->
 
     println!();
     style::subtitle("Proxy Status");
-    if let Err(error) = commands::proxy::run(
-        ProxyCommands::Status {
-            config: None,
-        },
-        global_config_path,
-    )
-    .await
+    if let Err(error) =
+        commands::proxy::run(ProxyCommands::Status { config: None }, global_config_path).await
     {
         style::warning(&format!("Proxy status command failed: {error}"));
         healthy = false;
@@ -695,7 +693,9 @@ async fn run_rollback(
     restore_backup_entries(&manifest.backups)?;
 
     if manifest.steps.proxy_enabled {
-        if let Err(error) = commands::proxy::run(ProxyCommands::Off, global_config_path.clone()).await {
+        if let Err(error) =
+            commands::proxy::run(ProxyCommands::Off, global_config_path.clone()).await
+        {
             style::warning(&format!("Failed to disable proxy during rollback: {error}"));
         }
     }
