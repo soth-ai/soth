@@ -2,13 +2,14 @@
 
 use super::middleware::{error_response, get_request_id, Layer, LayerResult, RequestContext};
 use crate::enforcement::core;
+use crate::metrics;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
 use soth_budget::{BudgetTracker, CostCalculator};
+use soth_core::types::budget::BudgetScope;
 use soth_dashboard::{BudgetAlert, DashboardState};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 /// Budget layer configuration
@@ -37,7 +38,7 @@ pub struct BudgetLayer {
     /// Configuration
     config: BudgetConfig,
     /// Budget tracker
-    tracker: Arc<RwLock<BudgetTracker>>,
+    tracker: Arc<BudgetTracker>,
     /// Cost calculator
     calculator: CostCalculator,
     /// Dashboard state for metrics (optional)
@@ -49,7 +50,7 @@ impl BudgetLayer {
     pub fn new(config: BudgetConfig) -> Self {
         Self {
             config,
-            tracker: Arc::new(RwLock::new(BudgetTracker::new())),
+            tracker: Arc::new(BudgetTracker::new()),
             calculator: CostCalculator::new(),
             dashboard: None,
         }
@@ -59,7 +60,7 @@ impl BudgetLayer {
     pub fn with_tracker(config: BudgetConfig, tracker: BudgetTracker) -> Self {
         Self {
             config,
-            tracker: Arc::new(RwLock::new(tracker)),
+            tracker: Arc::new(tracker),
             calculator: CostCalculator::new(),
             dashboard: None,
         }
@@ -71,11 +72,6 @@ impl BudgetLayer {
         self
     }
 
-    /// Get the budget tracker
-    pub fn tracker(&self) -> Arc<RwLock<BudgetTracker>> {
-        Arc::clone(&self.tracker)
-    }
-
     /// Set global budget limits
     pub async fn set_global_budget(
         &self,
@@ -83,8 +79,7 @@ impl BudgetLayer {
         weekly: Option<f64>,
         monthly: Option<f64>,
     ) {
-        let tracker = self.tracker.read().await;
-        tracker.set_global_budget(daily, weekly, monthly);
+        self.tracker.set_global_budget(daily, weekly, monthly);
     }
 
     /// Set agent budget limits
@@ -95,8 +90,43 @@ impl BudgetLayer {
         weekly: Option<f64>,
         monthly: Option<f64>,
     ) {
-        let tracker = self.tracker.read().await;
-        tracker.set_agent_budget(agent_id, daily, weekly, monthly);
+        self.tracker
+            .set_agent_budget(agent_id, daily, weekly, monthly);
+    }
+
+    /// Set default per-session budget limits
+    pub async fn set_session_budget(
+        &self,
+        daily: Option<f64>,
+        weekly: Option<f64>,
+        monthly: Option<f64>,
+    ) {
+        self.tracker.set_session_budget(daily, weekly, monthly);
+    }
+
+    /// Set per-model budget limits
+    pub async fn set_model_budget(
+        &self,
+        model: &str,
+        daily: Option<f64>,
+        weekly: Option<f64>,
+        monthly: Option<f64>,
+    ) {
+        self.tracker.set_model_budget(model, daily, weekly, monthly);
+    }
+
+    fn scope_label(scope: BudgetScope) -> &'static str {
+        match scope {
+            BudgetScope::Global => "global",
+            BudgetScope::PerAgent => "per_agent",
+            BudgetScope::PerSession => "per_session",
+            BudgetScope::PerModel => "per_model",
+        }
+    }
+
+    /// Get the budget tracker
+    pub fn tracker(&self) -> Arc<BudgetTracker> {
+        Arc::clone(&self.tracker)
     }
 
     /// Extract model name from message or context
@@ -127,9 +157,8 @@ impl BudgetLayer {
         input_tokens: u64,
         output_tokens: u64,
     ) {
-        let tracker = self.tracker.read().await;
         core::record_budget_spend(
-            &tracker,
+            &self.tracker,
             &ctx.session_id,
             ctx.agent_id.as_deref(),
             model,
@@ -146,10 +175,10 @@ impl BudgetLayer {
         );
     }
 
-    /// Check if budget is exceeded
-    async fn is_budget_exceeded(&self, ctx: &RequestContext) -> bool {
-        let tracker = self.tracker.read().await;
-        core::is_budget_exceeded(&tracker, ctx.agent_id.as_deref())
+    /// Check if budget is exceeded and return first matched scope.
+    fn exceeded_scope(&self, ctx: &RequestContext, model: Option<&str>) -> Option<BudgetScope> {
+        self.tracker
+            .first_exceeded_scope(&ctx.session_id, ctx.agent_id.as_deref(), model)
     }
 }
 
@@ -167,26 +196,37 @@ impl Layer for BudgetLayer {
 
             match &message {
                 JsonRpcMessage::Request(req) => {
+                    let model = self.extract_model(ctx, req);
+                    metrics::record_budget_check("request");
+
                     // Check budget before processing
-                    if self.config.block_on_exceeded && self.is_budget_exceeded(ctx).await {
-                        warn!(
-                            "Budget exceeded for session={} agent={:?}",
-                            ctx.session_id, ctx.agent_id
-                        );
+                    if self.config.block_on_exceeded {
+                        if let Some(scope) = self.exceeded_scope(ctx, Some(model.as_str())) {
+                            metrics::record_budget_block(Self::scope_label(scope));
+                            warn!(
+                                "Budget exceeded (scope={}) for session={} agent={:?}",
+                                Self::scope_label(scope),
+                                ctx.session_id,
+                                ctx.agent_id
+                            );
 
-                        // Record alert to dashboard
-                        if let Some(ref dash) = self.dashboard {
-                            dash.set_budget_alert(BudgetAlert {
-                                level: "error".to_string(),
-                                message: "Budget limit exceeded - requests blocked".to_string(),
-                            });
+                            // Record alert to dashboard
+                            if let Some(ref dash) = self.dashboard {
+                                dash.set_budget_alert(BudgetAlert {
+                                    level: "error".to_string(),
+                                    message: format!(
+                                        "Budget limit exceeded ({}) - requests blocked",
+                                        Self::scope_label(scope)
+                                    ),
+                                });
+                            }
+
+                            let id = get_request_id(&message);
+                            return error_response(
+                                id,
+                                JsonRpcError::budget_exceeded("Budget limit reached"),
+                            );
                         }
-
-                        let id = get_request_id(&message);
-                        return error_response(
-                            id,
-                            JsonRpcError::budget_exceeded("Budget limit reached"),
-                        );
                     }
 
                     // Count input tokens
@@ -199,7 +239,6 @@ impl Layer for BudgetLayer {
                     );
 
                     // Store model for later
-                    let model = self.extract_model(ctx, req);
                     ctx.metadata
                         .insert("budget_model".to_string(), serde_json::json!(model));
 
@@ -307,11 +346,9 @@ mod tests {
         layer.set_global_budget(Some(0.0), None, None).await;
 
         // Record some spend to exceed the budget
-        {
-            let tracker = layer.tracker.read().await;
-            for _ in 0..10 {
-                tracker.record_spend("session-1", None, "gpt-4o", 1_000_000, 500_000);
-            }
+        let tracker = layer.tracker();
+        for _ in 0..10 {
+            tracker.record_spend("session-1", None, "gpt-4o", 1_000_000, 500_000);
         }
 
         let mut ctx = RequestContext::new("session-1");

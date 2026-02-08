@@ -118,6 +118,10 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_reason: Option<String>,
 
+    /// Active policy artifact version used for this decision path
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+
     /// Whether PII was detected
     #[serde(default)]
     pub pii_detected: bool,
@@ -181,6 +185,7 @@ impl WrapEvent {
             agent,
             policy_allowed: None,
             policy_reason: None,
+            policy_version: None,
             pii_detected: false,
             pii_types: Vec::new(),
             token_count: None,
@@ -269,6 +274,12 @@ impl WrapEvent {
     pub fn with_policy(mut self, allowed: bool, reason: Option<String>) -> Self {
         self.policy_allowed = Some(allowed);
         self.policy_reason = reason;
+        self
+    }
+
+    /// Set policy version
+    pub fn with_policy_version(mut self, version: impl Into<String>) -> Self {
+        self.policy_version = Some(version.into());
         self
     }
 

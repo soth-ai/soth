@@ -2,6 +2,7 @@
 
 use super::middleware::{error_response, get_request_id, Layer, LayerResult, RequestContext};
 use crate::enforcement::core;
+use crate::metrics;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
 use soth_core::types::policy::{PolicyAction, PolicyDecision};
 use soth_dashboard::{DashboardState, DenialEntry};
@@ -9,6 +10,7 @@ use soth_policy::PolicyEngine;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -87,19 +89,14 @@ impl PolicyLayer {
         &self,
         ctx: &RequestContext,
         req: &JsonRpcRequest,
-    ) -> (PolicyDecision, String) {
+    ) -> Result<(PolicyDecision, String, Duration), (String, String, Duration)> {
         let input = core::build_mcp_policy_input(ctx, req);
+        let start = std::time::Instant::now();
         let engine = self.engine.read().await;
+        let fallback_version = engine.active_policy_version();
         match core::evaluate_policy(&engine, &input) {
-            Ok((decision, policy_version)) => (decision, policy_version),
-            Err(e) => {
-                warn!("Policy evaluation error: {}", e);
-                // On error, default to deny in enforce mode, allow otherwise
-                (
-                    PolicyDecision::deny_with_reason(format!("Policy evaluation error: {e}")),
-                    "runtime_error".to_string(),
-                )
-            }
+            Ok((decision, policy_version)) => Ok((decision, policy_version, start.elapsed())),
+            Err(e) => Err((e, fallback_version, start.elapsed())),
         }
     }
 }
@@ -134,12 +131,52 @@ impl Layer for PolicyLayer {
             }
 
             // Evaluate policy
-            let (decision, policy_version) = self.evaluate_policy(ctx, req).await;
+            let (decision, policy_version, eval_duration) =
+                match self.evaluate_policy(ctx, req).await {
+                    Ok((decision, policy_version, eval_duration)) => {
+                        metrics::record_policy_evaluation("success", eval_duration);
+                        metrics::set_policy_active_version(&policy_version);
+                        (decision, policy_version, eval_duration)
+                    }
+                    Err((error, policy_version, eval_duration)) => {
+                        warn!("Policy evaluation error: {}", error);
+                        metrics::record_policy_evaluation("error", eval_duration);
+                        metrics::set_policy_active_version(&policy_version);
+                        ctx.metadata
+                            .insert("policy_action".to_string(), serde_json::json!("error"));
+                        ctx.metadata.insert(
+                            "policy_reason".to_string(),
+                            serde_json::json!(format!("Policy evaluation error: {error}")),
+                        );
+                        ctx.metadata.insert(
+                            "policy_version".to_string(),
+                            serde_json::json!(policy_version.clone()),
+                        );
+
+                        if let Some(ref dash) = self.dashboard {
+                            dash.set_policy_active_version(policy_version.clone());
+                        }
+
+                        if self.config.mode == PolicyMode::Audit {
+                            return LayerResult::Continue(message);
+                        }
+
+                        let id = get_request_id(&message);
+                        return error_response(
+                            id,
+                            JsonRpcError::policy_denied("Policy evaluation failed (enforce mode)"),
+                        );
+                    }
+                };
 
             if self.config.log_evaluations {
                 debug!(
-                    "Policy evaluation: method={} action={:?} reason={:?} version={}",
-                    req.method, decision.action, decision.reason, policy_version
+                    "Policy evaluation: method={} action={:?} reason={:?} version={} duration_ms={}",
+                    req.method,
+                    decision.action,
+                    decision.reason,
+                    policy_version,
+                    eval_duration.as_millis()
                 );
             }
 
@@ -241,6 +278,7 @@ impl Layer for PolicyLayer {
 mod tests {
     use super::*;
     use crate::protocol::RequestId;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_policy_layer_disabled() {
@@ -287,5 +325,75 @@ mod tests {
 
         let result = layer.process(&mut ctx, msg).await;
         assert!(matches!(result, LayerResult::Continue(_)));
+    }
+
+    #[tokio::test]
+    async fn test_policy_layer_enforce_fails_closed_on_eval_error() {
+        let engine = PolicyEngine::new();
+        engine
+            .load_modules(HashMap::from([(
+                "invalid_runtime".to_string(),
+                "package mcp.policy".to_string(),
+            )]))
+            .unwrap();
+        let layer = PolicyLayer::with_engine(
+            PolicyConfig {
+                mode: PolicyMode::Enforce,
+                ..Default::default()
+            },
+            engine,
+        );
+
+        let mut ctx = RequestContext::new("session-1");
+        let msg = JsonRpcMessage::Request(JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"name": "safe_tool"})),
+            RequestId::Number(1),
+        ));
+
+        let result = layer.process(&mut ctx, msg).await;
+        assert!(matches!(result, LayerResult::Response(_)));
+        assert_eq!(
+            ctx.metadata
+                .get("policy_action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            "error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_policy_layer_audit_allows_on_eval_error() {
+        let engine = PolicyEngine::new();
+        engine
+            .load_modules(HashMap::from([(
+                "invalid_runtime".to_string(),
+                "package mcp.policy".to_string(),
+            )]))
+            .unwrap();
+        let layer = PolicyLayer::with_engine(
+            PolicyConfig {
+                mode: PolicyMode::Audit,
+                ..Default::default()
+            },
+            engine,
+        );
+
+        let mut ctx = RequestContext::new("session-1");
+        let msg = JsonRpcMessage::Request(JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"name": "safe_tool"})),
+            RequestId::Number(1),
+        ));
+
+        let result = layer.process(&mut ctx, msg).await;
+        assert!(matches!(result, LayerResult::Continue(_)));
+        assert_eq!(
+            ctx.metadata
+                .get("policy_action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            "error"
+        );
     }
 }

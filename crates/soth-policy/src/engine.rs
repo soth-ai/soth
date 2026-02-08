@@ -7,7 +7,6 @@ use parking_lot::RwLock;
 use soth_core::error::Result;
 use soth_core::types::policy::{EvaluationResult, PolicyData, PolicyDecision, PolicyInput};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,16 +38,35 @@ impl Default for PolicyEngineConfig {
 pub struct PolicyEngine {
     /// Configuration
     config: PolicyEngineConfig,
-    /// Policy modules (Rego source)
-    modules: RwLock<HashMap<String, String>>,
-    /// Runtime policy data
-    policy_data: RwLock<PolicyData>,
+    /// Active + previous artifact snapshots for versioned reload and rollback.
+    artifacts: RwLock<PolicyArtifactSet>,
     /// Decision cache
     cache: Arc<DecisionCache>,
     /// Statistics
     stats: RwLock<EngineStats>,
-    /// Monotonic version for active policy artifacts/data.
-    active_policy_version: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct PolicyArtifactSnapshot {
+    modules: HashMap<String, String>,
+    data: PolicyData,
+    version: u64,
+}
+
+impl Default for PolicyArtifactSnapshot {
+    fn default() -> Self {
+        Self {
+            modules: HashMap::new(),
+            data: PolicyData::default(),
+            version: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PolicyArtifactSet {
+    active: PolicyArtifactSnapshot,
+    previous: Option<PolicyArtifactSnapshot>,
 }
 
 /// Engine statistics
@@ -76,10 +94,8 @@ impl PolicyEngine {
         Self {
             cache: Arc::new(DecisionCache::new(config.cache.clone())),
             config,
-            modules: RwLock::new(HashMap::new()),
-            policy_data: RwLock::new(PolicyData::default()),
+            artifacts: RwLock::new(PolicyArtifactSet::default()),
             stats: RwLock::new(EngineStats::default()),
-            active_policy_version: AtomicU64::new(1),
         }
     }
 
@@ -91,10 +107,8 @@ impl PolicyEngine {
                 cache: cache_config,
                 ..Default::default()
             },
-            modules: RwLock::new(HashMap::new()),
-            policy_data: RwLock::new(PolicyData::default()),
+            artifacts: RwLock::new(PolicyArtifactSet::default()),
             stats: RwLock::new(EngineStats::default()),
-            active_policy_version: AtomicU64::new(1),
         }
     }
 
@@ -110,40 +124,106 @@ impl PolicyEngine {
 
     /// Load policy modules
     pub fn load_modules(&self, modules: HashMap<String, String>) -> Result<()> {
-        let mut m = self.modules.write();
-        *m = modules;
-        // Invalidate cache when modules change
-        self.cache.invalidate();
-        self.bump_policy_version();
+        let data = {
+            let artifacts = self.artifacts.read();
+            artifacts.active.data.clone()
+        };
+        self.reload_artifacts(modules, data)?;
         Ok(())
     }
 
     /// Set runtime policy data
     pub fn set_policy_data(&self, data: PolicyData) -> Result<()> {
-        let mut d = self.policy_data.write();
-        *d = data;
-        // Invalidate cache when data changes
-        self.cache.invalidate();
-        self.bump_policy_version();
+        let modules = {
+            let artifacts = self.artifacts.read();
+            artifacts.active.modules.clone()
+        };
+        self.reload_artifacts(modules, data)?;
         Ok(())
     }
 
     /// Get current active policy version.
     pub fn active_policy_version(&self) -> String {
-        format!("v{}", self.active_policy_version.load(Ordering::Relaxed))
+        let artifacts = self.artifacts.read();
+        format!("v{}", artifacts.active.version)
     }
 
-    fn bump_policy_version(&self) {
-        self.active_policy_version.fetch_add(1, Ordering::Relaxed);
+    /// Get previous policy version if rollback target exists.
+    pub fn previous_policy_version(&self) -> Option<String> {
+        let artifacts = self.artifacts.read();
+        artifacts
+            .previous
+            .as_ref()
+            .map(|snapshot| format!("v{}", snapshot.version))
+    }
+
+    /// Transactional artifact reload:
+    /// validate -> atomically swap active snapshot -> keep rollback target.
+    pub fn reload_artifacts(
+        &self,
+        modules: HashMap<String, String>,
+        data: PolicyData,
+    ) -> Result<String> {
+        self.validate_artifacts(&modules)?;
+
+        let mut artifacts = self.artifacts.write();
+        let mut next_active = artifacts.active.clone();
+        next_active.modules = modules;
+        next_active.data = data;
+        next_active.version = next_active.version.saturating_add(1);
+
+        artifacts.previous = Some(artifacts.active.clone());
+        artifacts.active = next_active;
+
+        self.cache.invalidate();
+        Ok(format!("v{}", artifacts.active.version))
+    }
+
+    /// Roll back to the previous artifact snapshot (if available).
+    pub fn rollback_artifacts(&self) -> Result<Option<String>> {
+        let mut artifacts = self.artifacts.write();
+        let Some(previous) = artifacts.previous.clone() else {
+            return Ok(None);
+        };
+        let current = artifacts.active.clone();
+        let mut restored = previous;
+        restored.version = current.version.saturating_add(1);
+        artifacts.active = restored;
+        artifacts.previous = Some(current);
+        self.cache.invalidate();
+        Ok(Some(format!("v{}", artifacts.active.version)))
+    }
+
+    fn validate_artifacts(&self, modules: &HashMap<String, String>) -> Result<()> {
+        for (name, module) in modules {
+            if name.trim().is_empty() {
+                return Err(soth_core::error::SothError::Policy(
+                    "Policy module name cannot be empty".to_string(),
+                ));
+            }
+            if module.trim().is_empty() {
+                return Err(soth_core::error::SothError::Policy(format!(
+                    "Policy module '{name}' cannot be empty"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Evaluate a policy decision
     pub fn evaluate(&self, input: &PolicyInput) -> Result<EvaluationResult> {
         let start = Instant::now();
+        let (policy_version, has_modules, policy_data) = {
+            let artifacts = self.artifacts.read();
+            (
+                format!("v{}", artifacts.active.version),
+                !artifacts.active.modules.is_empty(),
+                artifacts.active.data.clone(),
+            )
+        };
 
         // If disabled, allow everything
         if !self.config.enabled {
-            let policy_version = self.active_policy_version();
             return Ok(EvaluationResult {
                 decision: PolicyDecision {
                     allow: true,
@@ -161,7 +241,7 @@ impl PolicyEngine {
 
         // Fail closed if policy modules were loaded but module execution runtime
         // is not wired into this engine implementation.
-        if !self.modules.read().is_empty() {
+        if has_modules {
             return Err(soth_core::error::SothError::PolicyEvaluation(
                 "Loaded policy modules cannot be executed by current runtime".to_string(),
             ));
@@ -170,7 +250,6 @@ impl PolicyEngine {
         // Check cache
         let (cached, hit, tier) = self.cache.get(input);
         if hit {
-            let policy_version = self.active_policy_version();
             return Ok(EvaluationResult {
                 decision: cached.unwrap(),
                 input: input.clone(),
@@ -183,7 +262,13 @@ impl PolicyEngine {
         }
 
         // Evaluate policy
-        let decision = self.evaluate_policy(input)?;
+        let decision = match self.evaluate_policy(input, &policy_data) {
+            Ok(decision) => decision,
+            Err(err) => {
+                self.stats.write().eval_errors += 1;
+                return Err(err);
+            }
+        };
 
         let eval_time = start.elapsed();
 
@@ -204,8 +289,6 @@ impl PolicyEngine {
 
         // Cache the result
         self.cache.set(input, &decision);
-
-        let policy_version = self.active_policy_version();
 
         Ok(EvaluationResult {
             decision,
@@ -233,9 +316,7 @@ impl PolicyEngine {
     }
 
     /// Evaluate policy using built-in rules (simplified OPA replacement)
-    fn evaluate_policy(&self, input: &PolicyInput) -> Result<PolicyDecision> {
-        let data = self.policy_data.read();
-
+    fn evaluate_policy(&self, input: &PolicyInput, data: &PolicyData) -> Result<PolicyDecision> {
         // Check blocked agents
         if data.blocked_agents.contains(&input.agent.id) {
             return Ok(PolicyDecision::deny(vec![format!(
@@ -329,7 +410,11 @@ impl PolicyEngine {
 
     /// Check if the engine is ready
     pub fn is_ready(&self) -> bool {
-        !self.config.enabled || !self.modules.read().is_empty()
+        if !self.config.enabled {
+            return true;
+        }
+        let artifacts = self.artifacts.read();
+        artifacts.active.version > 0
     }
 
     /// Get engine statistics
@@ -497,5 +582,39 @@ mod tests {
 
         engine.set_policy_data(PolicyData::default()).unwrap();
         assert_eq!(engine.active_policy_version(), "v2");
+    }
+
+    #[test]
+    fn test_reload_artifacts_keeps_previous_for_rollback() {
+        let engine = PolicyEngine::new();
+        assert_eq!(engine.active_policy_version(), "v1");
+        assert_eq!(engine.previous_policy_version(), None);
+
+        let mut modules = HashMap::new();
+        modules.insert("policy".to_string(), "package mcp.policy".to_string());
+        let version = engine
+            .reload_artifacts(modules, PolicyData::default())
+            .unwrap();
+        assert_eq!(version, "v2");
+        assert_eq!(engine.active_policy_version(), "v2");
+        assert_eq!(engine.previous_policy_version(), Some("v1".to_string()));
+
+        let rolled_back = engine.rollback_artifacts().unwrap();
+        assert_eq!(rolled_back, Some("v3".to_string()));
+        assert_eq!(engine.active_policy_version(), "v3");
+        assert_eq!(engine.previous_policy_version(), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn test_reload_artifacts_validation_rejects_empty_module() {
+        let engine = PolicyEngine::new();
+        let mut modules = HashMap::new();
+        modules.insert("bad".to_string(), "   ".to_string());
+
+        let err = engine
+            .reload_artifacts(modules, PolicyData::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+        assert_eq!(engine.active_policy_version(), "v1");
     }
 }

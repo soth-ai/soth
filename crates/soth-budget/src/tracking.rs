@@ -110,8 +110,21 @@ pub struct BudgetTracker {
     spend_tracker: Arc<SpendTracker>,
     /// Budget states by ID
     budgets: RwLock<HashMap<String, BudgetState>>,
+    /// Session budget states (materialized from template on first use)
+    session_budgets: RwLock<HashMap<String, BudgetState>>,
+    /// Optional template for per-session limits
+    session_budget_template: RwLock<Option<BudgetLimits>>,
+    /// Per-model budget states
+    model_budgets: RwLock<HashMap<String, BudgetState>>,
     /// Global budget
     global_budget: RwLock<Option<BudgetState>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BudgetLimits {
+    daily: Option<f64>,
+    weekly: Option<f64>,
+    monthly: Option<f64>,
 }
 
 impl BudgetTracker {
@@ -120,6 +133,9 @@ impl BudgetTracker {
         Self {
             spend_tracker: Arc::new(SpendTracker::new()),
             budgets: RwLock::new(HashMap::new()),
+            session_budgets: RwLock::new(HashMap::new()),
+            session_budget_template: RwLock::new(None),
+            model_budgets: RwLock::new(HashMap::new()),
             global_budget: RwLock::new(None),
         }
     }
@@ -146,6 +162,35 @@ impl BudgetTracker {
         budget.weekly_limit = weekly;
         budget.monthly_limit = monthly;
         self.budgets.write().insert(agent_id.to_string(), budget);
+    }
+
+    /// Set default per-session budget limits.
+    pub fn set_session_budget(
+        &self,
+        daily: Option<f64>,
+        weekly: Option<f64>,
+        monthly: Option<f64>,
+    ) {
+        *self.session_budget_template.write() = Some(BudgetLimits {
+            daily,
+            weekly,
+            monthly,
+        });
+    }
+
+    /// Set budget limits for a specific model.
+    pub fn set_model_budget(
+        &self,
+        model: &str,
+        daily: Option<f64>,
+        weekly: Option<f64>,
+        monthly: Option<f64>,
+    ) {
+        let mut budget = BudgetState::new(model, BudgetScope::PerModel);
+        budget.daily_limit = daily;
+        budget.weekly_limit = weekly;
+        budget.monthly_limit = monthly;
+        self.model_budgets.write().insert(model.to_string(), budget);
     }
 
     /// Record spend and update budgets
@@ -184,28 +229,86 @@ impl BudgetTracker {
             }
         }
 
+        // Update session budget (materialized from template)
+        if let Some(limits) = *self.session_budget_template.read() {
+            let mut sessions = self.session_budgets.write();
+            let budget = sessions.entry(session_id.to_string()).or_insert_with(|| {
+                let mut budget = BudgetState::new(session_id, BudgetScope::PerSession);
+                budget.daily_limit = limits.daily;
+                budget.weekly_limit = limits.weekly;
+                budget.monthly_limit = limits.monthly;
+                budget
+            });
+            budget.current_spend += record.cost;
+            budget.total_tokens += record.token_usage.total_tokens;
+            budget.total_requests += 1;
+            budget.updated_at = Utc::now();
+        }
+
+        // Update model budget
+        if let Some(budget) = self.model_budgets.write().get_mut(model) {
+            budget.current_spend += record.cost;
+            budget.total_tokens += record.token_usage.total_tokens;
+            budget.total_requests += 1;
+            budget.updated_at = Utc::now();
+        }
+
         record
     }
 
-    /// Check if a budget is exceeded
-    pub fn is_budget_exceeded(&self, agent_id: Option<&str>) -> bool {
-        // Check global budget
+    /// Return the first exceeded scope in deterministic order:
+    /// global -> agent -> session -> model.
+    pub fn first_exceeded_scope(
+        &self,
+        session_id: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<BudgetScope> {
         if let Some(ref budget) = *self.global_budget.read() {
             if budget.is_exceeded() {
-                return true;
+                return Some(BudgetScope::Global);
             }
         }
 
-        // Check agent budget
         if let Some(agent_id) = agent_id {
             if let Some(budget) = self.budgets.read().get(agent_id) {
                 if budget.is_exceeded() {
-                    return true;
+                    return Some(BudgetScope::PerAgent);
                 }
             }
         }
 
-        false
+        if let Some(budget) = self.session_budgets.read().get(session_id) {
+            if budget.is_exceeded() {
+                return Some(BudgetScope::PerSession);
+            }
+        }
+
+        if let Some(model) = model {
+            if let Some(budget) = self.model_budgets.read().get(model) {
+                if budget.is_exceeded() {
+                    return Some(BudgetScope::PerModel);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if a budget is exceeded
+    pub fn is_budget_exceeded(&self, agent_id: Option<&str>) -> bool {
+        self.first_exceeded_scope("", agent_id, None).is_some()
+    }
+
+    /// Check if any configured scope budget is exceeded.
+    pub fn is_budget_exceeded_scoped(
+        &self,
+        session_id: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+    ) -> bool {
+        self.first_exceeded_scope(session_id, agent_id, model)
+            .is_some()
     }
 
     /// Get budget status for an agent
@@ -231,6 +334,16 @@ impl BudgetTracker {
         }
 
         for budget in self.budgets.write().values_mut() {
+            budget.current_spend = 0.0;
+            budget.period_start = Utc::now();
+        }
+
+        for budget in self.session_budgets.write().values_mut() {
+            budget.current_spend = 0.0;
+            budget.period_start = Utc::now();
+        }
+
+        for budget in self.model_budgets.write().values_mut() {
             budget.current_spend = 0.0;
             budget.period_start = Utc::now();
         }
@@ -310,5 +423,33 @@ mod tests {
 
         let status = tracker.get_budget_status("agent-1").unwrap();
         assert!(status.current_spend > 0.0);
+    }
+
+    #[test]
+    fn test_session_budget_scope() {
+        let tracker = BudgetTracker::new();
+        tracker.set_session_budget(Some(0.01), None, None);
+
+        tracker.record_spend("session-a", None, "gpt-4o", 1_000_000, 500_000);
+
+        assert!(tracker.is_budget_exceeded_scoped("session-a", None, Some("gpt-4o")));
+        assert_eq!(
+            tracker.first_exceeded_scope("session-a", None, Some("gpt-4o")),
+            Some(BudgetScope::PerSession)
+        );
+    }
+
+    #[test]
+    fn test_model_budget_scope() {
+        let tracker = BudgetTracker::new();
+        tracker.set_model_budget("gpt-4o", Some(0.01), None, None);
+
+        tracker.record_spend("session-a", None, "gpt-4o", 1_000_000, 500_000);
+
+        assert!(tracker.is_budget_exceeded_scoped("session-a", None, Some("gpt-4o")));
+        assert_eq!(
+            tracker.first_exceeded_scope("session-a", None, Some("gpt-4o")),
+            Some(BudgetScope::PerModel)
+        );
     }
 }

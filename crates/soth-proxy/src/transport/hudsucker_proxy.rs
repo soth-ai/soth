@@ -78,6 +78,10 @@ struct PendingRequest {
     mcp_method: Option<String>,
     /// Whether this pending request should be emitted as MCP source.
     is_mcp_jsonrpc: bool,
+    /// Policy decision metadata captured at request enforcement time.
+    policy_allowed: Option<bool>,
+    policy_reason: Option<String>,
+    policy_version: Option<String>,
 }
 
 /// Thread-safe store for pending requests
@@ -1234,14 +1238,17 @@ impl HttpHandler for AiProxyHandler {
                 (None, None, req)
             };
             let agent = Self::detect_agent_with_context(ua_agent, &host, &path, model.as_deref());
-            let mcp_request_method =
-                if !is_connect && (host_is_mcp_target || host_mode == HostFilterMode::Discovery) {
-                    body_content
-                        .as_deref()
-                        .and_then(|content| extract_mcp_request_method(content, &path))
-                } else {
-                    None
-                };
+            let mcp_request_method = if !is_connect
+                && (host_is_mcp_target || host_mode == HostFilterMode::Discovery)
+            {
+                body_content
+                    .as_deref()
+                    .and_then(|content| extract_mcp_request_method(content, &path))
+            } else {
+                None
+            };
+            let mut policy_allowed = None;
+            let mut policy_version = None;
 
             if !is_connect {
                 if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
@@ -1261,8 +1268,9 @@ impl HttpHandler for AiProxyHandler {
                     let enforcement = enforcer.enforce_envelope(&envelope);
 
                     match enforcement {
-                        Ok(identity_result) =>
-                        {
+                        Ok(identity_result) => {
+                            policy_allowed = Some(true);
+                            policy_version = identity_result.policy_version.clone();
                             #[cfg(feature = "dashboard")]
                             if let Some(ref dashboard) = dashboard {
                                 if let Some(ref did) = identity_result.did {
@@ -1279,7 +1287,7 @@ impl HttpHandler for AiProxyHandler {
                                 }
                             }
                         }
-                        Err((status, reason, policy_version)) => {
+                        Err((status, reason, denied_policy_version)) => {
                             warn!(
                                 status = status,
                                 provider = provider,
@@ -1294,7 +1302,7 @@ impl HttpHandler for AiProxyHandler {
                                 if let Some(ref did) = identity_did {
                                     dashboard.record_identity_verification(did, false);
                                 }
-                                if let Some(ref version) = policy_version {
+                                if let Some(ref version) = denied_policy_version {
                                     dashboard.set_policy_active_version(version.clone());
                                 }
                                 if enforcer.policy_mode != ProxyPolicyMode::Disabled {
@@ -1417,6 +1425,9 @@ impl HttpHandler for AiProxyHandler {
                             is_agent_app: Self::is_agent_app(&host),
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
+                            policy_allowed,
+                            policy_reason: None,
+                            policy_version,
                         },
                     );
                 }
@@ -1482,6 +1493,9 @@ impl HttpHandler for AiProxyHandler {
                         is_agent_app: false,
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
+                        policy_allowed: None,
+                        policy_reason: None,
+                        policy_version: None,
                     },
                 );
             } else {
@@ -1596,6 +1610,12 @@ impl HttpHandler for AiProxyHandler {
                     event.id = pending.event_id.clone();
                     event =
                         event.with_content_preview(format!("← {} (HTTP {})", method_name, status));
+                    if let Some(allowed) = pending.policy_allowed {
+                        event = event.with_policy(allowed, pending.policy_reason.clone());
+                    }
+                    if let Some(ref version) = pending.policy_version {
+                        event = event.with_policy_version(version.clone());
+                    }
                     logger.log(&event);
                 }
 
@@ -1633,6 +1653,12 @@ impl HttpHandler for AiProxyHandler {
                         traffic_envelope: pending.envelope.clone(),
                     });
                     event.id = pending.event_id.clone();
+                    if let Some(allowed) = pending.policy_allowed {
+                        event = event.with_policy(allowed, pending.policy_reason.clone());
+                    }
+                    if let Some(ref version) = pending.policy_version {
+                        event = event.with_policy_version(version.clone());
+                    }
                     logger.log(&event);
                 }
             }
@@ -1807,6 +1833,12 @@ impl HttpHandler for AiProxyHandler {
                             traffic_envelope: log_pending.envelope.clone(),
                         });
                         event.id = log_event_id.clone();
+                        if let Some(allowed) = log_pending.policy_allowed {
+                            event = event.with_policy(allowed, log_pending.policy_reason.clone());
+                        }
+                        if let Some(ref version) = log_pending.policy_version {
+                            event = event.with_policy_version(version.clone());
+                        }
 
                         logger.log(&event);
                         debug!("Logged paired streamed request/response");
@@ -1881,6 +1913,12 @@ impl HttpHandler for AiProxyHandler {
                         traffic_envelope: pending.envelope.clone(),
                     });
                     event.id = pending.event_id.clone();
+                    if let Some(allowed) = pending.policy_allowed {
+                        event = event.with_policy(allowed, pending.policy_reason.clone());
+                    }
+                    if let Some(ref version) = pending.policy_version {
+                        event = event.with_policy_version(version.clone());
+                    }
                     logger.log(&event);
                 }
             }
@@ -1941,6 +1979,10 @@ impl AiWebSocketHandler {
             hosts,
         }
     }
+}
+
+fn should_emit_non_mcp_ws_event(is_agent_app: bool, provider: &str) -> bool {
+    is_agent_app || provider != "unknown"
 }
 
 impl WebSocketHandler for AiWebSocketHandler {
@@ -2008,11 +2050,11 @@ impl WebSocketHandler for AiWebSocketHandler {
                         return Some(msg);
                     }
 
-                    let (source, ws_method, provider_for_event) = if let Some(method) = mcp_method {
-                        (EventSource::Mcp, method, "mcp")
+                    let event_shape = if let Some(method) = mcp_method {
+                        Some((EventSource::Mcp, method, "mcp"))
                     } else if is_mcp_response {
-                        (EventSource::Mcp, "response".to_string(), "mcp")
-                    } else {
+                        Some((EventSource::Mcp, "response".to_string(), "mcp"))
+                    } else if should_emit_non_mcp_ws_event(is_agent_app, provider) {
                         let source = if is_agent_app {
                             EventSource::AgentApp
                         } else {
@@ -2023,39 +2065,49 @@ impl WebSocketHandler for AiWebSocketHandler {
                         } else {
                             format!("WebSocket {}", ws_path)
                         };
-                        (source, method, provider)
+                        Some((source, method, provider))
+                    } else {
+                        None
                     };
 
-                    info!(
-                        host = %host,
-                        path = %ws_path,
-                        provider = provider_for_event,
-                        agent = detected_ws_agent.unwrap_or(provider_for_event),
-                        len = text.len(),
-                        "WebSocket text message"
-                    );
+                    if let Some((source, ws_method, provider_for_event)) = event_shape {
+                        info!(
+                            host = %host,
+                            path = %ws_path,
+                            provider = provider_for_event,
+                            agent = detected_ws_agent.unwrap_or(provider_for_event),
+                            len = text.len(),
+                            "WebSocket text message"
+                        );
 
-                    // Log WebSocket message for observability
-                    if let Some(ref logger) = event_logger {
-                        let resolved_agent = detected_ws_agent.unwrap_or_else(|| match source {
-                            EventSource::Mcp => "mcp",
-                            EventSource::AiProxy | EventSource::AgentApp => {
-                                if provider_for_event == "unknown" {
-                                    "websocket"
-                                } else {
-                                    provider_for_event
+                        // Log WebSocket message for observability
+                        if let Some(ref logger) = event_logger {
+                            let resolved_agent = detected_ws_agent.unwrap_or_else(|| match source {
+                                EventSource::Mcp => "mcp",
+                                EventSource::AiProxy | EventSource::AgentApp => {
+                                    if provider_for_event == "unknown" {
+                                        "websocket"
+                                    } else {
+                                        provider_for_event
+                                    }
                                 }
-                            }
-                        });
-                        let agent_info =
-                            AgentInfo::new(resolved_agent, DetectionSource::Environment);
+                            });
+                            let agent_info =
+                                AgentInfo::new(resolved_agent, DetectionSource::Environment);
 
-                        let event = WrapEvent::new(&session_id, &host, direction, agent_info)
-                            .with_source(source)
-                            .with_provider(provider_for_event)
-                            .with_method(ws_method)
-                            .with_content(text.to_string());
-                        logger.log(&event);
+                            let event = WrapEvent::new(&session_id, &host, direction, agent_info)
+                                .with_source(source)
+                                .with_provider(provider_for_event)
+                                .with_method(ws_method)
+                                .with_content(text.to_string());
+                            logger.log(&event);
+                        }
+                    } else {
+                        debug!(
+                            host = %host,
+                            path = %ws_path,
+                            "Skipping non-AI/non-MCP websocket payload from observability"
+                        );
                     }
                 }
                 Message::Binary(data) => {
@@ -2500,6 +2552,13 @@ mod tests {
     #[test]
     fn test_should_log_request_skips_connect() {
         assert!(!AiProxyHandler::should_log_request("/", "CONNECT"));
+    }
+
+    #[test]
+    fn test_should_emit_non_mcp_ws_event() {
+        assert!(should_emit_non_mcp_ws_event(true, "unknown"));
+        assert!(should_emit_non_mcp_ws_event(false, "openai"));
+        assert!(!should_emit_non_mcp_ws_event(false, "unknown"));
     }
 
     #[test]
