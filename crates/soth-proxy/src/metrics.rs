@@ -52,14 +52,20 @@ pub const ERRORS_TOTAL: &str = "soth_proxy_errors_total";
 pub const TOKENS_TOTAL: &str = "soth_proxy_tokens_total";
 pub const RATE_LIMITED_TOTAL: &str = "soth_proxy_rate_limited_total";
 pub const CIRCUIT_BREAKER_TRIPS: &str = "soth_proxy_circuit_breaker_trips_total";
+pub const POLICY_RELOAD_TOTAL: &str = "soth_policy_reload_total";
+pub const POLICY_EVAL_TOTAL: &str = "soth_policy_evaluations_total";
+pub const BUDGET_CHECKS_TOTAL: &str = "soth_budget_checks_total";
+pub const BUDGET_BLOCKS_TOTAL: &str = "soth_budget_blocks_total";
 
 // Gauges
 pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
 pub const CIRCUIT_BREAKER_STATE: &str = "soth_proxy_circuit_breaker_state";
+pub const POLICY_ACTIVE_VERSION: &str = "soth_policy_active_version";
 
 // Histograms
 pub const REQUEST_DURATION: &str = "soth_proxy_request_duration_seconds";
 pub const UPSTREAM_LATENCY: &str = "soth_proxy_upstream_latency_seconds";
+pub const POLICY_EVAL_DURATION: &str = "soth_policy_eval_duration_seconds";
 
 fn describe_counters() {
     describe_counter!(
@@ -80,6 +86,19 @@ fn describe_counters() {
         CIRCUIT_BREAKER_TRIPS,
         "Total number of circuit breaker trips"
     );
+    describe_counter!(
+        POLICY_RELOAD_TOTAL,
+        "Total number of policy reload attempts"
+    );
+    describe_counter!(
+        POLICY_EVAL_TOTAL,
+        "Total number of policy evaluations by outcome"
+    );
+    describe_counter!(BUDGET_CHECKS_TOTAL, "Total number of budget checks");
+    describe_counter!(
+        BUDGET_BLOCKS_TOTAL,
+        "Total number of budget blocks by scope"
+    );
 }
 
 fn describe_gauges() {
@@ -88,11 +107,16 @@ fn describe_gauges() {
         CIRCUIT_BREAKER_STATE,
         "Circuit breaker state (0=closed, 1=half-open, 2=open)"
     );
+    describe_gauge!(
+        POLICY_ACTIVE_VERSION,
+        "Marker gauge for active policy version (1 for current labels)"
+    );
 }
 
 fn describe_histograms() {
     describe_histogram!(REQUEST_DURATION, "Request duration in seconds");
     describe_histogram!(UPSTREAM_LATENCY, "Upstream server latency in seconds");
+    describe_histogram!(POLICY_EVAL_DURATION, "Policy evaluation latency in seconds");
 }
 
 // === Recording Functions ===
@@ -139,6 +163,34 @@ pub fn record_rate_limited(provider: &str, key: &str) {
 /// Record a circuit breaker trip
 pub fn record_circuit_breaker_trip(provider: &str) {
     counter!(CIRCUIT_BREAKER_TRIPS, "provider" => provider.to_string()).increment(1);
+}
+
+/// Record a policy reload result
+pub fn record_policy_reload(success: bool) {
+    let result = if success { "success" } else { "failure" };
+    counter!(POLICY_RELOAD_TOTAL, "result" => result.to_string()).increment(1);
+}
+
+/// Record policy evaluation latency and outcome
+pub fn record_policy_evaluation(outcome: &str, duration: Duration) {
+    counter!(POLICY_EVAL_TOTAL, "outcome" => outcome.to_string()).increment(1);
+    histogram!(POLICY_EVAL_DURATION, "outcome" => outcome.to_string())
+        .record(duration.as_secs_f64());
+}
+
+/// Expose active policy version as a labeled gauge marker
+pub fn set_policy_active_version(version: &str) {
+    gauge!(POLICY_ACTIVE_VERSION, "version" => version.to_string()).set(1.0);
+}
+
+/// Record budget checks
+pub fn record_budget_check(scope: &str) {
+    counter!(BUDGET_CHECKS_TOTAL, "scope" => scope.to_string()).increment(1);
+}
+
+/// Record budget blocks
+pub fn record_budget_block(scope: &str) {
+    counter!(BUDGET_BLOCKS_TOTAL, "scope" => scope.to_string()).increment(1);
 }
 
 /// Set active connections gauge

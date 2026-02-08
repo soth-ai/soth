@@ -155,6 +155,18 @@ function deriveUsageFromWrapEvent(wrapEvent: WrapEvent): DerivedUsage | undefine
   return undefined;
 }
 
+function shouldHideNoisyAiWebSocket(wrapEvent: WrapEvent): boolean {
+  if (wrapEvent.source !== "ai_proxy") {
+    return false;
+  }
+  const method = (wrapEvent.method || "").toLowerCase();
+  if (!method.startsWith("websocket")) {
+    return false;
+  }
+  const provider = (wrapEvent.provider || "unknown").toLowerCase();
+  return provider === "unknown";
+}
+
 function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
   const derivedUsage = deriveUsageFromWrapEvent(wrapEvent);
   const derivedInputTokens = wrapEvent.input_tokens ?? derivedUsage?.input;
@@ -236,6 +248,9 @@ export default function ObservabilityPage() {
 
   const handleWrapEvent = useCallback(
     (wrapEvent: WrapEvent) => {
+      if (shouldHideNoisyAiWebSocket(wrapEvent)) {
+        return;
+      }
       addLog(mapWrapEventToLog(wrapEvent));
 
       if (typeof wrapEvent.seq === "number") {

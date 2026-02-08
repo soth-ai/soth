@@ -425,6 +425,151 @@ function parsePossiblyEncodedJson(raw: string): unknown {
   return current;
 }
 
+function parseJsonValueLoose(raw: string): { ok: boolean; value: unknown } {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, value: raw };
+  }
+
+  try {
+    let current: unknown = JSON.parse(trimmed);
+    for (let depth = 0; depth < 2; depth++) {
+      if (typeof current !== 'string') {
+        break;
+      }
+      const nested = current.trim();
+      if (nested.length === 0) {
+        break;
+      }
+      try {
+        current = JSON.parse(nested);
+      } catch {
+        break;
+      }
+    }
+    return { ok: true, value: current };
+  } catch {
+    return { ok: false, value: raw };
+  }
+}
+
+function formatJsonLikeValue(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+function looksLikeSsePayload(raw: string): boolean {
+  if (!raw.includes('\n')) {
+    return false;
+  }
+  const lines = raw.split(/\r?\n/);
+  let taggedLines = 0;
+
+  for (const line of lines.slice(0, 120)) {
+    const trimmed = line.trimStart();
+    if (
+      trimmed.startsWith('data:') ||
+      trimmed.startsWith('event:') ||
+      trimmed.startsWith('id:') ||
+      trimmed.startsWith('retry:')
+    ) {
+      taggedLines += 1;
+    }
+  }
+
+  return taggedLines >= 2;
+}
+
+function tryFormatSseForEditor(raw: string): { content: string; language: 'plaintext' } | null {
+  if (!looksLikeSsePayload(raw)) {
+    return null;
+  }
+
+  const lines = raw.split(/\r?\n/);
+  const out: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trimStart();
+
+    if (trimmed.startsWith('data:')) {
+      const payload = trimmed.slice(5).trimStart();
+      if (payload.length === 0) {
+        out.push('data:');
+        continue;
+      }
+      if (payload === '[DONE]') {
+        out.push('data: [DONE]');
+        continue;
+      }
+
+      const parsed = parseJsonValueLoose(payload);
+      if (!parsed.ok) {
+        out.push(`data: ${payload}`);
+        continue;
+      }
+
+      const formatted = formatJsonLikeValue(parsed.value);
+      if (formatted.includes('\n')) {
+        out.push('data:');
+        for (const formattedLine of formatted.split('\n')) {
+          out.push(`  ${formattedLine}`);
+        }
+      } else {
+        out.push(`data: ${formatted}`);
+      }
+      continue;
+    }
+
+    if (
+      trimmed.startsWith('event:') ||
+      trimmed.startsWith('id:') ||
+      trimmed.startsWith('retry:')
+    ) {
+      out.push(trimmed);
+      continue;
+    }
+
+    if (trimmed.length === 0) {
+      out.push('');
+      continue;
+    }
+
+    out.push(line);
+  }
+
+  return {
+    content: out.join('\n'),
+    language: 'plaintext',
+  };
+}
+
+function tryFormatNdjsonForEditor(raw: string): { content: string; language: 'json' } | null {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  if (lines.length < 2) {
+    return null;
+  }
+
+  const parsedValues: unknown[] = [];
+  for (const line of lines) {
+    const parsed = parseJsonValueLoose(line);
+    if (!parsed.ok || typeof parsed.value === 'string') {
+      return null;
+    }
+    parsedValues.push(parsed.value);
+  }
+
+  return {
+    content: JSON.stringify(parsedValues, null, 2),
+    language: 'json',
+  };
+}
+
 function extractReadableText(value: unknown, depth = 0): string | null {
   if (value === null || value === undefined || depth > 4) {
     return null;
@@ -615,6 +760,16 @@ export function decodeEditorContent(raw?: string): {
 
   if (isLikelyBinaryPayload(raw)) {
     return { content: summarizeBinaryPreview(raw), language: 'plaintext' };
+  }
+
+  const sseFormatted = tryFormatSseForEditor(raw);
+  if (sseFormatted) {
+    return sseFormatted;
+  }
+
+  const ndjsonFormatted = tryFormatNdjsonForEditor(raw);
+  if (ndjsonFormatted) {
+    return ndjsonFormatted;
   }
 
   const parsed = parsePossiblyEncodedJson(raw);
