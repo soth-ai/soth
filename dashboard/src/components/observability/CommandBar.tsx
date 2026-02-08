@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   ShieldSlash,
   Eye,
@@ -12,6 +12,7 @@ import {
   Cpu,
   CloudArrowUp,
   CurrencyDollar,
+  DownloadSimple,
 } from "@phosphor-icons/react";
 import {
   useObservabilityStore,
@@ -21,7 +22,9 @@ import {
 } from "@/store/observability";
 import { Button } from "@/components/ui/button";
 import { PresetDropdown } from "./PresetDropdown";
+import { buildApiUrl } from "@/lib/endpoints";
 import { cn } from "@/lib/utils";
+import type { ApiResponse, BudgetPrimitives } from "@/types";
 
 interface QuickFilter {
   id: string;
@@ -47,6 +50,33 @@ export function CommandBar() {
   const setFilters = useObservabilityStore((state) => state.setFilters);
   const clearFilters = useObservabilityStore((state) => state.clearFilters);
   const clearLogs = useObservabilityStore((state) => state.clearLogs);
+  const [isExportingBudget, setIsExportingBudget] = useState(false);
+
+  const handleExportBudget = async () => {
+    try {
+      setIsExportingBudget(true);
+      const response = await fetch(buildApiUrl("/budget/primitives"), {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as ApiResponse<BudgetPrimitives>;
+      const blob = new Blob([JSON.stringify(payload.data, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `soth-observability-budget-primitives-${Date.now()}.json`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.warn("Failed to export budget primitives", error);
+    } finally {
+      setIsExportingBudget(false);
+    }
+  };
 
   // Apply source filter for counting
   const filteredBySource = useMemo(() => {
@@ -315,6 +345,16 @@ export function CommandBar() {
             Clear filters
           </Button>
         )}
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={handleExportBudget}
+          disabled={isExportingBudget}
+          className="h-6 px-2 text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          <DownloadSimple className="w-3 h-3 mr-1.5" />
+          {isExportingBudget ? "Exporting" : "Export budget"}
+        </Button>
         <Button
           variant="ghost"
           size="sm"

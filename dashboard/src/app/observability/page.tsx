@@ -18,12 +18,6 @@ import { cn } from "@/lib/utils";
 type MobilePanel = "stream" | "inspector" | "filters";
 const BOOTSTRAP_LIMIT = 250;
 
-type DerivedUsage = {
-  input?: number;
-  output?: number;
-  total?: number;
-};
-
 function normalizePayload(value: unknown): string {
   if (typeof value === "string") {
     return value;
@@ -43,117 +37,6 @@ function normalizePreview(value: unknown): string | undefined {
   return normalized.length > 0 ? normalized : undefined;
 }
 
-function toFiniteNonNegative(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return undefined;
-  }
-  return value;
-}
-
-function extractUsageFromObject(value: unknown): DerivedUsage | undefined {
-  if (!value || typeof value !== "object") {
-    return undefined;
-  }
-
-  const obj = value as Record<string, unknown>;
-  const usage = (obj.usage && typeof obj.usage === "object")
-    ? (obj.usage as Record<string, unknown>)
-    : undefined;
-
-  if (usage) {
-    const input =
-      toFiniteNonNegative(usage.input_tokens) ??
-      toFiniteNonNegative(usage.prompt_tokens);
-    const output =
-      toFiniteNonNegative(usage.output_tokens) ??
-      toFiniteNonNegative(usage.completion_tokens);
-    const total = toFiniteNonNegative(usage.total_tokens);
-    if (input !== undefined || output !== undefined || total !== undefined) {
-      return { input, output, total };
-    }
-  }
-
-  const usageMetadata = (obj.usageMetadata && typeof obj.usageMetadata === "object")
-    ? (obj.usageMetadata as Record<string, unknown>)
-    : undefined;
-  if (usageMetadata) {
-    const input = toFiniteNonNegative(usageMetadata.promptTokenCount);
-    const output = toFiniteNonNegative(usageMetadata.candidatesTokenCount);
-    if (input !== undefined || output !== undefined) {
-      return { input, output };
-    }
-  }
-
-  if (obj.message && typeof obj.message === "object") {
-    const nested = extractUsageFromObject(obj.message);
-    if (nested) return nested;
-  }
-  if (obj.response && typeof obj.response === "object") {
-    const nested = extractUsageFromObject(obj.response);
-    if (nested) return nested;
-  }
-
-  return undefined;
-}
-
-function parseUsageFromPayloadText(payload: string): DerivedUsage | undefined {
-  const trimmed = payload.trim();
-  if (!trimmed) return undefined;
-
-  if (trimmed.includes("\ndata:") || trimmed.startsWith("data:")) {
-    let input = 0;
-    let output = 0;
-    let found = false;
-
-    for (const line of trimmed.split("\n")) {
-      if (!line.startsWith("data:")) continue;
-      const jsonChunk = line.slice(5).trim();
-      if (!jsonChunk || jsonChunk === "[DONE]") continue;
-      try {
-        const parsed = JSON.parse(jsonChunk);
-        const usage = extractUsageFromObject(parsed);
-        if (!usage) continue;
-        input += usage.input ?? 0;
-        output += usage.output ?? 0;
-        if (usage.total !== undefined && usage.input === undefined && usage.output === undefined) {
-          input += usage.total;
-        }
-        found = true;
-      } catch {
-        // Ignore non-JSON SSE chunks.
-      }
-    }
-
-    if (found) {
-      return { input, output, total: input + output };
-    }
-  }
-
-  try {
-    const parsed = JSON.parse(trimmed);
-    return extractUsageFromObject(parsed);
-  } catch {
-    return undefined;
-  }
-}
-
-function deriveUsageFromWrapEvent(wrapEvent: WrapEvent): DerivedUsage | undefined {
-  const payloadCandidates = [
-    wrapEvent.response_content,
-    wrapEvent.content,
-    wrapEvent.response_preview,
-    wrapEvent.content_preview,
-  ];
-
-  for (const payload of payloadCandidates) {
-    if (!payload) continue;
-    const usage = parseUsageFromPayloadText(payload);
-    if (usage) return usage;
-  }
-
-  return undefined;
-}
-
 function shouldHideNoisyAiWebSocket(wrapEvent: WrapEvent): boolean {
   if (wrapEvent.source !== "ai_proxy") {
     return false;
@@ -167,12 +50,10 @@ function shouldHideNoisyAiWebSocket(wrapEvent: WrapEvent): boolean {
 }
 
 function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
-  const derivedUsage = deriveUsageFromWrapEvent(wrapEvent);
-  const derivedInputTokens = wrapEvent.input_tokens ?? derivedUsage?.input;
-  const derivedOutputTokens = wrapEvent.output_tokens ?? derivedUsage?.output;
+  const derivedInputTokens = wrapEvent.input_tokens;
+  const derivedOutputTokens = wrapEvent.output_tokens;
   const derivedTokenCount =
     wrapEvent.token_count ??
-    derivedUsage?.total ??
     ((derivedInputTokens ?? 0) + (derivedOutputTokens ?? 0) || undefined);
 
   const content =

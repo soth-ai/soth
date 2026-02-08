@@ -60,6 +60,46 @@ export interface BudgetMetrics {
   alerts: BudgetAlert[];
 }
 
+export interface ProviderBudgetPrimitive {
+  provider: string;
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  avg_cost_per_request: number;
+}
+
+export interface BudgetRequestPrimitive {
+  request_id: string | null;
+  timestamp: string;
+  provider: string;
+  host: string;
+  method: string;
+  path: string;
+  model: string | null;
+  status_code: number | null;
+  latency_ms: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface BudgetPrimitives {
+  total_requests: number;
+  total_responses: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  daily_limit_usd: number | null;
+  utilization_pct: number | null;
+  alerts: BudgetAlert[];
+  provider_breakdown: ProviderBudgetPrimitive[];
+  recent_requests: BudgetRequestPrimitive[];
+}
+
 // ============================================================================
 // Advanced Budget Analytics Types
 // ============================================================================
