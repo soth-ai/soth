@@ -7,10 +7,11 @@
 
 pub mod agent_detect;
 
+use crate::cli_config;
 use crate::commands::enforcement;
 use anyhow::{Context, Result};
 use clap::Args;
-use soth_core::config::{load_config, SothConfig};
+use soth_core::config::SothConfig;
 use soth_core::types::{AgentInfo, DetectionSource, TrafficEnvelope, WrapDirection, WrapEvent};
 use soth_core::{
     generate_session_name, EventLogger, MessageDirection, SessionRecorder, SessionStorage,
@@ -219,25 +220,7 @@ impl WrapSession {
 }
 
 fn load_wrap_config(path: Option<&PathBuf>) -> Result<SothConfig> {
-    if let Some(path) = path {
-        return load_config(path).context("Failed to load wrap config");
-    }
-
-    let default_paths = ["soth.yaml", "soth.yml", ".soth.yaml", "~/.soth/soth.yaml"];
-    for path in default_paths {
-        let expanded = if path.starts_with("~/") {
-            dirs::home_dir()
-                .map(|h| h.join(&path[2..]))
-                .unwrap_or_else(|| PathBuf::from(path))
-        } else {
-            PathBuf::from(path)
-        };
-        if expanded.exists() {
-            return load_config(&expanded).context("Failed to load wrap config");
-        }
-    }
-
-    Ok(SothConfig::default())
+    cli_config::load_effective_config(path, None).context("Failed to load wrap config")
 }
 
 fn extract_request_id_for_error(msg: &serde_json::Value) -> Option<RequestId> {

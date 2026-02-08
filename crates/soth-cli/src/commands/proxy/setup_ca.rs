@@ -1,5 +1,6 @@
 //! CA setup command
 
+use crate::cli_config;
 use crate::style;
 use owo_colors::OwoColorize;
 use soth_tls::CertificateAuthority;
@@ -16,12 +17,37 @@ fn expand_path(path: &str) -> PathBuf {
 }
 
 /// Run the setup-ca command
-pub async fn run(output: String, no_trust: bool) -> anyhow::Result<()> {
-    let output_path = expand_path(&output);
+pub async fn run(
+    output: Option<String>,
+    no_trust: bool,
+    config_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    let proxy_addr = format!("http://{}", config.forward_proxy.socket_addr());
+    let configured_cert_path = cli_config::expand_tilde(&config.forward_proxy.ca.cert_path);
+    let configured_key_path = cli_config::expand_tilde(&config.forward_proxy.ca.key_path);
+    let use_config_paths = output.is_none();
+    let output_path = output.as_ref().map_or_else(
+        || {
+            configured_cert_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf()
+        },
+        |value| expand_path(value),
+    );
 
     // Check if CA already exists
-    let cert_path = output_path.join("ca.crt");
-    let key_path = output_path.join("ca.key");
+    let cert_path = if use_config_paths {
+        configured_cert_path.clone()
+    } else {
+        output_path.join("ca.crt")
+    };
+    let key_path = if use_config_paths {
+        configured_key_path.clone()
+    } else {
+        output_path.join("ca.key")
+    };
 
     if cert_path.exists() && key_path.exists() {
         style::header("CA Certificate Status");
@@ -46,6 +72,17 @@ pub async fn run(output: String, no_trust: bool) -> anyhow::Result<()> {
     style::step(2, 3, "Generating CA certificate...");
     let _ca = CertificateAuthority::generate_new(output_path.clone())
         .map_err(|e| anyhow::anyhow!("Failed to generate CA: {}", e))?;
+
+    if use_config_paths {
+        let generated_cert_path = output_path.join("ca.crt");
+        let generated_key_path = output_path.join("ca.key");
+        if generated_cert_path != cert_path {
+            std::fs::rename(&generated_cert_path, &cert_path)?;
+        }
+        if generated_key_path != key_path {
+            std::fs::rename(&generated_key_path, &key_path)?;
+        }
+    }
     style::step_done(2, 3, "CA certificate generated");
 
     // Step 3: Verify
@@ -125,8 +162,9 @@ pub async fn run(output: String, no_trust: bool) -> anyhow::Result<()> {
         println!(
             "    {}",
             format!(
-                "curl --cacert {} --proxy http://127.0.0.1:8080 https://api.openai.com/v1/models",
-                cert_path.display()
+                "curl --cacert {} --proxy {} https://api.openai.com/v1/models",
+                cert_path.display(),
+                proxy_addr
             )
             .dimmed()
         );

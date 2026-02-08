@@ -1,27 +1,19 @@
 //! Proxy status command
 
+use crate::cli_config;
 use crate::style;
 use comfy_table::Cell;
 use owo_colors::OwoColorize;
 use std::path::PathBuf;
 
-/// Expand tilde in path
-fn expand_path(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Run the status command
-pub async fn run() -> anyhow::Result<()> {
-    let ca_path = expand_path("~/.soth/ca");
-    let cert_path = ca_path.join("ca.crt");
-    let key_path = ca_path.join("ca.key");
+pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    let cert_path = cli_config::expand_tilde(&config.forward_proxy.ca.cert_path);
+    let key_path = cli_config::expand_tilde(&config.forward_proxy.ca.key_path);
+    let expected_proxy = format!("http://{}", config.forward_proxy.socket_addr());
 
-    style::header("Forward Proxy Status");
+    style::header("SOTH Proxy Status");
 
     // CA Certificate status
     style::subtitle("CA Certificate");
@@ -55,7 +47,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
         println!("{ca_table}");
     } else {
-        style::error("CA certificate not installed");
+        style::warning("CA certificate not installed");
         println!();
         style::info("Run the following to set up:");
         println!("  {}", "soth proxy setup-ca".bold());
@@ -63,19 +55,22 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Proxy server status
     println!();
-    style::subtitle("Proxy Server");
+    style::subtitle("Runtime");
 
-    let proxy_addr = "127.0.0.1:8080";
+    let proxy_addr = config.forward_proxy.socket_addr();
     let mut server_table = style::table();
     server_table.set_header(vec!["Property", "Value"]);
 
-    server_table.add_row(vec![Cell::new("Default Address"), Cell::new(proxy_addr)]);
+    server_table.add_row(vec![
+        Cell::new("Configured Address"),
+        Cell::new(proxy_addr.to_string().cyan().to_string()),
+    ]);
 
-    let running = tokio::net::TcpStream::connect(proxy_addr).await.is_ok();
+    let running = tokio::net::TcpStream::connect(proxy_addr.as_str()).await.is_ok();
     let status_display = if running {
-        format!("{} Running", style::CIRCLE_FILLED.green())
+        format!("{} Running", style::CHECK.green())
     } else {
-        format!("{} Not running", style::CIRCLE_EMPTY.dimmed())
+        format!("{} Not running", style::CROSS.red())
     };
     server_table.add_row(vec![Cell::new("Status"), Cell::new(status_display)]);
     println!("{server_table}");
@@ -95,13 +90,21 @@ pub async fn run() -> anyhow::Result<()> {
 
     let http_proxy = std::env::var("HTTP_PROXY").ok();
     let https_proxy = std::env::var("HTTPS_PROXY").ok();
+    let no_proxy = std::env::var("NO_PROXY").ok();
     let ssl_cert_file = std::env::var("SSL_CERT_FILE").ok();
 
     env_table.add_row(vec![
         Cell::new("HTTP_PROXY"),
         Cell::new(
             http_proxy
-                .map(|v| v.green().to_string())
+                .as_ref()
+                .map(|v| {
+                    if v == &expected_proxy {
+                        v.as_str().green().to_string()
+                    } else {
+                        v.as_str().yellow().to_string()
+                    }
+                })
                 .unwrap_or_else(|| "(not set)".dimmed().to_string()),
         ),
     ]);
@@ -109,7 +112,23 @@ pub async fn run() -> anyhow::Result<()> {
         Cell::new("HTTPS_PROXY"),
         Cell::new(
             https_proxy
-                .map(|v| v.green().to_string())
+                .as_ref()
+                .map(|v| {
+                    if v == &expected_proxy {
+                        v.as_str().green().to_string()
+                    } else {
+                        v.as_str().yellow().to_string()
+                    }
+                })
+                .unwrap_or_else(|| "(not set)".dimmed().to_string()),
+        ),
+    ]);
+    env_table.add_row(vec![
+        Cell::new("NO_PROXY"),
+        Cell::new(
+            no_proxy
+                .as_ref()
+                .map(|v| v.as_str().green().to_string())
                 .unwrap_or_else(|| "(not set)".dimmed().to_string()),
         ),
     ]);
@@ -117,14 +136,32 @@ pub async fn run() -> anyhow::Result<()> {
         Cell::new("SSL_CERT_FILE"),
         Cell::new(
             ssl_cert_file
-                .map(|v| v.green().to_string())
+                .as_ref()
+                .map(|v| v.as_str().green().to_string())
                 .unwrap_or_else(|| "(not set)".dimmed().to_string()),
         ),
     ]);
     println!("{env_table}");
 
+    if let Some(ref current_http) = http_proxy {
+        if current_http != &expected_proxy {
+            style::warning(&format!(
+                "HTTP_PROXY points to {}, expected {}",
+                current_http, expected_proxy
+            ));
+        }
+    }
+    if let Some(ref current_https) = https_proxy {
+        if current_https != &expected_proxy {
+            style::warning(&format!(
+                "HTTPS_PROXY points to {}, expected {}",
+                current_https, expected_proxy
+            ));
+        }
+    }
+
     println!();
-    style::info("To configure environment:");
+    style::info("To configure environment for this proxy:");
     println!("  {}", "eval $(soth proxy env)".bold());
 
     style::footer();

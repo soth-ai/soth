@@ -1,26 +1,19 @@
 //! CA certificate info command
 
+use crate::cli_config;
+use crate::style;
+use owo_colors::OwoColorize;
 use std::path::PathBuf;
 use x509_parser::prelude::*;
 
-/// Expand tilde in path
-fn expand_path(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Run the ca-info command
-pub async fn run() -> anyhow::Result<()> {
-    let ca_path = expand_path("~/.soth/ca");
-    let cert_path = ca_path.join("ca.crt");
+pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    let cert_path = cli_config::expand_tilde(&config.forward_proxy.ca.cert_path);
 
     if !cert_path.exists() {
-        println!("CA certificate not found at {}", cert_path.display());
-        println!("Run: soth proxy setup-ca");
+        style::warning(&format!("CA certificate not found at {}", cert_path.display()));
+        style::info("Run: soth proxy setup-ca");
         return Ok(());
     }
 
@@ -35,12 +28,10 @@ pub async fn run() -> anyhow::Result<()> {
     let (_, cert) = X509Certificate::from_der(&pem.contents)
         .map_err(|e| anyhow::anyhow!("Failed to parse X.509: {:?}", e))?;
 
-    println!("SOTH CA Certificate Information");
-    println!("================================");
-    println!();
+    style::header("SOTH CA Certificate");
 
     // Subject
-    println!("Subject:");
+    style::subtitle("Subject");
     for rdn in cert.subject().iter() {
         for attr in rdn.iter() {
             if let Ok(s) = attr.as_str() {
@@ -52,14 +43,13 @@ pub async fn run() -> anyhow::Result<()> {
                     "2.5.4.8" => "ST",
                     _ => &attr.attr_type().to_string(),
                 };
-                println!("  {}: {}", oid_name, s);
+                style::kv(oid_name, s);
             }
         }
     }
-    println!();
 
     // Issuer (same as subject for self-signed)
-    println!("Issuer:");
+    style::subtitle("Issuer");
     for rdn in cert.issuer().iter() {
         for attr in rdn.iter() {
             if let Ok(s) = attr.as_str() {
@@ -68,16 +58,15 @@ pub async fn run() -> anyhow::Result<()> {
                     "2.5.4.10" => "O",
                     _ => &attr.attr_type().to_string(),
                 };
-                println!("  {}: {}", oid_name, s);
+                style::kv(oid_name, s);
             }
         }
     }
-    println!();
 
     // Validity
-    println!("Validity:");
-    println!("  Not Before: {}", cert.validity().not_before);
-    println!("  Not After:  {}", cert.validity().not_after);
+    style::subtitle("Validity");
+    style::kv("Not Before", &cert.validity().not_before.to_string());
+    style::kv("Not After", &cert.validity().not_after.to_string());
 
     // Check if expired
     let now = chrono::Utc::now();
@@ -86,34 +75,41 @@ pub async fn run() -> anyhow::Result<()> {
     let not_after_ts = not_after.unix_timestamp();
     let now_ts = now.timestamp();
     if not_after_ts < now_ts {
-        println!("  Status: EXPIRED!");
+        style::kv(
+            "Status",
+            &format!("{} {}", style::CROSS.red(), "EXPIRED".red().bold()),
+        );
     } else {
         let days_left = (not_after_ts - now_ts) / 86400;
-        println!("  Status: Valid ({} days remaining)", days_left);
+        style::kv(
+            "Status",
+            &format!(
+                "{} {} ({} days remaining)",
+                style::CHECK.green(),
+                "valid".green(),
+                days_left
+            ),
+        );
     }
-    println!();
 
-    // Serial number
-    println!("Serial Number: {}", cert.serial);
-    println!();
-
-    // Key info
-    println!("Public Key:");
-    println!("  Algorithm: {}", cert.public_key().algorithm.algorithm);
-    println!();
-
-    // File info
-    println!("File:");
-    println!("  Path: {}", cert_path.display());
+    style::subtitle("Certificate");
+    style::kv("Serial", &cert.serial.to_string());
+    style::kv("Public Key Algorithm", &cert.public_key().algorithm.algorithm.to_string());
+    style::kv("Path", &cert_path.display().to_string());
     if let Ok(metadata) = std::fs::metadata(&cert_path) {
-        println!("  Size: {} bytes", metadata.len());
+        style::kv("Size", &format!("{} bytes", metadata.len()));
     }
-    println!();
 
-    // Usage instructions
-    println!("Usage:");
-    println!("  curl --cacert {} https://...", cert_path.display());
-    println!("  export SSL_CERT_FILE={}", cert_path.display());
+    style::subtitle("Usage");
+    println!(
+        "  {}",
+        format!("curl --cacert {} https://...", cert_path.display()).dimmed()
+    );
+    println!(
+        "  {}",
+        format!("export SSL_CERT_FILE={}", cert_path.display()).dimmed()
+    );
+    style::footer();
 
     Ok(())
 }
