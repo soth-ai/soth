@@ -4,8 +4,8 @@ use crate::event_store::{
     AgentsSummary, ClustersSummary, EventStore, EventsSummary, RollupsSummary, StreamStats,
 };
 use crate::state::{
-    AdvancedBudgetMetrics, BudgetMetrics, DashboardState, IdentityMetrics, ObserveMetrics,
-    PolicyMetrics, ProxyMetrics,
+    AdvancedBudgetMetrics, BudgetMetrics, BudgetPrimitives, DashboardState, IdentityMetrics,
+    ObserveMetrics, PolicyMetrics, ProxyMetrics,
 };
 use crate::websocket::event_stream_handler;
 use axum::{
@@ -102,6 +102,7 @@ pub fn api_router_with_events(state: AppState) -> Router {
         .route("/api/policy", get(get_policy))
         .route("/api/observe", get(get_observe))
         .route("/api/budget", get(get_budget))
+        .route("/api/budget/primitives", get(get_budget_primitives))
         .route("/api/proxy", get(get_proxy))
         .route("/api/health", get(get_health))
         .route("/api/events", get(get_events))
@@ -116,6 +117,7 @@ pub fn api_router_with_events(state: AppState) -> Router {
         .route("/api/metrics/policy", get(get_policy))
         .route("/api/metrics/observe", get(get_observe))
         .route("/api/metrics/budget", get(get_advanced_budget))
+        .route("/api/metrics/budget/primitives", get(get_budget_primitives))
         .route("/api/metrics/proxy", get(get_proxy))
         // Production health check endpoints
         .route("/healthz", get(healthz))
@@ -215,6 +217,16 @@ async fn get_observe(State(state): State<AppState>) -> Json<ApiResponse<ObserveM
 /// Get budget metrics
 async fn get_budget(State(state): State<AppState>) -> Json<ApiResponse<BudgetMetrics>> {
     Json(ApiResponse::new(&state.dashboard, state.dashboard.budget()))
+}
+
+/// Get canonical budget primitives for unified dashboard + observability exports.
+async fn get_budget_primitives(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<BudgetPrimitives>> {
+    Json(ApiResponse::new(
+        &state.dashboard,
+        state.dashboard.budget_primitives(),
+    ))
 }
 
 /// Get proxy metrics
@@ -482,6 +494,36 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"total_tokens\":100"));
+    }
+
+    #[tokio::test]
+    async fn test_budget_primitives_endpoint() {
+        let state = DashboardState::new();
+        state.record_proxy_request(
+            Some("req-budget-routes"),
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+        );
+        state.record_proxy_response(
+            Some("req-budget-routes"),
+            "openai",
+            200,
+            90,
+            Some("gpt-4o"),
+            Some(50),
+            Some(75),
+            Some(0.0125),
+        );
+
+        let app = api_router(state);
+        let (status, body) = make_request(app, "/api/budget/primitives").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"total_input_tokens\":50"));
+        assert!(body.contains("\"total_output_tokens\":75"));
+        assert!(body.contains("\"provider_breakdown\""));
     }
 
     #[tokio::test]

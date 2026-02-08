@@ -422,17 +422,6 @@ pub fn enforce_proxy_request(
                 ));
             }
         }
-        if let Some(body) = envelope.request_body.as_deref() {
-            let input_tokens = TokenCounter::estimate_tokens(body);
-            let effective_model = envelope.model.as_deref().unwrap_or(config.default_model);
-            tracker.record_spend(
-                &envelope.session_id,
-                agent_id.as_deref(),
-                effective_model,
-                input_tokens,
-                0,
-            );
-        }
     }
 
     let Some(engine) = config.policy_engine else {

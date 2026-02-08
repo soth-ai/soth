@@ -19,6 +19,7 @@ import {
   Database,
 } from "@phosphor-icons/react";
 import { format } from "date-fns";
+import { useBudgetPrimitives } from "@/hooks/useDashboardData";
 import { useObservabilityStore, computeLogMetrics } from "@/store/observability";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -32,6 +33,8 @@ export function Sidebar() {
   const setFilters = useObservabilityStore((state) => state.setFilters);
   const clearFilters = useObservabilityStore((state) => state.clearFilters);
   const clearLogs = useObservabilityStore((state) => state.clearLogs);
+  const { data: budgetPrimitivesResponse } = useBudgetPrimitives();
+  const budgetPrimitives = budgetPrimitivesResponse?.data;
 
   // Apply source filter from store if set
   const filteredBySourceLogs = useMemo(() => {
@@ -42,6 +45,55 @@ export function Sidebar() {
   // Memoize metrics to avoid infinite loop
   const metrics = useMemo(() => computeLogMetrics(filteredBySourceLogs), [filteredBySourceLogs]);
   const [isTokenUsageExpanded, setIsTokenUsageExpanded] = useState(false);
+
+  const useCanonicalTokenProfile = !filters.source || filters.source === "ai_proxy";
+
+  const canonicalTopMethodsByTokens = useMemo(() => {
+    const requests = budgetPrimitives?.recent_requests ?? [];
+    if (requests.length === 0) {
+      return [] as [string, number][];
+    }
+
+    const tokensByMethod: Record<string, number> = {};
+    for (const request of requests) {
+      const normalizedPath = (request.path || "").split("?")[0] || request.path || "-";
+      const key = `${request.method || "HTTP"} ${normalizedPath}`;
+      const tokens = request.total_tokens || request.input_tokens + request.output_tokens;
+      tokensByMethod[key] = (tokensByMethod[key] || 0) + tokens;
+    }
+
+    return Object.entries(tokensByMethod)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5);
+  }, [budgetPrimitives?.recent_requests]);
+
+  const tokenProfile = useMemo(() => {
+    if (useCanonicalTokenProfile && budgetPrimitives) {
+      return {
+        totalTokens: budgetPrimitives.total_tokens,
+        tokensToServer: budgetPrimitives.total_input_tokens,
+        tokensFromServer: budgetPrimitives.total_output_tokens,
+        topMethodsByTokens: canonicalTopMethodsByTokens,
+        isCanonical: true,
+      };
+    }
+
+    return {
+      totalTokens: metrics.totalTokens,
+      tokensToServer: metrics.tokensToServer,
+      tokensFromServer: metrics.tokensFromServer,
+      topMethodsByTokens: metrics.topMethodsByTokens,
+      isCanonical: false,
+    };
+  }, [
+    useCanonicalTokenProfile,
+    budgetPrimitives,
+    canonicalTopMethodsByTokens,
+    metrics.totalTokens,
+    metrics.tokensToServer,
+    metrics.tokensFromServer,
+    metrics.topMethodsByTokens,
+  ]);
 
   // Activity chart data (last 10 seconds)
   const activityData = useMemo(() => {
@@ -124,7 +176,7 @@ export function Sidebar() {
             </div>
           </section>
 
-          {metrics.totalTokens > 0 && (
+          {tokenProfile.totalTokens > 0 && (
             <section className="rounded-md border border-warning/25 bg-warning/5">
               <button
                 onClick={() => setIsTokenUsageExpanded(!isTokenUsageExpanded)}
@@ -136,7 +188,7 @@ export function Sidebar() {
                 </span>
                 <span className="flex items-center gap-2">
                   <span className="font-mono font-semibold text-warning text-[10px]">
-                    {metrics.totalTokens.toLocaleString()}
+                    {tokenProfile.totalTokens.toLocaleString()}
                   </span>
                   {isTokenUsageExpanded ? (
                     <CaretDown className="w-2.5 h-2.5" />
@@ -148,26 +200,31 @@ export function Sidebar() {
 
               {isTokenUsageExpanded && (
                 <div className="border-t border-warning/20 px-2 py-1.5 space-y-1 animate-in fade-in slide-in-from-top-1">
+                  {tokenProfile.isCanonical && (
+                    <p className="text-[8px] text-muted-foreground uppercase tracking-[0.08em]">
+                      Synced with budget primitives
+                    </p>
+                  )}
                   <div className="flex items-center justify-between text-[10px]">
                     <span className="text-muted-foreground">Inbound tokens</span>
                     <span className="font-mono font-semibold text-accent tabular-nums">
-                      {metrics.tokensToServer.toLocaleString()}
+                      {tokenProfile.tokensToServer.toLocaleString()}
                     </span>
                   </div>
                   <div className="flex items-center justify-between text-[10px]">
                     <span className="text-muted-foreground">Outbound tokens</span>
                     <span className="font-mono font-semibold text-success tabular-nums">
-                      {metrics.tokensFromServer.toLocaleString()}
+                      {tokenProfile.tokensFromServer.toLocaleString()}
                     </span>
                   </div>
 
-                  {metrics.topMethodsByTokens.length > 0 && (
+                  {tokenProfile.topMethodsByTokens.length > 0 && (
                     <div className="pt-1 border-t border-warning/15 space-y-0.5">
                       <p className="text-[8px] text-muted-foreground uppercase font-semibold tracking-[0.08em]">
                         Top token methods
                       </p>
                       <div className="space-y-0.5">
-                        {metrics.topMethodsByTokens.map(([method, tokens]) => (
+                        {tokenProfile.topMethodsByTokens.map(([method, tokens]) => (
                           <div
                             key={method}
                             className="flex items-center justify-between text-[9px]"

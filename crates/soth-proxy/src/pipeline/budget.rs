@@ -4,7 +4,7 @@ use super::middleware::{error_response, get_request_id, Layer, LayerResult, Requ
 use crate::enforcement::core;
 use crate::metrics;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
-use soth_budget::{BudgetTracker, CostCalculator};
+use soth_budget::{BudgetTracker, PricingCatalog, TokenUsage};
 use soth_core::types::budget::BudgetScope;
 use soth_dashboard::{BudgetAlert, DashboardState};
 use std::future::Future;
@@ -39,8 +39,8 @@ pub struct BudgetLayer {
     config: BudgetConfig,
     /// Budget tracker
     tracker: Arc<BudgetTracker>,
-    /// Cost calculator
-    calculator: CostCalculator,
+    /// LiteLLM-compatible pricing catalog
+    pricing_catalog: PricingCatalog,
     /// Dashboard state for metrics (optional)
     dashboard: Option<DashboardState>,
 }
@@ -51,7 +51,7 @@ impl BudgetLayer {
         Self {
             config,
             tracker: Arc::new(BudgetTracker::new()),
-            calculator: CostCalculator::new(),
+            pricing_catalog: PricingCatalog::with_defaults(),
             dashboard: None,
         }
     }
@@ -61,7 +61,7 @@ impl BudgetLayer {
         Self {
             config,
             tracker: Arc::new(tracker),
-            calculator: CostCalculator::new(),
+            pricing_catalog: PricingCatalog::with_defaults(),
             dashboard: None,
         }
     }
@@ -165,9 +165,8 @@ impl BudgetLayer {
             input_tokens,
             output_tokens,
         );
-        let estimated_cost =
-            self.calculator
-                .calculate_cost_tokens(model, input_tokens, output_tokens);
+        let usage = TokenUsage::new(input_tokens, output_tokens);
+        let estimated_cost = self.pricing_catalog.calculate_cost(model, &usage);
 
         debug!(
             "Recorded spend: session={} agent={:?} model={} cost=${:.4}",
@@ -272,9 +271,8 @@ impl Layer for BudgetLayer {
                         .await;
 
                     // Calculate cost for metadata
-                    let cost =
-                        self.calculator
-                            .calculate_cost_tokens(&model, input_tokens, output_tokens);
+                    let usage = TokenUsage::new(input_tokens, output_tokens);
+                    let cost = self.pricing_catalog.calculate_cost(&model, &usage);
                     ctx.metadata
                         .insert("budget_cost".to_string(), serde_json::json!(cost));
 

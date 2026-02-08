@@ -1,6 +1,6 @@
 //! Spend tracking module
 
-use crate::cost::CostCalculator;
+use crate::pricing::PricingCatalog;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use soth_core::types::budget::{BudgetScope, BudgetState, SpendRecord, TokenUsage};
@@ -11,8 +11,8 @@ use std::sync::Arc;
 pub struct SpendTracker {
     /// Records by session
     records: RwLock<Vec<SpendRecord>>,
-    /// Cost calculator
-    calculator: CostCalculator,
+    /// LiteLLM-compatible pricing catalog
+    pricing_catalog: PricingCatalog,
 }
 
 impl SpendTracker {
@@ -20,7 +20,7 @@ impl SpendTracker {
     pub fn new() -> Self {
         Self {
             records: RwLock::new(Vec::new()),
-            calculator: CostCalculator::new(),
+            pricing_catalog: PricingCatalog::with_defaults(),
         }
     }
 
@@ -35,7 +35,7 @@ impl SpendTracker {
         method: Option<&str>,
     ) -> SpendRecord {
         let usage = TokenUsage::new(input_tokens, output_tokens);
-        let cost = self.calculator.calculate_cost(model, &usage);
+        let cost = self.pricing_catalog.calculate_cost(model, &usage);
 
         let record = SpendRecord {
             id: uuid::Uuid::new_v4().to_string(),

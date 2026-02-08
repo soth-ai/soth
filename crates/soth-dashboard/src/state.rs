@@ -153,6 +153,50 @@ pub struct ProxyStatus {
     pub ca_installed: bool,
 }
 
+/// Canonical budget primitives derived from proxy + budget state.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct BudgetPrimitives {
+    pub total_requests: u64,
+    pub total_responses: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+    pub daily_limit_usd: Option<f64>,
+    pub utilization_pct: Option<f64>,
+    pub alerts: Vec<BudgetAlert>,
+    pub provider_breakdown: Vec<ProviderBudgetPrimitive>,
+    pub recent_requests: Vec<BudgetRequestPrimitive>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProviderBudgetPrimitive {
+    pub provider: String,
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+    pub avg_cost_per_request: f64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct BudgetRequestPrimitive {
+    pub request_id: Option<String>,
+    pub timestamp: String,
+    pub provider: String,
+    pub host: String,
+    pub method: String,
+    pub path: String,
+    pub model: Option<String>,
+    pub status_code: Option<u16>,
+    pub latency_ms: Option<u64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+}
+
 // --- Advanced Budget Analytics ---
 
 /// Advanced budget metrics for Developer and CFO views
@@ -561,6 +605,122 @@ impl DashboardState {
     /// Get proxy metrics
     pub fn proxy(&self) -> ProxyMetrics {
         self.proxy.read().clone()
+    }
+
+    /// Get canonical budget primitives shared by Budget and Observability.
+    pub fn budget_primitives(&self) -> BudgetPrimitives {
+        let proxy = self.proxy();
+        let budget = self.budget();
+
+        let total_input_tokens: u64 = proxy
+            .tokens_by_provider
+            .values()
+            .map(|tokens| tokens.input_tokens)
+            .sum();
+        let total_output_tokens: u64 = proxy
+            .tokens_by_provider
+            .values()
+            .map(|tokens| tokens.output_tokens)
+            .sum();
+
+        let provider_set: HashSet<String> = proxy
+            .requests_by_provider
+            .keys()
+            .chain(proxy.tokens_by_provider.keys())
+            .chain(proxy.cost_by_provider.keys())
+            .cloned()
+            .collect();
+
+        let mut provider_breakdown: Vec<ProviderBudgetPrimitive> = provider_set
+            .into_iter()
+            .map(|provider| {
+                let request_count = proxy
+                    .requests_by_provider
+                    .get(&provider)
+                    .copied()
+                    .unwrap_or_default();
+                let token_usage = proxy
+                    .tokens_by_provider
+                    .get(&provider)
+                    .cloned()
+                    .unwrap_or_default();
+                let total_cost = proxy
+                    .cost_by_provider
+                    .get(&provider)
+                    .copied()
+                    .unwrap_or_default();
+                let total_tokens = token_usage.input_tokens + token_usage.output_tokens;
+                let avg_cost_per_request = if request_count > 0 {
+                    total_cost / request_count as f64
+                } else {
+                    0.0
+                };
+
+                ProviderBudgetPrimitive {
+                    provider,
+                    request_count,
+                    input_tokens: token_usage.input_tokens,
+                    output_tokens: token_usage.output_tokens,
+                    total_tokens,
+                    total_cost_usd: total_cost,
+                    avg_cost_per_request,
+                }
+            })
+            .collect();
+
+        provider_breakdown.sort_by(|a, b| {
+            b.total_cost_usd
+                .partial_cmp(&a.total_cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.request_count.cmp(&a.request_count))
+                .then_with(|| a.provider.cmp(&b.provider))
+        });
+
+        let recent_requests: Vec<BudgetRequestPrimitive> = proxy
+            .recent_requests
+            .iter()
+            .map(|entry| {
+                let input_tokens = entry.input_tokens.unwrap_or(0);
+                let output_tokens = entry.output_tokens.unwrap_or(0);
+                BudgetRequestPrimitive {
+                    request_id: entry.request_id.clone(),
+                    timestamp: entry.timestamp.clone(),
+                    provider: entry.provider.clone(),
+                    host: entry.host.clone(),
+                    method: entry.method.clone(),
+                    path: entry.path.clone(),
+                    model: entry.model.clone(),
+                    status_code: entry.status_code,
+                    latency_ms: entry.latency_ms,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens + output_tokens,
+                    cost_usd: entry.cost_usd.unwrap_or(0.0),
+                }
+            })
+            .collect();
+
+        let utilization_pct = budget.daily_limit_usd.and_then(|limit| {
+            if limit > 0.0 {
+                Some((proxy.total_cost_usd / limit) * 100.0)
+            } else {
+                None
+            }
+        });
+
+        BudgetPrimitives {
+            total_requests: proxy.total_requests,
+            total_responses: proxy.total_responses,
+            total_input_tokens,
+            total_output_tokens,
+            total_tokens: proxy.total_tokens,
+            total_cost_usd: proxy.total_cost_usd,
+            daily_limit_usd: budget.daily_limit_usd,
+            utilization_pct,
+            alerts: budget.alerts,
+            provider_breakdown,
+            recent_requests,
+        }
     }
 
     /// Get advanced budget metrics
@@ -984,5 +1144,49 @@ mod tests {
 
         assert_eq!(openai_entry.status_code, Some(200));
         assert_eq!(anthropic_entry.status_code, None);
+    }
+
+    #[test]
+    fn test_budget_primitives_from_proxy_metrics() {
+        let state = DashboardState::new();
+        state.set_daily_limit(Some(10.0));
+        state.set_budget_alert(BudgetAlert {
+            level: "warning".to_string(),
+            message: "usage above 80%".to_string(),
+        });
+
+        state.record_proxy_request(
+            Some("req-budget-1"),
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+        );
+        state.record_proxy_response(
+            Some("req-budget-1"),
+            "openai",
+            200,
+            100,
+            Some("gpt-4o"),
+            Some(120),
+            Some(80),
+            Some(0.02),
+        );
+
+        let primitives = state.budget_primitives();
+        assert_eq!(primitives.total_requests, 1);
+        assert_eq!(primitives.total_responses, 1);
+        assert_eq!(primitives.total_input_tokens, 120);
+        assert_eq!(primitives.total_output_tokens, 80);
+        assert_eq!(primitives.total_tokens, 200);
+        assert!((primitives.total_cost_usd - 0.02).abs() < 0.0001);
+        assert_eq!(primitives.daily_limit_usd, Some(10.0));
+        assert_eq!(primitives.alerts.len(), 1);
+        assert_eq!(primitives.provider_breakdown.len(), 1);
+        assert_eq!(primitives.provider_breakdown[0].provider, "openai");
+        assert_eq!(primitives.provider_breakdown[0].input_tokens, 120);
+        assert_eq!(primitives.provider_breakdown[0].output_tokens, 80);
+        assert_eq!(primitives.recent_requests.len(), 1);
+        assert_eq!(primitives.recent_requests[0].cost_usd, 0.02);
     }
 }
