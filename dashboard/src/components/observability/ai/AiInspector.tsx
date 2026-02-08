@@ -29,7 +29,7 @@ import { cn, formatTimestamp, formatLatency } from "@/lib/utils";
 type TabType = "request" | "response";
 
 export function AiInspector() {
-  const logs = useObservabilityStore((state) => state.logs);
+  const logEntities = useObservabilityStore((state) => state.logEntities);
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
   const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
   const hydrateLogPayload = useObservabilityStore((state) => state.hydrateLogPayload);
@@ -38,9 +38,9 @@ export function AiInspector() {
 
   // Memoize selected log lookup (AI proxy and agent app logs)
   const selectedLog = useMemo(() => {
-    const log = logs.find((l) => l.id === selectedLogId);
+    const log = selectedLogId ? logEntities[selectedLogId] : null;
     return (log?.source === "ai_proxy" || log?.source === "agent_app") ? log : null;
-  }, [logs, selectedLogId]);
+  }, [logEntities, selectedLogId]);
 
   // Check if this is a paired request/response event
   const hasPairedContent = useMemo(() => {

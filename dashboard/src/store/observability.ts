@@ -73,6 +73,9 @@ export interface LogEntry {
   latency_ms?: number;
   // Computed fields
   message_type?: 'json-rpc' | 'raw' | 'stderr';
+  search_index?: string;
+  path_cache?: string;
+  has_error_cache?: boolean;
 }
 
 // Parsed JSON-RPC message
@@ -122,11 +125,18 @@ interface ObservabilityState {
   // Connection
   isConnected: boolean;
   setConnected: (connected: boolean) => void;
+  streamCursorSeq: number | null;
+  setStreamCursorSeq: (seq: number | null) => void;
+  advanceStreamCursor: (seq: number) => void;
 
   // Logs
   logs: LogEntry[];
+  logEntities: Record<string, LogEntry>;
+  orderedLogIds: string[];
+  logIndexById: Record<string, number>;
   logIds: Set<string>;
   addLog: (log: LogEntry) => void;
+  addLogsBatch: (logs: LogEntry[]) => void;
   hydrateLogPayload: (
     id: string,
     part: "request" | "response" | "content",
@@ -239,14 +249,156 @@ const BUILT_IN_PRESETS: FilterPreset[] = [
   },
 ];
 
+const PARSED_MESSAGE_CACHE_LIMIT = 10_000;
+const SMART_DECODE_CACHE_LIMIT = 8_000;
+const EDITOR_DECODE_CACHE_LIMIT = 4_000;
+const LOG_SUMMARY_CACHE_LIMIT = 10_000;
+
+const parsedMessageCache = new Map<
+  string,
+  { signature: string; parsed: ParsedMessage | null }
+>();
+const smartDecodeCache = new Map<string, string>();
+const editorDecodeCache = new Map<
+  string,
+  {
+    content: string;
+    language: 'json' | 'plaintext';
+  }
+>();
+const logSummaryCache = new Map<string, { signature: string; summary: string }>();
+
+function setBoundedCache<T>(cache: Map<string, T>, key: string, value: T, limit: number): void {
+  if (cache.size >= limit) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey);
+    }
+  }
+  cache.set(key, value);
+}
+
+function parseSignature(log: LogEntry): string {
+  const content = log.content || '';
+  const prefix = content.slice(0, 256);
+  const suffix = content.slice(-128);
+  return `${log.message_type ?? ''}|${content.length}|${prefix}|${suffix}`;
+}
+
+function computeHasErrorCache(log: LogEntry): boolean {
+  if (log.status_code !== undefined && log.status_code >= 400) {
+    return true;
+  }
+  if (log.policy_allowed === false) {
+    return true;
+  }
+  if (log.message_type === 'raw' || log.message_type === 'stderr') {
+    return false;
+  }
+
+  if (!log.content) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(log.content) as { error?: unknown };
+    return parsed.error !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function computeSearchIndex(log: LogEntry): string {
+  const searchableContent = (log.content_preview || log.content || '').slice(0, 2048);
+  return [
+    searchableContent,
+    log.method || '',
+    log.tool_name || '',
+    log.server_name || '',
+    log.agent.name || '',
+  ]
+    .join(' ')
+    .toLowerCase();
+}
+
+function withDerivedLogFields(log: LogEntry): LogEntry {
+  const searchIndex = computeSearchIndex(log);
+  const pathCache = getLogPath(log);
+  const hasErrorCache = computeHasErrorCache(log);
+
+  if (
+    log.search_index === searchIndex &&
+    log.path_cache === pathCache &&
+    log.has_error_cache === hasErrorCache
+  ) {
+    return log;
+  }
+
+  return {
+    ...log,
+    search_index: searchIndex,
+    path_cache: pathCache,
+    has_error_cache: hasErrorCache,
+  };
+}
+
+export function filterLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
+  return logs.filter((log) => {
+    if (filters.source && log.source !== filters.source) return false;
+    if (filters.sessionId && log.session_id !== filters.sessionId) return false;
+
+    if (filters.searchText) {
+      const search = filters.searchText.toLowerCase();
+      const indexed = log.search_index ?? computeSearchIndex(log);
+      if (!indexed.includes(search)) {
+        return false;
+      }
+    }
+
+    if (filters.method && log.method !== filters.method) return false;
+    if (filters.direction && log.direction !== filters.direction) return false;
+    if (filters.serverName && !matchesServerFilter(log.server_name, filters.serverName)) return false;
+    if (filters.path && (log.path_cache ?? getLogPath(log)) !== filters.path) return false;
+
+    if (filters.minLatencyMs && log.latency_ms !== undefined && log.latency_ms < filters.minLatencyMs) {
+      return false;
+    }
+
+    if (filters.policyDenied && log.policy_allowed !== false) return false;
+    if (filters.piiDetected && !log.pii_detected) return false;
+    if (filters.hasError && !(log.has_error_cache ?? computeHasErrorCache(log))) return false;
+
+    return true;
+  });
+}
+
 // Parse JSON-RPC message from content
 export function parseLogMessage(log: LogEntry): ParsedMessage | null {
   if (log.message_type === 'raw' || log.message_type === 'stderr') {
     return null;
   }
+  const signature = parseSignature(log);
+  const cached = parsedMessageCache.get(log.id);
+  if (cached && cached.signature === signature) {
+    return cached.parsed;
+  }
+
   try {
-    return JSON.parse(log.content) as ParsedMessage;
+    const parsed = JSON.parse(log.content) as ParsedMessage;
+    setBoundedCache(
+      parsedMessageCache,
+      log.id,
+      { signature, parsed },
+      PARSED_MESSAGE_CACHE_LIMIT
+    );
+    return parsed;
   } catch {
+    setBoundedCache(
+      parsedMessageCache,
+      log.id,
+      { signature, parsed: null },
+      PARSED_MESSAGE_CACHE_LIMIT
+    );
     return null;
   }
 }
@@ -568,24 +720,37 @@ export function decodeSmartDisplayText(raw?: string): string {
     return '';
   }
 
+  const cached = smartDecodeCache.get(raw);
+  if (cached !== undefined) {
+    return cached;
+  }
+
   if (isLikelyBinaryPayload(raw)) {
-    return summarizeBinaryPreview(raw);
+    const value = summarizeBinaryPreview(raw);
+    setBoundedCache(smartDecodeCache, raw, value, SMART_DECODE_CACHE_LIMIT);
+    return value;
   }
 
   const parsed = parsePossiblyEncodedJson(raw);
   if (typeof parsed === 'string') {
     const normalized = normalizeInline(parsed);
     if (normalized.length === 0) {
-      return normalizeInline(raw);
+      const value = normalizeInline(raw);
+      setBoundedCache(smartDecodeCache, raw, value, SMART_DECODE_CACHE_LIMIT);
+      return value;
     }
     if (isLikelyBinaryPayload(normalized)) {
-      return summarizeBinaryPreview(raw);
+      const value = summarizeBinaryPreview(raw);
+      setBoundedCache(smartDecodeCache, raw, value, SMART_DECODE_CACHE_LIMIT);
+      return value;
     }
+    setBoundedCache(smartDecodeCache, raw, normalized, SMART_DECODE_CACHE_LIMIT);
     return normalized;
   }
 
   const extracted = extractReadableText(parsed);
   if (extracted) {
+    setBoundedCache(smartDecodeCache, raw, extracted, SMART_DECODE_CACHE_LIMIT);
     return extracted;
   }
 
@@ -593,15 +758,22 @@ export function decodeSmartDisplayText(raw?: string): string {
     try {
       const normalized = normalizeInline(JSON.stringify(parsed));
       if (isLikelyBinaryPayload(normalized)) {
-        return summarizeBinaryPreview(raw);
+        const value = summarizeBinaryPreview(raw);
+        setBoundedCache(smartDecodeCache, raw, value, SMART_DECODE_CACHE_LIMIT);
+        return value;
       }
+      setBoundedCache(smartDecodeCache, raw, normalized, SMART_DECODE_CACHE_LIMIT);
       return normalized;
     } catch {
-      return normalizeInline(raw);
+      const value = normalizeInline(raw);
+      setBoundedCache(smartDecodeCache, raw, value, SMART_DECODE_CACHE_LIMIT);
+      return value;
     }
   }
 
-  return normalizeInline(String(parsed));
+  const value = normalizeInline(String(parsed));
+  setBoundedCache(smartDecodeCache, raw, value, SMART_DECODE_CACHE_LIMIT);
+  return value;
 }
 
 // Decode payload for the inspector editor (preserves structure for JSON syntax highlight).
@@ -613,28 +785,41 @@ export function decodeEditorContent(raw?: string): {
     return { content: '', language: 'plaintext' };
   }
 
+  const cached = editorDecodeCache.get(raw);
+  if (cached) {
+    return cached;
+  }
+
   if (isLikelyBinaryPayload(raw)) {
-    return { content: summarizeBinaryPreview(raw), language: 'plaintext' };
+    const value = { content: summarizeBinaryPreview(raw), language: 'plaintext' as const };
+    setBoundedCache(editorDecodeCache, raw, value, EDITOR_DECODE_CACHE_LIMIT);
+    return value;
   }
 
   const parsed = parsePossiblyEncodedJson(raw);
 
   if (parsed !== null && typeof parsed === 'object') {
     try {
-      return {
+      const value = {
         content: JSON.stringify(parsed, null, 2),
-        language: 'json',
+        language: 'json' as const,
       };
+      setBoundedCache(editorDecodeCache, raw, value, EDITOR_DECODE_CACHE_LIMIT);
+      return value;
     } catch {
-      return { content: raw, language: 'plaintext' };
+      const value = { content: raw, language: 'plaintext' as const };
+      setBoundedCache(editorDecodeCache, raw, value, EDITOR_DECODE_CACHE_LIMIT);
+      return value;
     }
   }
 
   if (parsed === null || typeof parsed === 'number' || typeof parsed === 'boolean') {
-    return {
+    const value = {
       content: JSON.stringify(parsed, null, 2),
-      language: 'json',
+      language: 'json' as const,
     };
+    setBoundedCache(editorDecodeCache, raw, value, EDITOR_DECODE_CACHE_LIMIT);
+    return value;
   }
 
   const text = typeof parsed === 'string' ? parsed : String(parsed);
@@ -646,49 +831,104 @@ export function decodeEditorContent(raw?: string): {
   if (looksLikeJsonEnvelope) {
     try {
       const reparsed = JSON.parse(trimmed);
-      return {
+      const value = {
         content: JSON.stringify(reparsed, null, 2),
-        language: 'json',
+        language: 'json' as const,
       };
+      setBoundedCache(editorDecodeCache, raw, value, EDITOR_DECODE_CACHE_LIMIT);
+      return value;
     } catch {
       // Keep plaintext fallback below.
     }
   }
 
   if (isLikelyBinaryPayload(text)) {
-    return { content: summarizeBinaryPreview(raw), language: 'plaintext' };
+    const value = { content: summarizeBinaryPreview(raw), language: 'plaintext' as const };
+    setBoundedCache(editorDecodeCache, raw, value, EDITOR_DECODE_CACHE_LIMIT);
+    return value;
   }
 
-  return {
+  const value = {
     content: text,
-    language: 'plaintext',
+    language: 'plaintext' as const,
   };
+  setBoundedCache(editorDecodeCache, raw, value, EDITOR_DECODE_CACHE_LIMIT);
+  return value;
 }
 
 // Get summary of log content
 export function getLogSummary(log: LogEntry): string {
+  const signature = `${parseSignature(log)}|${log.content_preview ?? ''}`;
+  const cached = logSummaryCache.get(log.id);
+  if (cached && cached.signature === signature) {
+    return cached.summary;
+  }
+
+  let summary = '';
   if (log.content_preview) {
-    return decodeSmartDisplayText(log.content_preview);
+    summary = decodeSmartDisplayText(log.content_preview);
+    setBoundedCache(
+      logSummaryCache,
+      log.id,
+      { signature, summary },
+      LOG_SUMMARY_CACHE_LIMIT
+    );
+    return summary;
   }
 
   const parsed = parseLogMessage(log);
   if (!parsed) {
-    return decodeSmartDisplayText(log.content);
+    summary = decodeSmartDisplayText(log.content);
+    setBoundedCache(
+      logSummaryCache,
+      log.id,
+      { signature, summary },
+      LOG_SUMMARY_CACHE_LIMIT
+    );
+    return summary;
   }
 
   if (parsed.error) {
-    return decodeSmartDisplayText(`Error ${parsed.error.code}: ${parsed.error.message}`);
+    summary = decodeSmartDisplayText(`Error ${parsed.error.code}: ${parsed.error.message}`);
+    setBoundedCache(
+      logSummaryCache,
+      log.id,
+      { signature, summary },
+      LOG_SUMMARY_CACHE_LIMIT
+    );
+    return summary;
   }
 
   if (parsed.params) {
-    return decodeSmartDisplayText(JSON.stringify(parsed.params));
+    summary = decodeSmartDisplayText(JSON.stringify(parsed.params));
+    setBoundedCache(
+      logSummaryCache,
+      log.id,
+      { signature, summary },
+      LOG_SUMMARY_CACHE_LIMIT
+    );
+    return summary;
   }
 
   if (parsed.result) {
-    return decodeSmartDisplayText(JSON.stringify(parsed.result));
+    summary = decodeSmartDisplayText(JSON.stringify(parsed.result));
+    setBoundedCache(
+      logSummaryCache,
+      log.id,
+      { signature, summary },
+      LOG_SUMMARY_CACHE_LIMIT
+    );
+    return summary;
   }
 
-  return decodeSmartDisplayText(JSON.stringify(parsed));
+  summary = decodeSmartDisplayText(JSON.stringify(parsed));
+  setBoundedCache(
+    logSummaryCache,
+    log.id,
+    { signature, summary },
+    LOG_SUMMARY_CACHE_LIMIT
+  );
+  return summary;
 }
 
 // Separate persisted state for presets
@@ -711,71 +951,152 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
   // Connection
   isConnected: false,
   setConnected: (connected) => set({ isConnected: connected }),
+  streamCursorSeq: null,
+  setStreamCursorSeq: (seq) => set({ streamCursorSeq: seq }),
+  advanceStreamCursor: (seq) =>
+    set((state) => ({
+      streamCursorSeq:
+        state.streamCursorSeq === null
+          ? seq
+          : Math.max(state.streamCursorSeq, seq),
+    })),
 
   // Logs
   logs: [],
+  logEntities: {},
+  orderedLogIds: [],
+  logIndexById: {},
   logIds: new Set<string>(),
-  addLog: (log) =>
+  addLog: (log) => get().addLogsBatch([log]),
+  addLogsBatch: (incomingLogs) =>
     set((state) => {
-      if (state.logIds.has(log.id)) {
-        const index = state.logs.findIndex((entry) => entry.id === log.id);
-        if (index === -1) {
-          return state;
-        }
-
-        const logs = [...state.logs];
-        logs[index] = log;
-        return { logs };
+      if (!incomingLogs.length) {
+        return state;
       }
 
-      // Limit logs based on settings
-      const maxLogs = getMaxLogRetention();
-      let newLogs = [...state.logs, log];
-      const newLogIds = new Set(state.logIds);
-      newLogIds.add(log.id);
+      let logs = [...state.logs];
+      let orderedLogIds = [...state.orderedLogIds];
+      let logIndexById = { ...state.logIndexById };
+      const logEntities = { ...state.logEntities };
+      const logIds = new Set(state.logIds);
+      const sessionDelta = new Map<string, { count: number; lastActivity: string }>();
+      for (const log of incomingLogs) {
+        const normalizedLog = withDerivedLogFields(log);
+        const existingIndex = logIndexById[normalizedLog.id];
+        if (existingIndex !== undefined) {
+          logs[existingIndex] = normalizedLog;
+          logEntities[normalizedLog.id] = normalizedLog;
+          continue;
+        }
 
-      const overflow = Math.max(0, newLogs.length - maxLogs);
+        logIndexById[normalizedLog.id] = logs.length;
+        logs.push(normalizedLog);
+        orderedLogIds.push(normalizedLog.id);
+        logIds.add(normalizedLog.id);
+        logEntities[normalizedLog.id] = normalizedLog;
+
+        const existing = sessionDelta.get(normalizedLog.session_id);
+        if (existing) {
+          existing.count += 1;
+          if (normalizedLog.timestamp > existing.lastActivity) {
+            existing.lastActivity = normalizedLog.timestamp;
+          }
+        } else {
+          sessionDelta.set(normalizedLog.session_id, {
+            count: 1,
+            lastActivity: normalizedLog.timestamp,
+          });
+        }
+      }
+
+      const maxLogs = getMaxLogRetention();
+      const nextLogIds = logIds;
+
+      const overflow = Math.max(0, logs.length - maxLogs);
       if (overflow > 0) {
         for (let i = 0; i < overflow; i++) {
-          const removed = newLogs[i];
+          const removed = logs[i];
           if (removed) {
-            newLogIds.delete(removed.id);
+            nextLogIds.delete(removed.id);
+            delete logEntities[removed.id];
           }
         }
-        newLogs = newLogs.slice(overflow);
+        logs = logs.slice(overflow);
+        orderedLogIds = orderedLogIds.slice(overflow);
+        logIndexById = {};
+        for (let i = 0; i < logs.length; i++) {
+          logIndexById[logs[i].id] = i;
+        }
       }
 
-      // Update session message count
-      const sessions = state.sessions.map((s) =>
-        s.id === log.session_id
-          ? { ...s, message_count: s.message_count + 1, last_activity: log.timestamp }
-          : s
-      );
+      const sessions = state.sessions.map((session) => {
+        const delta = sessionDelta.get(session.id);
+        if (!delta) {
+          return session;
+        }
+        return {
+          ...session,
+          message_count: session.message_count + delta.count,
+          last_activity:
+            delta.lastActivity > session.last_activity ? delta.lastActivity : session.last_activity,
+        };
+      });
 
-      return { logs: newLogs, logIds: newLogIds, sessions };
+      return {
+        logs,
+        logEntities,
+        orderedLogIds,
+        logIndexById,
+        logIds: nextLogIds,
+        sessions,
+      };
     }),
   hydrateLogPayload: (id, part, content) =>
     set((state) => {
-      let updated = false;
-      const logs = state.logs.map((log) => {
-        if (log.id !== id) {
-          return log;
-        }
+      const index = state.logIndexById[id];
+      if (index === undefined) {
+        return state;
+      }
 
-        updated = true;
-        if (part === "request") {
-          return { ...log, request_content: content };
-        }
-        if (part === "response") {
-          return { ...log, response_content: content };
-        }
-        return { ...log, content };
-      });
+      const existing = state.logs[index];
+      if (!existing) {
+        return state;
+      }
 
-      return updated ? { logs } : state;
+      let nextLog: LogEntry;
+      if (part === "request") {
+        nextLog = withDerivedLogFields({ ...existing, request_content: content });
+      } else if (part === "response") {
+        nextLog = withDerivedLogFields({ ...existing, response_content: content });
+      } else {
+        nextLog = withDerivedLogFields({ ...existing, content });
+      }
+
+      const logs = [...state.logs];
+      logs[index] = nextLog;
+
+      return {
+        logs,
+        logEntities: {
+          ...state.logEntities,
+          [id]: nextLog,
+        },
+      };
     }),
-  clearLogs: () =>
-    set({ logs: [], logIds: new Set<string>(), selectedLogId: null, selectedLogPart: null }),
+  clearLogs: () => {
+    parsedMessageCache.clear();
+    logSummaryCache.clear();
+    set({
+      logs: [],
+      logEntities: {},
+      orderedLogIds: [],
+      logIndexById: {},
+      logIds: new Set<string>(),
+      streamCursorSeq: null,
+      selectedLogId: null,
+      selectedLogPart: null,
+    });
+  },
 
   // Selection
   selectedLogId: null,
@@ -786,8 +1107,11 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
       selectedLogPart: id === null ? null : part,
     }),
   getSelectedLog: () => {
-    const { logs, selectedLogId } = get();
-    return logs.find((l) => l.id === selectedLogId) || null;
+    const { logEntities, selectedLogId } = get();
+    if (!selectedLogId) {
+      return null;
+    }
+    return logEntities[selectedLogId] || null;
   },
 
   // Sessions
@@ -821,83 +1145,7 @@ export const useObservabilityStore = create<ObservabilityState>((set, get) => ({
   clearFilters: () => set({ filters: {} }),
   getFilteredLogs: () => {
     const { logs, filters } = get();
-
-    return logs.filter((log) => {
-      // Session filter
-      if (filters.sessionId && log.session_id !== filters.sessionId) {
-        return false;
-      }
-
-      // Search text
-      if (filters.searchText) {
-        const search = filters.searchText.toLowerCase();
-        const searchableContent = (log.content_preview || log.content || "").slice(0, 2048);
-        const matchesContent = searchableContent.toLowerCase().includes(search);
-        const matchesMethod = log.method?.toLowerCase().includes(search);
-        const matchesToolName = log.tool_name?.toLowerCase().includes(search);
-        const matchesServer = log.server_name.toLowerCase().includes(search);
-        const matchesAgent = log.agent.name.toLowerCase().includes(search);
-        if (!matchesContent && !matchesMethod && !matchesToolName && !matchesServer && !matchesAgent) {
-          return false;
-        }
-      }
-
-      // Method filter
-      if (filters.method && log.method !== filters.method) {
-        return false;
-      }
-
-      // Direction filter
-      if (filters.direction && log.direction !== filters.direction) {
-        return false;
-      }
-
-      // Server name filter
-      if (filters.serverName && !matchesServerFilter(log.server_name, filters.serverName)) {
-        return false;
-      }
-
-      // Path filter
-      if (filters.path && getLogPath(log) !== filters.path) {
-        return false;
-      }
-
-      // Latency filter
-      if (filters.minLatencyMs && log.latency_ms !== undefined) {
-        if (log.latency_ms < filters.minLatencyMs) {
-          return false;
-        }
-      }
-
-      // Policy denied filter
-      if (filters.policyDenied && log.policy_allowed !== false) {
-        return false;
-      }
-
-      // PII detected filter
-      if (filters.piiDetected && !log.pii_detected) {
-        return false;
-      }
-
-      // Has error filter
-      if (filters.hasError) {
-        try {
-          const parsed = JSON.parse(log.content);
-          if (!parsed.error) {
-            return false;
-          }
-        } catch {
-          return false;
-        }
-      }
-
-      // Source filter
-      if (filters.source && log.source !== filters.source) {
-        return false;
-      }
-
-      return true;
-    });
+    return filterLogs(logs, filters);
   },
 
   // Clustering
@@ -989,7 +1237,7 @@ export function computeLogMetrics(logs: LogEntry[]) {
     if (host) {
       hostCounts.set(host, (hostCounts.get(host) || 0) + 1);
     }
-    const path = getLogPath(log);
+    const path = log.path_cache ?? getLogPath(log);
     if (path) {
       pathCounts.set(path, (pathCounts.get(path) || 0) + 1);
     }

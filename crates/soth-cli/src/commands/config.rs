@@ -119,10 +119,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             "  AI hosts:    {}",
             config.forward_proxy.hosts.ai_inference.len()
         );
-        println!(
-            "  MCP hosts:   {}",
-            config.forward_proxy.hosts.mcp.len()
-        );
+        println!("  MCP hosts:   {}", config.forward_proxy.hosts.mcp.len());
         println!("  Host mode:   {}", config.forward_proxy.hosts.mode);
         println!(
             "  Block:       {} hosts",
@@ -195,9 +192,7 @@ fn validate_forward_proxy(
         && proxy.hosts.ai_inference.is_empty()
         && proxy.hosts.mcp.is_empty()
     {
-        warnings.push(
-            "No AI/MCP host patterns configured; traffic will mostly tunnel".to_string(),
-        );
+        warnings.push("No AI/MCP host patterns configured; traffic will mostly tunnel".to_string());
     }
     if proxy.hosts.mode == HostFilterMode::Discovery {
         warnings.push(

@@ -8,7 +8,9 @@ interface UseEventStreamOptions {
   enabled?: boolean;
   maxEvents?: number;
   sinceSeq?: number | null;
+  captureEvents?: boolean;
   onEvent?: (event: WrapEvent) => void;
+  onEvents?: (events: WrapEvent[]) => void;
 }
 
 interface UseEventStreamResult {
@@ -22,7 +24,14 @@ interface UseEventStreamResult {
 export function useEventStream(
   options: UseEventStreamOptions = {}
 ): UseEventStreamResult {
-  const { enabled = true, maxEvents = MAX_EVENTS, sinceSeq = null, onEvent } = options;
+  const {
+    enabled = true,
+    maxEvents = MAX_EVENTS,
+    sinceSeq = null,
+    captureEvents = true,
+    onEvent,
+    onEvents,
+  } = options;
   const [events, setEvents] = useState<WrapEvent[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -32,6 +41,7 @@ export function useEventStream(
   const sinceSeqRef = useRef<number | null>(sinceSeq);
   const lastAckSeqRef = useRef<number | null>(sinceSeq);
   const onEventRef = useRef<typeof onEvent>(onEvent);
+  const onEventsRef = useRef<typeof onEvents>(onEvents);
 
   useEffect(() => {
     sinceSeqRef.current = sinceSeq;
@@ -40,6 +50,10 @@ export function useEventStream(
   useEffect(() => {
     onEventRef.current = onEvent;
   }, [onEvent]);
+
+  useEffect(() => {
+    onEventsRef.current = onEvents;
+  }, [onEvents]);
 
   const clearEvents = useCallback(() => {
     setEvents([]);
@@ -93,34 +107,37 @@ export function useEventStream(
               return;
             }
 
-            setEvents((prev) => {
-              const updated = [...prev];
-              for (const wrapEvent of validEvents) {
-                const existingIndex = updated.findIndex(
-                  (existing) => existing.id === wrapEvent.id
-                );
-                if (existingIndex >= 0) {
-                  // Streamed proxy events reuse the same id: first placeholder, then final payload.
-                  // Replace in place so the UI reflects the latest body/metadata.
-                  updated[existingIndex] = wrapEvent;
-                  onEventRef.current?.(wrapEvent);
-                } else {
-                  updated.push(wrapEvent);
-                  onEventRef.current?.(wrapEvent);
+            if (captureEvents) {
+              setEvents((prev) => {
+                const updated = [...prev];
+                for (const wrapEvent of validEvents) {
+                  const existingIndex = updated.findIndex(
+                    (existing) => existing.id === wrapEvent.id
+                  );
+                  if (existingIndex >= 0) {
+                    // Streamed proxy events reuse the same id: first placeholder, then final payload.
+                    // Replace in place so the UI reflects the latest body/metadata.
+                    updated[existingIndex] = wrapEvent;
+                  } else {
+                    updated.push(wrapEvent);
+                  }
                 }
-                if (typeof wrapEvent.seq === "number") {
-                  maxSeqInFrame =
-                    maxSeqInFrame === null
-                      ? wrapEvent.seq
-                      : Math.max(maxSeqInFrame, wrapEvent.seq);
-                }
-              }
 
-              if (updated.length > maxEvents) {
-                return updated.slice(updated.length - maxEvents);
+                if (updated.length > maxEvents) {
+                  return updated.slice(updated.length - maxEvents);
+                }
+                return updated;
+              });
+            }
+
+            for (const wrapEvent of validEvents) {
+              if (typeof wrapEvent.seq === "number") {
+                maxSeqInFrame =
+                  maxSeqInFrame === null
+                    ? wrapEvent.seq
+                    : Math.max(maxSeqInFrame, wrapEvent.seq);
               }
-              return updated;
-            });
+            }
 
             if (maxSeqInFrame !== null) {
               sinceSeqRef.current =
@@ -141,6 +158,14 @@ export function useEventStream(
                   })
                 );
                 lastAckSeqRef.current = sinceSeqRef.current;
+              }
+            }
+
+            if (onEventsRef.current) {
+              onEventsRef.current(validEvents);
+            } else {
+              for (const wrapEvent of validEvents) {
+                onEventRef.current?.(wrapEvent);
               }
             }
           } catch (e) {
@@ -179,7 +204,7 @@ export function useEventStream(
         wsRef.current.close();
       }
     };
-  }, [enabled, maxEvents]);
+  }, [enabled, maxEvents, captureEvents]);
 
   return {
     events,

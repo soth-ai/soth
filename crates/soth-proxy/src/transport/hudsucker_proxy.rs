@@ -244,9 +244,7 @@ impl ProxyEnforcer {
                 budget_block_on_exceeded: self.budget_block_on_exceeded,
                 default_model: &self.default_model,
             },
-            enforcement_core::ProxyEnforcementInput {
-                envelope,
-            },
+            enforcement_core::ProxyEnforcementInput { envelope },
         );
         if let Err((_, ref reason, _)) = result {
             if self.policy_mode == ProxyPolicyMode::Audit {
@@ -1236,15 +1234,14 @@ impl HttpHandler for AiProxyHandler {
                 (None, None, req)
             };
             let agent = Self::detect_agent_with_context(ua_agent, &host, &path, model.as_deref());
-            let mcp_request_method = if !is_connect
-                && (host_is_mcp_target || host_mode == HostFilterMode::Discovery)
-            {
-                body_content
-                    .as_deref()
-                    .and_then(|content| extract_mcp_request_method(content, &path))
-            } else {
-                None
-            };
+            let mcp_request_method =
+                if !is_connect && (host_is_mcp_target || host_mode == HostFilterMode::Discovery) {
+                    body_content
+                        .as_deref()
+                        .and_then(|content| extract_mcp_request_method(content, &path))
+                } else {
+                    None
+                };
 
             if !is_connect {
                 if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
@@ -2050,7 +2047,8 @@ impl WebSocketHandler for AiWebSocketHandler {
                                 }
                             }
                         });
-                        let agent_info = AgentInfo::new(resolved_agent, DetectionSource::Environment);
+                        let agent_info =
+                            AgentInfo::new(resolved_agent, DetectionSource::Environment);
 
                         let event = WrapEvent::new(&session_id, &host, direction, agent_info)
                             .with_source(source)
@@ -2249,7 +2247,8 @@ mod tests {
     #[test]
     fn test_is_jsonrpc_response_for_mcp_detects_response_and_error() {
         let response = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32803,"message":"resource not found"}}"#;
+        let error =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32803,"message":"resource not found"}}"#;
         let generic = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
 
         assert!(is_jsonrpc_response_for_mcp(response));

@@ -913,7 +913,10 @@ async fn process_outbound_message(session: &WrapSession, content: &str) -> Outbo
 
         if event.traffic_envelope.is_none() {
             let request_id = msg.get("id").and_then(extract_context_id);
-            let method = event.method.clone().unwrap_or_else(|| "response".to_string());
+            let method = event
+                .method
+                .clone()
+                .unwrap_or_else(|| "response".to_string());
             let envelope = TrafficEnvelope::mcp_stdio(
                 &session.session_id,
                 request_id,
@@ -1001,8 +1004,8 @@ fn truncate_content(content: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soth_proxy::pipeline::middleware::RequestContext as PipelineCtx;
     use serde_json::json;
+    use soth_proxy::pipeline::middleware::RequestContext as PipelineCtx;
 
     #[test]
     fn test_derive_server_name_npx() {

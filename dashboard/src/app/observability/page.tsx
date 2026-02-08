@@ -14,7 +14,6 @@ import { useEventStream } from "@/hooks/useEventStream";
 import { buildApiUrl } from "@/lib/endpoints";
 import type { ApiResponse, EventsSummary, WrapEvent } from "@/types";
 import { cn } from "@/lib/utils";
-import { motion, AnimatePresence } from "framer-motion";
 
 type MobilePanel = "stream" | "inspector" | "filters";
 const BOOTSTRAP_LIMIT = 250;
@@ -217,11 +216,14 @@ function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
 }
 
 export default function ObservabilityPage() {
-  const { addLog, setConnected, selectedLogId } = useObservabilityStore();
+  const addLogsBatch = useObservabilityStore((state) => state.addLogsBatch);
+  const setConnected = useObservabilityStore((state) => state.setConnected);
+  const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
+  const streamCursorSeq = useObservabilityStore((state) => state.streamCursorSeq);
+  const advanceStreamCursor = useObservabilityStore((state) => state.advanceStreamCursor);
   const isMobile = useIsMobile();
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("stream");
   const [mounted, setMounted] = useState(false);
-  const [sinceSeq, setSinceSeq] = useState<number | null>(null);
 
   useEffect(() => {
     setMounted(true);
@@ -234,21 +236,30 @@ export default function ObservabilityPage() {
     }
   }, [isMobile, selectedLogId]);
 
-  const handleWrapEvent = useCallback(
-    (wrapEvent: WrapEvent) => {
-      addLog(mapWrapEventToLog(wrapEvent));
+  const handleWrapEvents = useCallback(
+    (wrapEvents: WrapEvent[]) => {
+      if (!wrapEvents.length) return;
+      const logs = wrapEvents.map(mapWrapEventToLog);
+      addLogsBatch(logs);
 
-      if (typeof wrapEvent.seq === "number") {
-        setSinceSeq((prev) => (prev === null ? wrapEvent.seq! : Math.max(prev, wrapEvent.seq!)));
+      let maxSeq: number | null = null;
+      for (const wrapEvent of wrapEvents) {
+        if (typeof wrapEvent.seq === "number") {
+          maxSeq = maxSeq === null ? wrapEvent.seq : Math.max(maxSeq, wrapEvent.seq);
+        }
+      }
+      if (maxSeq !== null) {
+        advanceStreamCursor(maxSeq);
       }
     },
-    [addLog]
+    [addLogsBatch, advanceStreamCursor]
   );
 
   const { isConnected: wsConnected } = useEventStream({
     enabled: mounted,
-    sinceSeq,
-    onEvent: handleWrapEvent,
+    sinceSeq: streamCursorSeq,
+    captureEvents: false,
+    onEvents: handleWrapEvents,
   });
 
   useEffect(() => {
@@ -276,12 +287,10 @@ export default function ObservabilityPage() {
         const payload = (await response.json()) as ApiResponse<EventsSummary>;
         const bootstrapEvents = [...payload.data.events].reverse();
 
-        for (const event of bootstrapEvents) {
-          if (cancelled) {
-            return;
-          }
-          handleWrapEvent(event);
+        if (cancelled || bootstrapEvents.length === 0) {
+          return;
         }
+        handleWrapEvents(bootstrapEvents);
       } catch (error) {
         console.warn("Failed to load initial event snapshot", error);
       }
@@ -292,7 +301,7 @@ export default function ObservabilityPage() {
     return () => {
       cancelled = true;
     };
-  }, [mounted, handleWrapEvent]);
+  }, [mounted, handleWrapEvents]);
 
   // Prevent hydration mismatch
   if (!mounted) {

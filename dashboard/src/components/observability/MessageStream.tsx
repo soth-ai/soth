@@ -7,15 +7,12 @@ import {
   ArrowUp,
   MagnifyingGlass,
   X,
-  Pause,
-  Play,
   Copy,
   Lightning,
   Funnel,
   Cpu,
   CloudArrowUp,
   Robot,
-  Stack,
   Pulse,
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
@@ -27,10 +24,8 @@ import {
   getLogSummary,
   getLogTokenCount,
   createClusters,
-  getLogPath,
-  matchesServerFilter,
+  filterLogs,
   type LogEntry,
-  type Filters,
   type EventCluster,
   type DisplayItem,
 } from "@/store/observability";
@@ -42,44 +37,6 @@ import {
   OBSERVABILITY_SCROLL_SEEK_CONFIG,
   OBSERVABILITY_VIRTUOSO_COMPONENTS,
 } from "@/components/observability/ScrollSeekPlaceholder";
-
-// Helper function to filter logs
-function filterLogs(logs: LogEntry[], filters: Filters): LogEntry[] {
-  return logs.filter((log) => {
-    if (filters.source && log.source !== filters.source) return false;
-    if (filters.sessionId && log.session_id !== filters.sessionId) return false;
-    if (filters.searchText) {
-      const search = filters.searchText.toLowerCase();
-      const searchableContent = (log.content_preview || log.content || "").slice(0, 2048);
-      const matchesContent = searchableContent.toLowerCase().includes(search);
-      const matchesMethod = log.method?.toLowerCase().includes(search);
-      const matchesToolName = log.tool_name?.toLowerCase().includes(search);
-      const matchesServer = log.server_name.toLowerCase().includes(search);
-      const matchesAgent = log.agent.name.toLowerCase().includes(search);
-      if (!matchesContent && !matchesMethod && !matchesToolName && !matchesServer && !matchesAgent) {
-        return false;
-      }
-    }
-    if (filters.method && log.method !== filters.method) return false;
-    if (filters.direction && log.direction !== filters.direction) return false;
-    if (filters.serverName && !matchesServerFilter(log.server_name, filters.serverName)) return false;
-    if (filters.path && getLogPath(log) !== filters.path) return false;
-    if (filters.minLatencyMs && log.latency_ms !== undefined) {
-      if (log.latency_ms < filters.minLatencyMs) return false;
-    }
-    if (filters.policyDenied && log.policy_allowed !== false) return false;
-    if (filters.piiDetected && !log.pii_detected) return false;
-    if (filters.hasError) {
-      try {
-        const parsed = JSON.parse(log.content);
-        if (!parsed.error && !(log.status_code && log.status_code >= 400)) return false;
-      } catch {
-        if (!(log.status_code && log.status_code >= 400)) return false;
-      }
-    }
-    return true;
-  });
-}
 
 // Source type config
 const sourceConfig = {
@@ -647,7 +604,6 @@ export function MessageStream() {
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
   const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
   const isLive = useObservabilityStore((state) => state.isLive);
-  const isConnected = useObservabilityStore((state) => state.isConnected);
   const setFilters = useObservabilityStore((state) => state.setFilters);
   const selectLog = useObservabilityStore((state) => state.selectLog);
   const setIsLive = useObservabilityStore((state) => state.setIsLive);

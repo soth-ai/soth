@@ -130,7 +130,10 @@ fn validate_policy_artifacts(
     Ok(())
 }
 
-fn apply_policy_artifacts(engine: &PolicyEngine, artifacts: &PolicyArtifacts) -> anyhow::Result<()> {
+fn apply_policy_artifacts(
+    engine: &PolicyEngine,
+    artifacts: &PolicyArtifacts,
+) -> anyhow::Result<()> {
     if let Some(ref data) = artifacts.data {
         engine.set_policy_data(data.clone())?;
     }

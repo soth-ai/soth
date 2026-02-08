@@ -133,6 +133,7 @@ function WhyThisMatters({
 
 export function Inspector() {
   const logs = useObservabilityStore((state) => state.logs);
+  const logEntities = useObservabilityStore((state) => state.logEntities);
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
   const selectedLogPart = useObservabilityStore((state) => state.selectedLogPart);
   const selectLog = useObservabilityStore((state) => state.selectLog);
@@ -141,10 +142,12 @@ export function Inspector() {
   const [activeTab, setActiveTab] = useState<"request" | "response">("request");
 
   // Memoize selected log lookup
-  const selectedLog = useMemo(
-    () => logs.find((l) => l.id === selectedLogId) || null,
-    [logs, selectedLogId]
-  );
+  const selectedLog = useMemo(() => {
+    if (!selectedLogId) {
+      return null;
+    }
+    return logEntities[selectedLogId] || null;
+  }, [logEntities, selectedLogId]);
 
   const hasPairedContent = useMemo(
     () => (selectedLog ? hasPairedPayload(selectedLog) : false),
