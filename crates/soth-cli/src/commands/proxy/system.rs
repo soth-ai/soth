@@ -85,28 +85,41 @@ async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<(
 
 /// Disable system proxy settings
 pub async fn disable() -> Result<()> {
-    println!(
-        "{} Removing system proxy configuration...",
-        style::ARROW_RIGHT
-    );
+    disable_internal(true).await
+}
+
+/// Disable system proxy settings without printing user-facing output.
+pub async fn disable_quiet() -> Result<()> {
+    disable_internal(false).await
+}
+
+async fn disable_internal(print_user_output: bool) -> Result<()> {
+    if print_user_output {
+        println!(
+            "{} Removing system proxy configuration...",
+            style::ARROW_RIGHT
+        );
+    }
 
     #[cfg(target_os = "macos")]
     {
-        configure_macos_proxy(false, 0, true).await?;
+        configure_macos_proxy(false, 0, print_user_output).await?;
     }
 
     #[cfg(target_os = "linux")]
     {
-        configure_linux_proxy(false, 0, true).await?;
+        configure_linux_proxy(false, 0, print_user_output).await?;
     }
 
     #[cfg(target_os = "windows")]
     {
-        configure_windows_proxy(false, 0, true).await?;
+        configure_windows_proxy(false, 0, print_user_output).await?;
     }
 
-    println!("\n{} System proxy disabled", style::success_prefix());
-    println!("   Direct connections restored");
+    if print_user_output {
+        println!("\n{} System proxy disabled", style::success_prefix());
+        println!("   Direct connections restored");
+    }
 
     Ok(())
 }

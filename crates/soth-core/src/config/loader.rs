@@ -76,7 +76,11 @@ fn load_domain_list_file(path: &Path) -> Result<Vec<String>> {
 
     let content = std::fs::read_to_string(path)?;
     let parsed: DomainListFile = serde_yaml::from_str(&content).map_err(|e| {
-        SothError::ConfigInvalid(format!("Invalid domain list file {}: {}", path.display(), e))
+        SothError::ConfigInvalid(format!(
+            "Invalid domain list file {}: {}",
+            path.display(),
+            e
+        ))
     })?;
 
     let domains = match parsed {
@@ -86,7 +90,10 @@ fn load_domain_list_file(path: &Path) -> Result<Vec<String>> {
     Ok(normalize_domains(domains))
 }
 
-fn apply_host_domain_file_overrides(config: &mut SothConfig, base_dir: Option<&Path>) -> Result<()> {
+fn apply_host_domain_file_overrides(
+    config: &mut SothConfig,
+    base_dir: Option<&Path>,
+) -> Result<()> {
     let domain_files = config.forward_proxy.hosts.domain_files.clone();
 
     if let Some(path) = domain_files.ai_inference.as_ref() {

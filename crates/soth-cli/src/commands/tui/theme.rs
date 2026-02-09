@@ -30,16 +30,16 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            success: Color::Green,
-            error: Color::Red,
-            warning: Color::Yellow,
-            info: Color::Cyan,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            border_focused: Color::Cyan,
+            success: Color::Rgb(87, 201, 140),
+            error: Color::Rgb(232, 93, 93),
+            warning: Color::Rgb(217, 119, 87),
+            info: Color::Rgb(89, 179, 223),
+            muted: Color::Rgb(159, 159, 159),
+            border: Color::Rgb(101, 54, 38),
+            border_focused: Color::Rgb(217, 119, 87),
             bg: Color::Reset,
-            fg: Color::White,
-            highlight_bg: Color::DarkGray,
+            fg: Color::Rgb(245, 245, 245),
+            highlight_bg: Color::Rgb(33, 33, 33),
         }
     }
 }
@@ -82,7 +82,9 @@ impl Theme {
     }
 
     pub fn header_style(&self) -> Style {
-        Style::default().fg(self.info).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.warning)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn highlight_style(&self) -> Style {
@@ -144,6 +146,7 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// Format duration from seconds
+#[allow(dead_code)]
 pub fn format_duration(secs: u64) -> String {
     let hours = secs / 3600;
     let mins = (secs % 3600) / 60;

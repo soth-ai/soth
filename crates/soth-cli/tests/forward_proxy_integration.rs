@@ -1,6 +1,8 @@
 //! Integration tests for forward proxy functionality
 
-use soth_core::config::{ForwardProxyConfig, HostDomainFilesConfig, HostFilterConfig, HostFilterMode};
+use soth_core::config::{
+    ForwardProxyConfig, HostDomainFilesConfig, HostFilterConfig, HostFilterMode,
+};
 use soth_proxy::providers::{HttpRequest, ProviderRegistry};
 use soth_tls::CertificateAuthority;
 use std::time::Duration;

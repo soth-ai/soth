@@ -1,4 +1,4 @@
-//! Transport modules used by the forward proxy runtime.
+//! Transport modules used by the soth proxy runtime.
 
 pub mod host_fingerprint;
 pub mod hudsucker_proxy;

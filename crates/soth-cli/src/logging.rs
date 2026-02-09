@@ -4,6 +4,7 @@ use chrono::Local;
 use owo_colors::OwoColorize;
 use std::fmt;
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::fmt::format::Writer;
@@ -18,6 +19,7 @@ const SOTH_TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF); // #FFFFFF
 const SOTH_OK: (u8, u8, u8) = (0x4A, 0xD6, 0x8D);
 const SOTH_WARN: (u8, u8, u8) = (0xF5, 0xB5, 0x41);
 const SOTH_ERROR: (u8, u8, u8) = (0xEF, 0x44, 0x44);
+static LOG_OUTPUT_PAUSED: AtomicBool = AtomicBool::new(false);
 
 /// Build the default log filter when `RUST_LOG` is not explicitly provided.
 pub fn default_log_filter(verbose: bool) -> EnvFilter {
@@ -32,6 +34,11 @@ pub fn default_log_filter(verbose: bool) -> EnvFilter {
 /// Use ANSI only when stdout is a TTY and colors are not disabled.
 pub fn use_ansi_colors() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Pause/resume formatted stdout log emission (used while TUI owns the screen).
+pub fn set_log_output_paused(paused: bool) {
+    LOG_OUTPUT_PAUSED.store(paused, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +137,10 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
+        if LOG_OUTPUT_PAUSED.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         let mut fields = FieldCollector::default();
         event.record(&mut fields);
 

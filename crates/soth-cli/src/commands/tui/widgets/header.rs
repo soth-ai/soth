@@ -28,17 +28,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ConnectionState::Disconnected => (CIRCLE_FILLED, theme.error_style()),
     };
 
-    let status_text = match app.connection {
+    let connection_text = match app.connection {
         ConnectionState::Connected => "Connected",
         ConnectionState::Connecting => "Connecting...",
         ConnectionState::Disconnected => "Disconnected",
     };
+    let refresh_text = if app.auto_refresh_enabled() {
+        "Live"
+    } else {
+        "Paused"
+    };
+    let status_text = format!("{connection_text} | {refresh_text}");
 
     // Create tabs widget
     let tabs = Tabs::new(titles)
         .block(
             Block::default()
-                .title(" SOTH ")
+                .title(" SOTH TUI ")
                 .title_style(theme.header_style())
                 .borders(Borders::ALL)
                 .border_style(theme.border_style(false)),

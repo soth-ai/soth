@@ -271,7 +271,12 @@ fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTrac
 pub fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer> {
     let identity_mode = match config.identity.mode.as_str() {
         "disabled" => ProxyIdentityMode::Disabled,
-        "required" => ProxyIdentityMode::Required,
+        "required" => {
+            warn!(
+                "identity mode 'required' is deferred until agentfacts adoption; using optional mode"
+            );
+            ProxyIdentityMode::Optional
+        }
         _ => ProxyIdentityMode::Optional,
     };
 
@@ -305,7 +310,12 @@ pub fn build_wrap_enforcement_runtime(
 
     let identity_mode = match config.identity.mode.as_str() {
         "disabled" => IdentityMode::Disabled,
-        "required" => IdentityMode::Required,
+        "required" => {
+            warn!(
+                "identity mode 'required' is deferred until agentfacts adoption; using optional mode"
+            );
+            IdentityMode::Optional
+        }
         _ => IdentityMode::Optional,
     };
     let identity_config = IdentityConfig::default();

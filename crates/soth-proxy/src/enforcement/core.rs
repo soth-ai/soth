@@ -1,4 +1,4 @@
-//! Shared enforcement helpers used by both MCP and forward proxy runtimes.
+//! Shared enforcement helpers used by both MCP and soth proxy runtimes.
 
 use std::collections::HashSet;
 
