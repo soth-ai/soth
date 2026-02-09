@@ -18,53 +18,66 @@ const DEFAULT_PROXY_PORT: u16 = 8080;
 
 /// Enable system proxy settings
 pub async fn enable(port: Option<u16>) -> Result<()> {
+    enable_internal(port, true).await
+}
+
+/// Enable system proxy settings without printing user-facing output.
+pub async fn enable_quiet(port: Option<u16>) -> Result<()> {
+    enable_internal(port, false).await
+}
+
+async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<()> {
     let proxy_port = port.unwrap_or(DEFAULT_PROXY_PORT);
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
 
-    println!(
-        "{} Configuring system to use SOTH proxy at {}",
-        style::ARROW_RIGHT,
-        style::highlight(&proxy_addr)
-    );
+    if print_user_output {
+        println!(
+            "{} Configuring system to use SOTH proxy at {}",
+            style::ARROW_RIGHT,
+            style::highlight(&proxy_addr)
+        );
+    }
 
     #[cfg(target_os = "macos")]
     {
-        configure_macos_proxy(true, proxy_port).await?;
+        configure_macos_proxy(true, proxy_port, print_user_output).await?;
     }
 
     #[cfg(target_os = "linux")]
     {
-        configure_linux_proxy(true, proxy_port).await?;
+        configure_linux_proxy(true, proxy_port, print_user_output).await?;
     }
 
     #[cfg(target_os = "windows")]
     {
-        configure_windows_proxy(true, proxy_port).await?;
+        configure_windows_proxy(true, proxy_port, print_user_output).await?;
     }
 
-    println!("\n{} System proxy enabled", style::success_prefix());
-    println!("   All HTTPS traffic will now route through SOTH proxy");
-    println!(
-        "   {} AI traffic: MITM intercepted (inspection enabled)",
-        style::INFO
-    );
-    println!(
-        "   {} Other traffic: Tunneled (no inspection)",
-        style::ARROW_RIGHT
-    );
-    println!(
-        "   {} Bypass: localhost, 127.0.0.1, *.local, private IPs",
-        style::ARROW_RIGHT
-    );
-
-    // Check if CA is trusted
-    let ca_path = get_ca_path();
-    if !ca_path.exists() {
+    if print_user_output {
+        println!("\n{} System proxy enabled", style::success_prefix());
+        println!("   All HTTPS traffic will now route through SOTH proxy");
         println!(
-            "\n{} CA certificate not found. Run: {}",
-            style::WARNING,
-            style::highlight("soth proxy setup-ca")
+            "   {} AI traffic: MITM intercepted (inspection enabled)",
+            style::INFO
         );
+        println!(
+            "   {} Other traffic: Tunneled (no inspection)",
+            style::ARROW_RIGHT
+        );
+        println!(
+            "   {} Bypass: localhost, 127.0.0.1, *.local, private IPs",
+            style::ARROW_RIGHT
+        );
+
+        // Check if CA is trusted
+        let ca_path = get_ca_path();
+        if !ca_path.exists() {
+            println!(
+                "\n{} CA certificate not found. Run: {}",
+                style::WARNING,
+                style::highlight("soth proxy setup-ca")
+            );
+        }
     }
 
     Ok(())
@@ -79,17 +92,17 @@ pub async fn disable() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        configure_macos_proxy(false, 0).await?;
+        configure_macos_proxy(false, 0, true).await?;
     }
 
     #[cfg(target_os = "linux")]
     {
-        configure_linux_proxy(false, 0).await?;
+        configure_linux_proxy(false, 0, true).await?;
     }
 
     #[cfg(target_os = "windows")]
     {
-        configure_windows_proxy(false, 0).await?;
+        configure_windows_proxy(false, 0, true).await?;
     }
 
     println!("\n{} System proxy disabled", style::success_prefix());
@@ -134,7 +147,7 @@ fn get_ca_path() -> PathBuf {
 const PROXY_BYPASS_DOMAINS: &str = "localhost,127.0.0.1,::1,*.local,192.168.*,10.*,172.16.*,172.17.*,172.18.*,172.19.*,172.20.*,172.21.*,172.22.*,172.23.*,172.24.*,172.25.*,172.26.*,172.27.*,172.28.*,172.29.*,172.30.*,172.31.*";
 
 #[cfg(target_os = "macos")]
-async fn configure_macos_proxy(enable: bool, port: u16) -> Result<()> {
+async fn configure_macos_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<()> {
     // Get list of network services
     let services = get_macos_network_services()?;
 
@@ -171,14 +184,16 @@ async fn configure_macos_proxy(enable: bool, port: u16) -> Result<()> {
         }
     }
 
-    if services.is_empty() {
-        println!(
-            "   {} No network services found to configure",
-            style::WARNING
-        );
-    } else {
-        for service in &services {
-            println!("   {} Configured: {}", style::CHECK, service);
+    if print_user_output {
+        if services.is_empty() {
+            println!(
+                "   {} No network services found to configure",
+                style::WARNING
+            );
+        } else {
+            for service in &services {
+                println!("   {} Configured: {}", style::CHECK, service);
+            }
         }
     }
 
@@ -260,30 +275,32 @@ async fn check_macos_proxy_status() -> Result<bool> {
 // === Linux Implementation ===
 
 #[cfg(target_os = "linux")]
-async fn configure_linux_proxy(enable: bool, port: u16) -> Result<()> {
+async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<()> {
     // Try GNOME gsettings first
     if which::which("gsettings").is_ok() {
-        configure_gnome_proxy(enable, port)?;
+        configure_gnome_proxy(enable, port, print_user_output)?;
         return Ok(());
     }
 
     // Fall back to environment variable instructions
-    if enable {
-        println!("   {} Add to your shell profile:", style::INFO);
-        println!("      export https_proxy=\"http://127.0.0.1:{}\"", port);
-        println!("      export HTTPS_PROXY=\"http://127.0.0.1:{}\"", port);
-        println!("      export no_proxy=\"localhost,127.0.0.1,::1,*.local\"");
-        println!("      export NO_PROXY=\"localhost,127.0.0.1,::1,*.local\"");
-    } else {
-        println!("   {} Remove from your shell profile:", style::INFO);
-        println!("      unset https_proxy HTTPS_PROXY no_proxy NO_PROXY");
+    if print_user_output {
+        if enable {
+            println!("   {} Add to your shell profile:", style::INFO);
+            println!("      export https_proxy=\"http://127.0.0.1:{}\"", port);
+            println!("      export HTTPS_PROXY=\"http://127.0.0.1:{}\"", port);
+            println!("      export no_proxy=\"localhost,127.0.0.1,::1,*.local\"");
+            println!("      export NO_PROXY=\"localhost,127.0.0.1,::1,*.local\"");
+        } else {
+            println!("   {} Remove from your shell profile:", style::INFO);
+            println!("      unset https_proxy HTTPS_PROXY no_proxy NO_PROXY");
+        }
     }
 
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn configure_gnome_proxy(enable: bool, port: u16) -> Result<()> {
+fn configure_gnome_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<()> {
     if enable {
         // Set proxy mode to manual
         run_gsettings(&["set", "org.gnome.system.proxy", "mode", "'manual'"])?;
@@ -310,11 +327,15 @@ fn configure_gnome_proxy(enable: bool, port: u16) -> Result<()> {
             "ignore-hosts",
             "\"['localhost', '127.0.0.0/8', '::1', '*.local']\"",
         ])?;
-        println!("   {} Configured GNOME proxy settings", style::CHECK);
+        if print_user_output {
+            println!("   {} Configured GNOME proxy settings", style::CHECK);
+        }
     } else {
         // Set proxy mode to none
         run_gsettings(&["set", "org.gnome.system.proxy", "mode", "'none'"])?;
-        println!("   {} Disabled GNOME proxy settings", style::CHECK);
+        if print_user_output {
+            println!("   {} Disabled GNOME proxy settings", style::CHECK);
+        }
     }
     Ok(())
 }
@@ -350,7 +371,7 @@ async fn check_linux_proxy_status() -> Result<bool> {
 // === Windows Implementation ===
 
 #[cfg(target_os = "windows")]
-async fn configure_windows_proxy(enable: bool, port: u16) -> Result<()> {
+async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<()> {
     use std::os::windows::process::CommandExt;
 
     let proxy_server = format!("127.0.0.1:{}", port);
@@ -378,7 +399,9 @@ async fn configure_windows_proxy(enable: bool, port: u16) -> Result<()> {
             "REG_SZ",
             proxy_bypass,
         )?;
-        println!("   {} Configured Windows proxy settings", style::CHECK);
+        if print_user_output {
+            println!("   {} Configured Windows proxy settings", style::CHECK);
+        }
     } else {
         // Disable proxy
         run_reg_add(
@@ -387,7 +410,9 @@ async fn configure_windows_proxy(enable: bool, port: u16) -> Result<()> {
             "REG_DWORD",
             "0",
         )?;
-        println!("   {} Disabled Windows proxy settings", style::CHECK);
+        if print_user_output {
+            println!("   {} Disabled Windows proxy settings", style::CHECK);
+        }
     }
 
     // Notify system of proxy change

@@ -27,6 +27,7 @@ import { AgentsPanel } from "@/components/panels/agents-panel";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { cn, formatCurrency, formatDuration, formatNumber } from "@/lib/utils";
+import { motion, AnimatePresence } from "framer-motion";
 
 type Tab = "metrics" | "live";
 type RangeKey = "1h" | "24h" | "7d";
@@ -61,10 +62,10 @@ function formatLatency(ms: number): string {
 
 function modeButtonClass(active: boolean): string {
   return cn(
-    "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border text-[11px] font-medium transition-colors",
+    "relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[11px] font-medium transition-all duration-200 ease-out",
     active
-      ? "bg-accent/12 text-accent border-accent/40"
-      : "bg-transparent text-muted-foreground border-border hover:text-foreground hover:bg-muted/40"
+      ? "bg-foreground text-background border-foreground shadow-[0_2px_10px_rgba(0,0,0,0.1)]"
+      : "bg-transparent text-muted-foreground border-border hover:text-foreground hover:bg-muted/50"
   );
 }
 
@@ -118,12 +119,22 @@ function SignalCard({
   level: "normal" | "warning" | "critical";
 }) {
   return (
-    <div className={cn("rounded-lg border p-3", signalToneClass(level))}>
-      <p className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{title}</p>
-      <p className="text-sm md:text-base font-semibold mt-1 tabular-nums">{value}</p>
-      <p className="text-[11px] text-muted-foreground mt-1">{line1}</p>
-      <p className="text-[11px] text-muted-foreground">{line2}</p>
-    </div>
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={cn(
+        "rounded-xl border p-4 glass-panel transition-all duration-300",
+        level === "critical" && "border-destructive/20 bg-destructive/5",
+        level === "warning" && "border-warning/20 bg-warning/5"
+      )}
+    >
+      <p className="text-[10px] uppercase tracking-[0.1em] text-muted-foreground font-medium">{title}</p>
+      <p className="text-xl md:text-2xl font-semibold mt-2 tabular-nums tracking-tight">{value}</p>
+      <div className="mt-3 space-y-0.5">
+        <p className="text-[12px] text-muted-foreground font-medium">{line1}</p>
+        <p className="text-[11px] opacity-60">{line2}</p>
+      </div>
+    </motion.div>
   );
 }
 
@@ -131,22 +142,32 @@ function OverviewSummaryCard({
   title,
   icon,
   children,
+  delay = 0,
 }: {
   title: string;
   icon: React.ElementType;
   children: React.ReactNode;
+  delay?: number;
 }) {
   const Icon = icon;
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-sm font-semibold tracking-[0.02em]">
-          <Icon className="h-3.5 w-3.5 text-accent" weight="duotone" />
-          {title}
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-1.5 text-xs">{children}</CardContent>
-    </Card>
+    <motion.div
+      initial={{ opacity: 0, y: 15 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay }}
+    >
+      <Card className="glass-panel border-white/[0.04]">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-[13px] font-semibold tracking-tight text-foreground/90">
+            <Icon className="h-4 w-4 text-accent" weight="duotone" />
+            {title}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2 text-[12px] leading-relaxed text-muted-foreground">
+          {children}
+        </CardContent>
+      </Card>
+    </motion.div>
   );
 }
 
@@ -447,53 +468,64 @@ export default function OverviewPage() {
   const envLabel = process.env.NEXT_PUBLIC_SOTH_ENV || "Prod";
 
   return (
-    <div className="min-h-screen">
-      <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-20">
-        <div className="px-4 md:px-6 py-2.5 md:py-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2 md:gap-3">
-            <h1 className="text-base md:text-lg font-semibold">Overview</h1>
-            <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-border text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
-              Env: {envLabel}
-              <span className={cn("h-1.5 w-1.5 rounded-full", isConnected ? "bg-success" : "bg-destructive")} />
-            </span>
-            <select
-              value={range}
-              onChange={(event) => setRange(event.target.value as RangeKey)}
-              className="h-7 rounded-md border border-border bg-transparent px-2 text-[11px] text-muted-foreground focus:outline-none focus:ring-1 focus:ring-accent"
-            >
-              <option value="1h">Last 1h</option>
-              <option value="24h">Last 24h</option>
-              <option value="7d">Last 7d</option>
-            </select>
+    <div className="min-h-screen bg-background selection:bg-accent/30">
+      <header className="border-b border-white/[0.04] bg-background/60 backdrop-blur-xl sticky top-0 z-20">
+        <div className="px-6 py-4 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <h1 className="text-xl font-bold tracking-tight bg-gradient-to-br from-foreground to-foreground/60 bg-clip-text text-transparent">
+              Overview
+            </h1>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-muted/50 border border-border text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                <span className={cn("h-1.5 w-1.5 rounded-full", isConnected ? "bg-success shadow-[0_0_8px_rgba(16,185,129,0.5)]" : "bg-destructive")} />
+                {envLabel}
+              </span>
+              <select
+                value={range}
+                onChange={(event) => setRange(event.target.value as RangeKey)}
+                className="h-8 rounded-full border border-border bg-card/50 px-3 text-[11px] font-medium text-foreground/80 hover:bg-card hover:border-border-hover transition-all focus:outline-none focus:ring-2 focus:ring-accent/20 cursor-pointer"
+              >
+                <option value="1h">Last 1 hour</option>
+                <option value="24h">Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+              </select>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setActiveTab("metrics")}
-              className={modeButtonClass(activeTab === "metrics")}
-            >
-              <ChartLine className="h-3.5 w-3.5" weight={activeTab === "metrics" ? "fill" : "regular"} />
-              Metrics
-            </button>
-            <button
-              onClick={() => setActiveTab("live")}
-              className={modeButtonClass(activeTab === "live")}
-            >
-              <Waveform className="h-3.5 w-3.5" weight={activeTab === "live" ? "fill" : "regular"} />
-              Live
-            </button>
+          <div className="flex items-center gap-3">
+            <div className="bg-muted/40 p-1 rounded-full flex gap-1">
+              <button
+                onClick={() => setActiveTab("metrics")}
+                className={modeButtonClass(activeTab === "metrics")}
+              >
+                <ChartLine className="h-3.5 w-3.5" weight={activeTab === "metrics" ? "fill" : "regular"} />
+                Metrics
+              </button>
+              <button
+                onClick={() => setActiveTab("live")}
+                className={modeButtonClass(activeTab === "live")}
+              >
+                <Waveform className="h-3.5 w-3.5" weight={activeTab === "live" ? "fill" : "regular"} />
+                Live
+              </button>
+            </div>
+
             <span className={cn(
-              "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] uppercase tracking-[0.08em]",
+              "hidden sm:inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest transition-all",
               alertsCount > 0
-                ? "border-warning/35 bg-warning/10 text-warning"
-                : "border-border text-muted-foreground"
+                ? "border-warning/20 bg-warning/10 text-warning animate-pulse"
+                : "border-border bg-muted/30 text-muted-foreground"
             )}>
               Alerts ({alertsCount})
             </span>
+
+            <div className="h-4 w-px bg-border mx-1 hidden sm:block" />
+
             <ConnectionStatus isConnected={isConnected} />
+
             {isConnected && (
-              <span className="hidden sm:inline text-[11px] text-muted-foreground font-mono tabular-nums">
-                {formatDuration(uptime)}
+              <span className="hidden lg:inline text-[11px] text-muted-foreground/60 font-mono tracking-tighter tabular-nums bg-muted/30 px-2 py-1 rounded-md">
+                UPTIME: {formatDuration(uptime)}
               </span>
             )}
           </div>
@@ -514,7 +546,7 @@ export default function OverviewPage() {
 
         {activeTab === "metrics" && (
           <>
-            <div className="hidden md:grid md:grid-cols-4 gap-3">
+            <div className="hidden md:grid md:grid-cols-4 gap-4">
               <SignalCard
                 title="Policy"
                 value={`Allow ${allowRate.toFixed(1)}%`}
@@ -524,7 +556,7 @@ export default function OverviewPage() {
               />
               <SignalCard
                 title="Traffic"
-                value={`${formatNumber(Math.round(requestsPerMinute))} / min`}
+                value={`${formatNumber(Math.round(requestsPerMinute))} bpm`}
                 line1={`p95 ${formatLatency(p95Latency)}`}
                 line2={`window: last ${rangeLabel}`}
                 level={p95Latency > 800 ? "warning" : "normal"}
@@ -545,131 +577,160 @@ export default function OverviewPage() {
               />
             </div>
 
-            <div className="hidden md:grid grid-cols-2 gap-4">
-              <div className="space-y-4">
-                <OverviewSummaryCard title="Traffic & Proxy" icon={Pulse}>
-                  <p className={cn("font-medium", proxy?.status.enabled ? "text-success" : "text-warning")}>
-                    Proxy: {proxy?.status.enabled ? "Running" : "Not running"}
-                  </p>
-                  <p className="text-muted-foreground">Active connections: {proxy?.active_connections ?? 0}</p>
-                  <p className="text-muted-foreground">Total requests: {formatNumber(requestCount)}</p>
+            <div className="hidden md:grid grid-cols-2 gap-6">
+              <div className="space-y-6">
+                <OverviewSummaryCard title="Traffic & Proxy" icon={Pulse} delay={0.1}>
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium text-foreground">Proxy Status</span>
+                    <span className={cn("px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border", proxy?.status.enabled ? "text-success border-success/20 bg-success/5" : "text-warning border-warning/20 bg-warning/5")}>
+                      {proxy?.status.enabled ? "Active" : "Disabled"}
+                    </span>
+                  </div>
+                  <p className="text-muted-foreground">Active connections: <span className="text-foreground font-medium">{proxy?.active_connections ?? 0}</span></p>
+                  <p className="text-muted-foreground">Total requests: <span className="text-foreground font-medium">{formatNumber(requestCount)}</span></p>
                 </OverviewSummaryCard>
 
-                <OverviewSummaryCard title="Policy Enforcement" icon={ShieldCheck}>
-                  <p className="text-muted-foreground">Evaluations: {formatNumber(policy?.evaluations ?? 0)}</p>
-                  <p className="text-muted-foreground">Allowed: {formatNumber(policy?.allowed ?? 0)}</p>
-                  <p className="text-muted-foreground">Denied: {formatNumber(policy?.denied ?? 0)}</p>
-                  <p className="text-muted-foreground truncate" title={policy?.recent_denials?.[0]?.reason ?? "-"}>
-                    Top deny reason: {policy?.recent_denials?.[0]?.reason ?? "-"}
-                  </p>
+                <OverviewSummaryCard title="Policy Enforcement" icon={ShieldCheck} delay={0.2}>
+                  <div className="space-y-1.5 pt-1">
+                    <div className="flex justify-between">
+                      <span>Evaluations</span>
+                      <span className="text-foreground font-medium">{formatNumber(policy?.evaluations ?? 0)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Allowed</span>
+                      <span className="text-success font-medium">{formatNumber(policy?.allowed ?? 0)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Denied</span>
+                      <span className="text-destructive font-medium">{formatNumber(policy?.denied ?? 0)}</span>
+                    </div>
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-border/50">
+                    <p className="text-[10px] uppercase font-bold tracking-widest text-muted-foreground/50">Top Deny Reason</p>
+                    <p className="text-foreground font-medium truncate mt-1" title={policy?.recent_denials?.[0]?.reason ?? "-"}>
+                      {policy?.recent_denials?.[0]?.reason ?? "None observed"}
+                    </p>
+                  </div>
                 </OverviewSummaryCard>
               </div>
 
-              <div className="space-y-4">
-                <OverviewSummaryCard title="Spend Velocity" icon={CurrencyDollar}>
-                  <p className="text-muted-foreground">{rangeLabel} vs 7d avg: {signedPercent(spendDeltaPct)}</p>
-                  <p className="text-muted-foreground">Burn rate: {formatCurrency(burnRatePerMin)} / min</p>
-                  <p className="text-muted-foreground">
-                    Forecast: {formatCurrency(monthForecast)}
-                  </p>
-                  <p className="text-muted-foreground">
-                    {budgetLimit
-                      ? `Daily budget utilization: ${utilization.toFixed(1)}%`
-                      : "No budget limit configured"}
-                  </p>
+              <div className="space-y-6">
+                <OverviewSummaryCard title="Spend Velocity" icon={CurrencyDollar} delay={0.15}>
+                  <div className="space-y-1.5 pt-1">
+                    <div className="flex justify-between">
+                      <span>Range vs 7d</span>
+                      <span className={cn("font-medium", spendDeltaPct > 0 ? "text-warning" : "text-success")}>{signedPercent(spendDeltaPct)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Burn Rate</span>
+                      <span className="text-foreground font-medium">{formatCurrency(burnRatePerMin)} / min</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Month Forecast</span>
+                      <span className="text-foreground font-medium">{formatCurrency(monthForecast)}</span>
+                    </div>
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-border/50">
+                    <p className="text-[10px] uppercase font-bold tracking-widest text-muted-foreground/50">Limit Status</p>
+                    <p className="text-foreground font-medium mt-1">
+                      {budgetLimit
+                        ? `Utilizing ${utilization.toFixed(1)}% of daily limit`
+                        : "No budget limit defined"}
+                    </p>
+                  </div>
                 </OverviewSummaryCard>
 
-                <OverviewSummaryCard title="Risk & Compliance" icon={ShieldWarning}>
+                <OverviewSummaryCard title="Risk & Compliance" icon={ShieldWarning} delay={0.25}>
                   {riskNotes.length === 0 ? (
-                    <p className="text-muted-foreground">No active risk indicators.</p>
+                    <p className="text-muted-foreground py-2 italic text-center">No active risk indicators.</p>
                   ) : (
-                    riskNotes.map((note) => (
-                      <p key={note} className="text-muted-foreground">{note}</p>
-                    ))
+                    <div className="space-y-2 pt-1">
+                      {riskNotes.map((note) => (
+                        <div key={note} className="flex items-center gap-2">
+                          <div className="h-1.5 w-1.5 rounded-full bg-accent/40" />
+                          <p className="text-foreground/80">{note}</p>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </OverviewSummaryCard>
               </div>
             </div>
 
-            <Card className="hidden md:block">
-              <CardHeader>
-                <CardTitle className="text-sm font-semibold tracking-[0.02em]">
-                  <Clock className="h-3.5 w-3.5 text-accent" weight="duotone" />
-                  What Changed Since {range === "1h" ? "Last 1h" : range === "7d" ? "Last 7d" : "Last 24h"}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-1.5 text-xs text-muted-foreground">
-                {changeSummary.map((item) => (
-                  <p key={item}>• {item}</p>
+            <OverviewSummaryCard title={`What Changed Since ${range === "1h" ? "Last Hour" : range === "7d" ? "Last 7 Days" : "Last 24 Hours"}`} icon={Clock} delay={0.3}>
+              <div className="space-y-2 pt-1 font-medium italic">
+                {changeSummary.map((item, i) => (
+                  <p key={item} className="text-foreground/70">• {item}</p>
                 ))}
-              </CardContent>
-            </Card>
+              </div>
+            </OverviewSummaryCard>
 
-            <Card className="hidden md:block">
-              <CardHeader>
-                <CardTitle className="text-sm font-semibold tracking-[0.02em]">
-                  <Warning className="h-3.5 w-3.5 text-warning" weight="duotone" />
-                  Priority Events
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
+            <OverviewSummaryCard title="Priority Events" icon={Warning} delay={0.35}>
+              <div className="space-y-3 pt-1">
                 {priorityEvents.length === 0 ? (
-                  <div className="rounded-md border border-success/30 bg-success/10 px-3 py-2 text-xs text-success">
-                    No priority events in current range.
+                  <div className="rounded-xl border border-success/10 bg-success/5 px-4 py-3 text-xs text-success/80 font-medium text-center">
+                    System nominal. No priority events observed.
                   </div>
                 ) : (
                   priorityEvents.map((event, index) => (
-                    <a
+                    <motion.a
                       key={`${event.title}-${index}`}
                       href={event.href}
+                      whileHover={{ scale: 1.01, x: 2 }}
                       className={cn(
-                        "flex items-start justify-between gap-2 rounded-md border px-3 py-2 transition-colors",
+                        "flex items-start justify-between gap-3 rounded-xl border px-4 py-3 transition-all",
                         priorityToneClass(event.severity),
-                        "hover:brightness-110"
+                        "hover:brightness-110 shadow-sm"
                       )}
                     >
-                      <div>
-                        <p className="text-xs font-medium">{event.title}</p>
-                        <p className="text-[11px] opacity-90 mt-0.5">{event.description}</p>
+                      <div className="space-y-1">
+                        <p className="text-[13px] font-bold tracking-tight">{event.title}</p>
+                        <p className="text-[11px] font-medium opacity-70 leading-relaxed">{event.description}</p>
                       </div>
-                      <ArrowsOutSimple className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-                    </a>
+                      <ArrowsOutSimple className="h-3.5 w-3.5 shrink-0 mt-0.5 opacity-40" />
+                    </motion.a>
                   ))
                 )}
 
                 <div className="flex items-center gap-2 pt-2">
-                  <Button asChild variant="outline" size="sm" className="h-7 px-2.5 text-[11px]">
-                    <a href="/observability">View Observability</a>
+                  <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-4 border-white/[0.04] bg-white/[0.02]">
+                    <a href="/observability">Observability</a>
                   </Button>
-                  <Button asChild variant="outline" size="sm" className="h-7 px-2.5 text-[11px]">
-                    <a href="/budget">View Budget</a>
+                  <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-4 border-white/[0.04] bg-white/[0.02]">
+                    <a href="/budget">Budget Control</a>
                   </Button>
-                  <Button asChild variant="outline" size="sm" className="h-7 px-2.5 text-[11px]">
-                    <a href="/policies">View Policies</a>
+                  <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-4 border-white/[0.04] bg-white/[0.02]">
+                    <a href="/policies">Policy Engine</a>
                   </Button>
                 </div>
-              </CardContent>
-            </Card>
+              </div>
+            </OverviewSummaryCard>
 
-            <Card className="hidden md:block">
-              <CardHeader>
-                <CardTitle className="text-sm font-semibold tracking-[0.02em]">
-                  <Info className="h-3.5 w-3.5 text-accent" weight="duotone" />
-                  Request Flow Snapshot
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-1.5 text-xs">
+            <OverviewSummaryCard title="Request Flow Architecture" icon={Info} delay={0.4}>
+              <div className="space-y-3 pt-1">
                 {flowSnapshots.length === 0 ? (
-                  <p className="text-muted-foreground">No request flow snapshots available for this range.</p>
+                  <p className="text-muted-foreground py-2 italic">Architecture telemetry unavailable for this range.</p>
                 ) : (
                   flowSnapshots.map((flow, index) => (
-                    <p key={`${flow.provider}-${flow.path}-${index}`} className="font-mono text-muted-foreground">
-                      Agent App -&gt; Policy Allowed -&gt; {flow.path} -&gt; {flow.model} ({flow.provider}) -&gt; {formatCurrency(flow.avgCost)} / req
-                    </p>
+                    <div key={`${flow.provider}-${flow.path}-${index}`} className="group p-3 rounded-xl border border-white/[0.04] bg-white/[0.02] hover:bg-white/[0.04] transition-colors">
+                      <div className="flex items-center gap-2 font-mono text-[11px] tracking-tight">
+                        <span className="text-accent/60">APP</span>
+                        <span className="text-muted-foreground/30">→</span>
+                        <span className="text-success/60">POLICY</span>
+                        <span className="text-muted-foreground/30">→</span>
+                        <span className="text-foreground/80 truncate">{flow.path}</span>
+                        <span className="text-muted-foreground/30">→</span>
+                        <span className="text-accent/80 font-bold">{flow.model}</span>
+                      </div>
+                      <div className="flex justify-between mt-2 items-center">
+                        <span className="text-[10px] uppercase font-bold tracking-widest text-muted-foreground/40">{flow.provider}</span>
+                        <span className="text-[11px] font-bold text-foreground/60">{formatCurrency(flow.avgCost)} <span className="text-[9px] font-normal opacity-40">avg/req</span></span>
+                      </div>
+                    </div>
                   ))
                 )}
-              </CardContent>
-            </Card>
+              </div>
+            </OverviewSummaryCard>
 
             <div className="md:hidden space-y-3">
               <Card>

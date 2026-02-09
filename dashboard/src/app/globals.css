@@ -35,9 +35,9 @@
 
 /* PREMIUM SOTH BRAND THEME (Modern Midnight) */
 :root {
-  --font-geist-sans: "Geist", "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  --font-geist-mono: "Geist Mono", "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --font-gafata: "Outfit", "Gaegu", var(--font-geist-sans);
+  --font-geist-sans: "Geist", "Inter", system-ui, sans-serif;
+  --font-geist-mono: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+  --font-gafata: "Outfit", var(--font-geist-sans);
 
   /* Soth.ai Official Palette */
   --background: #000000;
@@ -73,12 +73,11 @@
   --border: #262626;
   --border-hover: #333333;
 
-  --radius: 0.75rem;
+  --radius: 12px;
 
   /* Glassmorphism Presets */
   --glass-bg: rgba(10, 10, 10, 0.7);
   --glass-border: rgba(217, 119, 87, 0.1);
-  /* Subtle primary-tinted border */
   --glass-blur: 16px;
 }
 
@@ -116,6 +115,11 @@
   --ring: #D97757;
   --border: #E2E0D6;
   --border-hover: #D6D4C8;
+
+  /* Light-mode glass surfaces for overview cards */
+  --glass-bg: rgba(255, 255, 255, 0.86);
+  --glass-border: rgba(17, 17, 17, 0.08);
+  --glass-blur: 16px;
 }
 
 * {
@@ -134,15 +138,14 @@ a,
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  font-family: var(--font-sans), system-ui, sans-serif;
   font-size: 14px;
-  font-weight: 400;
-  letter-spacing: -0.0125em;
-  line-height: 1.625;
-  /* Premium loose leading */
+  font-weight: 450; /* Slightly heavier for Geist luxury feel */
+  letter-spacing: -0.015em;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-rendering: geometricPrecision;
+  -moz-osx-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 .glass-panel {

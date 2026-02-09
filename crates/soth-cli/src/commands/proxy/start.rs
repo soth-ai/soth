@@ -2,7 +2,9 @@
 
 use crate::cli_config;
 use crate::commands::enforcement;
+use crate::commands::proxy::system;
 use crate::style;
+use anyhow::Context;
 use console::Term;
 use owo_colors::OwoColorize;
 use soth_core::config::{HostFilterMode, SothConfig};
@@ -11,7 +13,9 @@ use soth_dashboard::server::DashboardServer;
 use soth_dashboard::DashboardState;
 use soth_proxy::metrics;
 use soth_proxy::transport::hudsucker_proxy;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 
 const SOTH_PROXY_ASCII: &[&str] = &[
     "  █████████     ███████    ███████████ █████   █████",
@@ -26,6 +30,9 @@ const SOTH_PROXY_ASCII: &[&str] = &[
 const SOTH_ACCENT: (u8, u8, u8) = (0xD9, 0x77, 0x57);
 const SOTH_MUTED: (u8, u8, u8) = (0x9F, 0x9F, 0x9F);
 const SOTH_TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+const DEFAULT_DASHBOARD_UI_DIR: &str = "dashboard";
+const DEFAULT_DASHBOARD_UI_URL: &str = "http://localhost:3002";
+const DEFAULT_DASHBOARD_UI_LOG_FILE: &str = "dashboard-ui-dev.log";
 
 /// Run the start command
 pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -55,6 +62,9 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
     }
 
     spinner.finish_and_clear();
+
+    // Auto-enable system proxy when forward proxy starts without extra console noise.
+    system::enable_quiet(Some(proxy_config.port)).await?;
 
     let intercept_count = proxy_config.hosts.intercept_domain_count();
     let mut intercept_hosts: Vec<String> = Vec::new();
@@ -109,6 +119,7 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
         intercept_count
     );
     let dashboard_line = format!("{dashboard_display}   Events {event_logging_status}");
+    let system_proxy_line = format!("enabled @ 127.0.0.1:{}", proxy_config.port);
 
     print_logo_banner();
     render_startup_panel(
@@ -118,6 +129,7 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
         "eval $(soth proxy env)",
         &compact_path(&ca_cert_path),
         &dashboard_line,
+        &system_proxy_line,
     );
 
     // Initialize Prometheus metrics
@@ -134,12 +146,30 @@ pub async fn run(port: Option<u16>, config_path: Option<PathBuf>) -> anyhow::Res
     );
     println!();
 
+    let dashboard_ui_dir = PathBuf::from(DEFAULT_DASHBOARD_UI_DIR);
+    let dashboard_ui_process = match spawn_dashboard_ui_process(
+        &dashboard_ui_dir,
+        config.dashboard.port,
+        DEFAULT_DASHBOARD_UI_URL,
+    ) {
+        Ok(child) => Some(child),
+        Err(error) => {
+            style::warning(&format!(
+                "Failed to start dashboard UI dev server: {}",
+                error
+            ));
+            style::info("Continuing with proxy only.");
+            None
+        }
+    };
+
     run_forward_proxy(
         &config,
         proxy_config,
         ca_cert_path,
         ca_key_path,
         event_logger,
+        dashboard_ui_process,
     )
     .await
 }
@@ -151,6 +181,7 @@ fn render_startup_panel(
     env_line: &str,
     ca_path: &str,
     dashboard_line: &str,
+    system_proxy_line: &str,
 ) {
     let term_width = Term::stdout().size().1 as usize;
     let total_width = term_width.saturating_sub(2).clamp(78, 110);
@@ -162,6 +193,7 @@ fn render_startup_panel(
     print_panel_kv_row(inner_width, "Env", env_line);
     print_panel_kv_row(inner_width, "CA", ca_path);
     print_panel_kv_row(inner_width, "Dashboard", dashboard_line);
+    print_panel_kv_row(inner_width, "System", system_proxy_line);
 
     print_panel_bottom(inner_width);
     println!();
@@ -275,6 +307,7 @@ async fn run_forward_proxy(
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
     event_logger: Option<EventLogger>,
+    dashboard_ui_process: Option<Child>,
 ) -> anyhow::Result<()> {
     let enforcer = enforcement::build_proxy_enforcer(config)?;
     let _policy_reload_task = enforcer
@@ -323,6 +356,10 @@ async fn run_forward_proxy(
     )
     .await;
 
+    if let Some(mut child) = dashboard_ui_process {
+        stop_dashboard_ui_process(&mut child);
+    }
+
     match result {
         Ok(()) => {
             style::success("Proxy stopped.");
@@ -332,5 +369,152 @@ async fn run_forward_proxy(
             style::error(&format!("Proxy error: {}", e));
             Err(anyhow::anyhow!("Proxy error: {}", e))
         }
+    }
+}
+
+fn spawn_dashboard_ui_process(
+    dashboard_ui_dir: &std::path::Path,
+    dashboard_port: u16,
+    dashboard_ui_url: &str,
+) -> anyhow::Result<Child> {
+    if !dashboard_ui_dir.exists() {
+        anyhow::bail!(
+            "Dashboard UI directory not found: {}",
+            dashboard_ui_dir.display()
+        );
+    }
+
+    if !dashboard_ui_dir.join("package.json").exists() {
+        anyhow::bail!(
+            "No package.json found in dashboard UI directory: {}",
+            dashboard_ui_dir.display()
+        );
+    }
+
+    let (stdout_stdio, stderr_stdio, log_path) = match open_dashboard_ui_log_stdio() {
+        Ok((stdout, stderr, path)) => (stdout, stderr, Some(path)),
+        Err(error) => {
+            style::warning(&format!(
+                "Could not open dashboard UI log file: {}. Suppressing UI output.",
+                error
+            ));
+            (Stdio::null(), Stdio::null(), None)
+        }
+    };
+
+    let mut cmd = Command::new(npm_executable());
+    cmd.arg("run")
+        .arg("dev")
+        .current_dir(dashboard_ui_dir)
+        .stdin(Stdio::null())
+        .stdout(stdout_stdio)
+        .stderr(stderr_stdio)
+        .env(
+            "NEXT_PUBLIC_SOTH_API_BASE",
+            format!("http://localhost:{}/api", dashboard_port),
+        )
+        .env(
+            "NEXT_PUBLIC_SOTH_WS_BASE",
+            format!("ws://localhost:{}", dashboard_port),
+        );
+
+    let child = cmd
+        .spawn()
+        .with_context(|| "failed to spawn dashboard UI dev server (`npm run dev`)")?;
+
+    if let Some(log_path) = log_path {
+        style::info(&format!(
+            "Dashboard UI dev server: {} (PID {}, dir: {}, logs: {})",
+            dashboard_ui_url,
+            child.id(),
+            dashboard_ui_dir.display(),
+            log_path.display(),
+        ));
+    } else {
+        style::info(&format!(
+            "Dashboard UI dev server: {} (PID {}, dir: {})",
+            dashboard_ui_url,
+            child.id(),
+            dashboard_ui_dir.display(),
+        ));
+    }
+
+    Ok(child)
+}
+
+fn open_dashboard_ui_log_stdio() -> anyhow::Result<(Stdio, Stdio, PathBuf)> {
+    let log_path = dashboard_ui_log_path();
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create dashboard UI log directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let stdout_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| {
+            format!(
+                "failed to open dashboard UI log file: {}",
+                log_path.display()
+            )
+        })?;
+
+    let stderr_file = stdout_file.try_clone().with_context(|| {
+        format!(
+            "failed to clone dashboard UI log file: {}",
+            log_path.display()
+        )
+    })?;
+
+    Ok((Stdio::from(stdout_file), Stdio::from(stderr_file), log_path))
+}
+
+fn dashboard_ui_log_path() -> PathBuf {
+    if let Some(home) = dirs::home_dir() {
+        return home
+            .join(".soth")
+            .join("logs")
+            .join(DEFAULT_DASHBOARD_UI_LOG_FILE);
+    }
+
+    PathBuf::from(DEFAULT_DASHBOARD_UI_LOG_FILE)
+}
+
+fn stop_dashboard_ui_process(child: &mut Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(error) => {
+            style::warning(&format!(
+                "Failed to check dashboard UI process status: {}",
+                error
+            ));
+            return;
+        }
+    }
+
+    if let Err(error) = child.kill() {
+        style::warning(&format!("Failed to stop dashboard UI process: {}", error));
+        return;
+    }
+
+    if let Err(error) = child.wait() {
+        style::warning(&format!(
+            "Failed waiting for dashboard UI process shutdown: {}",
+            error
+        ));
+    }
+}
+
+fn npm_executable() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "npm.cmd"
+    } else {
+        "npm"
     }
 }

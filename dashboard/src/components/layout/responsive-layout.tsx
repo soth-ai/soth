@@ -26,8 +26,8 @@ export function ResponsiveLayout({ children }: ResponsiveLayoutProps) {
 
   return (
     <>
-      <div className="flex min-h-screen flex-col pb-24">
-        <main className="flex-1">{children}</main>
+      <div className="flex min-h-screen flex-col pb-24 selection:bg-accent/30 selection:text-foreground">
+        <main className="flex-1 px-4 md:px-0">{children}</main>
       </div>
 
       <DockNav />
