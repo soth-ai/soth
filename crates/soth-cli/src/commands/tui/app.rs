@@ -11,8 +11,8 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Maximum number of events to keep in memory
-const MAX_EVENTS: usize = 500;
-const MAX_CLUSTERS: usize = 500;
+const MAX_EVENTS: usize = 1200;
+const MAX_CLUSTERS: usize = 800;
 const MAX_INSPECTOR_PAYLOAD_CHARS: usize = 12_000;
 const STARTUP_CONNECT_GRACE_SECS: u64 = 30;
 

@@ -961,9 +961,15 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    const EVENT_WINDOW: usize = 500;
-    const CLUSTER_WINDOW: usize = 500;
-    let top_n = if inner.width < 46 { 1 } else { 2 };
+    const EVENT_WINDOW: usize = 1200;
+    const CLUSTER_WINDOW: usize = 800;
+    let top_n = if inner.width >= 120 {
+        3
+    } else if inner.width >= 70 {
+        2
+    } else {
+        1
+    };
 
     let mut ai_events = 0u64;
     let mut mcp_events = 0u64;
@@ -1006,19 +1012,17 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         {
             *model_counts.entry(model.to_string()).or_insert(0) += 1;
             model_recency.entry(model.to_string()).or_insert(idx);
-            if event.source == EventSource::AiProxy {
-                let provider = event
-                    .provider
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|provider| !provider.is_empty())
-                    .unwrap_or("unknown");
-                let key = format!("{provider}/{model}");
-                *provider_model_counts.entry(key.clone()).or_insert(0) += 1;
-                provider_model_recency.entry(key.clone()).or_insert(idx);
-                if latest_ai_model.is_none() {
-                    latest_ai_model = Some(key);
-                }
+            let provider = event
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider| !provider.is_empty())
+                .unwrap_or("unknown");
+            let key = format!("{provider}/{model}");
+            *provider_model_counts.entry(key.clone()).or_insert(0) += 1;
+            provider_model_recency.entry(key.clone()).or_insert(idx);
+            if latest_ai_model.is_none() {
+                latest_ai_model = Some(key);
             }
         }
 
@@ -1096,16 +1100,8 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let provider_counts = if cluster_provider_counts.is_empty() {
-        event_provider_counts
-    } else {
-        cluster_provider_counts
-    };
-    let agent_counts = if cluster_agent_counts.is_empty() {
-        event_agent_counts
-    } else {
-        cluster_agent_counts
-    };
+    let provider_counts = merge_missing_counts(cluster_provider_counts, event_provider_counts);
+    let agent_counts = merge_missing_counts(cluster_agent_counts, event_agent_counts);
 
     let provider_total = provider_counts.values().sum::<u64>().max(1);
     let agent_total = agent_counts.values().sum::<u64>().max(1);
@@ -1123,23 +1119,52 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
     let top_agents = top_counts(agent_counts, top_n);
     let top_providers = top_counts(provider_counts, top_n);
     let top_mcp_methods = top_counts(mcp_method_counts, top_n);
+
+    if inner.width >= 74 && inner.height >= 6 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(inner);
+
+        render_observed_models_column(
+            frame,
+            cols[0],
+            &all_models,
+            model_total,
+            latest_ai_model.as_deref(),
+            theme,
+        );
+        render_observed_meta_column(
+            frame,
+            cols[1],
+            sampled_events,
+            sampled_clusters,
+            ai_events,
+            mcp_events,
+            agent_events,
+            ai_calls,
+            mcp_calls,
+            agent_calls,
+            &top_providers,
+            provider_total,
+            &top_mcp_methods,
+            mcp_method_total,
+            &top_agents,
+            agent_total,
+            theme,
+        );
+        return;
+    }
+
+    let panel_rows = inner.height as usize;
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("window ", theme.muted_style()),
         Span::styled(
             format!(
-                "ev:{} cl:{}",
+                "ev:{} cl:{} src ai:{} mcp:{} ag:{}",
                 short_number(sampled_events),
-                short_number(sampled_clusters)
-            ),
-            theme.info_style(),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("events ", theme.muted_style()),
-        Span::styled(
-            format!(
-                "ai:{} mcp:{} ag:{}",
+                short_number(sampled_clusters),
                 short_number(ai_events),
                 short_number(mcp_events),
                 short_number(agent_events)
@@ -1170,7 +1195,7 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ]));
 
-    push_ranked_group(
+    push_ranked_compact_line(
         &mut lines,
         "provider",
         &top_providers,
@@ -1178,7 +1203,7 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         inner.width as usize,
         theme,
     );
-    push_ranked_group(
+    push_ranked_compact_line(
         &mut lines,
         "mcp",
         &top_mcp_methods,
@@ -1186,8 +1211,7 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         inner.width as usize,
         theme,
     );
-    push_models_window(&mut lines, &all_models, model_total, inner.width as usize, theme);
-    push_ranked_group(
+    push_ranked_compact_line(
         &mut lines,
         "agent",
         &top_agents,
@@ -1196,11 +1220,284 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         theme,
     );
 
-    if lines.len() > inner.height as usize {
-        lines.truncate(inner.height as usize);
+    let model_rows_budget = panel_rows
+        .saturating_sub(lines.len())
+        .max(2);
+    push_models_window(
+        &mut lines,
+        &all_models,
+        model_total,
+        inner.width as usize,
+        model_rows_budget,
+        theme,
+    );
+
+    if lines.len() > panel_rows {
+        lines.truncate(panel_rows);
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn render_observed_models_column(
+    frame: &mut Frame,
+    area: Rect,
+    all_models: &[(String, u64)],
+    model_total: u64,
+    latest_ai_model: Option<&str>,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("latest ", theme.muted_style()),
+        Span::styled(
+            truncate(
+                latest_ai_model.unwrap_or("none"),
+                area.width.saturating_sub(8) as usize,
+            ),
+            theme.info_style(),
+        ),
+    ]));
+
+    let model_rows_budget = (area.height as usize).saturating_sub(lines.len()).max(1);
+    push_models_window(
+        &mut lines,
+        all_models,
+        model_total,
+        area.width as usize,
+        model_rows_budget,
+        theme,
+    );
+    if lines.len() > area.height as usize {
+        lines.truncate(area.height as usize);
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_observed_meta_column(
+    frame: &mut Frame,
+    area: Rect,
+    sampled_events: u64,
+    sampled_clusters: u64,
+    ai_events: u64,
+    mcp_events: u64,
+    agent_events: u64,
+    ai_calls: u64,
+    mcp_calls: u64,
+    agent_calls: u64,
+    top_providers: &[(String, u64)],
+    provider_total: u64,
+    top_mcp_methods: &[(String, u64)],
+    mcp_method_total: u64,
+    top_agents: &[(String, u64)],
+    agent_total: u64,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+
+    if area.width >= 24 && area.height >= 5 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(2)])
+            .split(area);
+
+        let summary_lines = vec![
+            Line::from(vec![
+                Span::styled("window ", theme.muted_style()),
+                Span::styled(
+                    format!(
+                        "ev:{} cl:{}",
+                        short_number(sampled_events),
+                        short_number(sampled_clusters)
+                    ),
+                    theme.info_style(),
+                ),
+                Span::raw("  "),
+                Span::styled("calls ", theme.muted_style()),
+                Span::styled(
+                    format!(
+                        "ai:{} mcp:{} ag:{}",
+                        short_number(ai_calls),
+                        short_number(mcp_calls),
+                        short_number(agent_calls)
+                    ),
+                    theme.info_style(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("src ", theme.muted_style()),
+                Span::styled(
+                    format!(
+                        "ai:{} mcp:{} ag:{}",
+                        short_number(ai_events),
+                        short_number(mcp_events),
+                        short_number(agent_events)
+                    ),
+                    theme.info_style(),
+                ),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(summary_lines), rows[0]);
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .split(rows[1]);
+
+        render_observed_meta_category(
+            frame,
+            cols[0],
+            "provider",
+            top_providers,
+            provider_total,
+            theme,
+        );
+        render_observed_meta_category(
+            frame,
+            cols[1],
+            "mcp",
+            top_mcp_methods,
+            mcp_method_total,
+            theme,
+        );
+        render_observed_meta_category(
+            frame,
+            cols[2],
+            "agent",
+            top_agents,
+            agent_total,
+            theme,
+        );
+        return;
+    }
+
+    let provider_primary = top_providers.first().cloned().into_iter().collect::<Vec<_>>();
+    let mcp_primary = top_mcp_methods
+        .first()
+        .cloned()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let agent_primary = top_agents.first().cloned().into_iter().collect::<Vec<_>>();
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("window ", theme.muted_style()),
+        Span::styled(
+            format!(
+                "ev:{} cl:{}",
+                short_number(sampled_events),
+                short_number(sampled_clusters)
+            ),
+            theme.info_style(),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("src ", theme.muted_style()),
+        Span::styled(
+            format!(
+                "ai:{} mcp:{} ag:{}",
+                short_number(ai_events),
+                short_number(mcp_events),
+                short_number(agent_events)
+            ),
+            theme.info_style(),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("calls ", theme.muted_style()),
+        Span::styled(
+            format!(
+                "ai:{} mcp:{} ag:{}",
+                short_number(ai_calls),
+                short_number(mcp_calls),
+                short_number(agent_calls)
+            ),
+            theme.info_style(),
+        ),
+    ]));
+    push_ranked_group(
+        &mut lines,
+        "provider",
+        &provider_primary,
+        provider_total,
+        area.width as usize,
+        theme,
+    );
+    push_ranked_group(
+        &mut lines,
+        "mcp",
+        &mcp_primary,
+        mcp_method_total,
+        area.width as usize,
+        theme,
+    );
+    push_ranked_group(
+        &mut lines,
+        "agent",
+        &agent_primary,
+        agent_total,
+        area.width as usize,
+        theme,
+    );
+
+    if lines.len() > area.height as usize {
+        lines.truncate(area.height as usize);
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn render_observed_meta_category(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    items: &[(String, u64)],
+    total: u64,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        label.to_ascii_uppercase(),
+        theme.muted_style(),
+    )));
+
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled("none", theme.muted_style())));
+    } else {
+        let available = area.height.saturating_sub(1) as usize;
+        for (name, count) in items.iter().take(available.max(1)) {
+            let pct = (*count as f64 / total.max(1) as f64) * 100.0;
+            let right = if area.width >= 16 {
+                format!(" {} ({})", short_number(*count), format_percent(pct))
+            } else {
+                format!(" {}", short_number(*count))
+            };
+            let max_name = (area.width as usize).saturating_sub(right.len()).max(3);
+            lines.push(Line::from(vec![
+                Span::styled(truncate(name, max_name), theme.info_style()),
+                Span::styled(right, theme.muted_style()),
+            ]));
+        }
+    }
+
+    if lines.len() > area.height as usize {
+        lines.truncate(area.height as usize);
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
 fn collect_actionables(app: &App) -> Vec<(u8, String)> {
@@ -1500,6 +1797,16 @@ fn top_counts(mut values: HashMap<String, u64>, take: usize) -> Vec<(String, u64
     rows.into_iter().take(take).collect()
 }
 
+fn merge_missing_counts(
+    mut primary: HashMap<String, u64>,
+    secondary: HashMap<String, u64>,
+) -> HashMap<String, u64> {
+    for (key, value) in secondary {
+        primary.entry(key).or_insert(value);
+    }
+    primary
+}
+
 fn push_ranked_group(
     lines: &mut Vec<Line<'static>>,
     label: &str,
@@ -1539,17 +1846,89 @@ fn push_ranked_group(
     }
 }
 
-fn push_models_window(
+fn push_ranked_compact_line(
     lines: &mut Vec<Line<'static>>,
+    label: &str,
     items: &[(String, u64)],
     total: u64,
     width: usize,
     theme: &Theme,
 ) {
+    let prefix = format!("{label:>7} ");
+    if items.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(prefix, theme.muted_style()),
+            Span::styled("none", theme.muted_style()),
+        ]));
+        return;
+    }
+
+    let mut parts = Vec::new();
+    for (name, count) in items.iter().take(2) {
+        let pct = (*count as f64 / total.max(1) as f64) * 100.0;
+        let compact_name = if width >= 88 {
+            truncate(name, 16)
+        } else {
+            truncate(name, 10)
+        };
+        let entry = if width >= 88 {
+            format!("{compact_name} {}({})", short_number(*count), format_percent(pct))
+        } else {
+            format!("{compact_name} {}", short_number(*count))
+        };
+        parts.push(entry);
+    }
+
+    let joined = parts.join(" | ");
+    let max_body = width.saturating_sub(prefix.len()).max(1);
+    lines.push(Line::from(vec![
+        Span::styled(prefix, theme.muted_style()),
+        Span::styled(truncate(&joined, max_body), theme.info_style()),
+    ]));
+}
+
+fn push_models_window(
+    lines: &mut Vec<Line<'static>>,
+    items: &[(String, u64)],
+    total: u64,
+    width: usize,
+    max_rows: usize,
+    theme: &Theme,
+) {
+    if max_rows == 0 {
+        return;
+    }
+
     if items.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(" models ", theme.muted_style()),
             Span::styled("none", theme.muted_style()),
+        ]));
+        return;
+    }
+
+    if max_rows <= 2 {
+        let summary = items
+            .iter()
+            .take(3)
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let more = items.len().saturating_sub(3);
+        let extra = if more > 0 {
+            format!(" +{more}")
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" models ", theme.muted_style()),
+            Span::styled(
+                truncate(
+                    &(summary + &extra),
+                    width.saturating_sub(8).max(1),
+                ),
+                theme.info_style(),
+            ),
         ]));
         return;
     }
@@ -1562,7 +1941,15 @@ fn push_models_window(
 
     let mut shown = 0usize;
     let label_width = width.saturating_sub(14).max(10);
-    for (name, count) in items {
+    let mut remaining = max_rows.saturating_sub(1);
+    for (idx, (name, count)) in items.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let will_have_more = idx + 1 < items.len();
+        if will_have_more && remaining == 1 {
+            break;
+        }
         let pct = (*count as f64 / total.max(1) as f64) * 100.0;
         let right = format!(" {} ({})", short_number(*count), format_percent(pct));
         let max_name = label_width.saturating_sub(right.len()).max(6);
@@ -1572,9 +1959,10 @@ fn push_models_window(
             Span::styled(right, theme.muted_style()),
         ]));
         shown += 1;
+        remaining = remaining.saturating_sub(1);
     }
 
-    if shown < items.len() {
+    if shown < items.len() && remaining > 0 {
         lines.push(Line::from(vec![
             Span::styled("        ", theme.muted_style()),
             Span::styled(format!("+{} more", items.len() - shown), theme.muted_style()),
