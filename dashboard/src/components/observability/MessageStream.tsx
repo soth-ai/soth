@@ -58,6 +58,12 @@ interface ClusterRowProps {
   selectedLogId: string | null;
   selectedLogPart: "request" | "response" | null;
   selectLog: (id: string | null, part?: "request" | "response" | null) => void;
+  showTimestamps: boolean;
+  compactMode: boolean;
+}
+
+function isActivateKey(event: React.KeyboardEvent | KeyboardEvent): boolean {
+  return event.key === "Enter" || event.key === " ";
 }
 
 function isClusterRequestSelected(
@@ -85,6 +91,12 @@ function isClusterResponseSelected(
 
 function areClusterRowPropsEqual(prev: ClusterRowProps, next: ClusterRowProps): boolean {
   if (prev.cluster !== next.cluster) {
+    return false;
+  }
+  if (prev.showTimestamps !== next.showTimestamps) {
+    return false;
+  }
+  if (prev.compactMode !== next.compactMode) {
     return false;
   }
 
@@ -121,6 +133,8 @@ const ClusterRow = memo(function ClusterRow({
   selectedLogId,
   selectedLogPart,
   selectLog,
+  showTimestamps,
+  compactMode,
 }: ClusterRowProps) {
   const highlightPii = useSettingsStore((state) => state.highlightPii);
   const highlightErrors = useSettingsStore((state) => state.highlightErrors);
@@ -172,7 +186,10 @@ const ClusterRow = memo(function ClusterRow({
   const responseIsSelected = isClusterResponseSelected(cluster, selectedLogId, selectedLogPart);
   const requestTokenCount = getLogTokenCount(cluster.request);
 
-  const rowClass = "flex items-center gap-3 px-4 h-8 overflow-hidden transition-all duration-200 group/row";
+  const rowClass = cn(
+    "flex items-center gap-3 px-4 overflow-hidden transition-all duration-200 group/row",
+    compactMode ? "h-7" : "h-8"
+  );
   const sourceChipClass =
     "inline-flex items-center justify-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold border w-[56px] flex-shrink-0 transition-opacity";
   const methodChipClass =
@@ -193,9 +210,19 @@ const ClusterRow = memo(function ClusterRow({
       {/* Request Row */}
       <div
         onClick={() => selectLog(cluster.request.id, isSameIdPair ? "request" : null)}
+        onKeyDown={(event) => {
+          if (!isActivateKey(event)) {
+            return;
+          }
+          event.preventDefault();
+          selectLog(cluster.request.id, isSameIdPair ? "request" : null);
+        }}
+        tabIndex={requestIsSelected ? 0 : -1}
+        role="button"
+        aria-label={`Select request event ${cluster.method}`}
         className={cn(
           rowClass,
-          "cursor-pointer",
+          "cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50",
           requestIsSelected && "bg-primary/[0.06] shadow-[inset_0_0_12px_-4px_rgba(217,119,87,0.1)]"
         )}
       >
@@ -206,9 +233,11 @@ const ClusterRow = memo(function ClusterRow({
           )} />
         </div>
 
-        <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap opacity-60 group-hover/row:opacity-100 transition-opacity">
-          {formatTimestamp(cluster.request.timestamp)}
-        </span>
+        {showTimestamps ? (
+          <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap opacity-60 group-hover/row:opacity-100 transition-opacity">
+            {formatTimestamp(cluster.request.timestamp)}
+          </span>
+        ) : null}
 
         <ArrowDown className="w-3.5 h-3.5 text-cyan-500/70 flex-shrink-0" weight="bold" />
 
@@ -270,9 +299,19 @@ const ClusterRow = memo(function ClusterRow({
       {/* Response Row */}
       <div
         onClick={() => selectLog(responseTargetId, isSameIdPair ? "response" : null)}
+        onKeyDown={(event) => {
+          if (!isActivateKey(event)) {
+            return;
+          }
+          event.preventDefault();
+          selectLog(responseTargetId, isSameIdPair ? "response" : null);
+        }}
+        tabIndex={responseIsSelected ? 0 : -1}
+        role="button"
+        aria-label={`Select response event ${cluster.method}`}
         className={cn(
           rowClass,
-          "cursor-pointer border-t border-border/30",
+          "cursor-pointer border-t border-border/30 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50",
           responseIsSelected && "bg-primary/[0.06] shadow-[inset_0_0_12px_-4px_rgba(217,119,87,0.1)]"
         )}
       >
@@ -290,9 +329,11 @@ const ClusterRow = memo(function ClusterRow({
           />
         </div>
 
-        <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap opacity-60 group-hover/row:opacity-100 transition-opacity">
-          {formatTimestamp(cluster.response?.timestamp || cluster.timestamp)}
-        </span>
+        {showTimestamps ? (
+          <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums whitespace-nowrap opacity-60 group-hover/row:opacity-100 transition-opacity">
+            {formatTimestamp(cluster.response?.timestamp || cluster.timestamp)}
+          </span>
+        ) : null}
 
         <ArrowUp
           className={cn(
@@ -379,7 +420,15 @@ const ClusterRow = memo(function ClusterRow({
 }, areClusterRowPropsEqual);
 
 // Standalone Log Row (for non-clustered items)
-const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
+const LogRow = memo(function LogRow({
+  log,
+  showTimestamps,
+  compactMode,
+}: {
+  log: LogEntry;
+  showTimestamps: boolean;
+  compactMode: boolean;
+}) {
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
   const selectLog = useObservabilityStore((state) => state.selectLog);
   const logs = useObservabilityStore((state) => state.logs);
@@ -459,15 +508,24 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
       ref={rowRef}
       tabIndex={isSelected ? 0 : -1}
       role="button"
+      aria-label={`Select event ${method}`}
       onClick={() => selectLog(log.id)}
+      onKeyDown={(event) => {
+        if (!isActivateKey(event)) {
+          return;
+        }
+        event.preventDefault();
+        selectLog(log.id);
+      }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       className={cn(
-        "group/row relative flex items-center gap-3 px-4 h-8 cursor-pointer border-b border-border/50 transition-all duration-300",
+        "group/row relative flex items-center gap-3 px-4 cursor-pointer border-b border-border/50 transition-all duration-300",
+        compactMode ? "h-7" : "h-8",
         isSelected ? "border-l-2 border-l-primary bg-primary/[0.03]" : "border-l-2 border-l-transparent hover:bg-muted/[0.08]",
         showErrorHighlight && !isSelected && "border-l-2 border-l-destructive bg-destructive/[0.02]",
         showPiiHighlight && !showErrorHighlight && !isSelected && "border-l-2 border-l-warning bg-warning/[0.02]",
-        "focus-visible:outline-none"
+        "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50"
       )}
     >
       {/* Status Dot */}
@@ -482,9 +540,11 @@ const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
       </div>
 
       {/* Timestamp */}
-      <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums opacity-60 group-hover/row:opacity-100 transition-opacity">
-        {formatTimestamp(log.timestamp)}
-      </span>
+      {showTimestamps ? (
+        <span className="text-[10px] text-muted-foreground font-mono w-24 flex-shrink-0 tabular-nums opacity-60 group-hover/row:opacity-100 transition-opacity">
+          {formatTimestamp(log.timestamp)}
+        </span>
+      ) : null}
 
       {/* Direction Icon */}
       <div className="flex-shrink-0">
@@ -609,6 +669,10 @@ export function MessageStream() {
   const setIsLive = useObservabilityStore((state) => state.setIsLive);
   const clusteringEnabled = useObservabilityStore((state) => state.clusteringEnabled);
   const setClusteringEnabled = useObservabilityStore((state) => state.setClusteringEnabled);
+  const defaultClusteringEnabled = useSettingsStore((state) => state.defaultClusteringEnabled);
+  const autoScrollEnabled = useSettingsStore((state) => state.autoScrollEnabled);
+  const showTimestamps = useSettingsStore((state) => state.showTimestamps);
+  const compactMode = useSettingsStore((state) => state.compactMode);
 
   const filteredLogs = useMemo(() => filterLogs(logs, filters), [logs, filters]);
   const allLogs = logs;
@@ -622,6 +686,9 @@ export function MessageStream() {
   }, [filteredLogs, clusteringEnabled]);
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const settingsAppliedRef = useRef(false);
+  const displayItemsRef = useRef<DisplayItem[]>(displayItems);
+  const selectedLogIdRef = useRef<string | null>(selectedLogId);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [searchValue, setSearchValue] = useState(filters.searchText || "");
 
@@ -637,6 +704,23 @@ export function MessageStream() {
     filters.hasError ||
     filters.source
   );
+
+  useEffect(() => {
+    displayItemsRef.current = displayItems;
+  }, [displayItems]);
+
+  useEffect(() => {
+    selectedLogIdRef.current = selectedLogId;
+  }, [selectedLogId]);
+
+  useEffect(() => {
+    if (settingsAppliedRef.current) {
+      return;
+    }
+    settingsAppliedRef.current = true;
+    setClusteringEnabled(defaultClusteringEnabled);
+    setIsLive(autoScrollEnabled);
+  }, [defaultClusteringEnabled, autoScrollEnabled, setClusteringEnabled, setIsLive]);
 
   // Auto-scroll to bottom when new items arrive
   useEffect(() => {
@@ -660,8 +744,42 @@ export function MessageStream() {
 
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
-        // Navigate through items
-        // (simplified - would need more logic for clusters)
+        const currentItems = displayItemsRef.current;
+        if (currentItems.length === 0) {
+          return;
+        }
+
+        const currentSelection = selectedLogIdRef.current;
+        const currentIndex = currentItems.findIndex((item) =>
+          item.type === "cluster"
+            ? currentSelection === item.cluster.request.id || currentSelection === item.cluster.response?.id
+            : currentSelection === item.log.id
+        );
+        const delta = e.key === "ArrowDown" ? 1 : -1;
+        const nextIndex =
+          currentIndex === -1
+            ? delta > 0
+              ? 0
+              : currentItems.length - 1
+            : Math.min(currentItems.length - 1, Math.max(0, currentIndex + delta));
+        const target = currentItems[nextIndex];
+        if (!target) {
+          return;
+        }
+
+        if (target.type === "cluster") {
+          const isSameIdPair =
+            !!target.cluster.response && target.cluster.request.id === target.cluster.response.id;
+          selectLog(target.cluster.request.id, isSameIdPair ? "request" : null);
+        } else {
+          selectLog(target.log.id);
+        }
+
+        virtuosoRef.current?.scrollToIndex({
+          index: nextIndex,
+          align: "center",
+          behavior: "auto",
+        });
       }
 
       if (e.key === "Escape") {
@@ -708,12 +826,14 @@ export function MessageStream() {
             selectedLogId={selectedLogId}
             selectedLogPart={selectedLogPart}
             selectLog={selectLog}
+            showTimestamps={showTimestamps}
+            compactMode={compactMode}
           />
         );
       }
-      return <LogRow log={item.log} />;
+      return <LogRow log={item.log} showTimestamps={showTimestamps} compactMode={compactMode} />;
     },
-    [selectedLogId, selectedLogPart, selectLog]
+    [selectedLogId, selectedLogPart, selectLog, showTimestamps, compactMode]
   );
 
   return (
@@ -881,7 +1001,7 @@ export function MessageStream() {
               return isLive && isAtBottom ? true : false;
             }}
             className="scrollbar-thin"
-            defaultItemHeight={32}
+            defaultItemHeight={clusteringEnabled ? (compactMode ? 56 : 64) : (compactMode ? 28 : 32)}
             increaseViewportBy={120}
             overscan={6}
           />
