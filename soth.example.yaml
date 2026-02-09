@@ -47,6 +47,10 @@ policy:
 observe:
   enabled: true
   pii_detection: true      # Detect and redact PII in logs
+  pii_scopes:
+    ai_inference: true     # Direct provider/API inference traffic
+    mcp: true              # MCP JSON-RPC traffic
+    agent_apps: true       # Agent app traffic (ChatGPT, Claude, etc.)
   log_requests: true       # Log inbound requests
   log_responses: true      # Log outbound responses
   tamper_proof: true       # Enable Merkle tree verification

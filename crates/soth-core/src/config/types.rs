@@ -447,6 +447,10 @@ pub struct ObserveConfig {
     #[serde(default = "default_true")]
     pub pii_detection: bool,
 
+    /// Source scopes where PII detection runs.
+    #[serde(default)]
+    pub pii_scopes: ObservePiiScopes,
+
     /// Log requests
     #[serde(default = "default_true")]
     pub log_requests: bool,
@@ -485,12 +489,37 @@ impl Default for ObserveConfig {
         Self {
             enabled: true,
             pii_detection: true,
+            pii_scopes: ObservePiiScopes::default(),
             log_requests: true,
             log_responses: true,
             tamper_proof: false,
             storage: StorageConfig::default(),
             buffer_size: default_buffer_size(),
             flush_interval: default_flush_interval(),
+        }
+    }
+}
+
+/// Source scopes for PII detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservePiiScopes {
+    /// Run PII detection for direct AI inference/provider traffic.
+    #[serde(default = "default_true")]
+    pub ai_inference: bool,
+    /// Run PII detection for MCP request/response traffic.
+    #[serde(default = "default_true")]
+    pub mcp: bool,
+    /// Run PII detection for agent-app traffic.
+    #[serde(default = "default_true")]
+    pub agent_apps: bool,
+}
+
+impl Default for ObservePiiScopes {
+    fn default() -> Self {
+        Self {
+            ai_inference: true,
+            mcp: true,
+            agent_apps: true,
         }
     }
 }

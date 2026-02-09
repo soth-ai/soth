@@ -44,6 +44,10 @@ policy:
 observe:
   enabled: true
   pii_detection: true
+  pii_scopes:
+    ai_inference: true
+    mcp: true
+    agent_apps: true
   log_requests: true
   log_responses: true
   tamper_proof: true

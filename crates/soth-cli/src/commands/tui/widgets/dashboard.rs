@@ -1220,9 +1220,7 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         theme,
     );
 
-    let model_rows_budget = panel_rows
-        .saturating_sub(lines.len())
-        .max(2);
+    let model_rows_budget = panel_rows.saturating_sub(lines.len()).max(2);
     push_models_window(
         &mut lines,
         &all_models,
@@ -1371,18 +1369,15 @@ fn render_observed_meta_column(
             mcp_method_total,
             theme,
         );
-        render_observed_meta_category(
-            frame,
-            cols[2],
-            "agent",
-            top_agents,
-            agent_total,
-            theme,
-        );
+        render_observed_meta_category(frame, cols[2], "agent", top_agents, agent_total, theme);
         return;
     }
 
-    let provider_primary = top_providers.first().cloned().into_iter().collect::<Vec<_>>();
+    let provider_primary = top_providers
+        .first()
+        .cloned()
+        .into_iter()
+        .collect::<Vec<_>>();
     let mcp_primary = top_mcp_methods
         .first()
         .cloned()
@@ -1872,7 +1867,11 @@ fn push_ranked_compact_line(
             truncate(name, 10)
         };
         let entry = if width >= 88 {
-            format!("{compact_name} {}({})", short_number(*count), format_percent(pct))
+            format!(
+                "{compact_name} {}({})",
+                short_number(*count),
+                format_percent(pct)
+            )
         } else {
             format!("{compact_name} {}", short_number(*count))
         };
@@ -1923,10 +1922,7 @@ fn push_models_window(
         lines.push(Line::from(vec![
             Span::styled(" models ", theme.muted_style()),
             Span::styled(
-                truncate(
-                    &(summary + &extra),
-                    width.saturating_sub(8).max(1),
-                ),
+                truncate(&(summary + &extra), width.saturating_sub(8).max(1)),
                 theme.info_style(),
             ),
         ]));
@@ -1965,7 +1961,10 @@ fn push_models_window(
     if shown < items.len() && remaining > 0 {
         lines.push(Line::from(vec![
             Span::styled("        ", theme.muted_style()),
-            Span::styled(format!("+{} more", items.len() - shown), theme.muted_style()),
+            Span::styled(
+                format!("+{} more", items.len() - shown),
+                theme.muted_style(),
+            ),
         ]));
     }
 }

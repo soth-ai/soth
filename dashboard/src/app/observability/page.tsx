@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import {
   Panel,
   PanelGroup,
@@ -111,12 +112,15 @@ function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
 export default function ObservabilityPage() {
   const addLogsBatch = useObservabilityStore((state) => state.addLogsBatch);
   const setConnected = useObservabilityStore((state) => state.setConnected);
+  const applyPreset = useObservabilityStore((state) => state.applyPreset);
   const selectedLogId = useObservabilityStore((state) => state.selectedLogId);
   const streamCursorSeq = useObservabilityStore((state) => state.streamCursorSeq);
   const advanceStreamCursor = useObservabilityStore((state) => state.advanceStreamCursor);
+  const searchParams = useSearchParams();
   const isMobile = useIsMobile();
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("stream");
   const [mounted, setMounted] = useState(false);
+  const appliedPresetFromQueryRef = useRef<string | null>(null);
 
   useEffect(() => {
     setMounted(true);
@@ -162,6 +166,22 @@ export default function ObservabilityPage() {
   useEffect(() => {
     setConnected(wsConnected);
   }, [wsConnected, setConnected]);
+
+  useEffect(() => {
+    if (!mounted) {
+      return;
+    }
+    const presetParam = searchParams.get("preset");
+    if (!presetParam) {
+      return;
+    }
+    const resolvedPreset = presetParam === "pii" ? "builtin-pii-alerts" : presetParam;
+    if (appliedPresetFromQueryRef.current === resolvedPreset) {
+      return;
+    }
+    applyPreset(resolvedPreset);
+    appliedPresetFromQueryRef.current = resolvedPreset;
+  }, [mounted, searchParams, applyPreset]);
 
   // Bootstrap with recent snapshot before relying on live stream updates.
   useEffect(() => {
