@@ -402,6 +402,13 @@ fn compact_path(path: &std::path::Path) -> String {
     full
 }
 
+struct ProxyRuntime {
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    proxy_task: JoinHandle<anyhow::Result<()>>,
+    dashboard_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    dashboard_task: Option<JoinHandle<()>>,
+}
+
 /// Run the soth proxy transport.
 async fn run_forward_proxy(
     config: &SothConfig,
@@ -413,7 +420,7 @@ async fn run_forward_proxy(
     quiet: bool,
 ) -> anyhow::Result<()> {
     logging::set_log_output_paused(false);
-    let (shutdown_tx, proxy_task) = match spawn_proxy_runtime(
+    let runtime = match spawn_proxy_runtime(
         config,
         proxy_config,
         ca_cert_path,
@@ -426,6 +433,10 @@ async fn run_forward_proxy(
             return Err(error);
         }
     };
+    let mut dashboard_shutdown_tx = runtime.dashboard_shutdown_tx;
+    let mut dashboard_task = runtime.dashboard_task;
+    let shutdown_tx = runtime.shutdown_tx;
+    let proxy_task = runtime.proxy_task;
 
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
@@ -440,6 +451,8 @@ async fn run_forward_proxy(
         Ok(runtime_result) => runtime_result,
         Err(error) => Err(anyhow::anyhow!("proxy runtime task join failed: {}", error)),
     };
+
+    shutdown_dashboard_runtime(&mut dashboard_shutdown_tx, &mut dashboard_task, quiet).await;
 
     if let Some(mut child) = dashboard_ui_process {
         stop_dashboard_ui_process(&mut child);
@@ -470,7 +483,7 @@ async fn run_forward_proxy_with_tui(
     quiet: bool,
 ) -> anyhow::Result<()> {
     let dashboard_port = config.dashboard.port;
-    let (shutdown_tx, mut proxy_task) = match spawn_proxy_runtime(
+    let runtime = match spawn_proxy_runtime(
         config,
         proxy_config,
         ca_cert_path,
@@ -483,7 +496,10 @@ async fn run_forward_proxy_with_tui(
             return Err(error);
         }
     };
-    let mut shutdown_tx = Some(shutdown_tx);
+    let mut shutdown_tx = Some(runtime.shutdown_tx);
+    let mut proxy_task = runtime.proxy_task;
+    let mut dashboard_shutdown_tx = runtime.dashboard_shutdown_tx;
+    let mut dashboard_task = runtime.dashboard_task;
 
     // Pause stdout logs before waiting + entering alternate screen to avoid overlap.
     logging::set_log_output_paused(true);
@@ -528,6 +544,8 @@ async fn run_forward_proxy_with_tui(
         }
     };
 
+    shutdown_dashboard_runtime(&mut dashboard_shutdown_tx, &mut dashboard_task, quiet).await;
+
     if let Some(mut child) = dashboard_ui_process {
         stop_dashboard_ui_process(&mut child);
     }
@@ -548,10 +566,7 @@ fn spawn_proxy_runtime(
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
     event_logger: Option<EventLogger>,
-) -> anyhow::Result<(
-    tokio::sync::oneshot::Sender<()>,
-    JoinHandle<anyhow::Result<()>>,
-)> {
+) -> anyhow::Result<ProxyRuntime> {
     let enforcer = enforcement::build_proxy_enforcer(config)?;
     let _policy_reload_task = enforcer
         .policy_engine()
@@ -559,15 +574,24 @@ fn spawn_proxy_runtime(
 
     let dashboard_state = DashboardState::new();
 
+    let mut dashboard_shutdown_tx = None;
+    let mut dashboard_task = None;
     if config.dashboard.enabled {
         let state_clone = dashboard_state.clone();
         let dashboard_port = config.dashboard.port;
-        tokio::spawn(async move {
+        let (dashboard_tx, dashboard_rx) = tokio::sync::oneshot::channel::<()>();
+        dashboard_shutdown_tx = Some(dashboard_tx);
+        dashboard_task = Some(tokio::spawn(async move {
             let server = DashboardServer::new(state_clone, dashboard_port).with_event_store();
-            if let Err(e) = server.run().await {
+            if let Err(e) = server
+                .run_with_shutdown(async move {
+                    let _ = dashboard_rx.await;
+                })
+                .await
+            {
                 tracing::error!("Dashboard server error: {}", e);
             }
-        });
+        }));
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -587,7 +611,12 @@ fn spawn_proxy_runtime(
         .map_err(|error| anyhow::anyhow!("Proxy error: {}", error))
     });
 
-    Ok((shutdown_tx, handle))
+    Ok(ProxyRuntime {
+        shutdown_tx,
+        proxy_task: handle,
+        dashboard_shutdown_tx,
+        dashboard_task,
+    })
 }
 
 async fn wait_for_dashboard_ready(port: u16, timeout: Duration) -> bool {
@@ -661,6 +690,11 @@ fn spawn_dashboard_ui_process(
             "NEXT_PUBLIC_SOTH_WS_BASE",
             format!("ws://localhost:{}", dashboard_port),
         );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let child = cmd
         .spawn()
@@ -744,6 +778,29 @@ fn stop_dashboard_ui_process(child: &mut Child) {
         }
     }
 
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(&process_group)
+            .status();
+        for _ in 0..10 {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(120)),
+                Err(_) => break,
+            }
+        }
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(&process_group)
+            .status();
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+    }
+
     if let Err(error) = child.kill() {
         style::warning(&format!("Failed to stop dashboard UI process: {}", error));
         return;
@@ -754,6 +811,33 @@ fn stop_dashboard_ui_process(child: &mut Child) {
             "Failed waiting for dashboard UI process shutdown: {}",
             error
         ));
+    }
+}
+
+async fn shutdown_dashboard_runtime(
+    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    dashboard_task: &mut Option<JoinHandle<()>>,
+    quiet: bool,
+) {
+    if let Some(tx) = shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+
+    if let Some(mut task) = dashboard_task.take() {
+        match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if !quiet {
+                    style::warning(&format!("Dashboard task join error: {}", error));
+                }
+            }
+            Err(_) => {
+                task.abort();
+                if !quiet {
+                    style::warning("Dashboard server shutdown timed out; aborted task.");
+                }
+            }
+        }
     }
 }
 

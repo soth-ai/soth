@@ -6,7 +6,7 @@ use crate::commands::tui::theme::{
     format_currency, format_number, format_percent, truncate, Theme, CIRCLE_FILLED, WARNING,
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use soth_core::types::{EventSource, WrapEvent};
 use std::collections::HashMap;
 
@@ -972,6 +972,9 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
     let mut mcp_calls = 0u64;
     let mut agent_calls = 0u64;
     let mut model_counts: HashMap<String, u64> = HashMap::new();
+    let mut model_recency: HashMap<String, usize> = HashMap::new();
+    let mut provider_model_counts: HashMap<String, u64> = HashMap::new();
+    let mut provider_model_recency: HashMap<String, usize> = HashMap::new();
     let mut mcp_method_counts: HashMap<String, u64> = HashMap::new();
     let mut event_agent_counts: HashMap<String, u64> = HashMap::new();
     let mut event_provider_counts: HashMap<String, u64> = HashMap::new();
@@ -979,8 +982,9 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
     let mut cluster_provider_counts: HashMap<String, u64> = HashMap::new();
     let mut sampled_events = 0u64;
     let mut sampled_clusters = 0u64;
+    let mut latest_ai_model: Option<String> = None;
 
-    for event in app.events.iter().take(EVENT_WINDOW) {
+    for (idx, event) in app.events.iter().take(EVENT_WINDOW).enumerate() {
         sampled_events += 1;
         match event.source {
             EventSource::AiProxy => ai_events += 1,
@@ -1001,6 +1005,21 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
             .filter(|model| !model.is_empty())
         {
             *model_counts.entry(model.to_string()).or_insert(0) += 1;
+            model_recency.entry(model.to_string()).or_insert(idx);
+            if event.source == EventSource::AiProxy {
+                let provider = event
+                    .provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|provider| !provider.is_empty())
+                    .unwrap_or("unknown");
+                let key = format!("{provider}/{model}");
+                *provider_model_counts.entry(key.clone()).or_insert(0) += 1;
+                provider_model_recency.entry(key.clone()).or_insert(idx);
+                if latest_ai_model.is_none() {
+                    latest_ai_model = Some(key);
+                }
+            }
         }
 
         if event.source == EventSource::Mcp {
@@ -1044,7 +1063,11 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
 
     for row in app.metrics.clusters.iter().take(CLUSTER_WINDOW) {
         sampled_clusters += 1;
-        let source = row.source.as_deref().unwrap_or_default().to_ascii_lowercase();
+        let source = row
+            .source
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if source.contains("mcp") {
             mcp_calls += 1;
         } else if source.contains("agent") {
@@ -1086,9 +1109,17 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
 
     let provider_total = provider_counts.values().sum::<u64>().max(1);
     let agent_total = agent_counts.values().sum::<u64>().max(1);
-    let model_total = model_counts.values().sum::<u64>().max(1);
+    let model_total = if provider_model_counts.is_empty() {
+        model_counts.values().sum::<u64>().max(1)
+    } else {
+        provider_model_counts.values().sum::<u64>().max(1)
+    };
     let mcp_method_total = mcp_method_counts.values().sum::<u64>().max(1);
-    let top_models = top_counts(model_counts, top_n);
+    let all_models = if provider_model_counts.is_empty() {
+        sort_counts_by_recency(model_counts, model_recency)
+    } else {
+        sort_counts_by_recency(provider_model_counts, provider_model_recency)
+    };
     let top_agents = top_counts(agent_counts, top_n);
     let top_providers = top_counts(provider_counts, top_n);
     let top_mcp_methods = top_counts(mcp_method_counts, top_n);
@@ -1128,6 +1159,16 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
             theme.info_style(),
         ),
     ]));
+    lines.push(Line::from(vec![
+        Span::styled("latest ", theme.muted_style()),
+        Span::styled(
+            truncate(
+                latest_ai_model.as_deref().unwrap_or("none"),
+                inner.width.saturating_sub(8) as usize,
+            ),
+            theme.info_style(),
+        ),
+    ]));
 
     push_ranked_group(
         &mut lines,
@@ -1145,14 +1186,7 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         inner.width as usize,
         theme,
     );
-    push_ranked_group(
-        &mut lines,
-        "model",
-        &top_models,
-        model_total,
-        inner.width as usize,
-        theme,
-    );
+    push_models_window(&mut lines, &all_models, model_total, inner.width as usize, theme);
     push_ranked_group(
         &mut lines,
         "agent",
@@ -1166,7 +1200,7 @@ fn render_observed_signals(frame: &mut Frame, area: Rect, app: &App) {
         lines.truncate(inner.height as usize);
     }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn collect_actionables(app: &App) -> Vec<(u8, String)> {
@@ -1503,6 +1537,62 @@ fn push_ranked_group(
             Span::styled(trailer, theme.muted_style()),
         ]));
     }
+}
+
+fn push_models_window(
+    lines: &mut Vec<Line<'static>>,
+    items: &[(String, u64)],
+    total: u64,
+    width: usize,
+    theme: &Theme,
+) {
+    if items.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" models ", theme.muted_style()),
+            Span::styled("none", theme.muted_style()),
+        ]));
+        return;
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(" models ", theme.muted_style()),
+        Span::styled(format!("{}", items.len()), theme.info_style()),
+        Span::styled(" (window)", theme.muted_style()),
+    ]));
+
+    let mut shown = 0usize;
+    let label_width = width.saturating_sub(14).max(10);
+    for (name, count) in items {
+        let pct = (*count as f64 / total.max(1) as f64) * 100.0;
+        let right = format!(" {} ({})", short_number(*count), format_percent(pct));
+        let max_name = label_width.saturating_sub(right.len()).max(6);
+        lines.push(Line::from(vec![
+            Span::styled("        ", theme.muted_style()),
+            Span::styled(truncate(name, max_name), theme.info_style()),
+            Span::styled(right, theme.muted_style()),
+        ]));
+        shown += 1;
+    }
+
+    if shown < items.len() {
+        lines.push(Line::from(vec![
+            Span::styled("        ", theme.muted_style()),
+            Span::styled(format!("+{} more", items.len() - shown), theme.muted_style()),
+        ]));
+    }
+}
+
+fn sort_counts_by_recency(
+    mut values: HashMap<String, u64>,
+    recency: HashMap<String, usize>,
+) -> Vec<(String, u64)> {
+    let mut rows: Vec<(String, u64)> = values.drain().collect();
+    rows.sort_by(|a, b| {
+        let ia = recency.get(&a.0).copied().unwrap_or(usize::MAX);
+        let ib = recency.get(&b.0).copied().unwrap_or(usize::MAX);
+        ia.cmp(&ib).then_with(|| b.1.cmp(&a.1))
+    });
+    rows
 }
 
 fn latency_band_series(clusters: &[ClusterRow], points: usize) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
