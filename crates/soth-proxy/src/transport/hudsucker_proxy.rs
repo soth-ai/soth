@@ -2467,7 +2467,7 @@ where
     // Create WebSocket handler with event logger
     let ws_handler = AiWebSocketHandler::new(session_id, event_logger_arc, ws_hosts);
 
-    info!("Starting hudsucker proxy on {}", listen_addr);
+    info!("Starting soth proxy on {}", listen_addr);
     info!("  AI+MCP domains -> MITM intercept");
     info!("  Other domains -> blind tunnel");
 
@@ -2937,7 +2937,10 @@ mod tests {
             &hosts,
             "codewhisperer.us-east-1.amazonaws.com"
         ));
-        assert!(AiProxyHandler::is_agent_app(&hosts, "statsig.anthropic.com"));
+        assert!(AiProxyHandler::is_agent_app(
+            &hosts,
+            "statsig.anthropic.com"
+        ));
         assert!(AiProxyHandler::is_agent_app(&hosts, "a-api.anthropic.com"));
         assert!(AiProxyHandler::is_agent_app(&hosts, "a-cdn.anthropic.com"));
         assert!(AiProxyHandler::is_agent_app(&hosts, "s-cdn.anthropic.com"));

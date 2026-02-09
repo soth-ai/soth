@@ -160,14 +160,12 @@ impl AiProvider for GoogleProvider {
             .as_ref()
             .and_then(find_usage_metadata)
             .and_then(extract_usage_fields);
-        let wrapped_usage = std::str::from_utf8(body)
-            .ok()
-            .and_then(|text| {
-                parse_batchexecute_wrapped_payloads(text)
-                    .iter()
-                    .filter_map(|payload| find_usage_metadata(payload).and_then(extract_usage_fields))
-                    .last()
-            });
+        let wrapped_usage = std::str::from_utf8(body).ok().and_then(|text| {
+            parse_batchexecute_wrapped_payloads(text)
+                .iter()
+                .filter_map(|payload| find_usage_metadata(payload).and_then(extract_usage_fields))
+                .last()
+        });
         let (input_tokens, output_tokens, cached_tokens) = direct_usage.or(wrapped_usage)?;
 
         Some(ProviderUsage {

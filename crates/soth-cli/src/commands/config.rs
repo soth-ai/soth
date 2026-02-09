@@ -66,7 +66,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
-    // Validate forward proxy section
+    // Validate soth proxy section
     validate_forward_proxy(&config, &mut warnings, &mut errors);
 
     // Validate identity section
@@ -124,7 +124,10 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             config.forward_proxy.hosts.ai_inference.len()
         );
         println!("  MCP hosts:   {}", config.forward_proxy.hosts.mcp.len());
-        println!("  Agent hosts: {}", config.forward_proxy.hosts.agent_apps.len());
+        println!(
+            "  Agent hosts: {}",
+            config.forward_proxy.hosts.agent_apps.len()
+        );
         println!("  Host mode:   {}", config.forward_proxy.hosts.mode);
         println!(
             "  Block:       {} hosts",
@@ -173,7 +176,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Validate forward proxy configuration
+/// Validate soth proxy configuration
 fn validate_forward_proxy(
     config: &SothConfig,
     warnings: &mut Vec<String>,
@@ -221,6 +224,12 @@ fn validate_identity(config: &SothConfig, warnings: &mut Vec<String>, errors: &m
 
     if mode == "required" && config.identity.key_path.is_none() {
         warnings.push("Identity mode is 'required' but no key_path specified".to_string());
+    }
+    if mode == "required" {
+        warnings.push(
+            "Identity mode 'required' is currently downgraded to 'optional' until agentfacts rollout"
+                .to_string(),
+        );
     }
 }
 

@@ -607,10 +607,10 @@ impl Default for DashboardConfig {
     }
 }
 
-/// Forward proxy configuration (HTTP/HTTPS interception)
+/// Soth proxy configuration (HTTP/HTTPS interception)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardProxyConfig {
-    /// Whether the forward proxy is enabled
+    /// Whether the soth proxy is enabled
     #[serde(default)]
     pub enabled: bool,
 
@@ -812,7 +812,7 @@ pub struct HostDomainFilesConfig {
     pub agent_apps: Option<PathBuf>,
 }
 
-/// Host filtering mode for forward proxy interception
+/// Host filtering mode for soth proxy interception
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HostFilterMode {

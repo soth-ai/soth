@@ -2,7 +2,7 @@
 //!
 //! The logger writes to SQLite (`events.db`) for low-latency durable writes.
 //!
-//! Used by both `soth wrap` (stdio interception) and forward proxy (HTTP interception)
+//! Used by both `soth wrap` (stdio interception) and soth proxy (HTTP interception)
 //! to emit events that appear in the observability dashboard.
 
 use crate::types::WrapEvent;

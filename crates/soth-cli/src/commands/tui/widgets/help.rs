@@ -25,7 +25,11 @@ pub fn render(frame: &mut Frame, area: Rect) {
         key_line("1-4", "Switch to tab (Dashboard/Events/Agents/Help)", theme),
         key_line("Tab", "Next tab", theme),
         key_line("Shift+Tab", "Previous tab", theme),
-        key_line("h/j/k/l", "Navigate panels / scroll (vim-style)", theme),
+        key_line("h / l", "Cycle focus across dashboard sections", theme),
+        key_line("w / - / =", "Timeline window (Dashboard tab)", theme),
+        key_line("[ / ]", "Cycle event filter (Events tab)", theme),
+        key_line("Enter", "Open Event Inspector (Events tab)", theme),
+        key_line("j / k", "Scroll lists in Events/Agents tabs", theme),
         key_line("Arrow keys", "Navigate panels / scroll", theme),
         Line::from(""),
         Line::from(Span::styled(
@@ -42,6 +46,8 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("Actions", theme.bold_style())),
         Line::from(""),
+        key_line("f", "Toggle live updates (pause/resume)", theme),
+        key_line("p", "Load full payload in Event Inspector", theme),
         key_line("r", "Force refresh data", theme),
         key_line("?", "Show this help", theme),
         key_line("q / Esc", "Quit", theme),
@@ -50,11 +56,15 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled("  API URL: ", theme.muted_style()),
-            Span::raw("Set with --api-url (default: http://localhost:3001)"),
+            Span::raw("Set with --api-url (default: http://127.0.0.1:3001)"),
         ]),
         Line::from(vec![
             Span::styled("  Refresh: ", theme.muted_style()),
             Span::raw("Set with --refresh (default: 2 seconds)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Inspector: ", theme.muted_style()),
+            Span::raw("Payload fetch is lazy/on-demand to avoid UI stalls"),
         ]),
     ];
 

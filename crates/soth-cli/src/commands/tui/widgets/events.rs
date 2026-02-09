@@ -1,16 +1,22 @@
 //! Events feed widget
 
 use crate::commands::tui::app::App;
-use crate::commands::tui::theme::{truncate, Theme, ARROW_LEFT, ARROW_RIGHT, CHECK, CROSS};
+use crate::commands::tui::theme::{
+    format_currency, format_number, truncate, Theme, ARROW_LEFT, ARROW_RIGHT, CHECK, CROSS,
+};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use soth_core::types::WrapDirection;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = Theme::get();
 
     let block = Block::default()
-        .title(format!(" Events ({}) ", app.events.len()))
+        .title(format!(
+            " Events ({}) [filter:{}] ",
+            app.filtered_events_len(),
+            app.event_filter_label()
+        ))
         .title_style(theme.title_style())
         .borders(Borders::ALL)
         .border_style(theme.border_style(false));
@@ -18,25 +24,32 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.events.is_empty() {
-        let empty = ratatui::widgets::Paragraph::new("No events yet")
+    let total = app.filtered_events_len();
+    if total == 0 {
+        let empty = Paragraph::new("No events for current filter")
             .style(theme.muted_style())
             .alignment(Alignment::Center);
         frame.render_widget(empty, inner);
         return;
     }
 
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(4)])
+        .split(inner);
+    let list_area = layout[0];
+    let detail_area = layout[1];
+
     // Calculate visible range
-    let visible_height = inner.height as usize;
-    let total = app.events.len();
+    let visible_height = list_area.height as usize;
     let offset = app.events_scroll.offset.min(total.saturating_sub(1));
+    let selected_abs = app.events_scroll.selected.min(total.saturating_sub(1));
+    let visible_event_indices = app.filtered_event_indices_window(offset, visible_height);
 
     // Build list items
-    let items: Vec<ListItem> = app
-        .events
+    let items: Vec<ListItem> = visible_event_indices
         .iter()
-        .skip(offset)
-        .take(visible_height)
+        .filter_map(|event_idx| app.events.get(*event_idx))
         .map(|event| {
             // Time (HH:MM:SS)
             let time = event.timestamp.format("%H:%M:%S").to_string();
@@ -96,18 +109,90 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let list = List::new(items).highlight_style(theme.highlight_style());
 
     // Calculate selection within visible range
-    let selected = if app.events_scroll.selected >= offset {
-        Some(app.events_scroll.selected - offset)
+    let selected = if selected_abs >= offset {
+        Some(selected_abs - offset)
     } else {
         None
     };
 
     let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(list, inner, &mut state);
+    frame.render_stateful_widget(list, list_area, &mut state);
 
     // Render scroll indicator if needed
     if total > visible_height {
-        render_scroll_indicator(frame, inner, offset, total, visible_height, theme);
+        render_scroll_indicator(frame, list_area, offset, total, visible_height, theme);
+    }
+
+    // Detail panel for selected event
+    if let Some(event) = app.cloned_filtered_event(selected_abs) {
+        let method_tool = if let Some(ref tool) = event.tool_name {
+            format!("{}/{}", event.server_name, tool)
+        } else if let Some(ref method) = event.method {
+            method.clone()
+        } else {
+            "-".to_string()
+        };
+        let status = event
+            .status_code
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let tokens = event
+            .token_count
+            .map(format_number)
+            .unwrap_or_else(|| "-".to_string());
+        let latency = event
+            .latency_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".to_string());
+        let cost = event
+            .cost_usd
+            .map(format_currency)
+            .unwrap_or_else(|| "-".to_string());
+        let provider = event.provider.as_deref().unwrap_or("-");
+        let model = event.model.as_deref().unwrap_or("-");
+
+        let detail = vec![
+            Line::from(vec![
+                Span::styled("src ", theme.muted_style()),
+                Span::raw(format!("{:?}", event.source)),
+                Span::raw("  "),
+                Span::styled("provider ", theme.muted_style()),
+                Span::raw(provider),
+                Span::raw("  "),
+                Span::styled("status ", theme.muted_style()),
+                Span::raw(status),
+                Span::raw("  "),
+                Span::styled("lat ", theme.muted_style()),
+                Span::raw(latency),
+            ]),
+            Line::from(vec![
+                Span::styled("op ", theme.muted_style()),
+                Span::raw(truncate(&method_tool, 28)),
+                Span::raw("  "),
+                Span::styled("model ", theme.muted_style()),
+                Span::raw(truncate(model, 18)),
+                Span::raw("  "),
+                Span::styled("tok ", theme.muted_style()),
+                Span::raw(tokens),
+                Span::raw("  "),
+                Span::styled("cost ", theme.muted_style()),
+                Span::raw(cost),
+            ]),
+            Line::from(vec![
+                Span::styled("hint ", theme.muted_style()),
+                Span::raw(truncate(
+                    event
+                        .request_preview
+                        .as_deref()
+                        .or(event.response_preview.as_deref())
+                        .or(event.content_preview.as_deref())
+                        .unwrap_or("no preview"),
+                    detail_area.width.saturating_sub(6) as usize,
+                )),
+            ]),
+        ];
+
+        frame.render_widget(Paragraph::new(detail), detail_area);
     }
 }
 

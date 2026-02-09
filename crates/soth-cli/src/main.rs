@@ -7,6 +7,7 @@
 //!   soth setup wizard            - Guided setup for proxy/wrap/shell
 //!   soth init                    - Initialize config and keys
 //!   soth tui                     - Interactive TUI dashboard
+//!   soth attach                  - Attach TUI to a running proxy
 //!   soth identity generate       - Generate a new keypair
 //!   soth identity list           - List trusted agents
 //!   soth identity trust <did>    - Add DID to trust store
@@ -82,7 +83,7 @@ enum Commands {
         output: PathBuf,
     },
 
-    /// HTTP/HTTPS forward proxy management
+    /// HTTP/HTTPS soth proxy management
     Proxy {
         #[command(subcommand)]
         action: commands::proxy::ProxyCommands,
@@ -111,6 +112,9 @@ enum Commands {
 
     /// Interactive TUI dashboard
     Tui(commands::tui::TuiArgs),
+
+    /// Attach TUI to a running soth proxy
+    Attach(commands::tui::TuiArgs),
 
     /// Audit trail management
     Audit {
@@ -372,6 +376,9 @@ async fn main() -> anyhow::Result<()> {
             commands::tail::run(args).await?;
         }
         Commands::Tui(args) => {
+            commands::tui::run(args).await?;
+        }
+        Commands::Attach(args) => {
             commands::tui::run(args).await?;
         }
         Commands::Audit { action } => {

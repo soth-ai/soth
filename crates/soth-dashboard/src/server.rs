@@ -42,6 +42,14 @@ impl DashboardServer {
 
     /// Run the dashboard server
     pub async fn run(self) -> std::io::Result<()> {
+        self.run_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    /// Run the dashboard server with graceful shutdown.
+    pub async fn run_with_shutdown<F>(self, shutdown: F) -> std::io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         // Build app state
         let app_state = AppState::new(self.state);
 
@@ -52,6 +60,7 @@ impl DashboardServer {
         };
 
         // Load initial events and start watcher
+        let mut watcher_task = None;
         if let Some(ref store) = self.event_store {
             let store_clone = store.clone();
             let store_path = store.path().display().to_string();
@@ -62,9 +71,9 @@ impl DashboardServer {
             }
 
             // Start file watcher in background
-            tokio::spawn(async move {
+            watcher_task = Some(tokio::spawn(async move {
                 store_clone.watch().await;
-            });
+            }));
 
             info!("Event store enabled, watching {}", store_path);
         }
@@ -87,7 +96,15 @@ impl DashboardServer {
         info!("For the full React dashboard, run: cd dashboard && npm run dev");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await
+        let serve_result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await;
+
+        if let Some(task) = watcher_task {
+            task.abort();
+        }
+
+        serve_result
     }
 }
 

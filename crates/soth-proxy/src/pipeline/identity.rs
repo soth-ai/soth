@@ -110,6 +110,9 @@ impl IdentityLayer {
             .map(|s| s.to_string());
 
         let signature = ctx.metadata.get(&self.config.signature_header).cloned();
+        // Preserve caller-provided DID in context even when verification fails.
+        ctx.agent_did = did.clone();
+        ctx.identity_verified = false;
 
         let store = self.trust_store.read().await;
         let verification = core::verify_mcp_identity(

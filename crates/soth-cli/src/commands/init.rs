@@ -174,8 +174,10 @@ pub async fn run(output: PathBuf) -> Result<()> {
         render_domain_list("# AI inference/API domains", &default_hosts.ai_inference);
     let mcp_domain_content =
         render_domain_list("# MCP transport/service domains", &default_hosts.mcp);
-    let agent_domain_content =
-        render_domain_list("# Agent app domains (chat/web/IDE agents)", &default_hosts.agent_apps);
+    let agent_domain_content = render_domain_list(
+        "# Agent app domains (chat/web/IDE agents)",
+        &default_hosts.agent_apps,
+    );
 
     let domains_dir = output.join("domains");
     fs::create_dir_all(&domains_dir).await?;

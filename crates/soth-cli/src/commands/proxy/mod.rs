@@ -1,10 +1,10 @@
-//! Forward proxy CLI commands
+//! Soth proxy CLI commands
 //!
-//! Commands for managing the HTTP/HTTPS forward proxy:
+//! Commands for managing the HTTP/HTTPS soth proxy:
 //! - `soth proxy on` - Enable system proxy (route traffic through SOTH)
 //! - `soth proxy off` - Disable system proxy (direct connections)
 //! - `soth proxy setup-ca` - Generate CA certificate
-//! - `soth proxy start` - Start the forward proxy
+//! - `soth proxy start` - Start the soth proxy
 //! - `soth proxy env` - Output environment variables
 //! - `soth proxy status` - Show proxy status
 //! - `soth proxy ca-info` - Show CA certificate info
@@ -25,8 +25,19 @@ mod start;
 mod status;
 mod system;
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// UI mode for `proxy start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StartUiMode {
+    /// Auto-select TUI when terminal supports it, otherwise use logs.
+    Auto,
+    /// Force interactive TUI.
+    Tui,
+    /// Force plain log output.
+    Logs,
+}
 
 /// Proxy subcommands
 #[derive(Subcommand)]
@@ -56,7 +67,7 @@ pub enum ProxyCommands {
         output: Option<String>,
     },
 
-    /// Start the forward proxy
+    /// Start the soth proxy
     Start {
         /// Port to listen on
         #[arg(short, long)]
@@ -65,6 +76,14 @@ pub enum ProxyCommands {
         /// Config file path
         #[arg(short, long)]
         config: Option<PathBuf>,
+
+        /// Startup UI mode (auto, tui, logs)
+        #[arg(long, value_enum, default_value_t = StartUiMode::Auto)]
+        ui: StartUiMode,
+
+        /// Suppress startup banner and helper lines
+        #[arg(short, long)]
+        quiet: bool,
     },
 
     /// Output shell environment variables for proxy configuration
@@ -166,9 +185,12 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
         ProxyCommands::SetupCa { no_trust, output } => {
             setup_ca::run(output, no_trust, global_config.clone()).await
         }
-        ProxyCommands::Start { port, config } => {
-            start::run(port, config.or(global_config.clone())).await
-        }
+        ProxyCommands::Start {
+            port,
+            config,
+            ui,
+            quiet,
+        } => start::run(port, config.or(global_config.clone()), ui, quiet).await,
         ProxyCommands::Env {
             shell,
             ca_only,
