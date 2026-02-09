@@ -4,6 +4,24 @@ function trimTrailingSlash(value: string): string {
   return value.endsWith("/") ? value.slice(0, -1) : value;
 }
 
+function readPersistedSettingsValue(key: string): string | undefined {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+
+  try {
+    const raw = window.localStorage.getItem("soth-dashboard-settings");
+    if (!raw) {
+      return undefined;
+    }
+    const parsed = JSON.parse(raw) as { state?: Record<string, unknown> };
+    const value = parsed.state?.[key];
+    return typeof value === "string" ? value.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeWsBase(value: string): string {
   const trimmed = trimTrailingSlash(value.trim());
 
@@ -25,7 +43,11 @@ function normalizeWsBase(value: string): string {
 export function getApiBaseUrl(): string {
   const configured = process.env.NEXT_PUBLIC_SOTH_API_BASE?.trim();
   if (!configured) {
-    return DEFAULT_API_BASE;
+    const persisted = readPersistedSettingsValue("apiBaseUrl");
+    if (!persisted) {
+      return DEFAULT_API_BASE;
+    }
+    return trimTrailingSlash(persisted);
   }
 
   return trimTrailingSlash(configured);
@@ -35,6 +57,18 @@ export function getWsBaseUrl(): string {
   const configured = process.env.NEXT_PUBLIC_SOTH_WS_BASE?.trim();
   if (configured) {
     return normalizeWsBase(configured);
+  }
+
+  const persistedApiBase = readPersistedSettingsValue("apiBaseUrl");
+  if (persistedApiBase) {
+    if (persistedApiBase.startsWith("http://") || persistedApiBase.startsWith("https://")) {
+      const trimmed = trimTrailingSlash(persistedApiBase);
+      const withoutApiSuffix = trimmed.replace(/\/api$/i, "");
+      return normalizeWsBase(withoutApiSuffix);
+    }
+    if (persistedApiBase.startsWith("ws://") || persistedApiBase.startsWith("wss://")) {
+      return normalizeWsBase(persistedApiBase);
+    }
   }
 
   if (typeof window !== "undefined") {

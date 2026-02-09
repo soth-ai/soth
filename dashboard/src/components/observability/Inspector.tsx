@@ -77,7 +77,7 @@ function WhyThisMatters({
       icon: Timer,
       color: "text-warning",
       title: "Performance Bottleneck",
-      description: `Operation latancy (${(effectiveLatency / 1000).toFixed(1)}s) exceeds safety threshold.`,
+      description: `Operation latency (${(effectiveLatency / 1000).toFixed(1)}s) exceeds safety threshold.`,
     });
   }
 

@@ -412,7 +412,6 @@ const AgentLogRow = memo(function AgentLogRow({ log, index }: AgentLogRowProps) 
       ref={rowRef}
       tabIndex={isSelected ? 0 : -1}
       role="button"
-      aria-selected={isSelected}
       onClick={() => selectLog(log.id)}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}

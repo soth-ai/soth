@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { WrapEvent } from "@/types";
 import { buildWsUrl } from "@/lib/endpoints";
+import { useSettingsStore } from "@/store/settings";
 
 const MAX_EVENTS = 200;
 
@@ -36,6 +37,7 @@ export function useEventStream(
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastSeq, setLastSeq] = useState<number | null>(null);
+  const wsReconnectInterval = useSettingsStore((state) => state.wsReconnectInterval);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const sinceSeqRef = useRef<number | null>(sinceSeq);
@@ -182,11 +184,11 @@ export function useEventStream(
           setIsConnected(false);
           wsRef.current = null;
 
-          // Attempt to reconnect after 3 seconds
+          // Respect user-configured reconnect interval.
           reconnectTimeoutRef.current = setTimeout(() => {
             console.log("Attempting to reconnect...");
             connect();
-          }, 3000);
+          }, Math.max(250, wsReconnectInterval));
         };
       } catch (e) {
         console.error("Failed to connect:", e);
@@ -204,7 +206,7 @@ export function useEventStream(
         wsRef.current.close();
       }
     };
-  }, [enabled, maxEvents, captureEvents]);
+  }, [enabled, maxEvents, captureEvents, wsReconnectInterval]);
 
   return {
     events,

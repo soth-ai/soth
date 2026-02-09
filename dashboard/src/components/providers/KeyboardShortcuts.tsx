@@ -17,7 +17,7 @@ interface ShortcutMap {
 const navigationShortcuts: ShortcutMap = {
   o: { path: "/", label: "Overview" },
   t: { path: "/observability", label: "Observability" },
-  p: { path: "/policies", label: "Identity & Policy" },
+  p: { path: "/policies", label: "Policy" },
   b: { path: "/budget", label: "Budget" },
   s: { path: "/settings", label: "Settings" },
 };
@@ -57,7 +57,6 @@ export function KeyboardShortcuts({ children }: { children: React.ReactNode }) {
             router.push(shortcut.path);
             toast.success(`Navigated to ${shortcut.label}`, {
               duration: 1500,
-              icon: "🚀",
             });
           }
         }

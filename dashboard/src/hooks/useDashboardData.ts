@@ -13,6 +13,7 @@ import type {
   AgentsSummary,
 } from "@/types";
 import { buildApiUrl } from "@/lib/endpoints";
+import { useSettingsStore } from "@/store/settings";
 
 async function fetchJson<T>(endpoint: string): Promise<T> {
   const response = await fetch(buildApiUrl(endpoint));
@@ -23,10 +24,11 @@ async function fetchJson<T>(endpoint: string): Promise<T> {
 }
 
 export function useHealth() {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
   return useQuery({
     queryKey: ["health"],
     queryFn: () => fetchJson<HealthResponse>("/health"),
-    refetchInterval: 5000,
+    refetchInterval: Math.max(1000, refreshInterval),
   });
 }
 
@@ -59,42 +61,47 @@ export function useBudgetMetrics() {
 }
 
 export function useProxyMetrics() {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
   return useQuery({
     queryKey: ["proxy"],
     queryFn: () => fetchJson<ApiResponse<ProxyMetrics>>("/proxy"),
-    refetchInterval: 2000,
+    refetchInterval: Math.max(1000, refreshInterval),
   });
 }
 
 export function useAdvancedBudgetMetrics() {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
   return useQuery({
     queryKey: ["budget", "advanced"],
     queryFn: () => fetchJson<ApiResponse<AdvancedBudgetMetrics>>("/budget/advanced"),
-    refetchInterval: 5000,
+    refetchInterval: Math.max(1000, refreshInterval),
   });
 }
 
 export function useBudgetPrimitives() {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
   return useQuery({
     queryKey: ["budget", "primitives"],
     queryFn: () => fetchJson<ApiResponse<BudgetPrimitives>>("/budget/primitives"),
-    refetchInterval: 2000,
+    refetchInterval: Math.max(1000, refreshInterval),
   });
 }
 
 export function useAgentsData() {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
   return useQuery({
     queryKey: ["agents"],
     queryFn: () => fetchJson<ApiResponse<AgentsSummary>>("/agents"),
-    refetchInterval: 5000,
+    refetchInterval: Math.max(1000, refreshInterval),
   });
 }
 
 export function useDashboardSnapshot() {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
   return useQuery({
     queryKey: ["snapshot"],
     queryFn: () => fetchJson<ApiResponse<DashboardSnapshot>>("/snapshot"),
-    refetchInterval: 2000,
+    refetchInterval: Math.max(1000, refreshInterval),
   });
 }
 
