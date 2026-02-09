@@ -12,6 +12,7 @@ import {
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import type { WrapEvent } from "@/types";
+import { motion, AnimatePresence } from "framer-motion";
 
 interface LiveFeedPanelProps {
   events: WrapEvent[];
@@ -41,10 +42,12 @@ function EventRow({ event }: { event: WrapEvent }) {
     : event.method || "-";
 
   return (
-    <div
+    <motion.div
+      initial={{ opacity: 0, x: -10 }}
+      animate={{ opacity: 1, x: 0 }}
       className={cn(
-        "flex items-center gap-3 py-2 px-3 text-sm border-b border-border last:border-0",
-        "hover:bg-muted/50 transition-colors"
+        "flex items-center gap-4 py-2.5 px-4 text-sm border-b border-white/[0.04] last:border-0",
+        "hover:bg-white/[0.02] transition-colors group"
       )}
     >
       {/* Time */}
@@ -91,50 +94,50 @@ function EventRow({ event }: { event: WrapEvent }) {
       </div>
 
       {/* Latency */}
-      <span className="text-muted-foreground font-mono text-xs w-14 text-right shrink-0">
+      <span className="text-muted-foreground/60 font-mono text-[11px] w-14 text-right shrink-0 tabular-nums">
         {event.latency_ms ? `${event.latency_ms}ms` : "-"}
       </span>
-    </div>
+    </motion.div>
   );
 }
 
 export function LiveFeedPanel({ events, isConnected, onClear }: LiveFeedPanelProps) {
   return (
-    <Card className="col-span-2 animate-fade-in">
-      <CardHeader className="flex flex-row items-center justify-between space-y-0">
-        <CardTitle>
+    <Card className="col-span-2 glass-panel border-white/[0.04] overflow-hidden">
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 px-6 py-4">
+        <CardTitle className="text-[14px] font-bold tracking-tight">
           <Waveform className="h-4 w-4 text-accent" weight="duotone" />
           Live Feed
           <span
             className={cn(
-              "ml-2 h-2 w-2 rounded-full",
-              isConnected ? "bg-success animate-pulse" : "bg-destructive"
+              "ml-2.5 h-1.5 w-1.5 rounded-full inline-block mb-0.5",
+              isConnected ? "bg-success shadow-[0_0_8px_rgba(16,185,129,0.5)] animate-pulse" : "bg-destructive"
             )}
           />
         </CardTitle>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground">
-            {events.length} events
+        <div className="flex items-center gap-3">
+          <span className="text-[11px] font-bold text-muted-foreground/50 uppercase tracking-widest bg-muted/30 px-2 py-0.5 rounded">
+            {events.length} EVENTS
           </span>
           <button
             onClick={onClear}
-            className="p-1 hover:bg-muted rounded transition-colors"
+            className="p-1.5 hover:bg-white/[0.05] rounded-full transition-all text-muted-foreground/40 hover:text-muted-foreground"
             title="Clear events"
           >
-            <Trash className="h-4 w-4 text-muted-foreground" />
+            <Trash className="h-4 w-4" />
           </button>
         </div>
       </CardHeader>
       <CardContent className="p-0">
         {/* Header */}
-        <div className="flex items-center gap-3 py-2 px-3 text-xs font-medium text-muted-foreground border-b border-border bg-muted/30">
+        <div className="flex items-center gap-4 py-2 px-4 text-[10px] font-bold tracking-widest text-muted-foreground/40 uppercase border-y border-white/[0.04] bg-white/[0.01]">
           <span className="w-16 shrink-0">TIME</span>
-          <span className="w-5 shrink-0">DIR</span>
+          <span className="w-5 shrink-0 text-center">DIR</span>
           <span className="w-28 shrink-0">AGENT</span>
-          <span className="flex-1">METHOD</span>
+          <span className="flex-1">TRANSACTION / TOOL</span>
           <span className="w-6 shrink-0 text-center">OK</span>
           <span className="w-6 shrink-0 text-center">PII</span>
-          <span className="w-14 shrink-0 text-right">LATENCY</span>
+          <span className="w-14 shrink-0 text-right">MS</span>
         </div>
 
         {/* Events list */}
