@@ -17,6 +17,7 @@ use soth_core::{
     generate_session_name, EventLogger, MessageDirection, SessionRecorder, SessionStorage,
 };
 use soth_proxy::pipeline::middleware::RequestContext as PipelineRequestContext;
+use soth_proxy::transport::pii_enrichment::PiiEventEnricher;
 use soth_proxy::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,6 +73,7 @@ struct WrapSession {
     request_contexts: RwLock<std::collections::HashMap<String, WrapRequestContext>>,
     enforcement: Option<Arc<WrapEnforcement>>,
     fail_open: bool,
+    pii_enricher: PiiEventEnricher,
     /// Session recorder for full message capture (optional)
     recorder: Option<Arc<SessionRecorder>>,
 }
@@ -133,6 +135,7 @@ impl WrapSession {
         event_logger: Option<EventLogger>,
         enforcement: Option<Arc<WrapEnforcement>>,
         fail_open: bool,
+        pii_enricher: PiiEventEnricher,
         record: bool,
         session_name: Option<String>,
     ) -> Result<Self> {
@@ -159,6 +162,7 @@ impl WrapSession {
             event_logger,
             enforcement,
             fail_open,
+            pii_enricher,
             request_contexts: RwLock::new(std::collections::HashMap::new()),
             recorder,
         })
@@ -166,7 +170,9 @@ impl WrapSession {
 
     async fn log_event(&self, event: &WrapEvent) {
         if let Some(ref logger) = self.event_logger {
-            logger.log(event);
+            let mut event = event.clone();
+            self.pii_enricher.enrich(&mut event);
+            logger.log(&event);
         }
     }
 
@@ -386,6 +392,7 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     };
 
     let config = load_wrap_config(config.as_ref())?;
+    let pii_enricher = PiiEventEnricher::from_observe_config(&config.observe);
     let enforcement = enforcement::build_wrap_enforcement_runtime(&config)?
         .map(|runtime| Arc::new(WrapEnforcement { runtime }));
     if enforcement.is_some() {
@@ -410,6 +417,7 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         event_logger,
         enforcement,
         fail_open,
+        pii_enricher,
         record,
         session_name,
     )?);

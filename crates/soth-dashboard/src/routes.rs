@@ -46,6 +46,16 @@ impl<T> ApiResponse<T> {
     }
 }
 
+fn observe_metrics_for_state(state: &AppState) -> ObserveMetrics {
+    if let Some(ref events) = state.events {
+        let from_events = events.observe_metrics();
+        if from_events.requests > 0 || from_events.responses > 0 || from_events.pii_detections > 0 {
+            return from_events;
+        }
+    }
+    state.dashboard.observe()
+}
+
 /// Combined application state
 #[derive(Clone)]
 pub struct AppState {
@@ -145,7 +155,7 @@ async fn get_snapshot(State(state): State<AppState>) -> Json<ApiResponse<Dashboa
         DashboardSnapshot {
             identity: state.dashboard.identity(),
             policy: state.dashboard.policy(),
-            observe: state.dashboard.observe(),
+            observe: observe_metrics_for_state(&state),
             budget: state.dashboard.budget(),
             proxy: state.dashboard.proxy(),
         },
@@ -210,7 +220,7 @@ async fn get_policy(State(state): State<AppState>) -> Json<ApiResponse<PolicyMet
 async fn get_observe(State(state): State<AppState>) -> Json<ApiResponse<ObserveMetrics>> {
     Json(ApiResponse::new(
         &state.dashboard,
-        state.dashboard.observe(),
+        observe_metrics_for_state(&state),
     ))
 }
 

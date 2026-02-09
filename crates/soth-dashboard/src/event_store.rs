@@ -3,6 +3,7 @@
 //! Uses SQLite wrap-event storage.
 //! Provides real-time event streaming via broadcast channel.
 
+use crate::state::ObserveMetrics;
 use parking_lot::RwLock;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -230,6 +231,31 @@ impl EventStore {
             total_events: inner.events.len(),
             events,
         }
+    }
+
+    /// Derive observe metrics from in-memory event stream state.
+    ///
+    /// This keeps Overview/Observe panels aligned with what is currently visible
+    /// in observability without depending on legacy dashboard state counters.
+    pub fn observe_metrics(&self) -> ObserveMetrics {
+        let inner = self.inner.read();
+        let mut metrics = ObserveMetrics::default();
+
+        for event in inner.events.iter() {
+            match event.direction {
+                WrapDirection::In => metrics.requests += 1,
+                WrapDirection::Out => metrics.responses += 1,
+            }
+
+            if event.pii_detected {
+                metrics.pii_detections += 1;
+                for pii_type in &event.pii_types {
+                    *metrics.pii_by_type.entry(pii_type.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        metrics
     }
 
     /// Get events strictly newer than a sqlite sequence cursor.

@@ -152,6 +152,12 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             }
         );
         println!(
+            "  PII scopes:  ai={} mcp={} agent={}",
+            config.observe.pii_scopes.ai_inference,
+            config.observe.pii_scopes.mcp,
+            config.observe.pii_scopes.agent_apps
+        );
+        println!(
             "  Budget:      {}",
             if config.budget.enabled {
                 "enabled"
@@ -264,6 +270,15 @@ fn validate_observe(config: &SothConfig, warnings: &mut Vec<String>, errors: &mu
 
     if config.observe.enabled && !config.observe.pii_detection {
         warnings.push("PII detection is disabled, sensitive data may be logged".to_string());
+    }
+
+    if config.observe.enabled
+        && config.observe.pii_detection
+        && !config.observe.pii_scopes.ai_inference
+        && !config.observe.pii_scopes.mcp
+        && !config.observe.pii_scopes.agent_apps
+    {
+        warnings.push("PII detection is enabled but all PII scopes are disabled".to_string());
     }
 
     if config.observe.buffer_size == 0 {

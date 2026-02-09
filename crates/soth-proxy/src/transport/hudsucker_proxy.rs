@@ -37,6 +37,7 @@ use crate::error::ProxyError;
 use crate::providers::ProviderRegistry;
 use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
+use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::response_event_builder::{
     build_paired_response_event, empty_response_placeholder, normalize_response_content,
     ResponseEventInput, ResponseKind,
@@ -45,7 +46,9 @@ use crate::transport::usage_enrichment::{
     build_http_request_for_provider, extract_usage_meta_from_decoded_payload,
     resolve_provider_parser, ResponseUsageMeta,
 };
-use soth_core::config::{ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode};
+use soth_core::config::{
+    ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode, ObserveConfig,
+};
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
 };
@@ -1010,10 +1013,12 @@ pub struct AiProxyHandler {
     provider_registry: Arc<ProviderRegistry>,
     /// LiteLLM-style pricing catalog
     pricing_catalog: Arc<PricingCatalog>,
+    /// Optional PII enrichment before events are written.
+    pii_enricher: Arc<PiiEventEnricher>,
 }
 
 impl AiProxyHandler {
-    pub fn new(config: &ForwardProxyConfig) -> Self {
+    pub fn new(config: &ForwardProxyConfig, observe: &ObserveConfig) -> Self {
         Self {
             hosts: Arc::new(config.hosts.clone()),
             #[cfg(feature = "dashboard")]
@@ -1024,6 +1029,7 @@ impl AiProxyHandler {
             enforcer: None,
             provider_registry: Arc::new(ProviderRegistry::new()),
             pricing_catalog: Arc::new(PricingCatalog::with_defaults()),
+            pii_enricher: Arc::new(PiiEventEnricher::from_observe_config(observe)),
         }
     }
 
@@ -1349,6 +1355,7 @@ impl HttpHandler for AiProxyHandler {
                 || (host_mode == HostFilterMode::Discovery && is_json));
         let provider_registry = self.provider_registry.clone();
         let event_logger = self.event_logger.clone();
+        let pii_enricher = self.pii_enricher.clone();
 
         debug!(
             is_post = is_post,
@@ -1659,6 +1666,7 @@ impl HttpHandler for AiProxyHandler {
                         event = event.with_content(request_body.clone());
                     }
                     event = event.with_content_preview(format!("→ {} {}", http_method, path));
+                    pii_enricher.enrich(&mut event);
                     logger.log(&event);
                 }
 
@@ -1717,6 +1725,7 @@ impl HttpHandler for AiProxyHandler {
         let status = res.status().as_u16();
         let pending_requests = self.pending_requests.clone();
         let event_logger = self.event_logger.clone();
+        let pii_enricher = self.pii_enricher.clone();
         let session_id = self.session_id.clone();
         let request_id = request_id_from_ctx(ctx);
         let provider_registry = self.provider_registry.clone();
@@ -1817,6 +1826,7 @@ impl HttpHandler for AiProxyHandler {
                     if let Some(ref version) = pending.policy_version {
                         event = event.with_policy_version(version.clone());
                     }
+                    pii_enricher.enrich(&mut event);
                     logger.log(&event);
                 }
 
@@ -1861,6 +1871,7 @@ impl HttpHandler for AiProxyHandler {
                     if let Some(ref version) = pending.policy_version {
                         event = event.with_policy_version(version.clone());
                     }
+                    pii_enricher.enrich(&mut event);
                     logger.log(&event);
                 }
             }
@@ -1919,6 +1930,7 @@ impl HttpHandler for AiProxyHandler {
                 let log_provider_registry = provider_registry.clone();
                 let log_pricing_catalog = pricing_catalog.clone();
                 let log_budget_tracker = budget_tracker.clone();
+                let log_pii_enricher = pii_enricher.clone();
                 #[cfg(feature = "dashboard")]
                 let log_dashboard = dashboard.clone();
 
@@ -2057,6 +2069,7 @@ impl HttpHandler for AiProxyHandler {
                             event = event.with_policy_version(version.clone());
                         }
 
+                        log_pii_enricher.enrich(&mut event);
                         logger.log(&event);
                         debug!("Logged paired streamed request/response");
                     }
@@ -2142,6 +2155,7 @@ impl HttpHandler for AiProxyHandler {
                     if let Some(ref version) = pending.policy_version {
                         event = event.with_policy_version(version.clone());
                     }
+                    pii_enricher.enrich(&mut event);
                     logger.log(&event);
                 }
             }
@@ -2188,6 +2202,8 @@ pub struct AiWebSocketHandler {
     session_id: String,
     /// Host filter config for source classification.
     hosts: Arc<HostFilterConfig>,
+    /// Optional PII enrichment before events are written.
+    pii_enricher: Arc<PiiEventEnricher>,
 }
 
 impl AiWebSocketHandler {
@@ -2195,11 +2211,13 @@ impl AiWebSocketHandler {
         session_id: String,
         event_logger: Option<Arc<EventLogger>>,
         hosts: Arc<HostFilterConfig>,
+        pii_enricher: Arc<PiiEventEnricher>,
     ) -> Self {
         Self {
             event_logger,
             session_id,
             hosts,
+            pii_enricher,
         }
     }
 }
@@ -2217,6 +2235,7 @@ impl WebSocketHandler for AiWebSocketHandler {
         let event_logger = self.event_logger.clone();
         let session_id = self.session_id.clone();
         let hosts = self.hosts.clone();
+        let pii_enricher = self.pii_enricher.clone();
 
         // Extract host/path and direction from context
         let (host, ws_path, direction) = match ctx {
@@ -2344,6 +2363,7 @@ impl WebSocketHandler for AiWebSocketHandler {
                                 );
                                 event = event.with_traffic_envelope(envelope);
                             }
+                            pii_enricher.enrich(&mut event);
                             logger.log(&event);
                         }
                     } else {
@@ -2391,6 +2411,7 @@ pub async fn start_proxy(
         dashboard,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2404,6 +2425,7 @@ pub async fn start_proxy_with_shutdown<F>(
     #[cfg(feature = "dashboard")] dashboard: Option<DashboardState>,
     event_logger: Option<EventLogger>,
     enforcer: Option<ProxyEnforcer>,
+    observe_config: Option<ObserveConfig>,
 ) -> Result<(), ProxyError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -2436,10 +2458,12 @@ where
     // Convert event_logger to Arc for sharing
     let event_logger_arc = event_logger.map(Arc::new);
     let ws_hosts = Arc::new(config.hosts.clone());
+    let observe_config = observe_config.unwrap_or_default();
+    let pii_enricher = Arc::new(PiiEventEnricher::from_observe_config(&observe_config));
 
     #[cfg(feature = "dashboard")]
     let handler = {
-        let mut h = AiProxyHandler::new(&config);
+        let mut h = AiProxyHandler::new(&config, &observe_config);
         if let Some(d) = dashboard {
             h = h.with_dashboard(d);
         }
@@ -2454,7 +2478,7 @@ where
 
     #[cfg(not(feature = "dashboard"))]
     let handler = {
-        let mut h = AiProxyHandler::new(&config);
+        let mut h = AiProxyHandler::new(&config, &observe_config);
         if let Some(ref logger) = event_logger_arc {
             h = h.with_event_logger_arc(logger.clone());
         }
@@ -2465,7 +2489,7 @@ where
     };
 
     // Create WebSocket handler with event logger
-    let ws_handler = AiWebSocketHandler::new(session_id, event_logger_arc, ws_hosts);
+    let ws_handler = AiWebSocketHandler::new(session_id, event_logger_arc, ws_hosts, pii_enricher);
 
     info!("Starting soth proxy on {}", listen_addr);
     info!("  AI+MCP domains -> MITM intercept");

@@ -164,6 +164,15 @@ fn apply_env_overrides(config: &mut SothConfig) {
     if let Ok(pii) = std::env::var("SOTH_OBSERVE_PII_DETECTION") {
         config.observe.pii_detection = pii.parse().unwrap_or(true);
     }
+    if let Ok(value) = std::env::var("SOTH_OBSERVE_PII_AI_INFERENCE") {
+        config.observe.pii_scopes.ai_inference = value.parse().unwrap_or(true);
+    }
+    if let Ok(value) = std::env::var("SOTH_OBSERVE_PII_MCP") {
+        config.observe.pii_scopes.mcp = value.parse().unwrap_or(true);
+    }
+    if let Ok(value) = std::env::var("SOTH_OBSERVE_PII_AGENT_APPS") {
+        config.observe.pii_scopes.agent_apps = value.parse().unwrap_or(true);
+    }
 
     // Budget overrides
     if let Ok(enabled) = std::env::var("SOTH_BUDGET_ENABLED") {

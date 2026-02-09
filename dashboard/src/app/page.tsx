@@ -41,6 +41,10 @@ interface PriorityEvent {
   href: string;
 }
 
+function formatPiiLabel(value: string): string {
+  return value.replace(/_/g, " ");
+}
+
 function percentile(values: number[], p: number): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -317,6 +321,15 @@ export default function OverviewPage() {
     utilization,
   ]);
 
+  const piiDetections = observe?.pii_detections ?? 0;
+  const piiByType = useMemo(
+    () =>
+      Object.entries(observe?.pii_by_type ?? {}).sort(([, a], [, b]) => b - a),
+    [observe?.pii_by_type]
+  );
+  const topPiiTypes = piiByType.slice(0, 5);
+  const piiAlertsHref = "/observability?preset=builtin-pii-alerts";
+
   const changeSummary = useMemo(() => {
     const changes: string[] = [];
 
@@ -388,6 +401,17 @@ export default function OverviewPage() {
       });
     }
 
+    if (piiDetections > 0) {
+      const topType = topPiiTypes[0];
+      const typeHint = topType ? `Top type: ${formatPiiLabel(topType[0])}.` : "";
+      items.push({
+        severity: "warning",
+        title: "PII detections observed",
+        description: `${formatNumber(piiDetections)} detections in current telemetry. ${typeHint}`.trim(),
+        href: piiAlertsHref,
+      });
+    }
+
     if (newModelFromAnomaly || latestModelObserved) {
       items.push({
         severity: "info",
@@ -419,6 +443,9 @@ export default function OverviewPage() {
   }, [
     costSpikeAnomaly,
     spendDeltaPct,
+    piiDetections,
+    topPiiTypes,
+    piiAlertsHref,
     proxy,
     trafficPresentInRange,
     utilization,
@@ -654,6 +681,42 @@ export default function OverviewPage() {
                     </div>
                   )}
                 </OverviewSummaryCard>
+
+                <OverviewSummaryCard title="PII Detection Queue" icon={Warning} delay={0.3}>
+                  <div className="space-y-2 pt-1">
+                    <div className="flex items-center justify-between">
+                      <span>Total detections</span>
+                      <span className={cn("font-medium", piiDetections > 0 ? "text-warning" : "text-success")}>
+                        {formatNumber(piiDetections)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span>Detected types</span>
+                      <span className="text-foreground font-medium">{formatNumber(piiByType.length)}</span>
+                    </div>
+                  </div>
+
+                  {topPiiTypes.length > 0 ? (
+                    <div className="mt-3 pt-3 border-t border-border/50 space-y-1.5">
+                      {topPiiTypes.slice(0, 4).map(([type, count]) => (
+                        <div key={type} className="flex items-center justify-between text-[11px]">
+                          <span className="text-foreground/80 capitalize">{formatPiiLabel(type)}</span>
+                          <span className="text-warning font-medium tabular-nums">{formatNumber(count)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="mt-3 pt-3 border-t border-border/50">
+                      <p className="text-xs text-muted-foreground">No PII detections in the selected range.</p>
+                    </div>
+                  )}
+
+                  <div className="mt-3 pt-3 border-t border-border/50">
+                    <Button asChild variant="outline" size="sm" className="h-7 rounded-full px-3 text-[11px]">
+                      <a href={piiAlertsHref}>Open PII Alerts</a>
+                    </Button>
+                  </div>
+                </OverviewSummaryCard>
               </div>
             </div>
 
@@ -808,6 +871,32 @@ export default function OverviewPage() {
                       <p className="opacity-90">{event.description}</p>
                     </a>
                   ))}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm font-semibold tracking-[0.02em]">
+                    <Warning className="h-3.5 w-3.5 text-warning" weight="duotone" />
+                    PII Detections
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-1.5 text-[11px]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted-foreground">Total</span>
+                    <span className={cn("font-semibold", piiDetections > 0 ? "text-warning" : "text-success")}>
+                      {formatNumber(piiDetections)}
+                    </span>
+                  </div>
+                  {topPiiTypes.slice(0, 3).map(([type, count]) => (
+                    <div key={type} className="flex items-center justify-between">
+                      <span className="text-muted-foreground capitalize">{formatPiiLabel(type)}</span>
+                      <span className="font-semibold tabular-nums text-warning">{formatNumber(count)}</span>
+                    </div>
+                  ))}
+                  <Button asChild variant="outline" size="sm" className="h-7 text-[11px] mt-1">
+                    <a href={piiAlertsHref}>Open PII Alerts</a>
+                  </Button>
                 </CardContent>
               </Card>
 

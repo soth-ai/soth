@@ -568,6 +568,7 @@ fn spawn_proxy_runtime(
     event_logger: Option<EventLogger>,
 ) -> anyhow::Result<ProxyRuntime> {
     let enforcer = enforcement::build_proxy_enforcer(config)?;
+    let observe_config = config.observe.clone();
     let _policy_reload_task = enforcer
         .policy_engine()
         .and_then(|engine| enforcement::spawn_policy_hot_reload(config, engine));
@@ -606,6 +607,7 @@ fn spawn_proxy_runtime(
             Some(dashboard_state),
             event_logger,
             Some(enforcer),
+            Some(observe_config),
         )
         .await
         .map_err(|error| anyhow::anyhow!("Proxy error: {}", error))
