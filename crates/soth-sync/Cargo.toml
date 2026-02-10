@@ -1,0 +1,17 @@
+[package]
+name = "soth-sync"
+description = "Edge-side cloud sync plumbing for SOTH"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soth-core = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true, features = ["json", "multipart"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }

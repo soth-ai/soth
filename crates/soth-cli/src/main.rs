@@ -6,6 +6,7 @@
 //!   soth uninstall               - Remove wrap configuration
 //!   soth setup wizard            - Guided setup for proxy/wrap/shell
 //!   soth init                    - Initialize config and keys
+//!   soth login                   - Store cloud API credentials locally
 //!   soth tui                     - Interactive TUI dashboard
 //!   soth attach                  - Attach TUI to a running proxy
 //!   soth identity generate       - Generate a new keypair
@@ -75,6 +76,9 @@ enum Commands {
         #[command(subcommand)]
         action: commands::setup::SetupCommands,
     },
+
+    /// Store cloud API credentials locally
+    Login(commands::login::LoginArgs),
 
     /// Initialize configuration and keys
     Init {
@@ -356,6 +360,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Setup { action } => {
             commands::setup::run(action, cli.config.clone()).await?;
+        }
+        Commands::Login(args) => {
+            commands::login::run(args, cli.config.clone()).await?;
         }
         Commands::Init { output } => {
             commands::init::run(output).await?;

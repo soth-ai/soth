@@ -6,7 +6,7 @@
 //! to emit events that appear in the observability dashboard.
 
 use crate::types::WrapEvent;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -15,11 +15,16 @@ use std::time::Duration;
 use tracing::warn;
 
 pub const EVENT_LOG_SQLITE_FILE: &str = "events.db";
+pub const SYNC_KEY_LAST_SYNCED_SEQ: &str = "last_synced_seq";
+pub const SYNC_KEY_LAST_BODY_SYNCED_SEQ: &str = "last_body_synced_seq";
+pub const SYNC_KEY_LAST_SYNC_TIMESTAMP: &str = "last_sync_timestamp";
+pub const SYNC_KEY_SYNC_ERRORS: &str = "sync_errors";
 
 const SQLITE_QUEUE_CAPACITY: usize = 4096;
 const SQLITE_BATCH_SIZE: usize = 64;
 const SQLITE_FLUSH_INTERVAL_MS: u64 = 20;
 const INLINE_PAYLOAD_MAX_BYTES: usize = 16 * 1024;
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
 
 enum EventLoggerStorage {
     SqliteAsync {
@@ -37,6 +42,15 @@ enum LoggerCommand {
 struct PayloadBlob {
     kind: &'static str,
     bytes: Vec<u8>,
+}
+
+/// Persistent sync cursors and status state for cloud synchronization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncCursorState {
+    pub last_synced_seq: Option<i64>,
+    pub last_body_synced_seq: Option<i64>,
+    pub last_sync_timestamp: Option<String>,
+    pub sync_errors: Option<String>,
 }
 
 /// Event logger that writes `WrapEvent`s to SQLite.
@@ -103,6 +117,49 @@ impl EventLogger {
     /// Get the path this logger writes to.
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    /// Read a sync-state value from SQLite.
+    pub fn get_sync_state(&self, key: &str) -> std::io::Result<Option<String>> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.query_row(
+            "SELECT value FROM sync_state WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_io_err)
+    }
+
+    /// Upsert a sync-state value in SQLite.
+    pub fn set_sync_state(&self, key: &str, value: &str) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.execute(
+            r#"
+            INSERT INTO sync_state (key, value, updated_at)
+            VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            "#,
+            params![key, value],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// Read the current sync cursor snapshot.
+    pub fn get_sync_cursor_state(&self) -> std::io::Result<SyncCursorState> {
+        let mut state = SyncCursorState::default();
+        state.last_synced_seq = self
+            .get_sync_state(SYNC_KEY_LAST_SYNCED_SEQ)?
+            .and_then(|value| value.parse::<i64>().ok());
+        state.last_body_synced_seq = self
+            .get_sync_state(SYNC_KEY_LAST_BODY_SYNCED_SEQ)?
+            .and_then(|value| value.parse::<i64>().ok());
+        state.last_sync_timestamp = self.get_sync_state(SYNC_KEY_LAST_SYNC_TIMESTAMP)?;
+        state.sync_errors = self.get_sync_state(SYNC_KEY_SYNC_ERRORS)?;
+        Ok(state)
     }
 
     /// Log an event.
@@ -184,6 +241,14 @@ impl EventLogger {
             }
         }
     }
+
+    fn open_sqlite_metadata_conn(&self) -> std::io::Result<Connection> {
+        let conn = Connection::open(&self.path).map_err(to_io_err)?;
+        conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+            .map_err(to_io_err)?;
+        init_sqlite_schema(&conn)?;
+        Ok(conn)
+    }
 }
 
 impl std::fmt::Debug for EventLogger {
@@ -249,6 +314,12 @@ fn init_sqlite_schema(conn: &Connection) -> std::io::Result<()> {
             ON wrap_events(timestamp);
         CREATE INDEX IF NOT EXISTS idx_wrap_event_payloads_event_id
             ON wrap_event_payloads(event_id);
+
+        CREATE TABLE IF NOT EXISTS sync_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         "#,
     )
     .map_err(to_io_err)?;
@@ -712,5 +783,49 @@ mod tests {
                 .is_none(),
             "request_body should be stripped before persistence"
         );
+    }
+
+    #[test]
+    fn test_sync_state_table_exists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let _logger = EventLogger::new(path.clone()).unwrap();
+        let conn = Connection::open(path).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn test_sync_cursor_state_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path).unwrap();
+
+        logger
+            .set_sync_state(SYNC_KEY_LAST_SYNCED_SEQ, "123")
+            .unwrap();
+        logger
+            .set_sync_state(SYNC_KEY_LAST_BODY_SYNCED_SEQ, "77")
+            .unwrap();
+        logger
+            .set_sync_state(SYNC_KEY_LAST_SYNC_TIMESTAMP, "2026-02-01T00:00:00Z")
+            .unwrap();
+        logger.set_sync_state(SYNC_KEY_SYNC_ERRORS, "none").unwrap();
+
+        let snapshot = logger.get_sync_cursor_state().unwrap();
+        assert_eq!(snapshot.last_synced_seq, Some(123));
+        assert_eq!(snapshot.last_body_synced_seq, Some(77));
+        assert_eq!(
+            snapshot.last_sync_timestamp.as_deref(),
+            Some("2026-02-01T00:00:00Z")
+        );
+        assert_eq!(snapshot.sync_errors.as_deref(), Some("none"));
     }
 }

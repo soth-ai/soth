@@ -42,6 +42,10 @@ pub struct SothConfig {
     #[serde(default)]
     pub budget: BudgetConfig,
 
+    /// Cloud sync configuration (optional)
+    #[serde(default)]
+    pub cloud: CloudConfig,
+
     /// Dashboard settings
     #[serde(default)]
     pub dashboard: DashboardConfig,
@@ -74,6 +78,7 @@ impl Default for SothConfig {
             policy: PolicyConfig::default(),
             observe: ObserveConfig::default(),
             budget: BudgetConfig::default(),
+            cloud: CloudConfig::default(),
             dashboard: DashboardConfig::default(),
             forward_proxy: ForwardProxyConfig::default(),
             production: ProductionConfig::default(),
@@ -704,6 +709,72 @@ impl Default for BudgetConfig {
             limits: Vec::new(),
             alerts: Vec::new(),
             db_path: default_budget_db_path(),
+        }
+    }
+}
+
+/// Cloud sync configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudConfig {
+    /// Whether cloud sync hooks are enabled
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// API key for cloud authentication
+    pub api_key: Option<String>,
+
+    /// Cloud API endpoint
+    #[serde(default = "default_cloud_endpoint")]
+    pub endpoint: String,
+
+    /// User-defined cloud tags for attribution
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+
+    /// Metadata sync interval
+    #[serde(default = "default_cloud_sync_interval_secs")]
+    pub sync_interval_secs: u64,
+
+    /// Config pull interval
+    #[serde(default = "default_cloud_config_pull_interval_secs")]
+    pub config_pull_interval_secs: u64,
+
+    /// Whether response/request body uploads are enabled
+    #[serde(default)]
+    pub body_upload_enabled: bool,
+
+    /// Local path for cached cloud config snapshot
+    #[serde(default = "default_cloud_cache_path")]
+    pub cache_path: Option<PathBuf>,
+}
+
+fn default_cloud_endpoint() -> String {
+    "https://api.soth.ai".to_string()
+}
+
+fn default_cloud_sync_interval_secs() -> u64 {
+    60
+}
+
+fn default_cloud_config_pull_interval_secs() -> u64 {
+    300
+}
+
+fn default_cloud_cache_path() -> Option<PathBuf> {
+    Some(PathBuf::from("~/.soth/cloud_config_cache.json"))
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            endpoint: default_cloud_endpoint(),
+            tags: BTreeMap::new(),
+            sync_interval_secs: default_cloud_sync_interval_secs(),
+            config_pull_interval_secs: default_cloud_config_pull_interval_secs(),
+            body_upload_enabled: false,
+            cache_path: default_cloud_cache_path(),
         }
     }
 }
@@ -1961,6 +2032,8 @@ mod tests {
         assert_eq!(config.version, "1.0");
         assert_eq!(config.server.transport, "stdio");
         assert_eq!(config.server.listen.port, 3000);
+        assert!(!config.cloud.enabled);
+        assert_eq!(config.cloud.endpoint, "https://api.soth.ai");
     }
 
     #[test]
@@ -1989,6 +2062,30 @@ upstream:
         assert_eq!(config.server.listen.port, 8080);
         assert_eq!(config.server.transport, "sse");
         assert_eq!(config.upstream.command, Some("npx".to_string()));
+    }
+
+    #[test]
+    fn test_parse_cloud_config_yaml() {
+        let yaml = r#"
+cloud:
+  enabled: true
+  api_key: "soth_live_abc123"
+  endpoint: "https://staging.soth.ai"
+  sync_interval_secs: 30
+  config_pull_interval_secs: 120
+  body_upload_enabled: true
+  tags:
+    project: "edge"
+    env: "staging"
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.cloud.enabled);
+        assert_eq!(config.cloud.api_key.as_deref(), Some("soth_live_abc123"));
+        assert_eq!(config.cloud.endpoint, "https://staging.soth.ai");
+        assert_eq!(config.cloud.sync_interval_secs, 30);
+        assert_eq!(config.cloud.config_pull_interval_secs, 120);
+        assert!(config.cloud.body_upload_enabled);
+        assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
     }
 
     #[test]

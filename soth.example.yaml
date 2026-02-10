@@ -89,6 +89,19 @@ budget:
     - threshold_percent: 100
       action: "block"     # Block requests
 
+# Cloud sync configuration (optional)
+# Used for edge -> cloud metadata sync and cloud-managed policy/budget controls.
+cloud:
+  enabled: false
+  api_key: null
+  endpoint: "https://api.soth.ai"
+  sync_interval_secs: 60
+  config_pull_interval_secs: 300
+  body_upload_enabled: false
+  cache_path: "~/.soth/cloud_config_cache.json"
+  tags:
+    environment: "development"
+
 # Dashboard configuration
 # Real-time metrics dashboard with 4 panels
 dashboard:

@@ -10,6 +10,7 @@ members = [
     "crates/soth-dashboard",
     "crates/soth-tls",
     "crates/soth-cli",
+    "crates/soth-sync",
     "crates/soth-test-utils",
 ]
 exclude = [
@@ -34,6 +35,7 @@ soth-budget = { path = "crates/soth-budget" }
 soth-proxy = { path = "crates/soth-proxy" }
 soth-dashboard = { path = "crates/soth-dashboard" }
 soth-tls = { path = "crates/soth-tls" }
+soth-sync = { path = "crates/soth-sync" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

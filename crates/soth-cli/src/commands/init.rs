@@ -82,6 +82,17 @@ budget:
       action: "warn"
     - threshold_percent: 100
       action: "block"
+
+# Cloud sync configuration (optional)
+cloud:
+  enabled: false
+  api_key: null
+  endpoint: "https://api.soth.ai"
+  sync_interval_secs: 60
+  config_pull_interval_secs: 300
+  body_upload_enabled: false
+  cache_path: "~/.soth/cloud_config_cache.json"
+  tags: {}
 "#;
 
 const DEFAULT_POLICY: &str = r#"# Default SOTH Policy
