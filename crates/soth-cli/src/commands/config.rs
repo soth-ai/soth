@@ -157,6 +157,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             config.observe.pii_scopes.mcp,
             config.observe.pii_scopes.agent_apps
         );
+        println!("  Event tags:  {}", config.observe.event_tags.len());
         println!(
             "  Budget:      {}",
             if config.budget.enabled {

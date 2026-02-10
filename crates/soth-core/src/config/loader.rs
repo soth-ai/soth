@@ -5,6 +5,7 @@
 use crate::config::types::SothConfig;
 use crate::error::{Result, SothError};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Load configuration from a YAML file
@@ -183,6 +184,9 @@ fn apply_env_overrides(config: &mut SothConfig) {
     if let Ok(value) = std::env::var("SOTH_OBSERVE_PII_AGENT_APPS") {
         config.observe.pii_scopes.agent_apps = value.parse().unwrap_or(true);
     }
+    if let Ok(value) = std::env::var("SOTH_OBSERVE_EVENT_TAGS") {
+        config.observe.event_tags = parse_key_value_tags(&value);
+    }
 
     // Budget overrides
     if let Ok(enabled) = std::env::var("SOTH_BUDGET_ENABLED") {
@@ -196,6 +200,26 @@ fn apply_env_overrides(config: &mut SothConfig) {
     if let Ok(format) = std::env::var("SOTH_LOG_FORMAT") {
         config.logging.format = format;
     }
+}
+
+fn parse_key_value_tags(input: &str) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    for part in input.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        tags.insert(key.to_string(), value.to_string());
+    }
+    tags
 }
 
 /// Expand tilde and environment variables in paths
@@ -416,5 +440,29 @@ forward_proxy:
             domains,
             vec!["api.openai.com".to_string(), "chatgpt.com".to_string()]
         );
+    }
+
+    #[test]
+    fn test_parse_key_value_tags() {
+        let tags = parse_key_value_tags("project=soth, env = dev,invalid,foo=bar");
+        assert_eq!(tags.get("project"), Some(&"soth".to_string()));
+        assert_eq!(tags.get("env"), Some(&"dev".to_string()));
+        assert_eq!(tags.get("foo"), Some(&"bar".to_string()));
+        assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn test_observe_event_tags_env_override() {
+        std::env::set_var("SOTH_OBSERVE_EVENT_TAGS", "project=soth,env=staging");
+        let config = load_config_from_str("version: \"1.0\"").unwrap();
+        assert_eq!(
+            config.observe.event_tags.get("project"),
+            Some(&"soth".to_string())
+        );
+        assert_eq!(
+            config.observe.event_tags.get("env"),
+            Some(&"staging".to_string())
+        );
+        std::env::remove_var("SOTH_OBSERVE_EVENT_TAGS");
     }
 }

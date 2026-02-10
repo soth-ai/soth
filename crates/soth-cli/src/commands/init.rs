@@ -48,6 +48,9 @@ observe:
     ai_inference: true
     mcp: true
     agent_apps: true
+  event_tags:
+    project: "local-dev"
+    environment: "development"
   log_requests: true
   log_responses: true
   tamper_proof: true

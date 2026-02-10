@@ -239,6 +239,13 @@ export interface WrapEvent {
   token_count?: number;
   input_tokens?: number;
   output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+  reasoning_tokens?: number;
+  request_size_bytes?: number;
+  response_size_bytes?: number;
+  headers?: Record<string, string>;
+  tags?: Record<string, string>;
   cost_usd?: number;
   latency_ms?: number;
 }

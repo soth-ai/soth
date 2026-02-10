@@ -3,6 +3,7 @@
 //! Defines the complete configuration structure for the SOTH edge proxy.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -451,6 +452,10 @@ pub struct ObserveConfig {
     #[serde(default)]
     pub pii_scopes: ObservePiiScopes,
 
+    /// User-defined tags attached to all emitted observability events.
+    #[serde(default)]
+    pub event_tags: BTreeMap<String, String>,
+
     /// Log requests
     #[serde(default = "default_true")]
     pub log_requests: bool,
@@ -490,6 +495,7 @@ impl Default for ObserveConfig {
             enabled: true,
             pii_detection: true,
             pii_scopes: ObservePiiScopes::default(),
+            event_tags: BTreeMap::new(),
             log_requests: true,
             log_responses: true,
             tamper_proof: false,
