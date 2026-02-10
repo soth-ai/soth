@@ -9,6 +9,10 @@ pub struct RetryQueueEntry {
     pub created_at: String,
     pub request_body_path: Option<PathBuf>,
     pub response_body_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_b64: Option<String>,
     pub attempts: u32,
     pub last_error: Option<String>,
 }
@@ -90,6 +94,28 @@ impl BodyRetryQueue {
             created_at: Utc::now().to_rfc3339(),
             request_body_path,
             response_body_path,
+            request_body_b64: None,
+            response_body_b64: None,
+            attempts: 0,
+            last_error: None,
+        }
+    }
+
+    pub fn build_entry_with_payloads(
+        event_id: impl Into<String>,
+        request_body: Option<Vec<u8>>,
+        response_body: Option<Vec<u8>>,
+    ) -> RetryQueueEntry {
+        use base64::Engine as _;
+        RetryQueueEntry {
+            event_id: event_id.into(),
+            created_at: Utc::now().to_rfc3339(),
+            request_body_path: None,
+            response_body_path: None,
+            request_body_b64: request_body
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            response_body_b64: response_body
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
             attempts: 0,
             last_error: None,
         }
@@ -131,5 +157,15 @@ impl BodyRetryQueue {
             }
         }
         Ok(())
+    }
+}
+
+impl RetryQueueEntry {
+    pub fn from_payloads(
+        event_id: impl Into<String>,
+        request_body: Option<Vec<u8>>,
+        response_body: Option<Vec<u8>>,
+    ) -> Self {
+        BodyRetryQueue::build_entry_with_payloads(event_id, request_body, response_body)
     }
 }

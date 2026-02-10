@@ -627,14 +627,14 @@ fn spawn_proxy_runtime(
 
     let mut retention_shutdown_tx = None;
     let mut retention_task = None;
-    if let Some(runtime) = retention::spawn_retention_runtime(config, event_db_path) {
+    if let Some(runtime) = retention::spawn_retention_runtime(config, event_db_path.clone()) {
         retention_shutdown_tx = Some(runtime.shutdown_tx);
         retention_task = Some(runtime.task);
     }
 
     let mut cloud_shutdown_tx = None;
     let mut cloud_task = None;
-    if let Some(runtime) = cloud_hooks::spawn_cloud_pull_runtime(config) {
+    if let Some(runtime) = cloud_hooks::spawn_cloud_pull_runtime(config, event_db_path.clone()) {
         cloud_shutdown_tx = Some(runtime.shutdown_tx);
         cloud_task = Some(runtime.task);
     }

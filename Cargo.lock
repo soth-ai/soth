@@ -3881,12 +3881,17 @@ name = "soth-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "base64 0.22.1",
  "chrono",
  "dirs",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "soth-core",
+ "soth-observe",
+ "tempfile",
  "tokio",
  "tracing",
 ]

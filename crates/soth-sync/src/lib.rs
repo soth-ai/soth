@@ -10,6 +10,7 @@ pub mod agent;
 pub mod body_uploader;
 pub mod cache;
 pub mod config_puller;
+pub mod heartbeat;
 pub mod metadata_pusher;
 pub mod retry_queue;
 
@@ -17,5 +18,6 @@ pub use agent::*;
 pub use body_uploader::*;
 pub use cache::*;
 pub use config_puller::*;
+pub use heartbeat::*;
 pub use metadata_pusher::*;
 pub use retry_queue::*;
