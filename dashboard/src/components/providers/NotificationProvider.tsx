@@ -2,11 +2,14 @@
 
 import { useEffect, useRef } from "react";
 import { toast } from "sonner";
-import { useObservabilityStore, type LogEntry } from "@/store/observability";
+import { useObservabilityStore } from "@/store/observability";
 import { useSettingsStore } from "@/store/settings";
 
 // Track which log IDs we've already notified about
 const notifiedLogIds = new Set<string>();
+const STARTUP_NOTIFICATION_WARMUP_MS = 4000;
+const HISTORICAL_EVENT_GRACE_MS = 1500;
+const PII_TOAST_ID = "pii-live";
 
 // Sound for notifications (optional)
 const playNotificationSound = () => {
@@ -24,6 +27,8 @@ const playNotificationSound = () => {
 export function NotificationProvider({ children }: { children: React.ReactNode }) {
   const logs = useObservabilityStore((state) => state.logs);
   const prevLogsLengthRef = useRef(0);
+  const warmupUntilRef = useRef(Date.now() + STARTUP_NOTIFICATION_WARMUP_MS);
+  const mountedAtRef = useRef(Date.now());
 
   // Settings
   const notifyOnPolicyDenial = useSettingsStore((state) => state.notifyOnPolicyDenial);
@@ -32,6 +37,12 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   const soundEnabled = useSettingsStore((state) => state.soundEnabled);
 
   useEffect(() => {
+    if (logs.length < prevLogsLengthRef.current) {
+      prevLogsLengthRef.current = logs.length;
+      logs.forEach((log) => notifiedLogIds.add(log.id));
+      return;
+    }
+
     // Only check new logs (avoid notifying on initial load)
     if (prevLogsLengthRef.current === 0) {
       prevLogsLengthRef.current = logs.length;
@@ -40,14 +51,30 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       return;
     }
 
+    // Warm up briefly after mount/reload to absorb bootstrap/backfill batches.
+    if (Date.now() < warmupUntilRef.current) {
+      prevLogsLengthRef.current = logs.length;
+      logs.forEach((log) => notifiedLogIds.add(log.id));
+      return;
+    }
+
     // Process new logs
     const newLogs = logs.slice(prevLogsLengthRef.current);
     prevLogsLengthRef.current = logs.length;
+    const piiLogsToNotify: Array<{ id: string; pii_types: string[] }> = [];
+    let shouldPlaySound = false;
 
     newLogs.forEach((log) => {
       // Skip if already notified
       if (notifiedLogIds.has(log.id)) return;
       notifiedLogIds.add(log.id);
+
+      const eventTs = Date.parse(log.timestamp);
+      const isHistorical =
+        Number.isFinite(eventTs) && eventTs < mountedAtRef.current - HISTORICAL_EVENT_GRACE_MS;
+      if (isHistorical) {
+        return;
+      }
 
       // Policy denial notification
       if (notifyOnPolicyDenial && log.policy_allowed === false) {
@@ -64,24 +91,13 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
             id: `policy-${log.id}`,
           }
         );
-        if (soundEnabled) playNotificationSound();
+        shouldPlaySound = true;
       }
 
       // PII detection notification
       if (notifyOnPiiDetection && log.pii_detected && log.pii_types.length > 0) {
-        toast.warning(
-          <div>
-            <p className="font-semibold">PII Detected</p>
-            <p className="text-xs opacity-80">
-              Found: {log.pii_types.join(", ")}
-            </p>
-          </div>,
-          {
-            duration: 4000,
-            id: `pii-${log.id}`,
-          }
-        );
-        if (soundEnabled) playNotificationSound();
+        piiLogsToNotify.push(log);
+        shouldPlaySound = true;
       }
 
       // Budget alert (check for high cost)
@@ -100,6 +116,41 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         );
       }
     });
+
+    if (notifyOnPiiDetection && piiLogsToNotify.length === 1) {
+      const log = piiLogsToNotify[0];
+      toast.warning(
+        <div>
+          <p className="font-semibold">PII Detected</p>
+          <p className="text-xs opacity-80">Found: {log.pii_types.join(", ")}</p>
+        </div>,
+        {
+          duration: 4000,
+          id: PII_TOAST_ID,
+        }
+      );
+    } else if (notifyOnPiiDetection && piiLogsToNotify.length > 1) {
+      const types = new Set<string>();
+      piiLogsToNotify.forEach((log) => log.pii_types.forEach((type) => types.add(type)));
+      const topTypes = Array.from(types).slice(0, 4);
+      toast.warning(
+        <div>
+          <p className="font-semibold">PII Detected ({piiLogsToNotify.length} events)</p>
+          <p className="text-xs opacity-80">
+            Types: {topTypes.join(", ")}
+            {types.size > topTypes.length ? ` +${types.size - topTypes.length} more` : ""}
+          </p>
+        </div>,
+        {
+          duration: 4500,
+          id: PII_TOAST_ID,
+        }
+      );
+    }
+
+    if (shouldPlaySound && soundEnabled) {
+      playNotificationSound();
+    }
 
     // Cleanup old IDs to prevent memory leak (keep last 1000)
     if (notifiedLogIds.size > 1000) {
