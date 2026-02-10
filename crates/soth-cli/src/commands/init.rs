@@ -54,11 +54,19 @@ observe:
   storage:
     backend: "sqlite"
     path: "./logs/observations.db"
+    retention:
+      ai_proxy_days: 7
+      mcp_days: 7
+      agent_app_days: 1
+      clusters_days: 14
+      rollups_days: 90
+      vacuum_after_cleanup: true
+    inline_threshold_bytes: 4096
 
 # Budget configuration
 budget:
   enabled: true
-  storage_path: "./budget.db"
+  db_path: "~/.soth/budget.db"
   limits:
     - scope: "global"
       daily: 50.00

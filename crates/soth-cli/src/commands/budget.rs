@@ -1,11 +1,11 @@
 //! Budget management commands
 
+use crate::cli_config;
 use crate::BudgetCommands;
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use soth_budget::BudgetStorage;
-
-const DEFAULT_DB_PATH: &str = "budget.db";
+use std::path::PathBuf;
 
 /// Run budget command
 pub async fn run(action: BudgetCommands) -> Result<()> {
@@ -274,6 +274,25 @@ async fn set_budget(
 
 /// Get budget storage
 fn get_storage() -> Result<BudgetStorage> {
-    BudgetStorage::new(DEFAULT_DB_PATH)
-        .map_err(|e| anyhow::anyhow!("Failed to open budget storage: {e}"))
+    let db_path = resolve_budget_db_path();
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to create budget DB directory: {e}"))?;
+    }
+
+    BudgetStorage::new(&db_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to open budget storage at {}: {}",
+            db_path.display(),
+            e
+        )
+    })
+}
+
+fn resolve_budget_db_path() -> PathBuf {
+    let configured = cli_config::load_effective_config(None, None)
+        .ok()
+        .and_then(|cfg| cfg.budget.db_path)
+        .unwrap_or_else(|| PathBuf::from("~/.soth/budget.db"));
+    cli_config::expand_tilde(configured)
 }

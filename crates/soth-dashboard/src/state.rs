@@ -1,11 +1,14 @@
 //! Dashboard state - thread-safe metrics sink
 
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use parking_lot::RwLock;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::debug;
 
 /// Maximum number of recent entries to keep
 const MAX_RECENT_ENTRIES: usize = 10;
@@ -15,6 +18,8 @@ const MAX_RECENT_PROXY_REQUESTS: usize = 50;
 
 /// Maximum number of daily trend points to keep
 const MAX_DAILY_TREND_POINTS: usize = 30;
+const ROLLUP_WARM_START_WINDOW_HOURS: i64 = 24;
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
 
 /// Thread-safe dashboard state that layers push updates to
 #[derive(Clone)]
@@ -35,6 +40,18 @@ struct Inner {
     unique_dids: HashSet<String>,
     /// Current date for daily trend tracking
     current_date: String,
+}
+
+/// Warm-start summary for rollup bootstrap.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RollupWarmStartSummary {
+    pub rows_scanned: usize,
+    pub providers_loaded: usize,
+    pub requests: u64,
+    pub responses: u64,
+    pub pii_events: u64,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
 }
 
 // --- Identity Panel ---
@@ -317,6 +334,187 @@ impl DashboardState {
     /// Get uptime in seconds
     pub fn uptime_secs(&self) -> u64 {
         self.inner.read().started_at.elapsed().as_secs()
+    }
+
+    /// Create a new dashboard state and best-effort warm-start from rollups.
+    pub fn new_with_rollup_warm_start(db_path: &Path) -> Self {
+        let state = Self::new();
+        if let Err(error) = state.warm_start_from_rollups(db_path) {
+            debug!(
+                db_path = %db_path.display(),
+                "Warm-start from rollups failed during state init: {}",
+                error
+            );
+        }
+        state
+    }
+
+    /// Warm-start dashboard metrics from materialized `rollups_1m`.
+    ///
+    /// This restores recent aggregate state on boot so proxy/budget cards are
+    /// immediately meaningful before new live events arrive.
+    pub fn warm_start_from_rollups(
+        &self,
+        db_path: &Path,
+    ) -> std::io::Result<RollupWarmStartSummary> {
+        if !db_path.exists() {
+            return Ok(RollupWarmStartSummary::default());
+        }
+
+        let cutoff = (Utc::now() - ChronoDuration::hours(ROLLUP_WARM_START_WINDOW_HOURS))
+            .format("%Y-%m-%dT%H:%M:00Z")
+            .to_string();
+
+        let conn = Connection::open(db_path).map_err(to_io_error)?;
+        conn.busy_timeout(std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+            .map_err(to_io_error)?;
+
+        let has_rollups: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='rollups_1m'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(to_io_error)?;
+        if has_rollups == 0 {
+            return Ok(RollupWarmStartSummary::default());
+        }
+
+        let (rows_scanned, requests, responses, pii_events, total_tokens, total_cost_usd): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            f64,
+        ) = conn
+            .query_row(
+                r#"
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(requests), 0),
+                    COALESCE(SUM(responses), 0),
+                    COALESCE(SUM(pii_events), 0),
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(total_cost_usd), 0.0)
+                FROM rollups_1m
+                WHERE bucket_start >= ?1
+                "#,
+                params![cutoff],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(to_io_error)?;
+
+        let mut provider_rows: Vec<(String, u64, u64, f64)> = Vec::new();
+        let mut provider_stmt = conn
+            .prepare(
+                r#"
+                SELECT
+                    provider,
+                    COALESCE(SUM(requests), 0) as requests,
+                    COALESCE(SUM(total_tokens), 0) as total_tokens,
+                    COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd
+                FROM rollups_1m
+                WHERE bucket_start >= ?1
+                GROUP BY provider
+                ORDER BY total_cost_usd DESC, requests DESC
+                "#,
+            )
+            .map_err(to_io_error)?;
+        let rows = provider_stmt
+            .query_map(params![cutoff], |row| {
+                let provider: String = row.get(0)?;
+                Ok((
+                    if provider.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        provider
+                    },
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, f64>(3)?,
+                ))
+            })
+            .map_err(to_io_error)?;
+        for row in rows {
+            provider_rows.push(row.map_err(to_io_error)?);
+        }
+
+        let requests = requests.max(0) as u64;
+        let responses = responses.max(0) as u64;
+        let pii_events = pii_events.max(0) as u64;
+        let total_tokens = total_tokens.max(0) as u64;
+
+        {
+            let mut inner = self.inner.write();
+            inner.observe.requests = requests;
+            inner.observe.responses = responses;
+            inner.observe.pii_detections = pii_events;
+            inner.budget.total_tokens = total_tokens;
+            inner.budget.total_cost_usd = total_cost_usd;
+
+            inner.advanced_budget.total_tokens = total_tokens;
+            inner.advanced_budget.total_cost_usd = total_cost_usd;
+            inner.advanced_budget.cost_by_provider.clear();
+            for (provider, request_count, provider_tokens, provider_cost) in provider_rows.iter() {
+                inner.advanced_budget.cost_by_provider.insert(
+                    provider.clone(),
+                    ProviderCostBreakdown {
+                        total_cost: *provider_cost,
+                        total_tokens: *provider_tokens,
+                        input_tokens: 0,
+                        output_tokens: *provider_tokens,
+                        request_count: *request_count,
+                        model_breakdown: HashMap::new(),
+                    },
+                );
+            }
+        }
+
+        {
+            let mut proxy = self.proxy.write();
+            proxy.total_requests = requests;
+            proxy.total_responses = responses;
+            proxy.total_tokens = total_tokens;
+            proxy.total_cost_usd = total_cost_usd;
+            proxy.requests_by_provider.clear();
+            proxy.tokens_by_provider.clear();
+            proxy.cost_by_provider.clear();
+            for (provider, request_count, provider_tokens, provider_cost) in provider_rows.iter() {
+                proxy
+                    .requests_by_provider
+                    .insert(provider.clone(), *request_count);
+                proxy.tokens_by_provider.insert(
+                    provider.clone(),
+                    ProviderTokens {
+                        input_tokens: 0,
+                        output_tokens: *provider_tokens,
+                    },
+                );
+                proxy
+                    .cost_by_provider
+                    .insert(provider.clone(), *provider_cost);
+            }
+        }
+
+        Ok(RollupWarmStartSummary {
+            rows_scanned: rows_scanned.max(0) as usize,
+            providers_loaded: provider_rows.len(),
+            requests,
+            responses,
+            pii_events,
+            total_tokens,
+            total_cost_usd,
+        })
     }
 
     // --- Update methods (called by layers) ---
@@ -932,9 +1130,15 @@ impl Default for DashboardState {
     }
 }
 
+fn to_io_error(error: rusqlite::Error) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{params, Connection};
+    use tempfile::tempdir;
 
     #[test]
     fn test_identity_metrics() {
@@ -1040,6 +1244,122 @@ mod tests {
         let metrics = state.budget();
         assert_eq!(metrics.alerts.len(), 1);
         assert_eq!(metrics.alerts[0].level, "warning");
+    }
+
+    #[test]
+    fn test_warm_start_from_rollups_populates_proxy_and_budget_metrics() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE rollups_1m (
+                bucket_start TEXT NOT NULL,
+                source TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                total_events INTEGER NOT NULL DEFAULT 0,
+                requests INTEGER NOT NULL DEFAULT 0,
+                responses INTEGER NOT NULL DEFAULT 0,
+                error_events INTEGER NOT NULL DEFAULT 0,
+                pii_events INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0.0,
+                PRIMARY KEY (bucket_start, source, provider, agent)
+            );
+            "#,
+        )
+        .unwrap();
+
+        let now = Utc::now();
+        let recent_bucket = (now - chrono::Duration::hours(1))
+            .format("%Y-%m-%dT%H:%M:00Z")
+            .to_string();
+        let old_bucket = (now - chrono::Duration::hours(40))
+            .format("%Y-%m-%dT%H:%M:00Z")
+            .to_string();
+
+        conn.execute(
+            r#"
+            INSERT INTO rollups_1m (
+                bucket_start, source, provider, agent,
+                total_events, requests, responses, error_events, pii_events,
+                total_tokens, total_cost_usd
+            )
+            VALUES (?1, 'ai_proxy', 'openai', 'codex', 5, 5, 4, 0, 1, 1000, 1.25)
+            "#,
+            params![recent_bucket],
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO rollups_1m (
+                bucket_start, source, provider, agent,
+                total_events, requests, responses, error_events, pii_events,
+                total_tokens, total_cost_usd
+            )
+            VALUES (?1, 'ai_proxy', 'anthropic', 'claude', 3, 3, 3, 0, 0, 700, 0.95)
+            "#,
+            params![recent_bucket],
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO rollups_1m (
+                bucket_start, source, provider, agent,
+                total_events, requests, responses, error_events, pii_events,
+                total_tokens, total_cost_usd
+            )
+            VALUES (?1, 'ai_proxy', 'openai', 'codex', 10, 10, 9, 0, 2, 2000, 3.50)
+            "#,
+            params![old_bucket],
+        )
+        .unwrap();
+
+        let state = DashboardState::new();
+        let summary = state.warm_start_from_rollups(&db_path).unwrap();
+        assert_eq!(summary.rows_scanned, 2);
+        assert_eq!(summary.providers_loaded, 2);
+        assert_eq!(summary.requests, 8);
+        assert_eq!(summary.responses, 7);
+        assert_eq!(summary.pii_events, 1);
+        assert_eq!(summary.total_tokens, 1700);
+        assert!((summary.total_cost_usd - 2.20).abs() < 0.0001);
+
+        let observe = state.observe();
+        assert_eq!(observe.requests, 8);
+        assert_eq!(observe.responses, 7);
+        assert_eq!(observe.pii_detections, 1);
+
+        let budget = state.budget();
+        assert_eq!(budget.total_tokens, 1700);
+        assert!((budget.total_cost_usd - 2.20).abs() < 0.0001);
+
+        let proxy = state.proxy();
+        assert_eq!(proxy.total_requests, 8);
+        assert_eq!(proxy.total_responses, 7);
+        assert_eq!(proxy.total_tokens, 1700);
+        assert!((proxy.total_cost_usd - 2.20).abs() < 0.0001);
+        assert_eq!(proxy.requests_by_provider.get("openai"), Some(&5));
+        assert_eq!(proxy.requests_by_provider.get("anthropic"), Some(&3));
+
+        let tokens_openai = proxy.tokens_by_provider.get("openai").unwrap();
+        assert_eq!(tokens_openai.input_tokens, 0);
+        assert_eq!(tokens_openai.output_tokens, 1000);
+    }
+
+    #[test]
+    fn test_warm_start_from_rollups_without_table_is_noop() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        Connection::open(&db_path).unwrap();
+
+        let state = DashboardState::new();
+        let summary = state.warm_start_from_rollups(&db_path).unwrap();
+
+        assert_eq!(summary.rows_scanned, 0);
+        assert_eq!(state.proxy().total_requests, 0);
+        assert_eq!(state.budget().total_tokens, 0);
     }
 
     #[test]

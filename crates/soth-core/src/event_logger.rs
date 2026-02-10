@@ -49,6 +49,15 @@ pub struct EventLogger {
 impl EventLogger {
     /// Create a new event logger that writes to the given path.
     pub fn new(path: PathBuf) -> std::io::Result<Self> {
+        Self::new_with_inline_payload_max_bytes(path, INLINE_PAYLOAD_MAX_BYTES)
+    }
+
+    /// Create a new event logger that writes to the given path and applies a custom
+    /// inline payload threshold before side-table offload.
+    pub fn new_with_inline_payload_max_bytes(
+        path: PathBuf,
+        inline_payload_max_bytes: usize,
+    ) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -56,11 +65,13 @@ impl EventLogger {
         let conn = Connection::open(&path).map_err(to_io_err)?;
         init_sqlite_schema(&conn)?;
         drop(conn);
+
+        let inline_payload_max_bytes = inline_payload_max_bytes.max(1);
         let (tx, rx) = mpsc::sync_channel(SQLITE_QUEUE_CAPACITY);
         let worker_path = path.clone();
         let worker = std::thread::Builder::new()
             .name("soth-event-sqlite-writer".to_string())
-            .spawn(move || run_sqlite_writer(worker_path, rx))
+            .spawn(move || run_sqlite_writer(worker_path, rx, inline_payload_max_bytes))
             .map_err(std::io::Error::other)?;
 
         let storage = EventLoggerStorage::SqliteAsync {
@@ -76,7 +87,17 @@ impl EventLogger {
 
     /// Create an event logger with the default write path (`~/.soth/logs/events.db`).
     pub fn with_default_path() -> std::io::Result<Self> {
-        Self::new(default_event_log_write_path()?)
+        Self::with_default_path_with_inline_payload_max_bytes(INLINE_PAYLOAD_MAX_BYTES)
+    }
+
+    /// Create an event logger with the default write path and custom inline threshold.
+    pub fn with_default_path_with_inline_payload_max_bytes(
+        inline_payload_max_bytes: usize,
+    ) -> std::io::Result<Self> {
+        Self::new_with_inline_payload_max_bytes(
+            default_event_log_write_path()?,
+            inline_payload_max_bytes,
+        )
     }
 
     /// Get the path this logger writes to.
@@ -235,7 +256,7 @@ fn init_sqlite_schema(conn: &Connection) -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>) {
+fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>, inline_payload_max_bytes: usize) {
     let mut conn = match Connection::open(&path) {
         Ok(conn) => conn,
         Err(error) => {
@@ -262,11 +283,13 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>) {
         match rx.recv_timeout(flush_interval) {
             Ok(LoggerCommand::Event(event)) => pending.push(event),
             Ok(LoggerCommand::Flush(ack)) => {
-                let result = flush_sqlite_events(&mut conn, &mut pending);
+                let result = flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes);
                 let _ = ack.send(result);
             }
             Ok(LoggerCommand::Shutdown) => {
-                if let Err(error) = flush_sqlite_events(&mut conn, &mut pending) {
+                if let Err(error) =
+                    flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
+                {
                     warn!("Failed to flush events during logger shutdown: {}", error);
                 }
                 return;
@@ -275,13 +298,17 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>) {
                 // Time-based durability/visibility: flush partial batches regularly
                 // so low-traffic sessions still appear in observability promptly.
                 if !pending.is_empty() {
-                    if let Err(error) = flush_sqlite_events(&mut conn, &mut pending) {
+                    if let Err(error) =
+                        flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
+                    {
                         warn!("Failed to flush timed events: {}", error);
                     }
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if let Err(error) = flush_sqlite_events(&mut conn, &mut pending) {
+                if let Err(error) =
+                    flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
+                {
                     warn!("Failed to flush events during logger shutdown: {}", error);
                 }
                 return;
@@ -292,18 +319,23 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>) {
             match rx.try_recv() {
                 Ok(LoggerCommand::Event(event)) => pending.push(event),
                 Ok(LoggerCommand::Flush(ack)) => {
-                    let result = flush_sqlite_events(&mut conn, &mut pending);
+                    let result =
+                        flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes);
                     let _ = ack.send(result);
                 }
                 Ok(LoggerCommand::Shutdown) => {
-                    if let Err(error) = flush_sqlite_events(&mut conn, &mut pending) {
+                    if let Err(error) =
+                        flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
+                    {
                         warn!("Failed to flush events during logger shutdown: {}", error);
                     }
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Err(error) = flush_sqlite_events(&mut conn, &mut pending) {
+                    if let Err(error) =
+                        flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
+                    {
                         warn!("Failed to flush events during logger shutdown: {}", error);
                     }
                     return;
@@ -312,21 +344,27 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>) {
         }
 
         if pending.len() >= SQLITE_BATCH_SIZE {
-            if let Err(error) = flush_sqlite_events(&mut conn, &mut pending) {
+            if let Err(error) =
+                flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
+            {
                 warn!("Failed to flush batched events: {}", error);
             }
         }
     }
 }
 
-fn flush_sqlite_events(conn: &mut Connection, pending: &mut Vec<WrapEvent>) -> std::io::Result<()> {
+fn flush_sqlite_events(
+    conn: &mut Connection,
+    pending: &mut Vec<WrapEvent>,
+    inline_payload_max_bytes: usize,
+) -> std::io::Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
 
     let tx = conn.transaction().map_err(to_io_err)?;
     for event in pending.drain(..) {
-        insert_sqlite_event(&tx, event)?;
+        insert_sqlite_event(&tx, event, inline_payload_max_bytes)?;
     }
     tx.commit().map_err(to_io_err)?;
     Ok(())
@@ -335,9 +373,10 @@ fn flush_sqlite_events(conn: &mut Connection, pending: &mut Vec<WrapEvent>) -> s
 fn insert_sqlite_event(
     tx: &rusqlite::Transaction<'_>,
     mut event: WrapEvent,
+    inline_payload_max_bytes: usize,
 ) -> std::io::Result<()> {
     let mut payloads = Vec::new();
-    offload_large_payloads(&mut event, &mut payloads);
+    offload_large_payloads(&mut event, &mut payloads, inline_payload_max_bytes);
 
     let json = serde_json::to_string(&event)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -375,7 +414,11 @@ fn insert_sqlite_event(
     Ok(())
 }
 
-fn offload_large_payloads(event: &mut WrapEvent, payloads: &mut Vec<PayloadBlob>) {
+fn offload_large_payloads(
+    event: &mut WrapEvent,
+    payloads: &mut Vec<PayloadBlob>,
+    inline_payload_max_bytes: usize,
+) {
     maybe_offload_payload(
         &event.id,
         "content",
@@ -383,6 +426,7 @@ fn offload_large_payloads(event: &mut WrapEvent, payloads: &mut Vec<PayloadBlob>
         &mut event.content_preview,
         &mut event.content_ref,
         payloads,
+        inline_payload_max_bytes,
     );
     maybe_offload_payload(
         &event.id,
@@ -391,6 +435,7 @@ fn offload_large_payloads(event: &mut WrapEvent, payloads: &mut Vec<PayloadBlob>
         &mut event.request_preview,
         &mut event.request_content_ref,
         payloads,
+        inline_payload_max_bytes,
     );
     maybe_offload_payload(
         &event.id,
@@ -399,7 +444,14 @@ fn offload_large_payloads(event: &mut WrapEvent, payloads: &mut Vec<PayloadBlob>
         &mut event.response_preview,
         &mut event.response_content_ref,
         payloads,
+        inline_payload_max_bytes,
     );
+
+    // Request bodies in traffic_envelope are only needed in-memory for enforcement.
+    // Strip before persistence to reduce event_json size growth.
+    if let Some(ref mut envelope) = event.traffic_envelope {
+        envelope.request_body = None;
+    }
 }
 
 fn maybe_offload_payload(
@@ -409,12 +461,13 @@ fn maybe_offload_payload(
     preview: &mut Option<String>,
     reference: &mut Option<String>,
     payloads: &mut Vec<PayloadBlob>,
+    inline_payload_max_bytes: usize,
 ) {
     let Some(content) = field.take() else {
         return;
     };
 
-    if content.as_bytes().len() <= INLINE_PAYLOAD_MAX_BYTES {
+    if content.as_bytes().len() <= inline_payload_max_bytes {
         *field = Some(content);
         return;
     }
@@ -460,7 +513,7 @@ fn to_io_err(error: rusqlite::Error) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AgentInfo, DetectionSource, WrapDirection};
+    use crate::types::{AgentInfo, DetectionSource, TrafficEnvelope, WrapDirection};
     use tempfile::tempdir;
 
     #[test]
@@ -562,5 +615,102 @@ mod tests {
 
         assert_eq!(String::from_utf8(request_payload).unwrap(), large_request);
         assert_eq!(String::from_utf8(response_payload).unwrap(), large_response);
+    }
+
+    #[test]
+    fn test_custom_inline_threshold_controls_offload_boundary() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let threshold = 256usize;
+        let logger =
+            EventLogger::new_with_inline_payload_max_bytes(path.clone(), threshold).unwrap();
+
+        let request_payload = "x".repeat(threshold + 1);
+        let response_payload = "y".repeat(threshold / 2);
+        let agent = AgentInfo::new("Test Agent", DetectionSource::CommandLine);
+        let event = WrapEvent::new("session-threshold", "test-server", WrapDirection::In, agent)
+            .with_method("POST /v1/messages")
+            .with_request(request_payload.clone(), "")
+            .with_response(response_payload.clone(), "");
+
+        logger.log(&event);
+        logger.close();
+
+        let conn = Connection::open(path).unwrap();
+        let event_json: String = conn
+            .query_row("SELECT event_json FROM wrap_events LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let stored_event: WrapEvent = serde_json::from_str(&event_json).unwrap();
+
+        // Request exceeds threshold and should be offloaded, response should stay inline.
+        assert!(stored_event.request_content.is_none());
+        assert!(stored_event.request_content_ref.is_some());
+        assert_eq!(
+            stored_event.response_content.as_deref(),
+            Some(response_payload.as_str())
+        );
+    }
+
+    #[test]
+    fn test_persisted_event_strips_traffic_envelope_request_body() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path.clone()).unwrap();
+
+        let agent = AgentInfo::new("Test Agent", DetectionSource::CommandLine);
+        let envelope_request_body = r#"{"secret":"sensitive payload"}"#.to_string();
+        let envelope = TrafficEnvelope::proxy(
+            "session-envelope",
+            "req-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-5"),
+            Some("codex"),
+            None,
+            None,
+            Some(&envelope_request_body),
+        );
+
+        let event = WrapEvent::new(
+            "session-envelope",
+            "api.openai.com",
+            WrapDirection::In,
+            agent,
+        )
+        .with_method("POST /v1/chat/completions")
+        .with_traffic_envelope(envelope);
+
+        logger.log(&event);
+        logger.close();
+
+        // In-memory event still has request_body (required for runtime enforcement flow).
+        assert_eq!(
+            event
+                .traffic_envelope
+                .as_ref()
+                .and_then(|value| value.request_body.as_deref()),
+            Some(envelope_request_body.as_str())
+        );
+
+        let conn = Connection::open(path).unwrap();
+        let event_json: String = conn
+            .query_row("SELECT event_json FROM wrap_events LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let stored_event: WrapEvent = serde_json::from_str(&event_json).unwrap();
+
+        assert!(
+            stored_event
+                .traffic_envelope
+                .as_ref()
+                .and_then(|value| value.request_body.as_deref())
+                .is_none(),
+            "request_body should be stripped before persistence"
+        );
     }
 }

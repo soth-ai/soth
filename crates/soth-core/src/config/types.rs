@@ -535,9 +535,20 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_path")]
     pub path: PathBuf,
 
-    /// Retention in days (0 = forever)
+    /// Source-aware retention configuration.
     #[serde(default)]
-    pub retention_days: u32,
+    pub retention: RetentionConfig,
+
+    /// Inline payload threshold (bytes) before payload side-table offload.
+    #[serde(default = "default_inline_threshold_bytes")]
+    pub inline_threshold_bytes: usize,
+
+    /// Deprecated single retention days setting (0 = forever).
+    /// Read for backward compatibility from existing configs.
+    #[serde(default)]
+    #[serde(rename = "retention_days")]
+    #[serde(skip_serializing)]
+    pub legacy_retention_days: Option<u32>,
 }
 
 fn default_storage_backend() -> String {
@@ -548,18 +559,116 @@ fn default_storage_path() -> PathBuf {
     PathBuf::from("./logs")
 }
 
+fn default_inline_threshold_bytes() -> usize {
+    4096
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: default_storage_backend(),
             path: default_storage_path(),
-            retention_days: 0,
+            retention: RetentionConfig::default(),
+            inline_threshold_bytes: default_inline_threshold_bytes(),
+            legacy_retention_days: None,
         }
     }
 }
 
+impl StorageConfig {
+    /// Applies deprecated `retention_days` when present and no explicit
+    /// source-aware retention values were configured.
+    pub fn apply_legacy_retention_days(&mut self) {
+        let Some(days) = self.legacy_retention_days.take() else {
+            return;
+        };
+
+        if self.retention.is_default() {
+            self.retention = RetentionConfig::uniform(days);
+        }
+    }
+}
+
+/// Source-aware retention policy for observability artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// AI provider/direct inference events.
+    #[serde(default = "default_retention_ai_proxy_days")]
+    pub ai_proxy_days: u32,
+    /// MCP events.
+    #[serde(default = "default_retention_mcp_days")]
+    pub mcp_days: u32,
+    /// Agent app events (typically highest volume/noisiest).
+    #[serde(default = "default_retention_agent_app_days")]
+    pub agent_app_days: u32,
+    /// Materialized request/response clusters.
+    #[serde(default = "default_retention_clusters_days")]
+    pub clusters_days: u32,
+    /// Minute rollups for dashboard warm starts and trends.
+    #[serde(default = "default_retention_rollups_days")]
+    pub rollups_days: u32,
+    /// Whether maintenance may run VACUUM after cleanup.
+    #[serde(default = "default_true")]
+    pub vacuum_after_cleanup: bool,
+}
+
+fn default_retention_ai_proxy_days() -> u32 {
+    7
+}
+
+fn default_retention_mcp_days() -> u32 {
+    7
+}
+
+fn default_retention_agent_app_days() -> u32 {
+    1
+}
+
+fn default_retention_clusters_days() -> u32 {
+    14
+}
+
+fn default_retention_rollups_days() -> u32 {
+    90
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            ai_proxy_days: default_retention_ai_proxy_days(),
+            mcp_days: default_retention_mcp_days(),
+            agent_app_days: default_retention_agent_app_days(),
+            clusters_days: default_retention_clusters_days(),
+            rollups_days: default_retention_rollups_days(),
+            vacuum_after_cleanup: true,
+        }
+    }
+}
+
+impl RetentionConfig {
+    pub fn uniform(days: u32) -> Self {
+        Self {
+            ai_proxy_days: days,
+            mcp_days: days,
+            agent_app_days: days,
+            clusters_days: days,
+            rollups_days: days,
+            vacuum_after_cleanup: true,
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.ai_proxy_days == default_retention_ai_proxy_days()
+            && self.mcp_days == default_retention_mcp_days()
+            && self.agent_app_days == default_retention_agent_app_days()
+            && self.clusters_days == default_retention_clusters_days()
+            && self.rollups_days == default_retention_rollups_days()
+            && self.vacuum_after_cleanup
+    }
+}
+
 /// Budget configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -573,7 +682,24 @@ pub struct BudgetConfig {
     pub alerts: Vec<AlertConfig>,
 
     /// Database path for persistence
+    #[serde(default = "default_budget_db_path")]
+    #[serde(alias = "storage_path")]
     pub db_path: Option<PathBuf>,
+}
+
+fn default_budget_db_path() -> Option<PathBuf> {
+    Some(PathBuf::from("~/.soth/budget.db"))
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            limits: Vec::new(),
+            alerts: Vec::new(),
+            db_path: default_budget_db_path(),
+        }
+    }
 }
 
 /// Budget limit configuration
