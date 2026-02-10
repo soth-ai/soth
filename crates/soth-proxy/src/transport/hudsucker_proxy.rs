@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
 use soth_policy::PolicyEngine;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -75,6 +75,10 @@ struct PendingRequest {
     started_at: Instant,
     /// Request body content for paired logging
     request_content: Option<String>,
+    /// Request payload size in bytes (wire payload)
+    request_size_bytes: Option<u64>,
+    /// Sanitized request headers captured post-forward sanitation
+    headers: Option<BTreeMap<String, String>>,
     /// Whether this is traffic from an agent app (chatgpt.com, claude.ai) vs direct API
     is_agent_app: bool,
     /// JSON-RPC MCP method (when this request is identified as MCP traffic)
@@ -443,6 +447,73 @@ fn header_size_bytes(headers: &hyper::HeaderMap) -> usize {
         .iter()
         .map(|(k, v)| k.as_str().len() + v.len() + 4)
         .sum()
+}
+
+fn parse_content_length(headers: &hyper::HeaderMap) -> Option<u64> {
+    headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "api-key"
+            | "x-auth-token"
+            | "x-csrf-token"
+            | "x-xsrf-token"
+    ) || name.contains("sentinel")
+        || name.contains("token")
+}
+
+fn capture_sanitized_headers(headers: &hyper::HeaderMap) -> BTreeMap<String, String> {
+    const MAX_CAPTURE_HEADERS: usize = 64;
+    const MAX_HEADER_VALUE_CHARS: usize = 192;
+    const REDACTED: &str = "[redacted]";
+
+    let mut captured: BTreeMap<String, String> = BTreeMap::new();
+    for (idx, (name, value)) in headers.iter().enumerate() {
+        if idx >= MAX_CAPTURE_HEADERS {
+            break;
+        }
+
+        let name = name.as_str().to_ascii_lowercase();
+        let rendered = if is_sensitive_header(&name) {
+            REDACTED.to_string()
+        } else if let Ok(text) = value.to_str() {
+            let char_count = text.chars().count();
+            if char_count > MAX_HEADER_VALUE_CHARS {
+                let mut truncated = String::with_capacity(MAX_HEADER_VALUE_CHARS + 3);
+                for ch in text.chars().take(MAX_HEADER_VALUE_CHARS) {
+                    truncated.push(ch);
+                }
+                truncated.push_str("...");
+                truncated
+            } else {
+                text.to_string()
+            }
+        } else {
+            format!("[binary:{} bytes]", value.as_bytes().len())
+        };
+
+        if let Some(existing) = captured.get_mut(&name) {
+            if existing != &rendered {
+                existing.push_str("; ");
+                existing.push_str(&rendered);
+            }
+        } else {
+            captured.insert(name, rendered);
+        }
+    }
+
+    captured
 }
 
 fn is_required_chat_ui_header(name: &str) -> bool {
@@ -1013,6 +1084,8 @@ pub struct AiProxyHandler {
     provider_registry: Arc<ProviderRegistry>,
     /// LiteLLM-style pricing catalog
     pricing_catalog: Arc<PricingCatalog>,
+    /// User-defined tags attached to all emitted events.
+    event_tags: Arc<BTreeMap<String, String>>,
     /// Optional PII enrichment before events are written.
     pii_enricher: Arc<PiiEventEnricher>,
 }
@@ -1029,6 +1102,7 @@ impl AiProxyHandler {
             enforcer: None,
             provider_registry: Arc::new(ProviderRegistry::new()),
             pricing_catalog: Arc::new(PricingCatalog::with_defaults()),
+            event_tags: Arc::new(observe.event_tags.clone()),
             pii_enricher: Arc::new(PiiEventEnricher::from_observe_config(observe)),
         }
     }
@@ -1355,6 +1429,7 @@ impl HttpHandler for AiProxyHandler {
                 || (host_mode == HostFilterMode::Discovery && is_json));
         let provider_registry = self.provider_registry.clone();
         let event_logger = self.event_logger.clone();
+        let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
 
         debug!(
@@ -1381,8 +1456,9 @@ impl HttpHandler for AiProxyHandler {
                 );
             }
 
-            // Capture body for AI requests
-            let (body_content, model, req) = if should_inspect_body {
+            // Capture body for AI/MCP requests and record payload-size metadata.
+            let declared_request_size_bytes = parse_content_length(req.headers());
+            let (body_content, request_size_bytes, model, req) = if should_inspect_body {
                 let (parts, body) = req.into_parts();
                 match body.collect().await {
                     Ok(collected) => {
@@ -1420,17 +1496,17 @@ impl HttpHandler for AiProxyHandler {
                         // Reconstruct request with body
                         let new_body = Body::from(Full::new(bytes));
                         let req = Request::from_parts(parts, new_body);
-                        (Some(body_str), model, req)
+                        (Some(body_str), Some(body_len as u64), model, req)
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to collect request body");
                         let req = Request::from_parts(parts, Body::empty());
-                        (None, None, req)
+                        (None, declared_request_size_bytes, None, req)
                     }
                 }
             } else {
                 debug!("Skipping body inspection");
-                (None, None, req)
+                (None, declared_request_size_bytes, None, req)
             };
             let agent = Self::detect_agent_with_context_gated(
                 ua_agent,
@@ -1622,6 +1698,8 @@ impl HttpHandler for AiProxyHandler {
                             model: model.clone(),
                             started_at: Instant::now(),
                             request_content: body_content,
+                            request_size_bytes,
+                            headers: None,
                             is_agent_app: host_is_agent_target,
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
@@ -1666,6 +1744,9 @@ impl HttpHandler for AiProxyHandler {
                         event = event.with_content(request_body.clone());
                     }
                     event = event.with_content_preview(format!("→ {} {}", http_method, path));
+                    if !event_tags.is_empty() {
+                        event = event.with_tags((*event_tags).clone());
+                    }
                     pii_enricher.enrich(&mut event);
                     logger.log(&event);
                 }
@@ -1695,6 +1776,8 @@ impl HttpHandler for AiProxyHandler {
                         model: None,
                         started_at: Instant::now(),
                         request_content: None,
+                        request_size_bytes,
+                        headers: None,
                         is_agent_app: false,
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
@@ -1712,6 +1795,23 @@ impl HttpHandler for AiProxyHandler {
             let (parts, body) = req.into_parts();
             let mut sanitized_req = Request::from_parts(parts, body);
             sanitize_request_headers(&mut sanitized_req, &host, &path);
+            let sanitized_request_size_bytes = parse_content_length(sanitized_req.headers());
+            let sanitized_headers = capture_sanitized_headers(sanitized_req.headers());
+
+            // Persist sanitized header map and request-size metadata into pending request
+            // so response-side paired events can include this context.
+            {
+                let mut pending = pending_requests.lock();
+                if let Some(entry) = pending.get_mut(&request_id) {
+                    if entry.provider.is_some() {
+                        entry.headers = Some(sanitized_headers);
+                    }
+                    if entry.request_size_bytes.is_none() {
+                        entry.request_size_bytes =
+                            request_size_bytes.or(sanitized_request_size_bytes);
+                    }
+                }
+            }
 
             RequestOrResponse::Request(sanitized_req)
         }
@@ -1725,6 +1825,7 @@ impl HttpHandler for AiProxyHandler {
         let status = res.status().as_u16();
         let pending_requests = self.pending_requests.clone();
         let event_logger = self.event_logger.clone();
+        let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
         let session_id = self.session_id.clone();
         let request_id = request_id_from_ctx(ctx);
@@ -1800,6 +1901,7 @@ impl HttpHandler for AiProxyHandler {
                         .mcp_method
                         .clone()
                         .unwrap_or_else(|| format!("{} {}", pending.method, pending.path));
+                    let response_size_bytes = body_content.as_ref().map(|body| body.len() as u64);
                     let response_payload = body_content.unwrap_or_else(|| {
                         format!(
                             "[no JSON-RPC response body captured for {} {} (HTTP {})]",
@@ -1817,6 +1919,8 @@ impl HttpHandler for AiProxyHandler {
                     if let Some(envelope) = pending.envelope.clone() {
                         event = event.with_traffic_envelope(envelope);
                     }
+                    event =
+                        event.with_payload_sizes(pending.request_size_bytes, response_size_bytes);
                     event.id = pending.event_id.clone();
                     event =
                         event.with_content_preview(format!("← {} (HTTP {})", method_name, status));
@@ -1825,6 +1929,9 @@ impl HttpHandler for AiProxyHandler {
                     }
                     if let Some(ref version) = pending.policy_version {
                         event = event.with_policy_version(version.clone());
+                    }
+                    if !event_tags.is_empty() {
+                        event = event.with_tags((*event_tags).clone());
                     }
                     pii_enricher.enrich(&mut event);
                     logger.log(&event);
@@ -1859,6 +1966,10 @@ impl HttpHandler for AiProxyHandler {
                         latency_ms,
                         request_content: pending.request_content.as_deref(),
                         response_content: Some(placeholder),
+                        request_size_bytes: pending.request_size_bytes,
+                        response_size_bytes: None,
+                        headers: pending.headers.clone(),
+                        tags: Some(event_tags.as_ref()),
                         usage_meta: &response_usage,
                         fallback_model: pending.model.as_deref(),
                         response_kind: ResponseKind::Stream { is_sse },
@@ -1878,6 +1989,7 @@ impl HttpHandler for AiProxyHandler {
 
             // For JSON responses, capture the body for logging (with decompression)
             // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
+            let mut response_size_bytes: Option<u64> = None;
             let (body_content, res, logged_in_stream) = if is_json
                 && !is_sse
                 && !is_codex_response_path
@@ -1887,6 +1999,7 @@ impl HttpHandler for AiProxyHandler {
                 match body.collect().await {
                     Ok(collected) => {
                         let bytes = collected.to_bytes();
+                        response_size_bytes = Some(bytes.len() as u64);
 
                         let (decoded_bytes, body_str) =
                             decode_payload_for_logging(&bytes, content_encoding.as_deref());
@@ -1930,6 +2043,7 @@ impl HttpHandler for AiProxyHandler {
                 let log_provider_registry = provider_registry.clone();
                 let log_pricing_catalog = pricing_catalog.clone();
                 let log_budget_tracker = budget_tracker.clone();
+                let log_event_tags = event_tags.clone();
                 let log_pii_enricher = pii_enricher.clone();
                 #[cfg(feature = "dashboard")]
                 let log_dashboard = dashboard.clone();
@@ -1967,7 +2081,7 @@ impl HttpHandler for AiProxyHandler {
                     }
 
                     // Stream ended - decompress and log the accumulated content
-                    let (decoded_bytes, raw_content) = {
+                    let (decoded_bytes, raw_content, streamed_response_size_bytes) = {
                         let raw_bytes = {
                             let mut guard = accumulated_clone.lock();
                             guard.take().unwrap_or_default()
@@ -1983,7 +2097,7 @@ impl HttpHandler for AiProxyHandler {
                         // Decode once and reuse decoded bytes for usage extraction.
                         let decoded = decode_payload_for_logging(&raw_bytes, log_content_encoding.as_deref());
                         release_stream_buffer(raw_bytes);
-                        decoded
+                        (decoded.0, decoded.1, raw_len as u64)
                     };
                     let usage_meta = extract_usage_meta_from_decoded_payload(
                         &log_provider_registry,
@@ -2056,6 +2170,10 @@ impl HttpHandler for AiProxyHandler {
                             latency_ms: log_latency_ms,
                             request_content: log_pending.request_content.as_deref(),
                             response_content: Some(content),
+                            request_size_bytes: log_pending.request_size_bytes,
+                            response_size_bytes: Some(streamed_response_size_bytes),
+                            headers: log_pending.headers.clone(),
+                            tags: Some(log_event_tags.as_ref()),
                             usage_meta: &usage_meta,
                             fallback_model: log_pending.model.as_deref(),
                             response_kind: ResponseKind::Stream { is_sse: log_is_sse },
@@ -2143,6 +2261,10 @@ impl HttpHandler for AiProxyHandler {
                         latency_ms,
                         request_content: pending.request_content.as_deref(),
                         response_content: normalized_response,
+                        request_size_bytes: pending.request_size_bytes,
+                        response_size_bytes,
+                        headers: pending.headers.clone(),
+                        tags: Some(event_tags.as_ref()),
                         usage_meta: &response_usage,
                         fallback_model: pending.model.as_deref(),
                         response_kind: ResponseKind::Http,
@@ -2202,6 +2324,8 @@ pub struct AiWebSocketHandler {
     session_id: String,
     /// Host filter config for source classification.
     hosts: Arc<HostFilterConfig>,
+    /// User-defined tags attached to emitted events.
+    event_tags: Arc<BTreeMap<String, String>>,
     /// Optional PII enrichment before events are written.
     pii_enricher: Arc<PiiEventEnricher>,
 }
@@ -2211,12 +2335,14 @@ impl AiWebSocketHandler {
         session_id: String,
         event_logger: Option<Arc<EventLogger>>,
         hosts: Arc<HostFilterConfig>,
+        event_tags: Arc<BTreeMap<String, String>>,
         pii_enricher: Arc<PiiEventEnricher>,
     ) -> Self {
         Self {
             event_logger,
             session_id,
             hosts,
+            event_tags,
             pii_enricher,
         }
     }
@@ -2235,6 +2361,7 @@ impl WebSocketHandler for AiWebSocketHandler {
         let event_logger = self.event_logger.clone();
         let session_id = self.session_id.clone();
         let hosts = self.hosts.clone();
+        let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
 
         // Extract host/path and direction from context
@@ -2349,6 +2476,9 @@ impl WebSocketHandler for AiWebSocketHandler {
                                     .with_provider(provider_for_event)
                                     .with_method(ws_method.clone())
                                     .with_content(text.to_string());
+                            if !event_tags.is_empty() {
+                                event = event.with_tags((*event_tags).clone());
+                            }
                             if matches!(source, EventSource::Mcp) {
                                 let envelope = TrafficEnvelope::mcp_http(
                                     &session_id,
@@ -2459,6 +2589,7 @@ where
     let event_logger_arc = event_logger.map(Arc::new);
     let ws_hosts = Arc::new(config.hosts.clone());
     let observe_config = observe_config.unwrap_or_default();
+    let event_tags = Arc::new(observe_config.event_tags.clone());
     let pii_enricher = Arc::new(PiiEventEnricher::from_observe_config(&observe_config));
 
     #[cfg(feature = "dashboard")]
@@ -2489,7 +2620,13 @@ where
     };
 
     // Create WebSocket handler with event logger
-    let ws_handler = AiWebSocketHandler::new(session_id, event_logger_arc, ws_hosts, pii_enricher);
+    let ws_handler = AiWebSocketHandler::new(
+        session_id,
+        event_logger_arc,
+        ws_hosts,
+        event_tags,
+        pii_enricher,
+    );
 
     info!("Starting soth proxy on {}", listen_addr);
     info!("  AI+MCP domains -> MITM intercept");

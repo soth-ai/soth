@@ -9,6 +9,10 @@ license.workspace = true
 name = "soth"
 path = "src/main.rs"
 
+[features]
+default = []
+cloud-sync = ["dep:soth-sync"]
+
 [dependencies]
 soth-core = { workspace = true }
 soth-identity = { workspace = true }
@@ -18,6 +22,7 @@ soth-budget = { workspace = true }
 soth-proxy = { workspace = true }
 soth-dashboard = { workspace = true }
 soth-tls = { workspace = true }
+soth-sync = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

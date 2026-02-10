@@ -57,12 +57,20 @@ observe:
   storage:
     backend: "sqlite"      # Options: sqlite
     path: "./logs/observations.db"
+    retention:
+      ai_proxy_days: 7
+      mcp_days: 7
+      agent_app_days: 1
+      clusters_days: 14
+      rollups_days: 90
+      vacuum_after_cleanup: true
+    inline_threshold_bytes: 4096
 
 # Budget configuration
 # Controls spend tracking and limits
 budget:
   enabled: true
-  storage_path: "./budget.db"
+  db_path: "~/.soth/budget.db"
   limits:
     # Global budget applies to all traffic
     - scope: "global"
@@ -80,6 +88,19 @@ budget:
       action: "warn"      # Log a warning
     - threshold_percent: 100
       action: "block"     # Block requests
+
+# Cloud sync configuration (optional)
+# Used for edge -> cloud metadata sync and cloud-managed policy/budget controls.
+cloud:
+  enabled: false
+  api_key: null
+  endpoint: "https://api.soth.ai"
+  sync_interval_secs: 60
+  config_pull_interval_secs: 300
+  body_upload_enabled: false
+  cache_path: "~/.soth/cloud_config_cache.json"
+  tags:
+    environment: "development"
 
 # Dashboard configuration
 # Real-time metrics dashboard with 4 panels

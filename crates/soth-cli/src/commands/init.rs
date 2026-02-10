@@ -48,17 +48,28 @@ observe:
     ai_inference: true
     mcp: true
     agent_apps: true
+  event_tags:
+    project: "local-dev"
+    environment: "development"
   log_requests: true
   log_responses: true
   tamper_proof: true
   storage:
     backend: "sqlite"
     path: "./logs/observations.db"
+    retention:
+      ai_proxy_days: 7
+      mcp_days: 7
+      agent_app_days: 1
+      clusters_days: 14
+      rollups_days: 90
+      vacuum_after_cleanup: true
+    inline_threshold_bytes: 4096
 
 # Budget configuration
 budget:
   enabled: true
-  storage_path: "./budget.db"
+  db_path: "~/.soth/budget.db"
   limits:
     - scope: "global"
       daily: 50.00
@@ -71,6 +82,17 @@ budget:
       action: "warn"
     - threshold_percent: 100
       action: "block"
+
+# Cloud sync configuration (optional)
+cloud:
+  enabled: false
+  api_key: null
+  endpoint: "https://api.soth.ai"
+  sync_interval_secs: 60
+  config_pull_interval_secs: 300
+  body_upload_enabled: false
+  cache_path: "~/.soth/cloud_config_cache.json"
+  tags: {}
 "#;
 
 const DEFAULT_POLICY: &str = r#"# Default SOTH Policy

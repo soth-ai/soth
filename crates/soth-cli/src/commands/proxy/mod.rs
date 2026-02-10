@@ -20,6 +20,7 @@ mod connections;
 mod env;
 mod metrics;
 mod ratelimit;
+mod retention;
 mod setup_ca;
 mod start;
 mod status;

@@ -408,7 +408,12 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     let event_logger = if no_log {
         None
     } else {
-        Some(EventLogger::with_default_path().context("Failed to initialize event logger")?)
+        Some(
+            EventLogger::with_default_path_with_inline_payload_max_bytes(
+                config.observe.storage.inline_threshold_bytes,
+            )
+            .context("Failed to initialize event logger")?,
+        )
     };
 
     let session = Arc::new(WrapSession::new(

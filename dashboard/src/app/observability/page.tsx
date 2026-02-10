@@ -100,6 +100,13 @@ function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
     token_count: derivedTokenCount,
     input_tokens: derivedInputTokens,
     output_tokens: derivedOutputTokens,
+    cache_read_tokens: wrapEvent.cache_read_tokens,
+    cache_write_tokens: wrapEvent.cache_write_tokens,
+    reasoning_tokens: wrapEvent.reasoning_tokens,
+    request_size_bytes: wrapEvent.request_size_bytes,
+    response_size_bytes: wrapEvent.response_size_bytes,
+    headers: wrapEvent.headers,
+    tags: wrapEvent.tags,
     cost_usd: wrapEvent.cost_usd,
     latency_ms: wrapEvent.latency_ms,
     message_type:

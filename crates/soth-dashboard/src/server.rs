@@ -7,7 +7,7 @@ use axum::{response::Html, routing::get, Router};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Dashboard server
 pub struct DashboardServer {
@@ -50,6 +50,7 @@ impl DashboardServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
+        let dashboard_state = self.state.clone();
         // Build app state
         let app_state = AppState::new(self.state);
 
@@ -67,7 +68,34 @@ impl DashboardServer {
 
             // Load initial events
             if let Err(e) = store.load_initial().await {
-                tracing::warn!("Failed to load initial events: {}", e);
+                warn!("Failed to load initial events: {}", e);
+            }
+
+            let should_warm_start = {
+                let proxy = dashboard_state.proxy();
+                proxy.total_requests == 0 && proxy.total_responses == 0 && proxy.total_tokens == 0
+            };
+            if should_warm_start {
+                match dashboard_state.warm_start_from_rollups(store.path()) {
+                    Ok(summary) if summary.rows_scanned > 0 => {
+                        info!(
+                            rows = summary.rows_scanned,
+                            providers = summary.providers_loaded,
+                            requests = summary.requests,
+                            responses = summary.responses,
+                            tokens = summary.total_tokens,
+                            cost_usd = summary.total_cost_usd,
+                            "Dashboard warm-started from rollups_1m"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(
+                            "Failed to warm-start dashboard metrics from rollups: {}",
+                            error
+                        );
+                    }
+                }
             }
 
             // Start file watcher in background

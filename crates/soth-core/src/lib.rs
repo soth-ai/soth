@@ -11,12 +11,14 @@
 //! - File watching utilities
 //! - Event logging utilities
 
+pub mod api;
 pub mod config;
 pub mod error;
 pub mod event_logger;
 pub mod types;
 pub mod watch;
 
+pub use api::*;
 pub use config::{loader::load_config, types::HostAction, types::SothConfig};
 pub use error::{Result, SothError};
 pub use event_logger::EventLogger;

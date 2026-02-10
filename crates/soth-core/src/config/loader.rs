@@ -5,6 +5,7 @@
 use crate::config::types::SothConfig;
 use crate::error::{Result, SothError};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Load configuration from a YAML file
@@ -17,10 +18,13 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 
     let content = std::fs::read_to_string(path)?;
     let mut config: SothConfig = serde_yaml::from_str(&content)?;
+    config.observe.storage.apply_legacy_retention_days();
     apply_host_domain_file_overrides(&mut config, path.parent())?;
 
     // Apply environment variable overrides
     apply_env_overrides(&mut config);
+    normalize_cloud_config(&mut config);
+    normalize_budget_db_path(&mut config);
 
     Ok(config)
 }
@@ -28,9 +32,27 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 /// Load configuration from a string
 pub fn load_config_from_str(content: &str) -> Result<SothConfig> {
     let mut config: SothConfig = serde_yaml::from_str(content)?;
+    config.observe.storage.apply_legacy_retention_days();
     apply_host_domain_file_overrides(&mut config, None)?;
     apply_env_overrides(&mut config);
+    normalize_cloud_config(&mut config);
+    normalize_budget_db_path(&mut config);
     Ok(config)
+}
+
+fn normalize_budget_db_path(config: &mut SothConfig) {
+    if let Some(path) = config.budget.db_path.clone() {
+        config.budget.db_path = Some(expand_path(&path));
+    }
+}
+
+fn normalize_cloud_config(config: &mut SothConfig) {
+    if let Some(path) = config.cloud.cache_path.clone() {
+        config.cloud.cache_path = Some(expand_path(&path));
+    }
+    if config.cloud.api_key.is_none() {
+        config.cloud.enabled = false;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +195,46 @@ fn apply_env_overrides(config: &mut SothConfig) {
     if let Ok(value) = std::env::var("SOTH_OBSERVE_PII_AGENT_APPS") {
         config.observe.pii_scopes.agent_apps = value.parse().unwrap_or(true);
     }
+    if let Ok(value) = std::env::var("SOTH_OBSERVE_EVENT_TAGS") {
+        config.observe.event_tags = parse_key_value_tags(&value);
+    }
+
+    // Cloud overrides
+    if let Ok(enabled) = std::env::var("SOTH_CLOUD_ENABLED") {
+        config.cloud.enabled = enabled.parse().unwrap_or(config.cloud.enabled);
+    }
+    if let Ok(api_key) = std::env::var("SOTH_CLOUD_API_KEY") {
+        if !api_key.trim().is_empty() {
+            config.cloud.api_key = Some(api_key);
+        }
+    }
+    if let Ok(endpoint) = std::env::var("SOTH_CLOUD_ENDPOINT") {
+        if !endpoint.trim().is_empty() {
+            config.cloud.endpoint = endpoint;
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_TAGS") {
+        config.cloud.tags = parse_key_value_tags(&value);
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_SYNC_INTERVAL_SECS") {
+        if let Ok(parsed) = value.parse() {
+            config.cloud.sync_interval_secs = parsed;
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_CONFIG_PULL_INTERVAL_SECS") {
+        if let Ok(parsed) = value.parse() {
+            config.cloud.config_pull_interval_secs = parsed;
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_BODY_UPLOAD_ENABLED") {
+        config.cloud.body_upload_enabled =
+            value.parse().unwrap_or(config.cloud.body_upload_enabled);
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_CACHE_PATH") {
+        if !value.trim().is_empty() {
+            config.cloud.cache_path = Some(value.into());
+        }
+    }
 
     // Budget overrides
     if let Ok(enabled) = std::env::var("SOTH_BUDGET_ENABLED") {
@@ -186,6 +248,26 @@ fn apply_env_overrides(config: &mut SothConfig) {
     if let Ok(format) = std::env::var("SOTH_LOG_FORMAT") {
         config.logging.format = format;
     }
+}
+
+fn parse_key_value_tags(input: &str) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    for part in input.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        tags.insert(key.to_string(), value.to_string());
+    }
+    tags
 }
 
 /// Expand tilde and environment variables in paths
@@ -225,7 +307,21 @@ mod dirs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env_var(name: &str, previous: Option<OsString>) {
+        match previous {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
 
     #[test]
     fn test_load_config_from_str() {
@@ -240,19 +336,88 @@ server:
     }
 
     #[test]
+    fn test_legacy_retention_days_migrates_to_source_aware_retention() {
+        let yaml = r#"
+observe:
+  storage:
+    retention_days: 5
+"#;
+        let config = load_config_from_str(yaml).unwrap();
+        assert_eq!(config.observe.storage.retention.ai_proxy_days, 5);
+        assert_eq!(config.observe.storage.retention.mcp_days, 5);
+        assert_eq!(config.observe.storage.retention.agent_app_days, 5);
+        assert_eq!(config.observe.storage.retention.clusters_days, 5);
+        assert_eq!(config.observe.storage.retention.rollups_days, 5);
+    }
+
+    #[test]
+    fn test_explicit_retention_config_wins_over_legacy_retention_days() {
+        let yaml = r#"
+observe:
+  storage:
+    retention:
+      ai_proxy_days: 9
+      mcp_days: 8
+      agent_app_days: 2
+      clusters_days: 20
+      rollups_days: 120
+      vacuum_after_cleanup: false
+    retention_days: 3
+"#;
+        let config = load_config_from_str(yaml).unwrap();
+        assert_eq!(config.observe.storage.retention.ai_proxy_days, 9);
+        assert_eq!(config.observe.storage.retention.mcp_days, 8);
+        assert_eq!(config.observe.storage.retention.agent_app_days, 2);
+        assert_eq!(config.observe.storage.retention.clusters_days, 20);
+        assert_eq!(config.observe.storage.retention.rollups_days, 120);
+        assert!(!config.observe.storage.retention.vacuum_after_cleanup);
+    }
+
+    #[test]
+    fn test_budget_storage_path_alias_maps_to_db_path() {
+        let yaml = r#"
+budget:
+  enabled: true
+  storage_path: "/tmp/soth-budget-alias.db"
+"#;
+        let config = load_config_from_str(yaml).unwrap();
+        assert_eq!(
+            config.budget.db_path,
+            Some(std::path::PathBuf::from("/tmp/soth-budget-alias.db"))
+        );
+    }
+
+    #[test]
+    fn test_budget_db_path_defaults_to_soth_home_db() {
+        let config = load_config_from_str("version: \"1.0\"").unwrap();
+        let db_path = config.budget.db_path.expect("default budget db path");
+        assert!(
+            db_path.to_string_lossy().contains(".soth/budget.db"),
+            "unexpected default budget db path: {}",
+            db_path.display()
+        );
+    }
+
+    #[test]
     fn test_expand_path_tilde() {
+        let _guard = env_lock().lock().unwrap();
+        let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", "/home/test");
         let path = Path::new("~/config/soth.yaml");
         let expanded = expand_path(path);
         assert!(expanded.to_string_lossy().contains("/home/test"));
+        restore_env_var("HOME", prev_home);
     }
 
     #[test]
     fn test_expand_path_env_var() {
+        let _guard = env_lock().lock().unwrap();
+        let prev = std::env::var_os("SOTH_CONFIG_DIR");
         std::env::set_var("SOTH_CONFIG_DIR", "/etc/soth");
         let path = Path::new("$SOTH_CONFIG_DIR/config.yaml");
         let expanded = expand_path(path);
         assert_eq!(expanded.to_string_lossy(), "/etc/soth/config.yaml");
+        restore_env_var("SOTH_CONFIG_DIR", prev);
     }
 
     #[test]
@@ -343,5 +508,76 @@ forward_proxy:
             domains,
             vec!["api.openai.com".to_string(), "chatgpt.com".to_string()]
         );
+    }
+
+    #[test]
+    fn test_parse_key_value_tags() {
+        let tags = parse_key_value_tags("project=soth, env = dev,invalid,foo=bar");
+        assert_eq!(tags.get("project"), Some(&"soth".to_string()));
+        assert_eq!(tags.get("env"), Some(&"dev".to_string()));
+        assert_eq!(tags.get("foo"), Some(&"bar".to_string()));
+        assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn test_observe_event_tags_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("SOTH_OBSERVE_EVENT_TAGS", "project=soth,env=staging");
+        let config = load_config_from_str("version: \"1.0\"").unwrap();
+        assert_eq!(
+            config.observe.event_tags.get("project"),
+            Some(&"soth".to_string())
+        );
+        assert_eq!(
+            config.observe.event_tags.get("env"),
+            Some(&"staging".to_string())
+        );
+        std::env::remove_var("SOTH_OBSERVE_EVENT_TAGS");
+    }
+
+    #[test]
+    fn test_cloud_overrides_and_normalization() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("SOTH_CLOUD_ENABLED", "true");
+        std::env::set_var("SOTH_CLOUD_API_KEY", "soth_live_test");
+        std::env::set_var("SOTH_CLOUD_ENDPOINT", "https://staging.soth.ai");
+        std::env::set_var("SOTH_CLOUD_TAGS", "project=soth,env=qa");
+        std::env::set_var("SOTH_CLOUD_SYNC_INTERVAL_SECS", "45");
+        std::env::set_var("SOTH_CLOUD_CONFIG_PULL_INTERVAL_SECS", "180");
+        std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED", "true");
+
+        let config = load_config_from_str("version: \"1.0\"").unwrap();
+        assert!(config.cloud.enabled);
+        assert_eq!(config.cloud.api_key.as_deref(), Some("soth_live_test"));
+        assert_eq!(config.cloud.endpoint, "https://staging.soth.ai");
+        assert_eq!(config.cloud.sync_interval_secs, 45);
+        assert_eq!(config.cloud.config_pull_interval_secs, 180);
+        assert!(config.cloud.body_upload_enabled);
+        assert_eq!(config.cloud.tags.get("project"), Some(&"soth".to_string()));
+
+        std::env::remove_var("SOTH_CLOUD_ENABLED");
+        std::env::remove_var("SOTH_CLOUD_API_KEY");
+        std::env::remove_var("SOTH_CLOUD_ENDPOINT");
+        std::env::remove_var("SOTH_CLOUD_TAGS");
+        std::env::remove_var("SOTH_CLOUD_SYNC_INTERVAL_SECS");
+        std::env::remove_var("SOTH_CLOUD_CONFIG_PULL_INTERVAL_SECS");
+        std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED");
+    }
+
+    #[test]
+    fn test_cloud_disabled_when_api_key_missing() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("SOTH_CLOUD_ENABLED");
+        std::env::remove_var("SOTH_CLOUD_API_KEY");
+
+        let yaml = r#"
+cloud:
+  enabled: true
+"#;
+        let config = load_config_from_str(yaml).unwrap();
+        assert!(!config.cloud.enabled);
+
+        std::env::remove_var("SOTH_CLOUD_ENABLED");
+        std::env::remove_var("SOTH_CLOUD_API_KEY");
     }
 }

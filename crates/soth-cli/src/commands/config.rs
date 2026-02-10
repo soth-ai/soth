@@ -81,6 +81,9 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
     // Validate budget section
     validate_budget(&config, &mut warnings, &mut errors);
 
+    // Validate cloud section
+    validate_cloud(&config, &mut warnings, &mut errors);
+
     // Print results
     println!();
     if !warnings.is_empty() {
@@ -157,6 +160,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             config.observe.pii_scopes.mcp,
             config.observe.pii_scopes.agent_apps
         );
+        println!("  Event tags:  {}", config.observe.event_tags.len());
         println!(
             "  Budget:      {}",
             if config.budget.enabled {
@@ -164,6 +168,15 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             } else {
                 "disabled"
             }
+        );
+        println!(
+            "  Cloud:       {} ({})",
+            if config.cloud.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            config.cloud.endpoint
         );
 
         // Cache config
@@ -308,6 +321,35 @@ fn validate_budget(config: &SothConfig, warnings: &mut Vec<String>, _errors: &mu
         if limit.daily.is_none() && limit.weekly.is_none() && limit.monthly.is_none() {
             warnings.push(format!("Budget limit {i} has no actual limits set"));
         }
+    }
+}
+
+/// Validate cloud configuration
+fn validate_cloud(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
+    if !config.cloud.enabled {
+        return;
+    }
+
+    if config.cloud.api_key.is_none() {
+        errors.push("cloud.enabled=true but cloud.api_key is missing".to_string());
+    }
+
+    if config.cloud.endpoint.trim().is_empty() {
+        errors.push("cloud.endpoint cannot be empty".to_string());
+    } else if !config.cloud.endpoint.starts_with("http://")
+        && !config.cloud.endpoint.starts_with("https://")
+    {
+        warnings.push("cloud.endpoint should start with http:// or https://".to_string());
+    }
+
+    if config.cloud.sync_interval_secs == 0 {
+        warnings
+            .push("cloud.sync_interval_secs is 0 (no periodic metadata sync cadence)".to_string());
+    }
+    if config.cloud.config_pull_interval_secs == 0 {
+        warnings.push(
+            "cloud.config_pull_interval_secs is 0 (no periodic config pull cadence)".to_string(),
+        );
     }
 }
 

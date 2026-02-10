@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::traffic_envelope::TrafficEnvelope;
 
@@ -142,6 +143,34 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
 
+    /// Prompt cache read tokens (cache hits)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+
+    /// Prompt cache write tokens (cache creation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+
+    /// Reasoning token usage (where provider reports it)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+
+    /// Request payload size in bytes (wire payload)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_size_bytes: Option<u64>,
+
+    /// Response payload size in bytes (wire payload)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_size_bytes: Option<u64>,
+
+    /// Sanitized HTTP headers captured for observability (sensitive values redacted)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+
+    /// User-configured event tags for cost allocation/routing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, String>>,
+
     /// Estimated cost in USD
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
@@ -191,6 +220,13 @@ impl WrapEvent {
             token_count: None,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            request_size_bytes: None,
+            response_size_bytes: None,
+            headers: None,
+            tags: None,
             cost_usd: None,
             latency_ms: None,
         }
@@ -301,6 +337,54 @@ impl WrapEvent {
         self.input_tokens = Some(input_tokens);
         self.output_tokens = Some(output_tokens);
         self.token_count = Some(input_tokens + output_tokens);
+        self
+    }
+
+    /// Set cache token details
+    pub fn with_cache_tokens(
+        mut self,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) -> Self {
+        self.cache_read_tokens = cache_read_tokens;
+        self.cache_write_tokens = cache_write_tokens;
+        self
+    }
+
+    /// Set reasoning token detail
+    pub fn with_reasoning_tokens(mut self, reasoning_tokens: u64) -> Self {
+        self.reasoning_tokens = Some(reasoning_tokens);
+        self
+    }
+
+    /// Set request/response payload sizes
+    pub fn with_payload_sizes(
+        mut self,
+        request_size_bytes: Option<u64>,
+        response_size_bytes: Option<u64>,
+    ) -> Self {
+        self.request_size_bytes = request_size_bytes;
+        self.response_size_bytes = response_size_bytes;
+        self
+    }
+
+    /// Set sanitized headers map
+    pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+        if headers.is_empty() {
+            self.headers = None;
+        } else {
+            self.headers = Some(headers);
+        }
+        self
+    }
+
+    /// Set event tags map
+    pub fn with_tags(mut self, tags: BTreeMap<String, String>) -> Self {
+        if tags.is_empty() {
+            self.tags = None;
+        } else {
+            self.tags = Some(tags);
+        }
         self
     }
 
@@ -469,10 +553,18 @@ mod tests {
     fn test_usage_tokens_sets_total() {
         let agent = AgentInfo::new("Claude Desktop", DetectionSource::McpInitialize);
         let event = WrapEvent::new("sess-usage", "api.anthropic.com", WrapDirection::Out, agent)
-            .with_usage_tokens(120, 45);
+            .with_usage_tokens(120, 45)
+            .with_cache_tokens(Some(33), Some(12))
+            .with_reasoning_tokens(9)
+            .with_payload_sizes(Some(1_024), Some(2_048));
 
         assert_eq!(event.input_tokens, Some(120));
         assert_eq!(event.output_tokens, Some(45));
         assert_eq!(event.token_count, Some(165));
+        assert_eq!(event.cache_read_tokens, Some(33));
+        assert_eq!(event.cache_write_tokens, Some(12));
+        assert_eq!(event.reasoning_tokens, Some(9));
+        assert_eq!(event.request_size_bytes, Some(1_024));
+        assert_eq!(event.response_size_bytes, Some(2_048));
     }
 }

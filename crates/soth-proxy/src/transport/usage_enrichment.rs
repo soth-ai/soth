@@ -15,6 +15,9 @@ pub struct ResponseUsageMeta {
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
 }
 
@@ -96,6 +99,11 @@ fn build_response_usage_meta(
         meta.input_tokens = Some(provider_usage.input_tokens);
         meta.output_tokens = Some(provider_usage.output_tokens);
     }
+    meta.cache_read_tokens = provider_usage
+        .cache_read_tokens
+        .or(provider_usage.cached_tokens);
+    meta.cache_write_tokens = provider_usage.cache_write_tokens;
+    meta.reasoning_tokens = provider_usage.reasoning_tokens;
 
     let model = provider_usage
         .model

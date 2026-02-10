@@ -1,7 +1,9 @@
 //! Start soth proxy command
 
 use crate::cli_config;
+use crate::commands::cloud_hooks;
 use crate::commands::enforcement;
+use crate::commands::proxy::retention;
 use crate::commands::proxy::system;
 use crate::commands::proxy::StartUiMode;
 use crate::commands::tui::{self, TuiArgs};
@@ -11,6 +13,7 @@ use anyhow::Context;
 use console::Term;
 use owo_colors::OwoColorize;
 use soth_core::config::{HostFilterMode, SothConfig};
+use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
 use soth_dashboard::server::DashboardServer;
 use soth_dashboard::DashboardState;
@@ -47,7 +50,8 @@ pub async fn run(
     ui_mode: StartUiMode,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    let mut config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    cloud_hooks::apply_cached_controls(&mut config)?;
     let resolved_ui = resolve_ui_mode(ui_mode, &config, quiet);
     if matches!(ui_mode, StartUiMode::Tui) && matches!(resolved_ui, StartUiMode::Logs) && !quiet {
         style::warning("Dashboard API is disabled in config; falling back to log mode.");
@@ -116,13 +120,15 @@ pub async fn run(
         HostFilterMode::Selective => summarize_hosts(&intercept_hosts, 3),
     };
 
-    let (event_logger, event_logging_status) = match EventLogger::with_default_path() {
-        Ok(logger) => {
-            let display = compact_path(logger.path());
-            (Some(logger), display)
-        }
-        Err(_) => (None, "disabled".to_string()),
-    };
+    let inline_threshold = config.observe.storage.inline_threshold_bytes;
+    let (event_logger, event_logging_status) =
+        match EventLogger::with_default_path_with_inline_payload_max_bytes(inline_threshold) {
+            Ok(logger) => {
+                let display = compact_path(logger.path());
+                (Some(logger), display)
+            }
+            Err(_) => (None, "disabled".to_string()),
+        };
 
     let dashboard_display = if config.dashboard.enabled {
         format!("http://localhost:{}", config.dashboard.port)
@@ -407,6 +413,10 @@ struct ProxyRuntime {
     proxy_task: JoinHandle<anyhow::Result<()>>,
     dashboard_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     dashboard_task: Option<JoinHandle<()>>,
+    retention_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    retention_task: Option<JoinHandle<()>>,
+    cloud_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    cloud_task: Option<JoinHandle<()>>,
 }
 
 /// Run the soth proxy transport.
@@ -435,6 +445,10 @@ async fn run_forward_proxy(
     };
     let mut dashboard_shutdown_tx = runtime.dashboard_shutdown_tx;
     let mut dashboard_task = runtime.dashboard_task;
+    let mut retention_shutdown_tx = runtime.retention_shutdown_tx;
+    let mut retention_task = runtime.retention_task;
+    let mut cloud_shutdown_tx = runtime.cloud_shutdown_tx;
+    let mut cloud_task = runtime.cloud_task;
     let shutdown_tx = runtime.shutdown_tx;
     let proxy_task = runtime.proxy_task;
 
@@ -453,6 +467,8 @@ async fn run_forward_proxy(
     };
 
     shutdown_dashboard_runtime(&mut dashboard_shutdown_tx, &mut dashboard_task, quiet).await;
+    shutdown_retention_runtime(&mut retention_shutdown_tx, &mut retention_task).await;
+    shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task).await;
 
     if let Some(mut child) = dashboard_ui_process {
         stop_dashboard_ui_process(&mut child);
@@ -500,6 +516,10 @@ async fn run_forward_proxy_with_tui(
     let mut proxy_task = runtime.proxy_task;
     let mut dashboard_shutdown_tx = runtime.dashboard_shutdown_tx;
     let mut dashboard_task = runtime.dashboard_task;
+    let mut retention_shutdown_tx = runtime.retention_shutdown_tx;
+    let mut retention_task = runtime.retention_task;
+    let mut cloud_shutdown_tx = runtime.cloud_shutdown_tx;
+    let mut cloud_task = runtime.cloud_task;
 
     // Pause stdout logs before waiting + entering alternate screen to avoid overlap.
     logging::set_log_output_paused(true);
@@ -545,6 +565,8 @@ async fn run_forward_proxy_with_tui(
     };
 
     shutdown_dashboard_runtime(&mut dashboard_shutdown_tx, &mut dashboard_task, quiet).await;
+    shutdown_retention_runtime(&mut retention_shutdown_tx, &mut retention_task).await;
+    shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task).await;
 
     if let Some(mut child) = dashboard_ui_process {
         stop_dashboard_ui_process(&mut child);
@@ -569,11 +591,19 @@ fn spawn_proxy_runtime(
 ) -> anyhow::Result<ProxyRuntime> {
     let enforcer = enforcement::build_proxy_enforcer(config)?;
     let observe_config = config.observe.clone();
+    let event_db_path = event_logger
+        .as_ref()
+        .map(|logger| logger.path().clone())
+        .or_else(|| default_event_log_write_path().ok());
     let _policy_reload_task = enforcer
         .policy_engine()
         .and_then(|engine| enforcement::spawn_policy_hot_reload(config, engine));
 
-    let dashboard_state = DashboardState::new();
+    let dashboard_state = if let Some(path) = event_db_path.as_deref() {
+        DashboardState::new_with_rollup_warm_start(path)
+    } else {
+        DashboardState::new()
+    };
 
     let mut dashboard_shutdown_tx = None;
     let mut dashboard_task = None;
@@ -593,6 +623,20 @@ fn spawn_proxy_runtime(
                 tracing::error!("Dashboard server error: {}", e);
             }
         }));
+    }
+
+    let mut retention_shutdown_tx = None;
+    let mut retention_task = None;
+    if let Some(runtime) = retention::spawn_retention_runtime(config, event_db_path.clone()) {
+        retention_shutdown_tx = Some(runtime.shutdown_tx);
+        retention_task = Some(runtime.task);
+    }
+
+    let mut cloud_shutdown_tx = None;
+    let mut cloud_task = None;
+    if let Some(runtime) = cloud_hooks::spawn_cloud_pull_runtime(config, event_db_path.clone()) {
+        cloud_shutdown_tx = Some(runtime.shutdown_tx);
+        cloud_task = Some(runtime.task);
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -618,6 +662,10 @@ fn spawn_proxy_runtime(
         proxy_task: handle,
         dashboard_shutdown_tx,
         dashboard_task,
+        retention_shutdown_tx,
+        retention_task,
+        cloud_shutdown_tx,
+        cloud_task,
     })
 }
 
@@ -838,6 +886,50 @@ async fn shutdown_dashboard_runtime(
                 if !quiet {
                     style::warning("Dashboard server shutdown timed out; aborted task.");
                 }
+            }
+        }
+    }
+}
+
+async fn shutdown_retention_runtime(
+    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    task: &mut Option<JoinHandle<()>>,
+) {
+    if let Some(tx) = shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+
+    if let Some(mut handle) = task.take() {
+        match tokio::time::timeout(Duration::from_secs(2), &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("Retention task join error: {}", error);
+            }
+            Err(_) => {
+                handle.abort();
+                tracing::warn!("Retention task shutdown timed out; aborted task.");
+            }
+        }
+    }
+}
+
+async fn shutdown_cloud_runtime(
+    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    task: &mut Option<JoinHandle<()>>,
+) {
+    if let Some(tx) = shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+
+    if let Some(mut handle) = task.take() {
+        match tokio::time::timeout(Duration::from_secs(2), &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("Cloud pull task join error: {}", error);
+            }
+            Err(_) => {
+                handle.abort();
+                tracing::warn!("Cloud pull task shutdown timed out; aborted task.");
             }
         }
     }

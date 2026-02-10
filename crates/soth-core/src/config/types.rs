@@ -3,6 +3,7 @@
 //! Defines the complete configuration structure for the SOTH edge proxy.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -41,6 +42,10 @@ pub struct SothConfig {
     #[serde(default)]
     pub budget: BudgetConfig,
 
+    /// Cloud sync configuration (optional)
+    #[serde(default)]
+    pub cloud: CloudConfig,
+
     /// Dashboard settings
     #[serde(default)]
     pub dashboard: DashboardConfig,
@@ -73,6 +78,7 @@ impl Default for SothConfig {
             policy: PolicyConfig::default(),
             observe: ObserveConfig::default(),
             budget: BudgetConfig::default(),
+            cloud: CloudConfig::default(),
             dashboard: DashboardConfig::default(),
             forward_proxy: ForwardProxyConfig::default(),
             production: ProductionConfig::default(),
@@ -451,6 +457,10 @@ pub struct ObserveConfig {
     #[serde(default)]
     pub pii_scopes: ObservePiiScopes,
 
+    /// User-defined tags attached to all emitted observability events.
+    #[serde(default)]
+    pub event_tags: BTreeMap<String, String>,
+
     /// Log requests
     #[serde(default = "default_true")]
     pub log_requests: bool,
@@ -490,6 +500,7 @@ impl Default for ObserveConfig {
             enabled: true,
             pii_detection: true,
             pii_scopes: ObservePiiScopes::default(),
+            event_tags: BTreeMap::new(),
             log_requests: true,
             log_responses: true,
             tamper_proof: false,
@@ -535,9 +546,20 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_path")]
     pub path: PathBuf,
 
-    /// Retention in days (0 = forever)
+    /// Source-aware retention configuration.
     #[serde(default)]
-    pub retention_days: u32,
+    pub retention: RetentionConfig,
+
+    /// Inline payload threshold (bytes) before payload side-table offload.
+    #[serde(default = "default_inline_threshold_bytes")]
+    pub inline_threshold_bytes: usize,
+
+    /// Deprecated single retention days setting (0 = forever).
+    /// Read for backward compatibility from existing configs.
+    #[serde(default)]
+    #[serde(rename = "retention_days")]
+    #[serde(skip_serializing)]
+    pub legacy_retention_days: Option<u32>,
 }
 
 fn default_storage_backend() -> String {
@@ -548,18 +570,116 @@ fn default_storage_path() -> PathBuf {
     PathBuf::from("./logs")
 }
 
+fn default_inline_threshold_bytes() -> usize {
+    4096
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: default_storage_backend(),
             path: default_storage_path(),
-            retention_days: 0,
+            retention: RetentionConfig::default(),
+            inline_threshold_bytes: default_inline_threshold_bytes(),
+            legacy_retention_days: None,
         }
     }
 }
 
+impl StorageConfig {
+    /// Applies deprecated `retention_days` when present and no explicit
+    /// source-aware retention values were configured.
+    pub fn apply_legacy_retention_days(&mut self) {
+        let Some(days) = self.legacy_retention_days.take() else {
+            return;
+        };
+
+        if self.retention.is_default() {
+            self.retention = RetentionConfig::uniform(days);
+        }
+    }
+}
+
+/// Source-aware retention policy for observability artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// AI provider/direct inference events.
+    #[serde(default = "default_retention_ai_proxy_days")]
+    pub ai_proxy_days: u32,
+    /// MCP events.
+    #[serde(default = "default_retention_mcp_days")]
+    pub mcp_days: u32,
+    /// Agent app events (typically highest volume/noisiest).
+    #[serde(default = "default_retention_agent_app_days")]
+    pub agent_app_days: u32,
+    /// Materialized request/response clusters.
+    #[serde(default = "default_retention_clusters_days")]
+    pub clusters_days: u32,
+    /// Minute rollups for dashboard warm starts and trends.
+    #[serde(default = "default_retention_rollups_days")]
+    pub rollups_days: u32,
+    /// Whether maintenance may run VACUUM after cleanup.
+    #[serde(default = "default_true")]
+    pub vacuum_after_cleanup: bool,
+}
+
+fn default_retention_ai_proxy_days() -> u32 {
+    7
+}
+
+fn default_retention_mcp_days() -> u32 {
+    7
+}
+
+fn default_retention_agent_app_days() -> u32 {
+    1
+}
+
+fn default_retention_clusters_days() -> u32 {
+    14
+}
+
+fn default_retention_rollups_days() -> u32 {
+    90
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            ai_proxy_days: default_retention_ai_proxy_days(),
+            mcp_days: default_retention_mcp_days(),
+            agent_app_days: default_retention_agent_app_days(),
+            clusters_days: default_retention_clusters_days(),
+            rollups_days: default_retention_rollups_days(),
+            vacuum_after_cleanup: true,
+        }
+    }
+}
+
+impl RetentionConfig {
+    pub fn uniform(days: u32) -> Self {
+        Self {
+            ai_proxy_days: days,
+            mcp_days: days,
+            agent_app_days: days,
+            clusters_days: days,
+            rollups_days: days,
+            vacuum_after_cleanup: true,
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.ai_proxy_days == default_retention_ai_proxy_days()
+            && self.mcp_days == default_retention_mcp_days()
+            && self.agent_app_days == default_retention_agent_app_days()
+            && self.clusters_days == default_retention_clusters_days()
+            && self.rollups_days == default_retention_rollups_days()
+            && self.vacuum_after_cleanup
+    }
+}
+
 /// Budget configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -573,7 +693,90 @@ pub struct BudgetConfig {
     pub alerts: Vec<AlertConfig>,
 
     /// Database path for persistence
+    #[serde(default = "default_budget_db_path")]
+    #[serde(alias = "storage_path")]
     pub db_path: Option<PathBuf>,
+}
+
+fn default_budget_db_path() -> Option<PathBuf> {
+    Some(PathBuf::from("~/.soth/budget.db"))
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            limits: Vec::new(),
+            alerts: Vec::new(),
+            db_path: default_budget_db_path(),
+        }
+    }
+}
+
+/// Cloud sync configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudConfig {
+    /// Whether cloud sync hooks are enabled
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// API key for cloud authentication
+    pub api_key: Option<String>,
+
+    /// Cloud API endpoint
+    #[serde(default = "default_cloud_endpoint")]
+    pub endpoint: String,
+
+    /// User-defined cloud tags for attribution
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+
+    /// Metadata sync interval
+    #[serde(default = "default_cloud_sync_interval_secs")]
+    pub sync_interval_secs: u64,
+
+    /// Config pull interval
+    #[serde(default = "default_cloud_config_pull_interval_secs")]
+    pub config_pull_interval_secs: u64,
+
+    /// Whether response/request body uploads are enabled
+    #[serde(default)]
+    pub body_upload_enabled: bool,
+
+    /// Local path for cached cloud config snapshot
+    #[serde(default = "default_cloud_cache_path")]
+    pub cache_path: Option<PathBuf>,
+}
+
+fn default_cloud_endpoint() -> String {
+    "https://api.soth.ai".to_string()
+}
+
+fn default_cloud_sync_interval_secs() -> u64 {
+    60
+}
+
+fn default_cloud_config_pull_interval_secs() -> u64 {
+    300
+}
+
+fn default_cloud_cache_path() -> Option<PathBuf> {
+    Some(PathBuf::from("~/.soth/cloud_config_cache.json"))
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            endpoint: default_cloud_endpoint(),
+            tags: BTreeMap::new(),
+            sync_interval_secs: default_cloud_sync_interval_secs(),
+            config_pull_interval_secs: default_cloud_config_pull_interval_secs(),
+            body_upload_enabled: false,
+            cache_path: default_cloud_cache_path(),
+        }
+    }
 }
 
 /// Budget limit configuration
@@ -1829,6 +2032,8 @@ mod tests {
         assert_eq!(config.version, "1.0");
         assert_eq!(config.server.transport, "stdio");
         assert_eq!(config.server.listen.port, 3000);
+        assert!(!config.cloud.enabled);
+        assert_eq!(config.cloud.endpoint, "https://api.soth.ai");
     }
 
     #[test]
@@ -1857,6 +2062,30 @@ upstream:
         assert_eq!(config.server.listen.port, 8080);
         assert_eq!(config.server.transport, "sse");
         assert_eq!(config.upstream.command, Some("npx".to_string()));
+    }
+
+    #[test]
+    fn test_parse_cloud_config_yaml() {
+        let yaml = r#"
+cloud:
+  enabled: true
+  api_key: "soth_live_abc123"
+  endpoint: "https://staging.soth.ai"
+  sync_interval_secs: 30
+  config_pull_interval_secs: 120
+  body_upload_enabled: true
+  tags:
+    project: "edge"
+    env: "staging"
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.cloud.enabled);
+        assert_eq!(config.cloud.api_key.as_deref(), Some("soth_live_abc123"));
+        assert_eq!(config.cloud.endpoint, "https://staging.soth.ai");
+        assert_eq!(config.cloud.sync_interval_secs, 30);
+        assert_eq!(config.cloud.config_pull_interval_secs, 120);
+        assert!(config.cloud.body_upload_enabled);
+        assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
     }
 
     #[test]
