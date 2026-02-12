@@ -2055,18 +2055,28 @@ impl HttpHandler for AiProxyHandler {
         let dashboard = self.dashboard.clone();
 
         // Check content type for body inspection
-        let is_json = res
+        let content_type = res
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_ascii_lowercase());
+        let is_json = content_type
+            .as_deref()
             .map(|ct| ct.contains("application/json"))
             .unwrap_or(false);
-        let is_sse = res
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
+        let is_sse = content_type
+            .as_deref()
             .map(|ct| ct.contains("text/event-stream"))
             .unwrap_or(false);
+        let is_grpc = content_type
+            .as_deref()
+            .map(|ct| ct.contains("application/grpc") || ct.contains("grpc-web"))
+            .unwrap_or(false);
+        let grpc_message_encoding = res
+            .headers()
+            .get("grpc-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_ascii_lowercase());
         let content_encoding = res
             .headers()
             .get("content-encoding")
@@ -2205,7 +2215,7 @@ impl HttpHandler for AiProxyHandler {
             // For JSON responses, capture the body for logging (with decompression)
             // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
             let mut response_size_bytes: Option<u64> = None;
-            let (body_content, res, logged_in_stream) = if is_json
+            let (body_content, res, logged_in_stream) = if (is_json || is_grpc)
                 && !is_sse
                 && !is_codex_response_path
                 && !is_gemini_bard_response_path
@@ -2226,8 +2236,11 @@ impl HttpHandler for AiProxyHandler {
                             &pending.host,
                             &decoded_bytes,
                             false,
+                            content_type.as_deref(),
+                            grpc_message_encoding.as_deref(),
                             pending.model.as_deref(),
-                        );
+                        )
+                        .await;
 
                         // Return original bytes to client (they handle decompression)
                         let new_body = Body::from(Full::new(bytes));
@@ -2253,6 +2266,8 @@ impl HttpHandler for AiProxyHandler {
                 let log_pending = pending.clone();
                 let log_latency_ms = latency_ms;
                 let log_content_encoding = content_encoding.clone();
+                let log_content_type = content_type.clone();
+                let log_grpc_message_encoding = grpc_message_encoding.clone();
                 let log_is_sse = is_sse;
                 let log_event_id = pending.event_id.clone();
                 let log_provider_registry = provider_registry.clone();
@@ -2338,8 +2353,11 @@ impl HttpHandler for AiProxyHandler {
                         &log_pending.host,
                         &decoded_bytes,
                         log_is_sse,
+                        log_content_type.as_deref(),
+                        log_grpc_message_encoding.as_deref(),
                         log_pending.model.as_deref(),
-                    );
+                    )
+                    .await;
                     if let Some(ref tracker) = log_budget_tracker {
                         record_proxy_budget_spend(
                             tracker,
