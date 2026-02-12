@@ -6,6 +6,7 @@ use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
 };
 
+use crate::json_security::strip_json_security_prefix_text;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
 
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +32,7 @@ pub struct ResponseEventInput<'a> {
     pub agent: Option<&'a str>,
     pub method: &'a str,
     pub path: &'a str,
+    pub graphql_operation: Option<&'a str>,
     pub is_agent_app: bool,
     pub status: u16,
     pub latency_ms: u64,
@@ -79,7 +81,14 @@ pub fn normalize_response_content(
 ) -> Option<String> {
     response_content
         .filter(|resp| !resp.trim().is_empty())
-        .map(ToString::to_string)
+        .map(|resp| {
+            let sanitized = strip_json_security_prefix_text(resp);
+            if sanitized.is_empty() {
+                resp.to_string()
+            } else {
+                sanitized.to_string()
+            }
+        })
         .or_else(|| {
             if always_placeholder_on_empty || request_content.is_some() || method == "POST" {
                 Some(empty_response_placeholder(method, path, status, is_sse))
@@ -93,6 +102,10 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
     let agent_name = input.agent.unwrap_or(input.provider);
     let agent_info = AgentInfo::new(agent_name, DetectionSource::Environment);
     let method_str = format!("{} {}", input.method, input.path);
+    let method_label = input
+        .graphql_operation
+        .map(|op| format!("{method_str} · gql:{op}"))
+        .unwrap_or(method_str);
     let source = if input.is_agent_app {
         EventSource::AgentApp
     } else {
@@ -102,9 +115,12 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
     let mut event = WrapEvent::new(input.session_id, input.host, WrapDirection::Out, agent_info)
         .with_source(source)
         .with_provider(input.provider)
-        .with_method(method_str)
+        .with_method(method_label)
         .with_status_code(input.status)
         .with_latency(input.latency_ms);
+    if let Some(op) = input.graphql_operation {
+        event = event.with_graphql_operation(op.to_string());
+    }
 
     if let Some(envelope) = input.traffic_envelope {
         event = event.with_traffic_envelope(envelope);
@@ -122,8 +138,14 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
     if let Some(headers) = input.headers {
         event = event.with_headers(headers);
     }
-    if let Some(tags) = input.tags {
-        event = event.with_tags(tags.clone());
+    if input.tags.is_some() || input.graphql_operation.is_some() {
+        let mut merged = input.tags.cloned().unwrap_or_default();
+        if let Some(op) = input.graphql_operation {
+            merged.insert("graphql_operation".to_string(), op.to_string());
+        }
+        if !merged.is_empty() {
+            event = event.with_tags(merged);
+        }
     }
 
     // Keep compact row summary; full payload is in request_content/response_content.
@@ -154,4 +176,32 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
     }
 
     event
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_response_content;
+
+    #[test]
+    fn normalize_response_content_strips_security_prefix() {
+        let content = normalize_response_content(
+            Some(")]}'\n{\"ok\":true}"),
+            Some("{}"),
+            "POST",
+            "/v1/messages",
+            200,
+            false,
+            true,
+        );
+        assert_eq!(content.as_deref(), Some("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn normalize_response_content_uses_placeholder_when_empty() {
+        let content =
+            normalize_response_content(Some(""), Some("{}"), "POST", "/x", 200, false, true);
+        assert!(content
+            .unwrap_or_default()
+            .contains("no HTTP response body captured"));
+    }
 }

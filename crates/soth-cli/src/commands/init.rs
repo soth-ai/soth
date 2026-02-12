@@ -90,6 +90,7 @@ cloud:
   endpoint: "https://api.soth.ai"
   sync_interval_secs: 60
   config_pull_interval_secs: 300
+  config_debounce_secs: 6
   body_upload_enabled: false
   cache_path: "~/.soth/cloud_config_cache.json"
   tags: {}

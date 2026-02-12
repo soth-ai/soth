@@ -284,7 +284,13 @@ pub fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer
 
     let mut enforcer = ProxyEnforcer::new()
         .with_identity_mode(identity_mode, trusted_dids)
-        .with_identity_headers("X-Agent-DID", "X-Agent-Signature");
+        .with_identity_headers("X-Agent-DID", "X-Agent-Signature")
+        .with_fail_open(
+            config.production.fail_open.enabled,
+            config.production.fail_open.enforcement_timeout,
+            config.production.fail_open.policy_fail_open,
+            config.production.fail_open.budget_fail_open,
+        );
 
     if let Some(engine) = build_policy_engine(config)? {
         let policy_mode = match config.policy.mode.as_str() {

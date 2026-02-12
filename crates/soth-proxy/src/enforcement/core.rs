@@ -45,8 +45,10 @@ pub struct ProxyEnforcementConfig<'a> {
     pub trusted_dids: &'a HashSet<String>,
     pub policy_mode: PolicyMode,
     pub policy_engine: Option<&'a PolicyEngine>,
+    pub policy_fail_open: bool,
     pub budget_tracker: Option<&'a BudgetTracker>,
     pub budget_block_on_exceeded: bool,
+    pub budget_fail_open: bool,
     pub default_model: &'a str,
 }
 
@@ -407,17 +409,31 @@ pub fn enforce_proxy_request(
             .map(|s| s.to_string());
         metrics::record_budget_check("request");
         if config.budget_block_on_exceeded {
-            if let Some(scope) = tracker.first_exceeded_scope(
-                &envelope.session_id,
-                agent_id.as_deref(),
-                envelope.model.as_deref(),
-            ) {
-                metrics::record_budget_block(budget_scope_label(scope));
-                return Err((
-                    429,
-                    format!("Budget exceeded ({})", budget_scope_label(scope)),
-                    None,
-                ));
+            let budget_eval = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tracker.first_exceeded_scope(
+                    &envelope.session_id,
+                    agent_id.as_deref(),
+                    envelope.model.as_deref(),
+                )
+            }));
+
+            match budget_eval {
+                Ok(Some(scope)) => {
+                    metrics::record_budget_block(budget_scope_label(scope));
+                    return Err((
+                        429,
+                        format!("Budget exceeded ({})", budget_scope_label(scope)),
+                        None,
+                    ));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    if config.budget_fail_open {
+                        metrics::record_enforcement_failopen("budget_error");
+                    } else {
+                        return Err((503, "Budget evaluation failed".to_string(), None));
+                    }
+                }
             }
         }
     }
@@ -436,6 +452,11 @@ pub fn enforce_proxy_request(
             metrics::set_policy_active_version(&active_version);
             match config.policy_mode {
                 PolicyMode::Enforce => {
+                    if config.policy_fail_open {
+                        metrics::record_enforcement_failopen("policy_error");
+                        identity.policy_version = Some(active_version);
+                        return Ok(identity);
+                    }
                     return Err((
                         403,
                         format!("Policy evaluation failed (enforce mode): {err}"),

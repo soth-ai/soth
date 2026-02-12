@@ -182,6 +182,81 @@ async fn contract_retry_queue_on_body_upload_failure() {
     assert_eq!(second.retry_uploaded, 1);
 }
 
+#[tokio::test]
+async fn contract_shutdown_flush_drains_multiple_rounds() {
+    let state = Arc::new(Mutex::new(CapturedState::default()));
+    let server_url = start_mock_server(state.clone()).await;
+
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("events.db");
+    create_test_db(&db_path, true);
+    let cache_path = temp.path().join("cloud_cache.json");
+    let retry_queue_dir = temp.path().join("retry");
+
+    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone());
+    let _ = puller.pull_once().await.unwrap();
+
+    let config = SyncAgentConfig {
+        endpoint: server_url,
+        api_key: "test-key".to_string(),
+        event_db_path: db_path.clone(),
+        cache_path,
+        agent_instance_id: "agent-instance-shutdown".to_string(),
+        proxy_version: "0.1.0-test".to_string(),
+        retry_queue_dir,
+        retry_queue_max_bytes: 10 * 1024 * 1024,
+        sync_interval: Duration::from_secs(1),
+        batch_size: 1,
+        body_batch_size: 1,
+        body_upload_enabled: true,
+        global_tags: BTreeMap::new(),
+    };
+    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+
+    let summary = agent.flush_for_shutdown(5).await.unwrap();
+    assert_eq!(summary.metadata_sent, 2);
+    assert_eq!(summary.body_uploaded, 1);
+
+    let conn = Connection::open(&db_path).unwrap();
+    let metadata_cursor: String = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'last_synced_seq'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(metadata_cursor, "2");
+}
+
+#[tokio::test]
+async fn contract_shutdown_flush_surfaces_sync_failure() {
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("events.db");
+    create_test_db(&db_path, false);
+
+    let config = SyncAgentConfig {
+        endpoint: "http://127.0.0.1:1".to_string(),
+        api_key: "test-key".to_string(),
+        event_db_path: db_path,
+        cache_path: temp.path().join("cloud_cache.json"),
+        agent_instance_id: "agent-instance-failure".to_string(),
+        proxy_version: "0.1.0-test".to_string(),
+        retry_queue_dir: temp.path().join("retry"),
+        retry_queue_max_bytes: 10 * 1024 * 1024,
+        sync_interval: Duration::from_secs(1),
+        batch_size: 10,
+        body_batch_size: 10,
+        body_upload_enabled: true,
+        global_tags: BTreeMap::new(),
+    };
+    let agent = SyncAgent::new(config, None).unwrap();
+    let error = agent.flush_for_shutdown(2).await.unwrap_err();
+    assert!(
+        !error.to_string().is_empty(),
+        "expected non-empty sync failure error"
+    );
+}
+
 async fn start_mock_server(state: SharedState) -> String {
     let app = Router::new()
         .route("/api/v1/events/batch", post(events_batch_handler))

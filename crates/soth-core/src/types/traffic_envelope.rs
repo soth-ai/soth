@@ -53,6 +53,15 @@ pub struct TrafficEnvelope {
     /// Optional agent identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Optional local process ID attributed to the source connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_pid: Option<u32>,
+    /// Optional local process name attributed to the source connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    /// Optional executable/command path for the source process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_executable: Option<String>,
     /// Optional identity DID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub did: Option<String>,
@@ -93,6 +102,9 @@ impl TrafficEnvelope {
             path: Some(path.into()),
             model: model.map(ToString::to_string),
             agent: agent.map(ToString::to_string),
+            process_pid: None,
+            process_name: None,
+            process_executable: None,
             did: did.map(ToString::to_string),
             signature: signature.map(ToString::to_string),
             request_body: request_body.map(ToString::to_string),
@@ -122,6 +134,9 @@ impl TrafficEnvelope {
             path: None,
             model: None,
             agent: agent.map(ToString::to_string),
+            process_pid: None,
+            process_name: None,
+            process_executable: None,
             did: did.map(ToString::to_string),
             signature: signature.map(ToString::to_string),
             request_body: request_body.map(ToString::to_string),
@@ -153,6 +168,9 @@ impl TrafficEnvelope {
             path: Some(path.into()),
             model: None,
             agent: agent.map(ToString::to_string),
+            process_pid: None,
+            process_name: None,
+            process_executable: None,
             did: did.map(ToString::to_string),
             signature: signature.map(ToString::to_string),
             request_body: request_body.map(ToString::to_string),

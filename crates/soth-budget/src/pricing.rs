@@ -208,7 +208,9 @@ impl PricingCatalog {
 
     /// Detect provider from model name
     pub fn detect_provider(&self, model: &str) -> Option<String> {
-        self.get_pricing(model).map(|e| e.provider)
+        self.get_pricing(model)
+            .map(|e| e.provider)
+            .or_else(|| soth_registry::detect_provider_from_model(model).map(str::to_string))
     }
 }
 
@@ -664,6 +666,11 @@ mod tests {
         assert_eq!(
             catalog.detect_provider("gemini-1.5-pro"),
             Some("google".to_string())
+        );
+        // Fallback when model is not in pricing catalog but matches registry hint.
+        assert_eq!(
+            catalog.detect_provider("llama-3.3-70b"),
+            Some("meta".to_string())
         );
     }
 }

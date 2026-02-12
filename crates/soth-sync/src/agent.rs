@@ -126,6 +126,31 @@ impl SyncAgent {
         })
     }
 
+    /// Run a bounded best-effort sync drain during shutdown.
+    ///
+    /// This repeatedly runs normal sync ticks and exits early once a round
+    /// produces no forward progress.
+    pub async fn flush_for_shutdown(&self, max_rounds: usize) -> anyhow::Result<SyncTickSummary> {
+        let rounds = max_rounds.max(1);
+        let mut total = SyncTickSummary::default();
+
+        for _ in 0..rounds {
+            let summary = self.tick().await?;
+            total.metadata_sent += summary.metadata_sent;
+            total.body_uploaded += summary.body_uploaded;
+            total.retry_uploaded += summary.retry_uploaded;
+
+            if summary.metadata_sent == 0
+                && summary.body_uploaded == 0
+                && summary.retry_uploaded == 0
+            {
+                break;
+            }
+        }
+
+        Ok(total)
+    }
+
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
         let config_version = self.cached_config_version();
         let request = HeartbeatRequest {

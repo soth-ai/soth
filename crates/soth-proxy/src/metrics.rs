@@ -56,11 +56,15 @@ pub const POLICY_RELOAD_TOTAL: &str = "soth_policy_reload_total";
 pub const POLICY_EVAL_TOTAL: &str = "soth_policy_evaluations_total";
 pub const BUDGET_CHECKS_TOTAL: &str = "soth_budget_checks_total";
 pub const BUDGET_BLOCKS_TOTAL: &str = "soth_budget_blocks_total";
+pub const ENFORCEMENT_FAILOPEN_TOTAL: &str = "soth_enforcement_failopen_total";
+pub const STREAM_CAPTURE_LIMIT_REACHED_TOTAL: &str = "soth_stream_capture_limit_reached_total";
+pub const TLS_LEARNED_PASSTHROUGH_TOTAL: &str = "soth_tls_learned_passthrough_total";
 
 // Gauges
 pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
 pub const CIRCUIT_BREAKER_STATE: &str = "soth_proxy_circuit_breaker_state";
 pub const POLICY_ACTIVE_VERSION: &str = "soth_policy_active_version";
+pub const TLS_LEARNED_PASSTHROUGH_ACTIVE: &str = "soth_tls_learned_passthrough_active";
 
 // Histograms
 pub const REQUEST_DURATION: &str = "soth_proxy_request_duration_seconds";
@@ -99,6 +103,18 @@ fn describe_counters() {
         BUDGET_BLOCKS_TOTAL,
         "Total number of budget blocks by scope"
     );
+    describe_counter!(
+        ENFORCEMENT_FAILOPEN_TOTAL,
+        "Total number of fail-open enforcement events by reason"
+    );
+    describe_counter!(
+        STREAM_CAPTURE_LIMIT_REACHED_TOTAL,
+        "Total number of response streams where capture limit was reached"
+    );
+    describe_counter!(
+        TLS_LEARNED_PASSTHROUGH_TOTAL,
+        "Total learned TLS passthrough events by action"
+    );
 }
 
 fn describe_gauges() {
@@ -110,6 +126,10 @@ fn describe_gauges() {
     describe_gauge!(
         POLICY_ACTIVE_VERSION,
         "Marker gauge for active policy version (1 for current labels)"
+    );
+    describe_gauge!(
+        TLS_LEARNED_PASSTHROUGH_ACTIVE,
+        "Current number of learned passthrough hosts"
     );
 }
 
@@ -191,6 +211,39 @@ pub fn record_budget_check(scope: &str) {
 /// Record budget blocks
 pub fn record_budget_block(scope: &str) {
     counter!(BUDGET_BLOCKS_TOTAL, "scope" => scope.to_string()).increment(1);
+}
+
+/// Record an enforcement fail-open event.
+pub fn record_enforcement_failopen(reason: &str) {
+    counter!(
+        ENFORCEMENT_FAILOPEN_TOTAL,
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a stream response capture limit hit.
+pub fn record_stream_capture_limit_reached(provider: &str, stream_kind: &str) {
+    counter!(
+        STREAM_CAPTURE_LIMIT_REACHED_TOTAL,
+        "provider" => provider.to_string(),
+        "stream_kind" => stream_kind.to_string()
+    )
+    .increment(1);
+}
+
+/// Record learned TLS passthrough action.
+pub fn record_tls_learned_passthrough(action: &str) {
+    counter!(
+        TLS_LEARNED_PASSTHROUGH_TOTAL,
+        "action" => action.to_string()
+    )
+    .increment(1);
+}
+
+/// Set current learned passthrough active host count.
+pub fn set_tls_learned_passthrough_active(count: f64) {
+    gauge!(TLS_LEARNED_PASSTHROUGH_ACTIVE).set(count);
 }
 
 /// Set active connections gauge

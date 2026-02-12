@@ -3680,6 +3680,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soth-core",
+ "soth-registry",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3711,6 +3712,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "soth-budget",
+ "soth-collector",
  "soth-core",
  "soth-dashboard",
  "soth-identity",
@@ -3728,6 +3730,22 @@ dependencies = [
  "uuid",
  "which",
  "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "soth-collector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "serde",
+ "serde_json",
+ "soth-core",
+ "soth-observe",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3861,6 +3879,7 @@ dependencies = [
  "soth-identity",
  "soth-observe",
  "soth-policy",
+ "soth-registry",
  "soth-tls",
  "tempfile",
  "thiserror 1.0.69",
@@ -3874,6 +3893,14 @@ dependencies = [
  "uuid",
  "webpki-roots 0.26.11",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "soth-registry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3922,6 +3949,8 @@ dependencies = [
  "rcgen 0.13.2",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "soth-core",
  "tempfile",
  "thiserror 1.0.69",

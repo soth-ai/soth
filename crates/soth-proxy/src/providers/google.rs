@@ -15,6 +15,7 @@
 //! - From URL path: `/models/{model}:generateContent`
 
 use super::{AiProvider, HttpRequest, ProviderUsage, SseEvent};
+use crate::json_security::{strip_json_security_prefix, strip_json_security_prefix_text};
 use serde_json::Value;
 
 fn parse_json_with_xssi_fallback(body: &[u8]) -> Option<Value> {
@@ -22,15 +23,10 @@ fn parse_json_with_xssi_fallback(body: &[u8]) -> Option<Value> {
         return Some(json);
     }
 
-    let text = std::str::from_utf8(body).ok()?;
-    let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix(")]}'") {
-        let payload = rest
-            .split_once('\n')
-            .map(|(_, tail)| tail.trim())
-            .unwrap_or_default();
-        if !payload.is_empty() {
-            return serde_json::from_str::<Value>(payload).ok();
+    let sanitized = strip_json_security_prefix(body);
+    if sanitized.len() != body.len() {
+        if let Ok(json) = serde_json::from_slice::<Value>(sanitized) {
+            return Some(json);
         }
     }
 
@@ -42,11 +38,12 @@ fn parse_batchexecute_wrapped_payloads(body: &str) -> Vec<Value> {
 
     for line in body.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(")]}'") || !trimmed.starts_with('[') {
+        let sanitized = strip_json_security_prefix_text(trimmed);
+        if sanitized.is_empty() || !sanitized.starts_with('[') {
             continue;
         }
 
-        let Ok(wrapper) = serde_json::from_str::<Value>(trimmed) else {
+        let Ok(wrapper) = serde_json::from_str::<Value>(sanitized) else {
             continue;
         };
         let Some(records) = wrapper.as_array() else {

@@ -21,12 +21,13 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
 use soth_policy::PolicyEngine;
+use soth_tls::LearnedPassthrough;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "dashboard")]
@@ -34,7 +35,11 @@ use soth_dashboard::{DashboardState, DenialEntry};
 
 use crate::enforcement::core as enforcement_core;
 use crate::error::ProxyError;
+use crate::json_security::strip_json_security_prefix_text;
+use crate::metrics;
+use crate::process_attribution::{ProcessAttribution, ProcessIdentity};
 use crate::providers::ProviderRegistry;
+use crate::transport::graphql_enrichment::extract_graphql_operation;
 use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
 use crate::transport::pii_enrichment::PiiEventEnricher;
@@ -72,6 +77,7 @@ struct PendingRequest {
     provider: Option<&'static str>,
     agent: Option<&'static str>,
     model: Option<String>,
+    graphql_operation: Option<String>,
     started_at: Instant,
     /// Request body content for paired logging
     request_content: Option<String>,
@@ -104,6 +110,8 @@ fn request_id_from_ctx(ctx: &HttpContext) -> u64 {
 const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
 const STREAM_CAPTURE_INITIAL_CAPACITY: usize = 64 * 1024;
 const STREAM_BUFFER_POOL_MAX_BUFFERS: usize = 32;
+const PROCESS_ATTR_LOOKUP_TIMEOUT: Duration = Duration::from_millis(25);
+const PROCESS_ATTR_CACHE_TTL: Duration = Duration::from_secs(30);
 
 static STREAM_BUFFER_POOL: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -125,6 +133,18 @@ fn release_stream_buffer(mut buffer: Vec<u8>) {
     if pool.len() < STREAM_BUFFER_POOL_MAX_BUFFERS {
         pool.push(buffer);
     }
+}
+
+/// Append a stream chunk into capture buffer with a hard memory cap.
+/// Returns true when the cap is reached (or already reached).
+fn append_stream_capture(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if buffer.len() >= STREAM_CAPTURE_MAX_BYTES {
+        return true;
+    }
+    let remaining = STREAM_CAPTURE_MAX_BYTES - buffer.len();
+    let write_len = remaining.min(chunk.len());
+    buffer.extend_from_slice(&chunk[..write_len]);
+    write_len < chunk.len()
 }
 
 /// Identity verification mode for proxy enforcement.
@@ -152,9 +172,13 @@ pub struct ProxyEnforcer {
     trusted_dids: Arc<HashSet<String>>,
     policy_mode: ProxyPolicyMode,
     policy_engine: Option<Arc<PolicyEngine>>,
+    policy_fail_open: bool,
     budget_tracker: Option<Arc<BudgetTracker>>,
     budget_block_on_exceeded: bool,
+    budget_fail_open: bool,
     default_model: String,
+    fail_open_enabled: bool,
+    enforcement_timeout: Duration,
 }
 
 type EnforcementResult = enforcement_core::IdentityResult;
@@ -169,9 +193,13 @@ impl ProxyEnforcer {
             trusted_dids: Arc::new(HashSet::new()),
             policy_mode: ProxyPolicyMode::Disabled,
             policy_engine: None,
+            policy_fail_open: true,
             budget_tracker: None,
             budget_block_on_exceeded: true,
+            budget_fail_open: true,
             default_model: "gpt-4o".to_string(),
+            fail_open_enabled: true,
+            enforcement_timeout: Duration::from_millis(500),
         }
     }
 
@@ -213,6 +241,20 @@ impl ProxyEnforcer {
         self
     }
 
+    pub fn with_fail_open(
+        mut self,
+        enabled: bool,
+        enforcement_timeout: Duration,
+        policy_fail_open: bool,
+        budget_fail_open: bool,
+    ) -> Self {
+        self.fail_open_enabled = enabled;
+        self.enforcement_timeout = enforcement_timeout;
+        self.policy_fail_open = policy_fail_open;
+        self.budget_fail_open = budget_fail_open;
+        self
+    }
+
     pub fn did_header(&self) -> &str {
         &self.did_header
     }
@@ -251,8 +293,10 @@ impl ProxyEnforcer {
                 trusted_dids: self.trusted_dids.as_ref(),
                 policy_mode: self.core_policy_mode(),
                 policy_engine: self.policy_engine.as_deref(),
+                policy_fail_open: self.policy_fail_open,
                 budget_tracker: self.budget_tracker.as_deref(),
                 budget_block_on_exceeded: self.budget_block_on_exceeded,
+                budget_fail_open: self.budget_fail_open,
                 default_model: &self.default_model,
             },
             enforcement_core::ProxyEnforcementInput { envelope },
@@ -263,6 +307,85 @@ impl ProxyEnforcer {
             }
         }
         result
+    }
+
+    async fn enforce_envelope_with_timeout(
+        &self,
+        envelope: &TrafficEnvelope,
+    ) -> Result<EnforcementResult, (u16, String, Option<String>)> {
+        let envelope = envelope.clone();
+        let identity_mode = self.core_identity_mode();
+        let trusted_dids = Arc::clone(&self.trusted_dids);
+        let policy_mode = self.core_policy_mode();
+        let policy_engine = self.policy_engine.clone();
+        let policy_fail_open = self.policy_fail_open;
+        let budget_tracker = self.budget_tracker.clone();
+        let budget_block_on_exceeded = self.budget_block_on_exceeded;
+        let budget_fail_open = self.budget_fail_open;
+        let default_model = self.default_model.clone();
+
+        let timeout_result = tokio::time::timeout(
+            self.enforcement_timeout,
+            tokio::task::spawn_blocking(move || {
+                let config = enforcement_core::ProxyEnforcementConfig {
+                    identity_mode,
+                    trusted_dids: trusted_dids.as_ref(),
+                    policy_mode,
+                    policy_engine: policy_engine.as_deref(),
+                    policy_fail_open,
+                    budget_tracker: budget_tracker.as_deref(),
+                    budget_block_on_exceeded,
+                    budget_fail_open,
+                    default_model: &default_model,
+                };
+                enforcement_core::enforce_proxy_request(
+                    config,
+                    enforcement_core::ProxyEnforcementInput {
+                        envelope: &envelope,
+                    },
+                )
+            }),
+        )
+        .await;
+
+        match timeout_result {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                if self.fail_open_enabled {
+                    metrics::record_enforcement_failopen("panic");
+                    warn!(
+                        error = %err,
+                        "Enforcement task join failed; failing open"
+                    );
+                    Ok(EnforcementResult::default())
+                } else {
+                    Err((
+                        503,
+                        "Enforcement unavailable (task join failure)".to_string(),
+                        None,
+                    ))
+                }
+            }
+            Err(_) => {
+                if self.fail_open_enabled {
+                    metrics::record_enforcement_failopen("timeout");
+                    warn!(
+                        timeout_ms = self.enforcement_timeout.as_millis(),
+                        "Enforcement timed out; failing open"
+                    );
+                    Ok(EnforcementResult::default())
+                } else {
+                    Err((
+                        503,
+                        format!(
+                            "Enforcement timed out after {}ms",
+                            self.enforcement_timeout.as_millis()
+                        ),
+                        None,
+                    ))
+                }
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -990,16 +1113,17 @@ fn extract_gemini_bard_stream_text(raw: &str) -> Option<String> {
 
     for line in raw.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(")]}'") {
+        let sanitized = strip_json_security_prefix_text(trimmed);
+        if sanitized.is_empty() {
             continue;
         }
 
-        if !trimmed.starts_with('[') {
+        if !sanitized.starts_with('[') {
             // Batch framing length lines are numeric and can be ignored.
             continue;
         }
 
-        let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(sanitized) else {
             continue;
         };
 
@@ -1064,6 +1188,18 @@ fn record_proxy_budget_spend(
     tracker.record_spend(session_id, agent_id, model, input_tokens, output_tokens);
 }
 
+fn apply_process_identity(
+    mut envelope: TrafficEnvelope,
+    process_identity: Option<&ProcessIdentity>,
+) -> TrafficEnvelope {
+    if let Some(process) = process_identity {
+        envelope.process_pid = Some(process.pid);
+        envelope.process_name = Some(process.name.clone());
+        envelope.process_executable = process.executable.clone();
+    }
+    envelope
+}
+
 /// AI-aware HTTP handler for hudsucker
 #[derive(Clone)]
 pub struct AiProxyHandler {
@@ -1088,6 +1224,14 @@ pub struct AiProxyHandler {
     event_tags: Arc<BTreeMap<String, String>>,
     /// Optional PII enrichment before events are written.
     pii_enricher: Arc<PiiEventEnricher>,
+    /// Adaptive learned TLS passthrough map (cert-pinning bypass).
+    learned_passthrough: Option<Arc<LearnedPassthrough>>,
+    /// Threshold of repeated failed intercept attempts before learning passthrough.
+    learned_failure_threshold: u32,
+    /// Rolling window for failure threshold accumulation.
+    learned_failure_window: Duration,
+    /// Platform-gated process attribution runtime.
+    process_attribution: Arc<ProcessAttribution>,
 }
 
 impl AiProxyHandler {
@@ -1104,6 +1248,13 @@ impl AiProxyHandler {
             pricing_catalog: Arc::new(PricingCatalog::with_defaults()),
             event_tags: Arc::new(observe.event_tags.clone()),
             pii_enricher: Arc::new(PiiEventEnricher::from_observe_config(observe)),
+            learned_passthrough: None,
+            learned_failure_threshold: config.tls.learned_passthrough.failure_threshold.max(1),
+            learned_failure_window: config.tls.learned_passthrough.failure_window,
+            process_attribution: Arc::new(ProcessAttribution::new(
+                PROCESS_ATTR_LOOKUP_TIMEOUT,
+                PROCESS_ATTR_CACHE_TTL,
+            )),
         }
     }
 
@@ -1131,9 +1282,17 @@ impl AiProxyHandler {
         self
     }
 
-    /// Check if host is blocked
-    fn is_blocked(&self, host: &str) -> bool {
-        matches!(self.hosts.action_for_host(host), HostAction::Block)
+    /// Set learned passthrough runtime and threshold parameters.
+    pub fn with_learned_passthrough(
+        mut self,
+        learned: Arc<LearnedPassthrough>,
+        failure_threshold: u32,
+        failure_window: Duration,
+    ) -> Self {
+        self.learned_passthrough = Some(learned);
+        self.learned_failure_threshold = failure_threshold.max(1);
+        self.learned_failure_window = failure_window;
+        self
     }
 
     /// Get action for host
@@ -1380,7 +1539,8 @@ impl HttpHandler for AiProxyHandler {
             method = %http_method,
             "Incoming request"
         );
-        let is_blocked = self.is_blocked(&host);
+        let host_action = self.get_action(&host);
+        let is_blocked = matches!(host_action, HostAction::Block);
         let host_is_ai_target = self.hosts.should_check_ai_inference(&host);
         let host_is_mcp_target = self.hosts.should_check_mcp(&host);
         let host_is_agent_target = Self::is_agent_app(&self.hosts, &host);
@@ -1431,6 +1591,16 @@ impl HttpHandler for AiProxyHandler {
         let event_logger = self.event_logger.clone();
         let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
+        let learned_passthrough = self.learned_passthrough.clone();
+        let learned_failure_threshold = self.learned_failure_threshold;
+        let learned_failure_window = self.learned_failure_window;
+        let process_attribution = self.process_attribution.clone();
+        let client_addr = ctx.client_addr;
+        let should_resolve_process = !is_connect
+            && (host_is_ai_target
+                || host_is_mcp_target
+                || host_is_agent_target
+                || host_mode == HostFilterMode::Discovery);
 
         debug!(
             is_post = is_post,
@@ -1454,6 +1624,32 @@ impl HttpHandler for AiProxyHandler {
                 return RequestOrResponse::Response(
                     Response::builder().status(403).body(Body::empty()).unwrap(),
                 );
+            }
+
+            let process_identity = if should_resolve_process {
+                process_attribution.resolve(client_addr).await
+            } else {
+                None
+            };
+
+            if is_connect && matches!(host_action, HostAction::Intercept) {
+                if let Some(ref learned) = learned_passthrough {
+                    if !learned.should_passthrough(&host)
+                        && learned.record_connect_attempt(
+                            &host,
+                            learned_failure_threshold,
+                            learned_failure_window,
+                        )
+                    {
+                        metrics::record_tls_learned_passthrough("learn");
+                        metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+                        warn!(
+                            host = %host,
+                            threshold = learned_failure_threshold,
+                            "Learned TLS passthrough host after repeated failed intercept attempts"
+                        );
+                    }
+                }
             }
 
             // Capture body for AI/MCP requests and record payload-size metadata.
@@ -1523,25 +1719,42 @@ impl HttpHandler for AiProxyHandler {
                 } else {
                     None
                 };
+            let graphql_operation = if !is_connect && is_json {
+                body_content.as_deref().and_then(extract_graphql_operation)
+            } else {
+                None
+            };
             let mut policy_allowed = None;
             let mut policy_version = None;
 
             if !is_connect {
+                if let Some(ref learned) = learned_passthrough {
+                    // Decrypted non-CONNECT request means intercept succeeded; clear any
+                    // stale learning/failure state for this host.
+                    learned.record_decrypted_request(&host);
+                    metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+                }
+            }
+
+            if !is_connect {
                 if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
-                    let envelope = TrafficEnvelope::proxy(
-                        &session_id,
-                        request_id.to_string(),
-                        provider,
-                        &host,
-                        &http_method,
-                        &path,
-                        model.as_deref(),
-                        agent,
-                        identity_did.as_deref(),
-                        identity_signature.as_deref(),
-                        body_content.as_deref(),
+                    let envelope = apply_process_identity(
+                        TrafficEnvelope::proxy(
+                            &session_id,
+                            request_id.to_string(),
+                            provider,
+                            &host,
+                            &http_method,
+                            &path,
+                            model.as_deref(),
+                            agent,
+                            identity_did.as_deref(),
+                            identity_signature.as_deref(),
+                            body_content.as_deref(),
+                        ),
+                        process_identity.as_ref(),
                     );
-                    let enforcement = enforcer.enforce_envelope(&envelope);
+                    let enforcement = enforcer.enforce_envelope_with_timeout(&envelope).await;
 
                     match enforcement {
                         Ok(identity_result) => {
@@ -1670,18 +1883,21 @@ impl HttpHandler for AiProxyHandler {
 
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
-                    let envelope = TrafficEnvelope::proxy(
-                        &session_id,
-                        request_id.to_string(),
-                        provider,
-                        &host,
-                        &http_method,
-                        &display_path,
-                        model.as_deref(),
-                        agent,
-                        identity_did.as_deref(),
-                        identity_signature.as_deref(),
-                        body_content.as_deref(),
+                    let envelope = apply_process_identity(
+                        TrafficEnvelope::proxy(
+                            &session_id,
+                            request_id.to_string(),
+                            provider,
+                            &host,
+                            &http_method,
+                            &display_path,
+                            model.as_deref(),
+                            agent,
+                            identity_did.as_deref(),
+                            identity_signature.as_deref(),
+                            body_content.as_deref(),
+                        ),
+                        process_identity.as_ref(),
                     );
                     let mut pending = pending_requests.lock();
                     pending.insert(
@@ -1696,6 +1912,7 @@ impl HttpHandler for AiProxyHandler {
                             provider: Some(provider),
                             agent,
                             model: model.clone(),
+                            graphql_operation: graphql_operation.clone(),
                             started_at: Instant::now(),
                             request_content: body_content,
                             request_size_bytes,
@@ -1728,16 +1945,19 @@ impl HttpHandler for AiProxyHandler {
                         WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
                             .with_source(EventSource::Mcp)
                             .with_method(mcp_method.clone());
-                    let envelope = TrafficEnvelope::mcp_http(
-                        &session_id,
-                        Some(request_id.to_string()),
-                        mcp_method.clone(),
-                        &host,
-                        &path,
-                        agent,
-                        identity_did.as_deref(),
-                        identity_signature.as_deref(),
-                        body_content.as_deref(),
+                    let envelope = apply_process_identity(
+                        TrafficEnvelope::mcp_http(
+                            &session_id,
+                            Some(request_id.to_string()),
+                            mcp_method.clone(),
+                            &host,
+                            &path,
+                            agent,
+                            identity_did.as_deref(),
+                            identity_signature.as_deref(),
+                            body_content.as_deref(),
+                        ),
+                        process_identity.as_ref(),
                     );
                     event = event.with_traffic_envelope(envelope);
                     if let Some(ref request_body) = body_content {
@@ -1757,16 +1977,19 @@ impl HttpHandler for AiProxyHandler {
                     PendingRequest {
                         request_id,
                         event_id: uuid::Uuid::new_v4().to_string(),
-                        envelope: Some(TrafficEnvelope::mcp_http(
-                            &session_id,
-                            Some(request_id.to_string()),
-                            mcp_method.clone(),
-                            &host,
-                            &path,
-                            agent,
-                            identity_did.as_deref(),
-                            identity_signature.as_deref(),
-                            body_content.as_deref(),
+                        envelope: Some(apply_process_identity(
+                            TrafficEnvelope::mcp_http(
+                                &session_id,
+                                Some(request_id.to_string()),
+                                mcp_method.clone(),
+                                &host,
+                                &path,
+                                agent,
+                                identity_did.as_deref(),
+                                identity_signature.as_deref(),
+                                body_content.as_deref(),
+                            ),
+                            process_identity.as_ref(),
                         )),
                         host: host.clone(),
                         path: path.clone(),
@@ -1774,6 +1997,7 @@ impl HttpHandler for AiProxyHandler {
                         provider: None,
                         agent,
                         model: None,
+                        graphql_operation: None,
                         started_at: Instant::now(),
                         request_content: None,
                         request_size_bytes,
@@ -1840,18 +2064,28 @@ impl HttpHandler for AiProxyHandler {
         let dashboard = self.dashboard.clone();
 
         // Check content type for body inspection
-        let is_json = res
+        let content_type = res
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_ascii_lowercase());
+        let is_json = content_type
+            .as_deref()
             .map(|ct| ct.contains("application/json"))
             .unwrap_or(false);
-        let is_sse = res
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
+        let is_sse = content_type
+            .as_deref()
             .map(|ct| ct.contains("text/event-stream"))
             .unwrap_or(false);
+        let is_grpc = content_type
+            .as_deref()
+            .map(|ct| ct.contains("application/grpc") || ct.contains("grpc-web"))
+            .unwrap_or(false);
+        let grpc_message_encoding = res
+            .headers()
+            .get("grpc-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_ascii_lowercase());
         let content_encoding = res
             .headers()
             .get("content-encoding")
@@ -1961,6 +2195,7 @@ impl HttpHandler for AiProxyHandler {
                         agent: pending.agent,
                         method: &pending.method,
                         path: &pending.path,
+                        graphql_operation: pending.graphql_operation.as_deref(),
                         is_agent_app: pending.is_agent_app,
                         status,
                         latency_ms,
@@ -1990,7 +2225,7 @@ impl HttpHandler for AiProxyHandler {
             // For JSON responses, capture the body for logging (with decompression)
             // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
             let mut response_size_bytes: Option<u64> = None;
-            let (body_content, res, logged_in_stream) = if is_json
+            let (body_content, res, logged_in_stream) = if (is_json || is_grpc)
                 && !is_sse
                 && !is_codex_response_path
                 && !is_gemini_bard_response_path
@@ -2011,8 +2246,11 @@ impl HttpHandler for AiProxyHandler {
                             &pending.host,
                             &decoded_bytes,
                             false,
+                            content_type.as_deref(),
+                            grpc_message_encoding.as_deref(),
                             pending.model.as_deref(),
-                        );
+                        )
+                        .await;
 
                         // Return original bytes to client (they handle decompression)
                         let new_body = Body::from(Full::new(bytes));
@@ -2038,6 +2276,8 @@ impl HttpHandler for AiProxyHandler {
                 let log_pending = pending.clone();
                 let log_latency_ms = latency_ms;
                 let log_content_encoding = content_encoding.clone();
+                let log_content_type = content_type.clone();
+                let log_grpc_message_encoding = grpc_message_encoding.clone();
                 let log_is_sse = is_sse;
                 let log_event_id = pending.event_id.clone();
                 let log_provider_registry = provider_registry.clone();
@@ -2045,12 +2285,22 @@ impl HttpHandler for AiProxyHandler {
                 let log_budget_tracker = budget_tracker.clone();
                 let log_event_tags = event_tags.clone();
                 let log_pii_enricher = pii_enricher.clone();
+                let log_stream_kind: &'static str = if is_sse {
+                    "sse"
+                } else if is_codex_response_path {
+                    "codex"
+                } else if is_gemini_bard_response_path {
+                    "gemini_bard"
+                } else {
+                    "stream"
+                };
                 #[cfg(feature = "dashboard")]
                 let log_dashboard = dashboard.clone();
 
                 // Create a tee stream that yields frames while accumulating data
                 let tee_stream = stream! {
                     let mut body = body;
+                    let mut capture_limit_reported = false;
                     loop {
                         match body.frame().await {
                             Some(Ok(frame)) => {
@@ -2059,10 +2309,17 @@ impl HttpHandler for AiProxyHandler {
                                     let mut guard = accumulated_clone.lock();
                                     if let Some(ref mut acc) = *guard {
                                         // Limit accumulation to prevent memory issues.
-                                        if acc.len() < STREAM_CAPTURE_MAX_BYTES {
-                                            let remaining = STREAM_CAPTURE_MAX_BYTES - acc.len();
-                                            let write_len = remaining.min(data.len());
-                                            acc.extend_from_slice(&data[..write_len]);
+                                        if append_stream_capture(acc, data) && !capture_limit_reported {
+                                            capture_limit_reported = true;
+                                            metrics::record_stream_capture_limit_reached(provider, log_stream_kind);
+                                            warn!(
+                                                provider = provider,
+                                                host = %log_pending.host,
+                                                path = %log_pending.path,
+                                                max_bytes = STREAM_CAPTURE_MAX_BYTES,
+                                                stream_kind = log_stream_kind,
+                                                "Response stream capture limit reached; truncating buffered payload"
+                                            );
                                         }
                                     }
                                 }
@@ -2106,8 +2363,11 @@ impl HttpHandler for AiProxyHandler {
                         &log_pending.host,
                         &decoded_bytes,
                         log_is_sse,
+                        log_content_type.as_deref(),
+                        log_grpc_message_encoding.as_deref(),
                         log_pending.model.as_deref(),
-                    );
+                    )
+                    .await;
                     if let Some(ref tracker) = log_budget_tracker {
                         record_proxy_budget_spend(
                             tracker,
@@ -2165,6 +2425,7 @@ impl HttpHandler for AiProxyHandler {
                             agent: log_pending.agent,
                             method: &log_pending.method,
                             path: &log_pending.path,
+                            graphql_operation: log_pending.graphql_operation.as_deref(),
                             is_agent_app: log_pending.is_agent_app,
                             status,
                             latency_ms: log_latency_ms,
@@ -2256,6 +2517,7 @@ impl HttpHandler for AiProxyHandler {
                         agent: pending.agent,
                         method: &pending.method,
                         path: &pending.path,
+                        graphql_operation: pending.graphql_operation.as_deref(),
                         is_agent_app: pending.is_agent_app,
                         status,
                         latency_ms,
@@ -2294,10 +2556,21 @@ impl HttpHandler for AiProxyHandler {
     ) -> impl std::future::Future<Output = bool> + Send {
         let host = Self::extract_host(req);
         let action = self.get_action(&host);
+        let learned_passthrough = self.learned_passthrough.clone();
 
         async move {
             match action {
                 HostAction::Intercept => {
+                    if let Some(learned) = learned_passthrough.as_ref() {
+                        if learned.should_passthrough(&host) {
+                            metrics::record_tls_learned_passthrough("bypass");
+                            metrics::set_tls_learned_passthrough_active(
+                                learned.active_count() as f64
+                            );
+                            debug!(host = %host, "Learned passthrough: blind tunnel");
+                            return false;
+                        }
+                    }
                     debug!(host = %host, "MITM intercept");
                     true
                 }
@@ -2591,6 +2864,18 @@ where
     let observe_config = observe_config.unwrap_or_default();
     let event_tags = Arc::new(observe_config.event_tags.clone());
     let pii_enricher = Arc::new(PiiEventEnricher::from_observe_config(&observe_config));
+    let learned_passthrough = if config.tls.learned_passthrough.enabled {
+        let learned = Arc::new(LearnedPassthrough::new(
+            config.tls.learned_passthrough.state_path.clone(),
+            config.hosts.ai_inference.clone(),
+            config.tls.learned_passthrough.max_age,
+        ));
+        learned.load();
+        metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+        Some(learned)
+    } else {
+        None
+    };
 
     #[cfg(feature = "dashboard")]
     let handler = {
@@ -2604,6 +2889,13 @@ where
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
         }
+        if let Some(ref learned) = learned_passthrough {
+            h = h.with_learned_passthrough(
+                learned.clone(),
+                config.tls.learned_passthrough.failure_threshold,
+                config.tls.learned_passthrough.failure_window,
+            );
+        }
         h
     };
 
@@ -2615,6 +2907,13 @@ where
         }
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
+        }
+        if let Some(ref learned) = learned_passthrough {
+            h = h.with_learned_passthrough(
+                learned.clone(),
+                config.tls.learned_passthrough.failure_threshold,
+                config.tls.learned_passthrough.failure_window,
+            );
         }
         h
     };
@@ -2658,6 +2957,11 @@ where
         .start()
         .await
         .map_err(|e| ProxyError::transport(format!("Proxy error: {}", e)))?;
+
+    if let Some(ref learned) = learned_passthrough {
+        learned.persist();
+        metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+    }
 
     Ok(())
 }
@@ -3303,6 +3607,22 @@ mod tests {
         let bytes = vec![0x28, 0xB5, 0x2F, 0xFD];
         let decoded = decode_body_for_logging(&bytes, Some("zstd"));
         assert!(decoded.contains("[compressed/zstd payload"));
+    }
+
+    #[test]
+    fn test_append_stream_capture_caps_buffer() {
+        let mut buffer = Vec::new();
+        assert!(!append_stream_capture(&mut buffer, &[1, 2, 3]));
+        assert_eq!(buffer.len(), 3);
+
+        let remaining = STREAM_CAPTURE_MAX_BYTES - buffer.len();
+        let mut chunk = vec![9u8; remaining + 16];
+        assert!(append_stream_capture(&mut buffer, &chunk));
+        assert_eq!(buffer.len(), STREAM_CAPTURE_MAX_BYTES);
+
+        chunk.truncate(1);
+        assert!(append_stream_capture(&mut buffer, &chunk));
+        assert_eq!(buffer.len(), STREAM_CAPTURE_MAX_BYTES);
     }
 
     #[test]

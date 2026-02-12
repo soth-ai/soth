@@ -97,6 +97,7 @@ cloud:
   endpoint: "https://api.soth.ai"
   sync_interval_secs: 60
   config_pull_interval_secs: 300
+  config_debounce_secs: 6
   body_upload_enabled: false
   cache_path: "~/.soth/cloud_config_cache.json"
   tags:
@@ -144,6 +145,16 @@ forward_proxy:
     agent_apps: []
     block: []
 
+  # Adaptive TLS passthrough for cert-pinned hosts that fail repeated MITM.
+  # AI inference domains are protected and never learned for passthrough.
+  tls:
+    learned_passthrough:
+      enabled: true
+      state_path: "~/.soth/learned-passthrough.json"
+      max_age: "7d"
+      failure_threshold: 3
+      failure_window: "90s"
+
 # Production hardening configuration
 # Rate limiting, circuit breakers, and connection management
 production:
@@ -178,6 +189,13 @@ production:
     connect_timeout: "10s"
     request_timeout: "5m"            # 5 minutes for AI requests
     tls_timeout: "10s"
+
+  # Enforcement fail-open behavior for internal timeout/error paths
+  fail_open:
+    enabled: true
+    enforcement_timeout: "500ms"     # Hard cap for proxy enforcement path
+    policy_fail_open: true           # Allow on policy engine internal error
+    budget_fail_open: true           # Allow on budget engine internal error
 
 # Logging configuration
 logging:

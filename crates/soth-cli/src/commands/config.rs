@@ -351,6 +351,12 @@ fn validate_cloud(config: &SothConfig, warnings: &mut Vec<String>, errors: &mut 
             "cloud.config_pull_interval_secs is 0 (no periodic config pull cadence)".to_string(),
         );
     }
+    if config.cloud.config_debounce_secs == 0 {
+        warnings.push(
+            "cloud.config_debounce_secs is 0 (new cloud config versions apply immediately)"
+                .to_string(),
+        );
+    }
 }
 
 /// Show the effective configuration

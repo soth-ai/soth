@@ -739,6 +739,10 @@ pub struct CloudConfig {
     #[serde(default = "default_cloud_config_pull_interval_secs")]
     pub config_pull_interval_secs: u64,
 
+    /// Debounce window before applying a newly pulled config version
+    #[serde(default = "default_cloud_config_debounce_secs")]
+    pub config_debounce_secs: u64,
+
     /// Whether response/request body uploads are enabled
     #[serde(default)]
     pub body_upload_enabled: bool,
@@ -760,6 +764,10 @@ fn default_cloud_config_pull_interval_secs() -> u64 {
     300
 }
 
+fn default_cloud_config_debounce_secs() -> u64 {
+    6
+}
+
 fn default_cloud_cache_path() -> Option<PathBuf> {
     Some(PathBuf::from("~/.soth/cloud_config_cache.json"))
 }
@@ -773,6 +781,7 @@ impl Default for CloudConfig {
             tags: BTreeMap::new(),
             sync_interval_secs: default_cloud_sync_interval_secs(),
             config_pull_interval_secs: default_cloud_config_pull_interval_secs(),
+            config_debounce_secs: default_cloud_config_debounce_secs(),
             body_upload_enabled: false,
             cache_path: default_cloud_cache_path(),
         }
@@ -866,6 +875,10 @@ pub struct ForwardProxyConfig {
     #[serde(default)]
     pub hosts: HostFilterConfig,
 
+    /// TLS interception behavior overrides.
+    #[serde(default)]
+    pub tls: ForwardProxyTlsConfig,
+
     /// Request timeout for AI providers (streaming can be long)
     #[serde(default = "default_ai_timeout", with = "humantime_serde")]
     pub request_timeout: Duration,
@@ -888,6 +901,7 @@ impl Default for ForwardProxyConfig {
             ca: CaConfig::default(),
             pool: PoolConfig::default(),
             hosts: HostFilterConfig::default(),
+            tls: ForwardProxyTlsConfig::default(),
             request_timeout: default_ai_timeout(),
         }
     }
@@ -897,6 +911,75 @@ impl ForwardProxyConfig {
     /// Get the socket address for the proxy
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.address, self.port)
+    }
+}
+
+/// TLS-specific options for the forward proxy transport.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ForwardProxyTlsConfig {
+    /// Adaptive passthrough of learned cert-pinned hosts.
+    #[serde(default)]
+    pub learned_passthrough: LearnedPassthroughConfig,
+}
+
+/// Learned TLS passthrough configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedPassthroughConfig {
+    /// Whether learned passthrough is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// JSON state path for learned host map.
+    #[serde(default = "default_learned_passthrough_state_path")]
+    pub state_path: PathBuf,
+
+    /// Max age before learned hosts expire.
+    #[serde(
+        default = "default_learned_passthrough_max_age",
+        with = "humantime_serde"
+    )]
+    pub max_age: Duration,
+
+    /// Number of repeated failed intercept attempts before learning passthrough.
+    #[serde(default = "default_learned_passthrough_failure_threshold")]
+    pub failure_threshold: u32,
+
+    /// Rolling window used for failure threshold accumulation.
+    #[serde(
+        default = "default_learned_passthrough_failure_window",
+        with = "humantime_serde"
+    )]
+    pub failure_window: Duration,
+}
+
+fn default_learned_passthrough_state_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".soth")
+        .join("learned-passthrough.json")
+}
+
+fn default_learned_passthrough_max_age() -> Duration {
+    Duration::from_secs(7 * 24 * 60 * 60)
+}
+
+fn default_learned_passthrough_failure_threshold() -> u32 {
+    3
+}
+
+fn default_learned_passthrough_failure_window() -> Duration {
+    Duration::from_secs(90)
+}
+
+impl Default for LearnedPassthroughConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            state_path: default_learned_passthrough_state_path(),
+            max_age: default_learned_passthrough_max_age(),
+            failure_threshold: default_learned_passthrough_failure_threshold(),
+            failure_window: default_learned_passthrough_failure_window(),
+        }
     }
 }
 
@@ -1970,6 +2053,41 @@ impl Default for ConnectionLimitsConfig {
     }
 }
 
+/// Fail-open behavior when enforcement internals timeout or error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailOpenConfig {
+    /// Whether enforcement should fail open on internal timeout/error.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Maximum wall-clock time for enforcement pipeline evaluation.
+    #[serde(default = "default_enforcement_timeout", with = "humantime_serde")]
+    pub enforcement_timeout: Duration,
+
+    /// Fail-open on policy evaluation internal errors.
+    #[serde(default = "default_true")]
+    pub policy_fail_open: bool,
+
+    /// Fail-open on budget evaluation internal errors.
+    #[serde(default = "default_true")]
+    pub budget_fail_open: bool,
+}
+
+fn default_enforcement_timeout() -> Duration {
+    Duration::from_millis(500)
+}
+
+impl Default for FailOpenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            enforcement_timeout: default_enforcement_timeout(),
+            policy_fail_open: default_true(),
+            budget_fail_open: default_true(),
+        }
+    }
+}
+
 /// Production configuration combining all hardening options
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProductionConfig {
@@ -1988,6 +2106,10 @@ pub struct ProductionConfig {
     /// Connection limits and timeouts
     #[serde(default)]
     pub connection_limits: ConnectionLimitsConfig,
+
+    /// Fail-open behavior for enforcement timeout/error paths.
+    #[serde(default)]
+    pub fail_open: FailOpenConfig,
 }
 
 /// Custom serde module for optional humantime Duration parsing
@@ -2034,6 +2156,8 @@ mod tests {
         assert_eq!(config.server.listen.port, 3000);
         assert!(!config.cloud.enabled);
         assert_eq!(config.cloud.endpoint, "https://api.soth.ai");
+        assert_eq!(config.cloud.config_debounce_secs, 6);
+        assert!(config.forward_proxy.tls.learned_passthrough.enabled);
     }
 
     #[test]
@@ -2073,6 +2197,7 @@ cloud:
   endpoint: "https://staging.soth.ai"
   sync_interval_secs: 30
   config_pull_interval_secs: 120
+  config_debounce_secs: 8
   body_upload_enabled: true
   tags:
     project: "edge"
@@ -2084,6 +2209,7 @@ cloud:
         assert_eq!(config.cloud.endpoint, "https://staging.soth.ai");
         assert_eq!(config.cloud.sync_interval_secs, 30);
         assert_eq!(config.cloud.config_pull_interval_secs, 120);
+        assert_eq!(config.cloud.config_debounce_secs, 8);
         assert!(config.cloud.body_upload_enabled);
         assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
     }
@@ -2664,12 +2790,35 @@ forward_proxy:
     }
 
     #[test]
+    fn test_learned_passthrough_config_default() {
+        let config = LearnedPassthroughConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.max_age, Duration::from_secs(7 * 24 * 60 * 60));
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.failure_window, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn test_fail_open_config_default() {
+        let config = FailOpenConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.enforcement_timeout, Duration::from_millis(500));
+        assert!(config.policy_fail_open);
+        assert!(config.budget_fail_open);
+    }
+
+    #[test]
     fn test_production_config_default() {
         let config = ProductionConfig::default();
         assert!(!config.rate_limit.enabled);
         assert!(config.circuit_breaker.enabled);
         assert!(config.health.enabled);
         assert_eq!(config.connection_limits.max_total_connections, 1000);
+        assert!(config.fail_open.enabled);
+        assert_eq!(
+            config.fail_open.enforcement_timeout,
+            Duration::from_millis(500)
+        );
     }
 
     #[test]
@@ -2697,6 +2846,11 @@ production:
     connect_timeout: "5s"
     request_timeout: "10m"
     tls_timeout: "15s"
+  fail_open:
+    enabled: false
+    enforcement_timeout: "750ms"
+    policy_fail_open: false
+    budget_fail_open: true
 "#;
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
 
@@ -2745,6 +2899,40 @@ production:
             config.production.connection_limits.tls_timeout,
             Duration::from_secs(15)
         );
+
+        // Fail-open
+        assert!(!config.production.fail_open.enabled);
+        assert_eq!(
+            config.production.fail_open.enforcement_timeout,
+            Duration::from_millis(750)
+        );
+        assert!(!config.production.fail_open.policy_fail_open);
+        assert!(config.production.fail_open.budget_fail_open);
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_tls_yaml() {
+        let yaml = r#"
+forward_proxy:
+  tls:
+    learned_passthrough:
+      enabled: true
+      state_path: "/tmp/learned-passthrough.json"
+      max_age: "5d"
+      failure_threshold: 4
+      failure_window: "2m"
+"#;
+
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        let learned = &config.forward_proxy.tls.learned_passthrough;
+        assert!(learned.enabled);
+        assert_eq!(
+            learned.state_path,
+            PathBuf::from("/tmp/learned-passthrough.json")
+        );
+        assert_eq!(learned.max_age, Duration::from_secs(5 * 24 * 60 * 60));
+        assert_eq!(learned.failure_threshold, 4);
+        assert_eq!(learned.failure_window, Duration::from_secs(120));
     }
 
     #[test]

@@ -64,6 +64,10 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
 
+    /// GraphQL operation label when request is GraphQL-based.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graphql_operation: Option<String>,
+
     /// Tool name (for tools/call)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -71,6 +75,14 @@ pub struct WrapEvent {
     /// Full message content (JSON-RPC message)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+
+    /// Local collector source name for file-derived events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collector_source: Option<String>,
+
+    /// Local collector byte offset for file-derived events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collector_offset: Option<u64>,
 
     /// External payload reference for full content when moved out of event_json.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,8 +212,11 @@ impl WrapEvent {
             provider: None,
             model: None,
             method: None,
+            graphql_operation: None,
             tool_name: None,
             content: None,
+            collector_source: None,
+            collector_offset: None,
             content_ref: None,
             content_preview: None,
             request_content: None,
@@ -262,6 +277,12 @@ impl WrapEvent {
         self
     }
 
+    /// Set GraphQL operation label.
+    pub fn with_graphql_operation(mut self, operation: impl Into<String>) -> Self {
+        self.graphql_operation = Some(operation.into());
+        self
+    }
+
     /// Set the tool name
     pub fn with_tool_name(mut self, name: impl Into<String>) -> Self {
         self.tool_name = Some(name.into());
@@ -271,6 +292,13 @@ impl WrapEvent {
     /// Set the full content (JSON-RPC message)
     pub fn with_content(mut self, content: impl Into<String>) -> Self {
         self.content = Some(content.into());
+        self
+    }
+
+    /// Set local collector metadata for file-derived events.
+    pub fn with_collector_metadata(mut self, source: impl Into<String>, offset: u64) -> Self {
+        self.collector_source = Some(source.into());
+        self.collector_offset = Some(offset);
         self
     }
 
