@@ -1970,6 +1970,41 @@ impl Default for ConnectionLimitsConfig {
     }
 }
 
+/// Fail-open behavior when enforcement internals timeout or error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailOpenConfig {
+    /// Whether enforcement should fail open on internal timeout/error.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Maximum wall-clock time for enforcement pipeline evaluation.
+    #[serde(default = "default_enforcement_timeout", with = "humantime_serde")]
+    pub enforcement_timeout: Duration,
+
+    /// Fail-open on policy evaluation internal errors.
+    #[serde(default = "default_true")]
+    pub policy_fail_open: bool,
+
+    /// Fail-open on budget evaluation internal errors.
+    #[serde(default = "default_true")]
+    pub budget_fail_open: bool,
+}
+
+fn default_enforcement_timeout() -> Duration {
+    Duration::from_millis(500)
+}
+
+impl Default for FailOpenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            enforcement_timeout: default_enforcement_timeout(),
+            policy_fail_open: default_true(),
+            budget_fail_open: default_true(),
+        }
+    }
+}
+
 /// Production configuration combining all hardening options
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProductionConfig {
@@ -1988,6 +2023,10 @@ pub struct ProductionConfig {
     /// Connection limits and timeouts
     #[serde(default)]
     pub connection_limits: ConnectionLimitsConfig,
+
+    /// Fail-open behavior for enforcement timeout/error paths.
+    #[serde(default)]
+    pub fail_open: FailOpenConfig,
 }
 
 /// Custom serde module for optional humantime Duration parsing
@@ -2664,12 +2703,26 @@ forward_proxy:
     }
 
     #[test]
+    fn test_fail_open_config_default() {
+        let config = FailOpenConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.enforcement_timeout, Duration::from_millis(500));
+        assert!(config.policy_fail_open);
+        assert!(config.budget_fail_open);
+    }
+
+    #[test]
     fn test_production_config_default() {
         let config = ProductionConfig::default();
         assert!(!config.rate_limit.enabled);
         assert!(config.circuit_breaker.enabled);
         assert!(config.health.enabled);
         assert_eq!(config.connection_limits.max_total_connections, 1000);
+        assert!(config.fail_open.enabled);
+        assert_eq!(
+            config.fail_open.enforcement_timeout,
+            Duration::from_millis(500)
+        );
     }
 
     #[test]
@@ -2697,6 +2750,11 @@ production:
     connect_timeout: "5s"
     request_timeout: "10m"
     tls_timeout: "15s"
+  fail_open:
+    enabled: false
+    enforcement_timeout: "750ms"
+    policy_fail_open: false
+    budget_fail_open: true
 "#;
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
 
@@ -2745,6 +2803,15 @@ production:
             config.production.connection_limits.tls_timeout,
             Duration::from_secs(15)
         );
+
+        // Fail-open
+        assert!(!config.production.fail_open.enabled);
+        assert_eq!(
+            config.production.fail_open.enforcement_timeout,
+            Duration::from_millis(750)
+        );
+        assert!(!config.production.fail_open.policy_fail_open);
+        assert!(config.production.fail_open.budget_fail_open);
     }
 
     #[test]

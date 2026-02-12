@@ -179,6 +179,13 @@ production:
     request_timeout: "5m"            # 5 minutes for AI requests
     tls_timeout: "10s"
 
+  # Enforcement fail-open behavior for internal timeout/error paths
+  fail_open:
+    enabled: true
+    enforcement_timeout: "500ms"     # Hard cap for proxy enforcement path
+    policy_fail_open: true           # Allow on policy engine internal error
+    budget_fail_open: true           # Allow on budget engine internal error
+
 # Logging configuration
 logging:
   level: "info"           # Options: debug | info | warn | error

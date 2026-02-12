@@ -26,7 +26,7 @@ use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "dashboard")]
@@ -34,6 +34,7 @@ use soth_dashboard::{DashboardState, DenialEntry};
 
 use crate::enforcement::core as enforcement_core;
 use crate::error::ProxyError;
+use crate::metrics;
 use crate::providers::ProviderRegistry;
 use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
@@ -152,9 +153,13 @@ pub struct ProxyEnforcer {
     trusted_dids: Arc<HashSet<String>>,
     policy_mode: ProxyPolicyMode,
     policy_engine: Option<Arc<PolicyEngine>>,
+    policy_fail_open: bool,
     budget_tracker: Option<Arc<BudgetTracker>>,
     budget_block_on_exceeded: bool,
+    budget_fail_open: bool,
     default_model: String,
+    fail_open_enabled: bool,
+    enforcement_timeout: Duration,
 }
 
 type EnforcementResult = enforcement_core::IdentityResult;
@@ -169,9 +174,13 @@ impl ProxyEnforcer {
             trusted_dids: Arc::new(HashSet::new()),
             policy_mode: ProxyPolicyMode::Disabled,
             policy_engine: None,
+            policy_fail_open: true,
             budget_tracker: None,
             budget_block_on_exceeded: true,
+            budget_fail_open: true,
             default_model: "gpt-4o".to_string(),
+            fail_open_enabled: true,
+            enforcement_timeout: Duration::from_millis(500),
         }
     }
 
@@ -213,6 +222,20 @@ impl ProxyEnforcer {
         self
     }
 
+    pub fn with_fail_open(
+        mut self,
+        enabled: bool,
+        enforcement_timeout: Duration,
+        policy_fail_open: bool,
+        budget_fail_open: bool,
+    ) -> Self {
+        self.fail_open_enabled = enabled;
+        self.enforcement_timeout = enforcement_timeout;
+        self.policy_fail_open = policy_fail_open;
+        self.budget_fail_open = budget_fail_open;
+        self
+    }
+
     pub fn did_header(&self) -> &str {
         &self.did_header
     }
@@ -251,8 +274,10 @@ impl ProxyEnforcer {
                 trusted_dids: self.trusted_dids.as_ref(),
                 policy_mode: self.core_policy_mode(),
                 policy_engine: self.policy_engine.as_deref(),
+                policy_fail_open: self.policy_fail_open,
                 budget_tracker: self.budget_tracker.as_deref(),
                 budget_block_on_exceeded: self.budget_block_on_exceeded,
+                budget_fail_open: self.budget_fail_open,
                 default_model: &self.default_model,
             },
             enforcement_core::ProxyEnforcementInput { envelope },
@@ -263,6 +288,85 @@ impl ProxyEnforcer {
             }
         }
         result
+    }
+
+    async fn enforce_envelope_with_timeout(
+        &self,
+        envelope: &TrafficEnvelope,
+    ) -> Result<EnforcementResult, (u16, String, Option<String>)> {
+        let envelope = envelope.clone();
+        let identity_mode = self.core_identity_mode();
+        let trusted_dids = Arc::clone(&self.trusted_dids);
+        let policy_mode = self.core_policy_mode();
+        let policy_engine = self.policy_engine.clone();
+        let policy_fail_open = self.policy_fail_open;
+        let budget_tracker = self.budget_tracker.clone();
+        let budget_block_on_exceeded = self.budget_block_on_exceeded;
+        let budget_fail_open = self.budget_fail_open;
+        let default_model = self.default_model.clone();
+
+        let timeout_result = tokio::time::timeout(
+            self.enforcement_timeout,
+            tokio::task::spawn_blocking(move || {
+                let config = enforcement_core::ProxyEnforcementConfig {
+                    identity_mode,
+                    trusted_dids: trusted_dids.as_ref(),
+                    policy_mode,
+                    policy_engine: policy_engine.as_deref(),
+                    policy_fail_open,
+                    budget_tracker: budget_tracker.as_deref(),
+                    budget_block_on_exceeded,
+                    budget_fail_open,
+                    default_model: &default_model,
+                };
+                enforcement_core::enforce_proxy_request(
+                    config,
+                    enforcement_core::ProxyEnforcementInput {
+                        envelope: &envelope,
+                    },
+                )
+            }),
+        )
+        .await;
+
+        match timeout_result {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                if self.fail_open_enabled {
+                    metrics::record_enforcement_failopen("panic");
+                    warn!(
+                        error = %err,
+                        "Enforcement task join failed; failing open"
+                    );
+                    Ok(EnforcementResult::default())
+                } else {
+                    Err((
+                        503,
+                        "Enforcement unavailable (task join failure)".to_string(),
+                        None,
+                    ))
+                }
+            }
+            Err(_) => {
+                if self.fail_open_enabled {
+                    metrics::record_enforcement_failopen("timeout");
+                    warn!(
+                        timeout_ms = self.enforcement_timeout.as_millis(),
+                        "Enforcement timed out; failing open"
+                    );
+                    Ok(EnforcementResult::default())
+                } else {
+                    Err((
+                        503,
+                        format!(
+                            "Enforcement timed out after {}ms",
+                            self.enforcement_timeout.as_millis()
+                        ),
+                        None,
+                    ))
+                }
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1541,7 +1645,7 @@ impl HttpHandler for AiProxyHandler {
                         identity_signature.as_deref(),
                         body_content.as_deref(),
                     );
-                    let enforcement = enforcer.enforce_envelope(&envelope);
+                    let enforcement = enforcer.enforce_envelope_with_timeout(&envelope).await;
 
                     match enforcement {
                         Ok(identity_result) => {

@@ -56,6 +56,7 @@ pub const POLICY_RELOAD_TOTAL: &str = "soth_policy_reload_total";
 pub const POLICY_EVAL_TOTAL: &str = "soth_policy_evaluations_total";
 pub const BUDGET_CHECKS_TOTAL: &str = "soth_budget_checks_total";
 pub const BUDGET_BLOCKS_TOTAL: &str = "soth_budget_blocks_total";
+pub const ENFORCEMENT_FAILOPEN_TOTAL: &str = "soth_enforcement_failopen_total";
 
 // Gauges
 pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
@@ -98,6 +99,10 @@ fn describe_counters() {
     describe_counter!(
         BUDGET_BLOCKS_TOTAL,
         "Total number of budget blocks by scope"
+    );
+    describe_counter!(
+        ENFORCEMENT_FAILOPEN_TOTAL,
+        "Total number of fail-open enforcement events by reason"
     );
 }
 
@@ -191,6 +196,15 @@ pub fn record_budget_check(scope: &str) {
 /// Record budget blocks
 pub fn record_budget_block(scope: &str) {
     counter!(BUDGET_BLOCKS_TOTAL, "scope" => scope.to_string()).increment(1);
+}
+
+/// Record an enforcement fail-open event.
+pub fn record_enforcement_failopen(reason: &str) {
+    counter!(
+        ENFORCEMENT_FAILOPEN_TOTAL,
+        "reason" => reason.to_string()
+    )
+    .increment(1);
 }
 
 /// Set active connections gauge
