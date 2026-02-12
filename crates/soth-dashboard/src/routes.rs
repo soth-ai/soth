@@ -1,7 +1,8 @@
 //! API routes for the dashboard
 
 use crate::event_store::{
-    AgentsSummary, ClustersSummary, EventStore, EventsSummary, RollupsSummary, StreamStats,
+    AgentsSummary, ClustersSummary, CryptoMerkleSummary, CryptoStatusSummary, EventStore,
+    EventsSummary, RollupsSummary, StreamStats,
 };
 use crate::state::{
     AdvancedBudgetMetrics, BudgetMetrics, BudgetPrimitives, DashboardState, IdentityMetrics,
@@ -121,6 +122,8 @@ pub fn api_router_with_events(state: AppState) -> Router {
         .route("/api/events/:event_id/payload", get(get_event_payload))
         .route("/api/events/stream/stats", get(get_event_stream_stats))
         .route("/api/agents", get(get_agents))
+        .route("/api/crypto/status", get(get_crypto_status))
+        .route("/api/crypto/merkle/recent", get(get_crypto_merkle_recent))
         // Advanced budget endpoints
         .route("/api/budget/advanced", get(get_advanced_budget))
         .route("/api/metrics/identity", get(get_identity))
@@ -183,12 +186,22 @@ pub struct RollupsQuery {
     pub limit: usize,
 }
 
+#[derive(Deserialize)]
+pub struct CryptoMerkleQuery {
+    #[serde(default = "default_crypto_merkle_limit")]
+    pub limit: usize,
+}
+
 fn default_limit() -> usize {
     100
 }
 
 fn default_rollup_limit() -> usize {
     240
+}
+
+fn default_crypto_merkle_limit() -> usize {
+    20
 }
 
 #[derive(Deserialize)]
@@ -373,6 +386,36 @@ async fn get_event_stream_stats(State(state): State<AppState>) -> Json<ApiRespon
     };
 
     Json(ApiResponse::new(&state.dashboard, stats))
+}
+
+/// Get crypto pipeline status summary.
+async fn get_crypto_status(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<CryptoStatusSummary>> {
+    let summary = if let Some(ref events) = state.events {
+        events.get_crypto_status()
+    } else {
+        CryptoStatusSummary::default()
+    };
+
+    Json(ApiResponse::new(&state.dashboard, summary))
+}
+
+/// Get recent Merkle seals with lightweight verification indicators.
+async fn get_crypto_merkle_recent(
+    State(state): State<AppState>,
+    Query(query): Query<CryptoMerkleQuery>,
+) -> Json<ApiResponse<CryptoMerkleSummary>> {
+    let summary = if let Some(ref events) = state.events {
+        events.get_crypto_merkle_recent(query.limit)
+    } else {
+        CryptoMerkleSummary {
+            total_batches: 0,
+            seals: Vec::new(),
+        }
+    };
+
+    Json(ApiResponse::new(&state.dashboard, summary))
 }
 
 /// Health check response
@@ -583,6 +626,28 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"total_agents\":0"));
+    }
+
+    #[tokio::test]
+    async fn test_crypto_status_endpoint_no_store() {
+        let state = DashboardState::new();
+        let app = api_router(state);
+        let (status, body) = make_request(app, "/api/crypto/status").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"total_events\":0"));
+        assert!(body.contains("\"merkle_batches\":0"));
+    }
+
+    #[tokio::test]
+    async fn test_crypto_merkle_recent_endpoint_no_store() {
+        let state = DashboardState::new();
+        let app = api_router(state);
+        let (status, body) = make_request(app, "/api/crypto/merkle/recent").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"total_batches\":0"));
+        assert!(body.contains("\"seals\":[]"));
     }
 
     #[tokio::test]

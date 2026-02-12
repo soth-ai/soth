@@ -145,6 +145,61 @@ pub struct RollupsSummary {
     pub rows: Vec<RollupRow>,
 }
 
+/// Aggregated cryptographic pipeline status for dashboard/API.
+#[derive(Debug, Clone, Serialize)]
+pub struct CryptoStatusSummary {
+    pub total_events: u64,
+    pub signed_events: u64,
+    pub signature_coverage_pct: f64,
+    pub verification_failures: u64,
+    pub active_key_id: Option<String>,
+    pub merkle_batches: u64,
+    pub latest_batch_id: Option<String>,
+    pub latest_root_hash: Option<String>,
+    pub latest_signer_did: Option<String>,
+    pub latest_sealed_at: Option<String>,
+}
+
+impl Default for CryptoStatusSummary {
+    fn default() -> Self {
+        Self {
+            total_events: 0,
+            signed_events: 0,
+            signature_coverage_pct: 0.0,
+            verification_failures: 0,
+            active_key_id: None,
+            merkle_batches: 0,
+            latest_batch_id: None,
+            latest_root_hash: None,
+            latest_signer_did: None,
+            latest_sealed_at: None,
+        }
+    }
+}
+
+/// One recent Merkle seal with lightweight verification indicators.
+#[derive(Debug, Clone, Serialize)]
+pub struct CryptoMerkleSealRow {
+    pub batch_id: String,
+    pub seq_start: i64,
+    pub seq_end: i64,
+    pub expected_events: u64,
+    pub observed_events: u64,
+    pub root_hash: String,
+    pub signer_did: String,
+    pub prev_root: Option<String>,
+    pub sealed_at: String,
+    pub chain_link_valid: bool,
+    pub verification_status: String,
+}
+
+/// Recent Merkle seal list response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CryptoMerkleSummary {
+    pub total_batches: usize,
+    pub seals: Vec<CryptoMerkleSealRow>,
+}
+
 impl EventStore {
     /// Create a new event store.
     ///
@@ -313,6 +368,22 @@ impl EventStore {
         RollupsSummary {
             total_rows: read_sqlite_rollup_total(&self.db_path).unwrap_or(rows.len()),
             rows,
+        }
+    }
+
+    /// Get cryptographic pipeline status.
+    pub fn get_crypto_status(&self) -> CryptoStatusSummary {
+        read_sqlite_crypto_status(&self.db_path).unwrap_or_default()
+    }
+
+    /// Get recent Merkle seals with lightweight verification.
+    pub fn get_crypto_merkle_recent(&self, limit: usize) -> CryptoMerkleSummary {
+        let capped_limit = limit.clamp(1, 200);
+        let seals =
+            read_sqlite_crypto_merkle_recent(&self.db_path, capped_limit).unwrap_or_default();
+        CryptoMerkleSummary {
+            total_batches: read_sqlite_merkle_batch_total(&self.db_path).unwrap_or(seals.len()),
+            seals,
         }
     }
 
@@ -618,6 +689,17 @@ fn read_sqlite_rollup_total(db_path: &Path) -> std::io::Result<usize> {
     Ok(count.max(0) as usize)
 }
 
+fn read_sqlite_merkle_batch_total(db_path: &Path) -> std::io::Result<usize> {
+    let conn = open_sqlite_connection(db_path)?;
+    ensure_wrap_events_schema(&conn)?;
+    let count = conn
+        .query_row("SELECT COUNT(*) FROM merkle_batches", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(to_io_err)?;
+    Ok(count.max(0) as usize)
+}
+
 fn read_sqlite_clusters(
     db_path: &Path,
     since_seq: Option<i64>,
@@ -747,6 +829,196 @@ fn read_sqlite_rollups_1m(db_path: &Path, limit: usize) -> std::io::Result<Vec<R
     for row in rows {
         result.push(row.map_err(to_io_err)?);
     }
+    Ok(result)
+}
+
+fn read_sqlite_crypto_status(db_path: &Path) -> std::io::Result<CryptoStatusSummary> {
+    let conn = open_sqlite_connection(db_path)?;
+    ensure_wrap_events_schema(&conn)?;
+
+    let total_events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM wrap_events", [], |row| row.get(0))
+        .map_err(to_io_err)?;
+    let signed_events: i64 = conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM wrap_events
+            WHERE json_extract(event_json, '$.traffic_envelope.signature') IS NOT NULL
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .map_err(to_io_err)?;
+    let verification_failures: i64 = conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM wrap_events
+            WHERE json_extract(event_json, '$.policy_allowed') = 0
+              AND (
+                    lower(COALESCE(json_extract(event_json, '$.policy_reason'), '')) LIKE '%signature%'
+                 OR lower(COALESCE(json_extract(event_json, '$.policy_reason'), '')) LIKE '%identity%'
+              )
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .map_err(to_io_err)?;
+
+    let latest_batch: Option<(String, String, String, String)> = conn
+        .query_row(
+            r#"
+            SELECT batch_id, root_hash, signer_did, sealed_at
+            FROM merkle_batches
+            ORDER BY seq_end DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(to_io_err)?;
+    let merkle_batches: i64 = conn
+        .query_row("SELECT COUNT(*) FROM merkle_batches", [], |row| row.get(0))
+        .map_err(to_io_err)?;
+    let active_key_id: Option<String> = conn
+        .query_row(
+            r#"
+            SELECT key_id
+            FROM key_versions
+            WHERE status = 'active'
+            ORDER BY datetime(created_at) DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_io_err)?;
+
+    let total_events_u = total_events.max(0) as u64;
+    let signed_events_u = signed_events.max(0) as u64;
+    let signature_coverage_pct = if total_events_u == 0 {
+        0.0
+    } else {
+        (signed_events_u as f64 / total_events_u as f64) * 100.0
+    };
+
+    Ok(CryptoStatusSummary {
+        total_events: total_events_u,
+        signed_events: signed_events_u,
+        signature_coverage_pct,
+        verification_failures: verification_failures.max(0) as u64,
+        active_key_id,
+        merkle_batches: merkle_batches.max(0) as u64,
+        latest_batch_id: latest_batch.as_ref().map(|v| v.0.clone()),
+        latest_root_hash: latest_batch.as_ref().map(|v| v.1.clone()),
+        latest_signer_did: latest_batch.as_ref().map(|v| v.2.clone()),
+        latest_sealed_at: latest_batch.as_ref().map(|v| v.3.clone()),
+    })
+}
+
+fn read_sqlite_crypto_merkle_recent(
+    db_path: &Path,
+    limit: usize,
+) -> std::io::Result<Vec<CryptoMerkleSealRow>> {
+    let conn = open_sqlite_connection(db_path)?;
+    ensure_wrap_events_schema(&conn)?;
+
+    let fetch_limit = (limit + 1) as i64;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT batch_id, seq_start, seq_end, root_hash, signature, signer_did, prev_root, sealed_at
+            FROM merkle_batches
+            ORDER BY seq_end DESC
+            LIMIT ?1
+            "#,
+        )
+        .map_err(to_io_err)?;
+
+    #[derive(Clone)]
+    struct BatchRow {
+        batch_id: String,
+        seq_start: i64,
+        seq_end: i64,
+        root_hash: String,
+        _signature: String,
+        signer_did: String,
+        prev_root: Option<String>,
+        sealed_at: String,
+    }
+
+    let rows = stmt
+        .query_map([fetch_limit], |row| {
+            Ok(BatchRow {
+                batch_id: row.get(0)?,
+                seq_start: row.get(1)?,
+                seq_end: row.get(2)?,
+                root_hash: row.get(3)?,
+                _signature: row.get(4)?,
+                signer_did: row.get(5)?,
+                prev_root: row.get(6)?,
+                sealed_at: row.get(7)?,
+            })
+        })
+        .map_err(to_io_err)?;
+
+    let mut batches = Vec::new();
+    for row in rows {
+        batches.push(row.map_err(to_io_err)?);
+    }
+
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    for (idx, batch) in batches.iter().take(limit).enumerate() {
+        let expected_events = (batch.seq_end - batch.seq_start + 1).max(0) as u64;
+        let observed_events: i64 = conn
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM wrap_events
+                WHERE json_extract(event_json, '$.merkle_batch_id') = ?1
+                "#,
+                [batch.batch_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(to_io_err)?;
+        let observed_events = observed_events.max(0) as u64;
+
+        let chain_link_valid = if let Some(next_batch) = batches.get(idx + 1) {
+            batch.prev_root.as_deref() == Some(next_batch.root_hash.as_str())
+        } else {
+            batch.prev_root.is_none()
+        };
+
+        let verification_status = if !chain_link_valid {
+            "chain_mismatch".to_string()
+        } else if observed_events != expected_events {
+            "event_count_mismatch".to_string()
+        } else {
+            "ok".to_string()
+        };
+
+        result.push(CryptoMerkleSealRow {
+            batch_id: batch.batch_id.clone(),
+            seq_start: batch.seq_start,
+            seq_end: batch.seq_end,
+            expected_events,
+            observed_events,
+            root_hash: batch.root_hash.clone(),
+            signer_did: batch.signer_did.clone(),
+            prev_root: batch.prev_root.clone(),
+            sealed_at: batch.sealed_at.clone(),
+            chain_link_valid,
+            verification_status,
+        });
+    }
+
     Ok(result)
 }
 
@@ -1237,10 +1509,33 @@ fn ensure_wrap_events_schema(conn: &Connection) -> std::io::Result<()> {
             PRIMARY KEY (bucket_start, source, provider, agent)
         );
 
+        CREATE TABLE IF NOT EXISTS merkle_batches (
+            batch_id TEXT PRIMARY KEY,
+            seq_start INTEGER NOT NULL,
+            seq_end INTEGER NOT NULL,
+            root_hash TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            signer_did TEXT NOT NULL,
+            prev_root TEXT,
+            sealed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS key_versions (
+            key_id TEXT PRIMARY KEY,
+            principal_type TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            did TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            rotated_at TEXT,
+            status TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_event_pairs_request_seq ON event_pairs(request_seq DESC);
         CREATE INDEX IF NOT EXISTS idx_event_pairs_session ON event_pairs(session_id, request_seq DESC);
         CREATE INDEX IF NOT EXISTS idx_event_clusters_request_seq ON event_clusters(request_seq DESC);
         CREATE INDEX IF NOT EXISTS idx_rollups_1m_bucket ON rollups_1m(bucket_start DESC);
+        CREATE INDEX IF NOT EXISTS idx_merkle_batches_sealed_at ON merkle_batches(sealed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_key_versions_status ON key_versions(status, created_at DESC);
         "#,
     )
     .map_err(to_io_err)?;
@@ -1330,6 +1625,7 @@ fn is_sqlite_lock_error(error: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soth_core::event_logger::{EventLoggerOptions, MerkleLoggingConfig};
     use soth_core::types::{
         AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection,
     };
@@ -1597,5 +1893,83 @@ mod tests {
         );
         assert_eq!(rollup_events_after, rollup_events_before);
         assert_eq!(rollup_tokens_after, rollup_tokens_before);
+    }
+
+    #[tokio::test]
+    async fn test_crypto_status_and_recent_merkle() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let logger = EventLogger::new_with_options(
+            db_path.clone(),
+            EventLoggerOptions {
+                inline_payload_max_bytes: 16 * 1024,
+                merkle: MerkleLoggingConfig {
+                    enabled: true,
+                    seal_interval: std::time::Duration::from_secs(60),
+                    max_events_per_batch: 2,
+                },
+            },
+        )
+        .unwrap();
+
+        let agent = AgentInfo::new("Crypto Agent", DetectionSource::CommandLine);
+        let e1 = WrapEvent::new(
+            "sess-crypto",
+            "api.openai.com",
+            WrapDirection::In,
+            agent.clone(),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_provider("openai")
+        .with_method("POST /v1/chat/completions")
+        .with_traffic_envelope(TrafficEnvelope::proxy(
+            "sess-crypto",
+            "req-crypto-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-5"),
+            Some("codex"),
+            Some("did:key:z6Mktest"),
+            Some("sig-test-1"),
+            None,
+        ));
+        let e2 = WrapEvent::new(
+            "sess-crypto",
+            "api.openai.com",
+            WrapDirection::Out,
+            agent.clone(),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_provider("openai")
+        .with_method("POST /v1/chat/completions");
+        let e3 = WrapEvent::new("sess-crypto", "api.anthropic.com", WrapDirection::In, agent)
+            .with_source(EventSource::AiProxy)
+            .with_provider("anthropic")
+            .with_method("POST /v1/messages");
+
+        logger.log(&e1);
+        logger.log(&e2);
+        logger.log(&e3);
+        logger.close();
+
+        let store = EventStore::new(db_path);
+        store.load_initial().await.unwrap();
+
+        let status = store.get_crypto_status();
+        assert_eq!(status.total_events, 3);
+        assert!(status.merkle_batches >= 2);
+        assert!(status.latest_batch_id.is_some());
+        assert!(status.latest_root_hash.is_some());
+
+        let recent = store.get_crypto_merkle_recent(10);
+        assert!(recent.total_batches >= 2);
+        assert!(!recent.seals.is_empty());
+        assert!(recent
+            .seals
+            .iter()
+            .all(|row| row.verification_status == "ok"
+                || row.verification_status == "chain_mismatch"));
     }
 }
