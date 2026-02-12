@@ -6,6 +6,7 @@ members = [
     "crates/soth-policy",
     "crates/soth-observe",
     "crates/soth-budget",
+    "crates/soth-collector",
     "crates/soth-proxy",
     "crates/soth-dashboard",
     "crates/soth-tls",
@@ -32,6 +33,7 @@ soth-identity = { path = "crates/soth-identity" }
 soth-policy = { path = "crates/soth-policy" }
 soth-observe = { path = "crates/soth-observe" }
 soth-budget = { path = "crates/soth-budget" }
+soth-collector = { path = "crates/soth-collector" }
 soth-proxy = { path = "crates/soth-proxy" }
 soth-dashboard = { path = "crates/soth-dashboard" }
 soth-tls = { path = "crates/soth-tls" }

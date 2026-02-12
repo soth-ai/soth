@@ -19,6 +19,7 @@ soth-identity = { workspace = true }
 soth-policy = { workspace = true }
 soth-observe = { workspace = true, features = ["sqlite"] }
 soth-budget = { workspace = true }
+soth-collector = { workspace = true }
 soth-proxy = { workspace = true }
 soth-dashboard = { workspace = true }
 soth-tls = { workspace = true }

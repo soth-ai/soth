@@ -1,0 +1,20 @@
+[package]
+name = "soth-collector"
+description = "Local transcript collector for SOTH observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+soth-core = { workspace = true }
+soth-observe = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

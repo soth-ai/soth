@@ -15,6 +15,7 @@ use owo_colors::OwoColorize;
 use soth_core::config::{HostFilterMode, SothConfig};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
+use soth_collector::CollectorRuntime;
 use soth_dashboard::server::DashboardServer;
 use soth_dashboard::DashboardState;
 use soth_proxy::metrics;
@@ -417,6 +418,8 @@ struct ProxyRuntime {
     retention_task: Option<JoinHandle<()>>,
     cloud_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     cloud_task: Option<JoinHandle<()>>,
+    collector_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    collector_task: Option<JoinHandle<()>>,
 }
 
 /// Run the soth proxy transport.
@@ -449,6 +452,8 @@ async fn run_forward_proxy(
     let mut retention_task = runtime.retention_task;
     let mut cloud_shutdown_tx = runtime.cloud_shutdown_tx;
     let mut cloud_task = runtime.cloud_task;
+    let mut collector_shutdown_tx = runtime.collector_shutdown_tx;
+    let mut collector_task = runtime.collector_task;
     let shutdown_tx = runtime.shutdown_tx;
     let proxy_task = runtime.proxy_task;
 
@@ -469,6 +474,7 @@ async fn run_forward_proxy(
     shutdown_dashboard_runtime(&mut dashboard_shutdown_tx, &mut dashboard_task, quiet).await;
     shutdown_retention_runtime(&mut retention_shutdown_tx, &mut retention_task).await;
     shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task).await;
+    shutdown_collector_runtime(&mut collector_shutdown_tx, &mut collector_task).await;
 
     if let Some(mut child) = dashboard_ui_process {
         stop_dashboard_ui_process(&mut child);
@@ -520,6 +526,8 @@ async fn run_forward_proxy_with_tui(
     let mut retention_task = runtime.retention_task;
     let mut cloud_shutdown_tx = runtime.cloud_shutdown_tx;
     let mut cloud_task = runtime.cloud_task;
+    let mut collector_shutdown_tx = runtime.collector_shutdown_tx;
+    let mut collector_task = runtime.collector_task;
 
     // Pause stdout logs before waiting + entering alternate screen to avoid overlap.
     logging::set_log_output_paused(true);
@@ -567,6 +575,7 @@ async fn run_forward_proxy_with_tui(
     shutdown_dashboard_runtime(&mut dashboard_shutdown_tx, &mut dashboard_task, quiet).await;
     shutdown_retention_runtime(&mut retention_shutdown_tx, &mut retention_task).await;
     shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task).await;
+    shutdown_collector_runtime(&mut collector_shutdown_tx, &mut collector_task).await;
 
     if let Some(mut child) = dashboard_ui_process {
         stop_dashboard_ui_process(&mut child);
@@ -639,6 +648,17 @@ fn spawn_proxy_runtime(
         cloud_task = Some(runtime.task);
     }
 
+    let mut collector_shutdown_tx = None;
+    let mut collector_task = None;
+    if let Some(ref logger) = event_logger {
+        if let Some(CollectorRuntime { shutdown_tx, task }) =
+            soth_collector::spawn_from_env(logger.clone(), config.observe.event_tags.clone())
+        {
+            collector_shutdown_tx = Some(shutdown_tx);
+            collector_task = Some(task);
+        }
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         hudsucker_proxy::start_proxy_with_shutdown(
@@ -666,6 +686,8 @@ fn spawn_proxy_runtime(
         retention_task,
         cloud_shutdown_tx,
         cloud_task,
+        collector_shutdown_tx,
+        collector_task,
     })
 }
 
@@ -930,6 +952,28 @@ async fn shutdown_cloud_runtime(
             Err(_) => {
                 handle.abort();
                 tracing::warn!("Cloud pull task shutdown timed out; aborted task.");
+            }
+        }
+    }
+}
+
+async fn shutdown_collector_runtime(
+    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    task: &mut Option<JoinHandle<()>>,
+) {
+    if let Some(tx) = shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+
+    if let Some(mut handle) = task.take() {
+        match tokio::time::timeout(Duration::from_secs(2), &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("Collector task join error: {}", error);
+            }
+            Err(_) => {
+                handle.abort();
+                tracing::warn!("Collector task shutdown timed out; aborted task.");
             }
         }
     }

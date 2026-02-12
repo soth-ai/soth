@@ -72,6 +72,14 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 
+    /// Local collector source name for file-derived events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collector_source: Option<String>,
+
+    /// Local collector byte offset for file-derived events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collector_offset: Option<u64>,
+
     /// External payload reference for full content when moved out of event_json.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_ref: Option<String>,
@@ -202,6 +210,8 @@ impl WrapEvent {
             method: None,
             tool_name: None,
             content: None,
+            collector_source: None,
+            collector_offset: None,
             content_ref: None,
             content_preview: None,
             request_content: None,
@@ -271,6 +281,13 @@ impl WrapEvent {
     /// Set the full content (JSON-RPC message)
     pub fn with_content(mut self, content: impl Into<String>) -> Self {
         self.content = Some(content.into());
+        self
+    }
+
+    /// Set local collector metadata for file-derived events.
+    pub fn with_collector_metadata(mut self, source: impl Into<String>, offset: u64) -> Self {
+        self.collector_source = Some(source.into());
+        self.collector_offset = Some(offset);
         self
     }
 
