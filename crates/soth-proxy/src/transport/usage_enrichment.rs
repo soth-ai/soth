@@ -203,7 +203,11 @@ fn parse_grpc_frames(body: &[u8]) -> Option<Vec<(bool, &[u8])>> {
         cursor = end;
     }
 
-    if frames.is_empty() { None } else { Some(frames) }
+    if frames.is_empty() {
+        None
+    } else {
+        Some(frames)
+    }
 }
 
 async fn decode_grpc_payload(

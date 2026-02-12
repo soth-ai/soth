@@ -845,6 +845,7 @@ fn read_sqlite_crypto_status(db_path: &Path) -> std::io::Result<CryptoStatusSumm
             SELECT COUNT(*)
             FROM wrap_events
             WHERE json_extract(event_json, '$.traffic_envelope.signature') IS NOT NULL
+               OR json_extract(event_json, '$.merkle_signature') IS NOT NULL
             "#,
             [],
             |row| row.get(0),
@@ -1959,6 +1960,8 @@ mod tests {
 
         let status = store.get_crypto_status();
         assert_eq!(status.total_events, 3);
+        assert_eq!(status.signed_events, 3);
+        assert!(status.signature_coverage_pct > 99.0);
         assert!(status.merkle_batches >= 2);
         assert!(status.latest_batch_id.is_some());
         assert!(status.latest_root_hash.is_some());

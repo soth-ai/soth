@@ -833,25 +833,33 @@ fn insert_sqlite_event(
     let json = serde_json::to_string(&event)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    tx.execute(
-        r#"
-        INSERT OR REPLACE INTO wrap_events (id, session_id, timestamp, event_json)
+    let inserted_rows = tx
+        .execute(
+            r#"
+        INSERT OR IGNORE INTO wrap_events (id, session_id, timestamp, event_json)
         VALUES (?1, ?2, ?3, ?4)
         "#,
-        params![
-            &event.id,
-            &event.session_id,
-            event.timestamp.to_rfc3339(),
-            &json
-        ],
-    )
-    .map_err(to_io_err)?;
+            params![
+                &event.id,
+                &event.session_id,
+                event.timestamp.to_rfc3339(),
+                &json
+            ],
+        )
+        .map_err(to_io_err)?;
+    if inserted_rows == 0 {
+        warn!(
+            event_id = %event.id,
+            "Dropped duplicate event id to preserve append-only event log semantics"
+        );
+        return Ok(None);
+    }
     let seq = tx.last_insert_rowid();
 
     for payload in payloads {
         tx.execute(
             r#"
-            INSERT OR REPLACE INTO wrap_event_payloads (event_id, payload_kind, payload, created_at)
+            INSERT INTO wrap_event_payloads (event_id, payload_kind, payload, created_at)
             VALUES (?1, ?2, ?3, ?4)
             "#,
             params![
@@ -1280,6 +1288,46 @@ mod tests {
             Some("2026-02-01T00:00:00Z")
         );
         assert_eq!(snapshot.sync_errors.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn test_duplicate_event_id_is_ignored_without_overwrite() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path.clone()).unwrap();
+        let agent = AgentInfo::new("Test Agent", DetectionSource::CommandLine);
+
+        let first = WrapEvent::new(
+            "session-dup",
+            "api.openai.com",
+            WrapDirection::Out,
+            agent.clone(),
+        )
+        .with_method("POST /v1/chat/completions")
+        .with_content("first-payload");
+        let mut duplicate =
+            WrapEvent::new("session-dup", "api.openai.com", WrapDirection::Out, agent)
+                .with_method("POST /v1/chat/completions")
+                .with_content("second-payload");
+        duplicate.id = first.id.clone();
+
+        logger.log(&first);
+        logger.log(&duplicate);
+        logger.close();
+
+        let conn = Connection::open(path).unwrap();
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wrap_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1);
+
+        let event_json: String = conn
+            .query_row("SELECT event_json FROM wrap_events LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let persisted: WrapEvent = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(persisted.content.as_deref(), Some("first-payload"));
     }
 
     #[test]

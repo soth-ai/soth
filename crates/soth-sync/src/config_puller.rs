@@ -80,12 +80,7 @@ impl ConfigPuller {
             .debounce_state
             .lock()
             .expect("config pull debounce state lock poisoned");
-        evaluate_debounce(
-            &mut state,
-            version,
-            self.debounce_window,
-            Instant::now(),
-        )
+        evaluate_debounce(&mut state, version, self.debounce_window, Instant::now())
     }
 }
 

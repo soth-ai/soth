@@ -84,8 +84,12 @@ mod tests {
 
     #[test]
     fn extracts_single_operation_name() {
-        let body = r#"{"operationName":"GetBudget","query":"query GetBudget { budget { total } }"}"#;
-        assert_eq!(extract_graphql_operation(body).as_deref(), Some("GetBudget"));
+        let body =
+            r#"{"operationName":"GetBudget","query":"query GetBudget { budget { total } }"}"#;
+        assert_eq!(
+            extract_graphql_operation(body).as_deref(),
+            Some("GetBudget")
+        );
     }
 
     #[test]
