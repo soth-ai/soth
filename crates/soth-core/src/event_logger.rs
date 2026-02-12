@@ -312,8 +312,37 @@ fn init_sqlite_schema(conn: &Connection) -> std::io::Result<()> {
             ON wrap_events(session_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_wrap_events_ts
             ON wrap_events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_wrap_events_merkle_batch_id
+            ON wrap_events((json_extract(event_json, '$.merkle_batch_id')));
         CREATE INDEX IF NOT EXISTS idx_wrap_event_payloads_event_id
             ON wrap_event_payloads(event_id);
+
+        CREATE TABLE IF NOT EXISTS merkle_batches (
+            batch_id TEXT PRIMARY KEY,
+            seq_start INTEGER NOT NULL,
+            seq_end INTEGER NOT NULL,
+            root_hash TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            signer_did TEXT NOT NULL,
+            prev_root TEXT,
+            sealed_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_merkle_batches_sealed_at
+            ON merkle_batches(sealed_at);
+
+        CREATE TABLE IF NOT EXISTS key_versions (
+            key_id TEXT PRIMARY KEY,
+            principal_type TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            did TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            rotated_at TEXT,
+            status TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_key_versions_principal
+            ON key_versions(principal_type, principal_id);
 
         CREATE TABLE IF NOT EXISTS sync_state (
             key TEXT PRIMARY KEY,

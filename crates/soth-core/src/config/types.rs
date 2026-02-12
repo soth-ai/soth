@@ -30,6 +30,10 @@ pub struct SothConfig {
     #[serde(default)]
     pub identity: IdentityConfig,
 
+    /// Unified cryptographic identity/audit/tls settings
+    #[serde(default)]
+    pub crypto_identity: CryptoIdentityConfig,
+
     /// Policy engine settings
     #[serde(default)]
     pub policy: PolicyConfig,
@@ -75,6 +79,7 @@ impl Default for SothConfig {
             upstream: UpstreamConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
+            crypto_identity: CryptoIdentityConfig::default(),
             policy: PolicyConfig::default(),
             observe: ObserveConfig::default(),
             budget: BudgetConfig::default(),
@@ -325,6 +330,167 @@ impl Default for IdentityConfig {
             max_age: default_max_age(),
             clock_skew: default_clock_skew(),
             allowed_dids: Vec::new(),
+        }
+    }
+}
+
+/// Unified cryptographic identity configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoIdentityConfig {
+    /// Enable unified crypto identity pipeline
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Mode: audit, enforce
+    #[serde(default = "default_crypto_identity_mode")]
+    pub mode: String,
+
+    /// Envelope signing controls
+    #[serde(default)]
+    pub signing: CryptoSigningConfig,
+
+    /// Key hierarchy and rotation controls
+    #[serde(default)]
+    pub hierarchy: CryptoHierarchyConfig,
+
+    /// Merkle accumulator controls
+    #[serde(default)]
+    pub merkle: CryptoMerkleConfig,
+
+    /// TLS key binding controls
+    #[serde(default)]
+    pub tls: CryptoTlsBindingConfig,
+}
+
+fn default_crypto_identity_mode() -> String {
+    "audit".to_string()
+}
+
+impl Default for CryptoIdentityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_crypto_identity_mode(),
+            signing: CryptoSigningConfig::default(),
+            hierarchy: CryptoHierarchyConfig::default(),
+            merkle: CryptoMerkleConfig::default(),
+            tls: CryptoTlsBindingConfig::default(),
+        }
+    }
+}
+
+/// Signature behavior for request envelopes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoSigningConfig {
+    /// Sign envelope metadata only (not full request body)
+    #[serde(default = "default_true")]
+    pub envelope_metadata_only: bool,
+
+    /// Signature algorithm for envelope signing
+    #[serde(default = "default_crypto_signing_algorithm")]
+    pub algorithm: String,
+}
+
+fn default_crypto_signing_algorithm() -> String {
+    "ed25519".to_string()
+}
+
+impl Default for CryptoSigningConfig {
+    fn default() -> Self {
+        Self {
+            envelope_metadata_only: true,
+            algorithm: default_crypto_signing_algorithm(),
+        }
+    }
+}
+
+/// Key hierarchy and rotation settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoHierarchyConfig {
+    /// Derivation scheme for org/user/agent key hierarchy
+    #[serde(default = "default_crypto_derivation")]
+    pub derivation: String,
+
+    /// Rotation cadence in days for active keys
+    #[serde(default = "default_crypto_rotation_days")]
+    pub rotation_days: u32,
+}
+
+fn default_crypto_derivation() -> String {
+    "slip10_hardened".to_string()
+}
+
+fn default_crypto_rotation_days() -> u32 {
+    90
+}
+
+impl Default for CryptoHierarchyConfig {
+    fn default() -> Self {
+        Self {
+            derivation: default_crypto_derivation(),
+            rotation_days: default_crypto_rotation_days(),
+        }
+    }
+}
+
+/// Merkle tree sealing behavior
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoMerkleConfig {
+    /// Enable Merkle audit chain
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Batch seal interval
+    #[serde(
+        default = "default_crypto_merkle_seal_interval",
+        with = "humantime_serde"
+    )]
+    pub seal_interval: Duration,
+
+    /// Max events per Merkle batch before seal
+    #[serde(default = "default_crypto_merkle_batch_size")]
+    pub max_events_per_batch: usize,
+}
+
+fn default_crypto_merkle_seal_interval() -> Duration {
+    Duration::from_secs(3)
+}
+
+fn default_crypto_merkle_batch_size() -> usize {
+    500
+}
+
+impl Default for CryptoMerkleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            seal_interval: default_crypto_merkle_seal_interval(),
+            max_events_per_batch: default_crypto_merkle_batch_size(),
+        }
+    }
+}
+
+/// TLS behavior controlled by crypto identity lifecycle
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoTlsBindingConfig {
+    /// Bind TLS issuer lifecycle to organization identity keys
+    #[serde(default = "default_true")]
+    pub bind_to_org_identity: bool,
+
+    /// Leaf certificate TTL
+    #[serde(default = "default_crypto_tls_leaf_ttl", with = "humantime_serde")]
+    pub leaf_ttl: Duration,
+}
+
+fn default_crypto_tls_leaf_ttl() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+impl Default for CryptoTlsBindingConfig {
+    fn default() -> Self {
+        Self {
+            bind_to_org_identity: true,
+            leaf_ttl: default_crypto_tls_leaf_ttl(),
         }
     }
 }
@@ -2154,6 +2320,9 @@ mod tests {
         assert_eq!(config.version, "1.0");
         assert_eq!(config.server.transport, "stdio");
         assert_eq!(config.server.listen.port, 3000);
+        assert!(!config.crypto_identity.enabled);
+        assert_eq!(config.crypto_identity.mode, "audit");
+        assert_eq!(config.crypto_identity.signing.algorithm, "ed25519");
         assert!(!config.cloud.enabled);
         assert_eq!(config.cloud.endpoint, "https://api.soth.ai");
         assert_eq!(config.cloud.config_debounce_secs, 6);
@@ -2212,6 +2381,49 @@ cloud:
         assert_eq!(config.cloud.config_debounce_secs, 8);
         assert!(config.cloud.body_upload_enabled);
         assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
+    }
+
+    #[test]
+    fn test_parse_crypto_identity_yaml() {
+        let yaml = r#"
+crypto_identity:
+  enabled: true
+  mode: enforce
+  signing:
+    envelope_metadata_only: true
+    algorithm: "ed25519"
+  hierarchy:
+    derivation: "slip10_hardened"
+    rotation_days: 60
+  merkle:
+    enabled: true
+    seal_interval: "5s"
+    max_events_per_batch: 400
+  tls:
+    bind_to_org_identity: true
+    leaf_ttl: "12h"
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.crypto_identity.enabled);
+        assert_eq!(config.crypto_identity.mode, "enforce");
+        assert!(config.crypto_identity.signing.envelope_metadata_only);
+        assert_eq!(config.crypto_identity.signing.algorithm, "ed25519");
+        assert_eq!(
+            config.crypto_identity.hierarchy.derivation,
+            "slip10_hardened"
+        );
+        assert_eq!(config.crypto_identity.hierarchy.rotation_days, 60);
+        assert!(config.crypto_identity.merkle.enabled);
+        assert_eq!(
+            config.crypto_identity.merkle.seal_interval,
+            Duration::from_secs(5)
+        );
+        assert_eq!(config.crypto_identity.merkle.max_events_per_batch, 400);
+        assert!(config.crypto_identity.tls.bind_to_org_identity);
+        assert_eq!(
+            config.crypto_identity.tls.leaf_ttl,
+            Duration::from_secs(12 * 60 * 60)
+        );
     }
 
     #[test]

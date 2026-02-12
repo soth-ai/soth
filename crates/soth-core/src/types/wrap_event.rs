@@ -52,6 +52,30 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traffic_envelope: Option<TrafficEnvelope>,
 
+    /// Event hash used as Merkle leaf input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_hash: Option<String>,
+
+    /// Merkle batch identifier when event is sealed into an audit batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merkle_batch_id: Option<String>,
+
+    /// Leaf index within the Merkle batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merkle_leaf_index: Option<u32>,
+
+    /// Merkle root for the sealed batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merkle_root: Option<String>,
+
+    /// Signature over Merkle root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merkle_signature: Option<String>,
+
+    /// DID used for signing Merkle roots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_signer_did: Option<String>,
+
     /// AI provider name (for proxy traffic)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -209,6 +233,12 @@ impl WrapEvent {
             direction,
             source: EventSource::Mcp,
             traffic_envelope: None,
+            event_hash: None,
+            merkle_batch_id: None,
+            merkle_leaf_index: None,
+            merkle_root: None,
+            merkle_signature: None,
+            audit_signer_did: None,
             provider: None,
             model: None,
             method: None,
@@ -256,6 +286,29 @@ impl WrapEvent {
     /// Attach canonical ingress envelope metadata.
     pub fn with_traffic_envelope(mut self, envelope: TrafficEnvelope) -> Self {
         self.traffic_envelope = Some(envelope);
+        self
+    }
+
+    /// Attach hash used as Merkle leaf input.
+    pub fn with_event_hash(mut self, event_hash: impl Into<String>) -> Self {
+        self.event_hash = Some(event_hash.into());
+        self
+    }
+
+    /// Attach Merkle seal metadata for this event.
+    pub fn with_merkle_seal(
+        mut self,
+        batch_id: impl Into<String>,
+        leaf_index: u32,
+        root: impl Into<String>,
+        signature: impl Into<String>,
+        signer_did: impl Into<String>,
+    ) -> Self {
+        self.merkle_batch_id = Some(batch_id.into());
+        self.merkle_leaf_index = Some(leaf_index);
+        self.merkle_root = Some(root.into());
+        self.merkle_signature = Some(signature.into());
+        self.audit_signer_did = Some(signer_did.into());
         self
     }
 
@@ -594,5 +647,23 @@ mod tests {
         assert_eq!(event.reasoning_tokens, Some(9));
         assert_eq!(event.request_size_bytes, Some(1_024));
         assert_eq!(event.response_size_bytes, Some(2_048));
+    }
+
+    #[test]
+    fn test_merkle_fields() {
+        let agent = AgentInfo::new("Codex", DetectionSource::Environment);
+        let event = WrapEvent::new("sess-merkle", "api.openai.com", WrapDirection::Out, agent)
+            .with_event_hash("event-hash-1")
+            .with_merkle_seal("batch-1", 7, "root-abc", "sig-xyz", "did:key:z6MkSigner");
+
+        assert_eq!(event.event_hash.as_deref(), Some("event-hash-1"));
+        assert_eq!(event.merkle_batch_id.as_deref(), Some("batch-1"));
+        assert_eq!(event.merkle_leaf_index, Some(7));
+        assert_eq!(event.merkle_root.as_deref(), Some("root-abc"));
+        assert_eq!(event.merkle_signature.as_deref(), Some("sig-xyz"));
+        assert_eq!(
+            event.audit_signer_did.as_deref(),
+            Some("did:key:z6MkSigner")
+        );
     }
 }
