@@ -128,6 +128,18 @@ fn release_stream_buffer(mut buffer: Vec<u8>) {
     }
 }
 
+/// Append a stream chunk into capture buffer with a hard memory cap.
+/// Returns true when the cap is reached (or already reached).
+fn append_stream_capture(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if buffer.len() >= STREAM_CAPTURE_MAX_BYTES {
+        return true;
+    }
+    let remaining = STREAM_CAPTURE_MAX_BYTES - buffer.len();
+    let write_len = remaining.min(chunk.len());
+    buffer.extend_from_slice(&chunk[..write_len]);
+    write_len < chunk.len()
+}
+
 /// Identity verification mode for proxy enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyIdentityMode {
@@ -2149,12 +2161,22 @@ impl HttpHandler for AiProxyHandler {
                 let log_budget_tracker = budget_tracker.clone();
                 let log_event_tags = event_tags.clone();
                 let log_pii_enricher = pii_enricher.clone();
+                let log_stream_kind: &'static str = if is_sse {
+                    "sse"
+                } else if is_codex_response_path {
+                    "codex"
+                } else if is_gemini_bard_response_path {
+                    "gemini_bard"
+                } else {
+                    "stream"
+                };
                 #[cfg(feature = "dashboard")]
                 let log_dashboard = dashboard.clone();
 
                 // Create a tee stream that yields frames while accumulating data
                 let tee_stream = stream! {
                     let mut body = body;
+                    let mut capture_limit_reported = false;
                     loop {
                         match body.frame().await {
                             Some(Ok(frame)) => {
@@ -2163,10 +2185,17 @@ impl HttpHandler for AiProxyHandler {
                                     let mut guard = accumulated_clone.lock();
                                     if let Some(ref mut acc) = *guard {
                                         // Limit accumulation to prevent memory issues.
-                                        if acc.len() < STREAM_CAPTURE_MAX_BYTES {
-                                            let remaining = STREAM_CAPTURE_MAX_BYTES - acc.len();
-                                            let write_len = remaining.min(data.len());
-                                            acc.extend_from_slice(&data[..write_len]);
+                                        if append_stream_capture(acc, data) && !capture_limit_reported {
+                                            capture_limit_reported = true;
+                                            metrics::record_stream_capture_limit_reached(provider, log_stream_kind);
+                                            warn!(
+                                                provider = provider,
+                                                host = %log_pending.host,
+                                                path = %log_pending.path,
+                                                max_bytes = STREAM_CAPTURE_MAX_BYTES,
+                                                stream_kind = log_stream_kind,
+                                                "Response stream capture limit reached; truncating buffered payload"
+                                            );
                                         }
                                     }
                                 }
@@ -3407,6 +3436,22 @@ mod tests {
         let bytes = vec![0x28, 0xB5, 0x2F, 0xFD];
         let decoded = decode_body_for_logging(&bytes, Some("zstd"));
         assert!(decoded.contains("[compressed/zstd payload"));
+    }
+
+    #[test]
+    fn test_append_stream_capture_caps_buffer() {
+        let mut buffer = Vec::new();
+        assert!(!append_stream_capture(&mut buffer, &[1, 2, 3]));
+        assert_eq!(buffer.len(), 3);
+
+        let remaining = STREAM_CAPTURE_MAX_BYTES - buffer.len();
+        let mut chunk = vec![9u8; remaining + 16];
+        assert!(append_stream_capture(&mut buffer, &chunk));
+        assert_eq!(buffer.len(), STREAM_CAPTURE_MAX_BYTES);
+
+        chunk.truncate(1);
+        assert!(append_stream_capture(&mut buffer, &chunk));
+        assert_eq!(buffer.len(), STREAM_CAPTURE_MAX_BYTES);
     }
 
     #[test]

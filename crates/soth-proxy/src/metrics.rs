@@ -57,6 +57,7 @@ pub const POLICY_EVAL_TOTAL: &str = "soth_policy_evaluations_total";
 pub const BUDGET_CHECKS_TOTAL: &str = "soth_budget_checks_total";
 pub const BUDGET_BLOCKS_TOTAL: &str = "soth_budget_blocks_total";
 pub const ENFORCEMENT_FAILOPEN_TOTAL: &str = "soth_enforcement_failopen_total";
+pub const STREAM_CAPTURE_LIMIT_REACHED_TOTAL: &str = "soth_stream_capture_limit_reached_total";
 
 // Gauges
 pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
@@ -103,6 +104,10 @@ fn describe_counters() {
     describe_counter!(
         ENFORCEMENT_FAILOPEN_TOTAL,
         "Total number of fail-open enforcement events by reason"
+    );
+    describe_counter!(
+        STREAM_CAPTURE_LIMIT_REACHED_TOTAL,
+        "Total number of response streams where capture limit was reached"
     );
 }
 
@@ -203,6 +208,16 @@ pub fn record_enforcement_failopen(reason: &str) {
     counter!(
         ENFORCEMENT_FAILOPEN_TOTAL,
         "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a stream response capture limit hit.
+pub fn record_stream_capture_limit_reached(provider: &str, stream_kind: &str) {
+    counter!(
+        STREAM_CAPTURE_LIMIT_REACHED_TOTAL,
+        "provider" => provider.to_string(),
+        "stream_kind" => stream_kind.to_string()
     )
     .increment(1);
 }
