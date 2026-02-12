@@ -6,6 +6,7 @@ use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
 };
 
+use crate::json_security::strip_json_security_prefix_text;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
 
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +80,14 @@ pub fn normalize_response_content(
 ) -> Option<String> {
     response_content
         .filter(|resp| !resp.trim().is_empty())
-        .map(ToString::to_string)
+        .map(|resp| {
+            let sanitized = strip_json_security_prefix_text(resp);
+            if sanitized.is_empty() {
+                resp.to_string()
+            } else {
+                sanitized.to_string()
+            }
+        })
         .or_else(|| {
             if always_placeholder_on_empty || request_content.is_some() || method == "POST" {
                 Some(empty_response_placeholder(method, path, status, is_sse))
@@ -154,4 +162,32 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
     }
 
     event
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_response_content;
+
+    #[test]
+    fn normalize_response_content_strips_security_prefix() {
+        let content = normalize_response_content(
+            Some(")]}'\n{\"ok\":true}"),
+            Some("{}"),
+            "POST",
+            "/v1/messages",
+            200,
+            false,
+            true,
+        );
+        assert_eq!(content.as_deref(), Some("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn normalize_response_content_uses_placeholder_when_empty() {
+        let content =
+            normalize_response_content(Some(""), Some("{}"), "POST", "/x", 200, false, true);
+        assert!(content
+            .unwrap_or_default()
+            .contains("no HTTP response body captured"));
+    }
 }

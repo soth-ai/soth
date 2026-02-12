@@ -5,6 +5,7 @@ use std::sync::Arc;
 use hudsucker::hyper;
 use soth_budget::{PricingCatalog, TokenUsage};
 
+use crate::json_security::strip_json_security_prefix;
 use crate::providers::{
     sse::parse_sse_body, AiProvider, HttpRequest, ProviderRegistry, ProviderUsage,
 };
@@ -71,15 +72,16 @@ pub fn extract_usage_meta_from_decoded_payload(
         return ResponseUsageMeta::default();
     };
 
+    let sanitized = strip_json_security_prefix(decoded_body);
     let usage = if is_sse {
-        let parsed = parse_sse_body(parser, decoded_body);
+        let parsed = parse_sse_body(parser, sanitized);
         if parsed.input_tokens == 0 && parsed.output_tokens == 0 {
             None
         } else {
             Some(parsed)
         }
     } else {
-        parser.extract_usage(decoded_body)
+        parser.extract_usage(sanitized)
     };
 
     build_response_usage_meta(usage, fallback_model, pricing_catalog)
