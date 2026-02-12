@@ -739,6 +739,10 @@ pub struct CloudConfig {
     #[serde(default = "default_cloud_config_pull_interval_secs")]
     pub config_pull_interval_secs: u64,
 
+    /// Debounce window before applying a newly pulled config version
+    #[serde(default = "default_cloud_config_debounce_secs")]
+    pub config_debounce_secs: u64,
+
     /// Whether response/request body uploads are enabled
     #[serde(default)]
     pub body_upload_enabled: bool,
@@ -760,6 +764,10 @@ fn default_cloud_config_pull_interval_secs() -> u64 {
     300
 }
 
+fn default_cloud_config_debounce_secs() -> u64 {
+    6
+}
+
 fn default_cloud_cache_path() -> Option<PathBuf> {
     Some(PathBuf::from("~/.soth/cloud_config_cache.json"))
 }
@@ -773,6 +781,7 @@ impl Default for CloudConfig {
             tags: BTreeMap::new(),
             sync_interval_secs: default_cloud_sync_interval_secs(),
             config_pull_interval_secs: default_cloud_config_pull_interval_secs(),
+            config_debounce_secs: default_cloud_config_debounce_secs(),
             body_upload_enabled: false,
             cache_path: default_cloud_cache_path(),
         }
@@ -2147,6 +2156,7 @@ mod tests {
         assert_eq!(config.server.listen.port, 3000);
         assert!(!config.cloud.enabled);
         assert_eq!(config.cloud.endpoint, "https://api.soth.ai");
+        assert_eq!(config.cloud.config_debounce_secs, 6);
         assert!(config.forward_proxy.tls.learned_passthrough.enabled);
     }
 
@@ -2187,6 +2197,7 @@ cloud:
   endpoint: "https://staging.soth.ai"
   sync_interval_secs: 30
   config_pull_interval_secs: 120
+  config_debounce_secs: 8
   body_upload_enabled: true
   tags:
     project: "edge"
@@ -2198,6 +2209,7 @@ cloud:
         assert_eq!(config.cloud.endpoint, "https://staging.soth.ai");
         assert_eq!(config.cloud.sync_interval_secs, 30);
         assert_eq!(config.cloud.config_pull_interval_secs, 120);
+        assert_eq!(config.cloud.config_debounce_secs, 8);
         assert!(config.cloud.body_upload_enabled);
         assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
     }

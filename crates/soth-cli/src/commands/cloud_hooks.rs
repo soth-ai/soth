@@ -70,7 +70,9 @@ pub fn spawn_cloud_pull_runtime(
     let cache_path = resolve_cache_path(config);
     let sync_interval_secs = config.cloud.sync_interval_secs.max(5);
     let interval_secs = config.cloud.config_pull_interval_secs.max(15);
-    let puller = ConfigPuller::new(endpoint, api_key, cache_path);
+    let debounce_secs = config.cloud.config_debounce_secs.max(1);
+    let puller = ConfigPuller::new(endpoint, api_key, cache_path)
+        .with_debounce(std::time::Duration::from_secs(debounce_secs));
     let sync_agent = event_db_path.and_then(|event_db_path| {
         if !event_db_path.exists() {
             warn!(

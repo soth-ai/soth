@@ -226,6 +226,11 @@ fn apply_env_overrides(config: &mut SothConfig) {
             config.cloud.config_pull_interval_secs = parsed;
         }
     }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_CONFIG_DEBOUNCE_SECS") {
+        if let Ok(parsed) = value.parse() {
+            config.cloud.config_debounce_secs = parsed;
+        }
+    }
     if let Ok(value) = std::env::var("SOTH_CLOUD_BODY_UPLOAD_ENABLED") {
         config.cloud.body_upload_enabled =
             value.parse().unwrap_or(config.cloud.body_upload_enabled);
@@ -544,6 +549,7 @@ forward_proxy:
         std::env::set_var("SOTH_CLOUD_TAGS", "project=soth,env=qa");
         std::env::set_var("SOTH_CLOUD_SYNC_INTERVAL_SECS", "45");
         std::env::set_var("SOTH_CLOUD_CONFIG_PULL_INTERVAL_SECS", "180");
+        std::env::set_var("SOTH_CLOUD_CONFIG_DEBOUNCE_SECS", "9");
         std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED", "true");
 
         let config = load_config_from_str("version: \"1.0\"").unwrap();
@@ -552,6 +558,7 @@ forward_proxy:
         assert_eq!(config.cloud.endpoint, "https://staging.soth.ai");
         assert_eq!(config.cloud.sync_interval_secs, 45);
         assert_eq!(config.cloud.config_pull_interval_secs, 180);
+        assert_eq!(config.cloud.config_debounce_secs, 9);
         assert!(config.cloud.body_upload_enabled);
         assert_eq!(config.cloud.tags.get("project"), Some(&"soth".to_string()));
 
@@ -561,6 +568,7 @@ forward_proxy:
         std::env::remove_var("SOTH_CLOUD_TAGS");
         std::env::remove_var("SOTH_CLOUD_SYNC_INTERVAL_SECS");
         std::env::remove_var("SOTH_CLOUD_CONFIG_PULL_INTERVAL_SECS");
+        std::env::remove_var("SOTH_CLOUD_CONFIG_DEBOUNCE_SECS");
         std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED");
     }
 
