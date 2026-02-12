@@ -37,6 +37,7 @@ use crate::enforcement::core as enforcement_core;
 use crate::error::ProxyError;
 use crate::json_security::strip_json_security_prefix_text;
 use crate::metrics;
+use crate::process_attribution::{ProcessAttribution, ProcessIdentity};
 use crate::providers::ProviderRegistry;
 use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
@@ -107,6 +108,8 @@ fn request_id_from_ctx(ctx: &HttpContext) -> u64 {
 const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
 const STREAM_CAPTURE_INITIAL_CAPACITY: usize = 64 * 1024;
 const STREAM_BUFFER_POOL_MAX_BUFFERS: usize = 32;
+const PROCESS_ATTR_LOOKUP_TIMEOUT: Duration = Duration::from_millis(25);
+const PROCESS_ATTR_CACHE_TTL: Duration = Duration::from_secs(30);
 
 static STREAM_BUFFER_POOL: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -1183,6 +1186,18 @@ fn record_proxy_budget_spend(
     tracker.record_spend(session_id, agent_id, model, input_tokens, output_tokens);
 }
 
+fn apply_process_identity(
+    mut envelope: TrafficEnvelope,
+    process_identity: Option<&ProcessIdentity>,
+) -> TrafficEnvelope {
+    if let Some(process) = process_identity {
+        envelope.process_pid = Some(process.pid);
+        envelope.process_name = Some(process.name.clone());
+        envelope.process_executable = process.executable.clone();
+    }
+    envelope
+}
+
 /// AI-aware HTTP handler for hudsucker
 #[derive(Clone)]
 pub struct AiProxyHandler {
@@ -1213,6 +1228,8 @@ pub struct AiProxyHandler {
     learned_failure_threshold: u32,
     /// Rolling window for failure threshold accumulation.
     learned_failure_window: Duration,
+    /// Platform-gated process attribution runtime.
+    process_attribution: Arc<ProcessAttribution>,
 }
 
 impl AiProxyHandler {
@@ -1232,6 +1249,10 @@ impl AiProxyHandler {
             learned_passthrough: None,
             learned_failure_threshold: config.tls.learned_passthrough.failure_threshold.max(1),
             learned_failure_window: config.tls.learned_passthrough.failure_window,
+            process_attribution: Arc::new(ProcessAttribution::new(
+                PROCESS_ATTR_LOOKUP_TIMEOUT,
+                PROCESS_ATTR_CACHE_TTL,
+            )),
         }
     }
 
@@ -1571,6 +1592,13 @@ impl HttpHandler for AiProxyHandler {
         let learned_passthrough = self.learned_passthrough.clone();
         let learned_failure_threshold = self.learned_failure_threshold;
         let learned_failure_window = self.learned_failure_window;
+        let process_attribution = self.process_attribution.clone();
+        let client_addr = ctx.client_addr;
+        let should_resolve_process = !is_connect
+            && (host_is_ai_target
+                || host_is_mcp_target
+                || host_is_agent_target
+                || host_mode == HostFilterMode::Discovery);
 
         debug!(
             is_post = is_post,
@@ -1595,6 +1623,12 @@ impl HttpHandler for AiProxyHandler {
                     Response::builder().status(403).body(Body::empty()).unwrap(),
                 );
             }
+
+            let process_identity = if should_resolve_process {
+                process_attribution.resolve(client_addr).await
+            } else {
+                None
+            };
 
             if is_connect && matches!(host_action, HostAction::Intercept) {
                 if let Some(ref learned) = learned_passthrough {
@@ -1697,18 +1731,21 @@ impl HttpHandler for AiProxyHandler {
 
             if !is_connect {
                 if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
-                    let envelope = TrafficEnvelope::proxy(
-                        &session_id,
-                        request_id.to_string(),
-                        provider,
-                        &host,
-                        &http_method,
-                        &path,
-                        model.as_deref(),
-                        agent,
-                        identity_did.as_deref(),
-                        identity_signature.as_deref(),
-                        body_content.as_deref(),
+                    let envelope = apply_process_identity(
+                        TrafficEnvelope::proxy(
+                            &session_id,
+                            request_id.to_string(),
+                            provider,
+                            &host,
+                            &http_method,
+                            &path,
+                            model.as_deref(),
+                            agent,
+                            identity_did.as_deref(),
+                            identity_signature.as_deref(),
+                            body_content.as_deref(),
+                        ),
+                        process_identity.as_ref(),
                     );
                     let enforcement = enforcer.enforce_envelope_with_timeout(&envelope).await;
 
@@ -1839,18 +1876,21 @@ impl HttpHandler for AiProxyHandler {
 
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
-                    let envelope = TrafficEnvelope::proxy(
-                        &session_id,
-                        request_id.to_string(),
-                        provider,
-                        &host,
-                        &http_method,
-                        &display_path,
-                        model.as_deref(),
-                        agent,
-                        identity_did.as_deref(),
-                        identity_signature.as_deref(),
-                        body_content.as_deref(),
+                    let envelope = apply_process_identity(
+                        TrafficEnvelope::proxy(
+                            &session_id,
+                            request_id.to_string(),
+                            provider,
+                            &host,
+                            &http_method,
+                            &display_path,
+                            model.as_deref(),
+                            agent,
+                            identity_did.as_deref(),
+                            identity_signature.as_deref(),
+                            body_content.as_deref(),
+                        ),
+                        process_identity.as_ref(),
                     );
                     let mut pending = pending_requests.lock();
                     pending.insert(
@@ -1897,16 +1937,19 @@ impl HttpHandler for AiProxyHandler {
                         WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
                             .with_source(EventSource::Mcp)
                             .with_method(mcp_method.clone());
-                    let envelope = TrafficEnvelope::mcp_http(
-                        &session_id,
-                        Some(request_id.to_string()),
-                        mcp_method.clone(),
-                        &host,
-                        &path,
-                        agent,
-                        identity_did.as_deref(),
-                        identity_signature.as_deref(),
-                        body_content.as_deref(),
+                    let envelope = apply_process_identity(
+                        TrafficEnvelope::mcp_http(
+                            &session_id,
+                            Some(request_id.to_string()),
+                            mcp_method.clone(),
+                            &host,
+                            &path,
+                            agent,
+                            identity_did.as_deref(),
+                            identity_signature.as_deref(),
+                            body_content.as_deref(),
+                        ),
+                        process_identity.as_ref(),
                     );
                     event = event.with_traffic_envelope(envelope);
                     if let Some(ref request_body) = body_content {
@@ -1926,16 +1969,19 @@ impl HttpHandler for AiProxyHandler {
                     PendingRequest {
                         request_id,
                         event_id: uuid::Uuid::new_v4().to_string(),
-                        envelope: Some(TrafficEnvelope::mcp_http(
-                            &session_id,
-                            Some(request_id.to_string()),
-                            mcp_method.clone(),
-                            &host,
-                            &path,
-                            agent,
-                            identity_did.as_deref(),
-                            identity_signature.as_deref(),
-                            body_content.as_deref(),
+                        envelope: Some(apply_process_identity(
+                            TrafficEnvelope::mcp_http(
+                                &session_id,
+                                Some(request_id.to_string()),
+                                mcp_method.clone(),
+                                &host,
+                                &path,
+                                agent,
+                                identity_did.as_deref(),
+                                identity_signature.as_deref(),
+                                body_content.as_deref(),
+                            ),
+                            process_identity.as_ref(),
                         )),
                         host: host.clone(),
                         path: path.clone(),

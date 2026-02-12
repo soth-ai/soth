@@ -18,6 +18,7 @@ pub mod error;
 pub mod json_security;
 pub mod metrics;
 pub mod pipeline;
+pub mod process_attribution;
 pub mod protocol;
 pub mod providers;
 pub mod rate_limit;
