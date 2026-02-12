@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use serde_json::Value;
 use soth_core::api::{ConfigResponse, RegistryVersionResponse};
+use soth_oisp_types::bundle::parse_compiled_bundle;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +93,8 @@ pub fn load_registry_bundle_cache(
     }
     validate_registry_bundle_payload(&envelope.bundle)
         .context("cached registry bundle payload failed schema validation")?;
+    validate_compiled_bundle_if_present(&envelope.bundle)
+        .context("cached registry bundle failed typed validation")?;
     Ok(Some(envelope))
 }
 
@@ -114,6 +117,8 @@ pub fn save_registry_bundle_cache(
         .context("failed parsing registry bundle payload as JSON")?;
     validate_registry_bundle_payload(&bundle)
         .context("registry bundle payload failed schema validation")?;
+    validate_compiled_bundle_if_present(&bundle)
+        .context("registry bundle failed typed validation")?;
     let envelope = CachedRegistryBundleEnvelope {
         schema_version: registry_cache_schema_version(),
         fetched_at: Utc::now().to_rfc3339(),
@@ -174,6 +179,17 @@ fn is_string_array_field(object: &Map<String, Value>, field: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn validate_compiled_bundle_if_present(bundle: &Value) -> anyhow::Result<()> {
+    let object = match bundle.as_object() {
+        Some(object) => object,
+        None => return Ok(()),
+    };
+    if is_compiled_bundle_schema(object) {
+        parse_compiled_bundle(bundle).context("typed compiled bundle parse failed")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,7 +215,16 @@ mod tests {
         let metadata = sample_registry_metadata("v1");
         let bundle = serde_json::json!({
             "version": "v1",
-            "providers": {},
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "type": "ai-inference",
+                    "domains": ["api.openai.com"]
+                }
+            },
             "domain_index": [],
             "filters": {},
             "pricing": {}
