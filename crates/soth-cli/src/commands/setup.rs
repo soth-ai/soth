@@ -905,7 +905,11 @@ fn render_shell_block(shell: &str, proxy_url: &str) -> String {
              set -gx SSL_CERT_FILE {ca_path}\n\
              set -gx REQUESTS_CA_BUNDLE {ca_path}\n\
              set -gx NODE_EXTRA_CA_CERTS {ca_path}\n\
+             set -gx CURL_CA_BUNDLE {ca_path}\n\
+             set -gx GIT_SSL_CAINFO {ca_path}\n\
+             set -gx AWS_CA_BUNDLE {ca_path}\n\
              set -gx NO_PROXY localhost,127.0.0.1,::1\n\
+             set -gx no_proxy localhost,127.0.0.1,::1\n\
              {WIZARD_END_MARKER}"
         ),
         _ => format!(
@@ -918,7 +922,11 @@ fn render_shell_block(shell: &str, proxy_url: &str) -> String {
              export SSL_CERT_FILE={ca_path}\n\
              export REQUESTS_CA_BUNDLE={ca_path}\n\
              export NODE_EXTRA_CA_CERTS={ca_path}\n\
+             export CURL_CA_BUNDLE={ca_path}\n\
+             export GIT_SSL_CAINFO={ca_path}\n\
+             export AWS_CA_BUNDLE={ca_path}\n\
              export NO_PROXY=localhost,127.0.0.1,::1\n\
+             export no_proxy=localhost,127.0.0.1,::1\n\
              {WIZARD_END_MARKER}"
         ),
     }
@@ -1092,6 +1100,11 @@ mod tests {
         assert!(block.contains(WIZARD_BEGIN_MARKER));
         assert!(block.contains(WIZARD_END_MARKER));
         assert!(block.contains("HTTP_PROXY"));
+        assert!(block.contains("CURL_CA_BUNDLE"));
+        assert!(block.contains("GIT_SSL_CAINFO"));
+        assert!(block.contains("AWS_CA_BUNDLE"));
+        assert!(block.contains("NO_PROXY"));
+        assert!(block.contains("no_proxy"));
     }
 
     #[test]

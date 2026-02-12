@@ -27,6 +27,9 @@ pub async fn run(shell: &str, ca_only: bool, config_path: Option<PathBuf>) -> an
             println!("export SSL_CERT_FILE={}", ca_path);
             println!("export REQUESTS_CA_BUNDLE={}", ca_path);
             println!("export NODE_EXTRA_CA_CERTS={}", ca_path);
+            println!("export CURL_CA_BUNDLE={}", ca_path);
+            println!("export GIT_SSL_CAINFO={}", ca_path);
+            println!("export AWS_CA_BUNDLE={}", ca_path);
             println!("# Run: eval $(soth proxy env)");
         }
         "fish" => {
@@ -39,24 +42,35 @@ pub async fn run(shell: &str, ca_only: bool, config_path: Option<PathBuf>) -> an
             println!("set -gx SSL_CERT_FILE {}", ca_path);
             println!("set -gx REQUESTS_CA_BUNDLE {}", ca_path);
             println!("set -gx NODE_EXTRA_CA_CERTS {}", ca_path);
+            println!("set -gx CURL_CA_BUNDLE {}", ca_path);
+            println!("set -gx GIT_SSL_CAINFO {}", ca_path);
+            println!("set -gx AWS_CA_BUNDLE {}", ca_path);
             println!("# Run: eval (soth proxy env --shell fish)");
         }
         "powershell" | "pwsh" => {
             println!("$env:HTTP_PROXY = \"{}\"", proxy_addr);
             println!("$env:HTTPS_PROXY = \"{}\"", proxy_addr);
             println!("$env:NO_PROXY = \"localhost,127.0.0.1,::1\"");
+            println!("$env:no_proxy = \"localhost,127.0.0.1,::1\"");
             println!("$env:SSL_CERT_FILE = \"{}\"", ca_path);
             println!("$env:REQUESTS_CA_BUNDLE = \"{}\"", ca_path);
             println!("$env:NODE_EXTRA_CA_CERTS = \"{}\"", ca_path);
+            println!("$env:CURL_CA_BUNDLE = \"{}\"", ca_path);
+            println!("$env:GIT_SSL_CAINFO = \"{}\"", ca_path);
+            println!("$env:AWS_CA_BUNDLE = \"{}\"", ca_path);
             println!("# Run in PowerShell to set variables");
         }
         "cmd" => {
             println!("set HTTP_PROXY={}", proxy_addr);
             println!("set HTTPS_PROXY={}", proxy_addr);
             println!("set NO_PROXY=localhost,127.0.0.1,::1");
+            println!("set no_proxy=localhost,127.0.0.1,::1");
             println!("set SSL_CERT_FILE={}", ca_path);
             println!("set REQUESTS_CA_BUNDLE={}", ca_path);
             println!("set NODE_EXTRA_CA_CERTS={}", ca_path);
+            println!("set CURL_CA_BUNDLE={}", ca_path);
+            println!("set GIT_SSL_CAINFO={}", ca_path);
+            println!("set AWS_CA_BUNDLE={}", ca_path);
             println!("REM Run each line in Command Prompt");
         }
         _ => {
@@ -67,6 +81,9 @@ pub async fn run(shell: &str, ca_only: bool, config_path: Option<PathBuf>) -> an
             println!("# SSL_CERT_FILE={}", ca_path);
             println!("# REQUESTS_CA_BUNDLE={}", ca_path);
             println!("# NODE_EXTRA_CA_CERTS={}", ca_path);
+            println!("# CURL_CA_BUNDLE={}", ca_path);
+            println!("# GIT_SSL_CAINFO={}", ca_path);
+            println!("# AWS_CA_BUNDLE={}", ca_path);
         }
     }
 
