@@ -144,6 +144,16 @@ forward_proxy:
     agent_apps: []
     block: []
 
+  # Adaptive TLS passthrough for cert-pinned hosts that fail repeated MITM.
+  # AI inference domains are protected and never learned for passthrough.
+  tls:
+    learned_passthrough:
+      enabled: true
+      state_path: "~/.soth/learned-passthrough.json"
+      max_age: "7d"
+      failure_threshold: 3
+      failure_window: "90s"
+
 # Production hardening configuration
 # Rate limiting, circuit breakers, and connection management
 production:

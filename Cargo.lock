@@ -3922,6 +3922,8 @@ dependencies = [
  "rcgen 0.13.2",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "soth-core",
  "tempfile",
  "thiserror 1.0.69",

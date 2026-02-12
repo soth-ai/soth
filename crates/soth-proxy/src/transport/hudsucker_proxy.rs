@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
 use soth_policy::PolicyEngine;
+use soth_tls::LearnedPassthrough;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
@@ -34,6 +35,7 @@ use soth_dashboard::{DashboardState, DenialEntry};
 
 use crate::enforcement::core as enforcement_core;
 use crate::error::ProxyError;
+use crate::json_security::strip_json_security_prefix_text;
 use crate::metrics;
 use crate::providers::ProviderRegistry;
 use crate::transport::host_fingerprint;
@@ -1106,16 +1108,17 @@ fn extract_gemini_bard_stream_text(raw: &str) -> Option<String> {
 
     for line in raw.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(")]}'") {
+        let sanitized = strip_json_security_prefix_text(trimmed);
+        if sanitized.is_empty() {
             continue;
         }
 
-        if !trimmed.starts_with('[') {
+        if !sanitized.starts_with('[') {
             // Batch framing length lines are numeric and can be ignored.
             continue;
         }
 
-        let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(sanitized) else {
             continue;
         };
 
@@ -1204,6 +1207,12 @@ pub struct AiProxyHandler {
     event_tags: Arc<BTreeMap<String, String>>,
     /// Optional PII enrichment before events are written.
     pii_enricher: Arc<PiiEventEnricher>,
+    /// Adaptive learned TLS passthrough map (cert-pinning bypass).
+    learned_passthrough: Option<Arc<LearnedPassthrough>>,
+    /// Threshold of repeated failed intercept attempts before learning passthrough.
+    learned_failure_threshold: u32,
+    /// Rolling window for failure threshold accumulation.
+    learned_failure_window: Duration,
 }
 
 impl AiProxyHandler {
@@ -1220,6 +1229,9 @@ impl AiProxyHandler {
             pricing_catalog: Arc::new(PricingCatalog::with_defaults()),
             event_tags: Arc::new(observe.event_tags.clone()),
             pii_enricher: Arc::new(PiiEventEnricher::from_observe_config(observe)),
+            learned_passthrough: None,
+            learned_failure_threshold: config.tls.learned_passthrough.failure_threshold.max(1),
+            learned_failure_window: config.tls.learned_passthrough.failure_window,
         }
     }
 
@@ -1247,9 +1259,17 @@ impl AiProxyHandler {
         self
     }
 
-    /// Check if host is blocked
-    fn is_blocked(&self, host: &str) -> bool {
-        matches!(self.hosts.action_for_host(host), HostAction::Block)
+    /// Set learned passthrough runtime and threshold parameters.
+    pub fn with_learned_passthrough(
+        mut self,
+        learned: Arc<LearnedPassthrough>,
+        failure_threshold: u32,
+        failure_window: Duration,
+    ) -> Self {
+        self.learned_passthrough = Some(learned);
+        self.learned_failure_threshold = failure_threshold.max(1);
+        self.learned_failure_window = failure_window;
+        self
     }
 
     /// Get action for host
@@ -1496,7 +1516,8 @@ impl HttpHandler for AiProxyHandler {
             method = %http_method,
             "Incoming request"
         );
-        let is_blocked = self.is_blocked(&host);
+        let host_action = self.get_action(&host);
+        let is_blocked = matches!(host_action, HostAction::Block);
         let host_is_ai_target = self.hosts.should_check_ai_inference(&host);
         let host_is_mcp_target = self.hosts.should_check_mcp(&host);
         let host_is_agent_target = Self::is_agent_app(&self.hosts, &host);
@@ -1547,6 +1568,9 @@ impl HttpHandler for AiProxyHandler {
         let event_logger = self.event_logger.clone();
         let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
+        let learned_passthrough = self.learned_passthrough.clone();
+        let learned_failure_threshold = self.learned_failure_threshold;
+        let learned_failure_window = self.learned_failure_window;
 
         debug!(
             is_post = is_post,
@@ -1570,6 +1594,26 @@ impl HttpHandler for AiProxyHandler {
                 return RequestOrResponse::Response(
                     Response::builder().status(403).body(Body::empty()).unwrap(),
                 );
+            }
+
+            if is_connect && matches!(host_action, HostAction::Intercept) {
+                if let Some(ref learned) = learned_passthrough {
+                    if !learned.should_passthrough(&host)
+                        && learned.record_connect_attempt(
+                            &host,
+                            learned_failure_threshold,
+                            learned_failure_window,
+                        )
+                    {
+                        metrics::record_tls_learned_passthrough("learn");
+                        metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+                        warn!(
+                            host = %host,
+                            threshold = learned_failure_threshold,
+                            "Learned TLS passthrough host after repeated failed intercept attempts"
+                        );
+                    }
+                }
             }
 
             // Capture body for AI/MCP requests and record payload-size metadata.
@@ -1641,6 +1685,15 @@ impl HttpHandler for AiProxyHandler {
                 };
             let mut policy_allowed = None;
             let mut policy_version = None;
+
+            if !is_connect {
+                if let Some(ref learned) = learned_passthrough {
+                    // Decrypted non-CONNECT request means intercept succeeded; clear any
+                    // stale learning/failure state for this host.
+                    learned.record_decrypted_request(&host);
+                    metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+                }
+            }
 
             if !is_connect {
                 if let (Some(provider), Some(enforcer)) = (provider, enforcer.as_ref()) {
@@ -2427,10 +2480,21 @@ impl HttpHandler for AiProxyHandler {
     ) -> impl std::future::Future<Output = bool> + Send {
         let host = Self::extract_host(req);
         let action = self.get_action(&host);
+        let learned_passthrough = self.learned_passthrough.clone();
 
         async move {
             match action {
                 HostAction::Intercept => {
+                    if let Some(learned) = learned_passthrough.as_ref() {
+                        if learned.should_passthrough(&host) {
+                            metrics::record_tls_learned_passthrough("bypass");
+                            metrics::set_tls_learned_passthrough_active(
+                                learned.active_count() as f64
+                            );
+                            debug!(host = %host, "Learned passthrough: blind tunnel");
+                            return false;
+                        }
+                    }
                     debug!(host = %host, "MITM intercept");
                     true
                 }
@@ -2724,6 +2788,18 @@ where
     let observe_config = observe_config.unwrap_or_default();
     let event_tags = Arc::new(observe_config.event_tags.clone());
     let pii_enricher = Arc::new(PiiEventEnricher::from_observe_config(&observe_config));
+    let learned_passthrough = if config.tls.learned_passthrough.enabled {
+        let learned = Arc::new(LearnedPassthrough::new(
+            config.tls.learned_passthrough.state_path.clone(),
+            config.hosts.ai_inference.clone(),
+            config.tls.learned_passthrough.max_age,
+        ));
+        learned.load();
+        metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+        Some(learned)
+    } else {
+        None
+    };
 
     #[cfg(feature = "dashboard")]
     let handler = {
@@ -2737,6 +2813,13 @@ where
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
         }
+        if let Some(ref learned) = learned_passthrough {
+            h = h.with_learned_passthrough(
+                learned.clone(),
+                config.tls.learned_passthrough.failure_threshold,
+                config.tls.learned_passthrough.failure_window,
+            );
+        }
         h
     };
 
@@ -2748,6 +2831,13 @@ where
         }
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
+        }
+        if let Some(ref learned) = learned_passthrough {
+            h = h.with_learned_passthrough(
+                learned.clone(),
+                config.tls.learned_passthrough.failure_threshold,
+                config.tls.learned_passthrough.failure_window,
+            );
         }
         h
     };

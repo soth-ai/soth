@@ -866,6 +866,10 @@ pub struct ForwardProxyConfig {
     #[serde(default)]
     pub hosts: HostFilterConfig,
 
+    /// TLS interception behavior overrides.
+    #[serde(default)]
+    pub tls: ForwardProxyTlsConfig,
+
     /// Request timeout for AI providers (streaming can be long)
     #[serde(default = "default_ai_timeout", with = "humantime_serde")]
     pub request_timeout: Duration,
@@ -888,6 +892,7 @@ impl Default for ForwardProxyConfig {
             ca: CaConfig::default(),
             pool: PoolConfig::default(),
             hosts: HostFilterConfig::default(),
+            tls: ForwardProxyTlsConfig::default(),
             request_timeout: default_ai_timeout(),
         }
     }
@@ -897,6 +902,75 @@ impl ForwardProxyConfig {
     /// Get the socket address for the proxy
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.address, self.port)
+    }
+}
+
+/// TLS-specific options for the forward proxy transport.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ForwardProxyTlsConfig {
+    /// Adaptive passthrough of learned cert-pinned hosts.
+    #[serde(default)]
+    pub learned_passthrough: LearnedPassthroughConfig,
+}
+
+/// Learned TLS passthrough configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedPassthroughConfig {
+    /// Whether learned passthrough is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// JSON state path for learned host map.
+    #[serde(default = "default_learned_passthrough_state_path")]
+    pub state_path: PathBuf,
+
+    /// Max age before learned hosts expire.
+    #[serde(
+        default = "default_learned_passthrough_max_age",
+        with = "humantime_serde"
+    )]
+    pub max_age: Duration,
+
+    /// Number of repeated failed intercept attempts before learning passthrough.
+    #[serde(default = "default_learned_passthrough_failure_threshold")]
+    pub failure_threshold: u32,
+
+    /// Rolling window used for failure threshold accumulation.
+    #[serde(
+        default = "default_learned_passthrough_failure_window",
+        with = "humantime_serde"
+    )]
+    pub failure_window: Duration,
+}
+
+fn default_learned_passthrough_state_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".soth")
+        .join("learned-passthrough.json")
+}
+
+fn default_learned_passthrough_max_age() -> Duration {
+    Duration::from_secs(7 * 24 * 60 * 60)
+}
+
+fn default_learned_passthrough_failure_threshold() -> u32 {
+    3
+}
+
+fn default_learned_passthrough_failure_window() -> Duration {
+    Duration::from_secs(90)
+}
+
+impl Default for LearnedPassthroughConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            state_path: default_learned_passthrough_state_path(),
+            max_age: default_learned_passthrough_max_age(),
+            failure_threshold: default_learned_passthrough_failure_threshold(),
+            failure_window: default_learned_passthrough_failure_window(),
+        }
     }
 }
 
@@ -2073,6 +2147,7 @@ mod tests {
         assert_eq!(config.server.listen.port, 3000);
         assert!(!config.cloud.enabled);
         assert_eq!(config.cloud.endpoint, "https://api.soth.ai");
+        assert!(config.forward_proxy.tls.learned_passthrough.enabled);
     }
 
     #[test]
@@ -2703,6 +2778,15 @@ forward_proxy:
     }
 
     #[test]
+    fn test_learned_passthrough_config_default() {
+        let config = LearnedPassthroughConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.max_age, Duration::from_secs(7 * 24 * 60 * 60));
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.failure_window, Duration::from_secs(90));
+    }
+
+    #[test]
     fn test_fail_open_config_default() {
         let config = FailOpenConfig::default();
         assert!(config.enabled);
@@ -2812,6 +2896,31 @@ production:
         );
         assert!(!config.production.fail_open.policy_fail_open);
         assert!(config.production.fail_open.budget_fail_open);
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_tls_yaml() {
+        let yaml = r#"
+forward_proxy:
+  tls:
+    learned_passthrough:
+      enabled: true
+      state_path: "/tmp/learned-passthrough.json"
+      max_age: "5d"
+      failure_threshold: 4
+      failure_window: "2m"
+"#;
+
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        let learned = &config.forward_proxy.tls.learned_passthrough;
+        assert!(learned.enabled);
+        assert_eq!(
+            learned.state_path,
+            PathBuf::from("/tmp/learned-passthrough.json")
+        );
+        assert_eq!(learned.max_age, Duration::from_secs(5 * 24 * 60 * 60));
+        assert_eq!(learned.failure_threshold, 4);
+        assert_eq!(learned.failure_window, Duration::from_secs(120));
     }
 
     #[test]

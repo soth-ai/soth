@@ -58,11 +58,13 @@ pub const BUDGET_CHECKS_TOTAL: &str = "soth_budget_checks_total";
 pub const BUDGET_BLOCKS_TOTAL: &str = "soth_budget_blocks_total";
 pub const ENFORCEMENT_FAILOPEN_TOTAL: &str = "soth_enforcement_failopen_total";
 pub const STREAM_CAPTURE_LIMIT_REACHED_TOTAL: &str = "soth_stream_capture_limit_reached_total";
+pub const TLS_LEARNED_PASSTHROUGH_TOTAL: &str = "soth_tls_learned_passthrough_total";
 
 // Gauges
 pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
 pub const CIRCUIT_BREAKER_STATE: &str = "soth_proxy_circuit_breaker_state";
 pub const POLICY_ACTIVE_VERSION: &str = "soth_policy_active_version";
+pub const TLS_LEARNED_PASSTHROUGH_ACTIVE: &str = "soth_tls_learned_passthrough_active";
 
 // Histograms
 pub const REQUEST_DURATION: &str = "soth_proxy_request_duration_seconds";
@@ -109,6 +111,10 @@ fn describe_counters() {
         STREAM_CAPTURE_LIMIT_REACHED_TOTAL,
         "Total number of response streams where capture limit was reached"
     );
+    describe_counter!(
+        TLS_LEARNED_PASSTHROUGH_TOTAL,
+        "Total learned TLS passthrough events by action"
+    );
 }
 
 fn describe_gauges() {
@@ -120,6 +126,10 @@ fn describe_gauges() {
     describe_gauge!(
         POLICY_ACTIVE_VERSION,
         "Marker gauge for active policy version (1 for current labels)"
+    );
+    describe_gauge!(
+        TLS_LEARNED_PASSTHROUGH_ACTIVE,
+        "Current number of learned passthrough hosts"
     );
 }
 
@@ -220,6 +230,20 @@ pub fn record_stream_capture_limit_reached(provider: &str, stream_kind: &str) {
         "stream_kind" => stream_kind.to_string()
     )
     .increment(1);
+}
+
+/// Record learned TLS passthrough action.
+pub fn record_tls_learned_passthrough(action: &str) {
+    counter!(
+        TLS_LEARNED_PASSTHROUGH_TOTAL,
+        "action" => action.to_string()
+    )
+    .increment(1);
+}
+
+/// Set current learned passthrough active host count.
+pub fn set_tls_learned_passthrough_active(count: f64) {
+    gauge!(TLS_LEARNED_PASSTHROUGH_ACTIVE).set(count);
 }
 
 /// Set active connections gauge
