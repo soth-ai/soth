@@ -123,7 +123,10 @@ pub async fn run(
 
     let inline_threshold = config.observe.storage.inline_threshold_bytes;
     let (event_logger, event_logging_status) =
-        match EventLogger::with_default_path_with_inline_payload_max_bytes(inline_threshold) {
+        match EventLogger::with_default_path_from_runtime_config(
+            inline_threshold,
+            &config.crypto_identity,
+        ) {
             Ok(logger) => {
                 let display = compact_path(logger.path());
                 (Some(logger), display)

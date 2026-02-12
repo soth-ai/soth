@@ -5,13 +5,18 @@
 //! Used by both `soth wrap` (stdio interception) and soth proxy (HTTP interception)
 //! to emit events that appear in the observability dashboard.
 
+use crate::config::types::CryptoIdentityConfig;
 use crate::types::WrapEvent;
+use chrono::Utc;
+use ed25519_dalek::{Signer, SigningKey};
+use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 pub const EVENT_LOG_SQLITE_FILE: &str = "events.db";
@@ -25,6 +30,57 @@ const SQLITE_BATCH_SIZE: usize = 64;
 const SQLITE_FLUSH_INTERVAL_MS: u64 = 20;
 const INLINE_PAYLOAD_MAX_BYTES: usize = 16 * 1024;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
+
+/// Event logger runtime options.
+#[derive(Debug, Clone)]
+pub struct EventLoggerOptions {
+    pub inline_payload_max_bytes: usize,
+    pub merkle: MerkleLoggingConfig,
+}
+
+impl Default for EventLoggerOptions {
+    fn default() -> Self {
+        Self {
+            inline_payload_max_bytes: INLINE_PAYLOAD_MAX_BYTES,
+            merkle: MerkleLoggingConfig::default(),
+        }
+    }
+}
+
+impl EventLoggerOptions {
+    /// Build logger options from observe + crypto config.
+    pub fn from_runtime_config(
+        inline_payload_max_bytes: usize,
+        crypto_identity: &CryptoIdentityConfig,
+    ) -> Self {
+        Self {
+            inline_payload_max_bytes,
+            merkle: MerkleLoggingConfig {
+                enabled: crypto_identity.enabled && crypto_identity.merkle.enabled,
+                seal_interval: crypto_identity.merkle.seal_interval,
+                max_events_per_batch: crypto_identity.merkle.max_events_per_batch.max(1),
+            },
+        }
+    }
+}
+
+/// Merkle-audit behavior for event logging.
+#[derive(Debug, Clone)]
+pub struct MerkleLoggingConfig {
+    pub enabled: bool,
+    pub seal_interval: Duration,
+    pub max_events_per_batch: usize,
+}
+
+impl Default for MerkleLoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            seal_interval: Duration::from_secs(3),
+            max_events_per_batch: 500,
+        }
+    }
+}
 
 enum EventLoggerStorage {
     SqliteAsync {
@@ -42,6 +98,202 @@ enum LoggerCommand {
 struct PayloadBlob {
     kind: &'static str,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedEventMeta {
+    seq: i64,
+    event_hash: String,
+}
+
+struct AuditSigner {
+    key: SigningKey,
+    did: String,
+}
+
+impl AuditSigner {
+    fn generate() -> Self {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut did_bytes = vec![0xed, 0x01];
+        did_bytes.extend_from_slice(&key.verifying_key().to_bytes());
+        let did = format!("did:key:z{}", bs58::encode(did_bytes).into_string());
+        Self { key, did }
+    }
+
+    fn did(&self) -> &str {
+        &self.did
+    }
+
+    fn sign_hex(&self, root: &[u8; 32]) -> String {
+        let signature = self.key.sign(root);
+        hex_encode(signature.to_bytes().as_ref())
+    }
+}
+
+struct MerkleAuditState {
+    enabled: bool,
+    seal_interval: Duration,
+    max_events_per_batch: usize,
+    last_sealed_at: Instant,
+    pending: Vec<PersistedEventMeta>,
+    prev_root: Option<[u8; 32]>,
+    batch_counter: u64,
+    signer: AuditSigner,
+}
+
+impl MerkleAuditState {
+    fn new(conn: &Connection, cfg: &MerkleLoggingConfig) -> std::io::Result<Self> {
+        let prev_root: Option<String> = conn
+            .query_row(
+                "SELECT root_hash FROM merkle_batches ORDER BY seq_end DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_io_err)?;
+        let prev_root = prev_root.as_deref().map(hex_decode_32).transpose()?;
+
+        let batch_counter: i64 = conn
+            .query_row("SELECT COUNT(*) FROM merkle_batches", [], |row| row.get(0))
+            .map_err(to_io_err)?;
+
+        Ok(Self {
+            enabled: cfg.enabled,
+            seal_interval: cfg.seal_interval,
+            max_events_per_batch: cfg.max_events_per_batch.max(1),
+            last_sealed_at: Instant::now(),
+            pending: Vec::new(),
+            prev_root,
+            batch_counter: batch_counter.max(0) as u64,
+            signer: AuditSigner::generate(),
+        })
+    }
+
+    fn on_events_persisted(
+        &mut self,
+        tx: &rusqlite::Transaction<'_>,
+        new_events: Vec<PersistedEventMeta>,
+        force: bool,
+    ) -> std::io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !new_events.is_empty() {
+            self.pending.extend(new_events);
+        }
+        self.seal_due_batches(tx, force)
+    }
+
+    fn seal_due_batches(
+        &mut self,
+        tx: &rusqlite::Transaction<'_>,
+        force: bool,
+    ) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let due_to_size = self.pending.len() >= self.max_events_per_batch;
+        let due_to_time = self.last_sealed_at.elapsed() >= self.seal_interval;
+        if !force && !due_to_size && !due_to_time {
+            return Ok(());
+        }
+
+        while self.pending.len() >= self.max_events_per_batch {
+            self.seal_one_batch(tx, self.max_events_per_batch)?;
+        }
+
+        if force || due_to_time {
+            while !self.pending.is_empty() {
+                let remaining = self.pending.len().min(self.max_events_per_batch);
+                self.seal_one_batch(tx, remaining)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn seal_one_batch(
+        &mut self,
+        tx: &rusqlite::Transaction<'_>,
+        count: usize,
+    ) -> std::io::Result<()> {
+        let leaves: Vec<PersistedEventMeta> = self.pending.drain(..count).collect();
+        if leaves.is_empty() {
+            return Ok(());
+        }
+
+        let seq_start = leaves.first().map(|leaf| leaf.seq).unwrap_or_default();
+        let seq_end = leaves.last().map(|leaf| leaf.seq).unwrap_or_default();
+        let leaf_hashes: Vec<[u8; 32]> = leaves
+            .iter()
+            .map(|leaf| hex_decode_32(&leaf.event_hash))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let base_root = compute_merkle_root(&leaf_hashes);
+
+        let chained_root = if let Some(prev_root) = self.prev_root {
+            hash_root_link(&prev_root, &base_root)
+        } else {
+            base_root
+        };
+        let root_hex = hex_encode(&chained_root);
+        let prev_root_hex = self.prev_root.map(|root| hex_encode(&root));
+        let signature_hex = self.signer.sign_hex(&chained_root);
+        let sealed_at = Utc::now().to_rfc3339();
+        let batch_id = format!("mb_{seq_start}_{seq_end}_{}", self.batch_counter + 1);
+
+        tx.execute(
+            r#"
+            INSERT INTO merkle_batches
+              (batch_id, seq_start, seq_end, root_hash, signature, signer_did, prev_root, sealed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                &batch_id,
+                seq_start,
+                seq_end,
+                &root_hex,
+                &signature_hex,
+                self.signer.did(),
+                prev_root_hex.as_deref(),
+                &sealed_at
+            ],
+        )
+        .map_err(to_io_err)?;
+
+        for (leaf_index, leaf) in leaves.iter().enumerate() {
+            tx.execute(
+                r#"
+                UPDATE wrap_events
+                SET event_json = json_set(
+                    event_json,
+                    '$.event_hash', ?2,
+                    '$.merkle_batch_id', ?3,
+                    '$.merkle_leaf_index', ?4,
+                    '$.merkle_root', ?5,
+                    '$.merkle_signature', ?6,
+                    '$.audit_signer_did', ?7
+                )
+                WHERE seq = ?1
+                "#,
+                params![
+                    leaf.seq,
+                    &leaf.event_hash,
+                    &batch_id,
+                    leaf_index as u32,
+                    &root_hex,
+                    &signature_hex,
+                    self.signer.did()
+                ],
+            )
+            .map_err(to_io_err)?;
+        }
+
+        self.prev_root = Some(chained_root);
+        self.batch_counter += 1;
+        self.last_sealed_at = Instant::now();
+        Ok(())
+    }
 }
 
 /// Persistent sync cursors and status state for cloud synchronization.
@@ -63,15 +315,12 @@ pub struct EventLogger {
 impl EventLogger {
     /// Create a new event logger that writes to the given path.
     pub fn new(path: PathBuf) -> std::io::Result<Self> {
-        Self::new_with_inline_payload_max_bytes(path, INLINE_PAYLOAD_MAX_BYTES)
+        Self::new_with_options(path, EventLoggerOptions::default())
     }
 
-    /// Create a new event logger that writes to the given path and applies a custom
-    /// inline payload threshold before side-table offload.
-    pub fn new_with_inline_payload_max_bytes(
-        path: PathBuf,
-        inline_payload_max_bytes: usize,
-    ) -> std::io::Result<Self> {
+    /// Create a new event logger that writes to the given path using explicit options.
+    pub fn new_with_options(path: PathBuf, options: EventLoggerOptions) -> std::io::Result<Self> {
+        let inline_payload_max_bytes = options.inline_payload_max_bytes.max(1);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -80,12 +329,14 @@ impl EventLogger {
         init_sqlite_schema(&conn)?;
         drop(conn);
 
-        let inline_payload_max_bytes = inline_payload_max_bytes.max(1);
         let (tx, rx) = mpsc::sync_channel(SQLITE_QUEUE_CAPACITY);
         let worker_path = path.clone();
+        let worker_options = options.clone();
         let worker = std::thread::Builder::new()
             .name("soth-event-sqlite-writer".to_string())
-            .spawn(move || run_sqlite_writer(worker_path, rx, inline_payload_max_bytes))
+            .spawn(move || {
+                run_sqlite_writer(worker_path, rx, inline_payload_max_bytes, worker_options)
+            })
             .map_err(std::io::Error::other)?;
 
         let storage = EventLoggerStorage::SqliteAsync {
@@ -99,6 +350,19 @@ impl EventLogger {
         })
     }
 
+    /// Create a new event logger that writes to the given path and applies a custom
+    /// inline payload threshold before side-table offload.
+    pub fn new_with_inline_payload_max_bytes(
+        path: PathBuf,
+        inline_payload_max_bytes: usize,
+    ) -> std::io::Result<Self> {
+        let options = EventLoggerOptions {
+            inline_payload_max_bytes,
+            ..EventLoggerOptions::default()
+        };
+        Self::new_with_options(path, options)
+    }
+
     /// Create an event logger with the default write path (`~/.soth/logs/events.db`).
     pub fn with_default_path() -> std::io::Result<Self> {
         Self::with_default_path_with_inline_payload_max_bytes(INLINE_PAYLOAD_MAX_BYTES)
@@ -108,10 +372,21 @@ impl EventLogger {
     pub fn with_default_path_with_inline_payload_max_bytes(
         inline_payload_max_bytes: usize,
     ) -> std::io::Result<Self> {
-        Self::new_with_inline_payload_max_bytes(
-            default_event_log_write_path()?,
+        let options = EventLoggerOptions {
             inline_payload_max_bytes,
-        )
+            ..EventLoggerOptions::default()
+        };
+        Self::new_with_options(default_event_log_write_path()?, options)
+    }
+
+    /// Create an event logger configured from runtime settings.
+    pub fn with_default_path_from_runtime_config(
+        inline_payload_max_bytes: usize,
+        crypto_identity: &CryptoIdentityConfig,
+    ) -> std::io::Result<Self> {
+        let options =
+            EventLoggerOptions::from_runtime_config(inline_payload_max_bytes, crypto_identity);
+        Self::new_with_options(default_event_log_write_path()?, options)
     }
 
     /// Get the path this logger writes to.
@@ -356,7 +631,12 @@ fn init_sqlite_schema(conn: &Connection) -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>, inline_payload_max_bytes: usize) {
+fn run_sqlite_writer(
+    path: PathBuf,
+    rx: Receiver<LoggerCommand>,
+    inline_payload_max_bytes: usize,
+    options: EventLoggerOptions,
+) {
     let mut conn = match Connection::open(&path) {
         Ok(conn) => conn,
         Err(error) => {
@@ -376,6 +656,17 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>, inline_payload_
         return;
     }
 
+    let mut merkle_state = match MerkleAuditState::new(&conn, &options.merkle) {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(
+                "Failed to initialize Merkle audit state at {:?}: {}",
+                path, error
+            );
+            return;
+        }
+    };
+
     let mut pending = Vec::with_capacity(SQLITE_BATCH_SIZE);
     let flush_interval = Duration::from_millis(SQLITE_FLUSH_INTERVAL_MS);
 
@@ -383,13 +674,23 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>, inline_payload_
         match rx.recv_timeout(flush_interval) {
             Ok(LoggerCommand::Event(event)) => pending.push(event),
             Ok(LoggerCommand::Flush(ack)) => {
-                let result = flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes);
+                let result = flush_sqlite_events(
+                    &mut conn,
+                    &mut pending,
+                    inline_payload_max_bytes,
+                    &mut merkle_state,
+                    true,
+                );
                 let _ = ack.send(result);
             }
             Ok(LoggerCommand::Shutdown) => {
-                if let Err(error) =
-                    flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
-                {
+                if let Err(error) = flush_sqlite_events(
+                    &mut conn,
+                    &mut pending,
+                    inline_payload_max_bytes,
+                    &mut merkle_state,
+                    true,
+                ) {
                     warn!("Failed to flush events during logger shutdown: {}", error);
                 }
                 return;
@@ -398,17 +699,37 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>, inline_payload_
                 // Time-based durability/visibility: flush partial batches regularly
                 // so low-traffic sessions still appear in observability promptly.
                 if !pending.is_empty() {
-                    if let Err(error) =
-                        flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
-                    {
+                    if let Err(error) = flush_sqlite_events(
+                        &mut conn,
+                        &mut pending,
+                        inline_payload_max_bytes,
+                        &mut merkle_state,
+                        false,
+                    ) {
                         warn!("Failed to flush timed events: {}", error);
+                    }
+                } else if merkle_state.enabled {
+                    match conn.transaction().map_err(to_io_err) {
+                        Ok(tx) => {
+                            if let Err(error) = merkle_state.seal_due_batches(&tx, false) {
+                                let _ = tx.rollback();
+                                warn!("Failed to seal timed Merkle batches: {}", error);
+                            } else if let Err(error) = tx.commit().map_err(to_io_err) {
+                                warn!("Failed to commit timed Merkle seal: {}", error);
+                            }
+                        }
+                        Err(error) => warn!("Failed to open timed Merkle transaction: {}", error),
                     }
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if let Err(error) =
-                    flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
-                {
+                if let Err(error) = flush_sqlite_events(
+                    &mut conn,
+                    &mut pending,
+                    inline_payload_max_bytes,
+                    &mut merkle_state,
+                    true,
+                ) {
                     warn!("Failed to flush events during logger shutdown: {}", error);
                 }
                 return;
@@ -419,23 +740,36 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>, inline_payload_
             match rx.try_recv() {
                 Ok(LoggerCommand::Event(event)) => pending.push(event),
                 Ok(LoggerCommand::Flush(ack)) => {
-                    let result =
-                        flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes);
+                    let result = flush_sqlite_events(
+                        &mut conn,
+                        &mut pending,
+                        inline_payload_max_bytes,
+                        &mut merkle_state,
+                        true,
+                    );
                     let _ = ack.send(result);
                 }
                 Ok(LoggerCommand::Shutdown) => {
-                    if let Err(error) =
-                        flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
-                    {
+                    if let Err(error) = flush_sqlite_events(
+                        &mut conn,
+                        &mut pending,
+                        inline_payload_max_bytes,
+                        &mut merkle_state,
+                        true,
+                    ) {
                         warn!("Failed to flush events during logger shutdown: {}", error);
                     }
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Err(error) =
-                        flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
-                    {
+                    if let Err(error) = flush_sqlite_events(
+                        &mut conn,
+                        &mut pending,
+                        inline_payload_max_bytes,
+                        &mut merkle_state,
+                        true,
+                    ) {
                         warn!("Failed to flush events during logger shutdown: {}", error);
                     }
                     return;
@@ -444,9 +778,13 @@ fn run_sqlite_writer(path: PathBuf, rx: Receiver<LoggerCommand>, inline_payload_
         }
 
         if pending.len() >= SQLITE_BATCH_SIZE {
-            if let Err(error) =
-                flush_sqlite_events(&mut conn, &mut pending, inline_payload_max_bytes)
-            {
+            if let Err(error) = flush_sqlite_events(
+                &mut conn,
+                &mut pending,
+                inline_payload_max_bytes,
+                &mut merkle_state,
+                false,
+            ) {
                 warn!("Failed to flush batched events: {}", error);
             }
         }
@@ -457,15 +795,23 @@ fn flush_sqlite_events(
     conn: &mut Connection,
     pending: &mut Vec<WrapEvent>,
     inline_payload_max_bytes: usize,
+    merkle_state: &mut MerkleAuditState,
+    force_seal: bool,
 ) -> std::io::Result<()> {
-    if pending.is_empty() {
+    if pending.is_empty() && (!merkle_state.enabled || !force_seal) {
         return Ok(());
     }
 
     let tx = conn.transaction().map_err(to_io_err)?;
+    let mut inserted = Vec::new();
     for event in pending.drain(..) {
-        insert_sqlite_event(&tx, event, inline_payload_max_bytes)?;
+        if let Some(meta) =
+            insert_sqlite_event(&tx, event, inline_payload_max_bytes, merkle_state.enabled)?
+        {
+            inserted.push(meta);
+        }
     }
+    merkle_state.on_events_persisted(&tx, inserted, force_seal)?;
     tx.commit().map_err(to_io_err)?;
     Ok(())
 }
@@ -474,9 +820,15 @@ fn insert_sqlite_event(
     tx: &rusqlite::Transaction<'_>,
     mut event: WrapEvent,
     inline_payload_max_bytes: usize,
-) -> std::io::Result<()> {
+    merkle_enabled: bool,
+) -> std::io::Result<Option<PersistedEventMeta>> {
     let mut payloads = Vec::new();
     offload_large_payloads(&mut event, &mut payloads, inline_payload_max_bytes);
+    if merkle_enabled && event.event_hash.is_none() {
+        let event_hash = compute_event_hash(&event)?;
+        event.event_hash = Some(event_hash);
+    }
+    let event_hash = event.event_hash.clone();
 
     let json = serde_json::to_string(&event)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -494,6 +846,7 @@ fn insert_sqlite_event(
         ],
     )
     .map_err(to_io_err)?;
+    let seq = tx.last_insert_rowid();
 
     for payload in payloads {
         tx.execute(
@@ -511,7 +864,14 @@ fn insert_sqlite_event(
         .map_err(to_io_err)?;
     }
 
-    Ok(())
+    if merkle_enabled {
+        Ok(event_hash.map(|hash| PersistedEventMeta {
+            seq,
+            event_hash: hash,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 fn offload_large_payloads(
@@ -604,6 +964,70 @@ fn build_preview(content: &str) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn compute_event_hash(event: &WrapEvent) -> std::io::Result<String> {
+    let mut canonical = event.clone();
+    canonical.seq = None;
+    canonical.event_hash = None;
+    canonical.merkle_batch_id = None;
+    canonical.merkle_leaf_index = None;
+    canonical.merkle_root = None;
+    canonical.merkle_signature = None;
+    canonical.audit_signer_did = None;
+
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(hex_encode(&Sha256::digest(bytes)))
+}
+
+fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        return Sha256::digest([]).into();
+    }
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
+
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let left = pair[0];
+            let right = if pair.len() == 2 { pair[1] } else { pair[0] };
+            let mut hasher = Sha256::new();
+            hasher.update([0x01]);
+            hasher.update(left);
+            hasher.update(right);
+            next.push(hasher.finalize().into());
+        }
+        level = next;
+    }
+    level[0]
+}
+
+fn hash_root_link(prev_root: &[u8; 32], current_root: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(prev_root);
+    hasher.update(current_root);
+    hasher.finalize().into()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode_32(value: &str) -> std::io::Result<[u8; 32]> {
+    let bytes = hex::decode(value).map_err(std::io::Error::other)?;
+    if bytes.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Expected 32-byte hash, got {}", bytes.len()),
+        ));
+    }
+    let mut array = [0u8; 32];
+    array.copy_from_slice(&bytes);
+    Ok(array)
 }
 
 fn to_io_err(error: rusqlite::Error) -> std::io::Error {
@@ -856,5 +1280,73 @@ mod tests {
             Some("2026-02-01T00:00:00Z")
         );
         assert_eq!(snapshot.sync_errors.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn test_merkle_batches_are_sealed_and_written_back_to_events() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let options = EventLoggerOptions {
+            inline_payload_max_bytes: INLINE_PAYLOAD_MAX_BYTES,
+            merkle: MerkleLoggingConfig {
+                enabled: true,
+                seal_interval: Duration::from_secs(60),
+                max_events_per_batch: 2,
+            },
+        };
+        let logger = EventLogger::new_with_options(path.clone(), options).unwrap();
+
+        let agent = AgentInfo::new("Test Agent", DetectionSource::CommandLine);
+        let event_a = WrapEvent::new(
+            "session-merkle",
+            "api.openai.com",
+            WrapDirection::Out,
+            agent.clone(),
+        )
+        .with_method("POST /v1/chat/completions");
+        let event_b = WrapEvent::new("session-merkle", "api.openai.com", WrapDirection::In, agent)
+            .with_method("POST /v1/chat/completions");
+
+        logger.log(&event_a);
+        logger.log(&event_b);
+        logger.close();
+
+        let conn = Connection::open(path).unwrap();
+        let batch_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM merkle_batches", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(batch_count, 1);
+
+        let (root_hash, signature, signer_did): (String, String, String) = conn
+            .query_row(
+                "SELECT root_hash, signature, signer_did FROM merkle_batches LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(!root_hash.is_empty());
+        assert!(!signature.is_empty());
+        assert!(signer_did.starts_with("did:key:z"));
+
+        let mut stmt = conn
+            .prepare("SELECT event_json FROM wrap_events ORDER BY seq ASC")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let first: WrapEvent = serde_json::from_str(&rows[0]).unwrap();
+        let second: WrapEvent = serde_json::from_str(&rows[1]).unwrap();
+        assert!(first.event_hash.is_some());
+        assert!(second.event_hash.is_some());
+        assert_eq!(first.merkle_leaf_index, Some(0));
+        assert_eq!(second.merkle_leaf_index, Some(1));
+        assert_eq!(first.merkle_root, Some(root_hash.clone()));
+        assert_eq!(second.merkle_root, Some(root_hash));
+        assert_eq!(first.audit_signer_did, Some(signer_did.clone()));
+        assert_eq!(second.audit_signer_did, Some(signer_did));
     }
 }

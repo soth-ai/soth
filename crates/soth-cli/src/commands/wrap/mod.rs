@@ -409,8 +409,9 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         None
     } else {
         Some(
-            EventLogger::with_default_path_with_inline_payload_max_bytes(
+            EventLogger::with_default_path_from_runtime_config(
                 config.observe.storage.inline_threshold_bytes,
+                &config.crypto_identity,
             )
             .context("Failed to initialize event logger")?,
         )

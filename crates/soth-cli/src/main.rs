@@ -275,7 +275,15 @@ enum AuditCommands {
     Verify {
         /// Audit log path
         #[arg(short, long)]
-        log: PathBuf,
+        log: Option<PathBuf>,
+
+        /// Lower bound for batch seal timestamp (RFC3339).
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Upper bound for batch seal timestamp (RFC3339).
+        #[arg(long)]
+        to: Option<String>,
     },
 
     /// Export audit proof
