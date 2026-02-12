@@ -8,12 +8,21 @@ use soth_core::config::BudgetLimit;
 #[cfg(feature = "cloud-sync")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "cloud-sync")]
+use std::time::Duration;
+#[cfg(feature = "cloud-sync")]
 use tracing::info;
 
 pub struct CloudPullRuntime {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
     pub task: JoinHandle<()>,
 }
+
+#[cfg(feature = "cloud-sync")]
+const FINAL_CLOUD_SYNC_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(feature = "cloud-sync")]
+const FINAL_CLOUD_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(feature = "cloud-sync")]
+const FINAL_CLOUD_SYNC_MAX_ROUNDS: usize = 3;
 
 #[cfg(feature = "cloud-sync")]
 pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
@@ -123,7 +132,39 @@ pub fn spawn_cloud_pull_runtime(
         heartbeat_interval.tick().await;
         loop {
             tokio::select! {
-                _ = &mut shutdown_rx => break,
+                _ = &mut shutdown_rx => {
+                    if let Some(agent) = &sync_agent {
+                        match tokio::time::timeout(
+                            FINAL_CLOUD_SYNC_TIMEOUT,
+                            agent.flush_for_shutdown(FINAL_CLOUD_SYNC_MAX_ROUNDS),
+                        ).await {
+                            Ok(Ok(summary)) => {
+                                if summary.metadata_sent > 0
+                                    || summary.body_uploaded > 0
+                                    || summary.retry_uploaded > 0
+                                {
+                                    info!(
+                                        metadata_sent = summary.metadata_sent,
+                                        body_uploaded = summary.body_uploaded,
+                                        retry_uploaded = summary.retry_uploaded,
+                                        "Final cloud sync flush on shutdown"
+                                    );
+                                }
+                            }
+                            Ok(Err(error)) => warn!("Final cloud sync flush failed: {}", error),
+                            Err(_) => warn!("Final cloud sync flush timed out"),
+                        }
+                        match tokio::time::timeout(
+                            FINAL_CLOUD_HEARTBEAT_TIMEOUT,
+                            agent.send_heartbeat(),
+                        ).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => warn!("Final cloud heartbeat failed: {}", error),
+                            Err(_) => warn!("Final cloud heartbeat timed out"),
+                        }
+                    }
+                    break
+                },
                 _ = interval.tick() => {
                     if let Err(error) = puller.pull_once().await {
                         warn!("Periodic cloud config pull failed: {}", error);

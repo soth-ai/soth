@@ -39,8 +39,8 @@ use crate::json_security::strip_json_security_prefix_text;
 use crate::metrics;
 use crate::process_attribution::{ProcessAttribution, ProcessIdentity};
 use crate::providers::ProviderRegistry;
-use crate::transport::host_fingerprint;
 use crate::transport::graphql_enrichment::extract_graphql_operation;
+use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
 use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::response_event_builder::{
@@ -1720,9 +1720,7 @@ impl HttpHandler for AiProxyHandler {
                     None
                 };
             let graphql_operation = if !is_connect && is_json {
-                body_content
-                    .as_deref()
-                    .and_then(extract_graphql_operation)
+                body_content.as_deref().and_then(extract_graphql_operation)
             } else {
                 None
             };
@@ -2193,13 +2191,13 @@ impl HttpHandler for AiProxyHandler {
                     let mut event = build_paired_response_event(ResponseEventInput {
                         session_id: &session_id,
                         host: &pending.host,
-                            provider,
-                            agent: pending.agent,
-                            method: &pending.method,
-                            path: &pending.path,
-                            graphql_operation: pending.graphql_operation.as_deref(),
-                            is_agent_app: pending.is_agent_app,
-                            status,
+                        provider,
+                        agent: pending.agent,
+                        method: &pending.method,
+                        path: &pending.path,
+                        graphql_operation: pending.graphql_operation.as_deref(),
+                        is_agent_app: pending.is_agent_app,
+                        status,
                         latency_ms,
                         request_content: pending.request_content.as_deref(),
                         response_content: Some(placeholder),
@@ -2959,6 +2957,11 @@ where
         .start()
         .await
         .map_err(|e| ProxyError::transport(format!("Proxy error: {}", e)))?;
+
+    if let Some(ref learned) = learned_passthrough {
+        learned.persist();
+        metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+    }
 
     Ok(())
 }

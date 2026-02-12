@@ -12,10 +12,10 @@ use crate::style;
 use anyhow::Context;
 use console::Term;
 use owo_colors::OwoColorize;
+use soth_collector::CollectorRuntime;
 use soth_core::config::{HostFilterMode, SothConfig};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
-use soth_collector::CollectorRuntime;
 use soth_dashboard::server::DashboardServer;
 use soth_dashboard::DashboardState;
 use soth_proxy::metrics;
@@ -412,6 +412,7 @@ fn compact_path(path: &std::path::Path) -> String {
 struct ProxyRuntime {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     proxy_task: JoinHandle<anyhow::Result<()>>,
+    event_logger: Option<EventLogger>,
     dashboard_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     dashboard_task: Option<JoinHandle<()>>,
     retention_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -454,8 +455,10 @@ async fn run_forward_proxy(
     let mut cloud_task = runtime.cloud_task;
     let mut collector_shutdown_tx = runtime.collector_shutdown_tx;
     let mut collector_task = runtime.collector_task;
+    let mut event_logger = runtime.event_logger;
     let shutdown_tx = runtime.shutdown_tx;
     let proxy_task = runtime.proxy_task;
+    let shutdown_timeout = runtime_shutdown_timeout(config);
 
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
@@ -471,10 +474,27 @@ async fn run_forward_proxy(
         Err(error) => Err(anyhow::anyhow!("proxy runtime task join failed: {}", error)),
     };
 
-    shutdown_dashboard_runtime(&mut dashboard_shutdown_tx, &mut dashboard_task, quiet).await;
-    shutdown_retention_runtime(&mut retention_shutdown_tx, &mut retention_task).await;
-    shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task).await;
-    shutdown_collector_runtime(&mut collector_shutdown_tx, &mut collector_task).await;
+    shutdown_collector_runtime(
+        &mut collector_shutdown_tx,
+        &mut collector_task,
+        shutdown_timeout,
+    )
+    .await;
+    flush_local_event_buffers(&mut event_logger, shutdown_timeout, quiet).await;
+    shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task, shutdown_timeout).await;
+    shutdown_retention_runtime(
+        &mut retention_shutdown_tx,
+        &mut retention_task,
+        shutdown_timeout,
+    )
+    .await;
+    shutdown_dashboard_runtime(
+        &mut dashboard_shutdown_tx,
+        &mut dashboard_task,
+        quiet,
+        shutdown_timeout,
+    )
+    .await;
 
     if let Some(mut child) = dashboard_ui_process {
         stop_dashboard_ui_process(&mut child);
@@ -528,6 +548,8 @@ async fn run_forward_proxy_with_tui(
     let mut cloud_task = runtime.cloud_task;
     let mut collector_shutdown_tx = runtime.collector_shutdown_tx;
     let mut collector_task = runtime.collector_task;
+    let mut event_logger = runtime.event_logger;
+    let shutdown_timeout = runtime_shutdown_timeout(config);
 
     // Pause stdout logs before waiting + entering alternate screen to avoid overlap.
     logging::set_log_output_paused(true);
@@ -572,10 +594,27 @@ async fn run_forward_proxy_with_tui(
         }
     };
 
-    shutdown_dashboard_runtime(&mut dashboard_shutdown_tx, &mut dashboard_task, quiet).await;
-    shutdown_retention_runtime(&mut retention_shutdown_tx, &mut retention_task).await;
-    shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task).await;
-    shutdown_collector_runtime(&mut collector_shutdown_tx, &mut collector_task).await;
+    shutdown_collector_runtime(
+        &mut collector_shutdown_tx,
+        &mut collector_task,
+        shutdown_timeout,
+    )
+    .await;
+    flush_local_event_buffers(&mut event_logger, shutdown_timeout, quiet).await;
+    shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task, shutdown_timeout).await;
+    shutdown_retention_runtime(
+        &mut retention_shutdown_tx,
+        &mut retention_task,
+        shutdown_timeout,
+    )
+    .await;
+    shutdown_dashboard_runtime(
+        &mut dashboard_shutdown_tx,
+        &mut dashboard_task,
+        quiet,
+        shutdown_timeout,
+    )
+    .await;
 
     if let Some(mut child) = dashboard_ui_process {
         stop_dashboard_ui_process(&mut child);
@@ -659,6 +698,7 @@ fn spawn_proxy_runtime(
         }
     }
 
+    let shutdown_event_logger = event_logger.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         hudsucker_proxy::start_proxy_with_shutdown(
@@ -680,6 +720,7 @@ fn spawn_proxy_runtime(
     Ok(ProxyRuntime {
         shutdown_tx,
         proxy_task: handle,
+        event_logger: shutdown_event_logger,
         dashboard_shutdown_tx,
         dashboard_task,
         retention_shutdown_tx,
@@ -890,13 +931,14 @@ async fn shutdown_dashboard_runtime(
     shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     dashboard_task: &mut Option<JoinHandle<()>>,
     quiet: bool,
+    timeout_budget: Duration,
 ) {
     if let Some(tx) = shutdown_tx.take() {
         let _ = tx.send(());
     }
 
     if let Some(mut task) = dashboard_task.take() {
-        match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+        match tokio::time::timeout(timeout_budget, &mut task).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 if !quiet {
@@ -916,13 +958,14 @@ async fn shutdown_dashboard_runtime(
 async fn shutdown_retention_runtime(
     shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     task: &mut Option<JoinHandle<()>>,
+    timeout_budget: Duration,
 ) {
     if let Some(tx) = shutdown_tx.take() {
         let _ = tx.send(());
     }
 
     if let Some(mut handle) = task.take() {
-        match tokio::time::timeout(Duration::from_secs(2), &mut handle).await {
+        match tokio::time::timeout(timeout_budget, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!("Retention task join error: {}", error);
@@ -938,13 +981,14 @@ async fn shutdown_retention_runtime(
 async fn shutdown_cloud_runtime(
     shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     task: &mut Option<JoinHandle<()>>,
+    timeout_budget: Duration,
 ) {
     if let Some(tx) = shutdown_tx.take() {
         let _ = tx.send(());
     }
 
     if let Some(mut handle) = task.take() {
-        match tokio::time::timeout(Duration::from_secs(2), &mut handle).await {
+        match tokio::time::timeout(timeout_budget, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!("Cloud pull task join error: {}", error);
@@ -960,13 +1004,14 @@ async fn shutdown_cloud_runtime(
 async fn shutdown_collector_runtime(
     shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     task: &mut Option<JoinHandle<()>>,
+    timeout_budget: Duration,
 ) {
     if let Some(tx) = shutdown_tx.take() {
         let _ = tx.send(());
     }
 
     if let Some(mut handle) = task.take() {
-        match tokio::time::timeout(Duration::from_secs(2), &mut handle).await {
+        match tokio::time::timeout(timeout_budget, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!("Collector task join error: {}", error);
@@ -974,6 +1019,69 @@ async fn shutdown_collector_runtime(
             Err(_) => {
                 handle.abort();
                 tracing::warn!("Collector task shutdown timed out; aborted task.");
+            }
+        }
+    }
+}
+
+fn runtime_shutdown_timeout(config: &SothConfig) -> Duration {
+    config
+        .server
+        .graceful_shutdown
+        .max(Duration::from_secs(2))
+        .min(Duration::from_secs(20))
+}
+
+async fn flush_local_event_buffers(
+    event_logger: &mut Option<EventLogger>,
+    timeout_budget: Duration,
+    quiet: bool,
+) {
+    let Some(logger) = event_logger.take() else {
+        return;
+    };
+
+    let flush_logger = logger.clone();
+    match tokio::time::timeout(
+        timeout_budget,
+        tokio::task::spawn_blocking(move || flush_logger.flush()),
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            if !quiet {
+                style::warning(&format!("Failed to flush local event logger: {}", error));
+            }
+        }
+        Ok(Err(error)) => {
+            if !quiet {
+                style::warning(&format!("Event logger flush task join error: {}", error));
+            }
+        }
+        Err(_) => {
+            if !quiet {
+                style::warning("Timed out flushing local event logger before shutdown.");
+            }
+        }
+    }
+
+    let close_logger = logger.clone();
+    match tokio::time::timeout(
+        timeout_budget,
+        tokio::task::spawn_blocking(move || close_logger.close()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if !quiet {
+                style::warning(&format!("Event logger close task join error: {}", error));
+            }
+        }
+        Err(_) => {
+            if !quiet {
+                style::warning("Timed out closing local event logger; continuing shutdown.");
             }
         }
     }
