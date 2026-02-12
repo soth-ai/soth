@@ -27,6 +27,97 @@ pub struct WrapEnforcementRuntime {
     pub signature_metadata_key: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CryptoRolloutMode {
+    Disabled,
+    Audit,
+    EnforceSelected,
+    EnforceGlobal,
+}
+
+#[derive(Debug, Clone)]
+struct CryptoIdentityRollout {
+    mode: CryptoRolloutMode,
+    principals: HashSet<String>,
+}
+
+impl CryptoIdentityRollout {
+    fn from_config(config: &SothConfig) -> Self {
+        if !config.crypto_identity.enabled {
+            return Self {
+                mode: CryptoRolloutMode::Disabled,
+                principals: HashSet::new(),
+            };
+        }
+
+        let normalized_mode = config.crypto_identity.mode.trim().to_ascii_lowercase();
+        if normalized_mode != "audit" && normalized_mode != "enforce" {
+            warn!(
+                "Unsupported crypto_identity.mode='{}'; falling back to audit",
+                config.crypto_identity.mode
+            );
+        }
+
+        if normalized_mode == "enforce" {
+            let principals = normalize_principals(&config.crypto_identity.enforce_principals);
+            if principals.is_empty() {
+                return Self {
+                    mode: CryptoRolloutMode::EnforceGlobal,
+                    principals,
+                };
+            }
+            return Self {
+                mode: CryptoRolloutMode::EnforceSelected,
+                principals,
+            };
+        }
+
+        Self {
+            mode: CryptoRolloutMode::Audit,
+            principals: HashSet::new(),
+        }
+    }
+
+    fn proxy_identity_mode(&self) -> ProxyIdentityMode {
+        match self.mode {
+            CryptoRolloutMode::Disabled => ProxyIdentityMode::Disabled,
+            CryptoRolloutMode::Audit | CryptoRolloutMode::EnforceSelected => {
+                ProxyIdentityMode::Optional
+            }
+            CryptoRolloutMode::EnforceGlobal => ProxyIdentityMode::Required,
+        }
+    }
+
+    fn wrap_identity_mode(&self) -> IdentityMode {
+        match self.mode {
+            CryptoRolloutMode::Disabled => IdentityMode::Disabled,
+            CryptoRolloutMode::Audit | CryptoRolloutMode::EnforceSelected => IdentityMode::Optional,
+            CryptoRolloutMode::EnforceGlobal => IdentityMode::Required,
+        }
+    }
+
+    fn required_principals(&self) -> HashSet<String> {
+        if self.mode == CryptoRolloutMode::EnforceSelected {
+            self.principals.clone()
+        } else {
+            HashSet::new()
+        }
+    }
+}
+
+fn normalize_principals(principals: &[String]) -> HashSet<String> {
+    let mut normalized = HashSet::new();
+    for principal in principals {
+        let trimmed = principal.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        normalized.insert(trimmed.to_string());
+        normalized.insert(trimmed.to_ascii_lowercase());
+    }
+    normalized
+}
+
 #[derive(Clone)]
 struct PolicyArtifacts {
     modules: HashMap<String, String>,
@@ -269,21 +360,24 @@ fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTrac
 }
 
 pub fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer> {
-    let identity_mode = match config.identity.mode.as_str() {
-        "disabled" => ProxyIdentityMode::Disabled,
-        "required" => {
-            warn!(
-                "identity mode 'required' is deferred until agentfacts adoption; using optional mode"
-            );
-            ProxyIdentityMode::Optional
-        }
-        _ => ProxyIdentityMode::Optional,
-    };
+    let rollout = CryptoIdentityRollout::from_config(config);
+    let identity_mode = rollout.proxy_identity_mode();
+    let required_principals = rollout.required_principals();
+    match rollout.mode {
+        CryptoRolloutMode::Disabled => info!("Crypto identity rollout: disabled"),
+        CryptoRolloutMode::Audit => info!("Crypto identity rollout: audit"),
+        CryptoRolloutMode::EnforceSelected => info!(
+            "Crypto identity rollout: enforce selected principals ({})",
+            required_principals.len()
+        ),
+        CryptoRolloutMode::EnforceGlobal => info!("Crypto identity rollout: enforce global"),
+    }
 
     let trusted_dids = collect_trusted_dids(config)?;
 
     let mut enforcer = ProxyEnforcer::new()
         .with_identity_mode(identity_mode, trusted_dids)
+        .with_required_principals(required_principals)
         .with_identity_headers("X-Agent-DID", "X-Agent-Signature")
         .with_fail_open(
             config.production.fail_open.enabled,
@@ -314,17 +408,23 @@ pub fn build_wrap_enforcement_runtime(
     let mut pipeline_builder = PipelineBuilder::new();
     let mut enabled = false;
 
-    let identity_mode = match config.identity.mode.as_str() {
-        "disabled" => IdentityMode::Disabled,
-        "required" => {
-            warn!(
-                "identity mode 'required' is deferred until agentfacts adoption; using optional mode"
-            );
-            IdentityMode::Optional
-        }
-        _ => IdentityMode::Optional,
+    let rollout = CryptoIdentityRollout::from_config(config);
+    let identity_mode = rollout.wrap_identity_mode();
+    let required_principals = rollout.required_principals();
+    let identity_config = IdentityConfig {
+        mode: identity_mode,
+        required_principals: required_principals.clone(),
+        ..IdentityConfig::default()
     };
-    let identity_config = IdentityConfig::default();
+    match rollout.mode {
+        CryptoRolloutMode::Disabled => info!("Wrap crypto identity rollout: disabled"),
+        CryptoRolloutMode::Audit => info!("Wrap crypto identity rollout: audit"),
+        CryptoRolloutMode::EnforceSelected => info!(
+            "Wrap crypto identity rollout: enforce selected principals ({})",
+            required_principals.len()
+        ),
+        CryptoRolloutMode::EnforceGlobal => info!("Wrap crypto identity rollout: enforce global"),
+    }
     if identity_mode != IdentityMode::Disabled {
         enabled = true;
         let mut trust_store = TrustStore::in_memory();
@@ -333,13 +433,7 @@ pub fn build_wrap_enforcement_runtime(
                 .trust(&did)
                 .with_context(|| format!("Failed to trust DID from config: {did}"))?;
         }
-        let layer = IdentityLayer::with_trust_store(
-            IdentityConfig {
-                mode: identity_mode,
-                ..identity_config.clone()
-            },
-            trust_store,
-        );
+        let layer = IdentityLayer::with_trust_store(identity_config.clone(), trust_store);
         pipeline_builder = pipeline_builder.layer(layer);
     }
 
@@ -382,4 +476,60 @@ pub fn build_wrap_enforcement_runtime(
         did_metadata_key: identity_config.did_header,
         signature_metadata_key: identity_config.signature_header,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollout_disabled_when_crypto_identity_disabled() {
+        let config = SothConfig::default();
+        let rollout = CryptoIdentityRollout::from_config(&config);
+        assert_eq!(rollout.mode, CryptoRolloutMode::Disabled);
+        assert_eq!(rollout.proxy_identity_mode(), ProxyIdentityMode::Disabled);
+        assert_eq!(rollout.wrap_identity_mode(), IdentityMode::Disabled);
+    }
+
+    #[test]
+    fn rollout_audit_when_enabled_in_audit_mode() {
+        let mut config = SothConfig::default();
+        config.crypto_identity.enabled = true;
+        config.crypto_identity.mode = "audit".to_string();
+
+        let rollout = CryptoIdentityRollout::from_config(&config);
+        assert_eq!(rollout.mode, CryptoRolloutMode::Audit);
+        assert_eq!(rollout.proxy_identity_mode(), ProxyIdentityMode::Optional);
+        assert_eq!(rollout.wrap_identity_mode(), IdentityMode::Optional);
+        assert!(rollout.required_principals().is_empty());
+    }
+
+    #[test]
+    fn rollout_enforce_selected_when_principals_present() {
+        let mut config = SothConfig::default();
+        config.crypto_identity.enabled = true;
+        config.crypto_identity.mode = "enforce".to_string();
+        config.crypto_identity.enforce_principals = vec!["Codex".to_string()];
+
+        let rollout = CryptoIdentityRollout::from_config(&config);
+        assert_eq!(rollout.mode, CryptoRolloutMode::EnforceSelected);
+        assert_eq!(rollout.proxy_identity_mode(), ProxyIdentityMode::Optional);
+        assert_eq!(rollout.wrap_identity_mode(), IdentityMode::Optional);
+        let required = rollout.required_principals();
+        assert!(required.contains("Codex"));
+        assert!(required.contains("codex"));
+    }
+
+    #[test]
+    fn rollout_enforce_global_when_principals_empty() {
+        let mut config = SothConfig::default();
+        config.crypto_identity.enabled = true;
+        config.crypto_identity.mode = "enforce".to_string();
+        config.crypto_identity.enforce_principals.clear();
+
+        let rollout = CryptoIdentityRollout::from_config(&config);
+        assert_eq!(rollout.mode, CryptoRolloutMode::EnforceGlobal);
+        assert_eq!(rollout.proxy_identity_mode(), ProxyIdentityMode::Required);
+        assert_eq!(rollout.wrap_identity_mode(), IdentityMode::Required);
+    }
 }

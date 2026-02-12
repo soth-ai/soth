@@ -345,6 +345,14 @@ pub struct CryptoIdentityConfig {
     #[serde(default = "default_crypto_identity_mode")]
     pub mode: String,
 
+    /// Optional principal allowlist for staged enforcement when mode=enforce.
+    ///
+    /// If this list is empty and mode=enforce, signature verification is required globally.
+    /// If this list is non-empty and mode=enforce, only matching principals are required.
+    /// Principal entries can be DID values (did:key:...) or agent IDs/names.
+    #[serde(default)]
+    pub enforce_principals: Vec<String>,
+
     /// Envelope signing controls
     #[serde(default)]
     pub signing: CryptoSigningConfig,
@@ -371,6 +379,7 @@ impl Default for CryptoIdentityConfig {
         Self {
             enabled: false,
             mode: default_crypto_identity_mode(),
+            enforce_principals: Vec::new(),
             signing: CryptoSigningConfig::default(),
             hierarchy: CryptoHierarchyConfig::default(),
             merkle: CryptoMerkleConfig::default(),
@@ -2389,6 +2398,9 @@ cloud:
 crypto_identity:
   enabled: true
   mode: enforce
+  enforce_principals:
+    - "did:key:z6MkhVexamplePrincipal"
+    - "cursor"
   signing:
     envelope_metadata_only: true
     algorithm: "ed25519"
@@ -2406,6 +2418,13 @@ crypto_identity:
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.crypto_identity.enabled);
         assert_eq!(config.crypto_identity.mode, "enforce");
+        assert_eq!(
+            config.crypto_identity.enforce_principals,
+            vec![
+                "did:key:z6MkhVexamplePrincipal".to_string(),
+                "cursor".to_string()
+            ]
+        );
         assert!(config.crypto_identity.signing.envelope_metadata_only);
         assert_eq!(config.crypto_identity.signing.algorithm, "ed25519");
         assert_eq!(

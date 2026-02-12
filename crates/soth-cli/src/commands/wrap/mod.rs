@@ -397,8 +397,11 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         .map(|runtime| Arc::new(WrapEnforcement { runtime }));
     if enforcement.is_some() {
         info!(
-            "Wrap enforcement enabled (identity_mode={}, policy_enabled={}, budget_enabled={})",
-            config.identity.mode, config.policy.enabled, config.budget.enabled
+            "Wrap enforcement enabled (crypto_identity_enabled={}, crypto_identity_mode={}, policy_enabled={}, budget_enabled={})",
+            config.crypto_identity.enabled,
+            config.crypto_identity.mode,
+            config.policy.enabled,
+            config.budget.enabled
         );
     } else {
         info!("Wrap enforcement disabled (identity/policy/budget all off)");

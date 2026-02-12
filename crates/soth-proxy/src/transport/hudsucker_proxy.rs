@@ -170,6 +170,7 @@ pub struct ProxyEnforcer {
     did_header: String,
     signature_header: String,
     trusted_dids: Arc<HashSet<String>>,
+    required_principals: Arc<HashSet<String>>,
     policy_mode: ProxyPolicyMode,
     policy_engine: Option<Arc<PolicyEngine>>,
     policy_fail_open: bool,
@@ -191,6 +192,7 @@ impl ProxyEnforcer {
             did_header: "X-Agent-DID".to_string(),
             signature_header: "X-Agent-Signature".to_string(),
             trusted_dids: Arc::new(HashSet::new()),
+            required_principals: Arc::new(HashSet::new()),
             policy_mode: ProxyPolicyMode::Disabled,
             policy_engine: None,
             policy_fail_open: true,
@@ -210,6 +212,11 @@ impl ProxyEnforcer {
     ) -> Self {
         self.identity_mode = mode;
         self.trusted_dids = Arc::new(trusted_dids);
+        self
+    }
+
+    pub fn with_required_principals(mut self, required_principals: HashSet<String>) -> Self {
+        self.required_principals = Arc::new(required_principals);
         self
     }
 
@@ -291,6 +298,7 @@ impl ProxyEnforcer {
             enforcement_core::ProxyEnforcementConfig {
                 identity_mode: self.core_identity_mode(),
                 trusted_dids: self.trusted_dids.as_ref(),
+                required_principals: self.required_principals.as_ref(),
                 policy_mode: self.core_policy_mode(),
                 policy_engine: self.policy_engine.as_deref(),
                 policy_fail_open: self.policy_fail_open,
@@ -316,6 +324,7 @@ impl ProxyEnforcer {
         let envelope = envelope.clone();
         let identity_mode = self.core_identity_mode();
         let trusted_dids = Arc::clone(&self.trusted_dids);
+        let required_principals = Arc::clone(&self.required_principals);
         let policy_mode = self.core_policy_mode();
         let policy_engine = self.policy_engine.clone();
         let policy_fail_open = self.policy_fail_open;
@@ -330,6 +339,7 @@ impl ProxyEnforcer {
                 let config = enforcement_core::ProxyEnforcementConfig {
                     identity_mode,
                     trusted_dids: trusted_dids.as_ref(),
+                    required_principals: required_principals.as_ref(),
                     policy_mode,
                     policy_engine: policy_engine.as_deref(),
                     policy_fail_open,
@@ -3520,6 +3530,57 @@ mod tests {
         let identity = result.unwrap();
         assert!(identity.verified);
         assert_eq!(identity.did, Some(did));
+    }
+
+    #[test]
+    fn test_proxy_enforcer_identity_selected_principal_requires_signature() {
+        let mut required_principals = HashSet::new();
+        required_principals.insert("codex".to_string());
+        let enforcer = ProxyEnforcer::new()
+            .with_identity_mode(ProxyIdentityMode::Optional, HashSet::new())
+            .with_required_principals(required_principals);
+
+        let result = enforcer.enforce_request(
+            "session-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-4o"),
+            Some(r#"{"model":"gpt-4o"}"#),
+            Some("codex"),
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err((401, _, _))));
+    }
+
+    #[test]
+    fn test_proxy_enforcer_identity_selected_principal_allows_other_agents_without_signature() {
+        let mut required_principals = HashSet::new();
+        required_principals.insert("codex".to_string());
+        let enforcer = ProxyEnforcer::new()
+            .with_identity_mode(ProxyIdentityMode::Optional, HashSet::new())
+            .with_required_principals(required_principals);
+
+        let result = enforcer.enforce_request(
+            "session-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-4o"),
+            Some(r#"{"model":"gpt-4o"}"#),
+            Some("chatgpt"),
+            None,
+            None,
+        );
+
+        assert!(result.is_ok());
+        let identity = result.unwrap();
+        assert!(!identity.verified);
+        assert!(identity.did.is_none());
     }
 
     #[test]
