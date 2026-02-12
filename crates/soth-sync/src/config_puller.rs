@@ -3,8 +3,10 @@ use soth_core::api::{version::API_VERSION_HEADER, ConfigResponse, API_VERSION};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 use crate::cache;
+use crate::registry_puller::RegistryPuller;
 
 #[derive(Clone)]
 pub struct ConfigPuller {
@@ -14,6 +16,7 @@ pub struct ConfigPuller {
     client: reqwest::Client,
     debounce_window: Duration,
     debounce_state: Arc<Mutex<DebounceState>>,
+    registry_puller: Option<RegistryPuller>,
 }
 
 #[derive(Debug, Default)]
@@ -36,11 +39,17 @@ impl ConfigPuller {
             client: reqwest::Client::new(),
             debounce_window: Duration::from_secs(6),
             debounce_state: Arc::new(Mutex::new(DebounceState::default())),
+            registry_puller: None,
         }
     }
 
     pub fn with_debounce(mut self, debounce_window: Duration) -> Self {
         self.debounce_window = debounce_window;
+        self
+    }
+
+    pub fn with_registry_puller(mut self, registry_puller: RegistryPuller) -> Self {
+        self.registry_puller = Some(registry_puller);
         self
     }
 
@@ -63,6 +72,15 @@ impl ConfigPuller {
             .json::<ConfigResponse>()
             .await
             .context("failed decoding cloud config response")?;
+
+        if let Some(registry_puller) = self.registry_puller.as_ref() {
+            if let Err(error) = registry_puller
+                .sync_from_hint(config.bundle_version.as_deref())
+                .await
+            {
+                warn!("Cloud registry bundle refresh failed: {}", error);
+            }
+        }
 
         if self.should_apply_version(&config.config_version) {
             cache::save_config_cache(&self.cache_path, &config)?;

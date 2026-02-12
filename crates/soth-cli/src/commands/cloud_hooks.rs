@@ -69,6 +69,7 @@ pub fn spawn_cloud_pull_runtime(
 ) -> Option<CloudPullRuntime> {
     use soth_sync::agent::{SyncAgent, SyncAgentConfig};
     use soth_sync::config_puller::ConfigPuller;
+    use soth_sync::registry_puller::RegistryPuller;
 
     if !config.cloud.enabled {
         return None;
@@ -77,10 +78,14 @@ pub fn spawn_cloud_pull_runtime(
     let api_key = config.cloud.api_key.clone()?;
     let endpoint = config.cloud.endpoint.clone();
     let cache_path = resolve_cache_path(config);
+    let registry_cache_path = resolve_registry_cache_path(config, &cache_path);
     let sync_interval_secs = config.cloud.sync_interval_secs.max(5);
     let interval_secs = config.cloud.config_pull_interval_secs.max(15);
     let debounce_secs = config.cloud.config_debounce_secs.max(1);
+    let registry_puller =
+        RegistryPuller::new(endpoint.clone(), api_key.clone(), registry_cache_path);
     let puller = ConfigPuller::new(endpoint, api_key, cache_path)
+        .with_registry_puller(registry_puller)
         .with_debounce(std::time::Duration::from_secs(debounce_secs));
     let sync_agent = event_db_path.and_then(|event_db_path| {
         if !event_db_path.exists() {
@@ -352,8 +357,23 @@ fn resolve_cache_path(config: &SothConfig) -> PathBuf {
 }
 
 #[cfg(feature = "cloud-sync")]
+fn resolve_registry_cache_path(config: &SothConfig, config_cache_path: &Path) -> PathBuf {
+    if config.cloud.cache_path.is_some() {
+        if let Some(parent) = config_cache_path.parent() {
+            return parent.join("registry_bundle_cache.json");
+        }
+    }
+    default_registry_cache_path()
+}
+
+#[cfg(feature = "cloud-sync")]
 fn default_cache_path() -> PathBuf {
     soth_sync::cache::default_cache_path()
+}
+
+#[cfg(feature = "cloud-sync")]
+fn default_registry_cache_path() -> PathBuf {
+    soth_sync::cache::default_registry_cache_path()
 }
 
 #[cfg(feature = "cloud-sync")]

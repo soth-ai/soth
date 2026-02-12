@@ -76,6 +76,20 @@ pub struct ConfigResponse {
     pub budget: ConfigBudget,
     pub body_sync_level: String,
     pub config_version: String,
+    #[serde(default)]
+    pub bundle_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryVersionResponse {
+    pub bundle_type: String,
+    pub version: String,
+    pub sha256: String,
+    pub compiled_at: String,
+    pub provider_count: u64,
+    pub domain_count: u64,
+    pub format_count: u64,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
