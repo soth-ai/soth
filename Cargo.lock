@@ -3680,6 +3680,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soth-core",
+ "soth-registry",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3878,6 +3879,7 @@ dependencies = [
  "soth-identity",
  "soth-observe",
  "soth-policy",
+ "soth-registry",
  "soth-tls",
  "tempfile",
  "thiserror 1.0.69",
@@ -3891,6 +3893,14 @@ dependencies = [
  "uuid",
  "webpki-roots 0.26.11",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "soth-registry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
