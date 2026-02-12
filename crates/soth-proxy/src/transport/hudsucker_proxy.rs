@@ -40,6 +40,7 @@ use crate::metrics;
 use crate::process_attribution::{ProcessAttribution, ProcessIdentity};
 use crate::providers::ProviderRegistry;
 use crate::transport::host_fingerprint;
+use crate::transport::graphql_enrichment::extract_graphql_operation;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
 use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::response_event_builder::{
@@ -76,6 +77,7 @@ struct PendingRequest {
     provider: Option<&'static str>,
     agent: Option<&'static str>,
     model: Option<String>,
+    graphql_operation: Option<String>,
     started_at: Instant,
     /// Request body content for paired logging
     request_content: Option<String>,
@@ -1717,6 +1719,13 @@ impl HttpHandler for AiProxyHandler {
                 } else {
                     None
                 };
+            let graphql_operation = if !is_connect && is_json {
+                body_content
+                    .as_deref()
+                    .and_then(extract_graphql_operation)
+            } else {
+                None
+            };
             let mut policy_allowed = None;
             let mut policy_version = None;
 
@@ -1905,6 +1914,7 @@ impl HttpHandler for AiProxyHandler {
                             provider: Some(provider),
                             agent,
                             model: model.clone(),
+                            graphql_operation: graphql_operation.clone(),
                             started_at: Instant::now(),
                             request_content: body_content,
                             request_size_bytes,
@@ -1989,6 +1999,7 @@ impl HttpHandler for AiProxyHandler {
                         provider: None,
                         agent,
                         model: None,
+                        graphql_operation: None,
                         started_at: Instant::now(),
                         request_content: None,
                         request_size_bytes,
@@ -2182,12 +2193,13 @@ impl HttpHandler for AiProxyHandler {
                     let mut event = build_paired_response_event(ResponseEventInput {
                         session_id: &session_id,
                         host: &pending.host,
-                        provider,
-                        agent: pending.agent,
-                        method: &pending.method,
-                        path: &pending.path,
-                        is_agent_app: pending.is_agent_app,
-                        status,
+                            provider,
+                            agent: pending.agent,
+                            method: &pending.method,
+                            path: &pending.path,
+                            graphql_operation: pending.graphql_operation.as_deref(),
+                            is_agent_app: pending.is_agent_app,
+                            status,
                         latency_ms,
                         request_content: pending.request_content.as_deref(),
                         response_content: Some(placeholder),
@@ -2415,6 +2427,7 @@ impl HttpHandler for AiProxyHandler {
                             agent: log_pending.agent,
                             method: &log_pending.method,
                             path: &log_pending.path,
+                            graphql_operation: log_pending.graphql_operation.as_deref(),
                             is_agent_app: log_pending.is_agent_app,
                             status,
                             latency_ms: log_latency_ms,
@@ -2506,6 +2519,7 @@ impl HttpHandler for AiProxyHandler {
                         agent: pending.agent,
                         method: &pending.method,
                         path: &pending.path,
+                        graphql_operation: pending.graphql_operation.as_deref(),
                         is_agent_app: pending.is_agent_app,
                         status,
                         latency_ms,

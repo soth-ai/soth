@@ -64,6 +64,10 @@ pub struct WrapEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
 
+    /// GraphQL operation label when request is GraphQL-based.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graphql_operation: Option<String>,
+
     /// Tool name (for tools/call)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -208,6 +212,7 @@ impl WrapEvent {
             provider: None,
             model: None,
             method: None,
+            graphql_operation: None,
             tool_name: None,
             content: None,
             collector_source: None,
@@ -269,6 +274,12 @@ impl WrapEvent {
     /// Set the method
     pub fn with_method(mut self, method: impl Into<String>) -> Self {
         self.method = Some(method.into());
+        self
+    }
+
+    /// Set GraphQL operation label.
+    pub fn with_graphql_operation(mut self, operation: impl Into<String>) -> Self {
+        self.graphql_operation = Some(operation.into());
         self
     }
 
