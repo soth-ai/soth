@@ -14,12 +14,14 @@ import {
   Clock,
   ShieldWarning,
   ArrowsOutSimple,
+  Key,
 } from "@phosphor-icons/react";
 import {
   useAdvancedBudgetMetrics,
   useBudgetPrimitives,
   useDashboardMetrics,
   useAgentsData,
+  useCryptoStatus,
 } from "@/hooks/useDashboardData";
 import { useEventStream } from "@/hooks/useEventStream";
 import { LiveFeedPanel } from "@/components/panels/live-feed-panel";
@@ -27,7 +29,7 @@ import { AgentsPanel } from "@/components/panels/agents-panel";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { cn, formatCurrency, formatDuration, formatNumber } from "@/lib/utils";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 
 type Tab = "metrics" | "live";
 type RangeKey = "1h" | "24h" | "7d";
@@ -64,6 +66,12 @@ function formatLatency(ms: number): string {
   return `${Math.round(ms)}ms`;
 }
 
+function compactId(value: string | null | undefined, head = 8, tail = 6): string {
+  if (!value) return "-";
+  if (value.length <= head + tail + 1) return value;
+  return `${value.slice(0, head)}...${value.slice(-tail)}`;
+}
+
 function modeButtonClass(active: boolean): string {
   return cn(
     "relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[11px] font-medium transition-all duration-200 ease-out",
@@ -71,12 +79,6 @@ function modeButtonClass(active: boolean): string {
       ? "bg-foreground text-background border-foreground shadow-[0_2px_10px_rgba(0,0,0,0.1)]"
       : "bg-transparent text-muted-foreground border-border hover:text-foreground hover:bg-muted/50"
   );
-}
-
-function signalToneClass(level: "normal" | "warning" | "critical"): string {
-  if (level === "critical") return "border-destructive/35 bg-destructive/8";
-  if (level === "warning") return "border-warning/35 bg-warning/8";
-  return "border-border bg-card";
 }
 
 function priorityToneClass(severity: PrioritySeverity): string {
@@ -182,10 +184,12 @@ export default function OverviewPage() {
   const { isLoading, isConnected, uptime, policy, observe, proxy } = useDashboardMetrics();
   const { data: budgetPrimitivesResponse } = useBudgetPrimitives();
   const { data: advancedBudgetResponse } = useAdvancedBudgetMetrics();
+  const { data: cryptoStatusResponse } = useCryptoStatus();
   const agents = useAgentsData();
 
   const primitives = budgetPrimitivesResponse?.data;
   const advanced = advancedBudgetResponse?.data;
+  const cryptoStatus = cryptoStatusResponse?.data;
 
   const { events, isConnected: wsConnected, clearEvents } = useEventStream({
     enabled: activeTab === "live",
@@ -329,6 +333,8 @@ export default function OverviewPage() {
   );
   const topPiiTypes = piiByType.slice(0, 5);
   const piiAlertsHref = "/observability?preset=builtin-pii-alerts";
+  const cryptoCoveragePct = cryptoStatus?.signature_coverage_pct ?? 0;
+  const cryptoFailures = cryptoStatus?.verification_failures ?? 0;
 
   const changeSummary = useMemo(() => {
     const changes: string[] = [];
@@ -682,6 +688,39 @@ export default function OverviewPage() {
                   )}
                 </OverviewSummaryCard>
 
+                <OverviewSummaryCard title="Crypto Integrity" icon={Key} delay={0.28}>
+                  <div className="space-y-1.5 pt-1">
+                    <div className="flex justify-between">
+                      <span>Signature coverage</span>
+                      <span className={cn("font-medium", cryptoCoveragePct >= 99 ? "text-success" : "text-warning")}>
+                        {cryptoCoveragePct.toFixed(1)}%
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Verification failures</span>
+                      <span className={cn("font-medium", cryptoFailures > 0 ? "text-destructive" : "text-success")}>
+                        {formatNumber(cryptoFailures)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Merkle batches</span>
+                      <span className="text-foreground font-medium">
+                        {formatNumber(cryptoStatus?.merkle_batches ?? 0)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-border/50 space-y-1">
+                    <p className="text-[10px] uppercase font-bold tracking-widest text-muted-foreground/50">Active Key</p>
+                    <p className="text-foreground font-medium font-mono text-[11px]" title={cryptoStatus?.active_key_id ?? "-"}>
+                      {compactId(cryptoStatus?.active_key_id)}
+                    </p>
+                    <p className="text-[10px] uppercase font-bold tracking-widest text-muted-foreground/50 pt-1">Latest Seal</p>
+                    <p className="text-foreground font-medium font-mono text-[11px]" title={cryptoStatus?.latest_batch_id ?? "-"}>
+                      {compactId(cryptoStatus?.latest_batch_id)}
+                    </p>
+                  </div>
+                </OverviewSummaryCard>
+
                 <OverviewSummaryCard title="PII Detection Queue" icon={Warning} delay={0.3}>
                   <div className="space-y-2 pt-1">
                     <div className="flex items-center justify-between">
@@ -722,7 +761,7 @@ export default function OverviewPage() {
 
             <OverviewSummaryCard title={`What Changed Since ${range === "1h" ? "Last Hour" : range === "7d" ? "Last 7 Days" : "Last 24 Hours"}`} icon={Clock} delay={0.3}>
               <div className="space-y-2 pt-1 font-medium italic">
-                {changeSummary.map((item, i) => (
+                {changeSummary.map((item) => (
                   <p key={item} className="text-foreground/70">• {item}</p>
                 ))}
               </div>

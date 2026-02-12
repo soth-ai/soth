@@ -7,6 +7,8 @@ import type {
   BudgetMetrics,
   BudgetPrimitives,
   AdvancedBudgetMetrics,
+  CryptoStatusSummary,
+  CryptoMerkleSummary,
   ProxyMetrics,
   HealthResponse,
   DashboardSnapshot,
@@ -92,6 +94,27 @@ export function useAgentsData() {
   return useQuery({
     queryKey: ["agents"],
     queryFn: () => fetchJson<ApiResponse<AgentsSummary>>("/agents"),
+    refetchInterval: Math.max(1000, refreshInterval),
+  });
+}
+
+export function useCryptoStatus() {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
+  return useQuery({
+    queryKey: ["crypto", "status"],
+    queryFn: () => fetchJson<ApiResponse<CryptoStatusSummary>>("/crypto/status"),
+    refetchInterval: Math.max(1000, refreshInterval),
+  });
+}
+
+export function useCryptoMerkleRecent(limit = 10) {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
+  return useQuery({
+    queryKey: ["crypto", "merkle", limit],
+    queryFn: () =>
+      fetchJson<ApiResponse<CryptoMerkleSummary>>(
+        `/crypto/merkle/recent?limit=${Math.max(1, Math.min(200, limit))}`
+      ),
     refetchInterval: Math.max(1000, refreshInterval),
   });
 }

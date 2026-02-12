@@ -19,10 +19,17 @@ import {
   Database,
 } from "@phosphor-icons/react";
 import { format } from "date-fns";
-import { useBudgetPrimitives } from "@/hooks/useDashboardData";
+import { useBudgetPrimitives, useCryptoStatus } from "@/hooks/useDashboardData";
 import { useObservabilityStore, computeLogMetrics } from "@/store/observability";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
+
+function compactId(value: string | null | undefined, head = 8, tail = 6): string {
+  if (!value) return "-";
+  if (value.length <= head + tail + 1) return value;
+  return `${value.slice(0, head)}...${value.slice(-tail)}`;
+}
+
 export function Sidebar() {
   const sessions = useObservabilityStore((state) => state.sessions);
   const currentSessionId = useObservabilityStore((state) => state.currentSessionId);
@@ -34,7 +41,9 @@ export function Sidebar() {
   const clearFilters = useObservabilityStore((state) => state.clearFilters);
   const clearLogs = useObservabilityStore((state) => state.clearLogs);
   const { data: budgetPrimitivesResponse } = useBudgetPrimitives();
+  const { data: cryptoStatusResponse } = useCryptoStatus();
   const budgetPrimitives = budgetPrimitivesResponse?.data;
+  const cryptoStatus = cryptoStatusResponse?.data;
 
   // Apply source filter from store if set
   const filteredBySourceLogs = useMemo(() => {
@@ -171,6 +180,57 @@ export function Sidebar() {
                   <span className="text-cyan-400">{metrics.incomingCount}</span>
                   <span className="text-muted-foreground/60 mx-1">/</span>
                   <span className="text-success">{metrics.outgoingCount}</span>
+                </span>
+              </div>
+            </div>
+          </section>
+
+          <section className="space-y-1.5">
+            <div className="flex items-center justify-between text-[8px] font-semibold text-muted-foreground uppercase tracking-[0.08em]">
+              <span className="inline-flex items-center gap-1">
+                <Database className="w-3 h-3 text-accent" weight="duotone" />
+                Crypto integrity
+              </span>
+            </div>
+            <div className="rounded-md border border-border/50 bg-secondary/20 divide-y divide-border/40">
+              <div className="flex items-center justify-between px-2 py-1 text-[10px]">
+                <span className="text-muted-foreground">Sig coverage</span>
+                <span
+                  className={cn(
+                    "font-mono font-semibold tabular-nums",
+                    (cryptoStatus?.signature_coverage_pct ?? 0) >= 99 ? "text-success" : "text-warning"
+                  )}
+                >
+                  {(cryptoStatus?.signature_coverage_pct ?? 0).toFixed(1)}%
+                </span>
+              </div>
+              <div className="flex items-center justify-between px-2 py-1 text-[10px]">
+                <span className="text-muted-foreground">Verify fails</span>
+                <span
+                  className={cn(
+                    "font-mono font-semibold tabular-nums",
+                    (cryptoStatus?.verification_failures ?? 0) > 0 ? "text-destructive" : "text-success"
+                  )}
+                >
+                  {(cryptoStatus?.verification_failures ?? 0).toLocaleString()}
+                </span>
+              </div>
+              <div className="flex items-center justify-between px-2 py-1 text-[10px]">
+                <span className="text-muted-foreground">Active key</span>
+                <span
+                  className="font-mono font-semibold text-foreground truncate max-w-[120px]"
+                  title={cryptoStatus?.active_key_id ?? "-"}
+                >
+                  {compactId(cryptoStatus?.active_key_id)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between px-2 py-1 text-[10px]">
+                <span className="text-muted-foreground">Latest seal</span>
+                <span
+                  className="font-mono font-semibold text-foreground truncate max-w-[120px]"
+                  title={cryptoStatus?.latest_batch_id ?? "-"}
+                >
+                  {compactId(cryptoStatus?.latest_batch_id)}
                 </span>
               </div>
             </div>
