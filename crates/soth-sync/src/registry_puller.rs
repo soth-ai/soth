@@ -1,5 +1,5 @@
 use anyhow::Context;
-use reqwest::header::{ETAG, IF_NONE_MATCH};
+use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH};
 use soth_core::api::{version::API_VERSION_HEADER, RegistryVersionResponse, API_VERSION};
 use std::path::PathBuf;
 
@@ -62,28 +62,14 @@ impl RegistryPuller {
                 None
             }
         };
+        let cached_version = cached.as_ref().map(|value| value.metadata.version.as_str());
 
-        match expected_bundle_version.as_deref() {
-            Some(expected_bundle_version)
-                if cached
-                    .as_ref()
-                    .map(|cached| cached.metadata.version.as_str())
-                    == Some(expected_bundle_version) =>
-            {
-                return Ok(RegistryPullOutcome {
-                    checked: false,
-                    downloaded: false,
-                    version: Some(expected_bundle_version.to_string()),
-                });
-            }
-            None if cached.is_some() => {
-                return Ok(RegistryPullOutcome {
-                    checked: false,
-                    downloaded: false,
-                    version: cached.map(|cached| cached.metadata.version),
-                });
-            }
-            _ => {}
+        if should_skip_pull(expected_bundle_version.as_deref(), cached_version) {
+            return Ok(RegistryPullOutcome {
+                checked: false,
+                downloaded: false,
+                version: expected_bundle_version.or_else(|| cached_version.map(str::to_string)),
+            });
         }
 
         let Some(version) = self.fetch_version().await? else {
@@ -174,13 +160,7 @@ impl RegistryPuller {
             );
         }
 
-        let etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(normalize_etag)
-            .filter(|value| !value.is_empty())
-            .context("cloud registry bundle response missing ETag header")?;
+        let etag = extract_required_etag(response.headers())?;
 
         let bytes = response
             .bytes()
@@ -213,12 +193,50 @@ fn normalize_etag(value: &str) -> String {
     value.trim().trim_matches('"').to_string()
 }
 
+fn extract_required_etag(headers: &HeaderMap) -> anyhow::Result<String> {
+    headers
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(normalize_etag)
+        .filter(|value| !value.is_empty())
+        .context("cloud registry bundle response missing ETag header")
+}
+
+fn should_skip_pull(expected_bundle_version: Option<&str>, cached_version: Option<&str>) -> bool {
+    match (expected_bundle_version, cached_version) {
+        (Some(expected), Some(cached)) => expected == cached,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_etag;
+    use super::{extract_required_etag, normalize_etag, should_skip_pull};
+    use reqwest::header::HeaderMap;
+    use reqwest::header::{HeaderValue, ETAG};
 
     #[test]
     fn normalize_etag_trims_quotes_and_whitespace() {
         assert_eq!(normalize_etag("  \"abc\" "), "abc");
+    }
+
+    #[test]
+    fn stale_expected_bundle_version_does_not_skip_pull() {
+        assert!(!should_skip_pull(Some("v2"), Some("v1")));
+        assert!(should_skip_pull(Some("v2"), Some("v2")));
+    }
+
+    #[test]
+    fn missing_etag_header_is_rejected() {
+        let headers = HeaderMap::new();
+        let err = extract_required_etag(&headers).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cloud registry bundle response missing ETag header"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ETAG, HeaderValue::from_static("\"etag-123\""));
+        assert_eq!(extract_required_etag(&headers).unwrap(), "etag-123");
     }
 }

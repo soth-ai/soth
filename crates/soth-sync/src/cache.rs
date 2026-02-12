@@ -1,6 +1,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use serde_json::Value;
 use soth_core::api::{ConfigResponse, RegistryVersionResponse};
 use std::path::{Path, PathBuf};
@@ -13,10 +14,16 @@ pub struct CachedConfigEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedRegistryBundleEnvelope {
+    #[serde(default = "registry_cache_schema_version")]
+    pub schema_version: u32,
     pub fetched_at: String,
     pub etag: String,
     pub metadata: RegistryVersionResponse,
     pub bundle: Value,
+}
+
+pub fn registry_cache_schema_version() -> u32 {
+    1
 }
 
 pub fn default_cache_path() -> PathBuf {
@@ -76,6 +83,15 @@ pub fn load_registry_bundle_cache(
         .with_context(|| format!("failed reading registry cache {}", path.display()))?;
     let envelope: CachedRegistryBundleEnvelope = serde_json::from_str(&content)
         .with_context(|| format!("failed parsing registry cache {}", path.display()))?;
+    if envelope.schema_version != registry_cache_schema_version() {
+        anyhow::bail!(
+            "unsupported registry cache schema_version {} (expected {})",
+            envelope.schema_version,
+            registry_cache_schema_version()
+        );
+    }
+    validate_registry_bundle_payload(&envelope.bundle)
+        .context("cached registry bundle payload failed schema validation")?;
     Ok(Some(envelope))
 }
 
@@ -96,7 +112,10 @@ pub fn save_registry_bundle_cache(
 
     let bundle: Value = serde_json::from_slice(bundle_bytes)
         .context("failed parsing registry bundle payload as JSON")?;
+    validate_registry_bundle_payload(&bundle)
+        .context("registry bundle payload failed schema validation")?;
     let envelope = CachedRegistryBundleEnvelope {
+        schema_version: registry_cache_schema_version(),
         fetched_at: Utc::now().to_rfc3339(),
         etag: etag.to_string(),
         metadata: metadata.clone(),
@@ -108,4 +127,112 @@ pub fn save_registry_bundle_cache(
     std::fs::write(path, payload)
         .with_context(|| format!("failed writing registry cache {}", path.display()))?;
     Ok(())
+}
+
+fn validate_registry_bundle_payload(bundle: &Value) -> anyhow::Result<()> {
+    let object = bundle
+        .as_object()
+        .context("bundle root must be a JSON object")?;
+
+    if is_compiled_bundle_schema(object) || is_domain_lists_schema(object) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "bundle payload did not match supported schemas (compiled_bundle or domain_lists)"
+    );
+}
+
+fn is_compiled_bundle_schema(object: &Map<String, Value>) -> bool {
+    let version_ok = object
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let providers_ok = object
+        .get("providers")
+        .and_then(|value| value.as_object())
+        .is_some();
+    let domain_index_ok = object
+        .get("domain_index")
+        .and_then(|value| value.as_array())
+        .is_some();
+    version_ok && providers_ok && domain_index_ok
+}
+
+fn is_domain_lists_schema(object: &Map<String, Value>) -> bool {
+    is_string_array_field(object, "ai_inference")
+        && is_string_array_field(object, "mcp")
+        && is_string_array_field(object, "agent_apps")
+}
+
+fn is_string_array_field(object: &Map<String, Value>, field: &str) -> bool {
+    object
+        .get(field)
+        .and_then(|value| value.as_array())
+        .map(|values| values.iter().all(|item| item.as_str().is_some()))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn sample_registry_metadata(version: &str) -> RegistryVersionResponse {
+        RegistryVersionResponse {
+            bundle_type: "local".to_string(),
+            version: version.to_string(),
+            sha256: "abc123".to_string(),
+            compiled_at: "2026-02-13T00:00:00Z".to_string(),
+            provider_count: 1,
+            domain_count: 3,
+            format_count: 1,
+            size_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn save_registry_bundle_cache_accepts_compiled_bundle_shape() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("v1");
+        let bundle = serde_json::json!({
+            "version": "v1",
+            "providers": {},
+            "domain_index": [],
+            "filters": {},
+            "pricing": {}
+        });
+
+        save_registry_bundle_cache(&path, &metadata, "etag-1", bundle.to_string().as_bytes())
+            .unwrap();
+
+        let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, registry_cache_schema_version());
+        assert_eq!(loaded.metadata.version, "v1");
+    }
+
+    #[test]
+    fn load_registry_bundle_cache_rejects_malformed_bundle_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("v1");
+        let malformed = serde_json::json!({
+            "schema_version": registry_cache_schema_version(),
+            "fetched_at": "2026-02-13T00:00:00Z",
+            "etag": "etag-1",
+            "metadata": metadata,
+            "bundle": {
+                "version": "v1",
+                "providers": []
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&malformed).unwrap()).unwrap();
+
+        let err = load_registry_bundle_cache(&path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cached registry bundle payload failed schema validation"));
+    }
 }
