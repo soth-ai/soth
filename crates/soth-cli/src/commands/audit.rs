@@ -2,6 +2,9 @@
 
 use crate::AuditCommands;
 use anyhow::Result;
+use rusqlite::{params, Connection};
+use sha2::Digest;
+use soth_identity::{decode_did_key, KeyPair};
 use soth_observe::{MerkleTree, SqliteStorage};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -9,8 +12,8 @@ use tokio::fs;
 /// Run audit command
 pub async fn run(action: AuditCommands) -> Result<()> {
     match action {
-        AuditCommands::Verify { log } => {
-            verify_log(log).await?;
+        AuditCommands::Verify { log, from, to } => {
+            verify_log(log, from, to).await?;
         }
         AuditCommands::Proof { event_id, output } => {
             generate_proof(&event_id, output).await?;
@@ -22,52 +25,253 @@ pub async fn run(action: AuditCommands) -> Result<()> {
     Ok(())
 }
 
-/// Convert bytes to hex string
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+/// Verify Merkle audit trail integrity from events SQLite storage.
+async fn verify_log(
+    log_path: Option<PathBuf>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<()> {
+    let log_path = if let Some(path) = log_path {
+        path
+    } else {
+        soth_core::event_logger::default_event_log_write_path()?
+    };
 
-/// Verify Merkle audit trail integrity
-async fn verify_log(log_path: PathBuf) -> Result<()> {
     if !log_path.exists() {
         anyhow::bail!("Log file not found: {log_path:?}");
     }
-
-    let events = load_audit_events(&log_path).await?;
-    let total_lines = events.len();
-
-    if events.is_empty() {
-        println!("Log file is empty");
-        return Ok(());
+    if !is_sqlite_path(&log_path) {
+        anyhow::bail!("Audit verify requires an SQLite events DB path");
     }
 
-    println!("Verifying {} entries...\n", total_lines);
+    let summary = tokio::task::spawn_blocking(move || verify_sqlite_merkle(&log_path, from, to))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to run audit verification: {e}"))??;
 
-    let mut tree = MerkleTree::new();
-    let mut valid = 0;
-
-    for (i, event) in events.iter().enumerate() {
-        // Add to Merkle tree
-        let data = serde_json::to_vec(event)?;
-        tree.append(&data);
-        valid += 1;
-
-        // Show progress every 1000 entries
-        if (i + 1) % 1000 == 0 {
-            print!("\rProcessed {} entries...", i + 1);
+    println!("Audit verification complete");
+    println!("════════════════════════════");
+    println!("  Batches verified: {}", summary.batches_verified);
+    println!("  Events verified:  {}", summary.events_verified);
+    println!(
+        "  Root hash:        {}",
+        summary.last_root.unwrap_or_else(|| "-".to_string())
+    );
+    println!("  Signers seen:     {}", summary.unique_signers.len());
+    if !summary.unique_signers.is_empty() {
+        for signer in summary.unique_signers {
+            println!("    - {signer}");
         }
     }
 
-    println!("\r");
-
-    println!("All {valid} entries are valid");
-    println!("\nMerkle Tree:");
-    if let Some(root) = tree.root() {
-        println!("  Root hash: {}", hex_encode(root));
-    }
-    println!("  Entries: {}", tree.len());
-
     Ok(())
+}
+
+#[derive(Debug)]
+struct VerifySummary {
+    batches_verified: usize,
+    events_verified: usize,
+    last_root: Option<String>,
+    unique_signers: std::collections::BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct MerkleBatchRow {
+    batch_id: String,
+    seq_start: i64,
+    seq_end: i64,
+    root_hash: String,
+    signature: String,
+    signer_did: String,
+    prev_root: Option<String>,
+}
+
+fn verify_sqlite_merkle(
+    db_path: &Path,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<VerifySummary> {
+    let conn = Connection::open(db_path)?;
+
+    let mut sql = String::from(
+        "SELECT batch_id, seq_start, seq_end, root_hash, signature, signer_did, prev_root \
+         FROM merkle_batches",
+    );
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    if let Some(from) = from {
+        where_clauses.push("sealed_at >= ?".to_string());
+        params.push(from);
+    }
+    if let Some(to) = to {
+        where_clauses.push("sealed_at <= ?".to_string());
+        params.push(to);
+    }
+    if !where_clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY seq_start ASC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(MerkleBatchRow {
+            batch_id: row.get(0)?,
+            seq_start: row.get(1)?,
+            seq_end: row.get(2)?,
+            root_hash: row.get(3)?,
+            signature: row.get(4)?,
+            signer_did: row.get(5)?,
+            prev_root: row.get(6)?,
+        })
+    })?;
+
+    let mut batches: Vec<MerkleBatchRow> = Vec::new();
+    for row in rows {
+        batches.push(row?);
+    }
+
+    if batches.is_empty() {
+        return Ok(VerifySummary {
+            batches_verified: 0,
+            events_verified: 0,
+            last_root: None,
+            unique_signers: std::collections::BTreeSet::new(),
+        });
+    }
+
+    let mut summary = VerifySummary {
+        batches_verified: 0,
+        events_verified: 0,
+        last_root: None,
+        unique_signers: std::collections::BTreeSet::new(),
+    };
+
+    let mut previous_root: Option<String> = None;
+    for (index, batch) in batches.iter().enumerate() {
+        if batch.seq_end < batch.seq_start {
+            anyhow::bail!(
+                "Invalid batch range for {}: {}..{}",
+                batch.batch_id,
+                batch.seq_start,
+                batch.seq_end
+            );
+        }
+
+        if index > 0 && batch.prev_root != previous_root {
+            anyhow::bail!(
+                "Batch chain discontinuity at {} (expected prev_root {:?}, got {:?})",
+                batch.batch_id,
+                previous_root,
+                batch.prev_root
+            );
+        }
+
+        let mut event_stmt = conn.prepare(
+            "SELECT event_json FROM wrap_events WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq ASC",
+        )?;
+        let event_rows = event_stmt.query_map(params![batch.seq_start, batch.seq_end], |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        let mut event_hashes = Vec::new();
+        for event_row in event_rows {
+            let event_json = event_row?;
+            let event: soth_core::types::WrapEvent = serde_json::from_str(&event_json)?;
+            let Some(event_hash) = event.event_hash else {
+                anyhow::bail!(
+                    "Missing event_hash in sealed range for batch {}",
+                    batch.batch_id
+                );
+            };
+            if event.merkle_batch_id.as_deref() != Some(batch.batch_id.as_str()) {
+                anyhow::bail!(
+                    "Event batch_id mismatch in {} (expected {}, got {:?})",
+                    event.id,
+                    batch.batch_id,
+                    event.merkle_batch_id
+                );
+            }
+            event_hashes.push(decode_hash_32(&event_hash)?);
+        }
+
+        if event_hashes.is_empty() {
+            anyhow::bail!("Batch {} has no events in range", batch.batch_id);
+        }
+
+        let base_root = compute_merkle_root(&event_hashes);
+        let chained_root = if let Some(prev_root) = batch.prev_root.as_deref() {
+            let prev = decode_hash_32(prev_root)?;
+            hash_root_link(&prev, &base_root)
+        } else {
+            base_root
+        };
+        let chained_root_hex = hex::encode(chained_root);
+        if chained_root_hex != batch.root_hash {
+            anyhow::bail!(
+                "Root mismatch for batch {}: expected {}, computed {}",
+                batch.batch_id,
+                batch.root_hash,
+                chained_root_hex
+            );
+        }
+
+        let public_key = decode_did_key(&batch.signer_did)?;
+        let verifier = KeyPair::from_public_key_bytes(&public_key)?;
+        let signature = hex::decode(&batch.signature)?;
+        if !verifier.verify(&chained_root, &signature) {
+            anyhow::bail!("Invalid Merkle signature for batch {}", batch.batch_id);
+        }
+
+        previous_root = Some(batch.root_hash.clone());
+        summary.last_root = Some(batch.root_hash.clone());
+        summary.unique_signers.insert(batch.signer_did.clone());
+        summary.events_verified += event_hashes.len();
+        summary.batches_verified += 1;
+    }
+
+    Ok(summary)
+}
+
+fn decode_hash_32(value: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(value)?;
+    if bytes.len() != 32 {
+        anyhow::bail!("Expected 32-byte hash, got {}", bytes.len());
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&bytes);
+    Ok(hash)
+}
+
+fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        return sha2::Sha256::digest([]).into();
+    }
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
+
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let left = pair[0];
+            let right = if pair.len() == 2 { pair[1] } else { pair[0] };
+            let mut hasher = sha2::Sha256::new();
+            hasher.update([0x01]);
+            hasher.update(left);
+            hasher.update(right);
+            next.push(hasher.finalize().into());
+        }
+        level = next;
+    }
+    level[0]
+}
+
+fn hash_root_link(prev_root: &[u8; 32], current_root: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(prev_root);
+    hasher.update(current_root);
+    hasher.finalize().into()
 }
 
 /// Generate proof for an event
@@ -258,5 +462,56 @@ async fn load_audit_events(path: &Path) -> Result<Vec<serde_json::Value>> {
             values.push(serde_json::from_str::<serde_json::Value>(line)?);
         }
         Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soth_core::event_logger::{EventLogger, EventLoggerOptions, MerkleLoggingConfig};
+    use soth_core::types::{AgentInfo, DetectionSource, WrapDirection, WrapEvent};
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_verify_sqlite_merkle_roundtrip() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let options = EventLoggerOptions {
+            inline_payload_max_bytes: 16 * 1024,
+            merkle: MerkleLoggingConfig {
+                enabled: true,
+                seal_interval: std::time::Duration::from_secs(60),
+                max_events_per_batch: 2,
+            },
+        };
+        let logger = EventLogger::new_with_options(db_path.clone(), options).unwrap();
+
+        let agent = AgentInfo::new("AuditTest", DetectionSource::CommandLine);
+        let e1 = WrapEvent::new(
+            "sess-audit",
+            "api.openai.com",
+            WrapDirection::Out,
+            agent.clone(),
+        )
+        .with_method("POST /v1/chat/completions");
+        let e2 = WrapEvent::new(
+            "sess-audit",
+            "api.openai.com",
+            WrapDirection::In,
+            agent.clone(),
+        )
+        .with_method("POST /v1/chat/completions");
+        let e3 = WrapEvent::new("sess-audit", "api.openai.com", WrapDirection::Out, agent)
+            .with_method("POST /v1/chat/completions");
+        logger.log(&e1);
+        logger.log(&e2);
+        logger.log(&e3);
+        logger.close();
+
+        let summary = verify_sqlite_merkle(&db_path, None, None).unwrap();
+        assert_eq!(summary.batches_verified, 2);
+        assert_eq!(summary.events_verified, 3);
+        assert!(summary.last_root.is_some());
+        assert!(!summary.unique_signers.is_empty());
     }
 }

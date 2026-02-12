@@ -1,6 +1,10 @@
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{
+    header::{CONTENT_TYPE, ETAG},
+    HeaderMap, HeaderValue, StatusCode,
+};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -10,22 +14,29 @@ use soth_core::api::{
     version::{API_VERSION, API_VERSION_HEADER},
     BodyUploadResponse, ConfigBudget, ConfigBudgetLimit, ConfigOrg, ConfigPolicy, ConfigResponse,
     ConfigTeam, ConfigUser, EventBatchRequest, EventBatchResponse, HeartbeatRequest,
-    HeartbeatResponse,
+    HeartbeatResponse, RegistryVersionResponse,
 };
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_sync::agent::{SyncAgent, SyncAgentConfig};
 use soth_sync::config_puller::ConfigPuller;
+use soth_sync::registry_puller::RegistryPuller;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
+const TEST_BUNDLE_VERSION: &str = "bundle-v1";
+const TEST_BUNDLE_SHA: &str = "bundle-sha-v1";
+const TEST_BUNDLE_JSON: &str = r#"{"version":"bundle-v1","providers":{}}"#;
+
 #[derive(Debug, Clone, Default)]
 struct CapturedState {
     metadata_requests: Vec<EventBatchRequest>,
     body_upload_payloads: Vec<String>,
     heartbeat_requests: Vec<HeartbeatRequest>,
+    registry_version_requests: usize,
+    registry_bundle_requests: usize,
     saw_version_headers: Vec<String>,
     saw_authorization_headers: Vec<String>,
     body_failures_remaining: usize,
@@ -42,9 +53,13 @@ async fn contract_sync_endpoints_and_cursors() {
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, false);
     let cache_path = temp.path().join("cloud_cache.json");
+    let registry_cache_path = temp.path().join("registry_cache.json");
     let retry_queue_dir = temp.path().join("retry");
 
-    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone());
+    let registry_puller =
+        RegistryPuller::new(server_url.clone(), "test-key", registry_cache_path.clone());
+    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone())
+        .with_registry_puller(registry_puller);
     let pulled = puller.pull_once().await.unwrap();
     assert!(pulled.is_some());
 
@@ -95,6 +110,12 @@ async fn contract_sync_endpoints_and_cursors() {
     assert_eq!(captured.metadata_requests.len(), 1);
     assert_eq!(captured.heartbeat_requests.len(), 1);
     assert_eq!(captured.body_upload_payloads.len(), 1);
+    assert_eq!(captured.registry_version_requests, 1);
+    assert_eq!(captured.registry_bundle_requests, 1);
+    assert!(
+        registry_cache_path.exists(),
+        "registry bundle cache should be materialized"
+    );
 
     let metadata = &captured.metadata_requests[0];
     assert_eq!(metadata.batch.len(), 1);
@@ -141,9 +162,13 @@ async fn contract_retry_queue_on_body_upload_failure() {
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, false);
     let cache_path = temp.path().join("cloud_cache.json");
+    let registry_cache_path = temp.path().join("registry_cache.json");
     let retry_queue_dir = temp.path().join("retry");
 
-    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone());
+    let registry_puller =
+        RegistryPuller::new(server_url.clone(), "test-key", registry_cache_path.clone());
+    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone())
+        .with_registry_puller(registry_puller);
     let _ = puller.pull_once().await.unwrap();
 
     let config = SyncAgentConfig {
@@ -191,9 +216,13 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, true);
     let cache_path = temp.path().join("cloud_cache.json");
+    let registry_cache_path = temp.path().join("registry_cache.json");
     let retry_queue_dir = temp.path().join("retry");
 
-    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone());
+    let registry_puller =
+        RegistryPuller::new(server_url.clone(), "test-key", registry_cache_path.clone());
+    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone())
+        .with_registry_puller(registry_puller);
     let _ = puller.pull_once().await.unwrap();
 
     let config = SyncAgentConfig {
@@ -263,6 +292,8 @@ async fn start_mock_server(state: SharedState) -> String {
         .route("/api/v1/events/:id/body", post(body_upload_handler))
         .route("/api/v1/config", get(config_handler))
         .route("/api/v1/heartbeat", post(heartbeat_handler))
+        .route("/api/v1/registry/version", get(registry_version_handler))
+        .route("/api/v1/registry/bundle", get(registry_bundle_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -370,6 +401,7 @@ async fn config_handler(
             },
             body_sync_level: "bodies_redacted".to_string(),
             config_version: "cfg_v1".to_string(),
+            bundle_version: Some(TEST_BUNDLE_VERSION.to_string()),
         }),
     )
 }
@@ -389,6 +421,45 @@ async fn heartbeat_handler(
             server_time: Utc::now().to_rfc3339(),
         }),
     )
+}
+
+async fn registry_version_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<RegistryVersionResponse>) {
+    record_headers(&state, &headers);
+    state.lock().unwrap().registry_version_requests += 1;
+    (
+        StatusCode::OK,
+        Json(RegistryVersionResponse {
+            bundle_type: "local".to_string(),
+            version: TEST_BUNDLE_VERSION.to_string(),
+            sha256: TEST_BUNDLE_SHA.to_string(),
+            compiled_at: Utc::now().to_rfc3339(),
+            provider_count: 3,
+            domain_count: 10,
+            format_count: 5,
+            size_bytes: TEST_BUNDLE_JSON.as_bytes().len() as u64,
+        }),
+    )
+}
+
+async fn registry_bundle_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    record_headers(&state, &headers);
+    state.lock().unwrap().registry_bundle_requests += 1;
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response_headers.insert(ETAG, HeaderValue::from_static(TEST_BUNDLE_SHA));
+    response_headers.insert(
+        "x-soth-bundle-version",
+        HeaderValue::from_static(TEST_BUNDLE_VERSION),
+    );
+
+    (StatusCode::OK, response_headers, TEST_BUNDLE_JSON)
 }
 
 fn record_headers(state: &SharedState, headers: &HeaderMap) {

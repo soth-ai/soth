@@ -18,6 +18,10 @@ humantime = "2.1"
 dirs = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+bs58 = { workspace = true }
+hex = "0.4"
 
 # File watching
 notify = { workspace = true }

@@ -187,6 +187,38 @@ export interface RecommendationEntry {
   effort: "low" | "medium" | "high";
 }
 
+export interface CryptoStatusSummary {
+  total_events: number;
+  signed_events: number;
+  signature_coverage_pct: number;
+  verification_failures: number;
+  active_key_id: string | null;
+  merkle_batches: number;
+  latest_batch_id: string | null;
+  latest_root_hash: string | null;
+  latest_signer_did: string | null;
+  latest_sealed_at: string | null;
+}
+
+export interface CryptoMerkleSealRow {
+  batch_id: string;
+  seq_start: number;
+  seq_end: number;
+  expected_events: number;
+  observed_events: number;
+  root_hash: string;
+  signer_did: string;
+  prev_root: string | null;
+  sealed_at: string;
+  chain_link_valid: boolean;
+  verification_status: string;
+}
+
+export interface CryptoMerkleSummary {
+  total_batches: number;
+  seals: CryptoMerkleSealRow[];
+}
+
 export interface ModelPricingEntry {
   model_id: string;
   model_name: string;

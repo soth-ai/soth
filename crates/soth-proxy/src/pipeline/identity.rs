@@ -5,6 +5,7 @@ use crate::enforcement::core;
 use crate::protocol::{JsonRpcError, JsonRpcMessage};
 use soth_dashboard::DashboardState;
 use soth_identity::TrustStore;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,6 +34,8 @@ impl Default for IdentityMode {
 pub struct IdentityConfig {
     /// Verification mode
     pub mode: IdentityMode,
+    /// Principals that should be required to provide a valid signature when mode is optional.
+    pub required_principals: HashSet<String>,
     /// Header name for signature
     pub signature_header: String,
     /// Header name for DID
@@ -43,6 +46,7 @@ impl Default for IdentityConfig {
     fn default() -> Self {
         Self {
             mode: IdentityMode::Optional,
+            required_principals: HashSet::new(),
             signature_header: "X-Agent-Signature".to_string(),
             did_header: "X-Agent-DID".to_string(),
         }
@@ -133,6 +137,34 @@ impl IdentityLayer {
 
         Ok(verification.verified)
     }
+
+    fn principal_matches(&self, value: Option<&str>) -> bool {
+        let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+            return false;
+        };
+
+        self.config.required_principals.contains(value)
+            || self
+                .config
+                .required_principals
+                .contains(&value.to_ascii_lowercase())
+    }
+
+    fn requires_strict_identity(&self, ctx: &RequestContext) -> bool {
+        if self.config.mode == IdentityMode::Required {
+            return true;
+        }
+        if self.config.mode != IdentityMode::Optional || self.config.required_principals.is_empty()
+        {
+            return false;
+        }
+
+        let did = ctx
+            .metadata
+            .get(&self.config.did_header)
+            .and_then(|v| v.as_str());
+        self.principal_matches(did) || self.principal_matches(ctx.agent_id.as_deref())
+    }
 }
 
 impl Layer for IdentityLayer {
@@ -146,6 +178,7 @@ impl Layer for IdentityLayer {
             if self.config.mode == IdentityMode::Disabled {
                 return LayerResult::Continue(message);
             }
+            let strict_identity = self.requires_strict_identity(ctx);
 
             // Try to verify identity
             match self.verify_identity(ctx, &message).await {
@@ -157,7 +190,7 @@ impl Layer for IdentityLayer {
                         }
                     }
 
-                    if self.config.mode == IdentityMode::Required && !verified {
+                    if strict_identity && !verified {
                         let id = get_request_id(&message);
                         return error_response(id, JsonRpcError::identity_required());
                     }
@@ -173,7 +206,7 @@ impl Layer for IdentityLayer {
                         }
                     }
 
-                    if self.config.mode == IdentityMode::Required {
+                    if strict_identity {
                         let id = get_request_id(&message);
                         return error_response(
                             id,
@@ -199,6 +232,7 @@ mod tests {
     use crate::protocol::{JsonRpcRequest, RequestId};
     use serde_json::json;
     use soth_identity::{signing::sign_bytes, Did, KeyPair};
+    use std::collections::HashSet;
 
     #[tokio::test]
     async fn test_identity_layer_disabled() {
@@ -337,5 +371,22 @@ mod tests {
         assert!(matches!(result, LayerResult::Response(_)));
         assert!(!ctx.identity_verified);
         assert_eq!(ctx.agent_did, Some(trusted_did));
+    }
+
+    #[tokio::test]
+    async fn test_identity_layer_optional_selected_principal_requires_identity() {
+        let mut required_principals = HashSet::new();
+        required_principals.insert("codex".to_string());
+        let layer = IdentityLayer::new(IdentityConfig {
+            mode: IdentityMode::Optional,
+            required_principals,
+            ..Default::default()
+        });
+
+        let mut ctx = RequestContext::new("session-1").with_agent_id("codex");
+        let msg = JsonRpcMessage::Request(JsonRpcRequest::new("test", None, RequestId::Number(1)));
+
+        let result = layer.process(&mut ctx, msg).await;
+        assert!(matches!(result, LayerResult::Response(_)));
     }
 }

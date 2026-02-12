@@ -397,8 +397,11 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         .map(|runtime| Arc::new(WrapEnforcement { runtime }));
     if enforcement.is_some() {
         info!(
-            "Wrap enforcement enabled (identity_mode={}, policy_enabled={}, budget_enabled={})",
-            config.identity.mode, config.policy.enabled, config.budget.enabled
+            "Wrap enforcement enabled (crypto_identity_enabled={}, crypto_identity_mode={}, policy_enabled={}, budget_enabled={})",
+            config.crypto_identity.enabled,
+            config.crypto_identity.mode,
+            config.policy.enabled,
+            config.budget.enabled
         );
     } else {
         info!("Wrap enforcement disabled (identity/policy/budget all off)");
@@ -409,8 +412,9 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         None
     } else {
         Some(
-            EventLogger::with_default_path_with_inline_payload_max_bytes(
+            EventLogger::with_default_path_from_runtime_config(
                 config.observe.storage.inline_threshold_bytes,
+                &config.crypto_identity,
             )
             .context("Failed to initialize event logger")?,
         )

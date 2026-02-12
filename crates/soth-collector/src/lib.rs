@@ -52,7 +52,12 @@ impl CollectorConfig {
     pub fn from_env() -> Option<Self> {
         let enabled = std::env::var("SOTH_COLLECTOR_ENABLED")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
         if !enabled {
             return None;
@@ -338,8 +343,9 @@ impl OffsetState {
             return Ok(Self::default());
         }
         let data = std::fs::read(path)?;
-        let parsed = serde_json::from_slice::<Self>(&data)
-            .with_context(|| format!("failed parsing collector offset state: {}", path.display()))?;
+        let parsed = serde_json::from_slice::<Self>(&data).with_context(|| {
+            format!("failed parsing collector offset state: {}", path.display())
+        })?;
         Ok(parsed)
     }
 
@@ -675,7 +681,13 @@ mod tests {
     #[test]
     fn parse_event_source_aliases() {
         assert_eq!(parse_event_source("mcp"), Some(EventSource::Mcp));
-        assert_eq!(parse_event_source("ai_inference"), Some(EventSource::AiProxy));
-        assert_eq!(parse_event_source("agent_apps"), Some(EventSource::AgentApp));
+        assert_eq!(
+            parse_event_source("ai_inference"),
+            Some(EventSource::AiProxy)
+        );
+        assert_eq!(
+            parse_event_source("agent_apps"),
+            Some(EventSource::AgentApp)
+        );
     }
 }

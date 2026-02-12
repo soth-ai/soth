@@ -33,6 +33,11 @@ impl CertGenerator {
         Self { validity }
     }
 
+    /// Current leaf certificate validity duration.
+    pub fn validity(&self) -> Duration {
+        self.validity
+    }
+
     /// Generate a self-signed CA certificate
     pub fn generate_ca(
         common_name: &str,

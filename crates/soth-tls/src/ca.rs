@@ -3,9 +3,12 @@
 use crate::cert_cache::CertCache;
 use crate::cert_gen::{CertGenerator, DEFAULT_CA_VALIDITY};
 use crate::error::{Result, TlsError};
+use chrono::Utc;
 use rcgen::{Certificate, CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls_pemfile;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -16,6 +19,24 @@ use tracing::{debug, info};
 
 /// Default CA common name
 const DEFAULT_CA_CN: &str = "SOTH Proxy CA";
+const DEFAULT_CACHE_ENTRIES: usize = 10_000;
+const IDENTITY_METADATA_FILE: &str = "ca.identity.json";
+
+/// Persisted CA identity metadata for TLS key lifecycle traceability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaIdentityMetadata {
+    /// Stable CA key identifier.
+    pub ca_key_id: String,
+    /// Whether TLS lifecycle is bound to org identity controls.
+    pub bind_to_org_identity: bool,
+    /// Leaf TTL in seconds.
+    pub leaf_ttl_secs: u64,
+    /// Optional active org key id/version reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_key_id: Option<String>,
+    /// Last metadata update timestamp.
+    pub updated_at: String,
+}
 
 /// Certificate Authority for generating TLS certificates
 pub struct CertificateAuthority {
@@ -29,6 +50,8 @@ pub struct CertificateAuthority {
     generator: CertGenerator,
     /// Storage path for CA files
     storage_path: PathBuf,
+    /// Identity metadata for CA/leaf issuance tracking
+    identity: CaIdentityMetadata,
 }
 
 impl CertificateAuthority {
@@ -60,12 +83,15 @@ impl CertificateAuthority {
 
         info!("CA certificate generated: {:?}", cert_path);
 
+        let identity = Self::load_or_create_identity_metadata(&storage_path, &ca_key)?;
+
         Ok(Self {
             ca_cert,
             ca_key,
             cache: CertCache::default(),
             generator: CertGenerator::new(),
             storage_path,
+            identity,
         })
     }
 
@@ -94,12 +120,15 @@ impl CertificateAuthority {
 
         info!("CA certificate loaded from {:?}", cert_path);
 
+        let identity = Self::load_or_create_identity_metadata(&storage_path, &ca_key)?;
+
         Ok(Self {
             ca_cert,
             ca_key,
             cache: CertCache::default(),
             generator: CertGenerator::new(),
             storage_path,
+            identity,
         })
     }
 
@@ -184,10 +213,17 @@ impl CertificateAuthority {
         let (cert_der, key_der) =
             self.generator
                 .generate_domain_cert(domain, &self.ca_cert, &self.ca_key)?;
+        let leaf_key_id = leaf_key_id_from_der(&key_der);
 
         // Cache it
-        self.cache
-            .insert(domain.to_string(), cert_der.clone(), key_der.clone());
+        self.cache.insert_with_identity(
+            domain.to_string(),
+            cert_der.clone(),
+            key_der.clone(),
+            self.generator.validity(),
+            self.identity.ca_key_id.clone(),
+            leaf_key_id,
+        );
 
         Ok((cert_der, key_der))
     }
@@ -244,6 +280,81 @@ impl CertificateAuthority {
     pub fn set_cache_params(&mut self, ttl: Duration, max_entries: usize) {
         self.cache = CertCache::new(ttl, max_entries);
     }
+
+    /// Apply crypto identity TLS settings and persist metadata.
+    pub fn apply_crypto_tls_binding(
+        &mut self,
+        bind_to_org_identity: bool,
+        leaf_ttl: Duration,
+        org_key_id: Option<String>,
+    ) -> Result<()> {
+        self.identity.bind_to_org_identity = bind_to_org_identity;
+        self.identity.leaf_ttl_secs = leaf_ttl.as_secs();
+        self.identity.org_key_id = org_key_id;
+        self.identity.updated_at = Utc::now().to_rfc3339();
+
+        self.set_cert_validity(leaf_ttl);
+        self.set_cache_params(leaf_ttl, DEFAULT_CACHE_ENTRIES);
+        self.persist_identity_metadata()?;
+        Ok(())
+    }
+
+    /// Apply crypto identity TLS settings from global config.
+    pub fn apply_crypto_tls_config(
+        &mut self,
+        cfg: &soth_core::config::types::CryptoTlsBindingConfig,
+        org_key_id: Option<String>,
+    ) -> Result<()> {
+        self.apply_crypto_tls_binding(cfg.bind_to_org_identity, cfg.leaf_ttl, org_key_id)
+    }
+
+    /// Read-only CA identity metadata.
+    pub fn identity_metadata(&self) -> &CaIdentityMetadata {
+        &self.identity
+    }
+
+    fn load_or_create_identity_metadata(
+        storage_path: &Path,
+        ca_key: &KeyPair,
+    ) -> Result<CaIdentityMetadata> {
+        let path = storage_path.join(IDENTITY_METADATA_FILE);
+        if path.exists() {
+            let data = fs::read_to_string(&path)?;
+            let parsed: CaIdentityMetadata = serde_json::from_str(&data)
+                .map_err(|e| TlsError::cert_load(format!("Failed to parse CA metadata: {}", e)))?;
+            return Ok(parsed);
+        }
+
+        let metadata = CaIdentityMetadata {
+            ca_key_id: ca_key_id(ca_key),
+            bind_to_org_identity: true,
+            leaf_ttl_secs: Duration::from_secs(24 * 60 * 60).as_secs(),
+            org_key_id: None,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let json = serde_json::to_string_pretty(&metadata)
+            .map_err(|e| TlsError::cert_load(format!("Failed to serialize CA metadata: {}", e)))?;
+        fs::write(path, json)?;
+        Ok(metadata)
+    }
+
+    fn persist_identity_metadata(&self) -> Result<()> {
+        let path = self.storage_path.join(IDENTITY_METADATA_FILE);
+        let json = serde_json::to_string_pretty(&self.identity)
+            .map_err(|e| TlsError::cert_load(format!("Failed to serialize CA metadata: {}", e)))?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+}
+
+fn ca_key_id(ca_key: &KeyPair) -> String {
+    let digest = Sha256::digest(ca_key.serialize_der());
+    format!("ca:{}", hex::encode(&digest[..8]))
+}
+
+fn leaf_key_id_from_der(key_der: &[u8]) -> String {
+    let digest = Sha256::digest(key_der);
+    format!("leaf:{}", hex::encode(&digest[..8]))
 }
 
 #[cfg(test)]
@@ -312,5 +423,38 @@ mod tests {
 
         let stats = ca.cache_stats();
         assert_eq!(stats.total, 2);
+        assert_eq!(stats.identity_bound_entries, 2);
+        assert_eq!(stats.distinct_ca_key_ids, 1);
+    }
+
+    #[test]
+    fn test_ca_identity_metadata_is_persisted() {
+        let temp_dir = TempDir::new().unwrap();
+        let ca = CertificateAuthority::generate_new(temp_dir.path().to_path_buf()).unwrap();
+        let metadata_path = temp_dir.path().join("ca.identity.json");
+        assert!(metadata_path.exists());
+        assert!(ca.identity_metadata().ca_key_id.starts_with("ca:"));
+    }
+
+    #[test]
+    fn test_apply_crypto_tls_binding_updates_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut ca = CertificateAuthority::generate_new(temp_dir.path().to_path_buf()).unwrap();
+        ca.apply_crypto_tls_binding(
+            true,
+            Duration::from_secs(2 * 60 * 60),
+            Some("org:root:v3".to_string()),
+        )
+        .unwrap();
+
+        let loaded = CertificateAuthority::load_from_path(temp_dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            loaded.identity_metadata().leaf_ttl_secs,
+            Duration::from_secs(2 * 60 * 60).as_secs()
+        );
+        assert_eq!(
+            loaded.identity_metadata().org_key_id.as_deref(),
+            Some("org:root:v3")
+        );
     }
 }

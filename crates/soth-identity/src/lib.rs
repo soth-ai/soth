@@ -23,12 +23,16 @@
 
 pub mod canonicalization;
 pub mod did;
+pub mod identity_manager;
 pub mod keypair;
 pub mod signing;
 pub mod trust_store;
 
 pub use canonicalization::{canonicalize_json, compute_hash, normalize_for_signing};
 pub use did::Did;
+pub use identity_manager::{
+    IdentityKeyVersion, IdentityManager, KeyStatus, Principal, VerificationMatch,
+};
 pub use keypair::KeyPair;
 pub use signing::{sign_json, verify_json_signature, SignedDocument};
 pub use trust_store::TrustStore;

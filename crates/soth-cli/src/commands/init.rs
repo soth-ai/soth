@@ -33,6 +33,25 @@ identity:
   key_path: "~/.soth/identity.pem"
   trust_store_path: "~/.soth/trust_store"
 
+# Unified crypto identity rollout
+crypto_identity:
+  enabled: false
+  mode: "audit" # audit | enforce
+  enforce_principals: []
+  signing:
+    envelope_metadata_only: true
+    algorithm: "ed25519"
+  hierarchy:
+    derivation: "slip10_hardened"
+    rotation_days: 90
+  merkle:
+    enabled: true
+    seal_interval: "3s"
+    max_events_per_batch: 500
+  tls:
+    bind_to_org_identity: true
+    leaf_ttl: "24h"
+
 # Policy configuration
 policy:
   enabled: true

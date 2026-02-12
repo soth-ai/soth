@@ -69,7 +69,6 @@ struct AiRequestBody {
 #[derive(Debug, Clone)]
 struct PendingRequest {
     request_id: u64,
-    event_id: String,
     envelope: Option<TrafficEnvelope>,
     host: String,
     path: String,
@@ -170,6 +169,7 @@ pub struct ProxyEnforcer {
     did_header: String,
     signature_header: String,
     trusted_dids: Arc<HashSet<String>>,
+    required_principals: Arc<HashSet<String>>,
     policy_mode: ProxyPolicyMode,
     policy_engine: Option<Arc<PolicyEngine>>,
     policy_fail_open: bool,
@@ -191,6 +191,7 @@ impl ProxyEnforcer {
             did_header: "X-Agent-DID".to_string(),
             signature_header: "X-Agent-Signature".to_string(),
             trusted_dids: Arc::new(HashSet::new()),
+            required_principals: Arc::new(HashSet::new()),
             policy_mode: ProxyPolicyMode::Disabled,
             policy_engine: None,
             policy_fail_open: true,
@@ -210,6 +211,11 @@ impl ProxyEnforcer {
     ) -> Self {
         self.identity_mode = mode;
         self.trusted_dids = Arc::new(trusted_dids);
+        self
+    }
+
+    pub fn with_required_principals(mut self, required_principals: HashSet<String>) -> Self {
+        self.required_principals = Arc::new(required_principals);
         self
     }
 
@@ -291,6 +297,7 @@ impl ProxyEnforcer {
             enforcement_core::ProxyEnforcementConfig {
                 identity_mode: self.core_identity_mode(),
                 trusted_dids: self.trusted_dids.as_ref(),
+                required_principals: self.required_principals.as_ref(),
                 policy_mode: self.core_policy_mode(),
                 policy_engine: self.policy_engine.as_deref(),
                 policy_fail_open: self.policy_fail_open,
@@ -316,6 +323,7 @@ impl ProxyEnforcer {
         let envelope = envelope.clone();
         let identity_mode = self.core_identity_mode();
         let trusted_dids = Arc::clone(&self.trusted_dids);
+        let required_principals = Arc::clone(&self.required_principals);
         let policy_mode = self.core_policy_mode();
         let policy_engine = self.policy_engine.clone();
         let policy_fail_open = self.policy_fail_open;
@@ -330,6 +338,7 @@ impl ProxyEnforcer {
                 let config = enforcement_core::ProxyEnforcementConfig {
                     identity_mode,
                     trusted_dids: trusted_dids.as_ref(),
+                    required_principals: required_principals.as_ref(),
                     policy_mode,
                     policy_engine: policy_engine.as_deref(),
                     policy_fail_open,
@@ -1904,7 +1913,6 @@ impl HttpHandler for AiProxyHandler {
                         request_id,
                         PendingRequest {
                             request_id,
-                            event_id: uuid::Uuid::new_v4().to_string(),
                             envelope: Some(envelope),
                             host: host.clone(),
                             path: display_path.clone(),
@@ -1976,7 +1984,6 @@ impl HttpHandler for AiProxyHandler {
                     request_id,
                     PendingRequest {
                         request_id,
-                        event_id: uuid::Uuid::new_v4().to_string(),
                         envelope: Some(apply_process_identity(
                             TrafficEnvelope::mcp_http(
                                 &session_id,
@@ -2155,7 +2162,6 @@ impl HttpHandler for AiProxyHandler {
                     }
                     event =
                         event.with_payload_sizes(pending.request_size_bytes, response_size_bytes);
-                    event.id = pending.event_id.clone();
                     event =
                         event.with_content_preview(format!("← {} (HTTP {})", method_name, status));
                     if let Some(allowed) = pending.policy_allowed {
@@ -2182,45 +2188,8 @@ impl HttpHandler for AiProxyHandler {
             let is_gemini_bard_response_path = is_gemini_bard_stream_path(&pending.path);
             let mut response_usage = ResponseUsageMeta::default();
 
-            // Streamed responses can be long-lived and may get dropped before completion.
-            // Emit a placeholder row immediately, then overwrite by ID when stream capture finishes.
-            if is_sse || is_codex_response_path || is_gemini_bard_response_path {
-                if let Some(ref logger) = event_logger {
-                    let placeholder =
-                        empty_response_placeholder(&pending.method, &pending.path, status, is_sse);
-                    let mut event = build_paired_response_event(ResponseEventInput {
-                        session_id: &session_id,
-                        host: &pending.host,
-                        provider,
-                        agent: pending.agent,
-                        method: &pending.method,
-                        path: &pending.path,
-                        graphql_operation: pending.graphql_operation.as_deref(),
-                        is_agent_app: pending.is_agent_app,
-                        status,
-                        latency_ms,
-                        request_content: pending.request_content.as_deref(),
-                        response_content: Some(placeholder),
-                        request_size_bytes: pending.request_size_bytes,
-                        response_size_bytes: None,
-                        headers: pending.headers.clone(),
-                        tags: Some(event_tags.as_ref()),
-                        usage_meta: &response_usage,
-                        fallback_model: pending.model.as_deref(),
-                        response_kind: ResponseKind::Stream { is_sse },
-                        traffic_envelope: pending.envelope.clone(),
-                    });
-                    event.id = pending.event_id.clone();
-                    if let Some(allowed) = pending.policy_allowed {
-                        event = event.with_policy(allowed, pending.policy_reason.clone());
-                    }
-                    if let Some(ref version) = pending.policy_version {
-                        event = event.with_policy_version(version.clone());
-                    }
-                    pii_enricher.enrich(&mut event);
-                    logger.log(&event);
-                }
-            }
+            // Streamed responses can be long-lived. Keep persistence append-only by emitting a
+            // single finalized event once stream capture completes (no placeholder upsert).
 
             // For JSON responses, capture the body for logging (with decompression)
             // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
@@ -2279,7 +2248,6 @@ impl HttpHandler for AiProxyHandler {
                 let log_content_type = content_type.clone();
                 let log_grpc_message_encoding = grpc_message_encoding.clone();
                 let log_is_sse = is_sse;
-                let log_event_id = pending.event_id.clone();
                 let log_provider_registry = provider_registry.clone();
                 let log_pricing_catalog = pricing_catalog.clone();
                 let log_budget_tracker = budget_tracker.clone();
@@ -2440,7 +2408,6 @@ impl HttpHandler for AiProxyHandler {
                             response_kind: ResponseKind::Stream { is_sse: log_is_sse },
                             traffic_envelope: log_pending.envelope.clone(),
                         });
-                        event.id = log_event_id.clone();
                         if let Some(allowed) = log_pending.policy_allowed {
                             event = event.with_policy(allowed, log_pending.policy_reason.clone());
                         }
@@ -2532,7 +2499,6 @@ impl HttpHandler for AiProxyHandler {
                         response_kind: ResponseKind::Http,
                         traffic_envelope: pending.envelope.clone(),
                     });
-                    event.id = pending.event_id.clone();
                     if let Some(allowed) = pending.policy_allowed {
                         event = event.with_policy(allowed, pending.policy_reason.clone());
                     }
@@ -3520,6 +3486,57 @@ mod tests {
         let identity = result.unwrap();
         assert!(identity.verified);
         assert_eq!(identity.did, Some(did));
+    }
+
+    #[test]
+    fn test_proxy_enforcer_identity_selected_principal_requires_signature() {
+        let mut required_principals = HashSet::new();
+        required_principals.insert("codex".to_string());
+        let enforcer = ProxyEnforcer::new()
+            .with_identity_mode(ProxyIdentityMode::Optional, HashSet::new())
+            .with_required_principals(required_principals);
+
+        let result = enforcer.enforce_request(
+            "session-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-4o"),
+            Some(r#"{"model":"gpt-4o"}"#),
+            Some("codex"),
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err((401, _, _))));
+    }
+
+    #[test]
+    fn test_proxy_enforcer_identity_selected_principal_allows_other_agents_without_signature() {
+        let mut required_principals = HashSet::new();
+        required_principals.insert("codex".to_string());
+        let enforcer = ProxyEnforcer::new()
+            .with_identity_mode(ProxyIdentityMode::Optional, HashSet::new())
+            .with_required_principals(required_principals);
+
+        let result = enforcer.enforce_request(
+            "session-1",
+            "openai",
+            "api.openai.com",
+            "POST",
+            "/v1/chat/completions",
+            Some("gpt-4o"),
+            Some(r#"{"model":"gpt-4o"}"#),
+            Some("chatgpt"),
+            None,
+            None,
+        );
+
+        assert!(result.is_ok());
+        let identity = result.unwrap();
+        assert!(!identity.verified);
+        assert!(identity.did.is_none());
     }
 
     #[test]

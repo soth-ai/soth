@@ -261,7 +261,10 @@ mod tests {
 
     #[test]
     fn detect_agent_apps_for_known_hosts() {
-        assert_eq!(detect_agent_app("statsig.anthropic.com"), Some("claude-code"));
+        assert_eq!(
+            detect_agent_app("statsig.anthropic.com"),
+            Some("claude-code")
+        );
         assert_eq!(detect_agent_app("api2.cursor.sh"), Some("cursor"));
         assert_eq!(detect_agent_app("cloud.zed.dev"), Some("zed"));
     }

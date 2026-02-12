@@ -76,6 +76,20 @@ pub struct ConfigResponse {
     pub budget: ConfigBudget,
     pub body_sync_level: String,
     pub config_version: String,
+    #[serde(default)]
+    pub bundle_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryVersionResponse {
+    pub bundle_type: String,
+    pub version: String,
+    pub sha256: String,
+    pub compiled_at: String,
+    pub provider_count: u64,
+    pub domain_count: u64,
+    pub format_count: u64,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,10 +861,7 @@ mod tests {
                 org_id: "org_123".to_string(),
                 team_id: Some("team_123".to_string()),
                 url: "https://example.com/webhook".to_string(),
-                events: vec![
-                    "policy.violation".to_string(),
-                    "pii.detected".to_string(),
-                ],
+                events: vec!["policy.violation".to_string(), "pii.detected".to_string()],
                 is_active: true,
                 created_at: "2026-02-10T00:00:00Z".to_string(),
             }],
@@ -901,10 +912,7 @@ mod tests {
                 admin_actions: 11,
                 policy_deployments: 2,
             },
-            pii_counts_by_type: HashMap::from([
-                ("email".to_string(), 2),
-                ("phone".to_string(), 1),
-            ]),
+            pii_counts_by_type: HashMap::from([("email".to_string(), 2), ("phone".to_string(), 1)]),
             policy_evaluation_history: vec![CompliancePolicyEvaluationRecord {
                 event_id: "evt_123".to_string(),
                 timestamp: "2026-02-10T00:00:00Z".to_string(),
@@ -1037,8 +1045,7 @@ mod tests {
             serde_json::from_str(&request_json).expect("deserialize role request");
         assert_eq!(parsed_request.role, "org_admin");
 
-        let response_json =
-            serde_json::to_string(&role_response).expect("serialize role response");
+        let response_json = serde_json::to_string(&role_response).expect("serialize role response");
         let parsed_response: OrgAdminMemberRoleResponse =
             serde_json::from_str(&response_json).expect("deserialize role response");
         assert_eq!(parsed_response.member.org_role, "org_admin");

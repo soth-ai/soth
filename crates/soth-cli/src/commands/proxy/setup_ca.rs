@@ -50,6 +50,9 @@ pub async fn run(
     };
 
     if cert_path.exists() && key_path.exists() {
+        if let Ok(mut existing_ca) = CertificateAuthority::load_from_path(output_path.clone()) {
+            let _ = existing_ca.apply_crypto_tls_config(&config.crypto_identity.tls, None);
+        }
         style::header("CA Certificate Status");
         style::success("CA certificate already exists");
         println!();
@@ -70,8 +73,10 @@ pub async fn run(
 
     // Step 2: Generate CA
     style::step(2, 3, "Generating CA certificate...");
-    let _ca = CertificateAuthority::generate_new(output_path.clone())
+    let mut ca = CertificateAuthority::generate_new(output_path.clone())
         .map_err(|e| anyhow::anyhow!("Failed to generate CA: {}", e))?;
+    ca.apply_crypto_tls_config(&config.crypto_identity.tls, None)
+        .map_err(|e| anyhow::anyhow!("Failed to apply TLS crypto identity settings: {}", e))?;
 
     if use_config_paths {
         let generated_cert_path = output_path.join("ca.crt");
@@ -94,6 +99,7 @@ pub async fn run(
     println!();
     style::kv("Certificate", &cert_path.display().to_string());
     style::kv("Private key", &key_path.display().to_string());
+    style::kv("CA key id", &ca.identity_metadata().ca_key_id);
 
     // Install to trust store if requested
     if !no_trust {

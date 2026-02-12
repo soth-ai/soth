@@ -43,6 +43,7 @@ pub struct ProxyEnforcementInput<'a> {
 pub struct ProxyEnforcementConfig<'a> {
     pub identity_mode: IdentityMode,
     pub trusted_dids: &'a HashSet<String>,
+    pub required_principals: &'a HashSet<String>,
     pub policy_mode: PolicyMode,
     pub policy_engine: Option<&'a PolicyEngine>,
     pub policy_fail_open: bool,
@@ -366,6 +367,14 @@ fn budget_scope_label(scope: BudgetScope) -> &'static str {
     }
 }
 
+fn principal_matches(required_principals: &HashSet<String>, value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return false;
+    };
+
+    required_principals.contains(value) || required_principals.contains(&value.to_ascii_lowercase())
+}
+
 pub fn enforce_proxy_request(
     config: ProxyEnforcementConfig<'_>,
     input: ProxyEnforcementInput<'_>,
@@ -377,9 +386,18 @@ pub fn enforce_proxy_request(
     let path = envelope.path.as_deref().unwrap_or("/");
     let did = envelope.did.as_deref();
     let signature = envelope.signature.as_deref();
+    let requires_strict_identity = !config.required_principals.is_empty()
+        && (principal_matches(config.required_principals, did)
+            || principal_matches(config.required_principals, envelope.agent.as_deref()));
+    let effective_identity_mode =
+        if config.identity_mode == IdentityMode::Optional && requires_strict_identity {
+            IdentityMode::Required
+        } else {
+            config.identity_mode
+        };
 
     let mut identity = match verify_proxy_identity(
-        config.identity_mode,
+        effective_identity_mode,
         config.trusted_dids,
         host,
         method,
@@ -390,7 +408,7 @@ pub fn enforce_proxy_request(
     ) {
         Ok(identity) => identity,
         Err(err) => {
-            if config.identity_mode == IdentityMode::Required {
+            if effective_identity_mode == IdentityMode::Required {
                 return Err((401, err, None));
             }
             IdentityResult {
