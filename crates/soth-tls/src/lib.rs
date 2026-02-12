@@ -26,7 +26,7 @@ pub mod error;
 pub mod learned_passthrough;
 pub mod sni;
 
-pub use ca::CertificateAuthority;
+pub use ca::{CaIdentityMetadata, CertificateAuthority};
 pub use cert_cache::CertCache;
 pub use cert_gen::CertGenerator;
 pub use error::{Result, TlsError};
