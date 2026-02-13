@@ -10,6 +10,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use soth_core::api::{
     version::{API_VERSION, API_VERSION_HEADER},
     BodyUploadResponse, ConfigBudget, ConfigBudgetLimit, ConfigOrg, ConfigPolicy, ConfigResponse,
@@ -27,8 +28,27 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 const TEST_BUNDLE_VERSION: &str = "bundle-v1";
-const TEST_BUNDLE_SHA: &str = "bundle-sha-v1";
-const TEST_BUNDLE_JSON: &str = r#"{"version":"bundle-v1","providers":{}}"#;
+const TEST_BUNDLE_JSON: &str = r#"{
+  "version":"bundle-v1",
+  "compiled_at":"2026-02-13T00:00:00Z",
+  "bundle_type":"local",
+  "domain_index":[],
+  "providers":{
+    "openai":{
+      "id":"openai",
+      "name":"OpenAI",
+      "type":"ai-inference",
+      "domains":["api.openai.com"]
+    }
+  },
+  "filters":{},
+  "pricing":{},
+  "stats":{"providers":1,"domains":1,"formats":1}
+}"#;
+
+fn test_bundle_sha() -> String {
+    format!("{:x}", Sha256::digest(TEST_BUNDLE_JSON.as_bytes()))
+}
 
 #[derive(Debug, Clone, Default)]
 struct CapturedState {
@@ -434,7 +454,7 @@ async fn registry_version_handler(
         Json(RegistryVersionResponse {
             bundle_type: "local".to_string(),
             version: TEST_BUNDLE_VERSION.to_string(),
-            sha256: TEST_BUNDLE_SHA.to_string(),
+            sha256: test_bundle_sha(),
             compiled_at: Utc::now().to_rfc3339(),
             provider_count: 3,
             domain_count: 10,
@@ -453,7 +473,10 @@ async fn registry_bundle_handler(
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response_headers.insert(ETAG, HeaderValue::from_static(TEST_BUNDLE_SHA));
+    response_headers.insert(
+        ETAG,
+        HeaderValue::from_str(test_bundle_sha().as_str()).unwrap(),
+    );
     response_headers.insert(
         "x-soth-bundle-version",
         HeaderValue::from_static(TEST_BUNDLE_VERSION),

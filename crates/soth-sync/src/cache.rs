@@ -1,7 +1,6 @@
 use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::Map;
 use serde_json::Value;
 use soth_core::api::{ConfigResponse, RegistryVersionResponse};
 use soth_oisp_types::bundle::parse_compiled_bundle;
@@ -77,25 +76,23 @@ pub fn save_config_cache(path: &Path, config: &ConfigResponse) -> anyhow::Result
 pub fn load_registry_bundle_cache(
     path: &Path,
 ) -> anyhow::Result<Option<CachedRegistryBundleEnvelope>> {
-    if !path.exists() {
-        return Ok(None);
+    match load_registry_bundle_cache_at(path) {
+        Ok(Some(envelope)) => Ok(Some(envelope)),
+        Ok(None) => load_registry_bundle_cache_at(&registry_cache_last_good_path(path)),
+        Err(primary_error) => {
+            let fallback_path = registry_cache_last_good_path(path);
+            if !fallback_path.exists() {
+                return Err(primary_error);
+            }
+            match load_registry_bundle_cache_at(&fallback_path) {
+                Ok(Some(envelope)) => Ok(Some(envelope)),
+                Ok(None) => Err(primary_error),
+                Err(fallback_error) => Err(anyhow::anyhow!(
+                    "primary registry cache invalid ({primary_error}); last-known-good cache invalid ({fallback_error})"
+                )),
+            }
+        }
     }
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed reading registry cache {}", path.display()))?;
-    let envelope: CachedRegistryBundleEnvelope = serde_json::from_str(&content)
-        .with_context(|| format!("failed parsing registry cache {}", path.display()))?;
-    if envelope.schema_version != registry_cache_schema_version() {
-        anyhow::bail!(
-            "unsupported registry cache schema_version {} (expected {})",
-            envelope.schema_version,
-            registry_cache_schema_version()
-        );
-    }
-    validate_registry_bundle_payload(&envelope.bundle)
-        .context("cached registry bundle payload failed schema validation")?;
-    validate_compiled_bundle_if_present(&envelope.bundle)
-        .context("cached registry bundle failed typed validation")?;
-    Ok(Some(envelope))
 }
 
 pub fn save_registry_bundle_cache(
@@ -113,12 +110,11 @@ pub fn save_registry_bundle_cache(
         })?;
     }
 
-    let bundle: Value = serde_json::from_slice(bundle_bytes)
+    let raw_bundle: Value = serde_json::from_slice(bundle_bytes)
         .context("failed parsing registry bundle payload as JSON")?;
+    let bundle = normalize_registry_bundle_payload(raw_bundle);
     validate_registry_bundle_payload(&bundle)
         .context("registry bundle payload failed schema validation")?;
-    validate_compiled_bundle_if_present(&bundle)
-        .context("registry bundle failed typed validation")?;
     let envelope = CachedRegistryBundleEnvelope {
         schema_version: registry_cache_schema_version(),
         fetched_at: Utc::now().to_rfc3339(),
@@ -131,83 +127,88 @@ pub fn save_registry_bundle_cache(
         .context("failed serializing cached registry bundle")?;
     std::fs::write(path, payload)
         .with_context(|| format!("failed writing registry cache {}", path.display()))?;
+    let last_good_path = registry_cache_last_good_path(path);
+    let payload_last_good = serde_json::to_string_pretty(&envelope)
+        .context("failed serializing last-known-good registry bundle")?;
+    std::fs::write(&last_good_path, payload_last_good).with_context(|| {
+        format!(
+            "failed writing last-known-good registry cache {}",
+            last_good_path.display()
+        )
+    })?;
     Ok(())
 }
 
 fn validate_registry_bundle_payload(bundle: &Value) -> anyhow::Result<()> {
-    let object = bundle
-        .as_object()
-        .context("bundle root must be a JSON object")?;
-
-    if is_compiled_bundle_schema(object)
-        || is_registry_catalog_schema(object)
-        || is_domain_lists_schema(object)
-    {
-        return Ok(());
-    }
-
-    anyhow::bail!(
-        "bundle payload did not match supported schemas (compiled_bundle, registry_catalog, or domain_lists)"
-    );
-}
-
-fn is_compiled_bundle_schema(object: &Map<String, Value>) -> bool {
-    let version_ok = object
-        .get("version")
-        .and_then(|value| value.as_str())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    let providers_ok = object
-        .get("providers")
-        .and_then(|value| value.as_object())
-        .is_some();
-    let domain_index_ok = object
-        .get("domain_index")
-        .and_then(|value| value.as_array())
-        .is_some();
-    version_ok && providers_ok && domain_index_ok
-}
-
-fn is_domain_lists_schema(object: &Map<String, Value>) -> bool {
-    is_string_array_field(object, "ai_inference")
-        && is_string_array_field(object, "mcp")
-        && is_string_array_field(object, "agent_apps")
-}
-
-fn is_registry_catalog_schema(object: &Map<String, Value>) -> bool {
-    let version_ok = object
-        .get("version")
-        .and_then(|value| value.as_str())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    let providers_ok = object
-        .get("providers")
-        .and_then(|value| value.as_object())
-        .is_some();
-    let domain_index_ok = object
-        .get("domain_index")
-        .and_then(|value| value.as_object())
-        .is_some();
-    version_ok && providers_ok && domain_index_ok
-}
-
-fn is_string_array_field(object: &Map<String, Value>, field: &str) -> bool {
-    object
-        .get(field)
-        .and_then(|value| value.as_array())
-        .map(|values| values.iter().all(|item| item.as_str().is_some()))
-        .unwrap_or(false)
-}
-
-fn validate_compiled_bundle_if_present(bundle: &Value) -> anyhow::Result<()> {
-    let object = match bundle.as_object() {
-        Some(object) => object,
-        None => return Ok(()),
-    };
-    if is_compiled_bundle_schema(object) {
-        parse_compiled_bundle(bundle).context("typed compiled bundle parse failed")?;
-    }
+    parse_compiled_bundle(bundle)
+        .context("bundle payload must match supported OISP bundle schema")?;
     Ok(())
+}
+
+fn normalize_registry_bundle_payload(bundle: Value) -> Value {
+    let Some(object) = bundle.as_object() else {
+        return bundle;
+    };
+
+    if let Some(inner) = object.get("bundle").cloned() {
+        return inner;
+    }
+    if let Some(inner) = object.get("compiled_bundle").cloned() {
+        return inner;
+    }
+    if let Some(data) = object.get("data") {
+        if let Some(inner) = data
+            .as_object()
+            .and_then(|value| value.get("bundle"))
+            .cloned()
+        {
+            return inner;
+        }
+        if let Some(inner) = data
+            .as_object()
+            .and_then(|value| value.get("compiled_bundle"))
+            .cloned()
+        {
+            return inner;
+        }
+    }
+
+    bundle
+}
+
+fn registry_cache_last_good_path(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "registry_bundle_cache.json".to_string());
+    let fallback_filename = format!("{filename}.last_good");
+    match path.parent() {
+        Some(parent) => parent.join(fallback_filename),
+        None => PathBuf::from(fallback_filename),
+    }
+}
+
+fn load_registry_bundle_cache_at(
+    path: &Path,
+) -> anyhow::Result<Option<CachedRegistryBundleEnvelope>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed reading registry cache {}", path.display()))?;
+    let mut envelope: CachedRegistryBundleEnvelope = serde_json::from_str(&content)
+        .with_context(|| format!("failed parsing registry cache {}", path.display()))?;
+    if envelope.schema_version != registry_cache_schema_version() {
+        anyhow::bail!(
+            "unsupported registry cache schema_version {} (expected {})",
+            envelope.schema_version,
+            registry_cache_schema_version()
+        );
+    }
+    envelope.bundle = normalize_registry_bundle_payload(envelope.bundle);
+    validate_registry_bundle_payload(&envelope.bundle)
+        .context("cached registry bundle payload failed schema validation")?;
+    Ok(Some(envelope))
 }
 
 #[cfg(test)]
@@ -259,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn save_registry_bundle_cache_accepts_registry_catalog_shape() {
+    fn save_registry_bundle_cache_accepts_catalog_shape() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("registry_bundle_cache.json");
         let metadata = sample_registry_metadata("catalog-v1");
@@ -317,5 +318,92 @@ mod tests {
         assert!(err
             .to_string()
             .contains("cached registry bundle payload failed schema validation"));
+    }
+
+    #[test]
+    fn save_registry_bundle_cache_accepts_wrapped_bundle_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("wrapped-v1");
+        let wrapped = serde_json::json!({
+            "bundle": {
+                "version": "wrapped-v1",
+                "compiled_at": "2026-02-13T00:00:00Z",
+                "bundle_type": "cloud",
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "name": "OpenAI",
+                        "type": "ai-inference",
+                        "domains": ["api.openai.com"]
+                    }
+                },
+                "domain_index": [],
+                "filters": {},
+                "pricing": {}
+            }
+        });
+
+        save_registry_bundle_cache(&path, &metadata, "etag-1", wrapped.to_string().as_bytes())
+            .unwrap();
+
+        let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
+        assert_eq!(loaded.metadata.version, "wrapped-v1");
+        assert_eq!(
+            loaded
+                .bundle
+                .get("version")
+                .and_then(serde_json::Value::as_str),
+            Some("wrapped-v1")
+        );
+    }
+
+    #[test]
+    fn load_registry_bundle_cache_falls_back_to_last_good_when_primary_invalid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("v1");
+        let valid_bundle = serde_json::json!({
+            "version": "v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "type": "ai-inference",
+                    "domains": ["api.openai.com"]
+                }
+            },
+            "domain_index": [],
+            "filters": {},
+            "pricing": {}
+        });
+        save_registry_bundle_cache(
+            &path,
+            &metadata,
+            "etag-1",
+            valid_bundle.to_string().as_bytes(),
+        )
+        .unwrap();
+
+        let broken_primary = serde_json::json!({
+            "schema_version": 1,
+            "fetched_at": "2026-02-13T00:00:00Z",
+            "etag": "etag-bad",
+            "metadata": metadata,
+            "bundle": { "version": "broken" }
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&broken_primary).unwrap()).unwrap();
+
+        let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
+        assert_eq!(loaded.metadata.version, "v1");
+        assert_eq!(
+            loaded
+                .bundle
+                .get("version")
+                .and_then(serde_json::Value::as_str),
+            Some("v1")
+        );
     }
 }
