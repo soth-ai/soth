@@ -49,8 +49,8 @@ use crate::transport::response_event_builder::{
     ResponseEventInput, ResponseKind,
 };
 use crate::transport::usage_enrichment::{
-    build_http_request_for_provider, extract_usage_meta_from_decoded_payload,
-    resolve_provider_parser, ResponseUsageMeta,
+    build_http_request_for_provider, extract_usage_meta_with_shadow, resolve_provider_parser,
+    ResponseUsageMeta,
 };
 use soth_core::config::{
     ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode, ObserveConfig,
@@ -1569,17 +1569,10 @@ impl HttpHandler for AiProxyHandler {
             host_is_ai_target || host_is_agent_target,
             host_mode,
         );
-        if let Some(engine) = self.oisp_engine.as_ref() {
-            if let Some(classification) = engine.classify(&host) {
-                debug!(
-                    host = %host,
-                    legacy_provider = ?provider,
-                    oisp_provider = %classification.provider_id,
-                    oisp_entry_type = ?classification.entry_type,
-                    "OISP shadow classification"
-                );
-            }
-        }
+        let oisp_classification = self
+            .oisp_engine
+            .as_ref()
+            .and_then(|engine| engine.classify(&host));
         let ua_agent = Self::detect_agent_from_user_agent(&req);
         let enforcer = self.enforcer.clone();
         let session_id = self.session_id.clone();
@@ -1644,6 +1637,48 @@ impl HttpHandler for AiProxyHandler {
 
         #[cfg(feature = "dashboard")]
         let dashboard = self.dashboard.clone();
+
+        if let Some(classification) = oisp_classification.as_ref() {
+            let legacy_class = host_fingerprint::legacy_detection_class(
+                host_is_ai_target,
+                host_is_mcp_target,
+                host_is_agent_target,
+            );
+            let registry_class = classification.entry_type_label();
+
+            if host_fingerprint::detection_shadow_mismatch(legacy_class, Some(registry_class)) {
+                metrics::record_detection_mismatch("http_request");
+                #[cfg(feature = "dashboard")]
+                if let Some(ref dashboard) = dashboard {
+                    dashboard.record_shadow_detection_mismatch();
+                }
+                debug!(
+                    host = %host,
+                    legacy_class = legacy_class,
+                    registry_class = registry_class,
+                    "Shadow detection mismatch"
+                );
+            }
+
+            let legacy_provider = provider.unwrap_or("unknown");
+            let registry_provider = classification.provider_id.as_str();
+            if host_fingerprint::provider_shadow_mismatch(
+                Some(legacy_provider),
+                Some(registry_provider),
+            ) {
+                metrics::record_provider_mismatch("http_request");
+                #[cfg(feature = "dashboard")]
+                if let Some(ref dashboard) = dashboard {
+                    dashboard.record_shadow_provider_mismatch();
+                }
+                debug!(
+                    host = %host,
+                    legacy_provider = legacy_provider,
+                    registry_provider = registry_provider,
+                    "Shadow provider mismatch"
+                );
+            }
+        }
         let pending_requests = self.pending_requests.clone();
         let request_id = request_id_from_ctx(ctx);
 
@@ -2229,7 +2264,7 @@ impl HttpHandler for AiProxyHandler {
                         let (decoded_bytes, body_str) =
                             decode_payload_for_logging(&bytes, content_encoding.as_deref());
 
-                        response_usage = extract_usage_meta_from_decoded_payload(
+                        let usage_outcome = extract_usage_meta_with_shadow(
                             &provider_registry,
                             &pricing_catalog,
                             provider,
@@ -2241,6 +2276,22 @@ impl HttpHandler for AiProxyHandler {
                             pending.model.as_deref(),
                         )
                         .await;
+                        if usage_outcome.mismatch {
+                            metrics::record_usage_mismatch(provider, "http");
+                            #[cfg(feature = "dashboard")]
+                            if let Some(ref dashboard) = dashboard {
+                                dashboard.record_shadow_usage_mismatch();
+                            }
+                            debug!(
+                                provider = provider,
+                                host = %pending.host,
+                                path = %pending.path,
+                                primary = ?usage_outcome.primary,
+                                shadow = ?usage_outcome.shadow,
+                                "Shadow usage mismatch"
+                            );
+                        }
+                        response_usage = usage_outcome.primary;
 
                         // Return original bytes to client (they handle decompression)
                         let new_body = Body::from(Full::new(bytes));
@@ -2345,7 +2396,7 @@ impl HttpHandler for AiProxyHandler {
                         release_stream_buffer(raw_bytes);
                         (decoded.0, decoded.1, raw_len as u64)
                     };
-                    let usage_meta = extract_usage_meta_from_decoded_payload(
+                    let usage_outcome = extract_usage_meta_with_shadow(
                         &log_provider_registry,
                         &log_pricing_catalog,
                         provider,
@@ -2357,6 +2408,23 @@ impl HttpHandler for AiProxyHandler {
                         log_pending.model.as_deref(),
                     )
                     .await;
+                    if usage_outcome.mismatch {
+                        metrics::record_usage_mismatch(provider, log_stream_kind);
+                        #[cfg(feature = "dashboard")]
+                        if let Some(ref dashboard) = log_dashboard {
+                            dashboard.record_shadow_usage_mismatch();
+                        }
+                        debug!(
+                            provider = provider,
+                            host = %log_pending.host,
+                            path = %log_pending.path,
+                            stream_kind = log_stream_kind,
+                            primary = ?usage_outcome.primary,
+                            shadow = ?usage_outcome.shadow,
+                            "Shadow usage mismatch"
+                        );
+                    }
+                    let usage_meta = usage_outcome.primary;
                     if let Some(ref tracker) = log_budget_tracker {
                         record_proxy_budget_spend(
                             tracker,

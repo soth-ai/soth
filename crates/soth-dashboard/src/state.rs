@@ -139,6 +139,15 @@ pub struct ProxyMetrics {
     pub recent_requests: VecDeque<ProxyRequestEntry>,
     /// Proxy status
     pub status: ProxyStatus,
+    /// Shadow parity counters for registry rollout visibility.
+    pub shadow_mismatches: ShadowMismatchMetrics,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ShadowMismatchMetrics {
+    pub detection_mismatch_count: u64,
+    pub provider_mismatch_count: u64,
+    pub usage_mismatch_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -776,6 +785,24 @@ impl DashboardState {
         if proxy.active_connections > 0 {
             proxy.active_connections -= 1;
         }
+    }
+
+    /// Record a legacy-vs-registry detection mismatch.
+    pub fn record_shadow_detection_mismatch(&self) {
+        let mut proxy = self.proxy.write();
+        proxy.shadow_mismatches.detection_mismatch_count += 1;
+    }
+
+    /// Record a legacy-vs-registry provider mismatch.
+    pub fn record_shadow_provider_mismatch(&self) {
+        let mut proxy = self.proxy.write();
+        proxy.shadow_mismatches.provider_mismatch_count += 1;
+    }
+
+    /// Record a usage extraction shadow mismatch.
+    pub fn record_shadow_usage_mismatch(&self) {
+        let mut proxy = self.proxy.write();
+        proxy.shadow_mismatches.usage_mismatch_count += 1;
     }
 
     // --- Read methods (called by API) ---

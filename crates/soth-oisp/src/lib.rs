@@ -12,6 +12,16 @@ pub struct Classification {
     pub api_format: Option<String>,
 }
 
+impl Classification {
+    pub fn entry_type_label(&self) -> &'static str {
+        match self.entry_type {
+            EntryType::AiInference => "ai_inference",
+            EntryType::AgentApp => "agent_app",
+            EntryType::Mcp => "mcp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterceptDecision {
     Intercept {

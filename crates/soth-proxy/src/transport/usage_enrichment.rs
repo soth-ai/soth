@@ -27,6 +27,14 @@ pub struct ResponseUsageMeta {
     pub cost_usd: Option<f64>,
 }
 
+/// Primary + shadow extraction outcome for E3 mismatch instrumentation.
+#[derive(Debug, Clone, Default)]
+pub struct UsageExtractionOutcome {
+    pub primary: ResponseUsageMeta,
+    pub shadow: Option<ResponseUsageMeta>,
+    pub mismatch: bool,
+}
+
 const GRPC_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const GRPC_MAX_TOTAL_DECODE_BYTES: usize = 8 * 1024 * 1024;
 const GRPC_MAX_FRAMES: usize = 16;
@@ -75,10 +83,127 @@ pub async fn extract_usage_meta_from_decoded_payload(
     grpc_message_encoding: Option<&str>,
     fallback_model: Option<&str>,
 ) -> ResponseUsageMeta {
-    let Some(parser) = resolve_provider_parser(registry, host, provider) else {
-        return ResponseUsageMeta::default();
+    extract_usage_meta_with_shadow(
+        registry,
+        pricing_catalog,
+        provider,
+        host,
+        decoded_body,
+        is_sse,
+        content_type,
+        grpc_message_encoding,
+        fallback_model,
+    )
+    .await
+    .primary
+}
+
+pub async fn extract_usage_meta_with_shadow(
+    registry: &ProviderRegistry,
+    pricing_catalog: &PricingCatalog,
+    provider: &str,
+    host: &str,
+    decoded_body: &[u8],
+    is_sse: bool,
+    content_type: Option<&str>,
+    grpc_message_encoding: Option<&str>,
+    fallback_model: Option<&str>,
+) -> UsageExtractionOutcome {
+    let Some(primary_parser) = resolve_provider_parser(registry, host, provider) else {
+        return UsageExtractionOutcome::default();
     };
 
+    let primary = extract_usage_meta_with_parser(
+        primary_parser.clone(),
+        pricing_catalog,
+        host,
+        decoded_body,
+        is_sse,
+        content_type,
+        grpc_message_encoding,
+        fallback_model,
+    )
+    .await;
+
+    let mut shadow = None;
+    if let Some(fallback_host) = parser_fallback_host(provider) {
+        if let Some(shadow_parser) = registry.find_provider(fallback_host) {
+            if !Arc::ptr_eq(&primary_parser, &shadow_parser) {
+                shadow = Some(
+                    extract_usage_meta_with_parser(
+                        shadow_parser,
+                        pricing_catalog,
+                        host,
+                        decoded_body,
+                        is_sse,
+                        content_type,
+                        grpc_message_encoding,
+                        fallback_model,
+                    )
+                    .await,
+                );
+            }
+        }
+    }
+
+    let mismatch = shadow
+        .as_ref()
+        .map(|shadow_meta| usage_meta_shadow_mismatch(&primary, shadow_meta))
+        .unwrap_or(false);
+
+    UsageExtractionOutcome {
+        primary,
+        shadow,
+        mismatch,
+    }
+}
+
+pub fn usage_meta_shadow_mismatch(primary: &ResponseUsageMeta, shadow: &ResponseUsageMeta) -> bool {
+    !same_optional_model(primary.model.as_deref(), shadow.model.as_deref())
+        || !same_optional_u64(primary.input_tokens, shadow.input_tokens)
+        || !same_optional_u64(primary.output_tokens, shadow.output_tokens)
+        || !same_optional_u64(primary.cache_read_tokens, shadow.cache_read_tokens)
+        || !same_optional_u64(primary.cache_write_tokens, shadow.cache_write_tokens)
+        || !same_optional_u64(primary.reasoning_tokens, shadow.reasoning_tokens)
+        || !same_optional_cost(primary.cost_usd, shadow.cost_usd)
+}
+
+fn same_optional_model(a: Option<&str>, b: Option<&str>) -> bool {
+    normalize_optional_model(a) == normalize_optional_model(b)
+}
+
+fn normalize_optional_model(value: Option<&str>) -> &str {
+    let value = value.unwrap_or("").trim();
+    if value.is_empty() {
+        "unknown"
+    } else {
+        value
+    }
+}
+
+fn same_optional_u64(a: Option<u64>, b: Option<u64>) -> bool {
+    a.unwrap_or(0) == b.unwrap_or(0)
+}
+
+fn same_optional_cost(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(left), Some(right)) => (left - right).abs() < 1e-9,
+        (Some(left), None) => left.abs() < 1e-9,
+        (None, Some(right)) => right.abs() < 1e-9,
+    }
+}
+
+async fn extract_usage_meta_with_parser(
+    parser: Arc<dyn AiProvider>,
+    pricing_catalog: &PricingCatalog,
+    host: &str,
+    decoded_body: &[u8],
+    is_sse: bool,
+    content_type: Option<&str>,
+    grpc_message_encoding: Option<&str>,
+    fallback_model: Option<&str>,
+) -> ResponseUsageMeta {
     if !is_sse {
         if let Some(meta) = extract_usage_from_grpc_frames(
             parser.as_ref(),
@@ -97,7 +222,7 @@ pub async fn extract_usage_meta_from_decoded_payload(
 
     let sanitized = strip_json_security_prefix(decoded_body);
     let usage = if is_sse {
-        let parsed = parse_sse_body(parser, sanitized);
+        let parsed = parse_sse_body(parser.clone(), sanitized);
         if parsed.input_tokens == 0 && parsed.output_tokens == 0 {
             None
         } else {
@@ -383,5 +508,33 @@ mod tests {
 
         assert_eq!(meta.input_tokens, None);
         assert_eq!(meta.output_tokens, None);
+    }
+
+    #[test]
+    fn usage_shadow_mismatch_treats_none_and_zero_as_equal() {
+        let primary = ResponseUsageMeta {
+            input_tokens: Some(0),
+            output_tokens: None,
+            ..Default::default()
+        };
+        let shadow = ResponseUsageMeta::default();
+        assert!(!usage_meta_shadow_mismatch(&primary, &shadow));
+    }
+
+    #[test]
+    fn usage_shadow_mismatch_detects_meaningful_delta() {
+        let primary = ResponseUsageMeta {
+            model: Some("gpt-4o".to_string()),
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            ..Default::default()
+        };
+        let shadow = ResponseUsageMeta {
+            model: Some("gpt-4o-mini".to_string()),
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            ..Default::default()
+        };
+        assert!(usage_meta_shadow_mismatch(&primary, &shadow));
     }
 }
