@@ -29,6 +29,7 @@ const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
 /// Projection retries for transient lock contention.
 const SQLITE_PROJECTION_MAX_RETRIES: usize = 3;
 const SQLITE_PROJECTION_RETRY_BASE_MS: u64 = 40;
+const SQLITE_PROJECTION_VERSION: i64 = 3;
 
 /// Event store that watches wrap events and provides real-time streaming.
 #[derive(Clone)]
@@ -1044,6 +1045,7 @@ fn project_sqlite_events_once(db_path: &Path) -> std::io::Result<i64> {
     let mut conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
     let tx = conn.transaction().map_err(to_io_err)?;
+    ensure_projection_version(&tx)?;
 
     let mut projected_seq: i64 = tx
         .query_row(
@@ -1106,6 +1108,58 @@ fn project_sqlite_events_once(db_path: &Path) -> std::io::Result<i64> {
     Ok(projected_seq)
 }
 
+fn ensure_projection_version(tx: &rusqlite::Transaction<'_>) -> std::io::Result<()> {
+    let current_version = tx
+        .query_row(
+            "SELECT value FROM projection_meta WHERE key = 'projection_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_io_err)?
+        .and_then(|value| value.parse::<i64>().ok());
+
+    if current_version == Some(SQLITE_PROJECTION_VERSION) {
+        return Ok(());
+    }
+
+    tx.execute_batch(
+        r#"
+        DELETE FROM event_pairs;
+        DELETE FROM event_clusters;
+        DELETE FROM event_pending_requests;
+        DELETE FROM rollups_1m;
+        "#,
+    )
+    .map_err(to_io_err)?;
+
+    tx.execute(
+        r#"
+        INSERT INTO projection_meta (key, value, updated_at)
+        VALUES ('last_projected_seq', '0', CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = CURRENT_TIMESTAMP
+        "#,
+        [],
+    )
+    .map_err(to_io_err)?;
+
+    tx.execute(
+        r#"
+        INSERT INTO projection_meta (key, value, updated_at)
+        VALUES ('projection_version', ?1, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = CURRENT_TIMESTAMP
+        "#,
+        [SQLITE_PROJECTION_VERSION.to_string()],
+    )
+    .map_err(to_io_err)?;
+
+    Ok(())
+}
+
 fn event_source_label(source: EventSource) -> &'static str {
     match source {
         EventSource::Mcp => "mcp",
@@ -1121,6 +1175,24 @@ fn has_paired_payload(event: &WrapEvent) -> bool {
         || event.response_content.is_some()
         || event.response_content_ref.is_some()
         || event.response_preview.is_some()
+}
+
+fn has_request_payload(event: &WrapEvent) -> bool {
+    event.request_content.is_some()
+        || event.request_content_ref.is_some()
+        || event.request_preview.is_some()
+}
+
+fn has_response_payload(event: &WrapEvent) -> bool {
+    event.response_content.is_some()
+        || event.response_content_ref.is_some()
+        || event.response_preview.is_some()
+}
+
+fn is_paired_proxy_response_event(event: &WrapEvent) -> bool {
+    matches!(event.source, EventSource::AiProxy | EventSource::AgentApp)
+        && event.direction == WrapDirection::Out
+        && has_response_payload(event)
 }
 
 fn event_request_key(event: &WrapEvent) -> String {
@@ -1158,12 +1230,18 @@ fn update_rollup_1m(tx: &rusqlite::Transaction<'_>, event: &WrapEvent) -> std::i
     let source = event_source_label(event.source);
     let provider = event.provider.as_deref().unwrap_or("unknown");
     let agent = event.agent.name.as_str();
-    let requests = if event.direction == WrapDirection::In {
+    // Paired proxy events may contain both request and response semantics in a single
+    // finalized `Out` event. Count both sides for AI/agent traffic even when request
+    // body is empty (e.g., GET /backend-api/wham/usage).
+    let requests = if event.direction == WrapDirection::In
+        || has_request_payload(event)
+        || is_paired_proxy_response_event(event)
+    {
         1_i64
     } else {
         0_i64
     };
-    let responses = if event.direction == WrapDirection::Out {
+    let responses = if event.direction == WrapDirection::Out || has_response_payload(event) {
         1_i64
     } else {
         0_i64
@@ -1867,12 +1945,17 @@ mod tests {
         let rollup_total_before = read_sqlite_rollup_total(&db_path).unwrap();
         let rollup_events_before: u64 =
             rollups_before.rows.iter().map(|row| row.total_events).sum();
+        let rollup_requests_before: u64 = rollups_before.rows.iter().map(|row| row.requests).sum();
+        let rollup_responses_before: u64 =
+            rollups_before.rows.iter().map(|row| row.responses).sum();
         let rollup_tokens_before: u64 =
             rollups_before.rows.iter().map(|row| row.total_tokens).sum();
 
         assert_eq!(cluster_total_before, 2);
         assert_eq!(clusters_before.total_clusters, 2);
         assert_eq!(rollup_events_before, 3);
+        assert_eq!(rollup_requests_before, 2);
+        assert_eq!(rollup_responses_before, 2);
         assert_eq!(rollup_tokens_before, 50);
         assert!(rollup_total_before >= 2);
 
@@ -1884,6 +1967,8 @@ mod tests {
         let cluster_total_after = read_sqlite_cluster_total(&db_path).unwrap();
         let rollup_total_after = read_sqlite_rollup_total(&db_path).unwrap();
         let rollup_events_after: u64 = rollups_after.rows.iter().map(|row| row.total_events).sum();
+        let rollup_requests_after: u64 = rollups_after.rows.iter().map(|row| row.requests).sum();
+        let rollup_responses_after: u64 = rollups_after.rows.iter().map(|row| row.responses).sum();
         let rollup_tokens_after: u64 = rollups_after.rows.iter().map(|row| row.total_tokens).sum();
 
         assert_eq!(cluster_total_after, cluster_total_before);
@@ -1893,6 +1978,8 @@ mod tests {
             clusters_before.total_clusters
         );
         assert_eq!(rollup_events_after, rollup_events_before);
+        assert_eq!(rollup_requests_after, rollup_requests_before);
+        assert_eq!(rollup_responses_after, rollup_responses_before);
         assert_eq!(rollup_tokens_after, rollup_tokens_before);
     }
 

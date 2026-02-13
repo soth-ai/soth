@@ -93,7 +93,7 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
         }
         Ok(Err(error)) => {
             warn!(
-                error = %error,
+                error = %format!("{:#}", error),
                 "Startup registry bundle refresh failed; continuing with cached bundle"
             );
         }
@@ -160,7 +160,7 @@ pub fn spawn_cloud_pull_runtime(
         match SyncAgent::new(sync_config, Some(puller.clone())) {
             Ok(agent) => Some(agent),
             Err(error) => {
-                warn!("Failed to initialize cloud sync agent: {}", error);
+                warn!("Failed to initialize cloud sync agent: {:#}", error);
                 None
             }
         }
@@ -169,7 +169,7 @@ pub fn spawn_cloud_pull_runtime(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         if let Err(error) = puller.pull_once().await {
-            warn!("Initial cloud config pull failed: {}", error);
+            warn!("Initial cloud config pull failed: {:#}", error);
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -203,7 +203,7 @@ pub fn spawn_cloud_pull_runtime(
                                     );
                                 }
                             }
-                            Ok(Err(error)) => warn!("Final cloud sync flush failed: {}", error),
+                            Ok(Err(error)) => warn!("Final cloud sync flush failed: {:#}", error),
                             Err(_) => warn!("Final cloud sync flush timed out"),
                         }
                         match tokio::time::timeout(
@@ -211,7 +211,7 @@ pub fn spawn_cloud_pull_runtime(
                             agent.send_heartbeat(),
                         ).await {
                             Ok(Ok(_)) => {}
-                            Ok(Err(error)) => warn!("Final cloud heartbeat failed: {}", error),
+                            Ok(Err(error)) => warn!("Final cloud heartbeat failed: {:#}", error),
                             Err(_) => warn!("Final cloud heartbeat timed out"),
                         }
                     }
@@ -219,7 +219,7 @@ pub fn spawn_cloud_pull_runtime(
                 },
                 _ = interval.tick() => {
                     if let Err(error) = puller.pull_once().await {
-                        warn!("Periodic cloud config pull failed: {}", error);
+                        warn!("Periodic cloud config pull failed: {:#}", error);
                     }
                 }
                 _ = sync_interval.tick() => {
@@ -238,14 +238,14 @@ pub fn spawn_cloud_pull_runtime(
                                     );
                                 }
                             }
-                            Err(error) => warn!("Cloud sync tick failed: {}", error),
+                            Err(error) => warn!("Cloud sync tick failed: {:#}", error),
                         }
                     }
                 }
                 _ = heartbeat_interval.tick() => {
                     if let Some(agent) = &sync_agent {
                         if let Err(error) = agent.send_heartbeat().await {
-                            warn!("Cloud heartbeat failed: {}", error);
+                            warn!("Cloud heartbeat failed: {:#}", error);
                         }
                     }
                 }
