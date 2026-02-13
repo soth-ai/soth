@@ -20,8 +20,8 @@ use hudsucker::{
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
-use soth_oisp::{InterceptDecision, OispEngine};
+use soth_budget::{BudgetTracker, TokenCounter};
+use soth_oisp::{InterceptDecision, OispEngine, OispStreamParser};
 use soth_policy::PolicyEngine;
 use soth_tls::LearnedPassthrough;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -40,7 +40,6 @@ use crate::error::ProxyError;
 use crate::json_security::strip_json_security_prefix_text;
 use crate::metrics;
 use crate::process_attribution::{ProcessAttribution, ProcessIdentity};
-use crate::providers::ProviderRegistry;
 use crate::transport::graphql_enrichment::extract_graphql_operation;
 use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
@@ -51,8 +50,8 @@ use crate::transport::response_event_builder::{
 };
 use crate::transport::tier_enrichment::extract_subscription_tags;
 use crate::transport::usage_enrichment::{
-    build_http_request_for_provider, extract_usage_meta_for_mode, resolve_provider_parser,
-    ResponseUsageMeta,
+    create_stream_usage_parser, extract_model_from_request_for_mode, extract_usage_meta_for_mode,
+    extract_usage_meta_from_stream_usage, ResponseUsageMeta,
 };
 use soth_core::config::{
     ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode, ObserveConfig, RegistryMode,
@@ -83,6 +82,8 @@ struct PendingRequest {
     started_at: Instant,
     /// Request body content for paired logging
     request_content: Option<String>,
+    /// Whether request body capture was truncated/skipped.
+    request_body_truncated: bool,
     /// Request payload size in bytes (wire payload)
     request_size_bytes: Option<u64>,
     /// Sanitized request headers captured post-forward sanitation
@@ -192,7 +193,29 @@ impl CatalogDiscoveryLimiter {
 fn append_catalog_discovery_tags(tags: &mut BTreeMap<String, String>, host: &str) {
     tags.insert("discovery_mode".to_string(), "catalog".to_string());
     tags.insert("discovery_capture".to_string(), "daily_first".to_string());
+    tags.insert("discovery_payload".to_string(), "metadata_only".to_string());
     tags.insert("discovery_host".to_string(), host.to_string());
+}
+
+fn append_capture_tags(
+    tags: &mut BTreeMap<String, String>,
+    request_body_truncated: bool,
+    response_body_truncated: bool,
+    response_reason: Option<&str>,
+    capture_limit_bytes: Option<u64>,
+) {
+    if request_body_truncated {
+        tags.insert("capture.request_body".to_string(), "truncated".to_string());
+    }
+    if response_body_truncated {
+        tags.insert("capture.response_body".to_string(), "truncated".to_string());
+        if let Some(reason) = response_reason {
+            tags.insert("capture.response_reason".to_string(), reason.to_string());
+        }
+    }
+    if let Some(limit) = capture_limit_bytes {
+        tags.insert("capture.body_limit_bytes".to_string(), limit.to_string());
+    }
 }
 
 /// Identity verification mode for proxy enforcement.
@@ -1274,10 +1297,6 @@ pub struct AiProxyHandler {
     pending_requests: PendingRequests,
     /// Optional enforcement runtime for identity/policy/budget checks
     enforcer: Option<Arc<ProxyEnforcer>>,
-    /// Provider parser registry
-    provider_registry: Arc<ProviderRegistry>,
-    /// LiteLLM-style pricing catalog
-    pricing_catalog: Arc<PricingCatalog>,
     /// User-defined tags attached to all emitted events.
     event_tags: Arc<BTreeMap<String, String>>,
     /// Optional PII enrichment before events are written.
@@ -1296,6 +1315,8 @@ pub struct AiProxyHandler {
     oisp_engine: Option<Arc<OispEngine>>,
     /// One-time-per-day limiter for catalog-domain discovery captures.
     catalog_discovery_limiter: Arc<CatalogDiscoveryLimiter>,
+    /// Maximum request/response body bytes to capture in observability payloads.
+    capture_max_body_bytes: u64,
 }
 
 impl AiProxyHandler {
@@ -1308,8 +1329,6 @@ impl AiProxyHandler {
             session_id: uuid::Uuid::new_v4().to_string(),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             enforcer: None,
-            provider_registry: Arc::new(ProviderRegistry::new()),
-            pricing_catalog: Arc::new(PricingCatalog::with_defaults()),
             event_tags: Arc::new(observe.event_tags.clone()),
             pii_enricher: Arc::new(PiiEventEnricher::from_observe_config(observe)),
             learned_passthrough: None,
@@ -1322,6 +1341,7 @@ impl AiProxyHandler {
             registry_mode: config.registry_mode,
             oisp_engine: None,
             catalog_discovery_limiter: Arc::new(CatalogDiscoveryLimiter::default()),
+            capture_max_body_bytes: config.capture_max_body_bytes,
         }
     }
 
@@ -1682,12 +1702,18 @@ impl HttpHandler for AiProxyHandler {
             .get("content-encoding")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_lowercase());
+        let declared_request_size_bytes = parse_content_length(req.headers());
+        let request_capture_oversized = declared_request_size_bytes
+            .map(|size| size > self.capture_max_body_bytes)
+            .unwrap_or(false);
         // Only inspect request bodies for relevant host classes (or discovery mode).
         let should_inspect_body = is_post
             && ((host_is_ai_target || host_is_agent_target)
                 || host_is_mcp_target
-                || (host_mode == HostFilterMode::Discovery && is_json));
-        let provider_registry = self.provider_registry.clone();
+                || (host_mode == HostFilterMode::Discovery && is_json))
+            && !is_catalog_discovery_host
+            && !request_capture_oversized;
+        let oisp_engine = self.oisp_engine.clone();
         let event_logger = self.event_logger.clone();
         let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
@@ -1695,6 +1721,7 @@ impl HttpHandler for AiProxyHandler {
         let learned_failure_threshold = self.learned_failure_threshold;
         let learned_failure_window = self.learned_failure_window;
         let process_attribution = self.process_attribution.clone();
+        let capture_max_body_bytes = self.capture_max_body_bytes;
         let client_addr = ctx.client_addr;
         let should_resolve_process = !is_connect
             && (host_is_ai_target
@@ -1753,8 +1780,7 @@ impl HttpHandler for AiProxyHandler {
             }
 
             // Capture body for AI/MCP requests and record payload-size metadata.
-            let declared_request_size_bytes = parse_content_length(req.headers());
-            let (body_content, request_size_bytes, model, req) = if should_inspect_body {
+            let (body_content, request_size_bytes, model, req, request_body_truncated) = if should_inspect_body {
                 let (parts, body) = req.into_parts();
                 match body.collect().await {
                     Ok(collected) => {
@@ -1769,20 +1795,16 @@ impl HttpHandler for AiProxyHandler {
                             "Captured request body"
                         );
 
-                        // Extract model from provider-specific schema first, then fallback to generic JSON.
+                        // Extract model from bundle parser first, then fallback to generic JSON.
                         let model = provider
                             .as_deref()
                             .and_then(|provider_name| {
-                                resolve_provider_parser(&provider_registry, &host, provider_name)
-                            })
-                            .and_then(|parser| {
-                                let request = build_http_request_for_provider(
-                                    &http_method,
-                                    &path,
-                                    &parts.headers,
-                                    Some(decoded_bytes.clone()),
-                                );
-                                parser.extract_model(&request)
+                                extract_model_from_request_for_mode(
+                                    oisp_engine.as_deref(),
+                                    provider_name,
+                                    &host,
+                                    &decoded_bytes,
+                                )
                             })
                             .or_else(|| {
                                 serde_json::from_slice::<AiRequestBody>(&decoded_bytes)
@@ -1793,17 +1815,32 @@ impl HttpHandler for AiProxyHandler {
                         // Reconstruct request with body
                         let new_body = Body::from(Full::new(bytes));
                         let req = Request::from_parts(parts, new_body);
-                        (Some(body_str), Some(body_len as u64), model, req)
+                        (Some(body_str), Some(body_len as u64), model, req, false)
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to collect request body");
                         let req = Request::from_parts(parts, Body::empty());
-                        (None, declared_request_size_bytes, None, req)
+                        (None, declared_request_size_bytes, None, req, false)
                     }
                 }
             } else {
                 debug!("Skipping body inspection");
-                (None, declared_request_size_bytes, None, req)
+                let preview = if request_capture_oversized {
+                    Some(format!(
+                        "[request body truncated; declared size {} bytes exceeds capture limit {} bytes]",
+                        declared_request_size_bytes.unwrap_or_default(),
+                        capture_max_body_bytes
+                    ))
+                } else {
+                    None
+                };
+                (
+                    preview,
+                    declared_request_size_bytes,
+                    None,
+                    req,
+                    request_capture_oversized,
+                )
             };
             let agent = Self::detect_agent_with_context_gated(
                 ua_agent,
@@ -2021,6 +2058,7 @@ impl HttpHandler for AiProxyHandler {
                             graphql_operation: graphql_operation.clone(),
                             started_at: Instant::now(),
                             request_content: body_content,
+                            request_body_truncated,
                             request_size_bytes,
                             headers: None,
                             is_agent_app: host_is_agent_target,
@@ -2110,6 +2148,7 @@ impl HttpHandler for AiProxyHandler {
                         graphql_operation: None,
                         started_at: Instant::now(),
                         request_content: None,
+                        request_body_truncated,
                         request_size_bytes,
                         headers: None,
                         is_agent_app: false,
@@ -2164,10 +2203,9 @@ impl HttpHandler for AiProxyHandler {
         let pii_enricher = self.pii_enricher.clone();
         let session_id = self.session_id.clone();
         let request_id = request_id_from_ctx(ctx);
-        let provider_registry = self.provider_registry.clone();
-        let pricing_catalog = self.pricing_catalog.clone();
         let registry_mode = self.registry_mode;
         let oisp_engine = self.oisp_engine.clone();
+        let capture_max_body_bytes = self.capture_max_body_bytes;
         let budget_tracker = self
             .enforcer
             .as_ref()
@@ -2204,6 +2242,7 @@ impl HttpHandler for AiProxyHandler {
             .get("content-encoding")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_lowercase());
+        let declared_response_size_bytes = parse_content_length(res.headers());
 
         async move {
             // Get pending request info
@@ -2280,6 +2319,17 @@ impl HttpHandler for AiProxyHandler {
                     if pending.catalog_discovery {
                         append_catalog_discovery_tags(&mut tags, &pending.host);
                     }
+                    append_capture_tags(
+                        &mut tags,
+                        pending.request_body_truncated,
+                        false,
+                        None,
+                        if pending.request_body_truncated {
+                            Some(capture_max_body_bytes)
+                        } else {
+                            None
+                        },
+                    );
                     if !tags.is_empty() {
                         event = event.with_tags(tags);
                     }
@@ -2299,7 +2349,25 @@ impl HttpHandler for AiProxyHandler {
                 .to_ascii_lowercase()
                 .contains("/backend-api/codex/responses");
             let is_gemini_bard_response_path = is_gemini_bard_stream_path(&pending.path);
+            let is_stream_response =
+                is_sse || is_codex_response_path || is_gemini_bard_response_path;
             let mut response_usage = ResponseUsageMeta::default();
+            let response_declared_oversized = declared_response_size_bytes
+                .map(|size| size > capture_max_body_bytes)
+                .unwrap_or(false);
+            let mut response_body_truncated = false;
+            let mut response_capture_reason: Option<&'static str> = None;
+            let skip_response_capture = if pending.catalog_discovery {
+                response_body_truncated = true;
+                response_capture_reason = Some("catalog_discovery_metadata_only");
+                true
+            } else if response_declared_oversized {
+                response_body_truncated = true;
+                response_capture_reason = Some("declared_size_exceeded");
+                true
+            } else {
+                false
+            };
 
             // Streamed responses can be long-lived. Keep persistence append-only by emitting a
             // single finalized event once stream capture completes (no placeholder upsert).
@@ -2307,7 +2375,8 @@ impl HttpHandler for AiProxyHandler {
             // For JSON responses, capture the body for logging (with decompression)
             // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
             let mut response_size_bytes: Option<u64> = None;
-            let (body_content, res, logged_in_stream) = if (is_json || is_grpc)
+            let (body_content, res, logged_in_stream) = if !skip_response_capture
+                && (is_json || is_grpc)
                 && !is_sse
                 && !is_codex_response_path
                 && !is_gemini_bard_response_path
@@ -2322,8 +2391,6 @@ impl HttpHandler for AiProxyHandler {
                             decode_payload_for_logging(&bytes, content_encoding.as_deref());
 
                         let usage_outcome = extract_usage_meta_for_mode(
-                            &provider_registry,
-                            &pricing_catalog,
                             oisp_engine.as_deref(),
                             registry_mode,
                             provider.as_str(),
@@ -2347,7 +2414,7 @@ impl HttpHandler for AiProxyHandler {
                         (None, res, false)
                     }
                 }
-            } else if is_sse || is_codex_response_path || is_gemini_bard_response_path {
+            } else if !skip_response_capture && is_stream_response {
                 // Streaming response: tee to forward chunks immediately while accumulating
                 let (parts, body) = res.into_parts();
 
@@ -2364,8 +2431,6 @@ impl HttpHandler for AiProxyHandler {
                 let log_content_type = content_type.clone();
                 let log_grpc_message_encoding = grpc_message_encoding.clone();
                 let log_is_sse = is_sse;
-                let log_provider_registry = provider_registry.clone();
-                let log_pricing_catalog = pricing_catalog.clone();
                 let log_registry_mode = registry_mode;
                 let log_oisp_engine = oisp_engine.clone();
                 let log_budget_tracker = budget_tracker.clone();
@@ -2388,11 +2453,19 @@ impl HttpHandler for AiProxyHandler {
                 let tee_stream = stream! {
                     let mut body = body;
                     let mut capture_limit_reported = false;
+                    let mut stream_usage_parser: Option<OispStreamParser> = create_stream_usage_parser(
+                        log_oisp_engine.as_deref(),
+                        log_provider.as_str(),
+                        &log_pending.host,
+                    );
                     loop {
                         match body.frame().await {
                             Some(Ok(frame)) => {
                                 // Clone data for accumulation if it's a data frame
                                 if let Some(data) = frame.data_ref() {
+                                    if let Some(parser) = stream_usage_parser.as_mut() {
+                                        parser.process_chunk(data);
+                                    }
                                     let mut guard = accumulated_clone.lock();
                                     if let Some(ref mut acc) = *guard {
                                         // Limit accumulation to prevent memory issues.
@@ -2443,21 +2516,29 @@ impl HttpHandler for AiProxyHandler {
                         release_stream_buffer(raw_bytes);
                         (decoded.0, decoded.1, raw_len as u64)
                     };
-                    let usage_outcome = extract_usage_meta_for_mode(
-                        &log_provider_registry,
-                        &log_pricing_catalog,
+                    let stream_usage = stream_usage_parser.and_then(|parser| parser.finalize());
+                    let mut usage_meta = extract_usage_meta_from_stream_usage(
                         log_oisp_engine.as_deref(),
-                        log_registry_mode,
                         log_provider.as_str(),
                         &log_pending.host,
-                        &decoded_bytes,
-                        log_is_sse,
-                        log_content_type.as_deref(),
-                        log_grpc_message_encoding.as_deref(),
+                        stream_usage,
                         log_pending.model.as_deref(),
-                    )
-                    .await;
-                    let usage_meta = usage_outcome.primary;
+                    );
+                    if !usage_meta.has_signal() {
+                        let usage_outcome = extract_usage_meta_for_mode(
+                            log_oisp_engine.as_deref(),
+                            log_registry_mode,
+                            log_provider.as_str(),
+                            &log_pending.host,
+                            &decoded_bytes,
+                            log_is_sse,
+                            log_content_type.as_deref(),
+                            log_grpc_message_encoding.as_deref(),
+                            log_pending.model.as_deref(),
+                        )
+                        .await;
+                        usage_meta = usage_outcome.primary;
+                    }
                     if let Some(ref tracker) = log_budget_tracker {
                         record_proxy_budget_spend(
                             tracker,
@@ -2512,6 +2593,21 @@ impl HttpHandler for AiProxyHandler {
                         if log_pending.catalog_discovery {
                             append_catalog_discovery_tags(&mut enriched_tags, &log_pending.host);
                         }
+                        append_capture_tags(
+                            &mut enriched_tags,
+                            log_pending.request_body_truncated,
+                            capture_limit_reported,
+                            if capture_limit_reported {
+                                Some("stream_capture_limit_reached")
+                            } else {
+                                None
+                            },
+                            if capture_limit_reported {
+                                Some(STREAM_CAPTURE_MAX_BYTES as u64)
+                            } else {
+                                None
+                            },
+                        );
                         let subscription_tags = extract_subscription_tags(
                             log_provider.as_str(),
                             &log_pending.host,
@@ -2564,8 +2660,15 @@ impl HttpHandler for AiProxyHandler {
                 // Return None for body_content - stream logging happens in tee stream.
                 (None, res, true)
             } else {
+                response_size_bytes = declared_response_size_bytes;
+                let placeholder = response_capture_reason.map(|reason| {
+                    format!(
+                        "[response body capture skipped: {} for {} {} (HTTP {})]",
+                        reason, pending.method, pending.path, status
+                    )
+                });
                 // Non-JSON, non-SSE - pass through without buffering
-                (None, res, false)
+                (placeholder, res, false)
             };
 
             info!(
@@ -2609,13 +2712,24 @@ impl HttpHandler for AiProxyHandler {
                         &pending.method,
                         &pending.path,
                         status,
-                        false,
+                        is_sse,
                         false,
                     );
                     let mut enriched_tags = (*event_tags).clone();
                     if pending.catalog_discovery {
                         append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
                     }
+                    append_capture_tags(
+                        &mut enriched_tags,
+                        pending.request_body_truncated,
+                        response_body_truncated,
+                        response_capture_reason,
+                        if pending.request_body_truncated || response_body_truncated {
+                            Some(capture_max_body_bytes)
+                        } else {
+                            None
+                        },
+                    );
                     if let Some(response_body) = normalized_response.as_deref() {
                         let subscription_tags = extract_subscription_tags(
                             provider.as_str(),
@@ -2646,7 +2760,11 @@ impl HttpHandler for AiProxyHandler {
                         tags: Some(&enriched_tags),
                         usage_meta: &response_usage,
                         fallback_model: pending.model.as_deref(),
-                        response_kind: ResponseKind::Http,
+                        response_kind: if is_stream_response {
+                            ResponseKind::Stream { is_sse }
+                        } else {
+                            ResponseKind::Http
+                        },
                         traffic_envelope: pending.envelope.clone(),
                     });
                     if let Some(allowed) = pending.policy_allowed {

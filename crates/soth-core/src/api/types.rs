@@ -51,6 +51,8 @@ pub struct EventMetadata {
 pub struct EventClientMetadata {
     pub pid: Option<u32>,
     pub bundle_id: Option<String>,
+    pub process_name: Option<String>,
+    pub process_executable: Option<String>,
     pub app_type: Option<String>,
 }
 
@@ -75,6 +77,8 @@ pub struct EventEnvelopeMetadata {
     pub body_hash: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     pub client: Option<EventClientMetadata>,
+    pub collector_source: Option<String>,
+    pub collector_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

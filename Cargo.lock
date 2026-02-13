@@ -3937,6 +3937,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs",
+ "flate2",
  "reqwest",
  "rusqlite",
  "serde",

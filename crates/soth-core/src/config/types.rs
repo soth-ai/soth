@@ -922,6 +922,18 @@ pub struct CloudConfig {
     #[serde(default)]
     pub body_upload_enabled: bool,
 
+    /// Maximum metadata events per upload batch.
+    #[serde(default = "default_cloud_metadata_max_events_per_batch")]
+    pub metadata_max_events_per_batch: usize,
+
+    /// Maximum compressed metadata batch size in bytes.
+    #[serde(default = "default_cloud_metadata_max_compressed_batch_bytes")]
+    pub metadata_max_compressed_batch_bytes: u64,
+
+    /// Maximum request/response body size eligible for cloud body upload.
+    #[serde(default = "default_cloud_body_upload_max_bytes")]
+    pub body_upload_max_bytes: u64,
+
     /// Local path for cached cloud config snapshot
     #[serde(default = "default_cloud_cache_path")]
     pub cache_path: Option<PathBuf>,
@@ -947,6 +959,18 @@ fn default_cloud_cache_path() -> Option<PathBuf> {
     Some(PathBuf::from("~/.soth/cloud_config_cache.json"))
 }
 
+fn default_cloud_metadata_max_events_per_batch() -> usize {
+    200
+}
+
+fn default_cloud_metadata_max_compressed_batch_bytes() -> u64 {
+    5 * 1024 * 1024
+}
+
+fn default_cloud_body_upload_max_bytes() -> u64 {
+    15 * 1024 * 1024
+}
+
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
@@ -958,6 +982,10 @@ impl Default for CloudConfig {
             config_pull_interval_secs: default_cloud_config_pull_interval_secs(),
             config_debounce_secs: default_cloud_config_debounce_secs(),
             body_upload_enabled: false,
+            metadata_max_events_per_batch: default_cloud_metadata_max_events_per_batch(),
+            metadata_max_compressed_batch_bytes:
+                default_cloud_metadata_max_compressed_batch_bytes(),
+            body_upload_max_bytes: default_cloud_body_upload_max_bytes(),
             cache_path: default_cloud_cache_path(),
         }
     }
@@ -1061,6 +1089,10 @@ pub struct ForwardProxyConfig {
     /// Detection/classification mode during registry migration.
     #[serde(default)]
     pub registry_mode: RegistryMode,
+
+    /// Maximum HTTP request/response body size to capture for observability.
+    #[serde(default = "default_forward_proxy_capture_max_body_bytes")]
+    pub capture_max_body_bytes: u64,
 }
 
 fn default_forward_proxy_port() -> u16 {
@@ -1069,6 +1101,10 @@ fn default_forward_proxy_port() -> u16 {
 
 fn default_ai_timeout() -> Duration {
     Duration::from_secs(300) // 5 minutes for long AI responses
+}
+
+fn default_forward_proxy_capture_max_body_bytes() -> u64 {
+    15 * 1024 * 1024
 }
 
 impl Default for ForwardProxyConfig {
@@ -1083,6 +1119,7 @@ impl Default for ForwardProxyConfig {
             tls: ForwardProxyTlsConfig::default(),
             request_timeout: default_ai_timeout(),
             registry_mode: RegistryMode::default(),
+            capture_max_body_bytes: default_forward_proxy_capture_max_body_bytes(),
         }
     }
 }
@@ -2400,6 +2437,9 @@ cloud:
   config_pull_interval_secs: 120
   config_debounce_secs: 8
   body_upload_enabled: true
+  metadata_max_events_per_batch: 120
+  metadata_max_compressed_batch_bytes: 3145728
+  body_upload_max_bytes: 10485760
   tags:
     project: "edge"
     env: "staging"
@@ -2412,6 +2452,9 @@ cloud:
         assert_eq!(config.cloud.config_pull_interval_secs, 120);
         assert_eq!(config.cloud.config_debounce_secs, 8);
         assert!(config.cloud.body_upload_enabled);
+        assert_eq!(config.cloud.metadata_max_events_per_batch, 120);
+        assert_eq!(config.cloud.metadata_max_compressed_batch_bytes, 3_145_728);
+        assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
     }
 

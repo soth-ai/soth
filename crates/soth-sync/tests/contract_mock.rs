@@ -8,6 +8,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+use flate2::read::GzDecoder;
 use rusqlite::Connection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -96,6 +97,9 @@ async fn contract_sync_endpoints_and_cursors() {
         batch_size: 100,
         body_batch_size: 100,
         body_upload_enabled: true,
+        metadata_max_events_per_batch: 200,
+        metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
@@ -204,6 +208,9 @@ async fn contract_retry_queue_on_body_upload_failure() {
         batch_size: 100,
         body_batch_size: 100,
         body_upload_enabled: true,
+        metadata_max_events_per_batch: 200,
+        metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
@@ -258,6 +265,9 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         batch_size: 1,
         body_batch_size: 1,
         body_upload_enabled: true,
+        metadata_max_events_per_batch: 200,
+        metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
@@ -296,6 +306,9 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         batch_size: 10,
         body_batch_size: 10,
         body_upload_enabled: true,
+        metadata_max_events_per_batch: 200,
+        metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
     };
     let agent = SyncAgent::new(config, None).unwrap();
@@ -327,9 +340,27 @@ async fn start_mock_server(state: SharedState) -> String {
 async fn events_batch_handler(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(request): Json<EventBatchRequest>,
+    body: Bytes,
 ) -> (StatusCode, Json<EventBatchResponse>) {
     record_headers(&state, &headers);
+    let request = match decode_event_batch_request(&headers, body.as_ref()) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(EventBatchResponse {
+                    accepted: 0,
+                    rejected: 1,
+                    errors: vec![soth_core::api::EventError {
+                        event_id: "decode".to_string(),
+                        reason: error,
+                    }],
+                    config_changed: false,
+                    server_time: Utc::now().to_rfc3339(),
+                }),
+            );
+        }
+    };
     state
         .lock()
         .unwrap()
@@ -345,6 +376,23 @@ async fn events_batch_handler(
             server_time: Utc::now().to_rfc3339(),
         }),
     )
+}
+
+fn decode_event_batch_request(headers: &HeaderMap, body: &[u8]) -> Result<EventBatchRequest, String> {
+    let is_gzip = headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("gzip"))
+        .unwrap_or(false);
+    if !is_gzip {
+        return serde_json::from_slice::<EventBatchRequest>(body).map_err(|e| e.to_string());
+    }
+
+    let mut decoder = GzDecoder::new(body);
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut decoded)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice::<EventBatchRequest>(&decoded).map_err(|e| e.to_string())
 }
 
 async fn body_upload_handler(

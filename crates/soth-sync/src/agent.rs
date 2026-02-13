@@ -2,7 +2,7 @@ use crate::body_uploader::BodyUploader;
 use crate::cache;
 use crate::config_puller::ConfigPuller;
 use crate::heartbeat::HeartbeatSender;
-use crate::metadata_pusher::MetadataPusher;
+use crate::metadata_pusher::{estimate_gzip_batch_size, MetadataPusher};
 use crate::retry_queue::{BodyRetryQueue, RetryQueueEntry};
 use anyhow::Context;
 use base64::Engine as _;
@@ -25,6 +25,9 @@ use tracing::warn;
 
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
 const MAX_RETRY_UPLOADS_PER_TICK: usize = 32;
+const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
+const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
+const DEFAULT_BODY_UPLOAD_MAX_BYTES: usize = 15 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct SyncAgentConfig {
@@ -40,6 +43,9 @@ pub struct SyncAgentConfig {
     pub batch_size: usize,
     pub body_batch_size: usize,
     pub body_upload_enabled: bool,
+    pub metadata_max_events_per_batch: usize,
+    pub metadata_max_compressed_batch_bytes: usize,
+    pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
 }
 
@@ -80,6 +86,24 @@ struct LoadedRows<T> {
     max_seq_seen: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct MetadataPushResult {
+    ack_seq: Option<i64>,
+    sent: usize,
+    config_changed: bool,
+    fully_processed: bool,
+}
+
+impl MetadataPushResult {
+    fn merge(mut self, other: MetadataPushResult) -> MetadataPushResult {
+        self.ack_seq = other.ack_seq.or(self.ack_seq);
+        self.sent += other.sent;
+        self.config_changed = self.config_changed || other.config_changed;
+        self.fully_processed = self.fully_processed && other.fully_processed;
+        self
+    }
+}
+
 impl<T> Default for LoadedRows<T> {
     fn default() -> Self {
         Self {
@@ -96,6 +120,17 @@ impl SyncAgent {
     ) -> anyhow::Result<Self> {
         config.batch_size = config.batch_size.max(1);
         config.body_batch_size = config.body_batch_size.max(1);
+        config.metadata_max_events_per_batch = config
+            .metadata_max_events_per_batch
+            .max(1)
+            .min(MAX_METADATA_BATCH_EVENTS_HARD_CAP);
+        config.metadata_max_compressed_batch_bytes = config
+            .metadata_max_compressed_batch_bytes
+            .max(1)
+            .min(MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP);
+        if config.body_upload_max_bytes == 0 {
+            config.body_upload_max_bytes = DEFAULT_BODY_UPLOAD_MAX_BYTES;
+        }
         let metadata_pusher = MetadataPusher::new(&config.endpoint, &config.api_key);
         let body_uploader = BodyUploader::new(&config.endpoint, &config.api_key);
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
@@ -189,7 +224,12 @@ impl SyncAgent {
 
     async fn sync_metadata_once(&self) -> anyhow::Result<usize> {
         let last_seq = self.read_cursor(SYNC_KEY_LAST_SYNCED_SEQ)?;
-        let loaded = self.load_event_rows(last_seq, self.config.batch_size)?;
+        let fetch_limit = self
+            .config
+            .batch_size
+            .max(1)
+            .min(self.config.metadata_max_events_per_batch);
+        let loaded = self.load_event_rows(last_seq, fetch_limit)?;
         let Some(max_seq_seen) = loaded.max_seq_seen else {
             return Ok(0);
         };
@@ -200,21 +240,12 @@ impl SyncAgent {
         }
 
         let config_version = self.cached_config_version();
-        let batch = loaded
-            .rows
-            .iter()
-            .map(|row| self.wrap_event_to_metadata(&row.event))
-            .collect::<Vec<_>>();
-
-        let request = EventBatchRequest {
-            agent_instance_id: self.config.agent_instance_id.clone(),
-            config_version: config_version.clone(),
-            batch,
-        };
-
-        match self.metadata_pusher.push_batch(&request).await {
-            Ok(Some(response)) => {
-                if response.config_changed {
+        match self
+            .push_rows_with_size_limits(&loaded.rows, config_version.as_ref())
+            .await
+        {
+            Ok(push) => {
+                if push.config_changed {
                     if let Some(puller) = &self.config_puller {
                         if let Err(error) = puller.pull_once().await {
                             warn!("Cloud config refresh after metadata hint failed: {}", error);
@@ -222,23 +253,132 @@ impl SyncAgent {
                     }
                 }
 
-                if let Some(ack_seq) = contiguous_ack_seq(&loaded.rows, &response.errors) {
+                if let Some(ack_seq) = push.ack_seq {
                     self.write_cursor(SYNC_KEY_LAST_SYNCED_SEQ, ack_seq)?;
                     self.mark_sync_success()?;
-                    Ok(loaded.rows.iter().take_while(|r| r.seq <= ack_seq).count())
+                    Ok(push.sent)
                 } else {
                     self.set_sync_error("metadata_push_rejected_initial_event")?;
                     Ok(0)
                 }
             }
-            Ok(None) => {
-                self.set_sync_error("metadata_push_non_success_status")?;
-                Ok(0)
-            }
             Err(error) => {
                 self.set_sync_error(&format!("metadata_push_error: {error}"))?;
                 Err(error)
             }
+        }
+    }
+
+    async fn push_rows_with_size_limits(
+        &self,
+        rows: &[SyncedEventRow],
+        config_version: Option<&String>,
+    ) -> anyhow::Result<MetadataPushResult> {
+        if rows.is_empty() {
+            return Ok(MetadataPushResult::default());
+        }
+        let mut overall = MetadataPushResult {
+            fully_processed: true,
+            ..MetadataPushResult::default()
+        };
+        let mut stack: Vec<&[SyncedEventRow]> = vec![rows];
+        while let Some(chunk) = stack.pop() {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            if chunk.len() > self.config.metadata_max_events_per_batch {
+                let split = self.config.metadata_max_events_per_batch.min(chunk.len());
+                stack.push(&chunk[split..]);
+                stack.push(&chunk[..split]);
+                continue;
+            }
+
+            let batch = chunk
+                .iter()
+                .map(|row| self.wrap_event_to_metadata_with_sync_tags(&row.event))
+                .collect::<Vec<_>>();
+            let request = EventBatchRequest {
+                agent_instance_id: self.config.agent_instance_id.clone(),
+                config_version: config_version.cloned(),
+                batch,
+            };
+            let compressed_size = estimate_gzip_batch_size(&request)?;
+            if compressed_size > self.config.metadata_max_compressed_batch_bytes {
+                if chunk.len() == 1 {
+                    let mut fallback = self.wrap_event_to_metadata_with_sync_tags(&chunk[0].event);
+                    mark_metadata_only_fallback(
+                        &mut fallback,
+                        "compressed_batch_limit",
+                        self.config.metadata_max_compressed_batch_bytes,
+                    );
+                    let fallback_request = EventBatchRequest {
+                        agent_instance_id: self.config.agent_instance_id.clone(),
+                        config_version: config_version.cloned(),
+                        batch: vec![fallback],
+                    };
+                    let fallback_size = estimate_gzip_batch_size(&fallback_request)?;
+                    if fallback_size > self.config.metadata_max_compressed_batch_bytes {
+                        warn!(
+                            event_id = %chunk[0].event.id,
+                            compressed_size = fallback_size,
+                            limit = self.config.metadata_max_compressed_batch_bytes,
+                            "Metadata-only fallback still exceeds compressed batch limit; deferring event"
+                        );
+                        overall.fully_processed = false;
+                        return Ok(overall);
+                    }
+
+                    let single = self.push_metadata_request(&fallback_request, chunk).await?;
+                    overall = overall.merge(single.clone());
+                    if !single.fully_processed {
+                        overall.fully_processed = false;
+                        return Ok(overall);
+                    }
+                    continue;
+                }
+
+                let mid = chunk.len() / 2;
+                stack.push(&chunk[mid..]);
+                stack.push(&chunk[..mid]);
+                continue;
+            }
+
+            let result = self.push_metadata_request(&request, chunk).await?;
+            overall = overall.merge(result.clone());
+            if !result.fully_processed {
+                overall.fully_processed = false;
+                return Ok(overall);
+            }
+        }
+        Ok(overall)
+    }
+
+    async fn push_metadata_request(
+        &self,
+        request: &EventBatchRequest,
+        rows: &[SyncedEventRow],
+    ) -> anyhow::Result<MetadataPushResult> {
+        match self.metadata_pusher.push_batch(request).await? {
+            Some(response) => {
+                if let Some(ack_seq) = contiguous_ack_seq(rows, &response.errors) {
+                    let sent = rows.iter().take_while(|row| row.seq <= ack_seq).count();
+                    Ok(MetadataPushResult {
+                        ack_seq: Some(ack_seq),
+                        sent,
+                        config_changed: response.config_changed,
+                        fully_processed: sent == rows.len(),
+                    })
+                } else {
+                    Ok(MetadataPushResult {
+                        ack_seq: None,
+                        sent: 0,
+                        config_changed: response.config_changed,
+                        fully_processed: false,
+                    })
+                }
+            }
+            None => Ok(MetadataPushResult::default()),
         }
     }
 
@@ -258,8 +398,21 @@ impl SyncAgent {
         let mut uploaded = 0usize;
 
         for row in &loaded.rows {
-            let request_body = self.redact_payload(row.request_body.clone());
-            let response_body = self.redact_payload(row.response_body.clone());
+            let request_body = self.cap_payload_for_upload(
+                &row.event_id,
+                "request",
+                self.redact_payload(row.request_body.clone()),
+            );
+            let response_body = self.cap_payload_for_upload(
+                &row.event_id,
+                "response",
+                self.redact_payload(row.response_body.clone()),
+            );
+
+            if request_body.is_none() && response_body.is_none() {
+                ack_seq = Some(row.seq);
+                continue;
+            }
 
             match self
                 .body_uploader
@@ -315,13 +468,24 @@ impl SyncAgent {
                 continue;
             }
 
+            let request_payload = self.cap_payload_for_upload(
+                &entry.event_id,
+                "request",
+                self.redact_payload(request_payload),
+            );
+            let response_payload = self.cap_payload_for_upload(
+                &entry.event_id,
+                "response",
+                self.redact_payload(response_payload),
+            );
+            if request_payload.is_none() && response_payload.is_none() {
+                self.retry_queue.remove(&entry.event_id)?;
+                continue;
+            }
+
             match self
                 .body_uploader
-                .upload(
-                    &entry.event_id,
-                    self.redact_payload(request_payload),
-                    self.redact_payload(response_payload),
-                )
+                .upload(&entry.event_id, request_payload, response_payload)
                 .await
             {
                 Ok(Some(_)) => {
@@ -341,7 +505,7 @@ impl SyncAgent {
         Ok(uploaded)
     }
 
-    fn wrap_event_to_metadata(&self, event: &WrapEvent) -> EventMetadata {
+    fn wrap_event_to_metadata_with_sync_tags(&self, event: &WrapEvent) -> EventMetadata {
         let source = match event.source {
             EventSource::Mcp => "mcp",
             EventSource::AiProxy => "ai_proxy",
@@ -359,7 +523,17 @@ impl SyncAgent {
             || event.request_content_ref.is_some()
             || event.response_content_ref.is_some();
 
-        let tags = merge_tags(&self.config.global_tags, event.tags.as_ref());
+        let mut tags = merge_tags(&self.config.global_tags, event.tags.as_ref()).unwrap_or_default();
+        if event.request_size_bytes.unwrap_or(0) as usize > self.config.body_upload_max_bytes
+            || event.response_size_bytes.unwrap_or(0) as usize > self.config.body_upload_max_bytes
+        {
+            tags.insert("sync.body_upload_fallback".to_string(), "metadata_only".to_string());
+            tags.insert(
+                "sync.body_upload_limit_bytes".to_string(),
+                self.config.body_upload_max_bytes.to_string(),
+            );
+        }
+        let tags = if tags.is_empty() { None } else { Some(tags) };
         let headers = event.headers.as_ref().map(tree_to_hash);
         let event_envelope = build_event_envelope_metadata(event, headers.as_ref());
 
@@ -452,6 +626,7 @@ impl SyncAgent {
             SELECT
                 we.seq,
                 we.id,
+                we.event_json,
                 req.payload AS request_payload,
                 resp.payload AS response_payload,
                 content.payload AS content_payload
@@ -475,12 +650,30 @@ impl SyncAgent {
             loaded.max_seq_seen = Some(seq);
 
             let event_id: String = row.get(1)?;
-            let request_payload: Option<Vec<u8>> = row.get(2)?;
-            let response_payload: Option<Vec<u8>> = row.get(3)?;
-            let content_payload: Option<Vec<u8>> = row.get(4)?;
+            let event_json: String = row.get(2)?;
+            let request_payload: Option<Vec<u8>> = row.get(3)?;
+            let response_payload: Option<Vec<u8>> = row.get(4)?;
+            let content_payload: Option<Vec<u8>> = row.get(5)?;
 
-            let request_body = request_payload.or(content_payload);
-            let response_body = response_payload;
+            let inline = inline_payloads_from_event_json(&event_json);
+            let request_body = request_payload
+                .or_else(|| inline.request_payload.clone())
+                .or_else(|| {
+                    if inline.direction.as_deref() == Some("in") {
+                        content_payload.clone().or(inline.content_payload.clone())
+                    } else {
+                        None
+                    }
+                });
+            let response_body = response_payload
+                .or_else(|| inline.response_payload)
+                .or_else(|| {
+                    if inline.direction.as_deref() == Some("out") {
+                        content_payload.or(inline.content_payload)
+                    } else {
+                        None
+                    }
+                });
             if request_body.is_none() && response_body.is_none() {
                 continue;
             }
@@ -534,6 +727,26 @@ impl SyncAgent {
             return Some(redacted.text.into_bytes());
         }
 
+        Some(payload)
+    }
+
+    fn cap_payload_for_upload(
+        &self,
+        event_id: &str,
+        kind: &str,
+        payload: Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        let payload = payload?;
+        if payload.len() > self.config.body_upload_max_bytes {
+            warn!(
+                event_id = %event_id,
+                kind = kind,
+                size = payload.len(),
+                limit = self.config.body_upload_max_bytes,
+                "Skipping oversized body payload upload"
+            );
+            return None;
+        }
         Some(payload)
     }
 
@@ -647,6 +860,27 @@ fn merge_tags(
     Some(merged)
 }
 
+fn mark_metadata_only_fallback(metadata: &mut EventMetadata, reason: &str, limit_bytes: usize) {
+    metadata.headers = None;
+    if let Some(ref mut envelope) = metadata.event_envelope {
+        envelope.headers = None;
+    }
+    metadata.mcp_body_preview = metadata
+        .mcp_body_preview
+        .as_deref()
+        .map(|value| value.chars().take(64).collect::<String>());
+    let tags = metadata.tags.get_or_insert_with(HashMap::new);
+    tags.insert("sync.metadata_fallback".to_string(), "metadata_only".to_string());
+    tags.insert(
+        "sync.metadata_fallback_reason".to_string(),
+        reason.to_string(),
+    );
+    tags.insert(
+        "sync.metadata_limit_bytes".to_string(),
+        limit_bytes.to_string(),
+    );
+}
+
 fn tree_to_hash(map: &BTreeMap<String, String>) -> HashMap<String, String> {
     map.iter()
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -657,44 +891,57 @@ fn build_event_envelope_metadata(
     event: &WrapEvent,
     headers: Option<&HashMap<String, String>>,
 ) -> Option<EventEnvelopeMetadata> {
-    let envelope = event.traffic_envelope.as_ref()?;
-    let client_bundle_id = infer_bundle_id(envelope.process_executable.as_deref());
+    let envelope = event.traffic_envelope.as_ref();
+    let process_pid = envelope.and_then(|value| value.process_pid);
+    let process_name = envelope.and_then(|value| value.process_name.clone());
+    let process_executable = envelope.and_then(|value| value.process_executable.clone());
+    let client_bundle_id = infer_bundle_id(process_executable.as_deref());
     let client = build_client_metadata(
-        envelope.process_pid,
+        process_pid,
         client_bundle_id,
         infer_app_type(
-            envelope.process_name.as_deref(),
-            envelope.process_executable.as_deref(),
+            process_name.as_deref(),
+            process_executable.as_deref(),
         ),
+        process_name,
+        process_executable,
     );
+    let collector_source = event.collector_source.clone();
+    let collector_offset = event.collector_offset;
+
+    if envelope.is_none() && client.is_none() && collector_source.is_none() && collector_offset.is_none() {
+        return None;
+    }
 
     Some(EventEnvelopeMetadata {
-        envelope_id: Some(envelope.envelope_id.clone()),
-        request_id: envelope.request_id.clone(),
-        capture_source: Some(match envelope.capture_source {
+        envelope_id: envelope.map(|value| value.envelope_id.clone()),
+        request_id: envelope.and_then(|value| value.request_id.clone()),
+        capture_source: envelope.map(|value| match value.capture_source {
             CaptureSource::Proxy => "proxy".to_string(),
             CaptureSource::Wrap => "wrap".to_string(),
         }),
-        source: Some(match envelope.source {
+        source: envelope.map(|value| match value.source {
             TrafficSource::ProxyHudsucker => "proxy_hudsucker".to_string(),
             TrafficSource::McpStdio => "mcp_stdio".to_string(),
             TrafficSource::McpHttp => "mcp_http".to_string(),
         }),
-        captured_at: Some(envelope.captured_at.to_rfc3339()),
-        method: Some(envelope.method.clone()),
-        provider: envelope.provider.clone(),
-        host: envelope.host.clone(),
-        path: envelope.path.clone(),
-        model: envelope.model.clone(),
-        agent: envelope.agent.clone(),
-        did: envelope.did.clone(),
-        key_id: envelope.key_id.clone(),
-        signature_alg: envelope.signature_alg.clone(),
-        signed_fields_version: envelope.signed_fields_version.clone(),
-        signature: envelope.signature.clone(),
-        body_hash: envelope.body_hash.clone(),
+        captured_at: envelope.map(|value| value.captured_at.to_rfc3339()),
+        method: envelope.map(|value| value.method.clone()),
+        provider: envelope.and_then(|value| value.provider.clone()),
+        host: envelope.and_then(|value| value.host.clone()),
+        path: envelope.and_then(|value| value.path.clone()),
+        model: envelope.and_then(|value| value.model.clone()),
+        agent: envelope.and_then(|value| value.agent.clone()),
+        did: envelope.and_then(|value| value.did.clone()),
+        key_id: envelope.and_then(|value| value.key_id.clone()),
+        signature_alg: envelope.and_then(|value| value.signature_alg.clone()),
+        signed_fields_version: envelope.and_then(|value| value.signed_fields_version.clone()),
+        signature: envelope.and_then(|value| value.signature.clone()),
+        body_hash: envelope.and_then(|value| value.body_hash.clone()),
         headers: headers.cloned(),
         client,
+        collector_source,
+        collector_offset,
     })
 }
 
@@ -702,15 +949,56 @@ fn build_client_metadata(
     pid: Option<u32>,
     bundle_id: Option<String>,
     app_type: Option<String>,
+    process_name: Option<String>,
+    process_executable: Option<String>,
 ) -> Option<EventClientMetadata> {
-    if pid.is_none() && bundle_id.is_none() && app_type.is_none() {
+    if pid.is_none()
+        && bundle_id.is_none()
+        && app_type.is_none()
+        && process_name.is_none()
+        && process_executable.is_none()
+    {
         return None;
     }
     Some(EventClientMetadata {
         pid,
         bundle_id,
+        process_name,
+        process_executable,
         app_type,
     })
+}
+
+#[derive(Debug, Clone, Default)]
+struct InlinePayloads {
+    request_payload: Option<Vec<u8>>,
+    response_payload: Option<Vec<u8>>,
+    content_payload: Option<Vec<u8>>,
+    direction: Option<String>,
+}
+
+fn inline_payloads_from_event_json(raw: &str) -> InlinePayloads {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return InlinePayloads::default();
+    };
+    InlinePayloads {
+        request_payload: value
+            .get("request_content")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| text.as_bytes().to_vec()),
+        response_payload: value
+            .get("response_content")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| text.as_bytes().to_vec()),
+        content_payload: value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| text.as_bytes().to_vec()),
+        direction: value
+            .get("direction")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.to_ascii_lowercase()),
+    }
 }
 
 fn infer_bundle_id(process_executable: Option<&str>) -> Option<String> {
@@ -872,5 +1160,23 @@ mod tests {
                 .map(String::as_str),
             Some("req_123")
         );
+    }
+
+    #[test]
+    fn event_envelope_metadata_includes_collector_fields_without_traffic_envelope() {
+        let event = WrapEvent::new(
+            "session-collector",
+            "collector-source",
+            WrapDirection::In,
+            AgentInfo::new("collector", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AgentApp)
+        .with_collector_metadata("collector-file", 42);
+
+        let mapped = build_event_envelope_metadata(&event, None).expect("envelope");
+        assert_eq!(mapped.collector_source.as_deref(), Some("collector-file"));
+        assert_eq!(mapped.collector_offset, Some(42));
+        assert!(mapped.client.is_none());
+        assert!(mapped.envelope_id.is_none());
     }
 }

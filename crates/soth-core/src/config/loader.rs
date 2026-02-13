@@ -235,9 +235,29 @@ fn apply_env_overrides(config: &mut SothConfig) {
         config.cloud.body_upload_enabled =
             value.parse().unwrap_or(config.cloud.body_upload_enabled);
     }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_METADATA_MAX_EVENTS_PER_BATCH") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            config.cloud.metadata_max_events_per_batch = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_METADATA_MAX_COMPRESSED_BATCH_BYTES") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.cloud.metadata_max_compressed_batch_bytes = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.cloud.body_upload_max_bytes = parsed.max(1);
+        }
+    }
     if let Ok(value) = std::env::var("SOTH_CLOUD_CACHE_PATH") {
         if !value.trim().is_empty() {
             config.cloud.cache_path = Some(value.into());
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.forward_proxy.capture_max_body_bytes = parsed.max(1);
         }
     }
 
@@ -551,6 +571,10 @@ forward_proxy:
         std::env::set_var("SOTH_CLOUD_CONFIG_PULL_INTERVAL_SECS", "180");
         std::env::set_var("SOTH_CLOUD_CONFIG_DEBOUNCE_SECS", "9");
         std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED", "true");
+        std::env::set_var("SOTH_CLOUD_METADATA_MAX_EVENTS_PER_BATCH", "150");
+        std::env::set_var("SOTH_CLOUD_METADATA_MAX_COMPRESSED_BATCH_BYTES", "4194304");
+        std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES", "10485760");
+        std::env::set_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES", "7340032");
 
         let config = load_config_from_str("version: \"1.0\"").unwrap();
         assert!(config.cloud.enabled);
@@ -560,6 +584,10 @@ forward_proxy:
         assert_eq!(config.cloud.config_pull_interval_secs, 180);
         assert_eq!(config.cloud.config_debounce_secs, 9);
         assert!(config.cloud.body_upload_enabled);
+        assert_eq!(config.cloud.metadata_max_events_per_batch, 150);
+        assert_eq!(config.cloud.metadata_max_compressed_batch_bytes, 4_194_304);
+        assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
+        assert_eq!(config.forward_proxy.capture_max_body_bytes, 7_340_032);
         assert_eq!(config.cloud.tags.get("project"), Some(&"soth".to_string()));
 
         std::env::remove_var("SOTH_CLOUD_ENABLED");
@@ -570,6 +598,10 @@ forward_proxy:
         std::env::remove_var("SOTH_CLOUD_CONFIG_PULL_INTERVAL_SECS");
         std::env::remove_var("SOTH_CLOUD_CONFIG_DEBOUNCE_SECS");
         std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED");
+        std::env::remove_var("SOTH_CLOUD_METADATA_MAX_EVENTS_PER_BATCH");
+        std::env::remove_var("SOTH_CLOUD_METADATA_MAX_COMPRESSED_BATCH_BYTES");
+        std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES");
+        std::env::remove_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES");
     }
 
     #[test]

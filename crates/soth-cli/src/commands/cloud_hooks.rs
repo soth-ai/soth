@@ -152,9 +152,15 @@ pub fn spawn_cloud_pull_runtime(
             retry_queue_dir: default_retry_queue_dir(),
             retry_queue_max_bytes: 500 * 1024 * 1024,
             sync_interval: std::time::Duration::from_secs(sync_interval_secs),
-            batch_size: 100,
+            batch_size: config.cloud.metadata_max_events_per_batch.max(1),
             body_batch_size: 64,
             body_upload_enabled: config.cloud.body_upload_enabled,
+            metadata_max_events_per_batch: config.cloud.metadata_max_events_per_batch.max(1),
+            metadata_max_compressed_batch_bytes: config
+                .cloud
+                .metadata_max_compressed_batch_bytes
+                .max(1) as usize,
+            body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
             global_tags: config.cloud.tags.clone(),
         };
         match SyncAgent::new(sync_config, Some(puller.clone())) {
