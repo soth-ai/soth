@@ -5,6 +5,7 @@
 
 use async_stream::stream;
 use brotli::Decompressor as BrotliDecoder;
+use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
 use flate2::read::GzDecoder;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hudsucker::{
@@ -48,6 +49,7 @@ use crate::transport::response_event_builder::{
     build_paired_response_event, empty_response_placeholder, normalize_response_content,
     ResponseEventInput, ResponseKind,
 };
+use crate::transport::tier_enrichment::extract_subscription_tags;
 use crate::transport::usage_enrichment::{
     build_http_request_for_provider, extract_usage_meta_for_mode, resolve_provider_parser,
     ResponseUsageMeta,
@@ -91,6 +93,8 @@ struct PendingRequest {
     mcp_method: Option<String>,
     /// Whether this pending request should be emitted as MCP source.
     is_mcp_jsonrpc: bool,
+    /// True when captured through discovery-mode catalog interception.
+    catalog_discovery: bool,
     /// Policy decision metadata captured at request enforcement time.
     policy_allowed: Option<bool>,
     policy_reason: Option<String>,
@@ -145,6 +149,50 @@ fn append_stream_capture(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
     let write_len = remaining.min(chunk.len());
     buffer.extend_from_slice(&chunk[..write_len]);
     write_len < chunk.len()
+}
+
+#[derive(Default)]
+struct CatalogDiscoveryLimiter {
+    seen_by_host_day: Mutex<HashMap<String, NaiveDate>>,
+}
+
+impl CatalogDiscoveryLimiter {
+    fn normalized_host(host: &str) -> String {
+        host.trim().to_ascii_lowercase()
+    }
+
+    fn reserve_once_per_day(&self, host: &str) -> bool {
+        let normalized = Self::normalized_host(host);
+        if normalized.is_empty() {
+            return false;
+        }
+
+        let today = Utc::now().date_naive();
+        let mut seen = self.seen_by_host_day.lock();
+        let cutoff = today - ChronoDuration::days(1);
+        seen.retain(|_, day| *day >= cutoff);
+        if seen.get(normalized.as_str()) == Some(&today) {
+            return false;
+        }
+        seen.insert(normalized, today);
+        true
+    }
+
+    fn was_reserved_today(&self, host: &str) -> bool {
+        let normalized = Self::normalized_host(host);
+        if normalized.is_empty() {
+            return false;
+        }
+        let today = Utc::now().date_naive();
+        let seen = self.seen_by_host_day.lock();
+        seen.get(normalized.as_str()) == Some(&today)
+    }
+}
+
+fn append_catalog_discovery_tags(tags: &mut BTreeMap<String, String>, host: &str) {
+    tags.insert("discovery_mode".to_string(), "catalog".to_string());
+    tags.insert("discovery_capture".to_string(), "daily_first".to_string());
+    tags.insert("discovery_host".to_string(), host.to_string());
 }
 
 /// Identity verification mode for proxy enforcement.
@@ -1246,6 +1294,8 @@ pub struct AiProxyHandler {
     registry_mode: RegistryMode,
     /// Bundle-driven classifier loaded from registry cache.
     oisp_engine: Option<Arc<OispEngine>>,
+    /// One-time-per-day limiter for catalog-domain discovery captures.
+    catalog_discovery_limiter: Arc<CatalogDiscoveryLimiter>,
 }
 
 impl AiProxyHandler {
@@ -1271,6 +1321,7 @@ impl AiProxyHandler {
             )),
             registry_mode: config.registry_mode,
             oisp_engine: None,
+            catalog_discovery_limiter: Arc::new(CatalogDiscoveryLimiter::default()),
         }
     }
 
@@ -1329,7 +1380,48 @@ impl AiProxyHandler {
                 InterceptDecision::Intercept { .. } => HostAction::Intercept,
                 InterceptDecision::Passthrough
                 | InterceptDecision::Noise
-                | InterceptDecision::Tunnel => HostAction::Tunnel,
+                | InterceptDecision::Tunnel => {
+                    if self.hosts.mode == HostFilterMode::Discovery
+                        && engine.classify(host).is_none()
+                        && engine.is_catalog_domain(host)
+                        && self.catalog_discovery_limiter.reserve_once_per_day(host)
+                    {
+                        info!(
+                            host = %host,
+                            "Catalog discovery interception enabled for first capture of the day"
+                        );
+                        HostAction::Intercept
+                    } else {
+                        HostAction::Tunnel
+                    }
+                }
+            }
+        } else {
+            self.hosts.action_for_host(host)
+        }
+    }
+
+    /// Resolve action for CONNECT/TLS handshake where request path is not available yet.
+    fn get_connect_action(&self, host: &str) -> HostAction {
+        if matches!(self.hosts.action_for_host(host), HostAction::Block) {
+            return HostAction::Block;
+        }
+
+        if let Some(engine) = self.oisp_engine.as_ref() {
+            if engine.should_intercept_host(host) {
+                HostAction::Intercept
+            } else if self.hosts.mode == HostFilterMode::Discovery
+                && engine.classify(host).is_none()
+                && engine.is_catalog_domain(host)
+                && self.catalog_discovery_limiter.reserve_once_per_day(host)
+            {
+                info!(
+                    host = %host,
+                    "Catalog discovery CONNECT interception enabled for first capture of the day"
+                );
+                HostAction::Intercept
+            } else {
+                HostAction::Tunnel
             }
         } else {
             self.hosts.action_for_host(host)
@@ -1522,13 +1614,28 @@ impl HttpHandler for AiProxyHandler {
             method = %http_method,
             "Incoming request"
         );
-        let host_action = self.get_action(&host, &path);
+        let host_action = if is_connect {
+            self.get_connect_action(&host)
+        } else {
+            self.get_action(&host, &path)
+        };
         let is_blocked = matches!(host_action, HostAction::Block);
         let host_mode = self.hosts.mode;
+        let catalog_discovery_limiter = self.catalog_discovery_limiter.clone();
         let oisp_classification = self
             .oisp_engine
             .as_ref()
             .and_then(|engine| engine.classify(&host));
+        let is_catalog_discovery_host = host_mode == HostFilterMode::Discovery
+            && oisp_classification.is_none()
+            && self
+                .oisp_engine
+                .as_ref()
+                .map(|engine| {
+                    engine.is_catalog_domain(&host)
+                        && catalog_discovery_limiter.was_reserved_today(&host)
+                })
+                .unwrap_or(false);
         let (host_is_ai_target, host_is_mcp_target, host_is_agent_target, provider) =
             if let Some(classification) = oisp_classification.as_ref() {
                 let (ai, mcp, agent) = match classification.entry_type_label() {
@@ -1538,6 +1645,8 @@ impl HttpHandler for AiProxyHandler {
                     _ => (false, false, false),
                 };
                 (ai, mcp, agent, Some(classification.provider_id.clone()))
+            } else if is_catalog_discovery_host {
+                (false, false, false, Some("catalog-discovery".to_string()))
             } else {
                 (false, false, false, None)
             };
@@ -1819,7 +1928,10 @@ impl HttpHandler for AiProxyHandler {
             // Log AI traffic (only inference endpoints, not images/tracking/etc)
             if is_connect {
                 debug!(host = %host, "CONNECT handshake (skipping AI request logging)");
-            } else if let (Some(provider), false) = (provider.as_deref(), host_is_mcp_target) {
+            } else if let Some(provider) = provider
+                .as_deref()
+                .filter(|_| !host_is_mcp_target && mcp_request_method.is_none())
+            {
                 let display_path = if path.is_empty() || path == "/" {
                     // For tunneled requests, path might be empty
                     "/".to_string()
@@ -1828,7 +1940,8 @@ impl HttpHandler for AiProxyHandler {
                 };
 
                 // Check if this request should be logged (blacklist non-inference content)
-                let should_log = Self::should_log_request(&display_path, &http_method);
+                let should_log = is_catalog_discovery_host
+                    || Self::should_log_request(&display_path, &http_method);
 
                 if should_log {
                     info!(
@@ -1838,6 +1951,7 @@ impl HttpHandler for AiProxyHandler {
                         path = %display_path,
                         method = %http_method,
                         model = ?model,
+                        catalog_discovery = is_catalog_discovery_host,
                         "AI API request"
                     );
                 } else {
@@ -1912,6 +2026,7 @@ impl HttpHandler for AiProxyHandler {
                             is_agent_app: host_is_agent_target,
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
+                            catalog_discovery: is_catalog_discovery_host,
                             policy_allowed,
                             policy_reason: None,
                             policy_version,
@@ -1956,8 +2071,12 @@ impl HttpHandler for AiProxyHandler {
                         event = event.with_content(request_body.clone());
                     }
                     event = event.with_content_preview(format!("→ {} {}", http_method, path));
-                    if !event_tags.is_empty() {
-                        event = event.with_tags((*event_tags).clone());
+                    let mut tags = (*event_tags).clone();
+                    if is_catalog_discovery_host {
+                        append_catalog_discovery_tags(&mut tags, &host);
+                    }
+                    if !tags.is_empty() {
+                        event = event.with_tags(tags);
                     }
                     pii_enricher.enrich(&mut event);
                     logger.log(&event);
@@ -1996,6 +2115,7 @@ impl HttpHandler for AiProxyHandler {
                         is_agent_app: false,
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
+                        catalog_discovery: is_catalog_discovery_host,
                         policy_allowed: None,
                         policy_reason: None,
                         policy_version: None,
@@ -2156,8 +2276,12 @@ impl HttpHandler for AiProxyHandler {
                     if let Some(ref version) = pending.policy_version {
                         event = event.with_policy_version(version.clone());
                     }
-                    if !event_tags.is_empty() {
-                        event = event.with_tags((*event_tags).clone());
+                    let mut tags = (*event_tags).clone();
+                    if pending.catalog_discovery {
+                        append_catalog_discovery_tags(&mut tags, &pending.host);
+                    }
+                    if !tags.is_empty() {
+                        event = event.with_tags(tags);
                     }
                     pii_enricher.enrich(&mut event);
                     logger.log(&event);
@@ -2384,6 +2508,19 @@ impl HttpHandler for AiProxyHandler {
                     }
 
                     if let Some(ref logger) = log_event_logger {
+                        let mut enriched_tags = (*log_event_tags).clone();
+                        if log_pending.catalog_discovery {
+                            append_catalog_discovery_tags(&mut enriched_tags, &log_pending.host);
+                        }
+                        let subscription_tags = extract_subscription_tags(
+                            log_provider.as_str(),
+                            &log_pending.host,
+                            &log_pending.path,
+                            content.as_str(),
+                        );
+                        if !subscription_tags.is_empty() {
+                            enriched_tags.extend(subscription_tags);
+                        }
                         let mut event = build_paired_response_event(ResponseEventInput {
                             session_id: &log_session_id,
                             host: &log_pending.host,
@@ -2400,7 +2537,7 @@ impl HttpHandler for AiProxyHandler {
                             request_size_bytes: log_pending.request_size_bytes,
                             response_size_bytes: Some(streamed_response_size_bytes),
                             headers: log_pending.headers.clone(),
-                            tags: Some(log_event_tags.as_ref()),
+                            tags: Some(&enriched_tags),
                             usage_meta: &usage_meta,
                             fallback_model: log_pending.model.as_deref(),
                             response_kind: ResponseKind::Stream { is_sse: log_is_sse },
@@ -2475,6 +2612,21 @@ impl HttpHandler for AiProxyHandler {
                         false,
                         false,
                     );
+                    let mut enriched_tags = (*event_tags).clone();
+                    if pending.catalog_discovery {
+                        append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
+                    }
+                    if let Some(response_body) = normalized_response.as_deref() {
+                        let subscription_tags = extract_subscription_tags(
+                            provider.as_str(),
+                            &pending.host,
+                            &pending.path,
+                            response_body,
+                        );
+                        if !subscription_tags.is_empty() {
+                            enriched_tags.extend(subscription_tags);
+                        }
+                    }
                     let mut event = build_paired_response_event(ResponseEventInput {
                         session_id: &session_id,
                         host: &pending.host,
@@ -2491,7 +2643,7 @@ impl HttpHandler for AiProxyHandler {
                         request_size_bytes: pending.request_size_bytes,
                         response_size_bytes,
                         headers: pending.headers.clone(),
-                        tags: Some(event_tags.as_ref()),
+                        tags: Some(&enriched_tags),
                         usage_meta: &response_usage,
                         fallback_model: pending.model.as_deref(),
                         response_kind: ResponseKind::Http,
@@ -2519,8 +2671,7 @@ impl HttpHandler for AiProxyHandler {
         req: &Request<Body>,
     ) -> impl std::future::Future<Output = bool> + Send {
         let host = Self::extract_host(req);
-        let connect_path = req.uri().path();
-        let action = self.get_action(&host, connect_path);
+        let action = self.get_connect_action(&host);
         let learned_passthrough = self.learned_passthrough.clone();
 
         async move {
@@ -2625,6 +2776,12 @@ impl WebSocketHandler for AiWebSocketHandler {
         let oisp_classification = oisp_engine
             .as_ref()
             .and_then(|engine| engine.classify(&host));
+        let is_catalog_discovery_ws = is_discovery
+            && oisp_classification.is_none()
+            && oisp_engine
+                .as_ref()
+                .map(|engine| engine.is_catalog_domain(&host))
+                .unwrap_or(false);
 
         let (host_is_ai_target, host_is_mcp_target, host_is_agent_target, provider) =
             if let Some(classification) = oisp_classification.as_ref() {
@@ -2726,8 +2883,12 @@ impl WebSocketHandler for AiWebSocketHandler {
                                     .with_provider(provider_for_event.clone())
                                     .with_method(ws_method.clone())
                                     .with_content(text.to_string());
-                            if !event_tags.is_empty() {
-                                event = event.with_tags((*event_tags).clone());
+                            let mut tags = (*event_tags).clone();
+                            if is_catalog_discovery_ws {
+                                append_catalog_discovery_tags(&mut tags, &host);
+                            }
+                            if !tags.is_empty() {
+                                event = event.with_tags(tags);
                             }
                             if matches!(source, EventSource::Mcp) {
                                 let envelope = TrafficEnvelope::mcp_http(
@@ -2773,6 +2934,7 @@ fn load_oisp_engine(cache_path: Option<&Path>) -> Option<Arc<OispEngine>> {
                 bundle_version = %engine.bundle_version(),
                 providers = engine.provider_count(),
                 domains = engine.domain_count(),
+                catalog_domains = engine.catalog_domain_count(),
                 "Loaded OISP bundle for proxy classification"
             );
             Some(Arc::new(engine))
@@ -3042,7 +3204,8 @@ mod tests {
                     "github-mcp": { "id": "github-mcp", "name": "GitHub MCP", "type": "mcp" }
                 },
                 "filters": {},
-                "pricing": {}
+                "pricing": {},
+                "catalog_domains": ["server.codeium.com", "*.githubcopilot.com"]
             }
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
@@ -3149,6 +3312,52 @@ mod tests {
         );
         assert_eq!(
             handler.get_action("chatgpt.com", "/backend-api/codex/responses"),
+            HostAction::Intercept
+        );
+    }
+
+    #[test]
+    fn test_connect_action_uses_host_only_oisp_decision() {
+        let mut config = ForwardProxyConfig::default();
+        config.registry_mode = RegistryMode::Registry;
+        config.hosts.ai_inference = vec![];
+        config.hosts.mcp = vec![];
+        config.hosts.agent_apps = vec![];
+        let observe = ObserveConfig::default();
+        let handler = AiProxyHandler::new(&config, &observe).with_oisp_engine(test_oisp_engine());
+
+        assert_eq!(
+            handler.get_connect_action("api.openai.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            handler.get_connect_action("unknown.example.com"),
+            HostAction::Tunnel
+        );
+    }
+
+    #[test]
+    fn test_discovery_mode_catalog_intercept_is_limited_to_first_daily_capture() {
+        let mut config = ForwardProxyConfig::default();
+        config.registry_mode = RegistryMode::Registry;
+        config.hosts.mode = HostFilterMode::Discovery;
+        config.hosts.ai_inference = vec![];
+        config.hosts.mcp = vec![];
+        config.hosts.agent_apps = vec![];
+        let observe = ObserveConfig::default();
+        let handler = AiProxyHandler::new(&config, &observe).with_oisp_engine(test_oisp_engine());
+
+        assert_eq!(
+            handler.get_connect_action("server.codeium.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            handler.get_connect_action("server.codeium.com"),
+            HostAction::Tunnel
+        );
+        // Registry-classified hosts stay intercepted even in discovery mode.
+        assert_eq!(
+            handler.get_connect_action("api.openai.com"),
             HostAction::Intercept
         );
     }
