@@ -1,4 +1,9 @@
 use anyhow::Context;
+use base64::Engine as _;
+use rusqlite::{
+    Connection, OpenFlags, params, params_from_iter,
+    types::{Value as SqlValue, ValueRef},
+};
 use serde::{Deserialize, Serialize};
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
@@ -7,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use tracing::{info, warn};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -29,6 +34,7 @@ pub struct CollectorConfig {
     pub agent_name: String,
     pub event_source: EventSource,
     pub sources: Vec<CollectorSource>,
+    pub sqlite_sources: Vec<CollectorSqliteSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,10 +48,52 @@ pub struct CollectorSource {
     pub tags: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CollectorSqliteSource {
+    pub name: String,
+    pub db_path: PathBuf,
+    pub server_name: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub queries: Vec<CollectorSqliteQuery>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectorSqliteQuery {
+    pub file_type: String,
+    pub sql: String,
+    pub incremental_field: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectorParser {
     JsonLines,
     TextLines,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvSqliteSource {
+    name: String,
+    db_path: String,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    queries: Vec<EnvSqliteQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvSqliteQuery {
+    file_type: String,
+    sql: String,
+    #[serde(default)]
+    incremental_field: Option<String>,
 }
 
 impl CollectorConfig {
@@ -63,50 +111,47 @@ impl CollectorConfig {
             return None;
         }
 
-        let sources_raw = match std::env::var("SOTH_COLLECTOR_SOURCES") {
-            Ok(v) => v,
-            Err(_) => {
-                warn!(
-                    "SOTH_COLLECTOR_ENABLED=true but SOTH_COLLECTOR_SOURCES is empty; collector disabled"
-                );
-                return None;
-            }
-        };
         let mut sources = Vec::new();
-        for raw in sources_raw.split(',') {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                continue;
+        if let Ok(sources_raw) = std::env::var("SOTH_COLLECTOR_SOURCES") {
+            for raw in sources_raw.split(',') {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                let path = expand_home_path(Path::new(raw));
+                let name = path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("collector-source")
+                    .to_string();
+                let parser = match path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "jsonl" | "ndjson" => CollectorParser::JsonLines,
+                    _ => CollectorParser::TextLines,
+                };
+                sources.push(CollectorSource {
+                    name,
+                    path,
+                    parser,
+                    server_name: None,
+                    provider: None,
+                    model: None,
+                    tags: BTreeMap::new(),
+                });
             }
-            let path = expand_home_path(Path::new(raw));
-            let name = path
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or("collector-source")
-                .to_string();
-            let parser = match path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "jsonl" | "ndjson" => CollectorParser::JsonLines,
-                _ => CollectorParser::TextLines,
-            };
-            sources.push(CollectorSource {
-                name,
-                path,
-                parser,
-                server_name: None,
-                provider: None,
-                model: None,
-                tags: BTreeMap::new(),
-            });
         }
 
-        if sources.is_empty() {
-            warn!("SOTH_COLLECTOR_SOURCES has no valid paths; collector disabled");
+        let sqlite_sources = parse_sqlite_sources_from_env();
+
+        if sources.is_empty() && sqlite_sources.is_empty() {
+            warn!(
+                "SOTH_COLLECTOR_ENABLED=true but both SOTH_COLLECTOR_SOURCES and SOTH_COLLECTOR_SQLITE_SOURCES are empty; collector disabled"
+            );
             return None;
         }
 
@@ -147,8 +192,92 @@ impl CollectorConfig {
             agent_name,
             event_source,
             sources,
+            sqlite_sources,
         })
     }
+}
+
+fn parse_sqlite_sources_from_env() -> Vec<CollectorSqliteSource> {
+    let raw = match std::env::var("SOTH_COLLECTOR_SQLITE_SOURCES") {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let parsed = match serde_json::from_str::<Vec<EnvSqliteSource>>(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Invalid SOTH_COLLECTOR_SQLITE_SOURCES JSON; sqlite collection disabled"
+            );
+            return Vec::new();
+        }
+    };
+
+    parsed
+        .into_iter()
+        .filter_map(|source| {
+            let db_path = expand_home_path(Path::new(source.db_path.trim()));
+            if source.name.trim().is_empty() || source.queries.is_empty() {
+                return None;
+            }
+            let queries = source
+                .queries
+                .into_iter()
+                .filter_map(|query| {
+                    if query.file_type.trim().is_empty() || query.sql.trim().is_empty() {
+                        return None;
+                    }
+                    Some(CollectorSqliteQuery {
+                        file_type: query.file_type.trim().to_string(),
+                        sql: query.sql,
+                        incremental_field: query
+                            .incremental_field
+                            .and_then(|value| {
+                                let trimmed = value.trim();
+                                if trimmed.is_empty() {
+                                    None
+                                } else {
+                                    Some(trimmed.to_string())
+                                }
+                            }),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if queries.is_empty() {
+                return None;
+            }
+            Some(CollectorSqliteSource {
+                name: source.name.trim().to_string(),
+                db_path,
+                server_name: source.server_name.and_then(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }),
+                provider: source.provider.and_then(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }),
+                model: source.model.and_then(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }),
+                tags: source.tags,
+                queries,
+            })
+        })
+        .collect::<Vec<_>>()
 }
 
 pub fn spawn_from_env(
@@ -167,7 +296,8 @@ pub fn spawn_runtime(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut collector = CollectorAgent::new(config, global_tags);
     info!(
-        sources = collector.config.sources.len(),
+        file_sources = collector.config.sources.len(),
+        sqlite_sources = collector.config.sqlite_sources.len(),
         poll_secs = collector.config.poll_interval.as_secs(),
         state_path = %collector.config.state_path.display(),
         "Local collector enabled"
@@ -234,20 +364,46 @@ impl CollectorAgent {
 
         for source in &self.config.sources {
             let key = source.path.to_string_lossy().to_string();
-            let offset = self.offsets.offsets.get(&key).copied().unwrap_or(0);
+            let prior_state = self
+                .offsets
+                .files
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
             let outcome = collect_source_events(
                 source,
-                offset,
+                &prior_state,
                 self.config.max_read_bytes_per_source,
                 self.config.max_line_bytes,
             )?;
-            if outcome.next_offset != offset {
-                self.offsets.offsets.insert(key, outcome.next_offset);
+            if outcome.next_state != prior_state {
+                self.offsets.files.insert(key, outcome.next_state);
                 state_changed = true;
             }
 
             for source_line in outcome.lines {
                 if let Some(event) = self.build_event(source, source_line) {
+                    logger.log(&event);
+                }
+            }
+        }
+
+        for source in &self.config.sqlite_sources {
+            let key = source.db_path.to_string_lossy().to_string();
+            let prior_state = self
+                .offsets
+                .sqlite
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            let outcome = collect_sqlite_events(source, &prior_state, self.config.max_line_bytes)?;
+            if outcome.next_state != prior_state {
+                self.offsets.sqlite.insert(key, outcome.next_state);
+                state_changed = true;
+            }
+
+            for source_line in outcome.lines {
+                if let Some(event) = self.build_sqlite_event(source, source_line) {
                     logger.log(&event);
                 }
             }
@@ -329,10 +485,110 @@ impl CollectorAgent {
 
         Some(event)
     }
+
+    fn build_sqlite_event(
+        &self,
+        source: &CollectorSqliteSource,
+        line: SqliteSourceLine,
+    ) -> Option<WrapEvent> {
+        let trimmed = line.content.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let parsed = parse_line(CollectorParser::JsonLines, trimmed);
+        let agent_name = parsed
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.config.agent_name.clone());
+        let server_name = source
+            .server_name
+            .clone()
+            .unwrap_or_else(|| source.name.clone());
+        let direction = parsed.direction.unwrap_or(WrapDirection::In);
+        let source_kind = parsed.source.unwrap_or(self.config.event_source);
+        let mut event = WrapEvent::new(
+            self.session_id.clone(),
+            server_name,
+            direction,
+            AgentInfo::new(agent_name, DetectionSource::Environment),
+        )
+        .with_source(source_kind)
+        .with_collector_metadata(format!("{}:{}", source.name, line.file_type), line.end_offset);
+
+        if let Some(provider) = parsed.provider.as_ref().or(source.provider.as_ref()) {
+            event = event.with_provider(provider.clone());
+        }
+        if let Some(model) = parsed.model.as_ref().or(source.model.as_ref()) {
+            event = event.with_model(model.clone());
+        }
+        if let Some(method) = parsed.method.as_ref() {
+            event = event.with_method(method.clone());
+        } else {
+            event = event.with_method(format!("sqlite:{}", line.file_type));
+        }
+        if let Some(tool_name) = parsed.tool_name.as_ref() {
+            event = event.with_tool_name(tool_name.clone());
+        }
+
+        let (content, pii_types) = redact_content(&self.redactor, parsed.content);
+        let preview = build_preview(&content, 240);
+        event = event.with_content(content).with_content_preview(preview);
+
+        if let Some(request) = parsed.request {
+            let (redacted_request, _) = redact_content(&self.redactor, request);
+            let request_preview = build_preview(&redacted_request, 180);
+            event = event.with_request(redacted_request, request_preview);
+        }
+        if let Some(response) = parsed.response {
+            let (redacted_response, _) = redact_content(&self.redactor, response);
+            let response_preview = build_preview(&redacted_response, 180);
+            event = event.with_response(redacted_response, response_preview);
+        }
+
+        if !pii_types.is_empty() {
+            event = event.with_pii(true, pii_types);
+        }
+
+        let mut tags = self.global_tags.clone();
+        for (k, v) in &source.tags {
+            tags.insert(k.clone(), v.clone());
+        }
+        tags.insert("collector.query_type".to_string(), line.file_type);
+        if !tags.is_empty() {
+            event = event.with_tags(tags);
+        }
+
+        Some(event)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct FileScanState {
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    mtime: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct SqliteScanState {
+    #[serde(default)]
+    mtime: u64,
+    #[serde(default)]
+    incremental: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct OffsetState {
+    #[serde(default)]
+    files: HashMap<String, FileScanState>,
+    #[serde(default)]
+    sqlite: HashMap<String, SqliteScanState>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyOffsetState {
     #[serde(default)]
     offsets: HashMap<String, u64>,
 }
@@ -343,10 +599,27 @@ impl OffsetState {
             return Ok(Self::default());
         }
         let data = std::fs::read(path)?;
-        let parsed = serde_json::from_slice::<Self>(&data).with_context(|| {
+        let value = serde_json::from_slice::<serde_json::Value>(&data).with_context(|| {
             format!("failed parsing collector offset state: {}", path.display())
         })?;
-        Ok(parsed)
+        if let Ok(parsed) = serde_json::from_value::<Self>(value.clone()) {
+            let has_legacy_offsets = value.get("offsets").is_some();
+            if !parsed.files.is_empty() || !parsed.sqlite.is_empty() || !has_legacy_offsets {
+                return Ok(parsed);
+            }
+        }
+        let legacy = serde_json::from_value::<LegacyOffsetState>(value).with_context(|| {
+            format!("failed parsing collector legacy offset state: {}", path.display())
+        })?;
+        let files = legacy
+            .offsets
+            .into_iter()
+            .map(|(path, offset)| (path, FileScanState { offset, mtime: 0 }))
+            .collect::<HashMap<_, _>>();
+        Ok(Self {
+            files,
+            sqlite: HashMap::new(),
+        })
     }
 
     fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -363,8 +636,14 @@ impl OffsetState {
 
 #[derive(Debug)]
 struct CollectOutcome {
-    next_offset: u64,
+    next_state: FileScanState,
     lines: Vec<SourceLine>,
+}
+
+#[derive(Debug)]
+struct SqliteCollectOutcome {
+    next_state: SqliteScanState,
+    lines: Vec<SqliteSourceLine>,
 }
 
 #[derive(Debug)]
@@ -373,9 +652,16 @@ struct SourceLine {
     end_offset: u64,
 }
 
+#[derive(Debug)]
+struct SqliteSourceLine {
+    content: String,
+    file_type: String,
+    end_offset: u64,
+}
+
 fn collect_source_events(
     source: &CollectorSource,
-    start_offset: u64,
+    previous_state: &FileScanState,
     max_read_bytes: usize,
     max_line_bytes: usize,
 ) -> anyhow::Result<CollectOutcome> {
@@ -383,7 +669,7 @@ fn collect_source_events(
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(CollectOutcome {
-                next_offset: 0,
+                next_state: FileScanState::default(),
                 lines: Vec::new(),
             });
         }
@@ -391,7 +677,14 @@ fn collect_source_events(
     };
 
     let file_len = metadata.len();
-    let mut offset = start_offset;
+    let current_mtime = metadata_mtime_seconds(&metadata);
+    let mut offset = previous_state.offset;
+    if current_mtime == previous_state.mtime && offset >= file_len {
+        return Ok(CollectOutcome {
+            next_state: previous_state.clone(),
+            lines: Vec::new(),
+        });
+    }
     if file_len < offset {
         // Rotation/truncation: restart from beginning.
         offset = 0;
@@ -399,7 +692,10 @@ fn collect_source_events(
 
     if file_len <= offset {
         return Ok(CollectOutcome {
-            next_offset: offset,
+            next_state: FileScanState {
+                offset,
+                mtime: current_mtime,
+            },
             lines: Vec::new(),
         });
     }
@@ -417,7 +713,10 @@ fn collect_source_events(
         .with_context(|| format!("collector read failed: {}", source.path.display()))?;
     if bytes_read == 0 {
         return Ok(CollectOutcome {
-            next_offset: offset,
+            next_state: FileScanState {
+                offset,
+                mtime: current_mtime,
+            },
             lines: Vec::new(),
         });
     }
@@ -427,7 +726,10 @@ fn collect_source_events(
     let (consumed_bytes, raw_lines) = extract_complete_lines(&buffer, at_eof);
     if consumed_bytes == 0 {
         return Ok(CollectOutcome {
-            next_offset: offset,
+            next_state: FileScanState {
+                offset,
+                mtime: current_mtime,
+            },
             lines: Vec::new(),
         });
     }
@@ -456,9 +758,253 @@ fn collect_source_events(
     }
 
     Ok(CollectOutcome {
-        next_offset: offset + consumed_bytes as u64,
+        next_state: FileScanState {
+            offset: offset + consumed_bytes as u64,
+            mtime: current_mtime,
+        },
         lines,
     })
+}
+
+fn metadata_mtime_seconds(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn collect_sqlite_events(
+    source: &CollectorSqliteSource,
+    previous_state: &SqliteScanState,
+    max_line_bytes: usize,
+) -> anyhow::Result<SqliteCollectOutcome> {
+    let metadata = match std::fs::metadata(&source.db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SqliteCollectOutcome {
+                next_state: SqliteScanState::default(),
+                lines: Vec::new(),
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("collector sqlite metadata failed: {}", source.db_path.display())
+            });
+        }
+    };
+    let mut current_mtime = metadata_mtime_seconds(&metadata);
+    let wal_path = PathBuf::from(format!("{}-wal", source.db_path.display()));
+    if let Ok(wal_metadata) = std::fs::metadata(&wal_path) {
+        current_mtime = current_mtime.max(metadata_mtime_seconds(&wal_metadata));
+    }
+
+    let has_incremental_queries = source
+        .queries
+        .iter()
+        .any(|query| query.incremental_field.is_some());
+    if current_mtime == previous_state.mtime && !has_incremental_queries {
+        return Ok(SqliteCollectOutcome {
+            next_state: previous_state.clone(),
+            lines: Vec::new(),
+        });
+    }
+
+    let mut next_state = previous_state.clone();
+    let mut lines = Vec::new();
+    let conn = Connection::open_with_flags(
+        &source.db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("collector sqlite open failed: {}", source.db_path.display()))?;
+    for query in &source.queries {
+        let previous_incremental = previous_state.incremental.get(&query.file_type);
+        let result = execute_sqlite_query(query, &conn, previous_incremental, max_line_bytes)
+            .with_context(|| {
+            format!(
+                "collector sqlite query failed ({} on {})",
+                query.file_type,
+                source.db_path.display()
+            )
+        })?;
+        if let Some(value) = result.max_incremental {
+            next_state
+                .incremental
+                .insert(query.file_type.clone(), value);
+        }
+        lines.extend(result.lines);
+    }
+    next_state.mtime = current_mtime;
+    Ok(SqliteCollectOutcome { next_state, lines })
+}
+
+struct SqliteQueryResult {
+    lines: Vec<SqliteSourceLine>,
+    max_incremental: Option<serde_json::Value>,
+}
+
+fn execute_sqlite_query(
+    query: &CollectorSqliteQuery,
+    conn: &Connection,
+    previous_incremental: Option<&serde_json::Value>,
+    max_line_bytes: usize,
+) -> anyhow::Result<SqliteQueryResult> {
+    let mut stmt = conn
+        .prepare(query.sql.as_str())
+        .with_context(|| format!("failed preparing sqlite query '{}'", query.file_type))?;
+    let column_names = stmt
+        .column_names()
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    let use_param = query.incremental_field.is_some() && query.sql.contains('?');
+    let mut rows = if use_param {
+        let parameter = sqlite_param_from_incremental(previous_incremental);
+        let params = vec![parameter];
+        stmt.query(params_from_iter(params.iter()))
+            .with_context(|| format!("failed executing sqlite query '{}'", query.file_type))?
+    } else {
+        stmt.query(params![])
+            .with_context(|| format!("failed executing sqlite query '{}'", query.file_type))?
+    };
+
+    let mut lines = Vec::new();
+    let mut max_incremental = previous_incremental.cloned();
+    let mut row_index = 0_u64;
+    while let Some(row) = rows.next()? {
+        let mut object = serde_json::Map::with_capacity(column_names.len());
+        for (index, column_name) in column_names.iter().enumerate() {
+            let value = json_value_from_sqlite_ref(
+                row.get_ref(index)
+                    .with_context(|| format!("failed reading sqlite column '{}'", column_name))?,
+            );
+            object.insert(column_name.clone(), value);
+        }
+
+        let json_value = serde_json::Value::Object(object);
+        let incremental_value = query
+            .incremental_field
+            .as_deref()
+            .and_then(|field| incremental_value_for_query(&json_value, field));
+        if let Some(ref value) = incremental_value {
+            if !use_param {
+                if let Some(previous) = previous_incremental {
+                    if !incremental_is_after(value, previous) {
+                        continue;
+                    }
+                }
+            }
+            max_incremental = match max_incremental {
+                Some(ref current) if !incremental_is_after(value, current) => max_incremental,
+                _ => Some(value.clone()),
+            };
+        }
+
+        row_index += 1;
+        let mut raw_line = serde_json::to_string(&json_value)?;
+        if raw_line.len() > max_line_bytes {
+            raw_line = truncate_utf8(raw_line.as_str(), max_line_bytes);
+        }
+        lines.push(SqliteSourceLine {
+            content: raw_line,
+            file_type: query.file_type.clone(),
+            end_offset: row_index,
+        });
+    }
+
+    Ok(SqliteQueryResult {
+        lines,
+        max_incremental,
+    })
+}
+
+fn sqlite_param_from_incremental(value: Option<&serde_json::Value>) -> SqlValue {
+    let Some(value) = value else {
+        return SqlValue::Integer(0);
+    };
+    match value {
+        serde_json::Value::Null => SqlValue::Null,
+        serde_json::Value::Bool(flag) => SqlValue::Integer(i64::from(*flag)),
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .map(SqlValue::Integer)
+            .or_else(|| number.as_f64().map(SqlValue::Real))
+            .unwrap_or(SqlValue::Integer(0)),
+        serde_json::Value::String(text) => SqlValue::Text(text.clone()),
+        _ => SqlValue::Text(value.to_string()),
+    }
+}
+
+fn json_value_from_sqlite_ref(value: ValueRef<'_>) -> serde_json::Value {
+    match value {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(v) => serde_json::Value::from(v),
+        ValueRef::Real(v) => serde_json::Value::from(v),
+        ValueRef::Text(v) => serde_json::Value::String(String::from_utf8_lossy(v).to_string()),
+        ValueRef::Blob(v) => {
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(v))
+        }
+    }
+}
+
+fn incremental_value_for_query(
+    row: &serde_json::Value,
+    field: &str,
+) -> Option<serde_json::Value> {
+    let object = row.as_object()?;
+    if let Some(value) = object.get(field) {
+        return Some(value.clone());
+    }
+    object.iter().find_map(|(key, value)| {
+        if key.contains(field) || field.contains(key) {
+            Some(value.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn incremental_is_after(candidate: &serde_json::Value, previous: &serde_json::Value) -> bool {
+    match (candidate, previous) {
+        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => left
+            .as_f64()
+            .zip(right.as_f64())
+            .map(|(l, r)| l > r)
+            .unwrap_or(false),
+        (serde_json::Value::String(left), serde_json::Value::String(right)) => left > right,
+        (serde_json::Value::String(left), serde_json::Value::Number(right)) => right
+            .as_f64()
+            .and_then(|r| left.parse::<f64>().ok().map(|l| l > r))
+            .unwrap_or(false),
+        (serde_json::Value::Number(left), serde_json::Value::String(right)) => left
+            .as_f64()
+            .and_then(|l| right.parse::<f64>().ok().map(|r| l > r))
+            .unwrap_or(false),
+        _ => candidate != previous,
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let marker = "... [truncated]";
+    let marker_bytes = marker.len();
+    let budget = max_bytes.saturating_sub(marker_bytes).max(1);
+    let mut out = String::new();
+    for ch in value.chars() {
+        let ch_bytes = ch.len_utf8();
+        if out.len() + ch_bytes > budget {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str(marker);
+    out
 }
 
 fn extract_complete_lines(bytes: &[u8], at_eof: bool) -> (usize, Vec<&[u8]>) {
@@ -657,6 +1203,7 @@ fn expand_home_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn extract_complete_lines_skips_partial_non_eof() {
@@ -688,6 +1235,109 @@ mod tests {
         assert_eq!(
             parse_event_source("agent_apps"),
             Some(EventSource::AgentApp)
+        );
+    }
+
+    #[test]
+    fn offset_state_loads_legacy_offsets() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("collector_state.json");
+        std::fs::write(
+            &path,
+            r#"{"offsets":{"/tmp/demo.jsonl":12345}}"#.as_bytes(),
+        )
+        .unwrap();
+        let loaded = OffsetState::load(&path).unwrap();
+        let file = loaded.files.get("/tmp/demo.jsonl").unwrap();
+        assert_eq!(file.offset, 12345);
+        assert_eq!(file.mtime, 0);
+        assert!(loaded.sqlite.is_empty());
+    }
+
+    #[test]
+    fn collect_source_events_skips_when_file_unchanged() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, b"{\"ok\":1}\n").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let size = metadata.len();
+        let mtime = metadata_mtime_seconds(&metadata);
+        let source = CollectorSource {
+            name: "events".to_string(),
+            path,
+            parser: CollectorParser::JsonLines,
+            server_name: None,
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        };
+        let prior = FileScanState {
+            offset: size,
+            mtime,
+        };
+        let outcome = collect_source_events(&source, &prior, 64 * 1024, 64 * 1024).unwrap();
+        assert_eq!(outcome.next_state, prior);
+        assert!(outcome.lines.is_empty());
+    }
+
+    #[test]
+    fn collect_sqlite_events_tracks_incremental_field() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE messages (createdAt INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages(createdAt, body) VALUES (?1, ?2)",
+                params![1_i64, "hello"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages(createdAt, body) VALUES (?1, ?2)",
+                params![2_i64, "world"],
+            )
+            .unwrap();
+        }
+
+        let source = CollectorSqliteSource {
+            name: "sqlite-source".to_string(),
+            db_path: db_path.clone(),
+            server_name: None,
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+            queries: vec![CollectorSqliteQuery {
+                file_type: "messages".to_string(),
+                sql: "SELECT createdAt, body FROM messages WHERE createdAt > ? ORDER BY createdAt ASC"
+                    .to_string(),
+                incremental_field: Some("createdAt".to_string()),
+            }],
+        };
+        let initial = collect_sqlite_events(&source, &SqliteScanState::default(), 64 * 1024).unwrap();
+        assert_eq!(initial.lines.len(), 2);
+        assert_eq!(
+            initial.next_state.incremental.get("messages"),
+            Some(&serde_json::Value::from(2_i64))
+        );
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO messages(createdAt, body) VALUES (?1, ?2)",
+                params![3_i64, "again"],
+            )
+            .unwrap();
+        }
+
+        let follow_up = collect_sqlite_events(&source, &initial.next_state, 64 * 1024).unwrap();
+        assert_eq!(follow_up.lines.len(), 1);
+        assert_eq!(
+            follow_up.next_state.incremental.get("messages"),
+            Some(&serde_json::Value::from(3_i64))
         );
     }
 }
