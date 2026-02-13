@@ -76,65 +76,6 @@ fn is_claude_code_host(host: &str) -> bool {
     host == "statsig.anthropic.com"
 }
 
-pub fn detect_provider(host: &str) -> Option<&'static str> {
-    let host = lower_host(host);
-
-    if is_chatgpt_web_host(&host) {
-        Some("chatgpt")
-    } else if is_gemini_web_host(&host) {
-        Some("gemini")
-    } else if is_claude_web_host(&host) || is_claude_agent_edge_host(&host) {
-        Some("claude")
-    } else if is_cursor_host(&host) {
-        Some("cursor")
-    } else if is_copilot_host(&host) {
-        Some("github-copilot")
-    } else if is_windsurf_host(&host) {
-        Some("windsurf")
-    } else if is_zed_host(&host) {
-        Some("zed")
-    } else if is_junie_host(&host) {
-        Some("junie")
-    } else if is_amazon_q_host(&host) {
-        Some("amazon-q")
-    } else if is_claude_code_host(&host) {
-        Some("claude-code")
-    } else if host == "api.openai.com"
-        || host.ends_with(".api.openai.com")
-        || host_eq_or_subdomain(&host, "openai.azure.com")
-    {
-        Some("openai")
-    } else if is_claude_api_host(&host) || host == "anthropic.com" {
-        Some("anthropic")
-    } else if host.contains("googleapis.com")
-        && (host.contains("aiplatform") || host.contains("generativelanguage"))
-    {
-        Some("google")
-    } else if host.contains("cohere.") {
-        Some("cohere")
-    } else if host.contains("mistral.ai") {
-        Some("mistral")
-    } else if host.contains("groq.com") {
-        Some("groq")
-    } else if host.contains("together.xyz") {
-        Some("together")
-    } else if host.contains("perplexity.ai") {
-        Some("perplexity")
-    } else if host.contains("replicate.com") {
-        Some("replicate")
-    } else if host.contains("huggingface.co") {
-        Some("huggingface")
-    } else if host.contains("fireworks.ai") {
-        Some("fireworks")
-    } else if host.contains("x.ai") {
-        Some("xai")
-    } else if host.contains("bedrock") && host.contains("amazonaws.com") {
-        Some("bedrock")
-    } else {
-        None
-    }
-}
-
 /// Detect end-user agent application identity from host.
 pub fn detect_agent_app(host: &str) -> Option<&'static str> {
     let host = lower_host(host);
@@ -250,13 +191,6 @@ mod tests {
         assert!(!is_agent_app("api.anthropic.com"));
         assert!(!is_agent_app("api.claude.ai"));
         assert!(is_agent_app("claude.ai"));
-    }
-
-    #[test]
-    fn detect_provider_for_core_hosts() {
-        assert_eq!(detect_provider("api.openai.com"), Some("openai"));
-        assert_eq!(detect_provider("api.anthropic.com"), Some("anthropic"));
-        assert_eq!(detect_provider("chatgpt.com"), Some("chatgpt"));
     }
 
     #[test]

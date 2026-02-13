@@ -59,9 +59,6 @@ pub const BUDGET_BLOCKS_TOTAL: &str = "soth_budget_blocks_total";
 pub const ENFORCEMENT_FAILOPEN_TOTAL: &str = "soth_enforcement_failopen_total";
 pub const STREAM_CAPTURE_LIMIT_REACHED_TOTAL: &str = "soth_stream_capture_limit_reached_total";
 pub const TLS_LEARNED_PASSTHROUGH_TOTAL: &str = "soth_tls_learned_passthrough_total";
-pub const DETECTION_MISMATCH_COUNT: &str = "soth_detection_mismatch_count";
-pub const PROVIDER_MISMATCH_COUNT: &str = "soth_provider_mismatch_count";
-pub const USAGE_MISMATCH_COUNT: &str = "soth_usage_mismatch_count";
 
 // Gauges
 pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
@@ -117,18 +114,6 @@ fn describe_counters() {
     describe_counter!(
         TLS_LEARNED_PASSTHROUGH_TOTAL,
         "Total learned TLS passthrough events by action"
-    );
-    describe_counter!(
-        DETECTION_MISMATCH_COUNT,
-        "Total number of shadow detection mismatches between legacy and registry paths"
-    );
-    describe_counter!(
-        PROVIDER_MISMATCH_COUNT,
-        "Total number of shadow provider mismatches between legacy and registry paths"
-    );
-    describe_counter!(
-        USAGE_MISMATCH_COUNT,
-        "Total number of shadow usage extraction mismatches between parser paths"
     );
 }
 
@@ -252,34 +237,6 @@ pub fn record_tls_learned_passthrough(action: &str) {
     counter!(
         TLS_LEARNED_PASSTHROUGH_TOTAL,
         "action" => action.to_string()
-    )
-    .increment(1);
-}
-
-/// Record a legacy-vs-registry detection-class mismatch.
-pub fn record_detection_mismatch(source: &str) {
-    counter!(
-        DETECTION_MISMATCH_COUNT,
-        "source" => source.to_string()
-    )
-    .increment(1);
-}
-
-/// Record a legacy-vs-registry provider mismatch.
-pub fn record_provider_mismatch(source: &str) {
-    counter!(
-        PROVIDER_MISMATCH_COUNT,
-        "source" => source.to_string()
-    )
-    .increment(1);
-}
-
-/// Record a usage extraction mismatch between primary and shadow parser paths.
-pub fn record_usage_mismatch(provider: &str, stream_kind: &str) {
-    counter!(
-        USAGE_MISMATCH_COUNT,
-        "provider" => provider.to_string(),
-        "stream_kind" => stream_kind.to_string()
     )
     .increment(1);
 }

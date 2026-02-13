@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde_json::Value;
 use soth_oisp_types::bundle::{parse_compiled_bundle, CompiledBundle, DomainIndexEntry};
-use soth_oisp_types::provider::EntryType;
+use soth_oisp_types::provider::{EntryType, ModelPricing};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -96,6 +96,61 @@ impl OispEngine {
         }
     }
 
+    /// Calculate request cost using bundle pricing for a provider/model pair.
+    ///
+    /// `provider_hints` are checked in order (for example: provider_id then api_format).
+    /// If no hinted provider contains the model, all providers are scanned as a fallback.
+    pub fn calculate_cost(
+        &self,
+        provider_hints: &[&str],
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) -> Option<f64> {
+        let model = model.trim();
+        if model.is_empty() {
+            return None;
+        }
+
+        for provider_hint in provider_hints {
+            let provider_hint = provider_hint.trim();
+            if provider_hint.is_empty() {
+                continue;
+            }
+            if let Some((_, pricing)) = self
+                .bundle
+                .pricing
+                .iter()
+                .find(|(provider, _)| provider.eq_ignore_ascii_case(provider_hint))
+                .and_then(|(_, models)| find_model_pricing(models, model))
+            {
+                return calculate_cost_from_pricing(
+                    pricing,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                );
+            }
+        }
+
+        for models in self.bundle.pricing.values() {
+            if let Some((_, pricing)) = find_model_pricing(models, model) {
+                return calculate_cost_from_pricing(
+                    pricing,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                );
+            }
+        }
+
+        None
+    }
+
     pub fn load_from_registry_cache(path: &Path) -> anyhow::Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
@@ -178,6 +233,53 @@ fn host_matches_pattern(host: &str, pattern: &str) -> bool {
     }
 
     false
+}
+
+fn find_model_pricing<'a>(
+    models: &'a std::collections::BTreeMap<String, ModelPricing>,
+    model: &str,
+) -> Option<(&'a str, &'a ModelPricing)> {
+    let model_lower = model.to_ascii_lowercase();
+
+    if let Some((id, pricing)) = models
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(model_lower.as_str()))
+    {
+        return Some((id.as_str(), pricing));
+    }
+
+    models
+        .iter()
+        .filter(|(id, _)| {
+            let id_lower = id.to_ascii_lowercase();
+            model_lower.starts_with(id_lower.as_str()) || id_lower.starts_with(model_lower.as_str())
+        })
+        .max_by_key(|(id, _)| id.len())
+        .map(|(id, pricing)| (id.as_str(), pricing))
+}
+
+fn calculate_cost_from_pricing(
+    pricing: &ModelPricing,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+) -> Option<f64> {
+    let input_rate = pricing.input_per_million_usd.unwrap_or(0.0);
+    let output_rate = pricing.output_per_million_usd.unwrap_or(0.0);
+    let cache_read_rate = pricing.cache_read_per_million_usd.unwrap_or(0.0);
+    let cache_write_rate = pricing.cache_write_per_million_usd.unwrap_or(0.0);
+
+    if input_rate == 0.0 && output_rate == 0.0 && cache_read_rate == 0.0 && cache_write_rate == 0.0
+    {
+        return None;
+    }
+
+    let cost = (input_tokens as f64 / 1_000_000.0) * input_rate
+        + (output_tokens as f64 / 1_000_000.0) * output_rate
+        + (cache_read_tokens.unwrap_or(0) as f64 / 1_000_000.0) * cache_read_rate
+        + (cache_write_tokens.unwrap_or(0) as f64 / 1_000_000.0) * cache_write_rate;
+    Some(cost)
 }
 
 #[cfg(test)]
@@ -369,5 +471,40 @@ mod tests {
         let engine = OispEngine::new(bundle).unwrap();
         let class = engine.classify("api.openai.com").unwrap();
         assert_eq!(class.entry_type, EntryType::Mcp);
+    }
+
+    #[test]
+    fn calculate_cost_uses_provider_hint_and_prefix_model_match() {
+        let engine = OispEngine::new(parse_compiled_bundle(&json!({
+            "version": "v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "local",
+            "domain_index": [
+                { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" }
+            ],
+            "providers": {
+                "chatgpt": { "id": "chatgpt", "name": "ChatGPT", "type": "agent-app", "api_format": "openai" }
+            },
+            "filters": {},
+            "pricing": {
+                "openai": {
+                    "gpt-5.3-codex": {
+                        "input_per_million_usd": 2.0,
+                        "output_per_million_usd": 8.0
+                    }
+                }
+            }
+        })).unwrap()).unwrap();
+
+        let cost = engine.calculate_cost(
+            &["chatgpt", "openai"],
+            "gpt-5.3-codex-2026-02-01",
+            1_000_000,
+            500_000,
+            None,
+            None,
+        );
+        assert!(cost.is_some());
+        assert!((cost.unwrap() - 6.0).abs() < 1e-9);
     }
 }

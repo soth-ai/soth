@@ -21,5 +21,5 @@ pub use server::DashboardServer;
 pub use state::{
     BudgetAlert, BudgetMetrics, BudgetPrimitives, BudgetRequestPrimitive, DashboardState,
     DenialEntry, DidEntry, IdentityMetrics, ObserveMetrics, PolicyMetrics, ProviderBudgetPrimitive,
-    ProviderTokens, ProxyMetrics, ProxyRequestEntry, ProxyStatus, ShadowMismatchMetrics,
+    ProviderTokens, ProxyMetrics, ProxyRequestEntry, ProxyStatus,
 };

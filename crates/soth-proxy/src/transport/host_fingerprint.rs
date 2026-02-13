@@ -67,77 +67,14 @@ pub fn detect_agent_with_context_gated(
     ua_agent
 }
 
-/// Detect AI provider from host.
-pub fn detect_provider(host: &str) -> Option<&'static str> {
-    registry::detect_provider(host)
-}
-
-/// Check if host is an agent app (end-user application) vs direct API.
-pub fn is_agent_app(host: &str) -> bool {
-    registry::is_agent_app(host)
-}
-
-/// Compute legacy detection class from configured host classes.
-pub fn legacy_detection_class(
-    host_is_ai_target: bool,
-    host_is_mcp_target: bool,
-    host_is_agent_target: bool,
-) -> &'static str {
-    if host_is_mcp_target {
-        "mcp"
-    } else if host_is_agent_target {
-        "agent_app"
-    } else if host_is_ai_target {
-        "ai_inference"
-    } else {
-        "unknown"
-    }
-}
-
-/// Return true when legacy host-class detection and registry entry type disagree.
-pub fn detection_shadow_mismatch(legacy_class: &str, registry_entry_type: Option<&str>) -> bool {
-    let registry_class = registry_entry_type.unwrap_or("unknown");
-    legacy_class != registry_class
-}
-
-/// Return true when legacy provider tag and registry provider tag disagree.
-pub fn provider_shadow_mismatch(
-    legacy_provider: Option<&str>,
-    registry_provider: Option<&str>,
-) -> bool {
-    normalize_provider_label(legacy_provider) != normalize_provider_label(registry_provider)
-}
-
-fn normalize_provider_label(provider: Option<&str>) -> &str {
-    match provider.unwrap_or("unknown").trim() {
-        "" => "unknown",
-        value => value,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn legacy_detection_class_priority_is_stable() {
-        assert_eq!(legacy_detection_class(true, true, true), "mcp");
-        assert_eq!(legacy_detection_class(true, false, true), "agent_app");
-        assert_eq!(legacy_detection_class(true, false, false), "ai_inference");
-        assert_eq!(legacy_detection_class(false, false, false), "unknown");
-    }
-
-    #[test]
-    fn detection_shadow_mismatch_compares_classes() {
-        assert!(detection_shadow_mismatch("ai_inference", Some("agent_app")));
-        assert!(!detection_shadow_mismatch("mcp", Some("mcp")));
-        assert!(!detection_shadow_mismatch("unknown", None));
-    }
-
-    #[test]
-    fn provider_shadow_mismatch_normalizes_missing_values() {
-        assert!(!provider_shadow_mismatch(None, Some("unknown")));
-        assert!(!provider_shadow_mismatch(Some(""), None));
-        assert!(provider_shadow_mismatch(Some("chatgpt"), Some("anthropic")));
+    fn codex_path_detection_catches_known_routes() {
+        assert!(is_codex_path("/backend-api/codex/responses"));
+        assert!(is_codex_path("/codex/run"));
+        assert!(!is_codex_path("/backend-api/f/conversation"));
     }
 }

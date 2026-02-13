@@ -8,6 +8,8 @@ use brotli::Decompressor as BrotliDecoder;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use hudsucker::hyper;
 use soth_budget::{PricingCatalog, TokenUsage};
+use soth_core::config::RegistryMode;
+use soth_oisp::OispEngine;
 use tokio::task::spawn_blocking;
 
 use crate::json_security::strip_json_security_prefix;
@@ -25,6 +27,22 @@ pub struct ResponseUsageMeta {
     pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
+}
+
+impl ResponseUsageMeta {
+    pub fn has_signal(&self) -> bool {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+            || self.input_tokens.unwrap_or(0) > 0
+            || self.output_tokens.unwrap_or(0) > 0
+            || self.cache_read_tokens.unwrap_or(0) > 0
+            || self.cache_write_tokens.unwrap_or(0) > 0
+            || self.reasoning_tokens.unwrap_or(0) > 0
+            || self.cost_usd.unwrap_or(0.0) > 0.0
+    }
 }
 
 /// Primary + shadow extraction outcome for E3 mismatch instrumentation.
@@ -83,10 +101,13 @@ pub async fn extract_usage_meta_from_decoded_payload(
     grpc_message_encoding: Option<&str>,
     fallback_model: Option<&str>,
 ) -> ResponseUsageMeta {
-    extract_usage_meta_with_shadow(
-        registry,
+    let Some(primary_parser) = resolve_provider_parser(registry, host, provider) else {
+        return ResponseUsageMeta::default();
+    };
+
+    extract_usage_meta_with_parser(
+        primary_parser,
         pricing_catalog,
-        provider,
         host,
         decoded_body,
         is_sse,
@@ -95,12 +116,13 @@ pub async fn extract_usage_meta_from_decoded_payload(
         fallback_model,
     )
     .await
-    .primary
 }
 
-pub async fn extract_usage_meta_with_shadow(
+pub async fn extract_usage_meta_for_mode(
     registry: &ProviderRegistry,
-    pricing_catalog: &PricingCatalog,
+    _pricing_catalog: &PricingCatalog,
+    oisp_engine: Option<&OispEngine>,
+    _registry_mode: RegistryMode,
     provider: &str,
     host: &str,
     decoded_body: &[u8],
@@ -109,13 +131,10 @@ pub async fn extract_usage_meta_with_shadow(
     grpc_message_encoding: Option<&str>,
     fallback_model: Option<&str>,
 ) -> UsageExtractionOutcome {
-    let Some(primary_parser) = resolve_provider_parser(registry, host, provider) else {
-        return UsageExtractionOutcome::default();
-    };
-
-    let primary = extract_usage_meta_with_parser(
-        primary_parser.clone(),
-        pricing_catalog,
+    let primary = extract_usage_meta_registry_primary(
+        registry,
+        oisp_engine,
+        provider,
         host,
         decoded_body,
         is_sse,
@@ -124,74 +143,78 @@ pub async fn extract_usage_meta_with_shadow(
         fallback_model,
     )
     .await;
-
-    let mut shadow = None;
-    if let Some(fallback_host) = parser_fallback_host(provider) {
-        if let Some(shadow_parser) = registry.find_provider(fallback_host) {
-            if !Arc::ptr_eq(&primary_parser, &shadow_parser) {
-                shadow = Some(
-                    extract_usage_meta_with_parser(
-                        shadow_parser,
-                        pricing_catalog,
-                        host,
-                        decoded_body,
-                        is_sse,
-                        content_type,
-                        grpc_message_encoding,
-                        fallback_model,
-                    )
-                    .await,
-                );
-            }
-        }
-    }
-
-    let mismatch = shadow
-        .as_ref()
-        .map(|shadow_meta| usage_meta_shadow_mismatch(&primary, shadow_meta))
-        .unwrap_or(false);
-
     UsageExtractionOutcome {
         primary,
-        shadow,
-        mismatch,
+        shadow: None,
+        mismatch: false,
     }
 }
 
-pub fn usage_meta_shadow_mismatch(primary: &ResponseUsageMeta, shadow: &ResponseUsageMeta) -> bool {
-    !same_optional_model(primary.model.as_deref(), shadow.model.as_deref())
-        || !same_optional_u64(primary.input_tokens, shadow.input_tokens)
-        || !same_optional_u64(primary.output_tokens, shadow.output_tokens)
-        || !same_optional_u64(primary.cache_read_tokens, shadow.cache_read_tokens)
-        || !same_optional_u64(primary.cache_write_tokens, shadow.cache_write_tokens)
-        || !same_optional_u64(primary.reasoning_tokens, shadow.reasoning_tokens)
-        || !same_optional_cost(primary.cost_usd, shadow.cost_usd)
-}
+async fn extract_usage_meta_registry_primary(
+    registry: &ProviderRegistry,
+    oisp_engine: Option<&OispEngine>,
+    provider: &str,
+    host: &str,
+    decoded_body: &[u8],
+    is_sse: bool,
+    content_type: Option<&str>,
+    grpc_message_encoding: Option<&str>,
+    fallback_model: Option<&str>,
+) -> ResponseUsageMeta {
+    let Some(engine) = oisp_engine else {
+        return ResponseUsageMeta::default();
+    };
+    let Some(classification) = engine.classify(host) else {
+        return ResponseUsageMeta::default();
+    };
 
-fn same_optional_model(a: Option<&str>, b: Option<&str>) -> bool {
-    normalize_optional_model(a) == normalize_optional_model(b)
-}
+    let parser_hint = classification
+        .api_format
+        .as_deref()
+        .unwrap_or(classification.provider_id.as_str());
+    let Some(parser) = resolve_provider_parser_by_hint(registry, parser_hint) else {
+        return ResponseUsageMeta::default();
+    };
 
-fn normalize_optional_model(value: Option<&str>) -> &str {
-    let value = value.unwrap_or("").trim();
-    if value.is_empty() {
-        "unknown"
-    } else {
-        value
+    let provider_usage = extract_provider_usage_with_parser(
+        parser,
+        host,
+        decoded_body,
+        is_sse,
+        content_type,
+        grpc_message_encoding,
+    )
+    .await;
+    let mut meta = build_response_usage_meta_without_cost(provider_usage, fallback_model);
+
+    if let (Some(model), Some(input_tokens), Some(output_tokens)) =
+        (meta.model.as_deref(), meta.input_tokens, meta.output_tokens)
+    {
+        let mut provider_hints = Vec::with_capacity(3);
+        provider_hints.push(classification.provider_id.as_str());
+        if let Some(api_format) = classification.api_format.as_deref() {
+            if !api_format.eq_ignore_ascii_case(classification.provider_id.as_str()) {
+                provider_hints.push(api_format);
+            }
+        }
+        if !provider.is_empty()
+            && !provider_hints
+                .iter()
+                .any(|hint| hint.eq_ignore_ascii_case(provider))
+        {
+            provider_hints.push(provider);
+        }
+        meta.cost_usd = engine.calculate_cost(
+            &provider_hints,
+            model,
+            input_tokens,
+            output_tokens,
+            meta.cache_read_tokens,
+            meta.cache_write_tokens,
+        );
     }
-}
 
-fn same_optional_u64(a: Option<u64>, b: Option<u64>) -> bool {
-    a.unwrap_or(0) == b.unwrap_or(0)
-}
-
-fn same_optional_cost(a: Option<f64>, b: Option<f64>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(left), Some(right)) => (left - right).abs() < 1e-9,
-        (Some(left), None) => left.abs() < 1e-9,
-        (None, Some(right)) => right.abs() < 1e-9,
-    }
+    meta
 }
 
 async fn extract_usage_meta_with_parser(
@@ -204,24 +227,42 @@ async fn extract_usage_meta_with_parser(
     grpc_message_encoding: Option<&str>,
     fallback_model: Option<&str>,
 ) -> ResponseUsageMeta {
+    let usage = extract_provider_usage_with_parser(
+        parser,
+        host,
+        decoded_body,
+        is_sse,
+        content_type,
+        grpc_message_encoding,
+    )
+    .await;
+    build_response_usage_meta(usage, fallback_model, pricing_catalog)
+}
+
+async fn extract_provider_usage_with_parser(
+    parser: Arc<dyn AiProvider>,
+    host: &str,
+    decoded_body: &[u8],
+    is_sse: bool,
+    content_type: Option<&str>,
+    grpc_message_encoding: Option<&str>,
+) -> Option<ProviderUsage> {
     if !is_sse {
-        if let Some(meta) = extract_usage_from_grpc_frames(
+        if let Some(usage) = extract_usage_from_grpc_frames(
             parser.as_ref(),
-            pricing_catalog,
             host,
             decoded_body,
             content_type,
             grpc_message_encoding,
-            fallback_model,
         )
         .await
         {
-            return meta;
+            return Some(usage);
         }
     }
 
     let sanitized = strip_json_security_prefix(decoded_body);
-    let usage = if is_sse {
+    if is_sse {
         let parsed = parse_sse_body(parser.clone(), sanitized);
         if parsed.input_tokens == 0 && parsed.output_tokens == 0 {
             None
@@ -230,20 +271,16 @@ async fn extract_usage_meta_with_parser(
         }
     } else {
         parser.extract_usage(sanitized)
-    };
-
-    build_response_usage_meta(usage, fallback_model, pricing_catalog)
+    }
 }
 
 async fn extract_usage_from_grpc_frames(
     parser: &dyn AiProvider,
-    pricing_catalog: &PricingCatalog,
     host: &str,
     body: &[u8],
     content_type: Option<&str>,
     grpc_message_encoding: Option<&str>,
-    fallback_model: Option<&str>,
-) -> Option<ResponseUsageMeta> {
+) -> Option<ProviderUsage> {
     if !is_grpc_signaled(content_type, host, body) {
         return None;
     }
@@ -261,11 +298,7 @@ async fn extract_usage_from_grpc_frames(
         let sanitized = strip_json_security_prefix(&decoded);
         if let Some(usage) = parser.extract_usage(sanitized) {
             if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.model.is_some() {
-                return Some(build_response_usage_meta(
-                    Some(usage),
-                    fallback_model,
-                    pricing_catalog,
-                ));
+                return Some(usage);
             }
         }
     }
@@ -415,6 +448,27 @@ fn build_response_usage_meta(
     fallback_model: Option<&str>,
     pricing_catalog: &PricingCatalog,
 ) -> ResponseUsageMeta {
+    let mut meta = build_response_usage_meta_without_cost(provider_usage, fallback_model);
+    if let (Some(model), Some(input_tokens), Some(output_tokens)) =
+        (meta.model.as_deref(), meta.input_tokens, meta.output_tokens)
+    {
+        let token_usage = TokenUsage::new(input_tokens, output_tokens);
+        let cost = pricing_catalog.calculate_cost_with_cache(
+            model,
+            &token_usage,
+            meta.cache_read_tokens,
+            meta.cache_write_tokens,
+        );
+        meta.cost_usd = Some(cost);
+    }
+
+    meta
+}
+
+fn build_response_usage_meta_without_cost(
+    provider_usage: Option<ProviderUsage>,
+    fallback_model: Option<&str>,
+) -> ResponseUsageMeta {
     let mut meta = ResponseUsageMeta::default();
     let Some(provider_usage) = provider_usage else {
         return meta;
@@ -429,30 +483,77 @@ fn build_response_usage_meta(
         .or(provider_usage.cached_tokens);
     meta.cache_write_tokens = provider_usage.cache_write_tokens;
     meta.reasoning_tokens = provider_usage.reasoning_tokens;
-
-    let model = provider_usage
+    meta.model = provider_usage
         .model
         .or_else(|| fallback_model.map(ToString::to_string));
-    meta.model = model.clone();
-
-    if let (Some(input_tokens), Some(output_tokens)) = (meta.input_tokens, meta.output_tokens) {
-        let token_usage = TokenUsage::new(input_tokens, output_tokens);
-        let model_for_pricing = model.as_deref().unwrap_or("unknown");
-        let cost = pricing_catalog.calculate_cost_with_cache(
-            model_for_pricing,
-            &token_usage,
-            provider_usage.cache_read_tokens,
-            provider_usage.cache_write_tokens,
-        );
-        meta.cost_usd = Some(cost);
-    }
-
     meta
+}
+
+fn resolve_provider_parser_by_hint(
+    registry: &ProviderRegistry,
+    provider_hint: &str,
+) -> Option<Arc<dyn AiProvider>> {
+    let provider_hint = provider_hint.trim();
+    if provider_hint.is_empty() {
+        return None;
+    }
+    parser_fallback_host(provider_hint).and_then(|host| registry.find_provider(host))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn test_oisp_engine() -> OispEngine {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let envelope = json!({
+            "schema_version": 1,
+            "fetched_at": "2026-02-13T00:00:00Z",
+            "etag": "test",
+            "metadata": {
+                "bundle_type": "local",
+                "version": "v1",
+                "sha256": "abc",
+                "compiled_at": "2026-02-13T00:00:00Z",
+                "provider_count": 1,
+                "domain_count": 1,
+                "format_count": 1,
+                "size_bytes": 123
+            },
+            "bundle": {
+                "version": "v1",
+                "compiled_at": "2026-02-13T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" }
+                ],
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "name": "OpenAI",
+                        "type": "ai-inference",
+                        "api_format": "openai"
+                    }
+                },
+                "filters": {},
+                "pricing": {
+                    "openai": {
+                        "gpt-4o": {
+                            "input_per_million_usd": 10.0,
+                            "output_per_million_usd": 20.0
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(path.clone(), serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+        OispEngine::load_from_registry_cache(&path)
+            .unwrap()
+            .unwrap()
+    }
 
     fn grpc_frame(payload: &[u8], compressed: bool) -> Vec<u8> {
         let mut framed = Vec::with_capacity(payload.len() + 5);
@@ -510,31 +611,61 @@ mod tests {
         assert_eq!(meta.output_tokens, None);
     }
 
-    #[test]
-    fn usage_shadow_mismatch_treats_none_and_zero_as_equal() {
-        let primary = ResponseUsageMeta {
-            input_tokens: Some(0),
-            output_tokens: None,
-            ..Default::default()
-        };
-        let shadow = ResponseUsageMeta::default();
-        assert!(!usage_meta_shadow_mismatch(&primary, &shadow));
+    #[tokio::test]
+    async fn registry_mode_uses_bundle_pricing_for_cost() {
+        let registry = ProviderRegistry::new();
+        let pricing = PricingCatalog::with_defaults();
+        let engine = test_oisp_engine();
+        let body = br#"{"model":"gpt-4o","usage":{"prompt_tokens":100,"completion_tokens":50}}"#;
+
+        let outcome = extract_usage_meta_for_mode(
+            &registry,
+            &pricing,
+            Some(&engine),
+            RegistryMode::Registry,
+            "openai",
+            "api.openai.com",
+            body,
+            false,
+            Some("application/json"),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.primary.input_tokens, Some(100));
+        assert_eq!(outcome.primary.output_tokens, Some(50));
+        assert_eq!(outcome.primary.model.as_deref(), Some("gpt-4o"));
+        assert!((outcome.primary.cost_usd.unwrap_or_default() - 0.002).abs() < 1e-9);
+        assert!(outcome.shadow.is_none());
+        assert!(!outcome.mismatch);
     }
 
-    #[test]
-    fn usage_shadow_mismatch_detects_meaningful_delta() {
-        let primary = ResponseUsageMeta {
-            model: Some("gpt-4o".to_string()),
-            input_tokens: Some(10),
-            output_tokens: Some(4),
-            ..Default::default()
-        };
-        let shadow = ResponseUsageMeta {
-            model: Some("gpt-4o-mini".to_string()),
-            input_tokens: Some(10),
-            output_tokens: Some(4),
-            ..Default::default()
-        };
-        assert!(usage_meta_shadow_mismatch(&primary, &shadow));
+    #[tokio::test]
+    async fn registry_mode_without_engine_returns_empty_usage() {
+        let registry = ProviderRegistry::new();
+        let pricing = PricingCatalog::with_defaults();
+        let body = br#"{"model":"gpt-4o","usage":{"prompt_tokens":42,"completion_tokens":11}}"#;
+
+        let outcome = extract_usage_meta_for_mode(
+            &registry,
+            &pricing,
+            None,
+            RegistryMode::Registry,
+            "openai",
+            "api.openai.com",
+            body,
+            false,
+            Some("application/json"),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.primary.input_tokens, None);
+        assert_eq!(outcome.primary.output_tokens, None);
+        assert_eq!(outcome.primary.cost_usd, None);
+        assert!(outcome.shadow.is_none());
+        assert!(!outcome.mismatch);
     }
 }

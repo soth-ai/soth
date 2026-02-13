@@ -1322,22 +1322,17 @@ pub enum HostFilterMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RegistryMode {
-    /// Legacy hardcoded detection/parsing behavior.
-    Legacy,
-    /// Legacy behavior + shadow mismatch instrumentation.
-    #[default]
-    Shadow,
     /// Registry bundle-driven detection/intercept decisions.
+    ///
+    /// `legacy` and `shadow` are accepted as compatibility aliases and map to this mode.
+    #[default]
+    #[serde(alias = "legacy", alias = "shadow")]
     Registry,
 }
 
 impl std::fmt::Display for RegistryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Legacy => write!(f, "legacy"),
-            Self::Shadow => write!(f, "shadow"),
-            Self::Registry => write!(f, "registry"),
-        }
+        write!(f, "registry")
     }
 }
 
@@ -2480,7 +2475,7 @@ crypto_identity:
         assert_eq!(config.port, 8080);
         assert_eq!(config.address, "127.0.0.1");
         assert_eq!(config.socket_addr(), "127.0.0.1:8080");
-        assert_eq!(config.registry_mode, RegistryMode::Shadow);
+        assert_eq!(config.registry_mode, RegistryMode::Registry);
     }
 
     #[test]
@@ -2930,6 +2925,21 @@ forward_proxy:
 "#;
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_registry_mode_legacy_aliases_yaml() {
+        for mode in ["legacy", "shadow"] {
+            let yaml = format!(
+                r#"
+forward_proxy:
+  enabled: true
+  registry_mode: {mode}
+"#
+            );
+            let config: SothConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
+        }
     }
 
     #[test]
