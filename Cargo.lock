@@ -3835,6 +3835,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "soth-oisp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "soth-oisp-types",
+ "tempfile",
+]
+
+[[package]]
 name = "soth-oisp-types"
 version = "0.1.0"
 dependencies = [
@@ -3892,6 +3902,7 @@ dependencies = [
  "soth-dashboard",
  "soth-identity",
  "soth-observe",
+ "soth-oisp",
  "soth-policy",
  "soth-registry",
  "soth-tls",

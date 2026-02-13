@@ -412,6 +412,19 @@ fn compact_path(path: &std::path::Path) -> String {
     full
 }
 
+fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
+    if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
+        let expanded = cli_config::expand_tilde(config_cache_path);
+        if let Some(parent) = expanded.parent() {
+            return parent.join("registry_bundle_cache.json");
+        }
+    }
+
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join("registry_bundle_cache.json"))
+        .unwrap_or_else(|| PathBuf::from(".soth/registry_bundle_cache.json"))
+}
+
 struct ProxyRuntime {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     proxy_task: JoinHandle<anyhow::Result<()>>,
@@ -703,6 +716,7 @@ fn spawn_proxy_runtime(
 
     let shutdown_event_logger = event_logger.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let oisp_registry_cache_path = resolve_registry_bundle_cache_path(config);
     let handle = tokio::spawn(async move {
         hudsucker_proxy::start_proxy_with_shutdown(
             proxy_config,
@@ -715,6 +729,7 @@ fn spawn_proxy_runtime(
             event_logger,
             Some(enforcer),
             Some(observe_config),
+            Some(oisp_registry_cache_path),
         )
         .await
         .map_err(|error| anyhow::anyhow!("Proxy error: {}", error))

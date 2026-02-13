@@ -11,6 +11,7 @@ dashboard = ["dep:soth-dashboard"]
 
 [dependencies]
 soth-core = { workspace = true }
+soth-oisp = { workspace = true }
 soth-registry = { workspace = true }
 soth-identity = { workspace = true }
 soth-policy = { workspace = true }

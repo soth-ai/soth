@@ -20,12 +20,13 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use soth_budget::{BudgetTracker, PricingCatalog, TokenCounter};
+use soth_oisp::OispEngine;
 use soth_policy::PolicyEngine;
 use soth_tls::LearnedPassthrough;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -1241,6 +1242,8 @@ pub struct AiProxyHandler {
     learned_failure_window: Duration,
     /// Platform-gated process attribution runtime.
     process_attribution: Arc<ProcessAttribution>,
+    /// Bundle-driven classifier loaded from registry cache (shadow mode).
+    oisp_engine: Option<Arc<OispEngine>>,
 }
 
 impl AiProxyHandler {
@@ -1264,6 +1267,7 @@ impl AiProxyHandler {
                 PROCESS_ATTR_LOOKUP_TIMEOUT,
                 PROCESS_ATTR_CACHE_TTL,
             )),
+            oisp_engine: None,
         }
     }
 
@@ -1301,6 +1305,12 @@ impl AiProxyHandler {
         self.learned_passthrough = Some(learned);
         self.learned_failure_threshold = failure_threshold.max(1);
         self.learned_failure_window = failure_window;
+        self
+    }
+
+    /// Set bundle-driven classifier for shadow evaluation.
+    pub fn with_oisp_engine(mut self, engine: Arc<OispEngine>) -> Self {
+        self.oisp_engine = Some(engine);
         self
     }
 
@@ -1559,6 +1569,17 @@ impl HttpHandler for AiProxyHandler {
             host_is_ai_target || host_is_agent_target,
             host_mode,
         );
+        if let Some(engine) = self.oisp_engine.as_ref() {
+            if let Some(classification) = engine.classify(&host) {
+                debug!(
+                    host = %host,
+                    legacy_provider = ?provider,
+                    oisp_provider = %classification.provider_id,
+                    oisp_entry_type = ?classification.entry_type,
+                    "OISP shadow classification"
+                );
+            }
+        }
         let ua_agent = Self::detect_agent_from_user_agent(&req);
         let enforcer = self.enforcer.clone();
         let session_id = self.session_id.clone();
@@ -2753,6 +2774,37 @@ impl WebSocketHandler for AiWebSocketHandler {
     }
 }
 
+fn load_oisp_engine(cache_path: Option<&Path>) -> Option<Arc<OispEngine>> {
+    let path = cache_path?;
+    match OispEngine::load_from_registry_cache(path) {
+        Ok(Some(engine)) => {
+            info!(
+                cache = %path.display(),
+                bundle_version = %engine.bundle_version(),
+                providers = engine.provider_count(),
+                domains = engine.domain_count(),
+                "Loaded OISP bundle for proxy shadow classification"
+            );
+            Some(Arc::new(engine))
+        }
+        Ok(None) => {
+            debug!(
+                cache = %path.display(),
+                "OISP registry cache not found; continuing without bundle-driven classification"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                cache = %path.display(),
+                error = %error,
+                "Failed to load OISP registry cache; continuing with host fingerprint detection"
+            );
+            None
+        }
+    }
+}
+
 /// Start the hudsucker-based proxy with graceful shutdown support
 pub async fn start_proxy(
     config: ForwardProxyConfig,
@@ -2781,6 +2833,7 @@ pub async fn start_proxy(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2795,6 +2848,7 @@ pub async fn start_proxy_with_shutdown<F>(
     event_logger: Option<EventLogger>,
     enforcer: Option<ProxyEnforcer>,
     observe_config: Option<ObserveConfig>,
+    oisp_registry_cache_path: Option<PathBuf>,
 ) -> Result<(), ProxyError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -2830,6 +2884,7 @@ where
     let observe_config = observe_config.unwrap_or_default();
     let event_tags = Arc::new(observe_config.event_tags.clone());
     let pii_enricher = Arc::new(PiiEventEnricher::from_observe_config(&observe_config));
+    let oisp_engine = load_oisp_engine(oisp_registry_cache_path.as_deref());
     let learned_passthrough = if config.tls.learned_passthrough.enabled {
         let learned = Arc::new(LearnedPassthrough::new(
             config.tls.learned_passthrough.state_path.clone(),
@@ -2862,6 +2917,9 @@ where
                 config.tls.learned_passthrough.failure_window,
             );
         }
+        if let Some(ref oisp) = oisp_engine {
+            h = h.with_oisp_engine(oisp.clone());
+        }
         h
     };
 
@@ -2880,6 +2938,9 @@ where
                 config.tls.learned_passthrough.failure_threshold,
                 config.tls.learned_passthrough.failure_window,
             );
+        }
+        if let Some(ref oisp) = oisp_engine {
+            h = h.with_oisp_engine(oisp.clone());
         }
         h
     };
