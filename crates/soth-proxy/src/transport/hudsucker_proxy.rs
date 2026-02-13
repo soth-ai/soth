@@ -11,7 +11,10 @@ use http_body_util::{BodyExt, Full, StreamBody};
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{Request, Response},
-    hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoServerBuilder},
+    hyper_util::{
+        client::legacy::Error as LegacyClientError, rt::TokioExecutor,
+        server::conn::auto::Builder as AutoServerBuilder,
+    },
     rcgen::{Issuer, KeyPair},
     rustls::crypto::aws_lc_rs,
     tokio_tungstenite::tungstenite::Message,
@@ -25,9 +28,11 @@ use soth_oisp::{InterceptDecision, OispEngine, OispStreamParser};
 use soth_policy::PolicyEngine;
 use soth_tls::LearnedPassthrough;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::error::Error as StdError;
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -105,11 +110,39 @@ struct PendingRequest {
 /// Thread-safe store for pending requests
 type PendingRequests = Arc<Mutex<HashMap<u64, PendingRequest>>>;
 
-/// Generate a request ID from context
-fn request_id_from_ctx(ctx: &HttpContext) -> u64 {
-    // Use the context's internal connection/request tracking
-    // Hash the pointer address as a simple unique ID
-    ctx as *const _ as u64
+static NEXT_PROXY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_proxy_request_id() -> u64 {
+    NEXT_PROXY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn is_benign_proxy_forward_error(err: &LegacyClientError) -> bool {
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if let Some(hyper_error) = cause.downcast_ref::<hyper::Error>() {
+            if hyper_error.is_canceled()
+                || hyper_error.is_closed()
+                || hyper_error.is_incomplete_message()
+                || hyper_error.is_body_write_aborted()
+            {
+                return true;
+            }
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            ) {
+                return true;
+            }
+        }
+        source = cause.source();
+    }
+    false
 }
 
 const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
@@ -543,6 +576,8 @@ const CHATGPT_STRICT_COOKIE_HEADER_BYTES: usize = 900;
 /// Chat UI upstreams can be stricter than generic HTTP servers.
 const CHAT_UI_STRICT_TOTAL_HEADER_BYTES: usize = 5200;
 const CHAT_UI_MAX_TOTAL_HEADER_BYTES: usize = 3000;
+const LARGE_HEADER_DEBUG_BYTES: usize = 8000;
+const LARGE_HEADER_WARN_BYTES: usize = 12000;
 
 fn is_chat_ui_host(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
@@ -914,7 +949,7 @@ fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path: &str) {
     let headers = req.headers();
     let total_size = header_size_bytes(headers);
 
-    if total_size > 8000 {
+    if total_size > LARGE_HEADER_DEBUG_BYTES {
         let mut sizes: Vec<(String, usize)> = headers
             .iter()
             .map(|(k, v)| (k.to_string(), v.len()))
@@ -927,12 +962,21 @@ fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path: &str) {
             .collect::<Vec<_>>()
             .join(", ");
 
-        warn!(
-            total = total_size,
-            top = %top3,
-            host = %host,
-            "Large headers"
-        );
+        if total_size > LARGE_HEADER_WARN_BYTES {
+            warn!(
+                total = total_size,
+                top = %top3,
+                host = %host,
+                "Large headers"
+            );
+        } else {
+            debug!(
+                total = total_size,
+                top = %top3,
+                host = %host,
+                "Large headers (within tolerated range after sanitization)"
+            );
+        }
     }
 }
 
@@ -1266,7 +1310,14 @@ fn record_proxy_budget_spend(
         .and_then(|envelope| envelope.did.as_deref())
         .or(pending.agent);
 
-    tracker.record_spend(session_id, agent_id, model, input_tokens, output_tokens);
+    tracker.record_spend_with_cost(
+        session_id,
+        agent_id,
+        model,
+        input_tokens,
+        output_tokens,
+        usage_meta.cost_usd,
+    );
 }
 
 fn apply_process_identity(
@@ -1282,7 +1333,6 @@ fn apply_process_identity(
 }
 
 /// AI-aware HTTP handler for hudsucker
-#[derive(Clone)]
 pub struct AiProxyHandler {
     /// Host filter config for selective interception
     hosts: Arc<HostFilterConfig>,
@@ -1317,6 +1367,33 @@ pub struct AiProxyHandler {
     catalog_discovery_limiter: Arc<CatalogDiscoveryLimiter>,
     /// Maximum request/response body bytes to capture in observability payloads.
     capture_max_body_bytes: u64,
+    /// Stable request/response correlation key for this handler clone lifecycle.
+    request_correlation_id: u64,
+}
+
+impl Clone for AiProxyHandler {
+    fn clone(&self) -> Self {
+        Self {
+            hosts: self.hosts.clone(),
+            #[cfg(feature = "dashboard")]
+            dashboard: self.dashboard.clone(),
+            event_logger: self.event_logger.clone(),
+            session_id: self.session_id.clone(),
+            pending_requests: self.pending_requests.clone(),
+            enforcer: self.enforcer.clone(),
+            event_tags: self.event_tags.clone(),
+            pii_enricher: self.pii_enricher.clone(),
+            learned_passthrough: self.learned_passthrough.clone(),
+            learned_failure_threshold: self.learned_failure_threshold,
+            learned_failure_window: self.learned_failure_window,
+            process_attribution: self.process_attribution.clone(),
+            registry_mode: self.registry_mode,
+            oisp_engine: self.oisp_engine.clone(),
+            catalog_discovery_limiter: self.catalog_discovery_limiter.clone(),
+            capture_max_body_bytes: self.capture_max_body_bytes,
+            request_correlation_id: next_proxy_request_id(),
+        }
+    }
 }
 
 impl AiProxyHandler {
@@ -1342,6 +1419,7 @@ impl AiProxyHandler {
             oisp_engine: None,
             catalog_discovery_limiter: Arc::new(CatalogDiscoveryLimiter::default()),
             capture_max_body_bytes: config.capture_max_body_bytes,
+            request_correlation_id: next_proxy_request_id(),
         }
     }
 
@@ -1742,7 +1820,7 @@ impl HttpHandler for AiProxyHandler {
         #[cfg(feature = "dashboard")]
         let dashboard = self.dashboard.clone();
         let pending_requests = self.pending_requests.clone();
-        let request_id = request_id_from_ctx(ctx);
+        let request_id = self.request_correlation_id;
 
         async move {
             // Check if blocked
@@ -2193,7 +2271,7 @@ impl HttpHandler for AiProxyHandler {
 
     fn handle_response(
         &mut self,
-        ctx: &HttpContext,
+        _ctx: &HttpContext,
         res: Response<Body>,
     ) -> impl std::future::Future<Output = Response<Body>> + Send {
         let status = res.status().as_u16();
@@ -2202,7 +2280,7 @@ impl HttpHandler for AiProxyHandler {
         let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
         let session_id = self.session_id.clone();
-        let request_id = request_id_from_ctx(ctx);
+        let request_id = self.request_correlation_id;
         let registry_mode = self.registry_mode;
         let oisp_engine = self.oisp_engine.clone();
         let capture_max_body_bytes = self.capture_max_body_bytes;
@@ -2779,6 +2857,98 @@ impl HttpHandler for AiProxyHandler {
             }
 
             res
+        }
+    }
+
+    fn handle_error(
+        &mut self,
+        ctx: &HttpContext,
+        err: LegacyClientError,
+    ) -> impl std::future::Future<Output = Response<Body>> + Send {
+        let client_addr = ctx.client_addr;
+        let request_id = self.request_correlation_id;
+        let benign = is_benign_proxy_forward_error(&err);
+        let error = err.to_string();
+        let pending_requests = self.pending_requests.clone();
+        let event_logger = self.event_logger.clone();
+        let event_tags = self.event_tags.clone();
+        let pii_enricher = self.pii_enricher.clone();
+        let session_id = self.session_id.clone();
+        async move {
+            let pending = {
+                let mut requests = pending_requests.lock();
+                requests.remove(&request_id)
+            };
+
+            if let (Some(logger), Some(pending_req)) = (event_logger.as_ref(), pending.as_ref()) {
+                let provider = pending_req
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let latency_ms = pending_req.started_at.elapsed().as_millis() as u64;
+                let failure_status = hyper::StatusCode::BAD_GATEWAY.as_u16();
+                let mut tags = (*event_tags).clone();
+                tags.insert("transport_forward_error".to_string(), "true".to_string());
+                if benign {
+                    tags.insert(
+                        "transport_forward_error_kind".to_string(),
+                        "transient_disconnect".to_string(),
+                    );
+                }
+                if pending_req.catalog_discovery {
+                    append_catalog_discovery_tags(&mut tags, &pending_req.host);
+                }
+                let usage_meta = ResponseUsageMeta::default();
+                let mut event = build_paired_response_event(ResponseEventInput {
+                    session_id: &session_id,
+                    host: &pending_req.host,
+                    provider: provider.as_str(),
+                    agent: pending_req.agent,
+                    method: &pending_req.method,
+                    path: &pending_req.path,
+                    graphql_operation: pending_req.graphql_operation.as_deref(),
+                    is_agent_app: pending_req.is_agent_app,
+                    status: failure_status,
+                    latency_ms,
+                    request_content: pending_req.request_content.as_deref(),
+                    response_content: Some(format!("[forward error] {error}")),
+                    request_size_bytes: pending_req.request_size_bytes,
+                    response_size_bytes: None,
+                    headers: pending_req.headers.clone(),
+                    tags: Some(&tags),
+                    usage_meta: &usage_meta,
+                    fallback_model: pending_req.model.as_deref(),
+                    response_kind: ResponseKind::Http,
+                    traffic_envelope: pending_req.envelope.clone(),
+                });
+                if let Some(allowed) = pending_req.policy_allowed {
+                    event = event.with_policy(allowed, pending_req.policy_reason.clone());
+                }
+                if let Some(ref version) = pending_req.policy_version {
+                    event = event.with_policy_version(version.clone());
+                }
+                pii_enricher.enrich(&mut event);
+                logger.log(&event);
+            }
+
+            if benign {
+                debug!(
+                    client_addr = %client_addr,
+                    error = %error,
+                    "Transient proxy forward failure (client/upstream disconnect)"
+                );
+            } else {
+                warn!(
+                    client_addr = %client_addr,
+                    error = %error,
+                    "Failed to forward request"
+                );
+            }
+
+            Response::builder()
+                .status(hyper::StatusCode::BAD_GATEWAY)
+                .body(Body::empty())
+                .expect("Failed to build proxy error response")
         }
     }
 

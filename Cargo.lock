@@ -3680,7 +3680,6 @@ dependencies = [
  "serde",
  "serde_json",
  "soth-core",
- "soth-registry",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3738,7 +3737,9 @@ name = "soth-collector"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs",
+ "rusqlite",
  "serde",
  "serde_json",
  "soth-core",
@@ -3904,7 +3905,6 @@ dependencies = [
  "soth-observe",
  "soth-oisp",
  "soth-policy",
- "soth-registry",
  "soth-tls",
  "tempfile",
  "thiserror 1.0.69",

@@ -18,9 +18,14 @@ pub struct SpendTracker {
 impl SpendTracker {
     /// Create a new spend tracker
     pub fn new() -> Self {
+        Self::with_pricing_catalog(PricingCatalog::with_defaults())
+    }
+
+    /// Create a spend tracker with an explicit pricing catalog.
+    pub fn with_pricing_catalog(pricing_catalog: PricingCatalog) -> Self {
         Self {
             records: RwLock::new(Vec::new()),
-            pricing_catalog: PricingCatalog::with_defaults(),
+            pricing_catalog,
         }
     }
 
@@ -34,8 +39,37 @@ impl SpendTracker {
         output_tokens: u64,
         method: Option<&str>,
     ) -> SpendRecord {
+        self.record_with_cost(
+            session_id,
+            agent_id,
+            model,
+            input_tokens,
+            output_tokens,
+            method,
+            None,
+        )
+    }
+
+    /// Record a spend event with optional explicit cost override.
+    pub fn record_with_cost(
+        &self,
+        session_id: &str,
+        agent_id: Option<&str>,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        method: Option<&str>,
+        cost_override: Option<f64>,
+    ) -> SpendRecord {
         let usage = TokenUsage::new(input_tokens, output_tokens);
-        let cost = self.pricing_catalog.calculate_cost(model, &usage);
+        let cost = cost_override.unwrap_or_else(|| {
+            self.pricing_catalog
+                .get_pricing(model)
+                .map(|pricing| {
+                    pricing.calculate_cost(usage.input_tokens, usage.output_tokens, None, None)
+                })
+                .unwrap_or(0.0)
+        });
 
         let record = SpendRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -202,13 +236,34 @@ impl BudgetTracker {
         input_tokens: u64,
         output_tokens: u64,
     ) -> SpendRecord {
-        let record = self.spend_tracker.record(
+        self.record_spend_with_cost(
             session_id,
             agent_id,
             model,
             input_tokens,
             output_tokens,
             None,
+        )
+    }
+
+    /// Record spend and update budgets, optionally using explicit cost.
+    pub fn record_spend_with_cost(
+        &self,
+        session_id: &str,
+        agent_id: Option<&str>,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_override: Option<f64>,
+    ) -> SpendRecord {
+        let record = self.spend_tracker.record_with_cost(
+            session_id,
+            agent_id,
+            model,
+            input_tokens,
+            output_tokens,
+            None,
+            cost_override,
         );
 
         // Update global budget
