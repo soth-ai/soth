@@ -91,6 +91,9 @@ pub async fn run(
         pb.finish_and_clear();
     }
 
+    // Best-effort startup refresh: try cloud registry fetch first, then fall back to cache.
+    cloud_hooks::refresh_registry_bundle_on_start(&config).await;
+
     // Auto-enable system proxy when soth proxy starts without extra console noise.
     system::enable_quiet(Some(proxy_config.port)).await?;
 

@@ -18,6 +18,9 @@ pub struct CloudPullRuntime {
 }
 
 #[cfg(feature = "cloud-sync")]
+const STARTUP_REGISTRY_REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(feature = "cloud-sync")]
 const FINAL_CLOUD_SYNC_TIMEOUT: Duration = Duration::from_secs(4);
 #[cfg(feature = "cloud-sync")]
 const FINAL_CLOUD_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -61,6 +64,50 @@ pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(feature = "cloud-sync")]
+pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
+    use soth_sync::registry_puller::RegistryPuller;
+
+    if !config.cloud.enabled {
+        return;
+    }
+
+    let Some(api_key) = config.cloud.api_key.clone() else {
+        warn!("cloud.enabled=true but cloud.api_key is missing; skipping startup registry refresh");
+        return;
+    };
+
+    let cache_path = resolve_cache_path(config);
+    let registry_cache_path = resolve_registry_cache_path(config, &cache_path);
+    let puller = RegistryPuller::new(config.cloud.endpoint.clone(), api_key, registry_cache_path);
+
+    match tokio::time::timeout(STARTUP_REGISTRY_REFRESH_TIMEOUT, puller.refresh_now()).await {
+        Ok(Ok(outcome)) => {
+            info!(
+                checked = outcome.checked,
+                downloaded = outcome.downloaded,
+                bundle_version = outcome.version.as_deref().unwrap_or("unknown"),
+                "Startup registry bundle refresh completed"
+            );
+        }
+        Ok(Err(error)) => {
+            warn!(
+                error = %error,
+                "Startup registry bundle refresh failed; continuing with cached bundle"
+            );
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = STARTUP_REGISTRY_REFRESH_TIMEOUT.as_secs(),
+                "Startup registry bundle refresh timed out; continuing with cached bundle"
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "cloud-sync"))]
+pub async fn refresh_registry_bundle_on_start(_config: &SothConfig) {}
 
 #[cfg(feature = "cloud-sync")]
 pub fn spawn_cloud_pull_runtime(

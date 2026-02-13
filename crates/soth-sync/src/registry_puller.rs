@@ -99,6 +99,49 @@ impl RegistryPuller {
         }
     }
 
+    /// Force a registry refresh attempt against cloud.
+    ///
+    /// Unlike `sync_from_hint`, this always checks cloud version/bundle endpoints
+    /// and uses ETag revalidation to avoid unnecessary downloads.
+    pub async fn refresh_now(&self) -> anyhow::Result<RegistryPullOutcome> {
+        let cached = match cache::load_registry_bundle_cache(&self.cache_path) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed reading cached registry bundle {}; continuing without cache: {}",
+                    self.cache_path.display(),
+                    err
+                );
+                None
+            }
+        };
+
+        let Some(version) = self.fetch_version().await? else {
+            return Ok(RegistryPullOutcome {
+                checked: false,
+                downloaded: false,
+                version: None,
+            });
+        };
+
+        let if_none_match = cached.as_ref().map(|value| value.etag.as_str());
+        match self.fetch_bundle(if_none_match).await? {
+            BundleFetchResult::NotModified => Ok(RegistryPullOutcome {
+                checked: true,
+                downloaded: false,
+                version: Some(version.version),
+            }),
+            BundleFetchResult::Downloaded { bytes, etag } => {
+                cache::save_registry_bundle_cache(&self.cache_path, &version, &etag, &bytes)?;
+                Ok(RegistryPullOutcome {
+                    checked: true,
+                    downloaded: true,
+                    version: Some(version.version),
+                })
+            }
+        }
+    }
+
     async fn fetch_version(&self) -> anyhow::Result<Option<RegistryVersionResponse>> {
         let url = format!("{}/api/v1/registry/version", self.endpoint);
         let response = self

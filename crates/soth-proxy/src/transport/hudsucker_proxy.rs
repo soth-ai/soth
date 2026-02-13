@@ -1318,6 +1318,7 @@ impl AiProxyHandler {
     }
 
     /// Resolve action for host/path using registry engine decisions.
+    /// Falls back to configured host filters when the bundle is unavailable.
     fn get_action(&self, host: &str, path: &str) -> HostAction {
         if matches!(self.hosts.action_for_host(host), HostAction::Block) {
             return HostAction::Block;
@@ -1331,7 +1332,7 @@ impl AiProxyHandler {
                 | InterceptDecision::Tunnel => HostAction::Tunnel,
             }
         } else {
-            HostAction::Tunnel
+            self.hosts.action_for_host(host)
         }
     }
 
@@ -2875,9 +2876,14 @@ where
     let pii_enricher = Arc::new(PiiEventEnricher::from_observe_config(&observe_config));
     let oisp_engine = load_oisp_engine(oisp_registry_cache_path.as_deref());
     if oisp_engine.is_none() {
-        return Err(ProxyError::config(
-            "compiled registry bundle is required for proxy start; run `soth init` (or cloud sync) to populate registry cache",
-        ));
+        let cache_path = oisp_registry_cache_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unset>".to_string());
+        warn!(
+            cache = %cache_path,
+            "Compiled registry bundle unavailable; continuing with configured host filters"
+        );
     }
     let learned_passthrough = if config.tls.learned_passthrough.enabled {
         let learned = Arc::new(LearnedPassthrough::new(
@@ -3120,6 +3126,30 @@ mod tests {
         assert_eq!(
             handler.get_action("api.openai.com", "/v1/chat/completions"),
             HostAction::Tunnel
+        );
+    }
+
+    #[test]
+    fn test_registry_mode_without_bundle_falls_back_to_configured_hosts() {
+        let mut config = ForwardProxyConfig::default();
+        config.registry_mode = RegistryMode::Registry;
+        config.hosts.ai_inference = vec!["api.openai.com".to_string()];
+        config.hosts.mcp = vec!["api.github.com".to_string()];
+        config.hosts.agent_apps = vec!["chatgpt.com".to_string()];
+        let observe = ObserveConfig::default();
+        let handler = AiProxyHandler::new(&config, &observe);
+
+        assert_eq!(
+            handler.get_action("api.openai.com", "/v1/chat/completions"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            handler.get_action("api.github.com", "/mcp"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            handler.get_action("chatgpt.com", "/backend-api/codex/responses"),
+            HostAction::Intercept
         );
     }
 

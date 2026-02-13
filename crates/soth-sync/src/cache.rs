@@ -139,12 +139,15 @@ fn validate_registry_bundle_payload(bundle: &Value) -> anyhow::Result<()> {
         .as_object()
         .context("bundle root must be a JSON object")?;
 
-    if is_compiled_bundle_schema(object) || is_domain_lists_schema(object) {
+    if is_compiled_bundle_schema(object)
+        || is_registry_catalog_schema(object)
+        || is_domain_lists_schema(object)
+    {
         return Ok(());
     }
 
     anyhow::bail!(
-        "bundle payload did not match supported schemas (compiled_bundle or domain_lists)"
+        "bundle payload did not match supported schemas (compiled_bundle, registry_catalog, or domain_lists)"
     );
 }
 
@@ -169,6 +172,23 @@ fn is_domain_lists_schema(object: &Map<String, Value>) -> bool {
     is_string_array_field(object, "ai_inference")
         && is_string_array_field(object, "mcp")
         && is_string_array_field(object, "agent_apps")
+}
+
+fn is_registry_catalog_schema(object: &Map<String, Value>) -> bool {
+    let version_ok = object
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let providers_ok = object
+        .get("providers")
+        .and_then(|value| value.as_object())
+        .is_some();
+    let domain_index_ok = object
+        .get("domain_index")
+        .and_then(|value| value.as_object())
+        .is_some();
+    version_ok && providers_ok && domain_index_ok
 }
 
 fn is_string_array_field(object: &Map<String, Value>, field: &str) -> bool {
@@ -236,6 +256,44 @@ mod tests {
         let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
         assert_eq!(loaded.schema_version, registry_cache_schema_version());
         assert_eq!(loaded.metadata.version, "v1");
+    }
+
+    #[test]
+    fn save_registry_bundle_cache_accepts_registry_catalog_shape() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("catalog-v1");
+        let bundle = serde_json::json!({
+            "version": "catalog-v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "local",
+            "domain_index": {
+                "api.openai.com": {
+                    "category": "ai-inference",
+                    "pattern_type": "exact",
+                    "provider": "openai"
+                }
+            },
+            "providers": {
+                "openai": {
+                    "name": "OpenAI",
+                    "category": "ai-inference",
+                    "api_domains": ["api.openai.com"]
+                }
+            },
+            "interception_patterns": {
+                "api.openai.com": [
+                    { "action": "intercept", "path": "/v1/chat/completions" }
+                ]
+            }
+        });
+
+        save_registry_bundle_cache(&path, &metadata, "etag-1", bundle.to_string().as_bytes())
+            .unwrap();
+
+        let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, registry_cache_schema_version());
+        assert_eq!(loaded.metadata.version, "catalog-v1");
     }
 
     #[test]
