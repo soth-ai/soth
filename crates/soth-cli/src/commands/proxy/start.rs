@@ -140,7 +140,8 @@ pub async fn run(
         "disabled".to_string()
     };
     let runtime_line = format!(
-        "soth proxy | {} | {}",
+        "soth proxy | {} | {} | {}",
+        proxy_config.registry_mode,
         proxy_config.hosts.mode,
         proxy_config.socket_addr()
     );

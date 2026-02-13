@@ -1057,6 +1057,10 @@ pub struct ForwardProxyConfig {
     /// Request timeout for AI providers (streaming can be long)
     #[serde(default = "default_ai_timeout", with = "humantime_serde")]
     pub request_timeout: Duration,
+
+    /// Detection/classification mode during registry migration.
+    #[serde(default)]
+    pub registry_mode: RegistryMode,
 }
 
 fn default_forward_proxy_port() -> u16 {
@@ -1078,6 +1082,7 @@ impl Default for ForwardProxyConfig {
             hosts: HostFilterConfig::default(),
             tls: ForwardProxyTlsConfig::default(),
             request_timeout: default_ai_timeout(),
+            registry_mode: RegistryMode::default(),
         }
     }
 }
@@ -1311,6 +1316,29 @@ pub enum HostFilterMode {
     Selective,
     /// Intercept all non-local hosts (useful for discovery).
     Discovery,
+}
+
+/// Registry migration mode for forward proxy classification/routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryMode {
+    /// Legacy hardcoded detection/parsing behavior.
+    Legacy,
+    /// Legacy behavior + shadow mismatch instrumentation.
+    #[default]
+    Shadow,
+    /// Registry bundle-driven detection/intercept decisions.
+    Registry,
+}
+
+impl std::fmt::Display for RegistryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy => write!(f, "legacy"),
+            Self::Shadow => write!(f, "shadow"),
+            Self::Registry => write!(f, "registry"),
+        }
+    }
 }
 
 impl std::fmt::Display for HostFilterMode {
@@ -2452,6 +2480,7 @@ crypto_identity:
         assert_eq!(config.port, 8080);
         assert_eq!(config.address, "127.0.0.1");
         assert_eq!(config.socket_addr(), "127.0.0.1:8080");
+        assert_eq!(config.registry_mode, RegistryMode::Shadow);
     }
 
     #[test]
@@ -2890,6 +2919,17 @@ forward_proxy:
             config.forward_proxy.hosts.action_for_host("google.com"),
             HostAction::Tunnel
         );
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_registry_mode_yaml() {
+        let yaml = r#"
+forward_proxy:
+  enabled: true
+  registry_mode: registry
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
     }
 
     #[test]
