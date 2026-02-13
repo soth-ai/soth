@@ -289,11 +289,11 @@ fn verify_bundle_integrity(
     if !expected_hash.is_empty() {
         if actual_hash != expected_hash {
             if etag_hash.as_deref() == Some(actual_hash.as_str()) {
-                tracing::warn!(
+                tracing::debug!(
                     metadata_hash = expected_hash,
                     actual_hash = actual_hash,
                     etag_hash = etag_hash.as_deref().unwrap_or_default(),
-                    "registry bundle metadata hash mismatch; accepting bundle because ETag hash matches payload"
+                    "registry bundle metadata hash drift detected; accepting bundle because ETag hash matches payload"
                 );
                 verified.sha256 = actual_hash;
                 verified.size_bytes = bundle_bytes.len() as u64;
@@ -306,10 +306,10 @@ fn verify_bundle_integrity(
             );
         }
         if size_mismatch {
-            tracing::warn!(
+            tracing::debug!(
                 metadata_size = metadata.size_bytes,
                 actual_size = bundle_bytes.len(),
-                "registry bundle metadata size mismatch; accepting bundle because sha256 matched"
+                "registry bundle metadata size drift detected; accepting bundle because sha256 matched"
             );
             verified.size_bytes = bundle_bytes.len() as u64;
         }
@@ -318,11 +318,11 @@ fn verify_bundle_integrity(
 
     if size_mismatch {
         if etag_hash.as_deref() == Some(actual_hash.as_str()) {
-            tracing::warn!(
+            tracing::debug!(
                 metadata_size = metadata.size_bytes,
                 actual_size = bundle_bytes.len(),
                 actual_hash = actual_hash,
-                "registry bundle metadata missing sha256 and has size mismatch; accepting bundle because ETag hash matches payload"
+                "registry bundle metadata missing sha256 and has size drift; accepting bundle because ETag hash matches payload"
             );
             verified.sha256 = actual_hash;
             verified.size_bytes = bundle_bytes.len() as u64;
