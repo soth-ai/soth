@@ -43,6 +43,38 @@ pub struct EventMetadata {
     pub mcp_body_truncated: bool,
     pub mcp_body_preview: Option<String>,
     pub tags: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_envelope: Option<EventEnvelopeMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventClientMetadata {
+    pub pid: Option<u32>,
+    pub bundle_id: Option<String>,
+    pub app_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelopeMetadata {
+    pub envelope_id: Option<String>,
+    pub request_id: Option<String>,
+    pub capture_source: Option<String>,
+    pub source: Option<String>,
+    pub captured_at: Option<String>,
+    pub method: Option<String>,
+    pub provider: Option<String>,
+    pub host: Option<String>,
+    pub path: Option<String>,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub did: Option<String>,
+    pub key_id: Option<String>,
+    pub signature_alg: Option<String>,
+    pub signed_fields_version: Option<String>,
+    pub signature: Option<String>,
+    pub body_hash: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub client: Option<EventClientMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -695,6 +727,7 @@ mod tests {
                 mcp_body_truncated: false,
                 mcp_body_preview: None,
                 tags: None,
+                event_envelope: None,
             }],
         };
 

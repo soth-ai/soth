@@ -8,12 +8,15 @@ use anyhow::Context;
 use base64::Engine as _;
 use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use soth_core::api::{EventBatchRequest, EventError, EventMetadata, HeartbeatRequest};
+use soth_core::api::{
+    EventBatchRequest, EventClientMetadata, EventEnvelopeMetadata, EventError, EventMetadata,
+    HeartbeatRequest,
+};
 use soth_core::event_logger::{
     SYNC_KEY_LAST_BODY_SYNCED_SEQ, SYNC_KEY_LAST_SYNCED_SEQ, SYNC_KEY_LAST_SYNC_TIMESTAMP,
     SYNC_KEY_SYNC_ERRORS,
 };
-use soth_core::types::{EventSource, WrapDirection, WrapEvent};
+use soth_core::types::{CaptureSource, EventSource, TrafficSource, WrapDirection, WrapEvent};
 use soth_observe::PiiRedactor;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -357,6 +360,8 @@ impl SyncAgent {
             || event.response_content_ref.is_some();
 
         let tags = merge_tags(&self.config.global_tags, event.tags.as_ref());
+        let headers = event.headers.as_ref().map(tree_to_hash);
+        let event_envelope = build_event_envelope_metadata(event, headers.as_ref());
 
         EventMetadata {
             id: event.id.clone(),
@@ -384,7 +389,7 @@ impl SyncAgent {
             policy_version: event.policy_version.clone(),
             agent_name: Some(event.agent.name.clone()),
             server_name: Some(event.server_name.clone()),
-            headers: event.headers.as_ref().map(tree_to_hash),
+            headers,
             mcp_tool_name: event.tool_name.clone(),
             mcp_body_truncated: event.source == EventSource::Mcp && has_body,
             mcp_body_preview: event
@@ -393,6 +398,7 @@ impl SyncAgent {
                 .or(event.request_preview.clone())
                 .or(event.response_preview.clone()),
             tags,
+            event_envelope,
         }
     }
 
@@ -647,6 +653,139 @@ fn tree_to_hash(map: &BTreeMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
+fn build_event_envelope_metadata(
+    event: &WrapEvent,
+    headers: Option<&HashMap<String, String>>,
+) -> Option<EventEnvelopeMetadata> {
+    let envelope = event.traffic_envelope.as_ref()?;
+    let client_bundle_id = infer_bundle_id(envelope.process_executable.as_deref());
+    let client = build_client_metadata(
+        envelope.process_pid,
+        client_bundle_id,
+        infer_app_type(
+            envelope.process_name.as_deref(),
+            envelope.process_executable.as_deref(),
+        ),
+    );
+
+    Some(EventEnvelopeMetadata {
+        envelope_id: Some(envelope.envelope_id.clone()),
+        request_id: envelope.request_id.clone(),
+        capture_source: Some(match envelope.capture_source {
+            CaptureSource::Proxy => "proxy".to_string(),
+            CaptureSource::Wrap => "wrap".to_string(),
+        }),
+        source: Some(match envelope.source {
+            TrafficSource::ProxyHudsucker => "proxy_hudsucker".to_string(),
+            TrafficSource::McpStdio => "mcp_stdio".to_string(),
+            TrafficSource::McpHttp => "mcp_http".to_string(),
+        }),
+        captured_at: Some(envelope.captured_at.to_rfc3339()),
+        method: Some(envelope.method.clone()),
+        provider: envelope.provider.clone(),
+        host: envelope.host.clone(),
+        path: envelope.path.clone(),
+        model: envelope.model.clone(),
+        agent: envelope.agent.clone(),
+        did: envelope.did.clone(),
+        key_id: envelope.key_id.clone(),
+        signature_alg: envelope.signature_alg.clone(),
+        signed_fields_version: envelope.signed_fields_version.clone(),
+        signature: envelope.signature.clone(),
+        body_hash: envelope.body_hash.clone(),
+        headers: headers.cloned(),
+        client,
+    })
+}
+
+fn build_client_metadata(
+    pid: Option<u32>,
+    bundle_id: Option<String>,
+    app_type: Option<String>,
+) -> Option<EventClientMetadata> {
+    if pid.is_none() && bundle_id.is_none() && app_type.is_none() {
+        return None;
+    }
+    Some(EventClientMetadata {
+        pid,
+        bundle_id,
+        app_type,
+    })
+}
+
+fn infer_bundle_id(process_executable: Option<&str>) -> Option<String> {
+    let executable = process_executable?.trim();
+    if executable.is_empty() {
+        return None;
+    }
+
+    let lower = executable.to_ascii_lowercase();
+    if let Some(idx) = lower.find(".app/") {
+        let app_root = &executable[..idx + 4];
+        let app_name = app_root
+            .rsplit('/')
+            .next()
+            .unwrap_or(app_root)
+            .trim_end_matches(".app")
+            .trim();
+        if app_name.is_empty() {
+            return None;
+        }
+        return Some(format!("macos.{}", slug_token(app_name)));
+    }
+
+    if lower.ends_with(".app") {
+        let app_name = executable
+            .rsplit('/')
+            .next()
+            .unwrap_or(executable)
+            .trim_end_matches(".app")
+            .trim();
+        if app_name.is_empty() {
+            return None;
+        }
+        return Some(format!("macos.{}", slug_token(app_name)));
+    }
+
+    None
+}
+
+fn infer_app_type(process_name: Option<&str>, process_executable: Option<&str>) -> Option<String> {
+    if process_name.is_none() && process_executable.is_none() {
+        return None;
+    }
+
+    if infer_bundle_id(process_executable).is_some() {
+        return Some("desktop_app".to_string());
+    }
+
+    let name_lc = process_name.unwrap_or("").to_ascii_lowercase();
+    let exe_lc = process_executable.unwrap_or("").to_ascii_lowercase();
+    if name_lc.contains("daemon")
+        || name_lc.contains("service")
+        || exe_lc.contains("/launchd")
+        || exe_lc.contains("systemd")
+    {
+        return Some("service".to_string());
+    }
+
+    Some("cli".to_string())
+}
+
+fn slug_token(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
 fn load_retry_payload(payload_b64: &Option<String>, path: Option<&PathBuf>) -> Option<Vec<u8>> {
     if let Some(encoded) = payload_b64.as_ref() {
         if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
@@ -661,4 +800,77 @@ fn resolve_hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soth_core::types::{AgentInfo, DetectionSource, TrafficEnvelope};
+
+    #[test]
+    fn infer_bundle_and_app_type_for_macos_app_paths() {
+        let executable = Some("/Applications/Cursor.app/Contents/MacOS/Cursor");
+        assert_eq!(
+            infer_bundle_id(executable).as_deref(),
+            Some("macos.cursor")
+        );
+        assert_eq!(
+            infer_app_type(Some("Cursor"), executable).as_deref(),
+            Some("desktop_app")
+        );
+    }
+
+    #[test]
+    fn infer_app_type_for_cli_paths() {
+        let executable = Some("/usr/local/bin/codex");
+        assert_eq!(infer_bundle_id(executable), None);
+        assert_eq!(
+            infer_app_type(Some("codex"), executable).as_deref(),
+            Some("cli")
+        );
+    }
+
+    #[test]
+    fn event_envelope_metadata_includes_client_and_headers() {
+        let mut event = WrapEvent::new(
+            "session-1",
+            "chatgpt.com",
+            WrapDirection::Out,
+            AgentInfo::new("codex", DetectionSource::CommandLine),
+        )
+        .with_source(EventSource::AgentApp);
+        let mut envelope = TrafficEnvelope::proxy(
+            "session-1",
+            "request-1",
+            "chatgpt",
+            "chatgpt.com",
+            "POST",
+            "/backend-api/codex/responses",
+            Some("gpt-5.3-codex"),
+            Some("codex"),
+            None,
+            None,
+            None,
+        );
+        envelope.process_pid = Some(4242);
+        envelope.process_name = Some("Cursor".to_string());
+        envelope.process_executable = Some("/Applications/Cursor.app/Contents/MacOS/Cursor".into());
+        event = event.with_traffic_envelope(envelope);
+
+        let mut headers = HashMap::new();
+        headers.insert("x-request-id".to_string(), "req_123".to_string());
+        let mapped = build_event_envelope_metadata(&event, Some(&headers)).expect("envelope");
+        let client = mapped.client.expect("client");
+        assert_eq!(client.pid, Some(4242));
+        assert_eq!(client.bundle_id.as_deref(), Some("macos.cursor"));
+        assert_eq!(client.app_type.as_deref(), Some("desktop_app"));
+        assert_eq!(
+            mapped
+                .headers
+                .as_ref()
+                .and_then(|h| h.get("x-request-id"))
+                .map(String::as_str),
+            Some("req_123")
+        );
+    }
 }
