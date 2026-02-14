@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use soth_core::event_logger::default_event_log_write_path;
+use soth_core::types::exchange_v2::{ExchangeEventV2, ExchangeSourceClass};
 use soth_core::types::{EventSource, WrapDirection, WrapEvent};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1052,6 +1053,12 @@ fn project_sqlite_events_once(db_path: &Path) -> std::io::Result<i64> {
     let tx = conn.transaction().map_err(to_io_err)?;
     ensure_projection_version(&tx)?;
 
+    if has_exchange_events(&tx)? {
+        let projected_exchange_seq = project_sqlite_exchange_rows(&tx)?;
+        tx.commit().map_err(to_io_err)?;
+        return Ok(projected_exchange_seq);
+    }
+
     let mut projected_seq: i64 = tx
         .query_row(
             "SELECT value FROM projection_meta WHERE key = 'last_projected_seq'",
@@ -1113,6 +1120,85 @@ fn project_sqlite_events_once(db_path: &Path) -> std::io::Result<i64> {
     Ok(projected_seq)
 }
 
+fn has_exchange_events(tx: &rusqlite::Transaction<'_>) -> std::io::Result<bool> {
+    let table_exists = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'exchange_events' LIMIT 1",
+            [],
+            |_row| Ok(true),
+        )
+        .optional()
+        .map_err(to_io_err)?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(false);
+    }
+
+    let count: i64 = tx
+        .query_row("SELECT COUNT(*) FROM exchange_events", [], |row| row.get(0))
+        .map_err(to_io_err)?;
+    Ok(count > 0)
+}
+
+fn project_sqlite_exchange_rows(tx: &rusqlite::Transaction<'_>) -> std::io::Result<i64> {
+    let mut projected_seq: i64 = tx
+        .query_row(
+            "SELECT value FROM projection_meta WHERE key = 'last_projected_exchange_seq'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_io_err)?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let mut queued_rows: Vec<(i64, String)> = Vec::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                r#"
+                SELECT seq, event_json
+                FROM exchange_events
+                WHERE seq > ?1
+                ORDER BY seq ASC
+                "#,
+            )
+            .map_err(to_io_err)?;
+
+        let rows = stmt
+            .query_map([projected_seq], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_err)?;
+
+        for row in rows {
+            queued_rows.push(row.map_err(to_io_err)?);
+        }
+    }
+
+    for (seq, event_json) in queued_rows {
+        let Ok(event) = serde_json::from_str::<ExchangeEventV2>(&event_json) else {
+            continue;
+        };
+        update_rollup_1m_from_exchange(tx, &event)?;
+        projected_seq = seq.max(projected_seq);
+    }
+
+    tx.execute(
+        r#"
+        INSERT INTO projection_meta (key, value, updated_at)
+        VALUES ('last_projected_exchange_seq', ?1, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = CURRENT_TIMESTAMP
+        "#,
+        [projected_seq.to_string()],
+    )
+    .map_err(to_io_err)?;
+
+    Ok(projected_seq)
+}
+
 fn ensure_projection_version(tx: &rusqlite::Transaction<'_>) -> std::io::Result<()> {
     let current_version = tx
         .query_row(
@@ -1142,6 +1228,18 @@ fn ensure_projection_version(tx: &rusqlite::Transaction<'_>) -> std::io::Result<
         r#"
         INSERT INTO projection_meta (key, value, updated_at)
         VALUES ('last_projected_seq', '0', CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = CURRENT_TIMESTAMP
+        "#,
+        [],
+    )
+    .map_err(to_io_err)?;
+
+    tx.execute(
+        r#"
+        INSERT INTO projection_meta (key, value, updated_at)
+        VALUES ('last_projected_exchange_seq', '0', CURRENT_TIMESTAMP)
         ON CONFLICT(key) DO UPDATE SET
           value = excluded.value,
           updated_at = CURRENT_TIMESTAMP
@@ -1264,6 +1362,69 @@ fn update_rollup_1m(tx: &rusqlite::Transaction<'_>, event: &WrapEvent) -> std::i
         .or_else(|| Some(event.input_tokens.unwrap_or(0) + event.output_tokens.unwrap_or(0)))
         .unwrap_or(0) as i64;
     let total_cost = event.cost_usd.unwrap_or(0.0_f64);
+
+    tx.execute(
+        r#"
+        INSERT INTO rollups_1m (
+            bucket_start, source, provider, agent, total_events,
+            requests, responses, error_events, pii_events, total_tokens, total_cost_usd
+        )
+        VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(bucket_start, source, provider, agent) DO UPDATE SET
+            total_events = total_events + 1,
+            requests = requests + excluded.requests,
+            responses = responses + excluded.responses,
+            error_events = error_events + excluded.error_events,
+            pii_events = pii_events + excluded.pii_events,
+            total_tokens = total_tokens + excluded.total_tokens,
+            total_cost_usd = total_cost_usd + excluded.total_cost_usd
+        "#,
+        params![
+            bucket_start,
+            source,
+            provider,
+            agent,
+            requests,
+            responses,
+            error_events,
+            pii_events,
+            total_tokens,
+            total_cost
+        ],
+    )
+    .map_err(to_io_err)?;
+
+    Ok(())
+}
+
+fn update_rollup_1m_from_exchange(
+    tx: &rusqlite::Transaction<'_>,
+    event: &ExchangeEventV2,
+) -> std::io::Result<()> {
+    let bucket_start = event.observed_at.format("%Y-%m-%dT%H:%M:00Z").to_string();
+    let source = match event.source_class {
+        ExchangeSourceClass::AiInference => "ai_proxy",
+        ExchangeSourceClass::AgentApp => "agent_app",
+        ExchangeSourceClass::Mcp => "mcp",
+        ExchangeSourceClass::Collector => "agent_app",
+    };
+    let provider = event.provider.as_deref().unwrap_or("unknown");
+    let agent = event.agent.as_deref().unwrap_or("unknown");
+    let requests = 1_i64;
+    let responses = if event.status_code.is_some() { 1_i64 } else { 0_i64 };
+    let error_events = if event.status_code.map(|code| code >= 400).unwrap_or(false) {
+        1_i64
+    } else {
+        0_i64
+    };
+    let pii_events = if event.flags.pii_detected { 1_i64 } else { 0_i64 };
+    let total_tokens =
+        (event.usage.input_tokens.unwrap_or(0) + event.usage.output_tokens.unwrap_or(0)) as i64;
+    let total_cost = event
+        .cost
+        .as_ref()
+        .map(|cost| cost.estimated_usd)
+        .unwrap_or(0.0_f64);
 
     tx.execute(
         r#"
@@ -1521,6 +1682,15 @@ fn ensure_wrap_events_schema(conn: &Connection) -> std::io::Result<()> {
             PRIMARY KEY (event_id, payload_kind)
         );
 
+        CREATE TABLE IF NOT EXISTS exchange_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange_id TEXT NOT NULL UNIQUE,
+            observed_at TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS projection_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -1618,6 +1788,7 @@ fn ensure_wrap_events_schema(conn: &Connection) -> std::io::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_event_pairs_session ON event_pairs(session_id, request_seq DESC);
         CREATE INDEX IF NOT EXISTS idx_event_clusters_request_seq ON event_clusters(request_seq DESC);
         CREATE INDEX IF NOT EXISTS idx_rollups_1m_bucket ON rollups_1m(bucket_start DESC);
+        CREATE INDEX IF NOT EXISTS idx_exchange_events_observed_at ON exchange_events(observed_at DESC);
         CREATE INDEX IF NOT EXISTS idx_merkle_batches_sealed_at ON merkle_batches(sealed_at DESC);
         CREATE INDEX IF NOT EXISTS idx_key_versions_status ON key_versions(status, created_at DESC);
         "#,

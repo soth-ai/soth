@@ -581,6 +581,22 @@ impl EventLogger {
         blobs_json: Option<&str>,
     ) -> std::io::Result<()> {
         let conn = self.open_sqlite_metadata_conn()?;
+        let observed_at =
+            extract_exchange_observed_at(payload_json).unwrap_or_else(|| Utc::now().to_rfc3339());
+        conn.execute(
+            r#"
+            INSERT INTO exchange_events (
+                exchange_id, observed_at, event_json, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT(exchange_id) DO UPDATE SET
+                observed_at = excluded.observed_at,
+                event_json = excluded.event_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![exchange_id, observed_at, payload_json],
+        )
+        .map_err(to_io_err)?;
         conn.execute(
             r#"
             INSERT INTO exchange_upload_queue (
@@ -823,6 +839,19 @@ fn init_sqlite_schema(conn: &Connection) -> std::io::Result<()> {
             ON wrap_events((json_extract(event_json, '$.merkle_batch_id')));
         CREATE INDEX IF NOT EXISTS idx_wrap_event_payloads_event_id
             ON wrap_event_payloads(event_id);
+
+        CREATE TABLE IF NOT EXISTS exchange_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange_id TEXT NOT NULL UNIQUE,
+            observed_at TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_events_observed_at
+            ON exchange_events(observed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_exchange_events_updated_at
+            ON exchange_events(updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS merkle_batches (
             batch_id TEXT PRIMARY KEY,
@@ -1310,6 +1339,14 @@ fn hex_decode_32(value: &str) -> std::io::Result<[u8; 32]> {
 
 fn to_io_err(error: rusqlite::Error) -> std::io::Error {
     std::io::Error::other(error.to_string())
+}
+
+fn extract_exchange_observed_at(payload_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(payload_json).ok()?;
+    value
+        .get("observed_at")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
 }
 
 #[cfg(test)]
