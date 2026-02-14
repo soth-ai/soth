@@ -111,6 +111,10 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     println!("  {}", "soth proxy ui start".bold());
     println!(
         "  {}",
+        "soth proxy profile start --profile dev-stack".bold()
+    );
+    println!(
+        "  {}",
         format!(
             "soth attach --api-url http://127.0.0.1:{}",
             config.dashboard.port

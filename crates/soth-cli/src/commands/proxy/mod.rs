@@ -7,6 +7,7 @@
 //! - `soth proxy start` - Start sensor-only proxy runtime
 //! - `soth proxy api start` - Start API/WebSocket service
 //! - `soth proxy ui start` - Start UI dev service
+//! - `soth proxy profile start` - Start runtime profile (sensor/api/ui/dev stack)
 //! - `soth proxy env` - Output environment variables
 //! - `soth proxy status` - Show proxy status
 //! - `soth proxy ca-info` - Show CA certificate info
@@ -22,6 +23,7 @@ mod circuit;
 mod connections;
 mod env;
 mod metrics;
+mod profile;
 mod ratelimit;
 mod retention;
 mod setup_ca;
@@ -86,6 +88,12 @@ pub enum ProxyCommands {
     Ui {
         #[command(subcommand)]
         action: UiAction,
+    },
+
+    /// Runtime profile management (sensor/api/ui/dev stack)
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
     },
 
     /// Output shell environment variables for proxy configuration
@@ -191,6 +199,41 @@ pub enum UiAction {
     },
 }
 
+/// Runtime profile actions
+#[derive(Subcommand)]
+pub enum ProfileAction {
+    /// Start one of the runtime profiles
+    Start {
+        /// Runtime profile to launch
+        #[arg(long, default_value = "sensor-only")]
+        profile: profile::RuntimeProfile,
+
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Sensor port override
+        #[arg(long)]
+        sensor_port: Option<u16>,
+
+        /// API port override
+        #[arg(long)]
+        api_port: Option<u16>,
+
+        /// UI working directory (defaults to ./dashboard)
+        #[arg(long)]
+        ui_dir: Option<PathBuf>,
+
+        /// For dev-stack profile, skip launching UI
+        #[arg(long)]
+        no_ui: bool,
+
+        /// Suppress startup helper lines
+        #[arg(short, long)]
+        quiet: bool,
+    },
+}
+
 /// Circuit breaker actions
 #[derive(Subcommand)]
 pub enum CircuitAction {
@@ -248,6 +291,28 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
                 dir,
                 quiet,
             } => ui::run_start(config.or(global_config.clone()), api_port, dir, quiet).await,
+        },
+        ProxyCommands::Profile { action } => match action {
+            ProfileAction::Start {
+                profile,
+                config,
+                sensor_port,
+                api_port,
+                ui_dir,
+                no_ui,
+                quiet,
+            } => {
+                profile::run_start(
+                    profile,
+                    sensor_port,
+                    api_port,
+                    config.or(global_config.clone()),
+                    ui_dir,
+                    no_ui,
+                    quiet,
+                )
+                .await
+            }
         },
         ProxyCommands::Env {
             shell,
