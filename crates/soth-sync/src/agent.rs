@@ -2,20 +2,23 @@ use crate::body_uploader::BodyUploader;
 use crate::cache;
 use crate::config_puller::ConfigPuller;
 use crate::heartbeat::HeartbeatSender;
-use crate::metadata_pusher::{estimate_gzip_batch_size, MetadataPusher};
+use crate::metadata_pusher::{
+    estimate_gzip_batch_size, estimate_gzip_exchange_batch_size, MetadataPusher,
+};
 use crate::retry_queue::{BodyRetryQueue, RetryQueueEntry};
 use anyhow::Context;
 use base64::Engine as _;
 use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use soth_core::api::{
-    EventBatchRequest, EventClientMetadata, EventEnvelopeMetadata, EventError, EventMetadata,
-    HeartbeatRequest,
+    BlobUploadRequest, EventBatchRequest, EventClientMetadata, EventEnvelopeMetadata, EventError,
+    EventMetadata, ExchangeBatchRequest, ExchangeMetadata, HeartbeatRequest,
 };
 use soth_core::event_logger::{
     SYNC_KEY_LAST_BODY_SYNCED_SEQ, SYNC_KEY_LAST_SYNCED_SEQ, SYNC_KEY_LAST_SYNC_TIMESTAMP,
     SYNC_KEY_SYNC_ERRORS,
 };
+use soth_core::types::exchange_v2::{ExchangeBodyMode, ExchangeEventV2};
 use soth_core::types::{CaptureSource, EventSource, TrafficSource, WrapDirection, WrapEvent};
 use soth_observe::PiiRedactor;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,6 +31,8 @@ const MAX_RETRY_UPLOADS_PER_TICK: usize = 32;
 const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
 const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
 const DEFAULT_BODY_UPLOAD_MAX_BYTES: usize = 15 * 1024 * 1024;
+const MAX_EXCHANGE_RETRY_BACKOFF_SECS: u64 = 15 * 60;
+const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
 
 #[derive(Clone)]
 pub struct SyncAgentConfig {
@@ -64,6 +69,8 @@ pub struct SyncTickSummary {
     pub metadata_sent: usize,
     pub body_uploaded: usize,
     pub retry_uploaded: usize,
+    pub exchange_sent: usize,
+    pub exchange_blob_uploaded: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +92,33 @@ struct BodySyncRow {
 struct LoadedRows<T> {
     rows: Vec<T>,
     max_seq_seen: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ExchangeQueueRow {
+    exchange_id: String,
+    payload_json: String,
+    blobs_json: Option<String>,
+    attempt_count: u32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ExchangeBlobQueueItem {
+    side: String,
+    reference: String,
+    content_encoding: String,
+    content_type: Option<String>,
+    sha256: String,
+    bytes_raw: u64,
+    bytes_gzip: u64,
+    payload_gzip_b64: String,
+}
+
+#[derive(Debug, Clone)]
+enum ExchangeQueueOutcome {
+    Synced { blob_uploaded: usize },
+    Retry { reason: String },
+    Drop { reason: String },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,6 +184,7 @@ impl SyncAgent {
 
     pub async fn tick(&self) -> anyhow::Result<SyncTickSummary> {
         let metadata_sent = self.sync_metadata_once().await?;
+        let (exchange_sent, exchange_blob_uploaded) = self.sync_exchange_queue_once().await?;
 
         let mut retry_uploaded = 0;
         let mut body_uploaded = 0;
@@ -162,6 +197,8 @@ impl SyncAgent {
             metadata_sent,
             body_uploaded,
             retry_uploaded,
+            exchange_sent,
+            exchange_blob_uploaded,
         })
     }
 
@@ -178,10 +215,14 @@ impl SyncAgent {
             total.metadata_sent += summary.metadata_sent;
             total.body_uploaded += summary.body_uploaded;
             total.retry_uploaded += summary.retry_uploaded;
+            total.exchange_sent += summary.exchange_sent;
+            total.exchange_blob_uploaded += summary.exchange_blob_uploaded;
 
             if summary.metadata_sent == 0
                 && summary.body_uploaded == 0
                 && summary.retry_uploaded == 0
+                && summary.exchange_sent == 0
+                && summary.exchange_blob_uploaded == 0
             {
                 break;
             }
@@ -380,6 +421,160 @@ impl SyncAgent {
                 }
             }
             None => Ok(MetadataPushResult::default()),
+        }
+    }
+
+    async fn sync_exchange_queue_once(&self) -> anyhow::Result<(usize, usize)> {
+        let rows = self.load_exchange_queue_ready(self.config.metadata_max_events_per_batch)?;
+        if rows.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let mut exchange_sent = 0usize;
+        let mut blob_uploaded = 0usize;
+        let config_version = self.cached_config_version();
+
+        for row in rows {
+            match self
+                .process_exchange_queue_row(&row, config_version.as_ref())
+                .await
+            {
+                Ok(ExchangeQueueOutcome::Synced {
+                    blob_uploaded: uploaded,
+                }) => {
+                    self.delete_exchange_queue_entry(&row.exchange_id)?;
+                    exchange_sent += 1;
+                    blob_uploaded += uploaded;
+                }
+                Ok(ExchangeQueueOutcome::Retry { reason }) => {
+                    self.mark_exchange_queue_attempt(&row.exchange_id, row.attempt_count)?;
+                    warn!(
+                        exchange_id = %row.exchange_id,
+                        attempt = row.attempt_count.saturating_add(1),
+                        reason = %reason,
+                        "Exchange upload deferred with retry backoff"
+                    );
+                }
+                Ok(ExchangeQueueOutcome::Drop { reason }) => {
+                    warn!(
+                        exchange_id = %row.exchange_id,
+                        reason = %reason,
+                        "Dropping malformed exchange upload entry"
+                    );
+                    self.delete_exchange_queue_entry(&row.exchange_id)?;
+                }
+                Err(error) => {
+                    self.mark_exchange_queue_attempt(&row.exchange_id, row.attempt_count)?;
+                    self.set_sync_error(&format!(
+                        "exchange_upload_error:{}:{}",
+                        row.exchange_id, error
+                    ))?;
+                    return Err(error);
+                }
+            }
+        }
+
+        if exchange_sent > 0 {
+            self.mark_sync_success()?;
+        }
+        Ok((exchange_sent, blob_uploaded))
+    }
+
+    async fn process_exchange_queue_row(
+        &self,
+        row: &ExchangeQueueRow,
+        config_version: Option<&String>,
+    ) -> anyhow::Result<ExchangeQueueOutcome> {
+        let mut event = match serde_json::from_str::<ExchangeEventV2>(&row.payload_json) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(ExchangeQueueOutcome::Drop {
+                    reason: format!("invalid_exchange_payload:{error}"),
+                });
+            }
+        };
+
+        let blobs = match row.blobs_json.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => {
+                match serde_json::from_str::<Vec<ExchangeBlobQueueItem>>(raw) {
+                    Ok(items) => items,
+                    Err(error) => {
+                        return Ok(ExchangeQueueOutcome::Drop {
+                            reason: format!("invalid_blob_payload:{error}"),
+                        });
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+
+        let mut blob_uploaded = 0usize;
+        for blob in blobs {
+            let request = BlobUploadRequest {
+                exchange_id: row.exchange_id.clone(),
+                side: blob.side.clone(),
+                reference: Some(blob.reference.clone()),
+                content_encoding: Some(blob.content_encoding.clone()),
+                content_type: blob.content_type.clone(),
+                sha256: Some(blob.sha256.clone()),
+                bytes_raw: Some(blob.bytes_raw),
+                bytes_gzip: Some(blob.bytes_gzip),
+                payload_gzip_b64: Some(blob.payload_gzip_b64.clone()),
+            };
+            match self.body_uploader.upload_blob(&request).await? {
+                Some(response) if response.stored => {
+                    blob_uploaded += 1;
+                    let resolved_reference = response
+                        .key
+                        .or(response.blob_key)
+                        .unwrap_or(blob.reference.clone());
+                    match blob.side.to_ascii_lowercase().as_str() {
+                        "request" => event.request.body.reference = Some(resolved_reference),
+                        "response" => event.response.body.reference = Some(resolved_reference),
+                        _ => {}
+                    }
+                }
+                Some(_) => {
+                    return Ok(ExchangeQueueOutcome::Retry {
+                        reason: "blob_upload_rejected".to_string(),
+                    });
+                }
+                None => {
+                    return Ok(ExchangeQueueOutcome::Retry {
+                        reason: "blob_upload_non_success_status".to_string(),
+                    });
+                }
+            }
+        }
+
+        let mut metadata = exchange_event_to_metadata(&event);
+        metadata.tags = merge_tags_for_exchange(&self.config.global_tags, event.tags.as_ref());
+
+        let request = ExchangeBatchRequest {
+            agent_instance_id: self.config.agent_instance_id.clone(),
+            config_version: config_version.cloned(),
+            batch: vec![metadata],
+        };
+        let compressed_size = estimate_gzip_exchange_batch_size(&request)?;
+        if compressed_size > self.config.metadata_max_compressed_batch_bytes {
+            return Ok(ExchangeQueueOutcome::Retry {
+                reason: format!(
+                    "compressed_batch_limit:{}>{}",
+                    compressed_size, self.config.metadata_max_compressed_batch_bytes
+                ),
+            });
+        }
+
+        match self.metadata_pusher.push_exchange_batch(&request).await? {
+            Some(response) if response.rejected == 0 => Ok(ExchangeQueueOutcome::Synced {
+                blob_uploaded,
+            }),
+            Some(response) => Ok(ExchangeQueueOutcome::Retry {
+                reason: format!("exchange_rejected_count={}", response.rejected),
+            }),
+            None => Ok(ExchangeQueueOutcome::Retry {
+                reason: "exchange_upload_non_success_status".to_string(),
+            }),
         }
     }
 
@@ -722,6 +917,104 @@ impl SyncAgent {
         Ok(loaded)
     }
 
+    fn load_exchange_queue_ready(&self, limit: usize) -> anyhow::Result<Vec<ExchangeQueueRow>> {
+        let conn = open_read_conn(&self.config.event_db_path)?;
+        let mut stmt = match conn.prepare(
+            r#"
+            SELECT exchange_id, payload_json, blobs_json, attempt_count
+            FROM exchange_upload_queue
+            WHERE next_attempt_at IS NULL
+               OR next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ORDER BY updated_at ASC
+            LIMIT ?1
+            "#,
+        ) {
+            Ok(stmt) => stmt,
+            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => {
+                return Ok(Vec::new());
+            }
+            Err(error) if is_missing_column_error(&error, "blobs_json") => {
+                let mut fallback_stmt = conn.prepare(
+                    r#"
+                    SELECT exchange_id, payload_json, attempt_count
+                    FROM exchange_upload_queue
+                    WHERE next_attempt_at IS NULL
+                       OR next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ORDER BY updated_at ASC
+                    LIMIT ?1
+                    "#,
+                )?;
+                let mut rows = fallback_stmt.query([limit.max(1) as i64])?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let attempt_count_i64: i64 = row.get(2)?;
+                    out.push(ExchangeQueueRow {
+                        exchange_id: row.get(0)?,
+                        payload_json: row.get(1)?,
+                        blobs_json: None,
+                        attempt_count: attempt_count_i64.max(0) as u32,
+                    });
+                }
+                return Ok(out);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut rows = stmt.query([limit.max(1) as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let attempt_count_i64: i64 = row.get(3)?;
+            out.push(ExchangeQueueRow {
+                exchange_id: row.get(0)?,
+                payload_json: row.get(1)?,
+                blobs_json: row.get(2)?,
+                attempt_count: attempt_count_i64.max(0) as u32,
+            });
+        }
+        Ok(out)
+    }
+
+    fn mark_exchange_queue_attempt(
+        &self,
+        exchange_id: &str,
+        attempt_count: u32,
+    ) -> anyhow::Result<()> {
+        let conn = open_rw_conn(&self.config.event_db_path)?;
+        let shift = attempt_count.min(20);
+        let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+        let retry_secs = EXCHANGE_RETRY_BASE_SECS
+            .saturating_mul(multiplier)
+            .min(MAX_EXCHANGE_RETRY_BACKOFF_SECS)
+            .max(1);
+
+        match conn.execute(
+            r#"
+            UPDATE exchange_upload_queue
+            SET attempt_count = attempt_count + 1,
+                next_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('+%d seconds', ?2)),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE exchange_id = ?1
+            "#,
+            params![exchange_id, retry_secs as i64],
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn delete_exchange_queue_entry(&self, exchange_id: &str) -> anyhow::Result<()> {
+        let conn = open_rw_conn(&self.config.event_db_path)?;
+        match conn.execute(
+            "DELETE FROM exchange_upload_queue WHERE exchange_id = ?1",
+            [exchange_id],
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn body_upload_allowed(&self) -> bool {
         if !self.config.body_upload_enabled {
             return false;
@@ -972,6 +1265,213 @@ fn metadata_only_body_upload_reason(event: &WrapEvent) -> Option<&'static str> {
     }
 
     None
+}
+
+fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
+    ExchangeMetadata {
+        exchange_id: event.exchange_id.clone(),
+        schema_version: event.schema_version.clone(),
+        observed_at: event.observed_at.to_rfc3339(),
+        started_at: event.started_at.map(|value| value.to_rfc3339()),
+        completed_at: event.completed_at.map(|value| value.to_rfc3339()),
+        duration_ms: event.duration_ms,
+        ttfb_ms: event.ttfb_ms,
+        trace_id: event.trace_id.clone(),
+        span_id: event.span_id.clone(),
+        parent_span_id: event.parent_span_id.clone(),
+        source_class: exchange_source_class_to_str(event.source_class).to_string(),
+        transport: exchange_transport_to_str(event.transport).to_string(),
+        provider: event.provider.clone(),
+        agent: event.agent.clone(),
+        model: event.model.clone(),
+        endpoint: event.endpoint.clone(),
+        method: event.method.clone(),
+        status_code: event.status_code,
+        input_tokens: event.usage.input_tokens,
+        output_tokens: event.usage.output_tokens,
+        cache_read_tokens: event.usage.cache_read_tokens,
+        cache_write_tokens: event.usage.cache_write_tokens,
+        reasoning_tokens: event.usage.reasoning_tokens,
+        cost_usd: event.cost.as_ref().map(|cost| cost.estimated_usd),
+        cost_currency: event.cost.as_ref().map(|cost| cost.currency.clone()),
+        pricing_version: event.cost.as_ref().and_then(|cost| cost.pricing_version.clone()),
+        request_size_bytes: event.request.body.bytes_raw,
+        response_size_bytes: event.response.body.bytes_raw,
+        request_body_mode: Some(exchange_body_mode_to_str(event.request.body.mode).to_string()),
+        response_body_mode: Some(exchange_body_mode_to_str(event.response.body.mode).to_string()),
+        request_body_ref: event.request.body.reference.clone(),
+        response_body_ref: event.response.body.reference.clone(),
+        request_body_sha256: event.request.body.sha256.clone(),
+        response_body_sha256: event.response.body.sha256.clone(),
+        truncated: event.flags.truncated,
+        metadata_only: event.flags.metadata_only,
+        discovery_capture: event.flags.discovery_capture,
+        blacklist_match: event.flags.blacklist_match,
+        pii_detected: event.flags.pii_detected,
+        pii_types: Vec::new(),
+        event_hash: event.integrity.as_ref().and_then(|value| value.event_hash.clone()),
+        signature: event.integrity.as_ref().and_then(|value| value.signature.clone()),
+        signature_key_id: event
+            .integrity
+            .as_ref()
+            .and_then(|value| value.signature_key_id.clone()),
+        parser_version: event.parse.as_ref().and_then(|value| value.parser_version.clone()),
+        bundle_version: event.parse.as_ref().and_then(|value| value.bundle_version.clone()),
+        parse_confidence: event.parse.as_ref().and_then(|value| value.parse_confidence),
+        detection_reason: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.detection_reason.clone()),
+        tags: event.tags.as_ref().map(tree_to_hash),
+        event_envelope: build_exchange_event_envelope_metadata(event),
+    }
+}
+
+fn merge_tags_for_exchange(
+    global_tags: &BTreeMap<String, String>,
+    event_tags: Option<&BTreeMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    merge_tags(global_tags, event_tags)
+}
+
+fn build_exchange_event_envelope_metadata(event: &ExchangeEventV2) -> Option<EventEnvelopeMetadata> {
+    let (host, path) = split_endpoint_host_path(event.endpoint.as_deref());
+    let client = event.client.as_ref().map(|value| EventClientMetadata {
+        pid: value.pid,
+        bundle_id: value.bundle_id.clone(),
+        process_name: value.process_name.clone(),
+        process_executable: None,
+        app_type: value.app_type.clone(),
+    });
+    let headers = event
+        .request
+        .headers
+        .as_ref()
+        .or(event.response.headers.as_ref())
+        .map(tree_to_hash);
+
+    if host.is_none() && path.is_none() && client.is_none() && headers.is_none() {
+        return None;
+    }
+
+    Some(EventEnvelopeMetadata {
+        envelope_id: None,
+        request_id: event.trace_id.clone(),
+        capture_source: Some(match event.source_class {
+            soth_core::types::exchange_v2::ExchangeSourceClass::Mcp => "wrap".to_string(),
+            _ => "proxy".to_string(),
+        }),
+        source: Some(exchange_transport_to_str(event.transport).to_string()),
+        captured_at: Some(event.observed_at.to_rfc3339()),
+        method: event.method.clone(),
+        provider: event.provider.clone(),
+        host,
+        path,
+        model: event.model.clone(),
+        agent: event.agent.clone(),
+        did: None,
+        key_id: event
+            .integrity
+            .as_ref()
+            .and_then(|value| value.signature_key_id.clone()),
+        signature_alg: None,
+        signed_fields_version: None,
+        signature: event.integrity.as_ref().and_then(|value| value.signature.clone()),
+        body_hash: event.integrity.as_ref().and_then(|value| value.event_hash.clone()),
+        headers,
+        client,
+        collector_source: None,
+        collector_offset: None,
+    })
+}
+
+fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(endpoint) = endpoint.map(str::trim) else {
+        return (None, None);
+    };
+    if endpoint.is_empty() {
+        return (None, None);
+    }
+
+    if endpoint.starts_with('/') {
+        return (None, Some(endpoint.to_string()));
+    }
+
+    if let Some((_, rest)) = endpoint.split_once("://") {
+        if let Some((host, path)) = rest.split_once('/') {
+            let path = if path.is_empty() {
+                None
+            } else {
+                Some(format!("/{}", path))
+            };
+            return (Some(host.to_string()), path);
+        }
+        return (Some(rest.to_string()), None);
+    }
+
+    if endpoint.contains('/') {
+        let mut parts = endpoint.splitn(2, '/');
+        let host = parts.next().unwrap_or_default();
+        let path = parts.next().map(|value| format!("/{}", value));
+        let host = if host.is_empty() {
+            None
+        } else {
+            Some(host.to_string())
+        };
+        return (host, path);
+    }
+
+    (Some(endpoint.to_string()), None)
+}
+
+fn exchange_source_class_to_str(
+    source: soth_core::types::exchange_v2::ExchangeSourceClass,
+) -> &'static str {
+    match source {
+        soth_core::types::exchange_v2::ExchangeSourceClass::AiInference => "ai_inference",
+        soth_core::types::exchange_v2::ExchangeSourceClass::AgentApp => "agent_app",
+        soth_core::types::exchange_v2::ExchangeSourceClass::Mcp => "mcp",
+        soth_core::types::exchange_v2::ExchangeSourceClass::Collector => "collector",
+    }
+}
+
+fn exchange_transport_to_str(transport: soth_core::types::exchange_v2::ExchangeTransport) -> &'static str {
+    match transport {
+        soth_core::types::exchange_v2::ExchangeTransport::Http => "http",
+        soth_core::types::exchange_v2::ExchangeTransport::Https => "https",
+        soth_core::types::exchange_v2::ExchangeTransport::Ws => "ws",
+        soth_core::types::exchange_v2::ExchangeTransport::Sse => "sse",
+        soth_core::types::exchange_v2::ExchangeTransport::Ndjson => "ndjson",
+        soth_core::types::exchange_v2::ExchangeTransport::Stdio => "stdio",
+        soth_core::types::exchange_v2::ExchangeTransport::Jsonrpc => "jsonrpc",
+    }
+}
+
+fn exchange_body_mode_to_str(mode: ExchangeBodyMode) -> &'static str {
+    match mode {
+        ExchangeBodyMode::Inline => "inline",
+        ExchangeBodyMode::Offloaded => "offloaded",
+        ExchangeBodyMode::PreviewOnly => "preview_only",
+        ExchangeBodyMode::MetadataOnly => "metadata_only",
+    }
+}
+
+fn is_missing_table_error(error: &rusqlite::Error, table: &str) -> bool {
+    if let rusqlite::Error::SqliteFailure(_, Some(message)) = error {
+        return message
+            .to_ascii_lowercase()
+            .contains(&format!("no such table: {}", table.to_ascii_lowercase()));
+    }
+    false
+}
+
+fn is_missing_column_error(error: &rusqlite::Error, column: &str) -> bool {
+    if let rusqlite::Error::SqliteFailure(_, Some(message)) = error {
+        return message
+            .to_ascii_lowercase()
+            .contains(&format!("no such column: {}", column.to_ascii_lowercase()));
+    }
+    false
 }
 
 fn tree_to_hash(map: &BTreeMap<String, String>) -> HashMap<String, String> {

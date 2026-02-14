@@ -722,6 +722,7 @@ fn spawn_proxy_runtime(
     let shutdown_event_logger = event_logger.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let oisp_registry_cache_path = resolve_registry_bundle_cache_path(config);
+    let exchange_v2_config = config.exchange_v2.clone();
     let handle = tokio::spawn(async move {
         hudsucker_proxy::start_proxy_with_shutdown(
             proxy_config,
@@ -735,6 +736,7 @@ fn spawn_proxy_runtime(
             Some(enforcer),
             Some(observe_config),
             Some(oisp_registry_cache_path),
+            Some(exchange_v2_config),
         )
         .await
         .map_err(|error| anyhow::anyhow!("Proxy error: {}", error))

@@ -117,6 +117,20 @@ cloud:
   body_upload_max_bytes: 15728640
   cache_path: "~/.soth/cloud_config_cache.json"
   tags: {}
+
+# Unified exchange v2 pipeline (disabled by default)
+exchange_v2:
+  enabled: false
+  inline_max_bytes: 262144
+  max_body_bytes: 15728640
+  max_stream_buffer_bytes: 15728640
+  stream_idle_timeout: "30s"
+  stream_max_duration: "10m"
+  spool_path: "~/.soth/runtime/exchange-spool.db"
+  spool_max_inflight: 10000
+  upload_queue_max_items: 20000
+  upload_queue_max_bytes: 536870912
+  recover_inflight_on_start: true
 "#;
 
 const DEFAULT_POLICY: &str = r#"# Default SOTH Policy

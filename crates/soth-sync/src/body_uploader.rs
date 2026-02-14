@@ -1,7 +1,10 @@
 use crate::http_client::build_cloud_client;
 use anyhow::Context;
 use reqwest::multipart::{Form, Part};
-use soth_core::api::{version::API_VERSION_HEADER, BodyUploadResponse, API_VERSION};
+use soth_core::api::{
+    version::API_VERSION_HEADER, BlobUploadRequest, BlobUploadResponse, BodyUploadResponse,
+    API_VERSION,
+};
 
 #[derive(Clone)]
 pub struct BodyUploader {
@@ -63,6 +66,33 @@ impl BodyUploader {
             .json::<BodyUploadResponse>()
             .await
             .context("failed decoding body upload response")?;
+        Ok(Some(decoded))
+    }
+
+    pub async fn upload_blob(
+        &self,
+        request: &BlobUploadRequest,
+    ) -> anyhow::Result<Option<BlobUploadResponse>> {
+        let url = format!("{}/api/v1/blobs", self.endpoint);
+        let response = self
+            .client
+            .post(&url)
+            .header(API_VERSION_HEADER, API_VERSION)
+            .header("content-type", "application/json")
+            .bearer_auth(&self.api_key)
+            .json(request)
+            .send()
+            .await
+            .with_context(|| format!("blob upload failed for {url}"))?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let decoded = response
+            .json::<BlobUploadResponse>()
+            .await
+            .context("failed decoding blob upload response")?;
         Ok(Some(decoded))
     }
 }

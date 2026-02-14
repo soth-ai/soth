@@ -45,6 +45,7 @@ use crate::error::ProxyError;
 use crate::json_security::strip_json_security_prefix_text;
 use crate::metrics;
 use crate::process_attribution::{ProcessAttribution, ProcessIdentity};
+use crate::transport::exchange_assembler::{ExchangeAssembler, ExchangeAssemblerConfig};
 use crate::transport::graphql_enrichment::extract_graphql_operation;
 use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
@@ -59,7 +60,12 @@ use crate::transport::usage_enrichment::{
     extract_usage_meta_from_stream_usage, ResponseUsageMeta,
 };
 use soth_core::config::{
-    ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode, ObserveConfig, RegistryMode,
+    ExchangeV2Config, ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode,
+    ObserveConfig, RegistryMode,
+};
+use soth_core::types::exchange_v2::{
+    ExchangeClient, ExchangeCost, ExchangeParse, ExchangeSourceClass, ExchangeTransport,
+    ExchangeUsage,
 };
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
@@ -76,6 +82,7 @@ struct AiRequestBody {
 #[derive(Debug, Clone)]
 struct PendingRequest {
     request_id: u64,
+    exchange_id: String,
     envelope: Option<TrafficEnvelope>,
     host: String,
     path: String,
@@ -93,6 +100,8 @@ struct PendingRequest {
     request_size_bytes: Option<u64>,
     /// Sanitized request headers captured post-forward sanitation
     headers: Option<BTreeMap<String, String>>,
+    /// Request content-type from ingress.
+    request_content_type: Option<String>,
     /// Whether this is traffic from an agent app (chatgpt.com, claude.ai) vs direct API
     is_agent_app: bool,
     /// JSON-RPC MCP method (when this request is identified as MCP traffic)
@@ -1320,6 +1329,274 @@ fn record_proxy_budget_spend(
     );
 }
 
+fn source_class_for_pending(pending: &PendingRequest) -> ExchangeSourceClass {
+    if pending.is_mcp_jsonrpc {
+        ExchangeSourceClass::Mcp
+    } else if pending.is_agent_app {
+        ExchangeSourceClass::AgentApp
+    } else {
+        ExchangeSourceClass::AiInference
+    }
+}
+
+fn transport_for_pending(pending: &PendingRequest, is_stream: bool, is_sse: bool) -> ExchangeTransport {
+    if pending.is_mcp_jsonrpc {
+        return ExchangeTransport::Jsonrpc;
+    }
+    if is_stream {
+        if is_sse {
+            return ExchangeTransport::Sse;
+        }
+        return ExchangeTransport::Ws;
+    }
+    ExchangeTransport::Https
+}
+
+fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<ExchangeClient> {
+    let envelope = envelope?;
+    if envelope.process_pid.is_none()
+        && envelope.process_name.is_none()
+        && envelope.process_executable.is_none()
+    {
+        return None;
+    }
+
+    let bundle_id = envelope.process_executable.as_deref().and_then(|path| {
+        let lower = path.to_ascii_lowercase();
+        lower.find(".app/").and_then(|idx| {
+            let app_root = &path[..idx + 4];
+            let app = app_root
+                .rsplit('/')
+                .next()
+                .unwrap_or(app_root)
+                .trim_end_matches(".app")
+                .trim();
+            if app.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "macos.{}",
+                    app.chars()
+                        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '_' })
+                        .collect::<String>()
+                        .trim_matches('_')
+                ))
+            }
+        })
+    });
+
+    let app_type = if bundle_id.is_some() {
+        Some("desktop_app".to_string())
+    } else {
+        Some("cli".to_string())
+    };
+
+    Some(ExchangeClient {
+        pid: envelope.process_pid,
+        bundle_id,
+        process_name: envelope.process_name.clone(),
+        app_type,
+        referrer_origin: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_and_enqueue_exchange_v2(
+    logger: &EventLogger,
+    exchange_cfg: &ExchangeAssemblerConfig,
+    pending: &PendingRequest,
+    session_id: &str,
+    status: u16,
+    is_stream: bool,
+    is_sse: bool,
+    response_content_type: Option<&str>,
+    response_headers: Option<BTreeMap<String, String>>,
+    response_body: Option<&str>,
+    usage_meta: &ResponseUsageMeta,
+    tags: Option<&BTreeMap<String, String>>,
+    response_truncated: bool,
+    response_truncated_reason: Option<&str>,
+    bundle_version: Option<&str>,
+) {
+    let mut assembler = ExchangeAssembler::new(
+        exchange_cfg.clone(),
+        pending.exchange_id.clone(),
+        source_class_for_pending(pending),
+        transport_for_pending(pending, is_stream, is_sse),
+    );
+    assembler.set_session_id(session_id.to_string());
+    assembler.set_route(
+        pending.provider.clone(),
+        pending.agent.map(|value| value.to_string()),
+        usage_meta
+            .model
+            .clone()
+            .or_else(|| pending.model.clone()),
+        Some(pending.path.clone()),
+        Some(pending.method.clone()),
+    );
+    assembler.set_client(exchange_client_from_envelope(pending.envelope.as_ref()));
+    assembler.set_parse(Some(ExchangeParse {
+        parser_version: Some("exchange_v2_edge".to_string()),
+        bundle_version: bundle_version.map(ToString::to_string),
+        parse_confidence: None,
+        detection_reason: None,
+    }));
+    assembler.set_request(
+        pending.headers.clone(),
+        pending.request_content_type.clone(),
+        pending.request_content.as_deref().unwrap_or_default().as_bytes(),
+    );
+    assembler.set_response_meta(
+        response_headers,
+        Some(status),
+        response_content_type.map(|value| value.to_string()),
+    );
+    if let Some(body) = response_body {
+        assembler.append_response_chunk(body.as_bytes());
+    }
+    assembler.set_usage(ExchangeUsage {
+        input_tokens: usage_meta.input_tokens,
+        output_tokens: usage_meta.output_tokens,
+        cache_read_tokens: usage_meta.cache_read_tokens,
+        cache_write_tokens: usage_meta.cache_write_tokens,
+        reasoning_tokens: usage_meta.reasoning_tokens,
+    });
+    assembler.set_cost(usage_meta.cost_usd.map(|estimated_usd| ExchangeCost {
+        estimated_usd,
+        currency: "USD".to_string(),
+        pricing_version: bundle_version.map(ToString::to_string),
+    }));
+    assembler.set_discovery_capture(pending.catalog_discovery);
+    if pending.catalog_discovery {
+        assembler.mark_metadata_only("catalog_discovery_metadata_only");
+    }
+    if pending.request_body_truncated {
+        assembler.mark_truncated("request_body_truncated");
+    }
+    if response_truncated {
+        assembler.mark_truncated(
+            response_truncated_reason.unwrap_or("response_body_truncated"),
+        );
+    }
+    if let Some(envelope) = pending.envelope.as_ref() {
+        assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
+    }
+    assembler.set_tags(tags.cloned());
+
+    let result = if response_truncated
+        && response_truncated_reason == Some("partial_timeout")
+    {
+        assembler.finalize_timeout_with_blobs()
+    } else {
+        assembler.finalize_complete_with_blobs()
+    };
+
+    let payload_json = match serde_json::to_string(&result.event) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                exchange_id = %pending.exchange_id,
+                error = %error,
+                "Failed encoding exchange.v2 payload"
+            );
+            return;
+        }
+    };
+    let blobs_json = if result.blobs.is_empty() {
+        None
+    } else {
+        match serde_json::to_string(&result.blobs) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(
+                    exchange_id = %pending.exchange_id,
+                    error = %error,
+                    "Failed encoding exchange.v2 blob payloads"
+                );
+                None
+            }
+        }
+    };
+
+    if let Err(error) = logger.enqueue_exchange_upload_with_blobs(
+        &pending.exchange_id,
+        &payload_json,
+        blobs_json.as_deref(),
+    ) {
+        warn!(
+            exchange_id = %pending.exchange_id,
+            error = %error,
+            "Failed enqueuing exchange.v2 payload"
+        );
+        return;
+    }
+    let _ = logger.finalize_exchange_spool(&pending.exchange_id, None);
+    let _ = logger.delete_exchange_spool(&pending.exchange_id);
+}
+
+fn seed_exchange_v2_spool(
+    logger: &EventLogger,
+    exchange_cfg: &ExchangeAssemblerConfig,
+    pending: &PendingRequest,
+    session_id: &str,
+    bundle_version: Option<&str>,
+) {
+    let mut assembler = ExchangeAssembler::new(
+        exchange_cfg.clone(),
+        pending.exchange_id.clone(),
+        source_class_for_pending(pending),
+        transport_for_pending(pending, false, false),
+    );
+    assembler.set_session_id(session_id.to_string());
+    assembler.set_route(
+        pending.provider.clone(),
+        pending.agent.map(|value| value.to_string()),
+        pending.model.clone(),
+        Some(pending.path.clone()),
+        Some(pending.method.clone()),
+    );
+    assembler.set_client(exchange_client_from_envelope(pending.envelope.as_ref()));
+    assembler.set_request(
+        pending.headers.clone(),
+        pending.request_content_type.clone(),
+        pending.request_content.as_deref().unwrap_or_default().as_bytes(),
+    );
+    assembler.set_discovery_capture(pending.catalog_discovery);
+    assembler.set_parse(Some(ExchangeParse {
+        parser_version: Some("exchange_v2_edge".to_string()),
+        bundle_version: bundle_version.map(ToString::to_string),
+        parse_confidence: None,
+        detection_reason: None,
+    }));
+    if let Some(envelope) = pending.envelope.as_ref() {
+        assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
+    }
+    let snapshot_json = match assembler.snapshot_json() {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                exchange_id = %pending.exchange_id,
+                error = %error,
+                "Failed serializing exchange spool snapshot"
+            );
+            return;
+        }
+    };
+    let started_at = assembler.snapshot().started_at.to_rfc3339();
+    if let Err(error) = logger.upsert_exchange_spool(
+        &pending.exchange_id,
+        &snapshot_json,
+        &started_at,
+    ) {
+        warn!(
+            exchange_id = %pending.exchange_id,
+            error = %error,
+            "Failed writing exchange spool snapshot"
+        );
+    }
+}
+
 fn apply_process_identity(
     mut envelope: TrafficEnvelope,
     process_identity: Option<&ProcessIdentity>,
@@ -1363,6 +1640,8 @@ pub struct AiProxyHandler {
     registry_mode: RegistryMode,
     /// Bundle-driven classifier loaded from registry cache or embedded fallback.
     oisp_engine: Arc<OispEngine>,
+    /// Optional exchange.v2 assembly config (disabled when None).
+    exchange_v2: Option<ExchangeAssemblerConfig>,
     /// One-time-per-day limiter for catalog-domain discovery captures.
     catalog_discovery_limiter: Arc<CatalogDiscoveryLimiter>,
     /// Maximum request/response body bytes to capture in observability payloads.
@@ -1389,6 +1668,7 @@ impl Clone for AiProxyHandler {
             process_attribution: self.process_attribution.clone(),
             registry_mode: self.registry_mode,
             oisp_engine: self.oisp_engine.clone(),
+            exchange_v2: self.exchange_v2.clone(),
             catalog_discovery_limiter: self.catalog_discovery_limiter.clone(),
             capture_max_body_bytes: self.capture_max_body_bytes,
             request_correlation_id: next_proxy_request_id(),
@@ -1421,6 +1701,7 @@ impl AiProxyHandler {
             )),
             registry_mode: config.registry_mode,
             oisp_engine,
+            exchange_v2: None,
             catalog_discovery_limiter: Arc::new(CatalogDiscoveryLimiter::default()),
             capture_max_body_bytes: config.capture_max_body_bytes,
             request_correlation_id: next_proxy_request_id(),
@@ -1442,6 +1723,16 @@ impl AiProxyHandler {
     /// Set event logger for observability (Arc version for sharing)
     pub fn with_event_logger_arc(mut self, logger: Arc<EventLogger>) -> Self {
         self.event_logger = Some(logger);
+        self
+    }
+
+    /// Enable exchange.v2 assembly + queue output.
+    pub fn with_exchange_v2(mut self, exchange_cfg: ExchangeV2Config) -> Self {
+        if exchange_cfg.enabled {
+            self.exchange_v2 = Some(ExchangeAssemblerConfig::from(&exchange_cfg));
+        } else {
+            self.exchange_v2 = None;
+        }
         self
     }
 
@@ -1793,6 +2084,12 @@ impl HttpHandler for AiProxyHandler {
         let process_attribution = self.process_attribution.clone();
         let capture_max_body_bytes = self.capture_max_body_bytes;
         let client_addr = ctx.client_addr;
+        let exchange_v2_cfg = self.exchange_v2.clone();
+        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+            Some(self.oisp_engine.bundle_version().to_string())
+        } else {
+            None
+        };
         let should_resolve_process = !is_connect
             && should_capture_observability
             && (host_is_ai_target
@@ -2131,6 +2428,7 @@ impl HttpHandler for AiProxyHandler {
                         request_id,
                         PendingRequest {
                             request_id,
+                            exchange_id: format!("ex-{}", request_id),
                             envelope: Some(envelope),
                             host: host.clone(),
                             path: display_path.clone(),
@@ -2144,6 +2442,7 @@ impl HttpHandler for AiProxyHandler {
                             request_body_truncated,
                             request_size_bytes,
                             headers: None,
+                            request_content_type: content_type.clone(),
                             is_agent_app: host_is_agent_target,
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
@@ -2208,6 +2507,7 @@ impl HttpHandler for AiProxyHandler {
                     request_id,
                     PendingRequest {
                         request_id,
+                        exchange_id: format!("ex-{}", request_id),
                         envelope: Some(apply_process_identity(
                             TrafficEnvelope::mcp_http(
                                 &session_id,
@@ -2234,6 +2534,7 @@ impl HttpHandler for AiProxyHandler {
                         request_body_truncated,
                         request_size_bytes,
                         headers: None,
+                        request_content_type: content_type.clone(),
                         is_agent_app: false,
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
@@ -2257,7 +2558,7 @@ impl HttpHandler for AiProxyHandler {
 
             // Persist sanitized header map and request-size metadata into pending request
             // so response-side paired events can include this context.
-            {
+            let pending_for_spool = {
                 let mut pending = pending_requests.lock();
                 if let Some(entry) = pending.get_mut(&request_id) {
                     if entry.provider.is_some() {
@@ -2267,7 +2568,27 @@ impl HttpHandler for AiProxyHandler {
                         entry.request_size_bytes =
                             request_size_bytes.or(sanitized_request_size_bytes);
                     }
+                    if exchange_v2_cfg.is_some() {
+                        Some(entry.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
+            };
+            if let (Some(exchange_cfg), Some(logger), Some(entry)) = (
+                exchange_v2_cfg.as_ref(),
+                event_logger.as_ref(),
+                pending_for_spool.as_ref(),
+            ) {
+                seed_exchange_v2_spool(
+                    logger,
+                    exchange_cfg,
+                    entry,
+                    &session_id,
+                    exchange_bundle_version.as_deref(),
+                );
             }
 
             RequestOrResponse::Request(sanitized_req)
@@ -2288,11 +2609,18 @@ impl HttpHandler for AiProxyHandler {
         let request_id = self.request_correlation_id;
         let registry_mode = self.registry_mode;
         let oisp_engine = self.oisp_engine.clone();
+        let exchange_v2_cfg = self.exchange_v2.clone();
+        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+            Some(self.oisp_engine.bundle_version().to_string())
+        } else {
+            None
+        };
         let capture_max_body_bytes = self.capture_max_body_bytes;
         let budget_tracker = self
             .enforcer
             .as_ref()
             .and_then(|enforcer| enforcer.budget_tracker.clone());
+        let response_headers = capture_sanitized_headers(res.headers());
 
         #[cfg(feature = "dashboard")]
         let dashboard = self.dashboard.clone();
@@ -2384,7 +2712,7 @@ impl HttpHandler for AiProxyHandler {
                             .with_method(method_name.clone())
                             .with_status_code(status)
                             .with_latency(latency_ms)
-                            .with_content(response_payload);
+                            .with_content(response_payload.clone());
                     if let Some(envelope) = pending.envelope.clone() {
                         event = event.with_traffic_envelope(envelope);
                     }
@@ -2413,11 +2741,32 @@ impl HttpHandler for AiProxyHandler {
                             None
                         },
                     );
+                    let exchange_tags = tags.clone();
                     if !tags.is_empty() {
                         event = event.with_tags(tags);
                     }
                     pii_enricher.enrich(&mut event);
                     logger.log(&event);
+
+                    if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
+                        finalize_and_enqueue_exchange_v2(
+                            logger,
+                            exchange_cfg,
+                            &pending,
+                            &session_id,
+                            status,
+                            false,
+                            false,
+                            content_type.as_deref(),
+                            Some(response_headers.clone()),
+                            Some(response_payload.as_str()),
+                            &ResponseUsageMeta::default(),
+                            Some(&exchange_tags),
+                            false,
+                            None,
+                            exchange_bundle_version.as_deref(),
+                        );
+                    }
                 }
 
                 return res;
@@ -2519,6 +2868,9 @@ impl HttpHandler for AiProxyHandler {
                 let log_budget_tracker = budget_tracker.clone();
                 let log_event_tags = event_tags.clone();
                 let log_pii_enricher = pii_enricher.clone();
+                let log_exchange_v2_cfg = exchange_v2_cfg.clone();
+                let log_exchange_bundle_version = exchange_bundle_version.clone();
+                let log_response_headers = response_headers.clone();
                 let log_provider = provider.clone();
                 let log_stream_kind: &'static str = if is_sse {
                     "sse"
@@ -2700,6 +3052,7 @@ impl HttpHandler for AiProxyHandler {
                         if !subscription_tags.is_empty() {
                             enriched_tags.extend(subscription_tags);
                         }
+                        let content_for_exchange = content.clone();
                         let mut event = build_paired_response_event(ResponseEventInput {
                             session_id: &log_session_id,
                             host: &log_pending.host,
@@ -2731,6 +3084,29 @@ impl HttpHandler for AiProxyHandler {
 
                         log_pii_enricher.enrich(&mut event);
                         logger.log(&event);
+                        if let Some(exchange_cfg) = log_exchange_v2_cfg.as_ref() {
+                            finalize_and_enqueue_exchange_v2(
+                                logger,
+                                exchange_cfg,
+                                &log_pending,
+                                &log_session_id,
+                                status,
+                                true,
+                                log_is_sse,
+                                log_content_type.as_deref(),
+                                Some(log_response_headers.clone()),
+                                Some(content_for_exchange.as_str()),
+                                &usage_meta,
+                                Some(&enriched_tags),
+                                capture_limit_reported,
+                                if capture_limit_reported {
+                                    Some("stream_capture_limit_reached")
+                                } else {
+                                    None
+                                },
+                                log_exchange_bundle_version.as_deref(),
+                            );
+                        }
                         debug!("Logged paired streamed request/response");
                     }
                 };
@@ -2798,6 +3174,7 @@ impl HttpHandler for AiProxyHandler {
                         is_sse,
                         false,
                     );
+                    let normalized_response_for_exchange = normalized_response.clone();
                     let mut enriched_tags = (*event_tags).clone();
                     if pending.catalog_discovery {
                         append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
@@ -2858,6 +3235,25 @@ impl HttpHandler for AiProxyHandler {
                     }
                     pii_enricher.enrich(&mut event);
                     logger.log(&event);
+                    if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
+                        finalize_and_enqueue_exchange_v2(
+                            logger,
+                            exchange_cfg,
+                            &pending,
+                            &session_id,
+                            status,
+                            is_stream_response,
+                            is_sse,
+                            content_type.as_deref(),
+                            Some(response_headers.clone()),
+                            normalized_response_for_exchange.as_deref(),
+                            &response_usage,
+                            Some(&enriched_tags),
+                            response_body_truncated,
+                            response_capture_reason,
+                            exchange_bundle_version.as_deref(),
+                        );
+                    }
                 }
             }
 
@@ -2879,6 +3275,12 @@ impl HttpHandler for AiProxyHandler {
         let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
         let session_id = self.session_id.clone();
+        let exchange_v2_cfg = self.exchange_v2.clone();
+        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+            Some(self.oisp_engine.bundle_version().to_string())
+        } else {
+            None
+        };
         async move {
             let pending = {
                 let mut requests = pending_requests.lock();
@@ -2934,6 +3336,26 @@ impl HttpHandler for AiProxyHandler {
                 }
                 pii_enricher.enrich(&mut event);
                 logger.log(&event);
+                if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
+                    let error_content = format!("[forward error] {error}");
+                    finalize_and_enqueue_exchange_v2(
+                        logger,
+                        exchange_cfg,
+                        pending_req,
+                        &session_id,
+                        failure_status,
+                        false,
+                        false,
+                        None,
+                        None,
+                        Some(error_content.as_str()),
+                        &usage_meta,
+                        Some(&tags),
+                        true,
+                        Some("transport_forward_error"),
+                        exchange_bundle_version.as_deref(),
+                    );
+                }
             }
 
             if benign {
@@ -3304,6 +3726,7 @@ pub async fn start_proxy(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -3319,6 +3742,7 @@ pub async fn start_proxy_with_shutdown<F>(
     enforcer: Option<ProxyEnforcer>,
     observe_config: Option<ObserveConfig>,
     oisp_registry_cache_path: Option<PathBuf>,
+    exchange_v2_config: Option<ExchangeV2Config>,
 ) -> Result<(), ProxyError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -3381,6 +3805,9 @@ where
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
         }
+        if let Some(ref exchange_cfg) = exchange_v2_config {
+            h = h.with_exchange_v2(exchange_cfg.clone());
+        }
         if let Some(ref learned) = learned_passthrough {
             h = h.with_learned_passthrough(
                 learned.clone(),
@@ -3400,6 +3827,9 @@ where
         }
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
+        }
+        if let Some(ref exchange_cfg) = exchange_v2_config {
+            h = h.with_exchange_v2(exchange_cfg.clone());
         }
         if let Some(ref learned) = learned_passthrough {
             h = h.with_learned_passthrough(

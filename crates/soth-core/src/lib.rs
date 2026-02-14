@@ -23,6 +23,6 @@ pub use config::{loader::load_config, types::HostAction, types::SothConfig};
 pub use error::{Result, SothError};
 pub use event_logger::EventLogger;
 pub use types::{
-    budget::*, identity::*, mcp::*, name_generator::*, observation::*, policy::*, replay::*,
-    session::*,
+    budget::*, exchange_v2::*, identity::*, mcp::*, name_generator::*, observation::*,
+    policy::*, replay::*, session::*,
 };

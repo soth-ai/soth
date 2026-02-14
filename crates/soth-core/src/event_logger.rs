@@ -308,6 +308,28 @@ pub struct SyncCursorState {
     pub sync_errors: Option<String>,
 }
 
+/// Durable in-flight exchange assembly record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeSpoolEntry {
+    pub exchange_id: String,
+    pub state_json: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub finalized_at: Option<String>,
+}
+
+/// Durable upload queue row for finalized exchanges awaiting sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeUploadQueueEntry {
+    pub exchange_id: String,
+    pub payload_json: String,
+    pub blobs_json: Option<String>,
+    pub attempt_count: u32,
+    pub next_attempt_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Event logger that writes `WrapEvent`s to SQLite.
 #[derive(Clone)]
 pub struct EventLogger {
@@ -438,6 +460,213 @@ impl EventLogger {
             last_sync_timestamp: self.get_sync_state(SYNC_KEY_LAST_SYNC_TIMESTAMP)?,
             sync_errors: self.get_sync_state(SYNC_KEY_SYNC_ERRORS)?,
         })
+    }
+
+    /// Insert or update an in-flight exchange spool row.
+    pub fn upsert_exchange_spool(
+        &self,
+        exchange_id: &str,
+        state_json: &str,
+        started_at: &str,
+    ) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.execute(
+            r#"
+            INSERT INTO exchange_spool (exchange_id, state_json, started_at, updated_at, finalized_at)
+            VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL)
+            ON CONFLICT(exchange_id) DO UPDATE SET
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![exchange_id, state_json, started_at],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// Mark a spool row finalized and optionally update final state snapshot.
+    pub fn finalize_exchange_spool(
+        &self,
+        exchange_id: &str,
+        final_state_json: Option<&str>,
+    ) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        match final_state_json {
+            Some(state_json) => {
+                conn.execute(
+                    r#"
+                    UPDATE exchange_spool
+                    SET state_json = ?2,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        finalized_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE exchange_id = ?1
+                    "#,
+                    params![exchange_id, state_json],
+                )
+                .map_err(to_io_err)?;
+            }
+            None => {
+                conn.execute(
+                    r#"
+                    UPDATE exchange_spool
+                    SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        finalized_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE exchange_id = ?1
+                    "#,
+                    params![exchange_id],
+                )
+                .map_err(to_io_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove an exchange spool row.
+    pub fn delete_exchange_spool(&self, exchange_id: &str) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.execute(
+            "DELETE FROM exchange_spool WHERE exchange_id = ?1",
+            params![exchange_id],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// List pending in-flight exchange spool rows (not finalized).
+    pub fn load_exchange_spool_pending(
+        &self,
+        limit: usize,
+    ) -> std::io::Result<Vec<ExchangeSpoolEntry>> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT exchange_id, state_json, started_at, updated_at, finalized_at
+                FROM exchange_spool
+                WHERE finalized_at IS NULL
+                ORDER BY updated_at ASC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(to_io_err)?;
+        let rows = stmt
+            .query_map([limit.max(1) as i64], |row| {
+                Ok(ExchangeSpoolEntry {
+                    exchange_id: row.get(0)?,
+                    state_json: row.get(1)?,
+                    started_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                    finalized_at: row.get(4)?,
+                })
+            })
+            .map_err(to_io_err)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(to_io_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Enqueue or refresh a finalized exchange upload payload.
+    pub fn enqueue_exchange_upload(&self, exchange_id: &str, payload_json: &str) -> std::io::Result<()> {
+        self.enqueue_exchange_upload_with_blobs(exchange_id, payload_json, None)
+    }
+
+    /// Enqueue or refresh a finalized exchange upload payload, with optional blob material.
+    pub fn enqueue_exchange_upload_with_blobs(
+        &self,
+        exchange_id: &str,
+        payload_json: &str,
+        blobs_json: Option<&str>,
+    ) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.execute(
+            r#"
+            INSERT INTO exchange_upload_queue (
+                exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, 0, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT(exchange_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                blobs_json = excluded.blobs_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![exchange_id, payload_json, blobs_json],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// List upload queue entries that are ready for dispatch.
+    pub fn load_exchange_upload_queue_ready(
+        &self,
+        limit: usize,
+    ) -> std::io::Result<Vec<ExchangeUploadQueueEntry>> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
+                FROM exchange_upload_queue
+                WHERE next_attempt_at IS NULL OR next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ORDER BY updated_at ASC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(to_io_err)?;
+        let rows = stmt
+            .query_map([limit.max(1) as i64], |row| {
+                Ok(ExchangeUploadQueueEntry {
+                    exchange_id: row.get(0)?,
+                    payload_json: row.get(1)?,
+                    blobs_json: row.get(2)?,
+                    attempt_count: row.get::<_, i64>(3)? as u32,
+                    next_attempt_at: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .map_err(to_io_err)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(to_io_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Increment upload attempt counters and set a retry delay.
+    pub fn mark_exchange_upload_attempt(
+        &self,
+        exchange_id: &str,
+        retry_delay: Duration,
+    ) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        let delay_secs = retry_delay.as_secs().max(1);
+        conn.execute(
+            r#"
+            UPDATE exchange_upload_queue
+            SET attempt_count = attempt_count + 1,
+                next_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('+%d seconds', ?2)),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE exchange_id = ?1
+            "#,
+            params![exchange_id, delay_secs],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// Remove an upload queue entry after successful sync.
+    pub fn delete_exchange_upload(&self, exchange_id: &str) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.execute(
+            "DELETE FROM exchange_upload_queue WHERE exchange_id = ?1",
+            params![exchange_id],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
     }
 
     /// Log an event.
@@ -627,9 +856,46 @@ fn init_sqlite_schema(conn: &Connection) -> std::io::Result<()> {
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS exchange_spool (
+            exchange_id TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finalized_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_spool_updated_at
+            ON exchange_spool(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_exchange_spool_finalized_at
+            ON exchange_spool(finalized_at);
+
+        CREATE TABLE IF NOT EXISTS exchange_upload_queue (
+            exchange_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            blobs_json TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_upload_queue_next_attempt
+            ON exchange_upload_queue(next_attempt_at);
+        CREATE INDEX IF NOT EXISTS idx_exchange_upload_queue_updated_at
+            ON exchange_upload_queue(updated_at);
         "#,
     )
     .map_err(to_io_err)?;
+
+    // Forward-compatible schema update for existing local DBs.
+    if let Err(error) = conn.execute(
+        "ALTER TABLE exchange_upload_queue ADD COLUMN blobs_json TEXT",
+        [],
+    ) {
+        let message = error.to_string().to_ascii_lowercase();
+        if !message.contains("duplicate column name") {
+            return Err(to_io_err(error));
+        }
+    }
 
     Ok(())
 }
@@ -1465,5 +1731,68 @@ mod tests {
         assert_eq!(second.merkle_root, Some(root_hash));
         assert_eq!(first.audit_signer_did, Some(signer_did.clone()));
         assert_eq!(second.audit_signer_did, Some(signer_did));
+    }
+
+    #[test]
+    fn test_exchange_spool_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path).unwrap();
+
+        logger
+            .upsert_exchange_spool(
+                "ex-1",
+                r#"{"state":"inflight","chunks":3}"#,
+                "2026-02-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let pending = logger.load_exchange_spool_pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].exchange_id, "ex-1");
+        assert_eq!(pending[0].finalized_at, None);
+
+        logger
+            .finalize_exchange_spool("ex-1", Some(r#"{"state":"done"}"#))
+            .unwrap();
+        let pending_after_finalize = logger.load_exchange_spool_pending(10).unwrap();
+        assert!(pending_after_finalize.is_empty());
+
+        logger.delete_exchange_spool("ex-1").unwrap();
+        logger.close();
+    }
+
+    #[test]
+    fn test_exchange_upload_queue_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path).unwrap();
+
+        logger
+            .enqueue_exchange_upload_with_blobs(
+                "ex-2",
+                r#"{"exchange_id":"ex-2"}"#,
+                Some(r#"[{"side":"response","reference":"blob://exchange/ex-2/response/abc"}]"#),
+            )
+            .unwrap();
+        let ready = logger.load_exchange_upload_queue_ready(10).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].exchange_id, "ex-2");
+        assert!(ready[0].blobs_json.is_some());
+        assert_eq!(ready[0].attempt_count, 0);
+
+        logger
+            .mark_exchange_upload_attempt("ex-2", Duration::from_secs(30))
+            .unwrap();
+        let ready_after_backoff = logger.load_exchange_upload_queue_ready(10).unwrap();
+        assert!(
+            ready_after_backoff.is_empty(),
+            "entry should be delayed by retry backoff"
+        );
+
+        logger.delete_exchange_upload("ex-2").unwrap();
+        let ready_after_delete = logger.load_exchange_upload_queue_ready(10).unwrap();
+        assert!(ready_after_delete.is_empty());
+        logger.close();
     }
 }
