@@ -45,6 +45,7 @@ use crate::error::ProxyError;
 use crate::json_security::strip_json_security_prefix_text;
 use crate::metrics;
 use crate::process_attribution::{ProcessAttribution, ProcessIdentity};
+use crate::transport::exchange_assembler::{ExchangeAssembler, ExchangeAssemblerConfig};
 use crate::transport::graphql_enrichment::extract_graphql_operation;
 use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
@@ -59,7 +60,12 @@ use crate::transport::usage_enrichment::{
     extract_usage_meta_from_stream_usage, ResponseUsageMeta,
 };
 use soth_core::config::{
-    ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode, ObserveConfig, RegistryMode,
+    ExchangeV2Config, ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode,
+    ObserveConfig, RegistryMode,
+};
+use soth_core::types::exchange_v2::{
+    ExchangeClient, ExchangeCost, ExchangeParse, ExchangeSourceClass, ExchangeTransport,
+    ExchangeUsage,
 };
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
@@ -76,6 +82,7 @@ struct AiRequestBody {
 #[derive(Debug, Clone)]
 struct PendingRequest {
     request_id: u64,
+    exchange_id: String,
     envelope: Option<TrafficEnvelope>,
     host: String,
     path: String,
@@ -93,6 +100,8 @@ struct PendingRequest {
     request_size_bytes: Option<u64>,
     /// Sanitized request headers captured post-forward sanitation
     headers: Option<BTreeMap<String, String>>,
+    /// Request content-type from ingress.
+    request_content_type: Option<String>,
     /// Whether this is traffic from an agent app (chatgpt.com, claude.ai) vs direct API
     is_agent_app: bool,
     /// JSON-RPC MCP method (when this request is identified as MCP traffic)
@@ -101,6 +110,10 @@ struct PendingRequest {
     is_mcp_jsonrpc: bool,
     /// True when captured through discovery-mode catalog interception.
     catalog_discovery: bool,
+    /// Bundle-based interception classification reason.
+    detection_reason: Option<String>,
+    /// Confidence score for detection reason.
+    parse_confidence: Option<f64>,
     /// Policy decision metadata captured at request enforcement time.
     policy_allowed: Option<bool>,
     policy_reason: Option<String>,
@@ -228,6 +241,35 @@ fn append_catalog_discovery_tags(tags: &mut BTreeMap<String, String>, host: &str
     tags.insert("discovery_capture".to_string(), "daily_first".to_string());
     tags.insert("discovery_payload".to_string(), "metadata_only".to_string());
     tags.insert("discovery_host".to_string(), host.to_string());
+}
+
+fn detection_reason_for_bucket(
+    host_is_ai_target: bool,
+    host_is_mcp_target: bool,
+    host_is_agent_target: bool,
+    is_catalog_discovery: bool,
+) -> Option<&'static str> {
+    if is_catalog_discovery {
+        return Some("bundle.discovery.catalog");
+    }
+    if host_is_ai_target {
+        return Some("bundle.whitelist.ai_inference");
+    }
+    if host_is_mcp_target {
+        return Some("bundle.whitelist.mcp");
+    }
+    if host_is_agent_target {
+        return Some("bundle.whitelist.agent_apps");
+    }
+    None
+}
+
+fn parse_confidence_for_reason(reason: Option<&str>) -> Option<f64> {
+    match reason {
+        Some("bundle.discovery.catalog") => Some(0.7),
+        Some(_) => Some(1.0),
+        None => None,
+    }
 }
 
 fn append_capture_tags(
@@ -1320,6 +1362,369 @@ fn record_proxy_budget_spend(
     );
 }
 
+fn source_class_for_pending(pending: &PendingRequest) -> ExchangeSourceClass {
+    if pending.is_mcp_jsonrpc {
+        ExchangeSourceClass::Mcp
+    } else if pending.is_agent_app {
+        ExchangeSourceClass::AgentApp
+    } else {
+        ExchangeSourceClass::AiInference
+    }
+}
+
+fn transport_for_pending(
+    pending: &PendingRequest,
+    is_stream: bool,
+    is_sse: bool,
+) -> ExchangeTransport {
+    if pending.is_mcp_jsonrpc {
+        return ExchangeTransport::Jsonrpc;
+    }
+    if is_stream {
+        if is_sse {
+            return ExchangeTransport::Sse;
+        }
+        return ExchangeTransport::Ws;
+    }
+    ExchangeTransport::Https
+}
+
+fn event_source_for_pending(pending: &PendingRequest) -> EventSource {
+    if pending.is_mcp_jsonrpc {
+        EventSource::Mcp
+    } else if pending.is_agent_app {
+        EventSource::AgentApp
+    } else {
+        EventSource::AiProxy
+    }
+}
+
+fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<ExchangeClient> {
+    let envelope = envelope?;
+    if envelope.process_pid.is_none()
+        && envelope.process_name.is_none()
+        && envelope.process_executable.is_none()
+    {
+        return None;
+    }
+
+    let bundle_id = envelope.process_executable.as_deref().and_then(|path| {
+        let lower = path.to_ascii_lowercase();
+        lower.find(".app/").and_then(|idx| {
+            let app_root = &path[..idx + 4];
+            let app = app_root
+                .rsplit('/')
+                .next()
+                .unwrap_or(app_root)
+                .trim_end_matches(".app")
+                .trim();
+            if app.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "macos.{}",
+                    app.chars()
+                        .map(|ch| if ch.is_ascii_alphanumeric() {
+                            ch.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        })
+                        .collect::<String>()
+                        .trim_matches('_')
+                ))
+            }
+        })
+    });
+
+    let app_type = if bundle_id.is_some() {
+        Some("desktop_app".to_string())
+    } else {
+        Some("cli".to_string())
+    };
+
+    Some(ExchangeClient {
+        pid: envelope.process_pid,
+        bundle_id,
+        process_name: envelope.process_name.clone(),
+        app_type,
+        referrer_origin: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_and_enqueue_exchange_v2(
+    logger: &EventLogger,
+    exchange_cfg: &ExchangeAssemblerConfig,
+    pii_enricher: &PiiEventEnricher,
+    pending: &PendingRequest,
+    session_id: &str,
+    status: u16,
+    is_stream: bool,
+    is_sse: bool,
+    response_content_type: Option<&str>,
+    response_headers: Option<BTreeMap<String, String>>,
+    response_body: Option<&str>,
+    usage_meta: &ResponseUsageMeta,
+    tags: Option<&BTreeMap<String, String>>,
+    response_truncated: bool,
+    response_truncated_reason: Option<&str>,
+    bundle_version: Option<&str>,
+) {
+    let mut assembler = ExchangeAssembler::new(
+        exchange_cfg.clone(),
+        pending.exchange_id.clone(),
+        source_class_for_pending(pending),
+        transport_for_pending(pending, is_stream, is_sse),
+    );
+    assembler.set_session_id(session_id.to_string());
+    assembler.set_route(
+        pending.provider.clone(),
+        pending.agent.map(|value| value.to_string()),
+        usage_meta.model.clone().or_else(|| pending.model.clone()),
+        Some(pending.path.clone()),
+        Some(pending.method.clone()),
+    );
+    assembler.set_client(exchange_client_from_envelope(pending.envelope.as_ref()));
+    assembler.set_parse(Some(ExchangeParse {
+        parser_version: Some("exchange_v2_edge".to_string()),
+        bundle_version: bundle_version.map(ToString::to_string),
+        parse_confidence: pending.parse_confidence,
+        detection_reason: pending.detection_reason.clone(),
+    }));
+    assembler.set_request(
+        pending.headers.clone(),
+        pending.request_content_type.clone(),
+        pending
+            .request_content
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    assembler.set_response_meta(
+        response_headers,
+        Some(status),
+        response_content_type.map(|value| value.to_string()),
+    );
+    if let Some(body) = response_body {
+        assembler.append_response_chunk(body.as_bytes());
+    }
+    assembler.set_usage(ExchangeUsage {
+        input_tokens: usage_meta.input_tokens,
+        output_tokens: usage_meta.output_tokens,
+        cache_read_tokens: usage_meta.cache_read_tokens,
+        cache_write_tokens: usage_meta.cache_write_tokens,
+        reasoning_tokens: usage_meta.reasoning_tokens,
+    });
+    assembler.set_cost(usage_meta.cost_usd.map(|estimated_usd| ExchangeCost {
+        estimated_usd,
+        currency: "USD".to_string(),
+        pricing_version: bundle_version.map(ToString::to_string),
+    }));
+    assembler.set_discovery_capture(pending.catalog_discovery);
+    if pending.catalog_discovery {
+        assembler.mark_metadata_only("catalog_discovery_metadata_only");
+    }
+    if pending.request_body_truncated {
+        assembler.mark_truncated("request_body_truncated");
+    }
+    if response_truncated {
+        assembler.mark_truncated(response_truncated_reason.unwrap_or("response_body_truncated"));
+    }
+    let mut exchange_tags = tags.cloned().unwrap_or_default();
+    if let Some(allowed) = pending.policy_allowed {
+        exchange_tags
+            .entry("policy.allowed".to_string())
+            .or_insert_with(|| allowed.to_string());
+    }
+    if let Some(version) = pending.policy_version.as_ref() {
+        exchange_tags
+            .entry("policy.version".to_string())
+            .or_insert_with(|| version.clone());
+    }
+    if let Some(reason) = pending.policy_reason.as_ref() {
+        exchange_tags
+            .entry("policy.reason".to_string())
+            .or_insert_with(|| reason.clone());
+    }
+    if let Some(operation) = pending.graphql_operation.as_ref() {
+        exchange_tags
+            .entry("graphql.operation".to_string())
+            .or_insert_with(|| operation.clone());
+    }
+    if let Some(method) = pending.mcp_method.as_ref() {
+        exchange_tags
+            .entry("mcp.method".to_string())
+            .or_insert_with(|| method.clone());
+    }
+    if let Some(envelope) = pending.envelope.as_ref() {
+        assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
+        if let Some(did) = envelope.did.as_ref() {
+            exchange_tags
+                .entry("identity.did".to_string())
+                .or_insert_with(|| did.clone());
+        }
+        if let Some(signature_alg) = envelope.signature_alg.as_ref() {
+            exchange_tags
+                .entry("identity.signature_alg".to_string())
+                .or_insert_with(|| signature_alg.clone());
+        }
+        if let Some(signed_fields_version) = envelope.signed_fields_version.as_ref() {
+            exchange_tags
+                .entry("identity.signed_fields_version".to_string())
+                .or_insert_with(|| signed_fields_version.clone());
+        }
+        if let Some(process_executable) = envelope.process_executable.as_ref() {
+            exchange_tags
+                .entry("client.process_executable".to_string())
+                .or_insert_with(|| process_executable.clone());
+        }
+    }
+    assembler.set_tags((!exchange_tags.is_empty()).then_some(exchange_tags));
+    let mut pii_probe = WrapEvent::new(
+        session_id,
+        &pending.host,
+        WrapDirection::Out,
+        AgentInfo::new(
+            pending.agent.unwrap_or("unknown"),
+            DetectionSource::Environment,
+        ),
+    )
+    .with_source(event_source_for_pending(pending));
+    if let Some(provider) = pending.provider.as_ref() {
+        pii_probe = pii_probe.with_provider(provider.clone());
+    }
+    if let Some(model) = usage_meta.model.as_ref().or(pending.model.as_ref()) {
+        pii_probe = pii_probe.with_model(model.clone());
+    }
+    pii_probe = pii_probe.with_method(
+        pending
+            .mcp_method
+            .clone()
+            .unwrap_or_else(|| format!("{} {}", pending.method, pending.path)),
+    );
+    if let Some(request_body) = pending.request_content.as_ref() {
+        pii_probe = pii_probe.with_request(request_body.clone(), "");
+    }
+    if let Some(response_body) = response_body {
+        pii_probe = pii_probe.with_response(response_body.to_string(), "");
+    }
+    pii_enricher.enrich(&mut pii_probe);
+    assembler.set_pii_detected(pii_probe.pii_detected);
+
+    let mut result = if response_truncated && response_truncated_reason == Some("partial_timeout") {
+        assembler.finalize_timeout_with_blobs()
+    } else {
+        assembler.finalize_complete_with_blobs()
+    };
+    result.event.pii_types = pii_probe.pii_types;
+
+    let payload_json = match serde_json::to_string(&result.event) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                exchange_id = %pending.exchange_id,
+                error = %error,
+                "Failed encoding exchange.v2 payload"
+            );
+            return;
+        }
+    };
+    let blobs_json = if result.blobs.is_empty() {
+        None
+    } else {
+        match serde_json::to_string(&result.blobs) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(
+                    exchange_id = %pending.exchange_id,
+                    error = %error,
+                    "Failed encoding exchange.v2 blob payloads"
+                );
+                None
+            }
+        }
+    };
+
+    if let Err(error) = logger.enqueue_exchange_upload_with_blobs(
+        &pending.exchange_id,
+        &payload_json,
+        blobs_json.as_deref(),
+    ) {
+        warn!(
+            exchange_id = %pending.exchange_id,
+            error = %error,
+            "Failed enqueuing exchange.v2 payload"
+        );
+        return;
+    }
+    let _ = logger.finalize_exchange_spool(&pending.exchange_id, None);
+    let _ = logger.delete_exchange_spool(&pending.exchange_id);
+}
+
+fn seed_exchange_v2_spool(
+    logger: &EventLogger,
+    exchange_cfg: &ExchangeAssemblerConfig,
+    pending: &PendingRequest,
+    session_id: &str,
+    bundle_version: Option<&str>,
+) {
+    let mut assembler = ExchangeAssembler::new(
+        exchange_cfg.clone(),
+        pending.exchange_id.clone(),
+        source_class_for_pending(pending),
+        transport_for_pending(pending, false, false),
+    );
+    assembler.set_session_id(session_id.to_string());
+    assembler.set_route(
+        pending.provider.clone(),
+        pending.agent.map(|value| value.to_string()),
+        pending.model.clone(),
+        Some(pending.path.clone()),
+        Some(pending.method.clone()),
+    );
+    assembler.set_client(exchange_client_from_envelope(pending.envelope.as_ref()));
+    assembler.set_request(
+        pending.headers.clone(),
+        pending.request_content_type.clone(),
+        pending
+            .request_content
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    assembler.set_discovery_capture(pending.catalog_discovery);
+    assembler.set_parse(Some(ExchangeParse {
+        parser_version: Some("exchange_v2_edge".to_string()),
+        bundle_version: bundle_version.map(ToString::to_string),
+        parse_confidence: pending.parse_confidence,
+        detection_reason: pending.detection_reason.clone(),
+    }));
+    if let Some(envelope) = pending.envelope.as_ref() {
+        assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
+    }
+    let snapshot_json = match assembler.snapshot_json() {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                exchange_id = %pending.exchange_id,
+                error = %error,
+                "Failed serializing exchange spool snapshot"
+            );
+            return;
+        }
+    };
+    let started_at = assembler.snapshot().started_at.to_rfc3339();
+    if let Err(error) =
+        logger.upsert_exchange_spool(&pending.exchange_id, &snapshot_json, &started_at)
+    {
+        warn!(
+            exchange_id = %pending.exchange_id,
+            error = %error,
+            "Failed writing exchange spool snapshot"
+        );
+    }
+}
+
 fn apply_process_identity(
     mut envelope: TrafficEnvelope,
     process_identity: Option<&ProcessIdentity>,
@@ -1363,6 +1768,8 @@ pub struct AiProxyHandler {
     registry_mode: RegistryMode,
     /// Bundle-driven classifier loaded from registry cache or embedded fallback.
     oisp_engine: Arc<OispEngine>,
+    /// Optional exchange.v2 assembly config (disabled when None).
+    exchange_v2: Option<ExchangeAssemblerConfig>,
     /// One-time-per-day limiter for catalog-domain discovery captures.
     catalog_discovery_limiter: Arc<CatalogDiscoveryLimiter>,
     /// Maximum request/response body bytes to capture in observability payloads.
@@ -1389,6 +1796,7 @@ impl Clone for AiProxyHandler {
             process_attribution: self.process_attribution.clone(),
             registry_mode: self.registry_mode,
             oisp_engine: self.oisp_engine.clone(),
+            exchange_v2: self.exchange_v2.clone(),
             catalog_discovery_limiter: self.catalog_discovery_limiter.clone(),
             capture_max_body_bytes: self.capture_max_body_bytes,
             request_correlation_id: next_proxy_request_id(),
@@ -1421,6 +1829,7 @@ impl AiProxyHandler {
             )),
             registry_mode: config.registry_mode,
             oisp_engine,
+            exchange_v2: None,
             catalog_discovery_limiter: Arc::new(CatalogDiscoveryLimiter::default()),
             capture_max_body_bytes: config.capture_max_body_bytes,
             request_correlation_id: next_proxy_request_id(),
@@ -1442,6 +1851,16 @@ impl AiProxyHandler {
     /// Set event logger for observability (Arc version for sharing)
     pub fn with_event_logger_arc(mut self, logger: Arc<EventLogger>) -> Self {
         self.event_logger = Some(logger);
+        self
+    }
+
+    /// Enable exchange.v2 assembly + queue output.
+    pub fn with_exchange_v2(mut self, exchange_cfg: ExchangeV2Config) -> Self {
+        if exchange_cfg.enabled {
+            self.exchange_v2 = Some(ExchangeAssemblerConfig::from(&exchange_cfg));
+        } else {
+            self.exchange_v2 = None;
+        }
         self
     }
 
@@ -1793,6 +2212,13 @@ impl HttpHandler for AiProxyHandler {
         let process_attribution = self.process_attribution.clone();
         let capture_max_body_bytes = self.capture_max_body_bytes;
         let client_addr = ctx.client_addr;
+        let exchange_v2_cfg = self.exchange_v2.clone();
+        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+            Some(self.oisp_engine.bundle_version().to_string())
+        } else {
+            None
+        };
+        let legacy_wrap_events_enabled = exchange_v2_cfg.is_none();
         let should_resolve_process = !is_connect
             && should_capture_observability
             && (host_is_ai_target
@@ -2110,6 +2536,12 @@ impl HttpHandler for AiProxyHandler {
 
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
+                    let detection_reason = detection_reason_for_bucket(
+                        host_is_ai_target,
+                        host_is_mcp_target,
+                        host_is_agent_target,
+                        is_catalog_discovery_host,
+                    );
                     let envelope = apply_process_identity(
                         TrafficEnvelope::proxy(
                             &session_id,
@@ -2131,6 +2563,7 @@ impl HttpHandler for AiProxyHandler {
                         request_id,
                         PendingRequest {
                             request_id,
+                            exchange_id: uuid::Uuid::new_v4().to_string(),
                             envelope: Some(envelope),
                             host: host.clone(),
                             path: display_path.clone(),
@@ -2144,10 +2577,13 @@ impl HttpHandler for AiProxyHandler {
                             request_body_truncated,
                             request_size_bytes,
                             headers: None,
+                            request_content_type: content_type.clone(),
                             is_agent_app: host_is_agent_target,
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
                             catalog_discovery: is_catalog_discovery_host,
+                            detection_reason: detection_reason.map(ToString::to_string),
+                            parse_confidence: parse_confidence_for_reason(detection_reason),
                             policy_allowed,
                             policy_reason: None,
                             policy_version,
@@ -2166,48 +2602,57 @@ impl HttpHandler for AiProxyHandler {
                     "MCP JSON-RPC request"
                 );
 
-                if let Some(ref logger) = event_logger {
-                    let mcp_agent =
-                        AgentInfo::new(agent.unwrap_or("mcp"), DetectionSource::Environment);
-                    let mut event =
-                        WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
-                            .with_source(EventSource::Mcp)
-                            .with_method(mcp_method.clone());
-                    let envelope = apply_process_identity(
-                        TrafficEnvelope::mcp_http(
-                            &session_id,
-                            Some(request_id.to_string()),
-                            mcp_method.clone(),
-                            &host,
-                            &path,
-                            agent,
-                            identity_did.as_deref(),
-                            identity_signature.as_deref(),
-                            body_content.as_deref(),
-                        ),
-                        process_identity.as_ref(),
-                    );
-                    event = event.with_traffic_envelope(envelope);
-                    if let Some(ref request_body) = body_content {
-                        event = event.with_content(request_body.clone());
+                if legacy_wrap_events_enabled {
+                    if let Some(ref logger) = event_logger {
+                        let mcp_agent =
+                            AgentInfo::new(agent.unwrap_or("mcp"), DetectionSource::Environment);
+                        let mut event =
+                            WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
+                                .with_source(EventSource::Mcp)
+                                .with_method(mcp_method.clone());
+                        let envelope = apply_process_identity(
+                            TrafficEnvelope::mcp_http(
+                                &session_id,
+                                Some(request_id.to_string()),
+                                mcp_method.clone(),
+                                &host,
+                                &path,
+                                agent,
+                                identity_did.as_deref(),
+                                identity_signature.as_deref(),
+                                body_content.as_deref(),
+                            ),
+                            process_identity.as_ref(),
+                        );
+                        event = event.with_traffic_envelope(envelope);
+                        if let Some(ref request_body) = body_content {
+                            event = event.with_content(request_body.clone());
+                        }
+                        event = event.with_content_preview(format!("→ {} {}", http_method, path));
+                        let mut tags = (*event_tags).clone();
+                        if is_catalog_discovery_host {
+                            append_catalog_discovery_tags(&mut tags, &host);
+                        }
+                        if !tags.is_empty() {
+                            event = event.with_tags(tags);
+                        }
+                        pii_enricher.enrich(&mut event);
+                        logger.log(&event);
                     }
-                    event = event.with_content_preview(format!("→ {} {}", http_method, path));
-                    let mut tags = (*event_tags).clone();
-                    if is_catalog_discovery_host {
-                        append_catalog_discovery_tags(&mut tags, &host);
-                    }
-                    if !tags.is_empty() {
-                        event = event.with_tags(tags);
-                    }
-                    pii_enricher.enrich(&mut event);
-                    logger.log(&event);
                 }
 
                 let mut pending = pending_requests.lock();
+                let detection_reason = detection_reason_for_bucket(
+                    host_is_ai_target,
+                    host_is_mcp_target,
+                    host_is_agent_target,
+                    is_catalog_discovery_host,
+                );
                 pending.insert(
                     request_id,
                     PendingRequest {
                         request_id,
+                        exchange_id: uuid::Uuid::new_v4().to_string(),
                         envelope: Some(apply_process_identity(
                             TrafficEnvelope::mcp_http(
                                 &session_id,
@@ -2234,10 +2679,13 @@ impl HttpHandler for AiProxyHandler {
                         request_body_truncated,
                         request_size_bytes,
                         headers: None,
+                        request_content_type: content_type.clone(),
                         is_agent_app: false,
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
                         catalog_discovery: is_catalog_discovery_host,
+                        detection_reason: detection_reason.map(ToString::to_string),
+                        parse_confidence: parse_confidence_for_reason(detection_reason),
                         policy_allowed: None,
                         policy_reason: None,
                         policy_version: None,
@@ -2257,7 +2705,7 @@ impl HttpHandler for AiProxyHandler {
 
             // Persist sanitized header map and request-size metadata into pending request
             // so response-side paired events can include this context.
-            {
+            let pending_for_spool = {
                 let mut pending = pending_requests.lock();
                 if let Some(entry) = pending.get_mut(&request_id) {
                     if entry.provider.is_some() {
@@ -2267,7 +2715,27 @@ impl HttpHandler for AiProxyHandler {
                         entry.request_size_bytes =
                             request_size_bytes.or(sanitized_request_size_bytes);
                     }
+                    if exchange_v2_cfg.is_some() {
+                        Some(entry.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
+            };
+            if let (Some(exchange_cfg), Some(logger), Some(entry)) = (
+                exchange_v2_cfg.as_ref(),
+                event_logger.as_ref(),
+                pending_for_spool.as_ref(),
+            ) {
+                seed_exchange_v2_spool(
+                    logger,
+                    exchange_cfg,
+                    entry,
+                    &session_id,
+                    exchange_bundle_version.as_deref(),
+                );
             }
 
             RequestOrResponse::Request(sanitized_req)
@@ -2288,11 +2756,19 @@ impl HttpHandler for AiProxyHandler {
         let request_id = self.request_correlation_id;
         let registry_mode = self.registry_mode;
         let oisp_engine = self.oisp_engine.clone();
+        let exchange_v2_cfg = self.exchange_v2.clone();
+        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+            Some(self.oisp_engine.bundle_version().to_string())
+        } else {
+            None
+        };
+        let legacy_wrap_events_enabled = exchange_v2_cfg.is_none();
         let capture_max_body_bytes = self.capture_max_body_bytes;
         let budget_tracker = self
             .enforcer
             .as_ref()
             .and_then(|enforcer| enforcer.budget_tracker.clone());
+        let response_headers = capture_sanitized_headers(res.headers());
 
         #[cfg(feature = "dashboard")]
         let dashboard = self.dashboard.clone();
@@ -2384,7 +2860,7 @@ impl HttpHandler for AiProxyHandler {
                             .with_method(method_name.clone())
                             .with_status_code(status)
                             .with_latency(latency_ms)
-                            .with_content(response_payload);
+                            .with_content(response_payload.clone());
                     if let Some(envelope) = pending.envelope.clone() {
                         event = event.with_traffic_envelope(envelope);
                     }
@@ -2413,11 +2889,35 @@ impl HttpHandler for AiProxyHandler {
                             None
                         },
                     );
-                    if !tags.is_empty() {
-                        event = event.with_tags(tags);
+                    let exchange_tags = tags.clone();
+                    if legacy_wrap_events_enabled {
+                        if !tags.is_empty() {
+                            event = event.with_tags(tags);
+                        }
+                        pii_enricher.enrich(&mut event);
+                        logger.log(&event);
                     }
-                    pii_enricher.enrich(&mut event);
-                    logger.log(&event);
+
+                    if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
+                        finalize_and_enqueue_exchange_v2(
+                            logger,
+                            exchange_cfg,
+                            &pii_enricher,
+                            &pending,
+                            &session_id,
+                            status,
+                            false,
+                            false,
+                            content_type.as_deref(),
+                            Some(response_headers.clone()),
+                            Some(response_payload.as_str()),
+                            &ResponseUsageMeta::default(),
+                            Some(&exchange_tags),
+                            false,
+                            None,
+                            exchange_bundle_version.as_deref(),
+                        );
+                    }
                 }
 
                 return res;
@@ -2519,6 +3019,9 @@ impl HttpHandler for AiProxyHandler {
                 let log_budget_tracker = budget_tracker.clone();
                 let log_event_tags = event_tags.clone();
                 let log_pii_enricher = pii_enricher.clone();
+                let log_exchange_v2_cfg = exchange_v2_cfg.clone();
+                let log_exchange_bundle_version = exchange_bundle_version.clone();
+                let log_response_headers = response_headers.clone();
                 let log_provider = provider.clone();
                 let log_stream_kind: &'static str = if is_sse {
                     "sse"
@@ -2700,37 +3203,64 @@ impl HttpHandler for AiProxyHandler {
                         if !subscription_tags.is_empty() {
                             enriched_tags.extend(subscription_tags);
                         }
-                        let mut event = build_paired_response_event(ResponseEventInput {
-                            session_id: &log_session_id,
-                            host: &log_pending.host,
-                            provider: log_provider.as_str(),
-                            agent: log_pending.agent,
-                            method: &log_pending.method,
-                            path: &log_pending.path,
-                            graphql_operation: log_pending.graphql_operation.as_deref(),
-                            is_agent_app: log_pending.is_agent_app,
-                            status,
-                            latency_ms: log_latency_ms,
-                            request_content: log_pending.request_content.as_deref(),
-                            response_content: Some(content),
-                            request_size_bytes: log_pending.request_size_bytes,
-                            response_size_bytes: Some(streamed_response_size_bytes),
-                            headers: log_pending.headers.clone(),
-                            tags: Some(&enriched_tags),
-                            usage_meta: &usage_meta,
-                            fallback_model: log_pending.model.as_deref(),
-                            response_kind: ResponseKind::Stream { is_sse: log_is_sse },
-                            traffic_envelope: log_pending.envelope.clone(),
-                        });
-                        if let Some(allowed) = log_pending.policy_allowed {
-                            event = event.with_policy(allowed, log_pending.policy_reason.clone());
-                        }
-                        if let Some(ref version) = log_pending.policy_version {
-                            event = event.with_policy_version(version.clone());
-                        }
+                        let content_for_exchange = content.clone();
+                        if legacy_wrap_events_enabled {
+                            let mut event = build_paired_response_event(ResponseEventInput {
+                                session_id: &log_session_id,
+                                host: &log_pending.host,
+                                provider: log_provider.as_str(),
+                                agent: log_pending.agent,
+                                method: &log_pending.method,
+                                path: &log_pending.path,
+                                graphql_operation: log_pending.graphql_operation.as_deref(),
+                                is_agent_app: log_pending.is_agent_app,
+                                status,
+                                latency_ms: log_latency_ms,
+                                request_content: log_pending.request_content.as_deref(),
+                                response_content: Some(content),
+                                request_size_bytes: log_pending.request_size_bytes,
+                                response_size_bytes: Some(streamed_response_size_bytes),
+                                headers: log_pending.headers.clone(),
+                                tags: Some(&enriched_tags),
+                                usage_meta: &usage_meta,
+                                fallback_model: log_pending.model.as_deref(),
+                                response_kind: ResponseKind::Stream { is_sse: log_is_sse },
+                                traffic_envelope: log_pending.envelope.clone(),
+                            });
+                            if let Some(allowed) = log_pending.policy_allowed {
+                                event = event.with_policy(allowed, log_pending.policy_reason.clone());
+                            }
+                            if let Some(ref version) = log_pending.policy_version {
+                                event = event.with_policy_version(version.clone());
+                            }
 
-                        log_pii_enricher.enrich(&mut event);
-                        logger.log(&event);
+                            log_pii_enricher.enrich(&mut event);
+                            logger.log(&event);
+                        }
+                        if let Some(exchange_cfg) = log_exchange_v2_cfg.as_ref() {
+                            finalize_and_enqueue_exchange_v2(
+                                logger,
+                                exchange_cfg,
+                                &log_pii_enricher,
+                                &log_pending,
+                                &log_session_id,
+                                status,
+                                true,
+                                log_is_sse,
+                                log_content_type.as_deref(),
+                                Some(log_response_headers.clone()),
+                                Some(content_for_exchange.as_str()),
+                                &usage_meta,
+                                Some(&enriched_tags),
+                                capture_limit_reported,
+                                if capture_limit_reported {
+                                    Some("stream_capture_limit_reached")
+                                } else {
+                                    None
+                                },
+                                log_exchange_bundle_version.as_deref(),
+                            );
+                        }
                         debug!("Logged paired streamed request/response");
                     }
                 };
@@ -2798,6 +3328,7 @@ impl HttpHandler for AiProxyHandler {
                         is_sse,
                         false,
                     );
+                    let normalized_response_for_exchange = normalized_response.clone();
                     let mut enriched_tags = (*event_tags).clone();
                     if pending.catalog_discovery {
                         append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
@@ -2824,40 +3355,62 @@ impl HttpHandler for AiProxyHandler {
                             enriched_tags.extend(subscription_tags);
                         }
                     }
-                    let mut event = build_paired_response_event(ResponseEventInput {
-                        session_id: &session_id,
-                        host: &pending.host,
-                        provider: provider.as_str(),
-                        agent: pending.agent,
-                        method: &pending.method,
-                        path: &pending.path,
-                        graphql_operation: pending.graphql_operation.as_deref(),
-                        is_agent_app: pending.is_agent_app,
-                        status,
-                        latency_ms,
-                        request_content: pending.request_content.as_deref(),
-                        response_content: normalized_response,
-                        request_size_bytes: pending.request_size_bytes,
-                        response_size_bytes,
-                        headers: pending.headers.clone(),
-                        tags: Some(&enriched_tags),
-                        usage_meta: &response_usage,
-                        fallback_model: pending.model.as_deref(),
-                        response_kind: if is_stream_response {
-                            ResponseKind::Stream { is_sse }
-                        } else {
-                            ResponseKind::Http
-                        },
-                        traffic_envelope: pending.envelope.clone(),
-                    });
-                    if let Some(allowed) = pending.policy_allowed {
-                        event = event.with_policy(allowed, pending.policy_reason.clone());
+                    if legacy_wrap_events_enabled {
+                        let mut event = build_paired_response_event(ResponseEventInput {
+                            session_id: &session_id,
+                            host: &pending.host,
+                            provider: provider.as_str(),
+                            agent: pending.agent,
+                            method: &pending.method,
+                            path: &pending.path,
+                            graphql_operation: pending.graphql_operation.as_deref(),
+                            is_agent_app: pending.is_agent_app,
+                            status,
+                            latency_ms,
+                            request_content: pending.request_content.as_deref(),
+                            response_content: normalized_response,
+                            request_size_bytes: pending.request_size_bytes,
+                            response_size_bytes,
+                            headers: pending.headers.clone(),
+                            tags: Some(&enriched_tags),
+                            usage_meta: &response_usage,
+                            fallback_model: pending.model.as_deref(),
+                            response_kind: if is_stream_response {
+                                ResponseKind::Stream { is_sse }
+                            } else {
+                                ResponseKind::Http
+                            },
+                            traffic_envelope: pending.envelope.clone(),
+                        });
+                        if let Some(allowed) = pending.policy_allowed {
+                            event = event.with_policy(allowed, pending.policy_reason.clone());
+                        }
+                        if let Some(ref version) = pending.policy_version {
+                            event = event.with_policy_version(version.clone());
+                        }
+                        pii_enricher.enrich(&mut event);
+                        logger.log(&event);
                     }
-                    if let Some(ref version) = pending.policy_version {
-                        event = event.with_policy_version(version.clone());
+                    if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
+                        finalize_and_enqueue_exchange_v2(
+                            logger,
+                            exchange_cfg,
+                            &pii_enricher,
+                            &pending,
+                            &session_id,
+                            status,
+                            is_stream_response,
+                            is_sse,
+                            content_type.as_deref(),
+                            Some(response_headers.clone()),
+                            normalized_response_for_exchange.as_deref(),
+                            &response_usage,
+                            Some(&enriched_tags),
+                            response_body_truncated,
+                            response_capture_reason,
+                            exchange_bundle_version.as_deref(),
+                        );
                     }
-                    pii_enricher.enrich(&mut event);
-                    logger.log(&event);
                 }
             }
 
@@ -2879,6 +3432,13 @@ impl HttpHandler for AiProxyHandler {
         let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
         let session_id = self.session_id.clone();
+        let exchange_v2_cfg = self.exchange_v2.clone();
+        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+            Some(self.oisp_engine.bundle_version().to_string())
+        } else {
+            None
+        };
+        let legacy_wrap_events_enabled = exchange_v2_cfg.is_none();
         async move {
             let pending = {
                 let mut requests = pending_requests.lock();
@@ -2904,36 +3464,59 @@ impl HttpHandler for AiProxyHandler {
                     append_catalog_discovery_tags(&mut tags, &pending_req.host);
                 }
                 let usage_meta = ResponseUsageMeta::default();
-                let mut event = build_paired_response_event(ResponseEventInput {
-                    session_id: &session_id,
-                    host: &pending_req.host,
-                    provider: provider.as_str(),
-                    agent: pending_req.agent,
-                    method: &pending_req.method,
-                    path: &pending_req.path,
-                    graphql_operation: pending_req.graphql_operation.as_deref(),
-                    is_agent_app: pending_req.is_agent_app,
-                    status: failure_status,
-                    latency_ms,
-                    request_content: pending_req.request_content.as_deref(),
-                    response_content: Some(format!("[forward error] {error}")),
-                    request_size_bytes: pending_req.request_size_bytes,
-                    response_size_bytes: None,
-                    headers: pending_req.headers.clone(),
-                    tags: Some(&tags),
-                    usage_meta: &usage_meta,
-                    fallback_model: pending_req.model.as_deref(),
-                    response_kind: ResponseKind::Http,
-                    traffic_envelope: pending_req.envelope.clone(),
-                });
-                if let Some(allowed) = pending_req.policy_allowed {
-                    event = event.with_policy(allowed, pending_req.policy_reason.clone());
+                if legacy_wrap_events_enabled {
+                    let mut event = build_paired_response_event(ResponseEventInput {
+                        session_id: &session_id,
+                        host: &pending_req.host,
+                        provider: provider.as_str(),
+                        agent: pending_req.agent,
+                        method: &pending_req.method,
+                        path: &pending_req.path,
+                        graphql_operation: pending_req.graphql_operation.as_deref(),
+                        is_agent_app: pending_req.is_agent_app,
+                        status: failure_status,
+                        latency_ms,
+                        request_content: pending_req.request_content.as_deref(),
+                        response_content: Some(format!("[forward error] {error}")),
+                        request_size_bytes: pending_req.request_size_bytes,
+                        response_size_bytes: None,
+                        headers: pending_req.headers.clone(),
+                        tags: Some(&tags),
+                        usage_meta: &usage_meta,
+                        fallback_model: pending_req.model.as_deref(),
+                        response_kind: ResponseKind::Http,
+                        traffic_envelope: pending_req.envelope.clone(),
+                    });
+                    if let Some(allowed) = pending_req.policy_allowed {
+                        event = event.with_policy(allowed, pending_req.policy_reason.clone());
+                    }
+                    if let Some(ref version) = pending_req.policy_version {
+                        event = event.with_policy_version(version.clone());
+                    }
+                    pii_enricher.enrich(&mut event);
+                    logger.log(&event);
                 }
-                if let Some(ref version) = pending_req.policy_version {
-                    event = event.with_policy_version(version.clone());
+                if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
+                    let error_content = format!("[forward error] {error}");
+                    finalize_and_enqueue_exchange_v2(
+                        logger,
+                        exchange_cfg,
+                        &pii_enricher,
+                        pending_req,
+                        &session_id,
+                        failure_status,
+                        false,
+                        false,
+                        None,
+                        None,
+                        Some(error_content.as_str()),
+                        &usage_meta,
+                        Some(&tags),
+                        true,
+                        Some("transport_forward_error"),
+                        exchange_bundle_version.as_deref(),
+                    );
                 }
-                pii_enricher.enrich(&mut event);
-                logger.log(&event);
             }
 
             if benign {
@@ -3304,6 +3887,7 @@ pub async fn start_proxy(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -3319,6 +3903,7 @@ pub async fn start_proxy_with_shutdown<F>(
     enforcer: Option<ProxyEnforcer>,
     observe_config: Option<ObserveConfig>,
     oisp_registry_cache_path: Option<PathBuf>,
+    exchange_v2_config: Option<ExchangeV2Config>,
 ) -> Result<(), ProxyError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -3381,6 +3966,9 @@ where
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
         }
+        if let Some(ref exchange_cfg) = exchange_v2_config {
+            h = h.with_exchange_v2(exchange_cfg.clone());
+        }
         if let Some(ref learned) = learned_passthrough {
             h = h.with_learned_passthrough(
                 learned.clone(),
@@ -3400,6 +3988,9 @@ where
         }
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
+        }
+        if let Some(ref exchange_cfg) = exchange_v2_config {
+            h = h.with_exchange_v2(exchange_cfg.clone());
         }
         if let Some(ref learned) = learned_passthrough {
             h = h.with_learned_passthrough(

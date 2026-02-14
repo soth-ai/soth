@@ -2,7 +2,7 @@ use crate::http_client::build_cloud_client;
 use anyhow::Context;
 use flate2::{write::GzEncoder, Compression};
 use soth_core::api::{
-    version::API_VERSION_HEADER, EventBatchRequest, EventBatchResponse, API_VERSION,
+    version::API_VERSION_HEADER, ExchangeBatchRequest, ExchangeBatchResponse, API_VERSION,
 };
 use std::io::Write;
 
@@ -23,15 +23,15 @@ impl MetadataPusher {
         }
     }
 
-    pub async fn push_batch(
+    pub async fn push_exchange_batch(
         &self,
-        request: &EventBatchRequest,
-    ) -> anyhow::Result<Option<EventBatchResponse>> {
-        let url = format!("{}/api/v1/events/batch", self.endpoint);
+        request: &ExchangeBatchRequest,
+    ) -> anyhow::Result<Option<ExchangeBatchResponse>> {
+        let url = format!("{}/api/v1/exchanges/batch", self.endpoint);
         let request_json =
-            serde_json::to_vec(request).context("failed encoding metadata push request")?;
+            serde_json::to_vec(request).context("failed encoding exchange push request")?;
         let request_gzip = gzip_bytes(request_json.as_slice())
-            .context("failed compressing metadata push request")?;
+            .context("failed compressing exchange push request")?;
 
         let gzip_response = self
             .client
@@ -43,13 +43,13 @@ impl MetadataPusher {
             .body(request_gzip)
             .send()
             .await
-            .with_context(|| format!("metadata push failed for {url}"))?;
+            .with_context(|| format!("exchange push failed for {url}"))?;
 
         if gzip_response.status().is_success() {
             let decoded = gzip_response
-                .json::<EventBatchResponse>()
+                .json::<ExchangeBatchResponse>()
                 .await
-                .context("failed decoding event batch response")?;
+                .context("failed decoding exchange batch response")?;
             return Ok(Some(decoded));
         }
 
@@ -66,24 +66,24 @@ impl MetadataPusher {
             .body(request_json)
             .send()
             .await
-            .with_context(|| format!("metadata push fallback failed for {url}"))?;
+            .with_context(|| format!("exchange push fallback failed for {url}"))?;
         if !plain_response.status().is_success() {
             return Ok(None);
         }
 
         let decoded = plain_response
-            .json::<EventBatchResponse>()
+            .json::<ExchangeBatchResponse>()
             .await
-            .context("failed decoding fallback event batch response")?;
+            .context("failed decoding fallback exchange batch response")?;
         Ok(Some(decoded))
     }
 }
 
-pub fn estimate_gzip_batch_size(request: &EventBatchRequest) -> anyhow::Result<usize> {
+pub fn estimate_gzip_exchange_batch_size(request: &ExchangeBatchRequest) -> anyhow::Result<usize> {
     let request_json =
-        serde_json::to_vec(request).context("failed encoding metadata batch for sizing")?;
+        serde_json::to_vec(request).context("failed encoding exchange batch for sizing")?;
     let request_gzip = gzip_bytes(request_json.as_slice())
-        .context("failed compressing metadata batch for sizing")?;
+        .context("failed compressing exchange batch for sizing")?;
     Ok(request_gzip.len())
 }
 

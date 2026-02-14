@@ -164,6 +164,7 @@ pub fn spawn_cloud_pull_runtime(
                 .max(1) as usize,
             body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
             global_tags: config.cloud.tags.clone(),
+            exchange_v2_only: config.exchange_v2.enabled,
         };
         match SyncAgent::new(sync_config, Some(puller.clone())) {
             Ok(agent) => Some(agent),

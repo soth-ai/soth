@@ -104,6 +104,7 @@ async fn contract_sync_endpoints_and_cursors() {
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
+        exchange_v2_only: true,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
@@ -220,6 +221,7 @@ async fn contract_retry_queue_on_body_upload_failure() {
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
+        exchange_v2_only: true,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
@@ -282,6 +284,7 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
+        exchange_v2_only: true,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
@@ -323,6 +326,7 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
+        exchange_v2_only: true,
     };
     let agent = SyncAgent::new(config, None).unwrap();
     let error = agent.flush_for_shutdown(2).await.unwrap_err();

@@ -1,7 +1,8 @@
 use crate::http_client::build_cloud_client;
 use anyhow::Context;
-use reqwest::multipart::{Form, Part};
-use soth_core::api::{version::API_VERSION_HEADER, BodyUploadResponse, API_VERSION};
+use soth_core::api::{
+    version::API_VERSION_HEADER, BlobUploadRequest, BlobUploadResponse, API_VERSION,
+};
 
 #[derive(Clone)]
 pub struct BodyUploader {
@@ -20,49 +21,30 @@ impl BodyUploader {
         }
     }
 
-    pub async fn upload(
+    pub async fn upload_blob(
         &self,
-        event_id: &str,
-        request_body: Option<Vec<u8>>,
-        response_body: Option<Vec<u8>>,
-    ) -> anyhow::Result<Option<BodyUploadResponse>> {
-        let url = format!("{}/api/v1/events/{event_id}/body", self.endpoint);
-        let mut form = Form::new();
-        if let Some(payload) = request_body {
-            form = form.part(
-                "request_body",
-                Part::bytes(payload)
-                    .mime_str("application/json")
-                    .context("invalid request_body mime type")?,
-            );
-        }
-        if let Some(payload) = response_body {
-            form = form.part(
-                "response_body",
-                Part::bytes(payload)
-                    .mime_str("application/json")
-                    .context("invalid response_body mime type")?,
-            );
-        }
-
+        request: &BlobUploadRequest,
+    ) -> anyhow::Result<Option<BlobUploadResponse>> {
+        let url = format!("{}/api/v1/blobs", self.endpoint);
         let response = self
             .client
             .post(&url)
             .header(API_VERSION_HEADER, API_VERSION)
+            .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .multipart(form)
+            .json(request)
             .send()
             .await
-            .with_context(|| format!("body upload failed for {url}"))?;
+            .with_context(|| format!("blob upload failed for {url}"))?;
 
         if !response.status().is_success() {
             return Ok(None);
         }
 
         let decoded = response
-            .json::<BodyUploadResponse>()
+            .json::<BlobUploadResponse>()
             .await
-            .context("failed decoding body upload response")?;
+            .context("failed decoding blob upload response")?;
         Ok(Some(decoded))
     }
 }

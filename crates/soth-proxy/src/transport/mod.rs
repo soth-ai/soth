@@ -1,5 +1,6 @@
 //! Transport modules used by the soth proxy runtime.
 
+pub mod exchange_assembler;
 pub mod graphql_enrichment;
 pub mod host_fingerprint;
 pub mod hudsucker_proxy;

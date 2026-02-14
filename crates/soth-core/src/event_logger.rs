@@ -5,8 +5,13 @@
 //! Used by both `soth wrap` (stdio interception) and soth proxy (HTTP interception)
 //! to emit events that appear in the observability dashboard.
 
-use crate::config::types::CryptoIdentityConfig;
-use crate::types::WrapEvent;
+use crate::config::types::{CryptoIdentityConfig, ExchangeV2Config};
+use crate::types::exchange_v2::{
+    ExchangeBody, ExchangeBodyMode, ExchangeClient, ExchangeCost, ExchangeEventV2, ExchangeFlags,
+    ExchangeIntegrity, ExchangeParse, ExchangeSide, ExchangeSourceClass, ExchangeTransport,
+    ExchangeUsage,
+};
+use crate::types::{EventSource, WrapDirection, WrapEvent};
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
@@ -308,6 +313,28 @@ pub struct SyncCursorState {
     pub sync_errors: Option<String>,
 }
 
+/// Durable in-flight exchange assembly record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeSpoolEntry {
+    pub exchange_id: String,
+    pub state_json: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub finalized_at: Option<String>,
+}
+
+/// Durable upload queue row for finalized exchanges awaiting sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeUploadQueueEntry {
+    pub exchange_id: String,
+    pub payload_json: String,
+    pub blobs_json: Option<String>,
+    pub attempt_count: u32,
+    pub next_attempt_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Event logger that writes `WrapEvent`s to SQLite.
 #[derive(Clone)]
 pub struct EventLogger {
@@ -438,6 +465,254 @@ impl EventLogger {
             last_sync_timestamp: self.get_sync_state(SYNC_KEY_LAST_SYNC_TIMESTAMP)?,
             sync_errors: self.get_sync_state(SYNC_KEY_SYNC_ERRORS)?,
         })
+    }
+
+    /// Insert or update an in-flight exchange spool row.
+    pub fn upsert_exchange_spool(
+        &self,
+        exchange_id: &str,
+        state_json: &str,
+        started_at: &str,
+    ) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.execute(
+            r#"
+            INSERT INTO exchange_spool (exchange_id, state_json, started_at, updated_at, finalized_at)
+            VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL)
+            ON CONFLICT(exchange_id) DO UPDATE SET
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![exchange_id, state_json, started_at],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// Mark a spool row finalized and optionally update final state snapshot.
+    pub fn finalize_exchange_spool(
+        &self,
+        exchange_id: &str,
+        final_state_json: Option<&str>,
+    ) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        match final_state_json {
+            Some(state_json) => {
+                conn.execute(
+                    r#"
+                    UPDATE exchange_spool
+                    SET state_json = ?2,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        finalized_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE exchange_id = ?1
+                    "#,
+                    params![exchange_id, state_json],
+                )
+                .map_err(to_io_err)?;
+            }
+            None => {
+                conn.execute(
+                    r#"
+                    UPDATE exchange_spool
+                    SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        finalized_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE exchange_id = ?1
+                    "#,
+                    params![exchange_id],
+                )
+                .map_err(to_io_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove an exchange spool row.
+    pub fn delete_exchange_spool(&self, exchange_id: &str) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.execute(
+            "DELETE FROM exchange_spool WHERE exchange_id = ?1",
+            params![exchange_id],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// List pending in-flight exchange spool rows (not finalized).
+    pub fn load_exchange_spool_pending(
+        &self,
+        limit: usize,
+    ) -> std::io::Result<Vec<ExchangeSpoolEntry>> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT exchange_id, state_json, started_at, updated_at, finalized_at
+                FROM exchange_spool
+                WHERE finalized_at IS NULL
+                ORDER BY updated_at ASC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(to_io_err)?;
+        let rows = stmt
+            .query_map([limit.max(1) as i64], |row| {
+                Ok(ExchangeSpoolEntry {
+                    exchange_id: row.get(0)?,
+                    state_json: row.get(1)?,
+                    started_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                    finalized_at: row.get(4)?,
+                })
+            })
+            .map_err(to_io_err)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(to_io_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Enqueue or refresh a finalized exchange upload payload.
+    pub fn enqueue_exchange_upload(
+        &self,
+        exchange_id: &str,
+        payload_json: &str,
+    ) -> std::io::Result<()> {
+        self.enqueue_exchange_upload_with_blobs(exchange_id, payload_json, None)
+    }
+
+    /// Enqueue or refresh a finalized exchange upload payload, with optional blob material.
+    pub fn enqueue_exchange_upload_with_blobs(
+        &self,
+        exchange_id: &str,
+        payload_json: &str,
+        blobs_json: Option<&str>,
+    ) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        let observed_at =
+            extract_exchange_observed_at(payload_json).unwrap_or_else(|| Utc::now().to_rfc3339());
+        conn.execute(
+            r#"
+            INSERT INTO exchange_events (
+                exchange_id, observed_at, event_json, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT(exchange_id) DO UPDATE SET
+                observed_at = excluded.observed_at,
+                event_json = excluded.event_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![exchange_id, observed_at, payload_json],
+        )
+        .map_err(to_io_err)?;
+        conn.execute(
+            r#"
+            INSERT INTO exchange_upload_queue (
+                exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, 0, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT(exchange_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                blobs_json = excluded.blobs_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![exchange_id, payload_json, blobs_json],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// Convert a [`WrapEvent`] into an `exchange.v2` payload and enqueue it for cloud upload.
+    ///
+    /// This is used by wrap/collector paths so they share the same cloud upload mechanism
+    /// as proxy traffic (`exchange_upload_queue` -> `/api/v1/exchanges/batch`).
+    pub fn enqueue_exchange_from_wrap_event(
+        &self,
+        event: &WrapEvent,
+        exchange_cfg: &ExchangeV2Config,
+        source_class_override: Option<ExchangeSourceClass>,
+    ) -> std::io::Result<()> {
+        if !exchange_cfg.enabled {
+            return Ok(());
+        }
+
+        let exchange_id = event.id.clone();
+        let payload = wrap_event_to_exchange_v2(event, exchange_cfg, source_class_override);
+        let payload_json = serde_json::to_string(&payload)
+            .map_err(|error| std::io::Error::other(format!("serialize exchange.v2: {error}")))?;
+        self.enqueue_exchange_upload(exchange_id.as_str(), payload_json.as_str())
+    }
+
+    /// List upload queue entries that are ready for dispatch.
+    pub fn load_exchange_upload_queue_ready(
+        &self,
+        limit: usize,
+    ) -> std::io::Result<Vec<ExchangeUploadQueueEntry>> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
+                FROM exchange_upload_queue
+                WHERE next_attempt_at IS NULL OR next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ORDER BY updated_at ASC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(to_io_err)?;
+        let rows = stmt
+            .query_map([limit.max(1) as i64], |row| {
+                Ok(ExchangeUploadQueueEntry {
+                    exchange_id: row.get(0)?,
+                    payload_json: row.get(1)?,
+                    blobs_json: row.get(2)?,
+                    attempt_count: row.get::<_, i64>(3)? as u32,
+                    next_attempt_at: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .map_err(to_io_err)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(to_io_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Increment upload attempt counters and set a retry delay.
+    pub fn mark_exchange_upload_attempt(
+        &self,
+        exchange_id: &str,
+        retry_delay: Duration,
+    ) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        let delay_secs = retry_delay.as_secs().max(1);
+        conn.execute(
+            r#"
+            UPDATE exchange_upload_queue
+            SET attempt_count = attempt_count + 1,
+                next_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('+%d seconds', ?2)),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE exchange_id = ?1
+            "#,
+            params![exchange_id, delay_secs],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
+    }
+
+    /// Remove an upload queue entry after successful sync.
+    pub fn delete_exchange_upload(&self, exchange_id: &str) -> std::io::Result<()> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        conn.execute(
+            "DELETE FROM exchange_upload_queue WHERE exchange_id = ?1",
+            params![exchange_id],
+        )
+        .map_err(to_io_err)?;
+        Ok(())
     }
 
     /// Log an event.
@@ -595,6 +870,19 @@ fn init_sqlite_schema(conn: &Connection) -> std::io::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_wrap_event_payloads_event_id
             ON wrap_event_payloads(event_id);
 
+        CREATE TABLE IF NOT EXISTS exchange_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange_id TEXT NOT NULL UNIQUE,
+            observed_at TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_events_observed_at
+            ON exchange_events(observed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_exchange_events_updated_at
+            ON exchange_events(updated_at DESC);
+
         CREATE TABLE IF NOT EXISTS merkle_batches (
             batch_id TEXT PRIMARY KEY,
             seq_start INTEGER NOT NULL,
@@ -627,9 +915,46 @@ fn init_sqlite_schema(conn: &Connection) -> std::io::Result<()> {
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS exchange_spool (
+            exchange_id TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finalized_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_spool_updated_at
+            ON exchange_spool(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_exchange_spool_finalized_at
+            ON exchange_spool(finalized_at);
+
+        CREATE TABLE IF NOT EXISTS exchange_upload_queue (
+            exchange_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            blobs_json TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_upload_queue_next_attempt
+            ON exchange_upload_queue(next_attempt_at);
+        CREATE INDEX IF NOT EXISTS idx_exchange_upload_queue_updated_at
+            ON exchange_upload_queue(updated_at);
         "#,
     )
     .map_err(to_io_err)?;
+
+    // Forward-compatible schema update for existing local DBs.
+    if let Err(error) = conn.execute(
+        "ALTER TABLE exchange_upload_queue ADD COLUMN blobs_json TEXT",
+        [],
+    ) {
+        let message = error.to_string().to_ascii_lowercase();
+        if !message.contains("duplicate column name") {
+            return Err(to_io_err(error));
+        }
+    }
 
     Ok(())
 }
@@ -1044,6 +1369,369 @@ fn hex_decode_32(value: &str) -> std::io::Result<[u8; 32]> {
 
 fn to_io_err(error: rusqlite::Error) -> std::io::Error {
     std::io::Error::other(error.to_string())
+}
+
+fn extract_exchange_observed_at(payload_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(payload_json).ok()?;
+    value
+        .get("observed_at")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn wrap_event_to_exchange_v2(
+    event: &WrapEvent,
+    exchange_cfg: &ExchangeV2Config,
+    source_class_override: Option<ExchangeSourceClass>,
+) -> ExchangeEventV2 {
+    let source_class = source_class_override.unwrap_or_else(|| source_class_from_wrap_event(event));
+    let transport = transport_from_wrap_event(event);
+    let mut payload = ExchangeEventV2::new(
+        event.id.clone(),
+        source_class,
+        transport,
+        ExchangeBodyMode::MetadataOnly,
+        ExchangeBodyMode::MetadataOnly,
+    );
+
+    payload.session_id = Some(event.session_id.clone());
+    payload.observed_at = event.timestamp;
+    payload.started_at = Some(event.timestamp);
+    payload.completed_at = Some(event.timestamp);
+    payload.duration_ms = event.latency_ms;
+    payload.ttfb_ms = event.latency_ms;
+
+    payload.provider = event.provider.clone().or_else(|| {
+        event
+            .traffic_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.provider.clone())
+    });
+    payload.agent = Some(event.agent.name.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            event
+                .traffic_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.agent.clone())
+        });
+    payload.model = event.model.clone().or_else(|| {
+        event
+            .traffic_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.model.clone())
+    });
+    payload.endpoint = event
+        .traffic_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.path.clone())
+        .or_else(|| Some(event.server_name.clone()));
+    payload.method = event.method.clone().or_else(|| {
+        event
+            .traffic_envelope
+            .as_ref()
+            .map(|envelope| envelope.method.clone())
+    });
+    payload.status_code = event.status_code;
+    payload.client = exchange_client_from_wrap_event(event);
+
+    let request_text = event
+        .request_content
+        .as_deref()
+        .or_else(|| match event.direction {
+            WrapDirection::In => event.content.as_deref(),
+            WrapDirection::Out => None,
+        });
+    let response_text = event
+        .response_content
+        .as_deref()
+        .or_else(|| match event.direction {
+            WrapDirection::Out => event.content.as_deref(),
+            WrapDirection::In => None,
+        });
+
+    let (request_body, request_truncated) = exchange_body_from_text(
+        request_text,
+        event
+            .request_preview
+            .as_deref()
+            .or(event.content_preview.as_deref()),
+        event.request_size_bytes,
+        None,
+        exchange_cfg,
+    );
+    let (response_body, response_truncated) = exchange_body_from_text(
+        response_text,
+        event
+            .response_preview
+            .as_deref()
+            .or(event.content_preview.as_deref()),
+        event.response_size_bytes,
+        None,
+        exchange_cfg,
+    );
+
+    payload.request = ExchangeSide {
+        headers: if request_text.is_some() || event.request_content.is_some() {
+            event.headers.clone()
+        } else {
+            None
+        },
+        body: request_body,
+    };
+    payload.response = ExchangeSide {
+        headers: if response_text.is_some() || event.response_content.is_some() {
+            event.headers.clone()
+        } else {
+            None
+        },
+        body: response_body,
+    };
+
+    payload.usage = ExchangeUsage {
+        input_tokens: event.input_tokens,
+        output_tokens: event.output_tokens,
+        cache_read_tokens: event.cache_read_tokens,
+        cache_write_tokens: event.cache_write_tokens,
+        reasoning_tokens: event.reasoning_tokens,
+    };
+    payload.cost = event.cost_usd.map(|estimated_usd| ExchangeCost {
+        estimated_usd,
+        currency: "USD".to_string(),
+        pricing_version: None,
+    });
+    payload.flags = ExchangeFlags {
+        truncated: request_truncated || response_truncated,
+        metadata_only: payload.request.body.mode == ExchangeBodyMode::MetadataOnly
+            && payload.response.body.mode == ExchangeBodyMode::MetadataOnly,
+        discovery_capture: false,
+        blacklist_match: false,
+        pii_detected: event.pii_detected,
+    };
+    payload.pii_types = event.pii_types.clone();
+    payload.integrity = Some(ExchangeIntegrity {
+        event_hash: event.event_hash.clone(),
+        signature: event
+            .traffic_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.signature.clone()),
+        signature_key_id: event
+            .traffic_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.key_id.clone()),
+    });
+    payload.parse = Some(ExchangeParse {
+        parser_version: Some("exchange_v2_wrap".to_string()),
+        bundle_version: None,
+        parse_confidence: None,
+        detection_reason: Some(format!("{:?}", event.agent.detected_from).to_ascii_lowercase()),
+    });
+    payload.tags = merge_exchange_tags(event);
+
+    payload
+}
+
+fn source_class_from_wrap_event(event: &WrapEvent) -> ExchangeSourceClass {
+    if event.collector_source.is_some() {
+        return ExchangeSourceClass::Collector;
+    }
+    match event.source {
+        EventSource::Mcp => ExchangeSourceClass::Mcp,
+        EventSource::AiProxy => ExchangeSourceClass::AiInference,
+        EventSource::AgentApp => ExchangeSourceClass::AgentApp,
+    }
+}
+
+fn transport_from_wrap_event(event: &WrapEvent) -> ExchangeTransport {
+    use crate::types::TrafficSource;
+
+    if let Some(envelope) = event.traffic_envelope.as_ref() {
+        return match envelope.source {
+            TrafficSource::McpStdio => ExchangeTransport::Stdio,
+            TrafficSource::McpHttp => ExchangeTransport::Jsonrpc,
+            TrafficSource::ProxyHudsucker => ExchangeTransport::Https,
+        };
+    }
+    if matches!(event.source, EventSource::Mcp) {
+        ExchangeTransport::Stdio
+    } else {
+        ExchangeTransport::Https
+    }
+}
+
+fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> {
+    let envelope = event.traffic_envelope.as_ref()?;
+    let bundle_id = bundle_id_from_executable_path(envelope.process_executable.as_deref());
+    Some(ExchangeClient {
+        pid: envelope.process_pid,
+        bundle_id: bundle_id.clone(),
+        process_name: envelope.process_name.clone(),
+        app_type: event.collector_source.as_ref().map(|_| "collector".to_string()).or(
+            bundle_id
+                .as_ref()
+                .map(|_| "desktop_app".to_string())
+                .or(Some("cli".to_string())),
+        ),
+        referrer_origin: None,
+    })
+}
+
+fn bundle_id_from_executable_path(path: Option<&str>) -> Option<String> {
+    let path = path?;
+    let lower = path.to_ascii_lowercase();
+    let idx = lower.find(".app/")?;
+    let app_root = &path[..idx + 4];
+    let app = app_root
+        .rsplit('/')
+        .next()
+        .unwrap_or(app_root)
+        .trim_end_matches(".app")
+        .trim();
+    if app.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "macos.{}",
+        app.chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('_')
+    ))
+}
+
+fn exchange_body_from_text(
+    text: Option<&str>,
+    preview: Option<&str>,
+    size_hint: Option<u64>,
+    content_type: Option<String>,
+    exchange_cfg: &ExchangeV2Config,
+) -> (ExchangeBody, bool) {
+    if let Some(value) = text {
+        let bytes = value.as_bytes();
+        if bytes.len() > exchange_cfg.max_body_bytes as usize {
+            return (
+                ExchangeBody {
+                    mode: ExchangeBodyMode::PreviewOnly,
+                    inline: None,
+                    reference: None,
+                    preview: Some(build_preview(value)),
+                    bytes_raw: Some(bytes.len() as u64),
+                    bytes_gzip: None,
+                    sha256: Some(hex_encode(&Sha256::digest(bytes))),
+                    content_type,
+                    truncated_reason: Some("max_body_bytes_exceeded".to_string()),
+                },
+                true,
+            );
+        }
+        return (
+            ExchangeBody {
+                mode: ExchangeBodyMode::Inline,
+                inline: Some(value.to_string()),
+                reference: None,
+                preview: None,
+                bytes_raw: Some(bytes.len() as u64),
+                bytes_gzip: None,
+                sha256: Some(hex_encode(&Sha256::digest(bytes))),
+                content_type,
+                truncated_reason: None,
+            },
+            false,
+        );
+    }
+
+    if let Some(preview) = preview {
+        return (
+            ExchangeBody {
+                mode: ExchangeBodyMode::PreviewOnly,
+                inline: None,
+                reference: None,
+                preview: Some(preview.to_string()),
+                bytes_raw: size_hint,
+                bytes_gzip: None,
+                sha256: None,
+                content_type,
+                truncated_reason: None,
+            },
+            false,
+        );
+    }
+
+    (
+        ExchangeBody {
+            mode: ExchangeBodyMode::MetadataOnly,
+            inline: None,
+            reference: None,
+            preview: None,
+            bytes_raw: size_hint,
+            bytes_gzip: None,
+            sha256: None,
+            content_type,
+            truncated_reason: None,
+        },
+        false,
+    )
+}
+
+fn merge_exchange_tags(event: &WrapEvent) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut tags = event.tags.clone().unwrap_or_default();
+    if let Some(source) = event.collector_source.as_ref() {
+        tags.entry("collector.source".to_string())
+            .or_insert_with(|| source.clone());
+    }
+    if let Some(offset) = event.collector_offset {
+        tags.entry("collector.offset".to_string())
+            .or_insert_with(|| offset.to_string());
+    }
+    if let Some(operation) = event.graphql_operation.as_ref() {
+        tags.entry("graphql.operation".to_string())
+            .or_insert_with(|| operation.clone());
+    }
+    if let Some(allowed) = event.policy_allowed {
+        tags.entry("policy.allowed".to_string())
+            .or_insert_with(|| allowed.to_string());
+    }
+    if let Some(version) = event.policy_version.as_ref() {
+        tags.entry("policy.version".to_string())
+            .or_insert_with(|| version.clone());
+    }
+    if let Some(reason) = event.policy_reason.as_ref() {
+        tags.entry("policy.reason".to_string())
+            .or_insert_with(|| reason.clone());
+    }
+    if let Some(tool_name) = event.tool_name.as_ref() {
+        tags.entry("mcp.tool_name".to_string())
+            .or_insert_with(|| tool_name.clone());
+    }
+    if let Some(envelope) = event.traffic_envelope.as_ref() {
+        if let Some(did) = envelope.did.as_ref() {
+            tags.entry("identity.did".to_string())
+                .or_insert_with(|| did.clone());
+        }
+        if let Some(signature_alg) = envelope.signature_alg.as_ref() {
+            tags.entry("identity.signature_alg".to_string())
+                .or_insert_with(|| signature_alg.clone());
+        }
+        if let Some(fields_version) = envelope.signed_fields_version.as_ref() {
+            tags.entry("identity.signed_fields_version".to_string())
+                .or_insert_with(|| fields_version.clone());
+        }
+        if let Some(executable) = envelope.process_executable.as_ref() {
+            tags.entry("client.process_executable".to_string())
+                .or_insert_with(|| executable.clone());
+        }
+    }
+    if tags.is_empty() {
+        None
+    } else {
+        Some(tags)
+    }
 }
 
 #[cfg(test)]
@@ -1465,5 +2153,103 @@ mod tests {
         assert_eq!(second.merkle_root, Some(root_hash));
         assert_eq!(first.audit_signer_did, Some(signer_did.clone()));
         assert_eq!(second.audit_signer_did, Some(signer_did));
+    }
+
+    #[test]
+    fn test_exchange_spool_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path).unwrap();
+
+        logger
+            .upsert_exchange_spool(
+                "ex-1",
+                r#"{"state":"inflight","chunks":3}"#,
+                "2026-02-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let pending = logger.load_exchange_spool_pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].exchange_id, "ex-1");
+        assert_eq!(pending[0].finalized_at, None);
+
+        logger
+            .finalize_exchange_spool("ex-1", Some(r#"{"state":"done"}"#))
+            .unwrap();
+        let pending_after_finalize = logger.load_exchange_spool_pending(10).unwrap();
+        assert!(pending_after_finalize.is_empty());
+
+        logger.delete_exchange_spool("ex-1").unwrap();
+        logger.close();
+    }
+
+    #[test]
+    fn test_exchange_upload_queue_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path).unwrap();
+
+        logger
+            .enqueue_exchange_upload_with_blobs(
+                "ex-2",
+                r#"{"exchange_id":"ex-2"}"#,
+                Some(r#"[{"side":"response","reference":"blob://exchange/ex-2/response/abc"}]"#),
+            )
+            .unwrap();
+        let ready = logger.load_exchange_upload_queue_ready(10).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].exchange_id, "ex-2");
+        assert!(ready[0].blobs_json.is_some());
+        assert_eq!(ready[0].attempt_count, 0);
+
+        logger
+            .mark_exchange_upload_attempt("ex-2", Duration::from_secs(30))
+            .unwrap();
+        let ready_after_backoff = logger.load_exchange_upload_queue_ready(10).unwrap();
+        assert!(
+            ready_after_backoff.is_empty(),
+            "entry should be delayed by retry backoff"
+        );
+
+        logger.delete_exchange_upload("ex-2").unwrap();
+        let ready_after_delete = logger.load_exchange_upload_queue_ready(10).unwrap();
+        assert!(ready_after_delete.is_empty());
+        logger.close();
+    }
+
+    #[test]
+    fn test_enqueue_exchange_from_wrap_event() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path).unwrap();
+
+        let mut cfg = ExchangeV2Config::default();
+        cfg.enabled = true;
+
+        let event = WrapEvent::new(
+            "session-wrap",
+            "mcp-server",
+            WrapDirection::In,
+            AgentInfo::new("claude-code", DetectionSource::CommandLine),
+        )
+        .with_source(EventSource::Mcp)
+        .with_method("tools/call")
+        .with_content(r#"{"jsonrpc":"2.0","method":"tools/call"}"#)
+        .with_usage_tokens(12, 34)
+        .with_cost(0.0042);
+
+        logger
+            .enqueue_exchange_from_wrap_event(&event, &cfg, Some(ExchangeSourceClass::Mcp))
+            .unwrap();
+
+        let ready = logger.load_exchange_upload_queue_ready(10).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].exchange_id, event.id);
+        assert!(ready[0].payload_json.contains("\"schema_version\":\"2.0\""));
+        assert!(ready[0].payload_json.contains("\"source_class\":\"mcp\""));
+        assert!(ready[0].payload_json.contains("\"method\":\"tools/call\""));
+        assert!(ready[0].payload_json.contains("\"input_tokens\":12"));
+        assert!(ready[0].payload_json.contains("\"output_tokens\":34"));
     }
 }
