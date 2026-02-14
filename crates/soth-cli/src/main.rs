@@ -7,7 +7,7 @@
 //!   soth setup wizard            - Guided setup for proxy/wrap/shell
 //!   soth init                    - Initialize config and keys
 //!   soth login                   - Store cloud API credentials locally
-//!   soth tui                     - Interactive TUI dashboard
+//!   soth tui                     - Interactive API-backed TUI
 //!   soth attach                  - Attach TUI to a running proxy
 //!   soth proxy api start         - Start local API/WebSocket service
 //!   soth proxy ui start          - Start local UI dev service
@@ -116,7 +116,7 @@ enum Commands {
     /// Stream live events
     Tail(commands::tail::TailArgs),
 
-    /// Interactive TUI dashboard
+    /// Interactive API-backed TUI
     Tui(commands::tui::TuiArgs),
 
     /// Attach TUI to a running soth proxy
