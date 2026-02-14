@@ -617,7 +617,7 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         discovery_capture: event.flags.discovery_capture,
         blacklist_match: event.flags.blacklist_match,
         pii_detected: event.flags.pii_detected,
-        pii_types: Vec::new(),
+        pii_types: event.pii_types.clone(),
         event_hash: event
             .integrity
             .as_ref()

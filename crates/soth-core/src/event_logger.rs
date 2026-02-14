@@ -1508,6 +1508,7 @@ fn wrap_event_to_exchange_v2(
         blacklist_match: false,
         pii_detected: event.pii_detected,
     };
+    payload.pii_types = event.pii_types.clone();
     payload.integrity = Some(ExchangeIntegrity {
         event_hash: event.event_hash.clone(),
         signature: event

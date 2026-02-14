@@ -183,6 +183,8 @@ pub struct ExchangeEventV2 {
     pub cost: Option<ExchangeCost>,
     #[serde(default)]
     pub flags: ExchangeFlags,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pii_types: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<ExchangeIntegrity>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,6 +253,7 @@ impl ExchangeEventV2 {
             usage: ExchangeUsage::default(),
             cost: None,
             flags: ExchangeFlags::default(),
+            pii_types: Vec::new(),
             integrity: None,
             parse: None,
             tags: None,

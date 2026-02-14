@@ -1356,6 +1356,16 @@ fn transport_for_pending(
     ExchangeTransport::Https
 }
 
+fn event_source_for_pending(pending: &PendingRequest) -> EventSource {
+    if pending.is_mcp_jsonrpc {
+        EventSource::Mcp
+    } else if pending.is_agent_app {
+        EventSource::AgentApp
+    } else {
+        EventSource::AiProxy
+    }
+}
+
 fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<ExchangeClient> {
     let envelope = envelope?;
     if envelope.process_pid.is_none()
@@ -1412,6 +1422,7 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
 fn finalize_and_enqueue_exchange_v2(
     logger: &EventLogger,
     exchange_cfg: &ExchangeAssemblerConfig,
+    pii_enricher: &PiiEventEnricher,
     pending: &PendingRequest,
     session_id: &str,
     status: u16,
@@ -1490,12 +1501,43 @@ fn finalize_and_enqueue_exchange_v2(
         assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
     }
     assembler.set_tags(tags.cloned());
+    let mut pii_probe = WrapEvent::new(
+        session_id,
+        &pending.host,
+        WrapDirection::Out,
+        AgentInfo::new(
+            pending.agent.unwrap_or("unknown"),
+            DetectionSource::Environment,
+        ),
+    )
+    .with_source(event_source_for_pending(pending));
+    if let Some(provider) = pending.provider.as_ref() {
+        pii_probe = pii_probe.with_provider(provider.clone());
+    }
+    if let Some(model) = usage_meta.model.as_ref().or(pending.model.as_ref()) {
+        pii_probe = pii_probe.with_model(model.clone());
+    }
+    pii_probe = pii_probe.with_method(
+        pending
+            .mcp_method
+            .clone()
+            .unwrap_or_else(|| format!("{} {}", pending.method, pending.path)),
+    );
+    if let Some(request_body) = pending.request_content.as_ref() {
+        pii_probe = pii_probe.with_request(request_body.clone(), "");
+    }
+    if let Some(response_body) = response_body {
+        pii_probe = pii_probe.with_response(response_body.to_string(), "");
+    }
+    pii_enricher.enrich(&mut pii_probe);
+    assembler.set_pii_detected(pii_probe.pii_detected);
 
-    let result = if response_truncated && response_truncated_reason == Some("partial_timeout") {
+    let mut result = if response_truncated && response_truncated_reason == Some("partial_timeout") {
         assembler.finalize_timeout_with_blobs()
     } else {
         assembler.finalize_complete_with_blobs()
     };
+    result.event.pii_types = pii_probe.pii_types;
 
     let payload_json = match serde_json::to_string(&result.event) {
         Ok(value) => value,
@@ -2765,6 +2807,7 @@ impl HttpHandler for AiProxyHandler {
                         finalize_and_enqueue_exchange_v2(
                             logger,
                             exchange_cfg,
+                            &pii_enricher,
                             &pending,
                             &session_id,
                             status,
@@ -3103,6 +3146,7 @@ impl HttpHandler for AiProxyHandler {
                             finalize_and_enqueue_exchange_v2(
                                 logger,
                                 exchange_cfg,
+                                &log_pii_enricher,
                                 &log_pending,
                                 &log_session_id,
                                 status,
@@ -3256,6 +3300,7 @@ impl HttpHandler for AiProxyHandler {
                         finalize_and_enqueue_exchange_v2(
                             logger,
                             exchange_cfg,
+                            &pii_enricher,
                             &pending,
                             &session_id,
                             status,
@@ -3361,6 +3406,7 @@ impl HttpHandler for AiProxyHandler {
                     finalize_and_enqueue_exchange_v2(
                         logger,
                         exchange_cfg,
+                        &pii_enricher,
                         pending_req,
                         &session_id,
                         failure_status,
