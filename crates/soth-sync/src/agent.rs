@@ -574,9 +574,39 @@ fn merge_tags(
 }
 
 fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
+    let policy_allowed = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("policy.allowed"))
+        .and_then(|value| {
+            if value.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if value.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            }
+        });
+    let policy_version = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("policy.version"))
+        .cloned();
+    let mcp_tool_name = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("mcp.tool_name"))
+        .cloned();
+    let graphql_operation = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("graphql.operation"))
+        .cloned();
+
     ExchangeMetadata {
         exchange_id: event.exchange_id.clone(),
         schema_version: event.schema_version.clone(),
+        session_id: event.session_id.clone(),
         observed_at: event.observed_at.to_rfc3339(),
         started_at: event.started_at.map(|value| value.to_rfc3339()),
         completed_at: event.completed_at.map(|value| value.to_rfc3339()),
@@ -612,12 +642,20 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         response_body_ref: event.response.body.reference.clone(),
         request_body_sha256: event.request.body.sha256.clone(),
         response_body_sha256: event.response.body.sha256.clone(),
+        request_body_preview: event.request.body.preview.clone(),
+        response_body_preview: event.response.body.preview.clone(),
+        request_truncated_reason: event.request.body.truncated_reason.clone(),
+        response_truncated_reason: event.response.body.truncated_reason.clone(),
         truncated: event.flags.truncated,
         metadata_only: event.flags.metadata_only,
         discovery_capture: event.flags.discovery_capture,
         blacklist_match: event.flags.blacklist_match,
         pii_detected: event.flags.pii_detected,
         pii_types: event.pii_types.clone(),
+        policy_allowed,
+        policy_version,
+        mcp_tool_name,
+        graphql_operation,
         event_hash: event
             .integrity
             .as_ref()
@@ -662,11 +700,15 @@ fn build_exchange_event_envelope_metadata(
     event: &ExchangeEventV2,
 ) -> Option<EventEnvelopeMetadata> {
     let (host, path) = split_endpoint_host_path(event.endpoint.as_deref());
+    let tags = event.tags.as_ref();
+    let process_executable = tags
+        .and_then(|value| value.get("client.process_executable"))
+        .cloned();
     let client = event.client.as_ref().map(|value| EventClientMetadata {
         pid: value.pid,
         bundle_id: value.bundle_id.clone(),
         process_name: value.process_name.clone(),
-        process_executable: None,
+        process_executable,
         app_type: value.app_type.clone(),
     });
     let headers = event
@@ -695,13 +737,17 @@ fn build_exchange_event_envelope_metadata(
         path,
         model: event.model.clone(),
         agent: event.agent.clone(),
-        did: None,
+        did: tags.and_then(|value| value.get("identity.did")).cloned(),
         key_id: event
             .integrity
             .as_ref()
             .and_then(|value| value.signature_key_id.clone()),
-        signature_alg: None,
-        signed_fields_version: None,
+        signature_alg: tags
+            .and_then(|value| value.get("identity.signature_alg"))
+            .cloned(),
+        signed_fields_version: tags
+            .and_then(|value| value.get("identity.signed_fields_version"))
+            .cloned(),
         signature: event
             .integrity
             .as_ref()
@@ -712,8 +758,12 @@ fn build_exchange_event_envelope_metadata(
             .and_then(|value| value.event_hash.clone()),
         headers,
         client,
-        collector_source: None,
-        collector_offset: None,
+        collector_source: tags
+            .and_then(|value| value.get("collector.source"))
+            .cloned(),
+        collector_offset: tags
+            .and_then(|value| value.get("collector.offset"))
+            .and_then(|value| value.parse::<u64>().ok()),
     })
 }
 

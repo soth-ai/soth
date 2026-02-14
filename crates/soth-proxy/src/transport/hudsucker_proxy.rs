@@ -110,6 +110,10 @@ struct PendingRequest {
     is_mcp_jsonrpc: bool,
     /// True when captured through discovery-mode catalog interception.
     catalog_discovery: bool,
+    /// Bundle-based interception classification reason.
+    detection_reason: Option<String>,
+    /// Confidence score for detection reason.
+    parse_confidence: Option<f64>,
     /// Policy decision metadata captured at request enforcement time.
     policy_allowed: Option<bool>,
     policy_reason: Option<String>,
@@ -237,6 +241,35 @@ fn append_catalog_discovery_tags(tags: &mut BTreeMap<String, String>, host: &str
     tags.insert("discovery_capture".to_string(), "daily_first".to_string());
     tags.insert("discovery_payload".to_string(), "metadata_only".to_string());
     tags.insert("discovery_host".to_string(), host.to_string());
+}
+
+fn detection_reason_for_bucket(
+    host_is_ai_target: bool,
+    host_is_mcp_target: bool,
+    host_is_agent_target: bool,
+    is_catalog_discovery: bool,
+) -> Option<&'static str> {
+    if is_catalog_discovery {
+        return Some("bundle.discovery.catalog");
+    }
+    if host_is_ai_target {
+        return Some("bundle.whitelist.ai_inference");
+    }
+    if host_is_mcp_target {
+        return Some("bundle.whitelist.mcp");
+    }
+    if host_is_agent_target {
+        return Some("bundle.whitelist.agent_apps");
+    }
+    None
+}
+
+fn parse_confidence_for_reason(reason: Option<&str>) -> Option<f64> {
+    match reason {
+        Some("bundle.discovery.catalog") => Some(0.7),
+        Some(_) => Some(1.0),
+        None => None,
+    }
 }
 
 fn append_capture_tags(
@@ -1455,8 +1488,8 @@ fn finalize_and_enqueue_exchange_v2(
     assembler.set_parse(Some(ExchangeParse {
         parser_version: Some("exchange_v2_edge".to_string()),
         bundle_version: bundle_version.map(ToString::to_string),
-        parse_confidence: None,
-        detection_reason: None,
+        parse_confidence: pending.parse_confidence,
+        detection_reason: pending.detection_reason.clone(),
     }));
     assembler.set_request(
         pending.headers.clone(),
@@ -1497,10 +1530,56 @@ fn finalize_and_enqueue_exchange_v2(
     if response_truncated {
         assembler.mark_truncated(response_truncated_reason.unwrap_or("response_body_truncated"));
     }
+    let mut exchange_tags = tags.cloned().unwrap_or_default();
+    if let Some(allowed) = pending.policy_allowed {
+        exchange_tags
+            .entry("policy.allowed".to_string())
+            .or_insert_with(|| allowed.to_string());
+    }
+    if let Some(version) = pending.policy_version.as_ref() {
+        exchange_tags
+            .entry("policy.version".to_string())
+            .or_insert_with(|| version.clone());
+    }
+    if let Some(reason) = pending.policy_reason.as_ref() {
+        exchange_tags
+            .entry("policy.reason".to_string())
+            .or_insert_with(|| reason.clone());
+    }
+    if let Some(operation) = pending.graphql_operation.as_ref() {
+        exchange_tags
+            .entry("graphql.operation".to_string())
+            .or_insert_with(|| operation.clone());
+    }
+    if let Some(method) = pending.mcp_method.as_ref() {
+        exchange_tags
+            .entry("mcp.method".to_string())
+            .or_insert_with(|| method.clone());
+    }
     if let Some(envelope) = pending.envelope.as_ref() {
         assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
+        if let Some(did) = envelope.did.as_ref() {
+            exchange_tags
+                .entry("identity.did".to_string())
+                .or_insert_with(|| did.clone());
+        }
+        if let Some(signature_alg) = envelope.signature_alg.as_ref() {
+            exchange_tags
+                .entry("identity.signature_alg".to_string())
+                .or_insert_with(|| signature_alg.clone());
+        }
+        if let Some(signed_fields_version) = envelope.signed_fields_version.as_ref() {
+            exchange_tags
+                .entry("identity.signed_fields_version".to_string())
+                .or_insert_with(|| signed_fields_version.clone());
+        }
+        if let Some(process_executable) = envelope.process_executable.as_ref() {
+            exchange_tags
+                .entry("client.process_executable".to_string())
+                .or_insert_with(|| process_executable.clone());
+        }
     }
-    assembler.set_tags(tags.cloned());
+    assembler.set_tags((!exchange_tags.is_empty()).then_some(exchange_tags));
     let mut pii_probe = WrapEvent::new(
         session_id,
         &pending.host,
@@ -1617,8 +1696,8 @@ fn seed_exchange_v2_spool(
     assembler.set_parse(Some(ExchangeParse {
         parser_version: Some("exchange_v2_edge".to_string()),
         bundle_version: bundle_version.map(ToString::to_string),
-        parse_confidence: None,
-        detection_reason: None,
+        parse_confidence: pending.parse_confidence,
+        detection_reason: pending.detection_reason.clone(),
     }));
     if let Some(envelope) = pending.envelope.as_ref() {
         assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
@@ -2457,6 +2536,12 @@ impl HttpHandler for AiProxyHandler {
 
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
+                    let detection_reason = detection_reason_for_bucket(
+                        host_is_ai_target,
+                        host_is_mcp_target,
+                        host_is_agent_target,
+                        is_catalog_discovery_host,
+                    );
                     let envelope = apply_process_identity(
                         TrafficEnvelope::proxy(
                             &session_id,
@@ -2497,6 +2582,8 @@ impl HttpHandler for AiProxyHandler {
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
                             catalog_discovery: is_catalog_discovery_host,
+                            detection_reason: detection_reason.map(ToString::to_string),
+                            parse_confidence: parse_confidence_for_reason(detection_reason),
                             policy_allowed,
                             policy_reason: None,
                             policy_version,
@@ -2555,6 +2642,12 @@ impl HttpHandler for AiProxyHandler {
                 }
 
                 let mut pending = pending_requests.lock();
+                let detection_reason = detection_reason_for_bucket(
+                    host_is_ai_target,
+                    host_is_mcp_target,
+                    host_is_agent_target,
+                    is_catalog_discovery_host,
+                );
                 pending.insert(
                     request_id,
                     PendingRequest {
@@ -2591,6 +2684,8 @@ impl HttpHandler for AiProxyHandler {
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
                         catalog_discovery: is_catalog_discovery_host,
+                        detection_reason: detection_reason.map(ToString::to_string),
+                        parse_confidence: parse_confidence_for_reason(detection_reason),
                         policy_allowed: None,
                         policy_reason: None,
                         policy_version: None,

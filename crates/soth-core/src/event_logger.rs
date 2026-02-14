@@ -1561,16 +1561,48 @@ fn transport_from_wrap_event(event: &WrapEvent) -> ExchangeTransport {
 
 fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> {
     let envelope = event.traffic_envelope.as_ref()?;
+    let bundle_id = bundle_id_from_executable_path(envelope.process_executable.as_deref());
     Some(ExchangeClient {
         pid: envelope.process_pid,
-        bundle_id: None,
+        bundle_id: bundle_id.clone(),
         process_name: envelope.process_name.clone(),
-        app_type: event
-            .collector_source
-            .as_ref()
-            .map(|_| "collector".to_string()),
+        app_type: event.collector_source.as_ref().map(|_| "collector".to_string()).or(
+            bundle_id
+                .as_ref()
+                .map(|_| "desktop_app".to_string())
+                .or(Some("cli".to_string())),
+        ),
         referrer_origin: None,
     })
+}
+
+fn bundle_id_from_executable_path(path: Option<&str>) -> Option<String> {
+    let path = path?;
+    let lower = path.to_ascii_lowercase();
+    let idx = lower.find(".app/")?;
+    let app_root = &path[..idx + 4];
+    let app = app_root
+        .rsplit('/')
+        .next()
+        .unwrap_or(app_root)
+        .trim_end_matches(".app")
+        .trim();
+    if app.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "macos.{}",
+        app.chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('_')
+    ))
 }
 
 fn exchange_body_from_text(
@@ -1660,6 +1692,40 @@ fn merge_exchange_tags(event: &WrapEvent) -> Option<std::collections::BTreeMap<S
     if let Some(operation) = event.graphql_operation.as_ref() {
         tags.entry("graphql.operation".to_string())
             .or_insert_with(|| operation.clone());
+    }
+    if let Some(allowed) = event.policy_allowed {
+        tags.entry("policy.allowed".to_string())
+            .or_insert_with(|| allowed.to_string());
+    }
+    if let Some(version) = event.policy_version.as_ref() {
+        tags.entry("policy.version".to_string())
+            .or_insert_with(|| version.clone());
+    }
+    if let Some(reason) = event.policy_reason.as_ref() {
+        tags.entry("policy.reason".to_string())
+            .or_insert_with(|| reason.clone());
+    }
+    if let Some(tool_name) = event.tool_name.as_ref() {
+        tags.entry("mcp.tool_name".to_string())
+            .or_insert_with(|| tool_name.clone());
+    }
+    if let Some(envelope) = event.traffic_envelope.as_ref() {
+        if let Some(did) = envelope.did.as_ref() {
+            tags.entry("identity.did".to_string())
+                .or_insert_with(|| did.clone());
+        }
+        if let Some(signature_alg) = envelope.signature_alg.as_ref() {
+            tags.entry("identity.signature_alg".to_string())
+                .or_insert_with(|| signature_alg.clone());
+        }
+        if let Some(fields_version) = envelope.signed_fields_version.as_ref() {
+            tags.entry("identity.signed_fields_version".to_string())
+                .or_insert_with(|| fields_version.clone());
+        }
+        if let Some(executable) = envelope.process_executable.as_ref() {
+            tags.entry("client.process_executable".to_string())
+                .or_insert_with(|| executable.clone());
+        }
     }
     if tags.is_empty() {
         None
