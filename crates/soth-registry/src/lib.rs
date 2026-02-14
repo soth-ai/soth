@@ -2,6 +2,11 @@
 //!
 //! This crate centralizes provider and agent-app attribution logic so transport
 //! layers can rely on one data plane instead of hardcoded per-module heuristics.
+//!
+//! Deprecated:
+//! Runtime detection is migrating to bundle-driven OISP rules in `soth-oisp`.
+//! Keep this crate only for compatibility during migration; do not add new
+//! detection signatures here.
 
 fn host_eq_or_subdomain(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
