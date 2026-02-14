@@ -330,6 +330,18 @@ enum ConfigCommands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Registry cache and bundle diagnostics
+    Registry {
+        #[command(subcommand)]
+        action: ConfigRegistryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigRegistryCommands {
+    /// Show local cloud registry cache status
+    Status,
 }
 
 #[tokio::main]

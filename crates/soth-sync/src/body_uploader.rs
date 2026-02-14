@@ -1,3 +1,4 @@
+use crate::http_client::build_cloud_client;
 use anyhow::Context;
 use reqwest::multipart::{Form, Part};
 use soth_core::api::{version::API_VERSION_HEADER, BodyUploadResponse, API_VERSION};
@@ -11,10 +12,11 @@ pub struct BodyUploader {
 
 impl BodyUploader {
     pub fn new(endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let endpoint = endpoint.into().trim_end_matches('/').to_string();
         Self {
-            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            client: build_cloud_client(&endpoint),
+            endpoint,
             api_key: api_key.into(),
-            client: reqwest::Client::new(),
         }
     }
 

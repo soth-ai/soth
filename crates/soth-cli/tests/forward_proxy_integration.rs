@@ -3,7 +3,6 @@
 use soth_core::config::{
     ForwardProxyConfig, HostDomainFilesConfig, HostFilterConfig, HostFilterMode,
 };
-use soth_proxy::providers::{HttpRequest, ProviderRegistry};
 use soth_tls::CertificateAuthority;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -136,106 +135,6 @@ fn test_host_filter_selective() {
     assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
 }
 
-/// Test provider registry
-#[test]
-fn test_provider_registry() {
-    let registry = ProviderRegistry::new();
-
-    // Check all default providers are registered
-    assert!(registry.has_provider("api.openai.com"));
-    assert!(registry.has_provider("api.anthropic.com"));
-    assert!(registry.has_provider("generativelanguage.googleapis.com"));
-    assert!(!registry.has_provider("unknown.api.com"));
-}
-
-/// Test OpenAI provider parsing
-#[test]
-fn test_openai_provider() {
-    let registry = ProviderRegistry::new();
-    let provider = registry.find_provider("api.openai.com").unwrap();
-
-    // Test model extraction
-    let body = r#"{"model": "gpt-4o", "messages": []}"#;
-    let request =
-        HttpRequest::new("POST", "/v1/chat/completions").with_body(body.as_bytes().to_vec());
-    assert_eq!(provider.extract_model(&request), Some("gpt-4o".to_string()));
-
-    // Test usage extraction
-    let response = r#"{
-        "id": "chatcmpl-xxx",
-        "model": "gpt-4o",
-        "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 50,
-            "total_tokens": 150
-        }
-    }"#;
-    let usage = provider.extract_usage(response.as_bytes()).unwrap();
-    assert_eq!(usage.input_tokens, 100);
-    assert_eq!(usage.output_tokens, 50);
-}
-
-/// Test Anthropic provider parsing
-#[test]
-fn test_anthropic_provider() {
-    let registry = ProviderRegistry::new();
-    let provider = registry.find_provider("api.anthropic.com").unwrap();
-
-    // Test model extraction
-    let body = r#"{"model": "claude-3-5-sonnet", "messages": []}"#;
-    let request = HttpRequest::new("POST", "/v1/messages").with_body(body.as_bytes().to_vec());
-    assert_eq!(
-        provider.extract_model(&request),
-        Some("claude-3-5-sonnet".to_string())
-    );
-
-    // Test usage extraction
-    let response = r#"{
-        "id": "msg_xxx",
-        "model": "claude-3-5-sonnet",
-        "usage": {
-            "input_tokens": 100,
-            "output_tokens": 50,
-            "cache_read_input_tokens": 25
-        }
-    }"#;
-    let usage = provider.extract_usage(response.as_bytes()).unwrap();
-    assert_eq!(usage.input_tokens, 100);
-    assert_eq!(usage.output_tokens, 50);
-    assert_eq!(usage.cached_tokens, Some(25));
-}
-
-/// Test Google provider parsing
-#[test]
-fn test_google_provider() {
-    let registry = ProviderRegistry::new();
-    let provider = registry
-        .find_provider("generativelanguage.googleapis.com")
-        .unwrap();
-
-    // Test model extraction from URL path
-    let request = HttpRequest::new(
-        "POST",
-        "/v1beta/models/gemini-1.5-flash:generateContent?key=xxx",
-    );
-    assert_eq!(
-        provider.extract_model(&request),
-        Some("gemini-1.5-flash".to_string())
-    );
-
-    // Test usage extraction
-    let response = r#"{
-        "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
-        "usageMetadata": {
-            "promptTokenCount": 100,
-            "candidatesTokenCount": 50
-        }
-    }"#;
-    let usage = provider.extract_usage(response.as_bytes()).unwrap();
-    assert_eq!(usage.input_tokens, 100);
-    assert_eq!(usage.output_tokens, 50);
-}
-
 /// Test config defaults
 #[test]
 fn test_config_defaults() {
@@ -330,62 +229,4 @@ fn create_test_client_hello(hostname: &str) -> Vec<u8> {
     data.extend_from_slice(hostname_bytes);
 
     data
-}
-
-/// Test SSE parsing for OpenAI
-#[test]
-fn test_sse_parsing_openai() {
-    use soth_proxy::providers::openai::OpenAiProvider;
-    use soth_proxy::providers::{AiProvider, SseEvent};
-
-    let provider = OpenAiProvider::new();
-
-    // Content event
-    let chunk = r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#;
-    match provider.parse_sse_chunk(chunk) {
-        Some(SseEvent::Content(text)) => assert_eq!(text, "Hello"),
-        _ => panic!("Expected Content event"),
-    }
-
-    // Done event
-    let chunk = "data: [DONE]";
-    match provider.parse_sse_chunk(chunk) {
-        Some(SseEvent::Done) => {}
-        _ => panic!("Expected Done event"),
-    }
-
-    // Usage event
-    let chunk = r#"data: {"model":"gpt-4o","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-    match provider.parse_sse_chunk(chunk) {
-        Some(SseEvent::Usage(usage)) => {
-            assert_eq!(usage.input_tokens, 10);
-            assert_eq!(usage.output_tokens, 5);
-        }
-        _ => panic!("Expected Usage event"),
-    }
-}
-
-/// Test SSE parsing for Anthropic
-#[test]
-fn test_sse_parsing_anthropic() {
-    use soth_proxy::providers::anthropic::AnthropicProvider;
-    use soth_proxy::providers::{AiProvider, SseEvent};
-
-    let provider = AnthropicProvider::new();
-
-    // Content delta
-    let chunk = r#"event: content_block_delta
-data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#;
-    match provider.parse_sse_chunk(chunk) {
-        Some(SseEvent::Content(text)) => assert_eq!(text, "Hi"),
-        _ => panic!("Expected Content event"),
-    }
-
-    // Message stop
-    let chunk = r#"event: message_stop
-data: {"type":"message_stop"}"#;
-    match provider.parse_sse_chunk(chunk) {
-        Some(SseEvent::Done) => {}
-        _ => panic!("Expected Done event"),
-    }
 }

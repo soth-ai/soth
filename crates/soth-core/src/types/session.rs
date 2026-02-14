@@ -129,7 +129,7 @@ impl std::fmt::Display for MessageDirection {
 }
 
 /// Metadata about a recorded message
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageMetadata {
     /// MCP method name (if applicable)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,20 +157,6 @@ pub struct MessageMetadata {
     /// Token count estimate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_count: Option<u64>,
-}
-
-impl Default for MessageMetadata {
-    fn default() -> Self {
-        Self {
-            method: None,
-            jsonrpc_id: None,
-            size_bytes: 0,
-            modified: false,
-            policy_allowed: None,
-            pii_detected: false,
-            token_count: None,
-        }
-    }
 }
 
 /// Session metadata
@@ -454,7 +440,7 @@ impl SessionStorage {
 
     /// Get the path for a session file
     fn session_path(&self, session_id: &str) -> PathBuf {
-        self.base_dir.join(format!("{}.json", session_id))
+        self.base_dir.join(format!("{session_id}.json"))
     }
 
     /// Save a session to disk
@@ -492,7 +478,7 @@ impl SessionStorage {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
+            if path.extension().is_some_and(|ext| ext == "json") {
                 if let Ok(session) = self.load_from_path(&path) {
                     let duration_ms = session.duration_ms();
                     let message_count = session.messages.len();

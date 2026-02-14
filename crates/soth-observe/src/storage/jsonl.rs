@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
+use tracing::warn;
 
 /// JSONL storage backend
 pub struct JsonlStorage {
@@ -66,11 +67,12 @@ impl JsonlReader {
 
     /// Read all events from the file
     pub fn read_all(&self) -> std::io::Result<Vec<ObservationEvent>> {
-        let content = std::fs::read_to_string(&self.path)?;
+        let bytes = std::fs::read(&self.path)?;
+        let content = String::from_utf8_lossy(&bytes);
         let events: Vec<ObservationEvent> = content
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
+            .enumerate()
+            .filter_map(|(line_no, line)| self.parse_line(line, line_no + 1))
             .collect();
         Ok(events)
     }
@@ -91,18 +93,74 @@ impl JsonlReader {
 
     /// Iterate over events lazily
     pub fn iter(&self) -> std::io::Result<impl Iterator<Item = ObservationEvent>> {
-        let content = std::fs::read_to_string(&self.path)?;
+        let bytes = std::fs::read(&self.path)?;
+        let content = String::from_utf8_lossy(&bytes);
         let events: Vec<ObservationEvent> = content
             .lines()
-            .filter_map(|line| {
-                if line.trim().is_empty() {
-                    None
-                } else {
-                    serde_json::from_str(line).ok()
-                }
-            })
+            .enumerate()
+            .filter_map(|(line_no, line)| self.parse_line(line, line_no + 1))
             .collect();
         Ok(events.into_iter())
+    }
+
+    fn parse_line(&self, line: &str, line_no: usize) -> Option<ObservationEvent> {
+        if line.trim().is_empty() {
+            return None;
+        }
+
+        match serde_json::from_str::<ObservationEvent>(line) {
+            Ok(event) => Some(event),
+            Err(primary_error) => {
+                if let Some(cleaned) = sanitize_json_line(line) {
+                    match serde_json::from_str::<ObservationEvent>(&cleaned) {
+                        Ok(event) => {
+                            warn!(
+                                path = %self.path.display(),
+                                line_no = line_no,
+                                "Recovered malformed JSONL line after sanitization"
+                            );
+                            return Some(event);
+                        }
+                        Err(sanitized_error) => {
+                            warn!(
+                                path = %self.path.display(),
+                                line_no = line_no,
+                                error = %sanitized_error,
+                                "Skipping malformed JSONL observation line (sanitized parse failed)"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                warn!(
+                    path = %self.path.display(),
+                    line_no = line_no,
+                    error = %primary_error,
+                    "Skipping malformed JSONL observation line"
+                );
+                None
+            }
+        }
+    }
+}
+
+fn sanitize_json_line(line: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(line.len());
+
+    for ch in line.chars() {
+        let should_drop = ch == '\u{FFFD}' || (ch.is_control() && ch != '\t');
+        if should_drop {
+            changed = true;
+            continue;
+        }
+        out.push(ch);
+    }
+
+    if changed {
+        Some(out)
+    } else {
+        None
     }
 }
 
@@ -187,5 +245,24 @@ mod tests {
         let reader = JsonlReader::new(&path);
         let events = reader.read_all().unwrap();
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn test_recover_malformed_line_by_sanitizing_bad_chars() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recover.jsonl");
+        let event = ObservationEvent::new("session-1", Direction::In, EventType::Request, "ok");
+        let json = serde_json::to_string(&event).unwrap();
+
+        // Inject a raw invalid UTF-8 byte between JSON tokens.
+        let mut bytes = json.into_bytes();
+        bytes.insert(1, 0xFF);
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+
+        let reader = JsonlReader::new(&path);
+        let events = reader.read_all().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, "session-1");
     }
 }

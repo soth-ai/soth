@@ -5,8 +5,11 @@
 
 use crate::cli_config;
 use crate::ConfigCommands;
+use crate::ConfigRegistryCommands;
 use anyhow::{Context, Result};
 use soth_core::config::{HostFilterMode, SothConfig};
+#[cfg(feature = "cloud-sync")]
+use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::info;
@@ -27,6 +30,11 @@ pub async fn run(global_config: Option<PathBuf>, action: ConfigCommands) -> Resu
         ConfigCommands::Example { output } => {
             generate_example(output).await?;
         }
+        ConfigCommands::Registry { action } => match action {
+            ConfigRegistryCommands::Status => {
+                show_registry_status(global_config).await?;
+            }
+        },
     }
     Ok(())
 }
@@ -403,4 +411,87 @@ async fn generate_example(output: Option<PathBuf>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "cloud-sync")]
+async fn show_registry_status(global_config: Option<PathBuf>) -> Result<()> {
+    use soth_sync::cache;
+
+    let config = cli_config::load_effective_config(None, global_config.as_ref())?;
+    let config_cache_path = resolve_config_cache_path(&config);
+    let registry_cache_path = resolve_registry_cache_path(&config, &config_cache_path);
+
+    println!("Registry Status");
+    println!("  Cloud enabled: {}", config.cloud.enabled);
+    println!("  Endpoint: {}", config.cloud.endpoint);
+    println!(
+        "  Config cache path: {}",
+        config_cache_path.as_path().display()
+    );
+    println!(
+        "  Registry cache path: {}",
+        registry_cache_path.as_path().display()
+    );
+
+    let cached_config = cache::load_config_cache(&config_cache_path)?;
+    if let Some(cached_config) = cached_config {
+        println!("  Config version: {}", cached_config.config_version);
+        println!(
+            "  Expected bundle version: {}",
+            cached_config.bundle_version.as_deref().unwrap_or("-")
+        );
+    } else {
+        println!("  Config cache: missing");
+    }
+
+    match cache::load_registry_bundle_cache(&registry_cache_path) {
+        Ok(Some(bundle_cache)) => {
+            println!("  Registry cache: valid");
+            println!("  Cache schema version: {}", bundle_cache.schema_version);
+            println!("  Bundle version: {}", bundle_cache.metadata.version);
+            println!("  Bundle type: {}", bundle_cache.metadata.bundle_type);
+            println!("  ETag: {}", bundle_cache.etag);
+            println!("  Fetched at: {}", bundle_cache.fetched_at);
+            println!(
+                "  Providers/domains/formats: {}/{}/{}",
+                bundle_cache.metadata.provider_count,
+                bundle_cache.metadata.domain_count,
+                bundle_cache.metadata.format_count
+            );
+            println!("  Bundle size bytes: {}", bundle_cache.metadata.size_bytes);
+        }
+        Ok(None) => {
+            println!("  Registry cache: missing");
+        }
+        Err(error) => {
+            println!("  Registry cache: invalid");
+            println!("  Error: {error}");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(feature = "cloud-sync"))]
+async fn show_registry_status(_global_config: Option<PathBuf>) -> Result<()> {
+    println!("Registry status is unavailable: soth-cli built without cloud-sync feature.");
+    Ok(())
+}
+
+#[cfg(feature = "cloud-sync")]
+fn resolve_config_cache_path(config: &SothConfig) -> PathBuf {
+    if let Some(path) = config.cloud.cache_path.as_ref() {
+        return path.clone();
+    }
+    soth_sync::cache::default_cache_path()
+}
+
+#[cfg(feature = "cloud-sync")]
+fn resolve_registry_cache_path(config: &SothConfig, config_cache_path: &Path) -> PathBuf {
+    if config.cloud.cache_path.is_some() {
+        if let Some(parent) = config_cache_path.parent() {
+            return parent.join("registry_bundle_cache.json");
+        }
+    }
+    soth_sync::cache::default_registry_cache_path()
 }

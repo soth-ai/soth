@@ -256,8 +256,7 @@ mod tests {
 
         assert!(
             matches!(event, WatchEvent::Modified | WatchEvent::Created),
-            "Expected Modified or Created, got {:?}",
-            event
+            "Expected Modified or Created, got {event:?}"
         );
     }
 
@@ -344,7 +343,7 @@ mod tests {
                     .append(true)
                     .open(&file_path)
                     .unwrap();
-                writeln!(file, "content {}", i).unwrap();
+                writeln!(file, "content {i}").unwrap();
                 file.sync_all().unwrap();
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -359,8 +358,7 @@ mod tests {
         // Accept any change notification - the key is we get notified
         assert!(
             matches!(event, WatchEvent::Modified | WatchEvent::Created),
-            "Expected Modified or Created, got {:?}",
-            event
+            "Expected Modified or Created, got {event:?}"
         );
     }
 

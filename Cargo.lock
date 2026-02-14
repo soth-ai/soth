@@ -3680,7 +3680,6 @@ dependencies = [
  "serde",
  "serde_json",
  "soth-core",
- "soth-registry",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3738,7 +3737,9 @@ name = "soth-collector"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs",
+ "rusqlite",
  "serde",
  "serde_json",
  "soth-core",
@@ -3835,6 +3836,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "soth-oisp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "soth-oisp-types",
+ "tempfile",
+]
+
+[[package]]
+name = "soth-oisp-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "soth-policy"
 version = "0.1.0"
 dependencies = [
@@ -3883,8 +3903,8 @@ dependencies = [
  "soth-dashboard",
  "soth-identity",
  "soth-observe",
+ "soth-oisp",
  "soth-policy",
- "soth-registry",
  "soth-tls",
  "tempfile",
  "thiserror 1.0.69",
@@ -3917,12 +3937,15 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs",
+ "flate2",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "soth-core",
  "soth-observe",
+ "soth-oisp-types",
  "tempfile",
  "tokio",
  "tracing",

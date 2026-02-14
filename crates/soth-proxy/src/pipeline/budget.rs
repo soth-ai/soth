@@ -51,7 +51,7 @@ impl BudgetLayer {
         Self {
             config,
             tracker: Arc::new(BudgetTracker::new()),
-            pricing_catalog: PricingCatalog::with_defaults(),
+            pricing_catalog: PricingCatalog::new(),
             dashboard: None,
         }
     }
@@ -61,7 +61,7 @@ impl BudgetLayer {
         Self {
             config,
             tracker: Arc::new(tracker),
-            pricing_catalog: PricingCatalog::with_defaults(),
+            pricing_catalog: PricingCatalog::new(),
             dashboard: None,
         }
     }

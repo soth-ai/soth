@@ -20,7 +20,6 @@ pub mod metrics;
 pub mod pipeline;
 pub mod process_attribution;
 pub mod protocol;
-pub mod providers;
 pub mod rate_limit;
 pub mod router;
 pub mod session;

@@ -13,7 +13,7 @@ use anyhow::Context;
 use console::Term;
 use owo_colors::OwoColorize;
 use soth_collector::CollectorRuntime;
-use soth_core::config::{HostFilterMode, SothConfig};
+use soth_core::config::{HostFilterMode, ObserveCollectorConfig, SothConfig};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
 use soth_dashboard::server::DashboardServer;
@@ -91,6 +91,9 @@ pub async fn run(
         pb.finish_and_clear();
     }
 
+    // Best-effort startup refresh: try cloud registry fetch first, then fall back to cache.
+    cloud_hooks::refresh_registry_bundle_on_start(&config).await;
+
     // Auto-enable system proxy when soth proxy starts without extra console noise.
     system::enable_quiet(Some(proxy_config.port)).await?;
 
@@ -140,7 +143,8 @@ pub async fn run(
         "disabled".to_string()
     };
     let runtime_line = format!(
-        "soth proxy | {} | {}",
+        "soth proxy | {} | {} | {}",
+        proxy_config.registry_mode,
         proxy_config.hosts.mode,
         proxy_config.socket_addr()
     );
@@ -410,6 +414,19 @@ fn compact_path(path: &std::path::Path) -> String {
         }
     }
     full
+}
+
+fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
+    if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
+        let expanded = cli_config::expand_tilde(config_cache_path);
+        if let Some(parent) = expanded.parent() {
+            return parent.join("registry_bundle_cache.json");
+        }
+    }
+
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join("registry_bundle_cache.json"))
+        .unwrap_or_else(|| PathBuf::from(".soth/registry_bundle_cache.json"))
 }
 
 struct ProxyRuntime {
@@ -692,6 +709,7 @@ fn spawn_proxy_runtime(
 
     let mut collector_shutdown_tx = None;
     let mut collector_task = None;
+    apply_collector_env_overrides(&config.observe.collector);
     if let Some(ref logger) = event_logger {
         if let Some(CollectorRuntime { shutdown_tx, task }) =
             soth_collector::spawn_from_env(logger.clone(), config.observe.event_tags.clone())
@@ -703,6 +721,7 @@ fn spawn_proxy_runtime(
 
     let shutdown_event_logger = event_logger.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let oisp_registry_cache_path = resolve_registry_bundle_cache_path(config);
     let handle = tokio::spawn(async move {
         hudsucker_proxy::start_proxy_with_shutdown(
             proxy_config,
@@ -715,6 +734,7 @@ fn spawn_proxy_runtime(
             event_logger,
             Some(enforcer),
             Some(observe_config),
+            Some(oisp_registry_cache_path),
         )
         .await
         .map_err(|error| anyhow::anyhow!("Proxy error: {}", error))
@@ -733,6 +753,53 @@ fn spawn_proxy_runtime(
         collector_shutdown_tx,
         collector_task,
     })
+}
+
+fn set_env_if_present<T: ToString>(key: &str, value: Option<T>) {
+    if let Some(value) = value {
+        std::env::set_var(key, value.to_string());
+    }
+}
+
+fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
+    if !collector.enabled {
+        return;
+    }
+
+    std::env::set_var("SOTH_COLLECTOR_ENABLED", "true");
+
+    if !collector.sources.is_empty() {
+        let sources = collector
+            .sources
+            .iter()
+            .map(|source| cli_config::expand_tilde(&source.path).to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        std::env::set_var("SOTH_COLLECTOR_SOURCES", sources);
+    }
+
+    set_env_if_present(
+        "SOTH_COLLECTOR_POLL_INTERVAL_SECS",
+        collector.poll_interval_secs,
+    );
+    set_env_if_present(
+        "SOTH_COLLECTOR_MAX_READ_BYTES",
+        collector.max_read_bytes_per_source,
+    );
+    set_env_if_present("SOTH_COLLECTOR_MAX_LINE_BYTES", collector.max_line_bytes);
+    set_env_if_present(
+        "SOTH_COLLECTOR_STATE_PATH",
+        collector
+            .state_path
+            .as_ref()
+            .map(cli_config::expand_tilde)
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    set_env_if_present("SOTH_COLLECTOR_AGENT", collector.agent_name.clone());
+    set_env_if_present(
+        "SOTH_COLLECTOR_EVENT_SOURCE",
+        collector.event_source.clone(),
+    );
 }
 
 async fn wait_for_dashboard_ready(port: u16, timeout: Duration) -> bool {

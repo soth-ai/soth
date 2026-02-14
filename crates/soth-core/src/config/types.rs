@@ -636,6 +636,10 @@ pub struct ObserveConfig {
     #[serde(default)]
     pub event_tags: BTreeMap<String, String>,
 
+    /// Local transcript collector configuration (Codex/Claude/etc).
+    #[serde(default)]
+    pub collector: ObserveCollectorConfig,
+
     /// Log requests
     #[serde(default = "default_true")]
     pub log_requests: bool,
@@ -676,6 +680,7 @@ impl Default for ObserveConfig {
             pii_detection: true,
             pii_scopes: ObservePiiScopes::default(),
             event_tags: BTreeMap::new(),
+            collector: ObserveCollectorConfig::default(),
             log_requests: true,
             log_responses: true,
             tamper_proof: false,
@@ -684,6 +689,48 @@ impl Default for ObserveConfig {
             flush_interval: default_flush_interval(),
         }
     }
+}
+
+/// Local collector settings for ingesting agent session files incrementally.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ObserveCollectorConfig {
+    /// Enable local collector runtime.
+    #[serde(default)]
+    pub enabled: bool,
+    /// File sources (JSONL/text) for incremental tailing.
+    #[serde(default)]
+    pub sources: Vec<ObserveCollectorSourceConfig>,
+    /// Poll interval in seconds.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+    /// Maximum bytes read per source per poll cycle.
+    #[serde(default)]
+    pub max_read_bytes_per_source: Option<usize>,
+    /// Maximum bytes allowed per parsed line.
+    #[serde(default)]
+    pub max_line_bytes: Option<usize>,
+    /// Optional collector state path override.
+    #[serde(default)]
+    pub state_path: Option<PathBuf>,
+    /// Optional agent name override for collector events.
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    /// Optional event source override.
+    #[serde(default)]
+    pub event_source: Option<String>,
+}
+
+/// Per-file local collector source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveCollectorSourceConfig {
+    /// Optional logical source name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Source file path.
+    pub path: PathBuf,
+    /// Parser type: jsonl/ndjson/text.
+    #[serde(default)]
+    pub parser: Option<String>,
 }
 
 /// Source scopes for PII detection.
@@ -922,6 +969,18 @@ pub struct CloudConfig {
     #[serde(default)]
     pub body_upload_enabled: bool,
 
+    /// Maximum metadata events per upload batch.
+    #[serde(default = "default_cloud_metadata_max_events_per_batch")]
+    pub metadata_max_events_per_batch: usize,
+
+    /// Maximum compressed metadata batch size in bytes.
+    #[serde(default = "default_cloud_metadata_max_compressed_batch_bytes")]
+    pub metadata_max_compressed_batch_bytes: u64,
+
+    /// Maximum request/response body size eligible for cloud body upload.
+    #[serde(default = "default_cloud_body_upload_max_bytes")]
+    pub body_upload_max_bytes: u64,
+
     /// Local path for cached cloud config snapshot
     #[serde(default = "default_cloud_cache_path")]
     pub cache_path: Option<PathBuf>,
@@ -947,6 +1006,18 @@ fn default_cloud_cache_path() -> Option<PathBuf> {
     Some(PathBuf::from("~/.soth/cloud_config_cache.json"))
 }
 
+fn default_cloud_metadata_max_events_per_batch() -> usize {
+    200
+}
+
+fn default_cloud_metadata_max_compressed_batch_bytes() -> u64 {
+    5 * 1024 * 1024
+}
+
+fn default_cloud_body_upload_max_bytes() -> u64 {
+    15 * 1024 * 1024
+}
+
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
@@ -957,7 +1028,11 @@ impl Default for CloudConfig {
             sync_interval_secs: default_cloud_sync_interval_secs(),
             config_pull_interval_secs: default_cloud_config_pull_interval_secs(),
             config_debounce_secs: default_cloud_config_debounce_secs(),
-            body_upload_enabled: false,
+            body_upload_enabled: true,
+            metadata_max_events_per_batch: default_cloud_metadata_max_events_per_batch(),
+            metadata_max_compressed_batch_bytes: default_cloud_metadata_max_compressed_batch_bytes(
+            ),
+            body_upload_max_bytes: default_cloud_body_upload_max_bytes(),
             cache_path: default_cloud_cache_path(),
         }
     }
@@ -1057,6 +1132,14 @@ pub struct ForwardProxyConfig {
     /// Request timeout for AI providers (streaming can be long)
     #[serde(default = "default_ai_timeout", with = "humantime_serde")]
     pub request_timeout: Duration,
+
+    /// Detection/classification mode during registry migration.
+    #[serde(default)]
+    pub registry_mode: RegistryMode,
+
+    /// Maximum HTTP request/response body size to capture for observability.
+    #[serde(default = "default_forward_proxy_capture_max_body_bytes")]
+    pub capture_max_body_bytes: u64,
 }
 
 fn default_forward_proxy_port() -> u16 {
@@ -1065,6 +1148,10 @@ fn default_forward_proxy_port() -> u16 {
 
 fn default_ai_timeout() -> Duration {
     Duration::from_secs(300) // 5 minutes for long AI responses
+}
+
+fn default_forward_proxy_capture_max_body_bytes() -> u64 {
+    15 * 1024 * 1024
 }
 
 impl Default for ForwardProxyConfig {
@@ -1078,6 +1165,8 @@ impl Default for ForwardProxyConfig {
             hosts: HostFilterConfig::default(),
             tls: ForwardProxyTlsConfig::default(),
             request_timeout: default_ai_timeout(),
+            registry_mode: RegistryMode::default(),
+            capture_max_body_bytes: default_forward_proxy_capture_max_body_bytes(),
         }
     }
 }
@@ -1264,8 +1353,9 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostFilterConfig {
     /// Host filtering mode:
-    /// - selective: intercept configured AI/MCP hosts and tunnel the rest (default)
+    /// - selective: intercept configured AI/MCP hosts and tunnel the rest
     /// - discovery: intercept all non-local hosts to discover new MCP/AI domains
+    ///   (default)
     #[serde(default)]
     pub mode: HostFilterMode,
 
@@ -1307,10 +1397,28 @@ pub struct HostDomainFilesConfig {
 #[serde(rename_all = "snake_case")]
 pub enum HostFilterMode {
     /// Intercept configured hosts only; blind tunnel everything else.
-    #[default]
     Selective,
     /// Intercept all non-local hosts (useful for discovery).
+    #[default]
     Discovery,
+}
+
+/// Registry migration mode for forward proxy classification/routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryMode {
+    /// Registry bundle-driven detection/intercept decisions.
+    ///
+    /// `legacy` and `shadow` are accepted as compatibility aliases and map to this mode.
+    #[default]
+    #[serde(alias = "legacy", alias = "shadow")]
+    Registry,
+}
+
+impl std::fmt::Display for RegistryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "registry")
+    }
 }
 
 impl std::fmt::Display for HostFilterMode {
@@ -1322,438 +1430,32 @@ impl std::fmt::Display for HostFilterMode {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct DomainSeedFile {
+    #[serde(default)]
+    domains: Vec<String>,
+}
+
 fn default_ai_inference_hosts() -> Vec<String> {
-    dedupe_hosts(vec![
-        // ===== OpenAI / ChatGPT =====
-        "api.openai.com".to_string(),
-        "*.openai.azure.com".to_string(), // Azure OpenAI
-        "chat.openai.com".to_string(),    // Legacy ChatGPT web app
-        "*.chat.openai.com".to_string(),  // Legacy ChatGPT subdomains
-        "chatgpt.com".to_string(),        // ChatGPT web app
-        "*.chatgpt.com".to_string(),      // ChatGPT WebSocket (ws.chatgpt.com)
-        // ===== Anthropic =====
-        "api.anthropic.com".to_string(),
-        "*.anthropic.com".to_string(), // Claude Desktop uses a-api, statsig, s-cdn subdomains
-        "claude.ai".to_string(),       // Claude Desktop app
-        "*.claude.ai".to_string(),     // Claude Desktop WebSocket connections
-        // ===== Google =====
-        "gemini.google.com".to_string(),   // Gemini web app
-        "*.gemini.google.com".to_string(), // Gemini web subdomains
-        "generativelanguage.googleapis.com".to_string(), // Gemini API
-        "aiplatform.googleapis.com".to_string(), // Vertex AI
-        "*-aiplatform.googleapis.com".to_string(), // Regional
-        "*.aiplatform.googleapis.com".to_string(),
-        // ===== AWS Bedrock =====
-        "bedrock.*.amazonaws.com".to_string(),
-        "bedrock-runtime.*.amazonaws.com".to_string(),
-        // ===== Microsoft/GitHub =====
-        "api.githubcopilot.com".to_string(),
-        "*.githubcopilot.com".to_string(),
-        "copilot-proxy.githubusercontent.com".to_string(),
-        "*.ingest.monitor.azure.com".to_string(), // Azure AI telemetry
-        // ===== Mistral =====
-        "api.mistral.ai".to_string(),
-        "*.mistral.ai".to_string(),
-        // ===== Cohere =====
-        "api.cohere.ai".to_string(),
-        "api.cohere.com".to_string(),
-        "*.cohere.ai".to_string(),
-        // ===== xAI (Grok) =====
-        "api.x.ai".to_string(),
-        "*.x.ai".to_string(),
-        // ===== Groq =====
-        "api.groq.com".to_string(),
-        "*.groq.com".to_string(),
-        // ===== Together AI =====
-        "api.together.xyz".to_string(),
-        "*.together.xyz".to_string(),
-        // ===== Perplexity =====
-        "api.perplexity.ai".to_string(),
-        "*.perplexity.ai".to_string(),
-        // ===== Replicate =====
-        "api.replicate.com".to_string(),
-        "*.replicate.delivery".to_string(), // Model delivery
-        // ===== Hugging Face =====
-        "*.huggingface.co".to_string(),
-        "*.hf.co".to_string(), // Short domain
-        // ===== Fireworks AI =====
-        "api.fireworks.ai".to_string(),
-        "*.fireworks.ai".to_string(),
-        // ===== DeepInfra =====
-        "api.deepinfra.com".to_string(),
-        "*.deepinfra.com".to_string(),
-        // ===== AI21 Labs =====
-        "api.ai21.com".to_string(),
-        "*.ai21.com".to_string(),
-        // ===== Stability AI =====
-        "api.stability.ai".to_string(),
-        "*.stability.ai".to_string(),
-        // ===== OpenRouter =====
-        "openrouter.ai".to_string(),
-        "*.openrouter.ai".to_string(),
-        // ===== Anyscale =====
-        "*.anyscale.com".to_string(),
-        // ===== Voyage AI (embeddings) =====
-        "api.voyageai.com".to_string(),
-        // ===== Nvidia =====
-        "api.nvcf.nvidia.com".to_string(),
-        "integrate.api.nvidia.com".to_string(),
-        "*.ngc.nvidia.com".to_string(), // NGC containers
-        // ===== IBM watsonx =====
-        "*.watsonx.ai".to_string(),
-        "*.ml.cloud.ibm.com".to_string(),
-        // ===== Databricks =====
-        "*.databricks.com".to_string(),
-        "*.azuredatabricks.net".to_string(),
-        "*.cloud.databricks.com".to_string(),
-        // ===== Snowflake Cortex =====
-        "*.snowflakecomputing.com".to_string(),
-        // ===== LangChain / LangSmith =====
-        "*.langchain.com".to_string(),
-        "*.langsmith.com".to_string(),
-        // ===== Writer =====
-        "api.writer.com".to_string(),
-        "*.writer.com".to_string(),
-        // ===== Reka =====
-        "api.reka.ai".to_string(),
-        // ===== LiteLLM provider coverage extensions =====
-        "api.aimlapi.com".to_string(),
-        "*.aimlapi.com".to_string(),
-        "api.clarifai.com".to_string(),
-        "*.clarifai.com".to_string(),
-        "api.cloudflare.com".to_string(),
-        "api.cometapi.com".to_string(),
-        "*.cometapi.com".to_string(),
-        "*.compactif.ai".to_string(),
-        "app.datarobot.com".to_string(),
-        "*.datarobot.com".to_string(),
-        "*.featherless.ai".to_string(),
-        "api.friendli.ai".to_string(),
-        "*.friendli.ai".to_string(),
-        "*.galadriel.com".to_string(),
-        "api.nlpcloud.io".to_string(),
-        "*.nlpcloud.io".to_string(),
-        "*.nscale.com".to_string(),
-        "api.novita.ai".to_string(),
-        "*.novita.ai".to_string(),
-        "endpoints.ai.cloud.ovh.net".to_string(),
-        "*.ai.cloud.ovh.net".to_string(),
-        "serving.app.predibase.com".to_string(),
-        "*.predibase.com".to_string(),
-        "external.api.recraft.ai".to_string(),
-        "*.recraft.ai".to_string(),
-        "api.studio.nebius.ai".to_string(),
-        "api.studio.nebius.com".to_string(),
-        "*.nebius.ai".to_string(),
-        "*.nebius.com".to_string(),
-        "api.v0.dev".to_string(),
-        "*.v0.dev".to_string(),
-        "*.volcengine.com".to_string(),
-        "*.volces.com".to_string(),
-        "api.inference.wandb.ai".to_string(),
-        "*.wandb.ai".to_string(),
-        "api.z.ai".to_string(),
-        "*.z.ai".to_string(),
-        // ===== Code Completion Tools =====
-        "api2.cursor.sh".to_string(),
-        "api3.cursor.sh".to_string(),
-        "*.cursor.sh".to_string(),
-        "api.vercel.ai".to_string(),
-        "*.tabnine.com".to_string(),
-        "cloud.zed.dev".to_string(),
-        "*.zed.dev".to_string(),
-        "*.codeium.com".to_string(),
-        "api.jetbrains.ai".to_string(),
-        "*.jetbrains.ai".to_string(),
-        "codewhisperer.*.amazonaws.com".to_string(),
-        "*.sourcegraph.com".to_string(), // Cody
-        // ===== Inference Platforms =====
-        "*.modal.com".to_string(),
-        "*.lepton.ai".to_string(),
-        "*.baseten.co".to_string(),
-        "*.banana.dev".to_string(),
-        "*.runpod.io".to_string(),
-        "*.lambdalabs.com".to_string(),
-        "*.cerebras.ai".to_string(),
-        "*.sambanova.ai".to_string(),
-        "*.octo.ai".to_string(),
-        "*.octoml.ai".to_string(),
-        // ===== Embedding Providers =====
-        "api.jina.ai".to_string(),
-        "*.jina.ai".to_string(),
-        "api.mixedbread.ai".to_string(),
-        // ===== Speech/Audio AI =====
-        "api.elevenlabs.io".to_string(),
-        "*.elevenlabs.io".to_string(),
-        "api.assemblyai.com".to_string(),
-        "*.assemblyai.com".to_string(),
-        "api.deepgram.com".to_string(),
-        "*.deepgram.com".to_string(),
-        "api.openai.com".to_string(), // Whisper via OpenAI
-        // ===== Image Generation =====
-        "api.leonardo.ai".to_string(),
-        "*.leonardo.ai".to_string(),
-        "api.getimg.ai".to_string(),
-        "*.clipdrop.co".to_string(),
-        "api.ideogram.ai".to_string(),
-        "api.black-forest-labs.ai".to_string(), // FLUX
-        // ===== Vector DBs =====
-        "*.pinecone.io".to_string(),
-        "*.weaviate.cloud".to_string(),
-        "*.qdrant.io".to_string(),
-        "*.qdrant.cloud".to_string(),
-        "*.milvus.io".to_string(),
-        "*.zilliz.com".to_string(), // Managed Milvus
-        "*.chroma.com".to_string(),
-        "*.turbopuffer.com".to_string(),
-        // ===== AI Agents / Orchestration =====
-        "api.e2b.dev".to_string(), // Code execution
-        "*.e2b.dev".to_string(),
-        "*.relevanceai.com".to_string(),
-        "*.dust.tt".to_string(),
-        // ===== Enterprise AI =====
-        "*.scale.com".to_string(), // Scale AI
-        "*.enterprisedb.ai".to_string(),
-        "*.vectara.io".to_string(),
-        "*.forethought.ai".to_string(),
-        // ===== China AI Providers =====
-        "api.moonshot.cn".to_string(), // Moonshot (Kimi)
-        "*.moonshot.cn".to_string(),
-        "aip.baidubce.com".to_string(), // Baidu ERNIE
-        "*.baidubce.com".to_string(),
-        "dashscope.aliyuncs.com".to_string(), // Alibaba Qwen
-        "*.dashscope.aliyuncs.com".to_string(),
-        "open.bigmodel.cn".to_string(), // Zhipu (GLM)
-        "*.bigmodel.cn".to_string(),
-        "api.minimax.chat".to_string(),  // MiniMax
-        "*.sensecore.cn".to_string(),    // SenseTime
-        "*.baichuan-ai.com".to_string(), // Baichuan
-        "*.01.ai".to_string(),           // Yi (01.AI)
-        "*.deepseek.com".to_string(),    // DeepSeek
-    ])
+    load_seed_domains(include_str!("../../../../domains/ai_inference.yaml"))
 }
 
 fn default_mcp_service_hosts() -> Vec<String> {
-    vec![
-        // ===== Source Control / Code Hosting =====
-        "api.github.com".to_string(),
-        "github.com".to_string(),
-        "uploads.github.com".to_string(),
-        "raw.githubusercontent.com".to_string(),
-        "objects.githubusercontent.com".to_string(),
-        "codeload.github.com".to_string(),
-        "*.githubusercontent.com".to_string(),
-        "api.gitlab.com".to_string(),
-        "gitlab.com".to_string(),
-        "*.gitlab.com".to_string(),
-        "api.bitbucket.org".to_string(),
-        "bitbucket.org".to_string(),
-        "api.atlassian.com".to_string(),
-        "*.atlassian.net".to_string(),
-        "api.azure.dev".to_string(),
-        "dev.azure.com".to_string(),
-        "*.visualstudio.com".to_string(),
-        // ===== Project / Knowledge Tools =====
-        "api.linear.app".to_string(),
-        "linear.app".to_string(),
-        "*.linear.app".to_string(),
-        "api.notion.com".to_string(),
-        "www.notion.so".to_string(),
-        "*.notion.so".to_string(),
-        "api.asana.com".to_string(),
-        "app.asana.com".to_string(),
-        "*.asana.com".to_string(),
-        "api.clickup.com".to_string(),
-        "app.clickup.com".to_string(),
-        "*.clickup.com".to_string(),
-        "api.monday.com".to_string(),
-        "*.monday.com".to_string(),
-        "api.airtable.com".to_string(),
-        "airtable.com".to_string(),
-        "*.airtable.com".to_string(),
-        "api.trello.com".to_string(),
-        "trello.com".to_string(),
-        "*.trello.com".to_string(),
-        "api.todoist.com".to_string(),
-        "todoist.com".to_string(),
-        "*.todoist.com".to_string(),
-        "api.coda.io".to_string(),
-        "coda.io".to_string(),
-        "*.coda.io".to_string(),
-        // ===== Chat / Collaboration =====
-        "slack.com".to_string(),
-        "api.slack.com".to_string(),
-        "*.slack.com".to_string(),
-        "hooks.slack.com".to_string(),
-        "discord.com".to_string(),
-        "*.discord.com".to_string(),
-        "api.twilio.com".to_string(),
-        "*.twilio.com".to_string(),
-        // ===== Google Workspace =====
-        "www.googleapis.com".to_string(),
-        "drive.googleapis.com".to_string(),
-        "docs.googleapis.com".to_string(),
-        "sheets.googleapis.com".to_string(),
-        "calendar.googleapis.com".to_string(),
-        "gmail.googleapis.com".to_string(),
-        "people.googleapis.com".to_string(),
-        "admin.googleapis.com".to_string(),
-        "script.googleapis.com".to_string(),
-        "storage.googleapis.com".to_string(),
-        // ===== Microsoft 365 =====
-        "graph.microsoft.com".to_string(),
-        "login.microsoftonline.com".to_string(),
-        "outlook.office.com".to_string(),
-        "*.sharepoint.com".to_string(),
-        "*.office.com".to_string(),
-        "*.office365.com".to_string(),
-        // ===== File Storage / Docs =====
-        "api.dropboxapi.com".to_string(),
-        "content.dropboxapi.com".to_string(),
-        "www.dropbox.com".to_string(),
-        "api.box.com".to_string(),
-        "upload.box.com".to_string(),
-        "*.box.com".to_string(),
-        "api.figma.com".to_string(),
-        "*.figma.com".to_string(),
-        "api.canva.com".to_string(),
-        "*.canva.com".to_string(),
-        // ===== Payments / CRM / Support =====
-        "api.stripe.com".to_string(),
-        "dashboard.stripe.com".to_string(),
-        "*.stripe.com".to_string(),
-        "api.hubapi.com".to_string(),
-        "app.hubspot.com".to_string(),
-        "*.hubspot.com".to_string(),
-        "login.salesforce.com".to_string(),
-        "*.salesforce.com".to_string(),
-        "api.zendesk.com".to_string(),
-        "*.zendesk.com".to_string(),
-        "api.shopify.com".to_string(),
-        "partners.shopify.com".to_string(),
-        "*.myshopify.com".to_string(),
-        "*.shopify.com".to_string(),
-        // ===== Cloud / Deploy / Infra =====
-        "api.cloudflare.com".to_string(),
-        "dash.cloudflare.com".to_string(),
-        "*.workers.dev".to_string(),
-        "api.vercel.com".to_string(),
-        "vercel.com".to_string(),
-        "*.vercel.app".to_string(),
-        "api.netlify.com".to_string(),
-        "app.netlify.com".to_string(),
-        "*.netlify.app".to_string(),
-        "api.render.com".to_string(),
-        "dashboard.render.com".to_string(),
-        "api.fly.io".to_string(),
-        "fly.io".to_string(),
-        "api.railway.app".to_string(),
-        "railway.app".to_string(),
-        "api.heroku.com".to_string(),
-        "*.herokuapp.com".to_string(),
-        // ===== Data / Observability =====
-        "api.supabase.com".to_string(),
-        "*.supabase.co".to_string(),
-        "*.supabase.com".to_string(),
-        "api.planetscale.com".to_string(),
-        "*.planetscale.com".to_string(),
-        "api.neon.tech".to_string(),
-        "console.neon.tech".to_string(),
-        "*.neon.tech".to_string(),
-        "cloud.mongodb.com".to_string(),
-        "*.mongodb.net".to_string(),
-        "api.segment.io".to_string(),
-        "app.segment.com".to_string(),
-        "*.segment.io".to_string(),
-        "api.datadoghq.com".to_string(),
-        "app.datadoghq.com".to_string(),
-        "*.datadoghq.com".to_string(),
-        "api.newrelic.com".to_string(),
-        "one.newrelic.com".to_string(),
-        "*.newrelic.com".to_string(),
-        "api.sentry.io".to_string(),
-        "sentry.io".to_string(),
-        "*.sentry.io".to_string(),
-        // ===== MCP Middleware / Automation =====
-        "api.pipedream.com".to_string(),
-        "*.pipedream.net".to_string(),
-        "api.composio.dev".to_string(),
-        "*.composio.dev".to_string(),
-        "api.browserbase.com".to_string(),
-        "*.browserbase.com".to_string(),
-        "api.firecrawl.dev".to_string(),
-        "*.firecrawl.dev".to_string(),
-        "api.scrapfly.io".to_string(),
-        "*.scrapfly.io".to_string(),
-        "api.zyte.com".to_string(),
-        "*.zyte.com".to_string(),
-        "api.resend.com".to_string(),
-        "resend.com".to_string(),
-        "api.postmarkapp.com".to_string(),
-        "*.postmarkapp.com".to_string(),
-        "api.mailgun.net".to_string(),
-        "*.mailgun.net".to_string(),
-        "api.sendgrid.com".to_string(),
-        "*.sendgrid.com".to_string(),
-        "api.n8n.io".to_string(),
-        "n8n.io".to_string(),
-        "*.n8n.cloud".to_string(),
-        "api.zapier.com".to_string(),
-        "zapier.com".to_string(),
-        "*.zapier.com".to_string(),
-        "api.make.com".to_string(),
-        "www.make.com".to_string(),
-        "*.integromat.com".to_string(),
-        "api.retool.com".to_string(),
-        "retool.com".to_string(),
-        "*.retool.com".to_string(),
-        // ===== Identity / Auth Backends Common in MCP Connectors =====
-        "api.okta.com".to_string(),
-        "*.okta.com".to_string(),
-        "api.auth0.com".to_string(),
-        "*.auth0.com".to_string(),
-    ]
+    load_seed_domains(include_str!("../../../../domains/mcp.yaml"))
 }
 
 fn default_agent_app_hosts() -> Vec<String> {
-    dedupe_hosts(vec![
-        // ===== OpenAI / ChatGPT =====
-        "chat.openai.com".to_string(),
-        "*.chat.openai.com".to_string(),
-        "chatgpt.com".to_string(),
-        "*.chatgpt.com".to_string(),
-        // ===== Google Gemini =====
-        "gemini.google.com".to_string(),
-        "*.gemini.google.com".to_string(),
-        // ===== Anthropic / Claude =====
-        "claude.ai".to_string(),
-        "*.claude.ai".to_string(),
-        "a-api.anthropic.com".to_string(),
-        "*.a-api.anthropic.com".to_string(),
-        "a-cdn.anthropic.com".to_string(),
-        "*.a-cdn.anthropic.com".to_string(),
-        "s-cdn.anthropic.com".to_string(),
-        "*.s-cdn.anthropic.com".to_string(),
-        "statsig.anthropic.com".to_string(),
-        // ===== IDE-native agents =====
-        "api2.cursor.sh".to_string(),
-        "api3.cursor.sh".to_string(),
-        "*.cursor.sh".to_string(),
-        "*.githubcopilot.com".to_string(),
-        "copilot-proxy.githubusercontent.com".to_string(),
-        "server.codeium.com".to_string(),
-        "*.codeium.com".to_string(),
-        "cloud.zed.dev".to_string(),
-        "*.zed.dev".to_string(),
-        "api.jetbrains.ai".to_string(),
-        "*.jetbrains.ai".to_string(),
-        "codewhisperer.*.amazonaws.com".to_string(),
-        // ===== Other web agent apps =====
-        "perplexity.ai".to_string(),
-        "*.perplexity.ai".to_string(),
-        "aistudio.google.com".to_string(),
-        "makersuite.google.com".to_string(),
-    ])
+    load_seed_domains(include_str!("../../../../domains/agent_apps.yaml"))
+}
+
+fn load_seed_domains(contents: &str) -> Vec<String> {
+    match serde_yaml::from_str::<DomainSeedFile>(contents) {
+        Ok(seed) => dedupe_hosts(seed.domains),
+        Err(error) => {
+            tracing::warn!("Failed to parse embedded domain seed list: {error}");
+            Vec::new()
+        }
+    }
 }
 
 fn dedupe_hosts(hosts: Vec<String>) -> Vec<String> {
@@ -2377,6 +2079,9 @@ cloud:
   config_pull_interval_secs: 120
   config_debounce_secs: 8
   body_upload_enabled: true
+  metadata_max_events_per_batch: 120
+  metadata_max_compressed_batch_bytes: 3145728
+  body_upload_max_bytes: 10485760
   tags:
     project: "edge"
     env: "staging"
@@ -2389,6 +2094,9 @@ cloud:
         assert_eq!(config.cloud.config_pull_interval_secs, 120);
         assert_eq!(config.cloud.config_debounce_secs, 8);
         assert!(config.cloud.body_upload_enabled);
+        assert_eq!(config.cloud.metadata_max_events_per_batch, 120);
+        assert_eq!(config.cloud.metadata_max_compressed_batch_bytes, 3_145_728);
+        assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
     }
 
@@ -2452,6 +2160,7 @@ crypto_identity:
         assert_eq!(config.port, 8080);
         assert_eq!(config.address, "127.0.0.1");
         assert_eq!(config.socket_addr(), "127.0.0.1:8080");
+        assert_eq!(config.registry_mode, RegistryMode::Registry);
     }
 
     #[test]
@@ -2491,10 +2200,10 @@ crypto_identity:
     }
 
     #[test]
-    fn test_host_filter_default_selective() {
+    fn test_host_filter_default_discovery() {
         use super::HostAction;
         let filter = HostFilterConfig::default();
-        assert_eq!(filter.mode, HostFilterMode::Selective);
+        assert_eq!(filter.mode, HostFilterMode::Discovery);
 
         // AI domains should be intercepted
         assert_eq!(
@@ -2510,12 +2219,12 @@ crypto_identity:
             HostAction::Intercept
         );
 
-        // Non-AI domains should be tunneled (not blocked!)
+        // In discovery mode, non-local unknown domains are intercepted.
         assert_eq!(
             filter.action_for_host("random.example.com"),
-            HostAction::Tunnel
+            HostAction::Intercept
         );
-        assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
+        assert_eq!(filter.action_for_host("google.com"), HostAction::Intercept);
     }
 
     #[test]
@@ -2630,8 +2339,7 @@ crypto_identity:
         for domain in ai_domains {
             assert!(
                 filter.should_intercept(domain),
-                "Expected {} to be intercepted",
-                domain
+                "Expected {domain} to be intercepted"
             );
         }
 
@@ -2646,8 +2354,7 @@ crypto_identity:
         for domain in non_ai_domains {
             assert!(
                 !filter.should_intercept(domain),
-                "Expected {} to NOT be intercepted",
-                domain
+                "Expected {domain} to NOT be intercepted"
             );
         }
     }
@@ -2736,18 +2443,17 @@ crypto_identity:
     }
 
     #[test]
-    fn test_default_host_filter_tunnels_unknown_mcp_hosts() {
+    fn test_default_host_filter_intercepts_unknown_mcp_hosts() {
         let filter = HostFilterConfig::default();
 
-        // Unknown hosts are tunneled by default. For HTTPS CONNECT, this means we
-        // cannot inspect payloads on those hosts unless they are explicitly listed.
+        // Discovery mode intercepts unknown non-local hosts by default.
         assert_eq!(
             filter.action_for_host("custom-mcp.example.com"),
-            HostAction::Tunnel
+            HostAction::Intercept
         );
         assert_eq!(
             filter.action_for_host("mcp.partner.internal"),
-            HostAction::Tunnel
+            HostAction::Intercept
         );
     }
 
@@ -2847,6 +2553,7 @@ forward_proxy:
   port: 9090
   address: "0.0.0.0"
   hosts:
+    mode: selective
     ai_inference:
       - "api.openai.com"
       - "api.anthropic.com"
@@ -2893,6 +2600,32 @@ forward_proxy:
     }
 
     #[test]
+    fn test_parse_forward_proxy_registry_mode_yaml() {
+        let yaml = r#"
+forward_proxy:
+  enabled: true
+  registry_mode: registry
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_registry_mode_legacy_aliases_yaml() {
+        for mode in ["legacy", "shadow"] {
+            let yaml = format!(
+                r#"
+forward_proxy:
+  enabled: true
+  registry_mode: {mode}
+"#
+            );
+            let config: SothConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
+        }
+    }
+
+    #[test]
     fn test_parse_forward_proxy_yaml_ai_inference_only() {
         use super::HostAction;
         let yaml = r#"
@@ -2900,6 +2633,7 @@ forward_proxy:
   enabled: true
   port: 9090
   hosts:
+    mode: selective
     ai_inference:
       - "api.openai.com"
       - "custom.api.com"
@@ -2930,6 +2664,7 @@ forward_proxy:
 forward_proxy:
   enabled: true
   hosts:
+    mode: selective
     ai_inference: []
     mcp: []
     agent_apps:
@@ -3190,8 +2925,7 @@ forward_proxy:
             assert_eq!(
                 filter.action_for_host(addr),
                 HostAction::Tunnel,
-                "Expected {} to always tunnel (bypass proxy)",
-                addr
+                "Expected {addr} to always tunnel (bypass proxy)"
             );
         }
 

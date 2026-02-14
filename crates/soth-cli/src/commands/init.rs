@@ -14,8 +14,9 @@ forward_proxy:
   enabled: true
   address: "127.0.0.1"
   port: 8080
+  capture_max_body_bytes: 15728640
   hosts:
-    mode: "selective"  # selective | discovery
+    mode: "discovery"  # discovery | selective
     # Domain classes are loaded from dedicated files (recommended).
     # If a file is configured, it replaces the corresponding inline list.
     domain_files:
@@ -110,7 +111,10 @@ cloud:
   sync_interval_secs: 60
   config_pull_interval_secs: 300
   config_debounce_secs: 6
-  body_upload_enabled: false
+  body_upload_enabled: true
+  metadata_max_events_per_batch: 200
+  metadata_max_compressed_batch_bytes: 5242880
+  body_upload_max_bytes: 15728640
   cache_path: "~/.soth/cloud_config_cache.json"
   tags: {}
 "#;

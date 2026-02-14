@@ -90,7 +90,7 @@ enum EventLoggerStorage {
 }
 
 enum LoggerCommand {
-    Event(WrapEvent),
+    Event(Box<WrapEvent>),
     Flush(std::sync::mpsc::Sender<std::io::Result<()>>),
     Shutdown,
 }
@@ -218,7 +218,9 @@ impl MerkleAuditState {
         tx: &rusqlite::Transaction<'_>,
         count: usize,
     ) -> std::io::Result<()> {
-        let leaves: Vec<PersistedEventMeta> = self.pending.drain(..count).collect();
+        let batch_len = count.min(self.pending.len());
+        let leaves: Vec<PersistedEventMeta> =
+            self.pending.iter().take(batch_len).cloned().collect();
         if leaves.is_empty() {
             return Ok(());
         }
@@ -289,6 +291,7 @@ impl MerkleAuditState {
             .map_err(to_io_err)?;
         }
 
+        self.pending.drain(..batch_len);
         self.prev_root = Some(chained_root);
         self.batch_counter += 1;
         self.last_sealed_at = Instant::now();
@@ -425,16 +428,16 @@ impl EventLogger {
 
     /// Read the current sync cursor snapshot.
     pub fn get_sync_cursor_state(&self) -> std::io::Result<SyncCursorState> {
-        let mut state = SyncCursorState::default();
-        state.last_synced_seq = self
-            .get_sync_state(SYNC_KEY_LAST_SYNCED_SEQ)?
-            .and_then(|value| value.parse::<i64>().ok());
-        state.last_body_synced_seq = self
-            .get_sync_state(SYNC_KEY_LAST_BODY_SYNCED_SEQ)?
-            .and_then(|value| value.parse::<i64>().ok());
-        state.last_sync_timestamp = self.get_sync_state(SYNC_KEY_LAST_SYNC_TIMESTAMP)?;
-        state.sync_errors = self.get_sync_state(SYNC_KEY_SYNC_ERRORS)?;
-        Ok(state)
+        Ok(SyncCursorState {
+            last_synced_seq: self
+                .get_sync_state(SYNC_KEY_LAST_SYNCED_SEQ)?
+                .and_then(|value| value.parse::<i64>().ok()),
+            last_body_synced_seq: self
+                .get_sync_state(SYNC_KEY_LAST_BODY_SYNCED_SEQ)?
+                .and_then(|value| value.parse::<i64>().ok()),
+            last_sync_timestamp: self.get_sync_state(SYNC_KEY_LAST_SYNC_TIMESTAMP)?,
+            sync_errors: self.get_sync_state(SYNC_KEY_SYNC_ERRORS)?,
+        })
     }
 
     /// Log an event.
@@ -451,7 +454,7 @@ impl EventLogger {
 
         match guard.as_mut() {
             Some(EventLoggerStorage::SqliteAsync { tx, .. }) => {
-                let command = LoggerCommand::Event(event.clone());
+                let command = LoggerCommand::Event(Box::new(event.clone()));
                 match tx.try_send(command) {
                     Ok(()) => {}
                     Err(TrySendError::Full(command)) => tx.send(command).map_err(|_| {
@@ -672,7 +675,7 @@ fn run_sqlite_writer(
 
     loop {
         match rx.recv_timeout(flush_interval) {
-            Ok(LoggerCommand::Event(event)) => pending.push(event),
+            Ok(LoggerCommand::Event(event)) => pending.push(*event),
             Ok(LoggerCommand::Flush(ack)) => {
                 let result = flush_sqlite_events(
                     &mut conn,
@@ -738,7 +741,7 @@ fn run_sqlite_writer(
 
         while pending.len() < SQLITE_BATCH_SIZE {
             match rx.try_recv() {
-                Ok(LoggerCommand::Event(event)) => pending.push(event),
+                Ok(LoggerCommand::Event(event)) => pending.push(*event),
                 Ok(LoggerCommand::Flush(ack)) => {
                     let result = flush_sqlite_events(
                         &mut conn,
@@ -804,7 +807,7 @@ fn flush_sqlite_events(
 
     let tx = conn.transaction().map_err(to_io_err)?;
     let mut inserted = Vec::new();
-    for event in pending.drain(..) {
+    for event in pending.iter().cloned() {
         if let Some(meta) =
             insert_sqlite_event(&tx, event, inline_payload_max_bytes, merkle_state.enabled)?
         {
@@ -813,6 +816,7 @@ fn flush_sqlite_events(
     }
     merkle_state.on_events_persisted(&tx, inserted, force_seal)?;
     tx.commit().map_err(to_io_err)?;
+    pending.clear();
     Ok(())
 }
 
@@ -935,7 +939,7 @@ fn maybe_offload_payload(
         return;
     };
 
-    if content.as_bytes().len() <= inline_payload_max_bytes {
+    if content.len() <= inline_payload_max_bytes {
         *field = Some(content);
         return;
     }
@@ -1098,6 +1102,71 @@ mod tests {
             observed >= 1,
             "expected timed flush to persist event without waiting for batch=64"
         );
+    }
+
+    #[test]
+    fn test_flush_sqlite_events_keeps_pending_when_insert_fails() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut conn = Connection::open(path).unwrap();
+        init_sqlite_schema(&conn).unwrap();
+        conn.execute("DROP TABLE wrap_events", []).unwrap();
+
+        let agent = AgentInfo::new("Test Agent", DetectionSource::CommandLine);
+        let mut pending =
+            vec![
+                WrapEvent::new("session-fail", "api.openai.com", WrapDirection::Out, agent)
+                    .with_method("POST /v1/chat/completions"),
+            ];
+        let pending_id = pending[0].id.clone();
+
+        let mut merkle_state =
+            MerkleAuditState::new(&conn, &MerkleLoggingConfig::default()).unwrap();
+        let result = flush_sqlite_events(
+            &mut conn,
+            &mut pending,
+            INLINE_PAYLOAD_MAX_BYTES,
+            &mut merkle_state,
+            false,
+        );
+        assert!(result.is_err(), "expected sqlite insert to fail");
+        assert_eq!(pending.len(), 1, "pending events must be retained");
+        assert_eq!(pending[0].id, pending_id);
+    }
+
+    #[test]
+    fn test_merkle_seal_keeps_pending_when_batch_write_fails() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut conn = Connection::open(path).unwrap();
+        init_sqlite_schema(&conn).unwrap();
+
+        let mut merkle_state = MerkleAuditState::new(
+            &conn,
+            &MerkleLoggingConfig {
+                enabled: true,
+                seal_interval: Duration::from_secs(0),
+                max_events_per_batch: 1,
+            },
+        )
+        .unwrap();
+        conn.execute("DROP TABLE merkle_batches", []).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let event_hash = hex_encode(&[0x11; 32]);
+        let result = merkle_state.on_events_persisted(
+            &tx,
+            vec![PersistedEventMeta { seq: 1, event_hash }],
+            true,
+        );
+
+        assert!(result.is_err(), "expected merkle batch write to fail");
+        assert_eq!(
+            merkle_state.pending.len(),
+            1,
+            "pending leaf must be retained"
+        );
+        assert_eq!(merkle_state.pending[0].seq, 1);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use crate::cache;
+use crate::http_client::build_cloud_client;
 use crate::registry_puller::RegistryPuller;
 
 #[derive(Clone)]
@@ -32,11 +33,12 @@ impl ConfigPuller {
         api_key: impl Into<String>,
         cache_path: PathBuf,
     ) -> Self {
+        let endpoint = endpoint.into().trim_end_matches('/').to_string();
         Self {
-            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            client: build_cloud_client(&endpoint),
+            endpoint,
             api_key: api_key.into(),
             cache_path,
-            client: reqwest::Client::new(),
             debounce_window: Duration::from_secs(6),
             debounce_state: Arc::new(Mutex::new(DebounceState::default())),
             registry_puller: None,

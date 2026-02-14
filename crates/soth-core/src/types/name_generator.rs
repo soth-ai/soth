@@ -36,7 +36,7 @@ pub fn generate_session_name() -> String {
     let mut rng = thread_rng();
     let adjective = ADJECTIVES.choose(&mut rng).unwrap_or(&"happy");
     let noun = NOUNS.choose(&mut rng).unwrap_or(&"penguin");
-    format!("{}-{}", adjective, noun)
+    format!("{adjective}-{noun}")
 }
 
 /// Generate a deterministic name from a seed (e.g., session ID)
@@ -60,7 +60,7 @@ pub fn generate_unique_names(count: usize) -> Vec<String> {
     while names.len() < count {
         let adjective = ADJECTIVES.choose(&mut rng).unwrap_or(&"happy");
         let noun = NOUNS.choose(&mut rng).unwrap_or(&"penguin");
-        names.insert(format!("{}-{}", adjective, noun));
+        names.insert(format!("{adjective}-{noun}"));
     }
 
     names.into_iter().collect()
@@ -113,7 +113,7 @@ impl NameGenerator {
             .choose(&mut rng)
             .map(|s| s.as_str())
             .unwrap_or("penguin");
-        format!("{}-{}", adjective, noun)
+        format!("{adjective}-{noun}")
     }
 
     /// Generate a name from a seed

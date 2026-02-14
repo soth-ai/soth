@@ -164,6 +164,7 @@ impl TrafficEnvelope {
     }
 
     /// Create a normalized proxy envelope for MCP JSON-RPC over HTTP/WebSocket.
+    #[allow(clippy::too_many_arguments)]
     pub fn mcp_http(
         session_id: impl Into<String>,
         request_id: Option<impl Into<String>>,

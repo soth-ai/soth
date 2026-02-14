@@ -138,11 +138,7 @@ impl PricingCatalog {
                 cache_write_tokens,
             )
         } else {
-            // Default pricing for unknown models (conservative estimate)
-            let default_input = 5.0; // $5 per million input
-            let default_output = 15.0; // $15 per million output
-            (usage.input_tokens as f64 / 1_000_000.0) * default_input
-                + (usage.output_tokens as f64 / 1_000_000.0) * default_output
+            0.0
         }
     }
 
@@ -208,15 +204,13 @@ impl PricingCatalog {
 
     /// Detect provider from model name
     pub fn detect_provider(&self, model: &str) -> Option<String> {
-        self.get_pricing(model)
-            .map(|e| e.provider)
-            .or_else(|| soth_registry::detect_provider_from_model(model).map(str::to_string))
+        self.get_pricing(model).map(|e| e.provider)
     }
 }
 
 impl Default for PricingCatalog {
     fn default() -> Self {
-        Self::with_defaults()
+        Self::new()
     }
 }
 
@@ -626,9 +620,9 @@ mod tests {
         let catalog = PricingCatalog::with_defaults();
         let usage = TokenUsage::new(1_000_000, 1_000_000);
 
-        // Unknown model should use conservative defaults ($5/M in, $15/M out)
+        // Unknown model should not use fallback static pricing.
         let cost = catalog.calculate_cost("unknown-model-xyz", &usage);
-        assert!((cost - 20.0).abs() < 0.01);
+        assert_eq!(cost, 0.0);
     }
 
     #[test]
@@ -667,10 +661,6 @@ mod tests {
             catalog.detect_provider("gemini-1.5-pro"),
             Some("google".to_string())
         );
-        // Fallback when model is not in pricing catalog but matches registry hint.
-        assert_eq!(
-            catalog.detect_provider("llama-3.3-70b"),
-            Some("meta".to_string())
-        );
+        assert_eq!(catalog.detect_provider("llama-3.3-70b"), None);
     }
 }

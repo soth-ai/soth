@@ -8,9 +8,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Replay speed multiplier
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum ReplaySpeed {
     /// Real-time (1x speed)
+    #[default]
     RealTime,
     /// Fast (no delays between messages)
     Fast,
@@ -32,12 +33,6 @@ impl ReplaySpeed {
                 }
             }
         }
-    }
-}
-
-impl Default for ReplaySpeed {
-    fn default() -> Self {
-        ReplaySpeed::RealTime
     }
 }
 
@@ -257,7 +252,7 @@ impl SessionReplayer {
     }
 
     /// Get and advance to next message
-    pub fn next(&mut self) -> Option<&RecordedMessage> {
+    pub fn next_message(&mut self) -> Option<&RecordedMessage> {
         if self.current_index >= self.filtered_indices.len() {
             return None;
         }
@@ -323,7 +318,7 @@ impl SessionReplayer {
             }
 
             // Get next message (clone to release borrow before accessing current_index)
-            if let Some(message) = self.next().cloned() {
+            if let Some(message) = self.next_message().cloned() {
                 tx.send(ReplayEvent::Message {
                     index: self.current_index - 1,
                     total,
@@ -465,17 +460,17 @@ mod tests {
         assert_eq!(replayer.total_messages(), 3);
         assert!(!replayer.is_complete());
 
-        let msg = replayer.next().unwrap();
+        let msg = replayer.next_message().unwrap();
         assert_eq!(msg.id, "msg-0");
 
-        let msg = replayer.next().unwrap();
+        let msg = replayer.next_message().unwrap();
         assert_eq!(msg.id, "msg-1");
 
-        let msg = replayer.next().unwrap();
+        let msg = replayer.next_message().unwrap();
         assert_eq!(msg.id, "msg-2");
 
         assert!(replayer.is_complete());
-        assert!(replayer.next().is_none());
+        assert!(replayer.next_message().is_none());
     }
 
     #[test]
@@ -486,10 +481,10 @@ mod tests {
 
         assert_eq!(replayer.total_messages(), 2);
 
-        let msg = replayer.next().unwrap();
+        let msg = replayer.next_message().unwrap();
         assert_eq!(msg.direction, MessageDirection::ToServer);
 
-        let msg = replayer.next().unwrap();
+        let msg = replayer.next_message().unwrap();
         assert_eq!(msg.direction, MessageDirection::ToServer);
     }
 
@@ -501,7 +496,7 @@ mod tests {
 
         assert_eq!(replayer.total_messages(), 1);
 
-        let msg = replayer.next().unwrap();
+        let msg = replayer.next_message().unwrap();
         assert_eq!(msg.method(), Some("tools/list"));
     }
 
@@ -513,7 +508,7 @@ mod tests {
 
         assert_eq!(replayer.total_messages(), 2);
 
-        let msg = replayer.next().unwrap();
+        let msg = replayer.next_message().unwrap();
         assert_eq!(msg.id, "msg-1");
     }
 
@@ -539,7 +534,7 @@ mod tests {
         replayer.seek(2);
         assert_eq!(replayer.current_position(), 2);
 
-        let msg = replayer.next().unwrap();
+        let msg = replayer.next_message().unwrap();
         assert_eq!(msg.id, "msg-2");
     }
 

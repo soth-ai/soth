@@ -8,7 +8,7 @@ use soth_core::config::BudgetLimit;
 #[cfg(feature = "cloud-sync")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "cloud-sync")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "cloud-sync")]
 use tracing::info;
 
@@ -18,11 +18,16 @@ pub struct CloudPullRuntime {
 }
 
 #[cfg(feature = "cloud-sync")]
+const STARTUP_REGISTRY_REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(feature = "cloud-sync")]
 const FINAL_CLOUD_SYNC_TIMEOUT: Duration = Duration::from_secs(4);
 #[cfg(feature = "cloud-sync")]
 const FINAL_CLOUD_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "cloud-sync")]
 const FINAL_CLOUD_SYNC_MAX_ROUNDS: usize = 3;
+#[cfg(feature = "cloud-sync")]
+const CLOUD_BACKOFF_MAX_CAP: Duration = Duration::from_secs(15 * 60);
 
 #[cfg(feature = "cloud-sync")]
 pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
@@ -61,6 +66,50 @@ pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(feature = "cloud-sync")]
+pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
+    use soth_sync::registry_puller::RegistryPuller;
+
+    if !config.cloud.enabled {
+        return;
+    }
+
+    let Some(api_key) = config.cloud.api_key.clone() else {
+        warn!("cloud.enabled=true but cloud.api_key is missing; skipping startup registry refresh");
+        return;
+    };
+
+    let cache_path = resolve_cache_path(config);
+    let registry_cache_path = resolve_registry_cache_path(config, &cache_path);
+    let puller = RegistryPuller::new(config.cloud.endpoint.clone(), api_key, registry_cache_path);
+
+    match tokio::time::timeout(STARTUP_REGISTRY_REFRESH_TIMEOUT, puller.refresh_now()).await {
+        Ok(Ok(outcome)) => {
+            info!(
+                checked = outcome.checked,
+                downloaded = outcome.downloaded,
+                bundle_version = outcome.version.as_deref().unwrap_or("unknown"),
+                "Startup registry bundle refresh completed"
+            );
+        }
+        Ok(Err(error)) => {
+            warn!(
+                error = %format!("{:#}", error),
+                "Startup registry bundle refresh failed; continuing with cached bundle"
+            );
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = STARTUP_REGISTRY_REFRESH_TIMEOUT.as_secs(),
+                "Startup registry bundle refresh timed out; continuing with cached bundle"
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "cloud-sync"))]
+pub async fn refresh_registry_bundle_on_start(_config: &SothConfig) {}
 
 #[cfg(feature = "cloud-sync")]
 pub fn spawn_cloud_pull_runtime(
@@ -105,15 +154,21 @@ pub fn spawn_cloud_pull_runtime(
             retry_queue_dir: default_retry_queue_dir(),
             retry_queue_max_bytes: 500 * 1024 * 1024,
             sync_interval: std::time::Duration::from_secs(sync_interval_secs),
-            batch_size: 100,
+            batch_size: config.cloud.metadata_max_events_per_batch.max(1),
             body_batch_size: 64,
             body_upload_enabled: config.cloud.body_upload_enabled,
+            metadata_max_events_per_batch: config.cloud.metadata_max_events_per_batch.max(1),
+            metadata_max_compressed_batch_bytes: config
+                .cloud
+                .metadata_max_compressed_batch_bytes
+                .max(1) as usize,
+            body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
             global_tags: config.cloud.tags.clone(),
         };
         match SyncAgent::new(sync_config, Some(puller.clone())) {
             Ok(agent) => Some(agent),
             Err(error) => {
-                warn!("Failed to initialize cloud sync agent: {}", error);
+                warn!("Failed to initialize cloud sync agent: {:#}", error);
                 None
             }
         }
@@ -121,8 +176,23 @@ pub fn spawn_cloud_pull_runtime(
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
+        let config_pull_base = std::time::Duration::from_secs(interval_secs);
+        let sync_base = std::time::Duration::from_secs(sync_interval_secs);
+        let heartbeat_base = std::time::Duration::from_secs(sync_interval_secs.max(30));
+        let mut config_pull_backoff =
+            ExponentialBackoff::new(config_pull_base, bounded_backoff_max(config_pull_base));
+        let mut sync_backoff = ExponentialBackoff::new(sync_base, bounded_backoff_max(sync_base));
+        let mut heartbeat_backoff =
+            ExponentialBackoff::new(heartbeat_base, bounded_backoff_max(heartbeat_base));
+
         if let Err(error) = puller.pull_once().await {
-            warn!("Initial cloud config pull failed: {}", error);
+            let retry_in = config_pull_backoff.record_failure();
+            warn!(
+                retry_in_secs = retry_in.as_secs(),
+                "Initial cloud config pull failed: {:#}", error
+            );
+        } else {
+            config_pull_backoff.record_success();
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -156,7 +226,7 @@ pub fn spawn_cloud_pull_runtime(
                                     );
                                 }
                             }
-                            Ok(Err(error)) => warn!("Final cloud sync flush failed: {}", error),
+                            Ok(Err(error)) => warn!("Final cloud sync flush failed: {:#}", error),
                             Err(_) => warn!("Final cloud sync flush timed out"),
                         }
                         match tokio::time::timeout(
@@ -164,21 +234,35 @@ pub fn spawn_cloud_pull_runtime(
                             agent.send_heartbeat(),
                         ).await {
                             Ok(Ok(_)) => {}
-                            Ok(Err(error)) => warn!("Final cloud heartbeat failed: {}", error),
+                            Ok(Err(error)) => warn!("Final cloud heartbeat failed: {:#}", error),
                             Err(_) => warn!("Final cloud heartbeat timed out"),
                         }
                     }
                     break
                 },
                 _ = interval.tick() => {
+                    if !config_pull_backoff.is_ready() {
+                        continue;
+                    }
                     if let Err(error) = puller.pull_once().await {
-                        warn!("Periodic cloud config pull failed: {}", error);
+                        let retry_in = config_pull_backoff.record_failure();
+                        warn!(
+                            retry_in_secs = retry_in.as_secs(),
+                            "Periodic cloud config pull failed: {:#}",
+                            error
+                        );
+                    } else {
+                        config_pull_backoff.record_success();
                     }
                 }
                 _ = sync_interval.tick() => {
                     if let Some(agent) = &sync_agent {
+                        if !sync_backoff.is_ready() {
+                            continue;
+                        }
                         match agent.tick().await {
                             Ok(summary) => {
+                                sync_backoff.record_success();
                                 if summary.metadata_sent > 0
                                     || summary.body_uploaded > 0
                                     || summary.retry_uploaded > 0
@@ -191,14 +275,31 @@ pub fn spawn_cloud_pull_runtime(
                                     );
                                 }
                             }
-                            Err(error) => warn!("Cloud sync tick failed: {}", error),
+                            Err(error) => {
+                                let retry_in = sync_backoff.record_failure();
+                                warn!(
+                                    retry_in_secs = retry_in.as_secs(),
+                                    "Cloud sync tick failed: {:#}",
+                                    error
+                                );
+                            }
                         }
                     }
                 }
                 _ = heartbeat_interval.tick() => {
                     if let Some(agent) = &sync_agent {
+                        if !heartbeat_backoff.is_ready() {
+                            continue;
+                        }
                         if let Err(error) = agent.send_heartbeat().await {
-                            warn!("Cloud heartbeat failed: {}", error);
+                            let retry_in = heartbeat_backoff.record_failure();
+                            warn!(
+                                retry_in_secs = retry_in.as_secs(),
+                                "Cloud heartbeat failed: {:#}",
+                                error
+                            );
+                        } else {
+                            heartbeat_backoff.record_success();
                         }
                     }
                 }
@@ -215,6 +316,64 @@ pub fn spawn_cloud_pull_runtime(
     _event_db_path: Option<std::path::PathBuf>,
 ) -> Option<CloudPullRuntime> {
     None
+}
+
+#[cfg(feature = "cloud-sync")]
+#[derive(Debug, Clone)]
+struct ExponentialBackoff {
+    base: Duration,
+    max: Duration,
+    failures: u32,
+    blocked_until: Option<Instant>,
+}
+
+#[cfg(feature = "cloud-sync")]
+impl ExponentialBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        let safe_base = std::cmp::max(base, Duration::from_secs(1));
+        let safe_max = std::cmp::max(max, safe_base);
+        Self {
+            base: safe_base,
+            max: safe_max,
+            failures: 0,
+            blocked_until: None,
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.blocked_until
+            .map(|deadline| Instant::now() >= deadline)
+            .unwrap_or(true)
+    }
+
+    fn record_success(&mut self) {
+        self.failures = 0;
+        self.blocked_until = None;
+    }
+
+    fn record_failure(&mut self) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let shift = self.failures.saturating_sub(1).min(10);
+        let multiplier = 1_u32 << shift;
+        let delay = self
+            .base
+            .checked_mul(multiplier)
+            .unwrap_or(self.max)
+            .min(self.max);
+        self.blocked_until = Some(Instant::now() + delay);
+        delay
+    }
+}
+
+#[cfg(feature = "cloud-sync")]
+fn bounded_backoff_max(base: Duration) -> Duration {
+    std::cmp::max(
+        base,
+        std::cmp::min(
+            base.checked_mul(32).unwrap_or(CLOUD_BACKOFF_MAX_CAP),
+            CLOUD_BACKOFF_MAX_CAP,
+        ),
+    )
 }
 
 #[cfg(feature = "cloud-sync")]

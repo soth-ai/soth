@@ -150,6 +150,9 @@ where
         let message = fields
             .message
             .unwrap_or_else(|| metadata.target().to_string());
+        if should_suppress_noisy_proxy_error(metadata.target(), metadata.level(), &message) {
+            return Ok(());
+        }
 
         write!(
             writer,
@@ -173,6 +176,20 @@ where
 
         writeln!(writer)
     }
+}
+
+fn should_suppress_noisy_proxy_error(target: &str, level: &Level, message: &str) -> bool {
+    if std::env::var_os("SOTH_LOG_TRANSIENT_PROXY_ERRORS").is_some() {
+        return false;
+    }
+    if *level != Level::ERROR || !target.starts_with("hudsucker") {
+        return false;
+    }
+
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("failed to forward request: client error (sendrequest)")
+        || normalized
+            .contains("error serving connection: connection closed before message completed")
 }
 
 #[derive(Default)]
