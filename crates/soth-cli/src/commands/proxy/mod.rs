@@ -338,3 +338,68 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
         ProxyCommands::RateLimit { config } => ratelimit::run(config.or(global_config)).await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        proxy: ProxyCommands,
+    }
+
+    #[test]
+    fn parses_profile_dev_stack_with_overrides() {
+        let cli = TestCli::try_parse_from([
+            "soth",
+            "profile",
+            "start",
+            "--profile",
+            "dev-stack",
+            "--sensor-port",
+            "8088",
+            "--api-port",
+            "3010",
+            "--no-ui",
+            "--quiet",
+        ])
+        .expect("profile command should parse");
+
+        match cli.proxy {
+            ProxyCommands::Profile { action } => match action {
+                ProfileAction::Start {
+                    profile,
+                    sensor_port,
+                    api_port,
+                    no_ui,
+                    quiet,
+                    ..
+                } => {
+                    assert!(matches!(profile, profile::RuntimeProfile::DevStack));
+                    assert_eq!(sensor_port, Some(8088));
+                    assert_eq!(api_port, Some(3010));
+                    assert!(no_ui);
+                    assert!(quiet);
+                }
+            },
+            _ => panic!("expected profile subcommand"),
+        }
+    }
+
+    #[test]
+    fn profile_defaults_to_sensor_only() {
+        let cli = TestCli::try_parse_from(["soth", "profile", "start"])
+            .expect("profile start should parse");
+
+        match cli.proxy {
+            ProxyCommands::Profile { action } => match action {
+                ProfileAction::Start { profile, .. } => {
+                    assert!(matches!(profile, profile::RuntimeProfile::SensorOnly));
+                }
+            },
+            _ => panic!("expected profile subcommand"),
+        }
+    }
+}
