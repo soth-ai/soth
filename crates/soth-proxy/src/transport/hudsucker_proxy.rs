@@ -1718,13 +1718,18 @@ impl HttpHandler for AiProxyHandler {
             self.get_action(&host, &path)
         };
         let is_blocked = matches!(host_action, HostAction::Block);
+        let should_capture_observability = matches!(host_action, HostAction::Intercept);
         let host_mode = self.hosts.mode;
         let catalog_discovery_limiter = self.catalog_discovery_limiter.clone();
-        let oisp_classification = self
-            .oisp_engine
-            .as_ref()
-            .and_then(|engine| engine.classify(&host));
-        let is_catalog_discovery_host = host_mode == HostFilterMode::Discovery
+        let oisp_classification = if should_capture_observability {
+            self.oisp_engine
+                .as_ref()
+                .and_then(|engine| engine.classify(&host))
+        } else {
+            None
+        };
+        let is_catalog_discovery_host = should_capture_observability
+            && host_mode == HostFilterMode::Discovery
             && oisp_classification.is_none()
             && self
                 .oisp_engine
@@ -1786,6 +1791,7 @@ impl HttpHandler for AiProxyHandler {
             .unwrap_or(false);
         // Only inspect request bodies for relevant host classes (or discovery mode).
         let should_inspect_body = is_post
+            && should_capture_observability
             && ((host_is_ai_target || host_is_agent_target)
                 || host_is_mcp_target
                 || (host_mode == HostFilterMode::Discovery && is_json))
@@ -1802,6 +1808,7 @@ impl HttpHandler for AiProxyHandler {
         let capture_max_body_bytes = self.capture_max_body_bytes;
         let client_addr = ctx.client_addr;
         let should_resolve_process = !is_connect
+            && should_capture_observability
             && (host_is_ai_target
                 || host_is_mcp_target
                 || host_is_agent_target
@@ -1920,6 +1927,14 @@ impl HttpHandler for AiProxyHandler {
                     request_capture_oversized,
                 )
             };
+            if !is_connect && !should_capture_observability {
+                debug!(
+                    host = %host,
+                    path = %path,
+                    method = %http_method,
+                    "Skipping observability capture for tunneled/noise request"
+                );
+            }
             let agent = Self::detect_agent_with_context_gated(
                 ua_agent,
                 &host,
@@ -1928,6 +1943,7 @@ impl HttpHandler for AiProxyHandler {
                 host_is_agent_target || (host_mode == HostFilterMode::Discovery),
             );
             let mcp_request_method = if !is_connect
+                && should_capture_observability
                 && (host_is_mcp_target || (host_mode == HostFilterMode::Discovery))
             {
                 body_content
