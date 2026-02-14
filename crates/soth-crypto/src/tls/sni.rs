@@ -1,6 +1,6 @@
 //! SNI (Server Name Indication) extraction from TLS ClientHello
 
-use crate::error::{Result, TlsError};
+use super::error::{Result, TlsError};
 
 /// TLS content types
 const TLS_HANDSHAKE: u8 = 0x16;

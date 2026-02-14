@@ -1,8 +1,8 @@
 //! Certificate Authority management
 
-use crate::cert_cache::CertCache;
-use crate::cert_gen::{CertGenerator, DEFAULT_CA_VALIDITY};
-use crate::error::{Result, TlsError};
+use super::cert_cache::CertCache;
+use super::cert_gen::{CertGenerator, DEFAULT_CA_VALIDITY};
+use super::error::{Result, TlsError};
 use chrono::Utc;
 use rcgen::{Certificate, CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -262,7 +262,7 @@ impl CertificateAuthority {
     }
 
     /// Get cache statistics
-    pub fn cache_stats(&self) -> crate::cert_cache::CacheStats {
+    pub fn cache_stats(&self) -> super::cert_cache::CacheStats {
         self.cache.stats()
     }
 

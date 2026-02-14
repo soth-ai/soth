@@ -3,8 +3,8 @@
 //! Provides functions to sign and verify JSON documents using Ed25519 signatures
 //! with RFC 8785 canonicalization.
 
-use crate::canonicalization::{canonicalize_json, normalize_for_signing};
-use crate::keypair::KeyPair;
+use super::canonicalization::{canonicalize_json, normalize_for_signing};
+use super::keypair::KeyPair;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use soth_core::error::{Result, SothError};
@@ -99,7 +99,7 @@ pub fn verify_json_signature(document: &SignedDocument, keypair: &KeyPair) -> Re
 /// Verify a signed document by extracting the key from the DID
 pub fn verify_json_signature_from_did(document: &SignedDocument) -> Result<bool> {
     // Parse the DID from the signature
-    let did = crate::did::Did::parse(&document.signature.signer)?;
+    let did = super::did::Did::parse(&document.signature.signer)?;
 
     // Get a verification key pair from the DID
     let keypair = did.to_key_pair()?;
@@ -137,8 +137,8 @@ pub fn verify_bytes(data: &[u8], signature: &SignatureBlock, keypair: &KeyPair) 
 
 #[cfg(test)]
 mod tests {
+    use super::super::did::Did;
     use super::*;
-    use crate::did::Did;
     use serde_json::json;
 
     #[test]

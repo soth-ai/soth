@@ -13,9 +13,11 @@ use soth_proxy::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
 use soth_proxy::pipeline::PipelineBuilder;
 use soth_proxy::protocol::{JsonRpcMessage, JsonRpcRequest, RequestId};
 use soth_proxy::Pipeline;
-use soth_test_utils::overhead::{LatencyStats, OverheadMeasurement};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod support_overhead;
+use support_overhead::{LatencyStats, OverheadMeasurement};
 
 /// Create a minimal pipeline (identity + policy only)
 fn create_minimal_pipeline() -> Pipeline {

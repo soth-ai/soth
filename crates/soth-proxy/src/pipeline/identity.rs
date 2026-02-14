@@ -3,7 +3,7 @@
 use super::middleware::{error_response, get_request_id, Layer, LayerResult, RequestContext};
 use crate::enforcement::core;
 use crate::protocol::{JsonRpcError, JsonRpcMessage};
-use soth_identity::TrustStore;
+use soth_crypto::identity::TrustStore;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -78,7 +78,7 @@ impl IdentityLayer {
     }
 
     /// Add a trusted DID
-    pub async fn add_trusted_did(&self, did: &str) -> soth_identity::Result<()> {
+    pub async fn add_trusted_did(&self, did: &str) -> soth_crypto::identity::Result<()> {
         let mut store = self.trust_store.write().await;
         store.trust(did)
     }
@@ -206,7 +206,7 @@ mod tests {
     use super::*;
     use crate::protocol::{JsonRpcRequest, RequestId};
     use serde_json::json;
-    use soth_identity::{signing::sign_bytes, Did, KeyPair};
+    use soth_crypto::identity::{signing::sign_bytes, Did, KeyPair};
     use std::collections::HashSet;
 
     #[tokio::test]

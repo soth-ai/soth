@@ -4,7 +4,7 @@ use crate::AuditCommands;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use sha2::Digest;
-use soth_identity::{decode_did_key, KeyPair};
+use soth_crypto::identity::{decode_did_key, KeyPair};
 use soth_observe::{MerkleTree, SqliteStorage};
 use std::path::{Path, PathBuf};
 use tokio::fs;

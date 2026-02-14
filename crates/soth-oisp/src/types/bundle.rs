@@ -1,4 +1,4 @@
-use crate::provider::{EntryType, ModelPricing, ProviderDefinition};
+use super::provider::{EntryType, ModelPricing, ProviderDefinition};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

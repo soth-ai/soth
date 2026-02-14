@@ -3,7 +3,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soth_core::api::{ConfigResponse, RegistryVersionResponse};
-use soth_oisp_types::bundle::parse_compiled_bundle;
+use soth_oisp::types::bundle::parse_compiled_bundle;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

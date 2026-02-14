@@ -1,6 +1,6 @@
 //! Certificate generation utilities
 
-use crate::error::{Result, TlsError};
+use super::error::{Result, TlsError};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,

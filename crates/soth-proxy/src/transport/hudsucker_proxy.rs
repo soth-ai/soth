@@ -24,9 +24,9 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use soth_budget::{BudgetTracker, TokenCounter};
+use soth_crypto::tls::LearnedPassthrough;
 use soth_oisp::{InterceptDecision, OispEngine, OispStreamParser};
 use soth_policy::PolicyEngine;
-use soth_tls::LearnedPassthrough;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::io::{Cursor, Read};
@@ -3913,7 +3913,7 @@ mod tests {
     use super::*;
     use flate2::{write::GzEncoder, Compression};
     use soth_core::types::policy::PolicyData;
-    use soth_identity::Did;
+    use soth_crypto::identity::Did;
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -4438,7 +4438,7 @@ mod tests {
 
     #[test]
     fn test_proxy_enforcer_identity_required_valid_signature() {
-        let keypair = soth_identity::KeyPair::generate();
+        let keypair = soth_crypto::identity::KeyPair::generate();
         let did = Did::from_key_pair(&keypair).unwrap().uri();
 
         let mut trusted = HashSet::new();

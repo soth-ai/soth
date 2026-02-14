@@ -4,7 +4,7 @@ use anyhow::Context;
 use soth_budget::BudgetTracker;
 use soth_core::config::SothConfig;
 use soth_core::types::policy::PolicyInputBuilder;
-use soth_identity::TrustStore;
+use soth_crypto::identity::TrustStore;
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine, PolicyLoader};
 use soth_proxy::metrics;
 use soth_proxy::pipeline::budget::{BudgetConfig, BudgetLayer};

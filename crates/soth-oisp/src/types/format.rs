@@ -1,4 +1,4 @@
-use crate::provider::{FieldPath, RequestParser, ResponseParser};
+use super::provider::{FieldPath, RequestParser, ResponseParser};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

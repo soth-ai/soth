@@ -3,7 +3,7 @@
 //! This provides deterministic hardened key derivation from an organization seed,
 //! active key lookup, key rotation, and verification across historical key versions.
 
-use crate::{Did, KeyPair};
+use super::{Did, KeyPair};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};

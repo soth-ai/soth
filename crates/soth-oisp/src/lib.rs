@@ -1,9 +1,12 @@
 use anyhow::Context;
 use serde_json::Value;
-use soth_oisp_types::bundle::{parse_compiled_bundle, CompiledBundle, DomainIndexEntry};
-use soth_oisp_types::provider::{EntryType, ModelPricing, StreamFormat};
 use std::path::Path;
 use std::sync::Arc;
+
+pub mod types;
+
+use types::bundle::{parse_compiled_bundle, CompiledBundle, DomainIndexEntry};
+use types::provider::{EntryType, ModelPricing, StreamFormat};
 
 const EMBEDDED_MINIMAL_BUNDLE_JSON: &str = include_str!("../assets/minimal_registry_bundle.json");
 
@@ -1928,7 +1931,7 @@ mod tests {
         let mut bundle = sample_bundle();
         let providers = BTreeMap::from([(
             "openai".to_string(),
-            soth_oisp_types::bundle::ResolvedProvider {
+            types::bundle::ResolvedProvider {
                 id: "openai".to_string(),
                 name: "OpenAI".to_string(),
                 entry_type: EntryType::Mcp,

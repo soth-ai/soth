@@ -4,19 +4,15 @@ members = [
     "crates/soth-core",
     "crates/soth-storage",
     "crates/soth-oisp",
-    "crates/soth-oisp-types",
-    "crates/soth-identity",
+    "crates/soth-crypto",
     "crates/soth-policy",
     "crates/soth-observe",
     "crates/soth-budget",
     "crates/soth-collector",
-    "crates/soth-registry",
     "crates/soth-proxy",
     "crates/soth-dashboard",
-    "crates/soth-tls",
     "crates/soth-cli",
     "crates/soth-sync",
-    "crates/soth-test-utils",
 ]
 exclude = [
     "tests/tools/mock_mcp_server",
@@ -35,16 +31,13 @@ authors = ["Labterminal"]
 soth-core = { path = "crates/soth-core" }
 soth-storage = { path = "crates/soth-storage" }
 soth-oisp = { path = "crates/soth-oisp" }
-soth-oisp-types = { path = "crates/soth-oisp-types" }
-soth-identity = { path = "crates/soth-identity" }
+soth-crypto = { path = "crates/soth-crypto" }
 soth-policy = { path = "crates/soth-policy" }
 soth-observe = { path = "crates/soth-observe" }
 soth-budget = { path = "crates/soth-budget" }
 soth-collector = { path = "crates/soth-collector" }
-soth-registry = { path = "crates/soth-registry" }
 soth-proxy = { path = "crates/soth-proxy" }
 soth-dashboard = { path = "crates/soth-dashboard" }
-soth-tls = { path = "crates/soth-tls" }
 soth-sync = { path = "crates/soth-sync" }
 
 # Async runtime

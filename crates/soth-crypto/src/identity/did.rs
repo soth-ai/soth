@@ -3,7 +3,7 @@
 //! Implements the did:key method using Ed25519 public keys.
 //! DID Format: did:key:z6Mk<base58-multibase-encoded-public-key>
 
-use crate::keypair::KeyPair;
+use super::keypair::KeyPair;
 use sha2::{Digest, Sha256};
 use soth_core::error::{Result, SothError};
 

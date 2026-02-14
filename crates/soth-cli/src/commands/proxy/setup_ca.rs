@@ -3,7 +3,7 @@
 use crate::cli_config;
 use crate::style;
 use owo_colors::OwoColorize;
-use soth_tls::CertificateAuthority;
+use soth_crypto::tls::CertificateAuthority;
 use std::path::PathBuf;
 
 /// Expand tilde in path

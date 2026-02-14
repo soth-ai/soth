@@ -2,7 +2,7 @@
 //!
 //! Tests for keygen → sign → verify round-trip
 
-use soth_identity::{sign_json, verify_json_signature, Did, KeyPair, TrustStore};
+use soth_crypto::identity::{sign_json, verify_json_signature, Did, KeyPair, TrustStore};
 use tempfile::tempdir;
 
 #[test]

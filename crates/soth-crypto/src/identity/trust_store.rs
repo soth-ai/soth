@@ -2,7 +2,7 @@
 //!
 //! Provides file-based storage for trusted agent DIDs.
 
-use crate::did::Did;
+use super::did::Did;
 use soth_core::error::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
