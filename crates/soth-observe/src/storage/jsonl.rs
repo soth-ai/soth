@@ -157,7 +157,11 @@ fn sanitize_json_line(line: &str) -> Option<String> {
         out.push(ch);
     }
 
-    if changed { Some(out) } else { None }
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -135,7 +135,6 @@ fn test_host_filter_selective() {
     assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
 }
 
-
 /// Test config defaults
 #[test]
 fn test_config_defaults() {

@@ -78,6 +78,7 @@ struct BodySyncRow {
     event_id: String,
     request_body: Option<Vec<u8>>,
     response_body: Option<Vec<u8>>,
+    metadata_only_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +399,11 @@ impl SyncAgent {
         let mut uploaded = 0usize;
 
         for row in &loaded.rows {
+            if row.metadata_only_reason.is_some() {
+                ack_seq = Some(row.seq);
+                continue;
+            }
+
             let request_body = self.cap_payload_for_upload(
                 &row.event_id,
                 "request",
@@ -458,6 +464,14 @@ impl SyncAgent {
         let entries = self.retry_queue.list()?;
         let mut uploaded = 0usize;
         for entry in entries.into_iter().take(MAX_RETRY_UPLOADS_PER_TICK) {
+            if self
+                .metadata_only_reason_for_event_id(&entry.event_id)?
+                .is_some()
+            {
+                self.retry_queue.remove(&entry.event_id)?;
+                continue;
+            }
+
             let request_payload =
                 load_retry_payload(&entry.request_body_b64, entry.request_body_path.as_ref());
             let response_payload =
@@ -523,11 +537,25 @@ impl SyncAgent {
             || event.request_content_ref.is_some()
             || event.response_content_ref.is_some();
 
-        let mut tags = merge_tags(&self.config.global_tags, event.tags.as_ref()).unwrap_or_default();
+        let mut tags =
+            merge_tags(&self.config.global_tags, event.tags.as_ref()).unwrap_or_default();
+        if let Some(reason) = metadata_only_body_upload_reason(event) {
+            tags.insert(
+                "sync.body_upload_policy".to_string(),
+                "metadata_only".to_string(),
+            );
+            tags.insert(
+                "sync.body_upload_policy_reason".to_string(),
+                reason.to_string(),
+            );
+        }
         if event.request_size_bytes.unwrap_or(0) as usize > self.config.body_upload_max_bytes
             || event.response_size_bytes.unwrap_or(0) as usize > self.config.body_upload_max_bytes
         {
-            tags.insert("sync.body_upload_fallback".to_string(), "metadata_only".to_string());
+            tags.insert(
+                "sync.body_upload_fallback".to_string(),
+                "metadata_only".to_string(),
+            );
             tags.insert(
                 "sync.body_upload_limit_bytes".to_string(),
                 self.config.body_upload_max_bytes.to_string(),
@@ -651,6 +679,10 @@ impl SyncAgent {
 
             let event_id: String = row.get(1)?;
             let event_json: String = row.get(2)?;
+            let metadata_only_reason = serde_json::from_str::<WrapEvent>(&event_json)
+                .ok()
+                .and_then(|event| metadata_only_body_upload_reason(&event))
+                .map(str::to_string);
             let request_payload: Option<Vec<u8>> = row.get(3)?;
             let response_payload: Option<Vec<u8>> = row.get(4)?;
             let content_payload: Option<Vec<u8>> = row.get(5)?;
@@ -683,6 +715,7 @@ impl SyncAgent {
                 event_id,
                 request_body,
                 response_body,
+                metadata_only_reason,
             });
         }
 
@@ -709,6 +742,23 @@ impl SyncAgent {
             .ok()
             .flatten()
             .map(|config| config.config_version)
+    }
+
+    fn metadata_only_reason_for_event_id(&self, event_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = open_read_conn(&self.config.event_db_path)?;
+        let event_json: Option<String> = conn
+            .query_row(
+                "SELECT event_json FROM wrap_events WHERE id = ?1 LIMIT 1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let reason = event_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<WrapEvent>(raw).ok())
+            .and_then(|event| metadata_only_body_upload_reason(&event))
+            .map(str::to_string);
+        Ok(reason)
     }
 
     fn redact_payload(&self, payload: Option<Vec<u8>>) -> Option<Vec<u8>> {
@@ -870,7 +920,10 @@ fn mark_metadata_only_fallback(metadata: &mut EventMetadata, reason: &str, limit
         .as_deref()
         .map(|value| value.chars().take(64).collect::<String>());
     let tags = metadata.tags.get_or_insert_with(HashMap::new);
-    tags.insert("sync.metadata_fallback".to_string(), "metadata_only".to_string());
+    tags.insert(
+        "sync.metadata_fallback".to_string(),
+        "metadata_only".to_string(),
+    );
     tags.insert(
         "sync.metadata_fallback_reason".to_string(),
         reason.to_string(),
@@ -879,6 +932,46 @@ fn mark_metadata_only_fallback(metadata: &mut EventMetadata, reason: &str, limit
         "sync.metadata_limit_bytes".to_string(),
         limit_bytes.to_string(),
     );
+}
+
+fn metadata_only_body_upload_reason(event: &WrapEvent) -> Option<&'static str> {
+    let method = event
+        .method
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if method.starts_with("websocket ") {
+        return Some("websocket_payload");
+    }
+
+    let provider = event
+        .provider
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let model = event
+        .model
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let agent = event.agent.name.to_ascii_lowercase();
+    let path = event
+        .traffic_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.path.as_deref())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if provider == "chatgpt"
+        && (method.contains("/backend-api/codex/")
+            || path.contains("/backend-api/codex/")
+            || model.contains("codex")
+            || agent == "codex")
+    {
+        return Some("codex_payload");
+    }
+
+    None
 }
 
 fn tree_to_hash(map: &BTreeMap<String, String>) -> HashMap<String, String> {
@@ -899,17 +992,18 @@ fn build_event_envelope_metadata(
     let client = build_client_metadata(
         process_pid,
         client_bundle_id,
-        infer_app_type(
-            process_name.as_deref(),
-            process_executable.as_deref(),
-        ),
+        infer_app_type(process_name.as_deref(), process_executable.as_deref()),
         process_name,
         process_executable,
     );
     let collector_source = event.collector_source.clone();
     let collector_offset = event.collector_offset;
 
-    if envelope.is_none() && client.is_none() && collector_source.is_none() && collector_offset.is_none() {
+    if envelope.is_none()
+        && client.is_none()
+        && collector_source.is_none()
+        && collector_offset.is_none()
+    {
         return None;
     }
 
@@ -1098,10 +1192,7 @@ mod tests {
     #[test]
     fn infer_bundle_and_app_type_for_macos_app_paths() {
         let executable = Some("/Applications/Cursor.app/Contents/MacOS/Cursor");
-        assert_eq!(
-            infer_bundle_id(executable).as_deref(),
-            Some("macos.cursor")
-        );
+        assert_eq!(infer_bundle_id(executable).as_deref(), Some("macos.cursor"));
         assert_eq!(
             infer_app_type(Some("Cursor"), executable).as_deref(),
             Some("desktop_app")
@@ -1178,5 +1269,42 @@ mod tests {
         assert_eq!(mapped.collector_offset, Some(42));
         assert!(mapped.client.is_none());
         assert!(mapped.envelope_id.is_none());
+    }
+
+    #[test]
+    fn metadata_only_body_upload_reason_flags_websocket_events() {
+        let event = WrapEvent::new(
+            "session-1",
+            "ws.chatgpt.com",
+            WrapDirection::Out,
+            AgentInfo::new("chatgpt", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AgentApp)
+        .with_provider("chatgpt")
+        .with_method("WebSocket /c2/ws/user/abc");
+
+        assert_eq!(
+            metadata_only_body_upload_reason(&event),
+            Some("websocket_payload")
+        );
+    }
+
+    #[test]
+    fn metadata_only_body_upload_reason_flags_codex_payloads() {
+        let event = WrapEvent::new(
+            "session-1",
+            "chatgpt.com",
+            WrapDirection::Out,
+            AgentInfo::new("codex", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AgentApp)
+        .with_provider("chatgpt")
+        .with_model("gpt-5.3-codex")
+        .with_method("POST /backend-api/codex/responses");
+
+        assert_eq!(
+            metadata_only_body_upload_reason(&event),
+            Some("codex_payload")
+        );
     }
 }

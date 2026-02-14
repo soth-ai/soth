@@ -636,6 +636,10 @@ pub struct ObserveConfig {
     #[serde(default)]
     pub event_tags: BTreeMap<String, String>,
 
+    /// Local transcript collector configuration (Codex/Claude/etc).
+    #[serde(default)]
+    pub collector: ObserveCollectorConfig,
+
     /// Log requests
     #[serde(default = "default_true")]
     pub log_requests: bool,
@@ -676,6 +680,7 @@ impl Default for ObserveConfig {
             pii_detection: true,
             pii_scopes: ObservePiiScopes::default(),
             event_tags: BTreeMap::new(),
+            collector: ObserveCollectorConfig::default(),
             log_requests: true,
             log_responses: true,
             tamper_proof: false,
@@ -684,6 +689,48 @@ impl Default for ObserveConfig {
             flush_interval: default_flush_interval(),
         }
     }
+}
+
+/// Local collector settings for ingesting agent session files incrementally.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ObserveCollectorConfig {
+    /// Enable local collector runtime.
+    #[serde(default)]
+    pub enabled: bool,
+    /// File sources (JSONL/text) for incremental tailing.
+    #[serde(default)]
+    pub sources: Vec<ObserveCollectorSourceConfig>,
+    /// Poll interval in seconds.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+    /// Maximum bytes read per source per poll cycle.
+    #[serde(default)]
+    pub max_read_bytes_per_source: Option<usize>,
+    /// Maximum bytes allowed per parsed line.
+    #[serde(default)]
+    pub max_line_bytes: Option<usize>,
+    /// Optional collector state path override.
+    #[serde(default)]
+    pub state_path: Option<PathBuf>,
+    /// Optional agent name override for collector events.
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    /// Optional event source override.
+    #[serde(default)]
+    pub event_source: Option<String>,
+}
+
+/// Per-file local collector source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveCollectorSourceConfig {
+    /// Optional logical source name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Source file path.
+    pub path: PathBuf,
+    /// Parser type: jsonl/ndjson/text.
+    #[serde(default)]
+    pub parser: Option<String>,
 }
 
 /// Source scopes for PII detection.
@@ -983,8 +1030,8 @@ impl Default for CloudConfig {
             config_debounce_secs: default_cloud_config_debounce_secs(),
             body_upload_enabled: true,
             metadata_max_events_per_batch: default_cloud_metadata_max_events_per_batch(),
-            metadata_max_compressed_batch_bytes:
-                default_cloud_metadata_max_compressed_batch_bytes(),
+            metadata_max_compressed_batch_bytes: default_cloud_metadata_max_compressed_batch_bytes(
+            ),
             body_upload_max_bytes: default_cloud_body_upload_max_bytes(),
             cache_path: default_cloud_cache_path(),
         }
@@ -1306,8 +1353,9 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostFilterConfig {
     /// Host filtering mode:
-    /// - selective: intercept configured AI/MCP hosts and tunnel the rest (default)
+    /// - selective: intercept configured AI/MCP hosts and tunnel the rest
     /// - discovery: intercept all non-local hosts to discover new MCP/AI domains
+    ///   (default)
     #[serde(default)]
     pub mode: HostFilterMode,
 
@@ -1349,9 +1397,9 @@ pub struct HostDomainFilesConfig {
 #[serde(rename_all = "snake_case")]
 pub enum HostFilterMode {
     /// Intercept configured hosts only; blind tunnel everything else.
-    #[default]
     Selective,
     /// Intercept all non-local hosts (useful for discovery).
+    #[default]
     Discovery,
 }
 
@@ -2152,10 +2200,10 @@ crypto_identity:
     }
 
     #[test]
-    fn test_host_filter_default_selective() {
+    fn test_host_filter_default_discovery() {
         use super::HostAction;
         let filter = HostFilterConfig::default();
-        assert_eq!(filter.mode, HostFilterMode::Selective);
+        assert_eq!(filter.mode, HostFilterMode::Discovery);
 
         // AI domains should be intercepted
         assert_eq!(
@@ -2171,12 +2219,12 @@ crypto_identity:
             HostAction::Intercept
         );
 
-        // Non-AI domains should be tunneled (not blocked!)
+        // In discovery mode, non-local unknown domains are intercepted.
         assert_eq!(
             filter.action_for_host("random.example.com"),
-            HostAction::Tunnel
+            HostAction::Intercept
         );
-        assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
+        assert_eq!(filter.action_for_host("google.com"), HostAction::Intercept);
     }
 
     #[test]
@@ -2395,18 +2443,17 @@ crypto_identity:
     }
 
     #[test]
-    fn test_default_host_filter_tunnels_unknown_mcp_hosts() {
+    fn test_default_host_filter_intercepts_unknown_mcp_hosts() {
         let filter = HostFilterConfig::default();
 
-        // Unknown hosts are tunneled by default. For HTTPS CONNECT, this means we
-        // cannot inspect payloads on those hosts unless they are explicitly listed.
+        // Discovery mode intercepts unknown non-local hosts by default.
         assert_eq!(
             filter.action_for_host("custom-mcp.example.com"),
-            HostAction::Tunnel
+            HostAction::Intercept
         );
         assert_eq!(
             filter.action_for_host("mcp.partner.internal"),
-            HostAction::Tunnel
+            HostAction::Intercept
         );
     }
 
@@ -2506,6 +2553,7 @@ forward_proxy:
   port: 9090
   address: "0.0.0.0"
   hosts:
+    mode: selective
     ai_inference:
       - "api.openai.com"
       - "api.anthropic.com"
@@ -2585,6 +2633,7 @@ forward_proxy:
   enabled: true
   port: 9090
   hosts:
+    mode: selective
     ai_inference:
       - "api.openai.com"
       - "custom.api.com"
@@ -2615,6 +2664,7 @@ forward_proxy:
 forward_proxy:
   enabled: true
   hosts:
+    mode: selective
     ai_inference: []
     mcp: []
     agent_apps:

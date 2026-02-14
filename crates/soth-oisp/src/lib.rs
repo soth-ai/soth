@@ -5,6 +5,8 @@ use soth_oisp_types::provider::{EntryType, ModelPricing, StreamFormat};
 use std::path::Path;
 use std::sync::Arc;
 
+const EMBEDDED_MINIMAL_BUNDLE_JSON: &str = include_str!("../assets/minimal_registry_bundle.json");
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub provider_id: String,
@@ -123,11 +125,16 @@ impl OispEngine {
     }
 
     pub fn is_catalog_domain(&self, host: &str) -> bool {
-        host_matches_any(host, &self.bundle.catalog_domains)
+        let host = normalize_host_for_matching(host);
+        host_matches_any(host.as_str(), &self.bundle.catalog_domains)
     }
 
     pub fn classify(&self, host: &str) -> Option<Classification> {
-        let entry = select_best_domain_match(&self.bundle.domain_index, host)?;
+        let host = normalize_host_for_matching(host);
+        if host.is_empty() {
+            return None;
+        }
+        let entry = select_best_domain_match(&self.bundle.domain_index, host.as_str())?;
         let provider = self.bundle.providers.get(&entry.provider_id)?;
         Some(Classification {
             provider_id: entry.provider_id.clone(),
@@ -137,25 +144,26 @@ impl OispEngine {
     }
 
     pub fn should_intercept(&self, host: &str, path: &str) -> InterceptDecision {
+        let host = normalize_host_for_matching(host);
         if contains_noise_keyword(path, &self.bundle.filters.noise_keywords) {
             return InterceptDecision::Noise;
         }
 
-        if host_matches_any(host, &self.bundle.filters.passthrough) {
+        if host_matches_any(host.as_str(), &self.bundle.filters.passthrough) {
             return InterceptDecision::Passthrough;
         }
 
         if !self.bundle.filters.whitelist.is_empty()
-            && !host_matches_any(host, &self.bundle.filters.whitelist)
+            && !host_matches_any(host.as_str(), &self.bundle.filters.whitelist)
         {
             return InterceptDecision::Tunnel;
         }
 
-        if host_matches_any(host, &self.bundle.filters.blacklist) {
+        if host_matches_any(host.as_str(), &self.bundle.filters.blacklist) {
             return InterceptDecision::Tunnel;
         }
 
-        let Some(entry) = select_best_domain_match(&self.bundle.domain_index, host) else {
+        let Some(entry) = select_best_domain_match(&self.bundle.domain_index, host.as_str()) else {
             return InterceptDecision::Tunnel;
         };
 
@@ -175,21 +183,23 @@ impl OispEngine {
 
     /// Host-only interception decision for CONNECT/TLS handshake phase where path is unknown.
     pub fn should_intercept_host(&self, host: &str) -> bool {
-        if host_matches_any(host, &self.bundle.filters.passthrough) {
+        let host = normalize_host_for_matching(host);
+
+        if host_matches_any(host.as_str(), &self.bundle.filters.passthrough) {
             return false;
         }
 
         if !self.bundle.filters.whitelist.is_empty()
-            && !host_matches_any(host, &self.bundle.filters.whitelist)
+            && !host_matches_any(host.as_str(), &self.bundle.filters.whitelist)
         {
             return false;
         }
 
-        if host_matches_any(host, &self.bundle.filters.blacklist) {
+        if host_matches_any(host.as_str(), &self.bundle.filters.blacklist) {
             return false;
         }
 
-        self.classify(host).is_some()
+        self.classify(host.as_str()).is_some()
     }
 
     /// Calculate request cost using bundle pricing for a provider/model pair.
@@ -284,7 +294,11 @@ impl OispEngine {
     }
 
     /// Extract usage/model fields from response payload using provider format response parser.
-    pub fn extract_usage_from_response(&self, provider_id: &str, body: &[u8]) -> Option<ProviderUsage> {
+    pub fn extract_usage_from_response(
+        &self,
+        provider_id: &str,
+        body: &[u8],
+    ) -> Option<ProviderUsage> {
         let transformed = self.apply_body_transform(provider_id, body);
         let format_value = self.resolve_provider_format(provider_id)?;
         let response = format_value.get("response")?;
@@ -321,6 +335,28 @@ impl OispEngine {
                 }
             }
         }
+    }
+
+    /// Load the repository-shipped minimal bundle used as local fallback when cache/cloud bundle
+    /// is missing or invalid.
+    pub fn load_embedded_minimal_bundle() -> anyhow::Result<Self> {
+        let root: Value = serde_json::from_str(EMBEDDED_MINIMAL_BUNDLE_JSON)
+            .context("failed parsing embedded minimal bundle JSON")?;
+        let bundle_value = extract_compiled_bundle_value(&root)
+            .context("embedded minimal bundle missing compiled payload")?;
+        build_engine_from_bundle_value(&bundle_value)
+            .context("failed loading embedded minimal bundle")
+    }
+
+    /// Overlay embedded minimal bundle coverage onto a loaded bundle engine.
+    ///
+    /// This preserves cloud/cache bundle behavior while ensuring baseline host/format coverage
+    /// for core providers is always present.
+    pub fn with_embedded_overlay(&self) -> anyhow::Result<Self> {
+        let mut merged = (*self.bundle).clone();
+        let embedded = embedded_minimal_compiled_bundle()?;
+        merge_compiled_bundle(&mut merged, embedded);
+        OispEngine::new(merged)
     }
 
     fn resolve_provider_format(&self, provider_id: &str) -> Option<&Value> {
@@ -373,9 +409,7 @@ fn load_from_registry_cache_path(path: &Path) -> anyhow::Result<Option<OispEngin
         .with_context(|| format!("failed parsing registry cache {}", path.display()))?;
     let bundle_value = extract_compiled_bundle_value(&root)
         .context("registry cache missing compiled bundle payload")?;
-
-    let bundle = parse_compiled_bundle(&bundle_value).context("failed parsing OISP bundle")?;
-    Ok(Some(OispEngine::new(bundle)?))
+    Ok(Some(build_engine_from_bundle_value(&bundle_value)?))
 }
 
 fn extract_compiled_bundle_value(root: &Value) -> anyhow::Result<Value> {
@@ -403,6 +437,108 @@ fn extract_compiled_bundle_value(root: &Value) -> anyhow::Result<Value> {
     anyhow::bail!("registry cache envelope does not contain bundle/compiled_bundle field");
 }
 
+fn build_engine_from_bundle_value(bundle_value: &Value) -> anyhow::Result<OispEngine> {
+    let bundle = parse_compiled_bundle(bundle_value).context("failed parsing OISP bundle")?;
+    OispEngine::new(bundle).context("failed constructing OISP engine")
+}
+
+fn embedded_minimal_compiled_bundle() -> anyhow::Result<CompiledBundle> {
+    let root: Value = serde_json::from_str(EMBEDDED_MINIMAL_BUNDLE_JSON)
+        .context("failed parsing embedded minimal bundle JSON")?;
+    let bundle_value = extract_compiled_bundle_value(&root)
+        .context("embedded minimal bundle missing compiled payload")?;
+    parse_compiled_bundle(&bundle_value).context("failed parsing embedded minimal bundle")
+}
+
+fn entry_type_key(entry_type: &EntryType) -> &'static str {
+    match entry_type {
+        EntryType::AiInference => "ai_inference",
+        EntryType::AgentApp => "agent_app",
+        EntryType::Mcp => "mcp",
+    }
+}
+
+fn dedupe_sort(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
+}
+
+fn merge_compiled_bundle(primary: &mut CompiledBundle, baseline: CompiledBundle) {
+    for (provider_id, provider) in baseline.providers {
+        primary.providers.entry(provider_id).or_insert(provider);
+    }
+
+    let mut index_pos: std::collections::HashMap<(String, String, String), usize> =
+        std::collections::HashMap::new();
+    for (idx, entry) in primary.domain_index.iter().enumerate() {
+        index_pos.insert(
+            (
+                entry.host.clone(),
+                entry.provider_id.clone(),
+                entry_type_key(&entry.entry_type).to_string(),
+            ),
+            idx,
+        );
+    }
+    for mut entry in baseline.domain_index {
+        let key = (
+            entry.host.clone(),
+            entry.provider_id.clone(),
+            entry_type_key(&entry.entry_type).to_string(),
+        );
+        if let Some(existing_idx) = index_pos.get(&key).copied() {
+            if let Some(existing) = primary.domain_index.get_mut(existing_idx) {
+                existing.paths.append(&mut entry.paths);
+                dedupe_sort(&mut existing.paths);
+            }
+        } else {
+            index_pos.insert(key, primary.domain_index.len());
+            primary.domain_index.push(entry);
+        }
+    }
+
+    for (format_key, format_value) in baseline.formats {
+        primary.formats.entry(format_key).or_insert(format_value);
+    }
+
+    for (provider_id, models) in baseline.pricing {
+        let provider_models = primary.pricing.entry(provider_id).or_default();
+        for (model, price) in models {
+            provider_models.entry(model).or_insert(price);
+        }
+    }
+
+    primary
+        .filters
+        .whitelist
+        .extend(baseline.filters.whitelist.into_iter());
+    primary
+        .filters
+        .blacklist
+        .extend(baseline.filters.blacklist.into_iter());
+    primary
+        .filters
+        .passthrough
+        .extend(baseline.filters.passthrough.into_iter());
+    primary
+        .filters
+        .noise_keywords
+        .extend(baseline.filters.noise_keywords.into_iter());
+    dedupe_sort(&mut primary.filters.whitelist);
+    dedupe_sort(&mut primary.filters.blacklist);
+    dedupe_sort(&mut primary.filters.passthrough);
+    dedupe_sort(&mut primary.filters.noise_keywords);
+
+    primary
+        .catalog_domains
+        .extend(baseline.catalog_domains.into_iter());
+    dedupe_sort(&mut primary.catalog_domains);
+
+    primary.stats.providers = primary.providers.len();
+    primary.stats.domains = primary.domain_index.len();
+    primary.stats.formats = primary.formats.len();
+}
+
 fn format_uses_strip_xssi(format_value: &Value) -> bool {
     let Some(body_transform) = format_value.get("body_transform") else {
         return false;
@@ -422,11 +558,13 @@ fn format_uses_strip_xssi(format_value: &Value) -> bool {
                 })
                 .unwrap_or(false)
         }),
-        Value::Object(map) => map.contains_key("strip_prefix")
-            || map
-                .get("strip_xssi")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+        Value::Object(map) => {
+            map.contains_key("strip_prefix")
+                || map
+                    .get("strip_xssi")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
         _ => false,
     }
 }
@@ -554,7 +692,11 @@ fn extract_usage_from_json_value(root: &Value, response: &Value) -> Option<Provi
         }
     }
 
-    if out.has_signal() { Some(out) } else { None }
+    if out.has_signal() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn out_ref(out: &mut ProviderUsage) -> &mut ProviderUsage {
@@ -622,7 +764,10 @@ fn merge_option_token(current: Option<u64>, next: Option<u64>) -> u64 {
 fn merge_provider_usage(current: &mut ProviderUsage, next: ProviderUsage) {
     current.input_tokens = merge_token(current.input_tokens, Some(next.input_tokens));
     current.output_tokens = merge_token(current.output_tokens, Some(next.output_tokens));
-    current.cache_read_tokens = Some(merge_option_token(current.cache_read_tokens, next.cache_read_tokens));
+    current.cache_read_tokens = Some(merge_option_token(
+        current.cache_read_tokens,
+        next.cache_read_tokens,
+    ));
     current.cache_write_tokens = Some(merge_option_token(
         current.cache_write_tokens,
         next.cache_write_tokens,
@@ -661,7 +806,10 @@ fn extract_from_json_lines(text: &str, response: &Value) -> Option<ProviderUsage
     }
 }
 
-fn extract_from_batchexecute_wrapped_payloads(text: &str, response: &Value) -> Option<ProviderUsage> {
+fn extract_from_batchexecute_wrapped_payloads(
+    text: &str,
+    response: &Value,
+) -> Option<ProviderUsage> {
     let mut aggregate = ProviderUsage::default();
     let mut saw = false;
 
@@ -801,12 +949,20 @@ fn parse_stream_rule_config(value: &Value) -> Option<StreamRuleConfig> {
     let extract = obj
         .get("extract")
         .and_then(Value::as_object)
-        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())
+        .map(|map| {
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let extract_usage = obj
         .get("extract_usage")
         .and_then(Value::as_object)
-        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())
+        .map(|map| {
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
 
     Some(StreamRuleConfig {
@@ -816,7 +972,10 @@ fn parse_stream_rule_config(value: &Value) -> Option<StreamRuleConfig> {
     })
 }
 
-fn parse_stream_payload_with_config(payload: &[u8], config: &StreamParserConfig) -> Option<ProviderUsage> {
+fn parse_stream_payload_with_config(
+    payload: &[u8],
+    config: &StreamParserConfig,
+) -> Option<ProviderUsage> {
     match config.format {
         StreamFormat::Sse => parse_sse_stream_payload(payload, config),
         StreamFormat::Ndjson => parse_ndjson_stream_payload(payload, config),
@@ -867,7 +1026,10 @@ fn parse_sse_stream_payload(payload: &[u8], config: &StreamParserConfig) -> Opti
     }
 }
 
-fn parse_ndjson_stream_payload(payload: &[u8], config: &StreamParserConfig) -> Option<ProviderUsage> {
+fn parse_ndjson_stream_payload(
+    payload: &[u8],
+    config: &StreamParserConfig,
+) -> Option<ProviderUsage> {
     let text = std::str::from_utf8(payload).ok()?;
     let mut aggregate = ProviderUsage::default();
     let mut saw = false;
@@ -893,7 +1055,10 @@ fn parse_ndjson_stream_payload(payload: &[u8], config: &StreamParserConfig) -> O
     }
 }
 
-fn parse_length_prefixed_stream_payload(payload: &[u8], config: &StreamParserConfig) -> Option<ProviderUsage> {
+fn parse_length_prefixed_stream_payload(
+    payload: &[u8],
+    config: &StreamParserConfig,
+) -> Option<ProviderUsage> {
     let text = std::str::from_utf8(payload).ok()?;
     let stripped = if let Some(prefix) = config.header_strip.as_deref() {
         text.strip_prefix(prefix).unwrap_or(text)
@@ -921,7 +1086,9 @@ fn apply_stream_rules(root: &Value, config: &StreamParserConfig) -> Option<Provi
         for (field, path_spec) in &rule.extract_usage {
             let value = extract_u64_from_field_path_value(root, path_spec);
             match field.as_str() {
-                "input_tokens" | "prompt_tokens" => out.input_tokens = merge_token(out.input_tokens, value),
+                "input_tokens" | "prompt_tokens" => {
+                    out.input_tokens = merge_token(out.input_tokens, value)
+                }
                 "output_tokens" | "completion_tokens" => {
                     out.output_tokens = merge_token(out.output_tokens, value)
                 }
@@ -1030,11 +1197,12 @@ fn extract_u64_from_path(root: &Value, path: &str) -> Option<u64> {
             .as_u64()
             .or_else(|| number.as_i64().and_then(|raw| u64::try_from(raw).ok()))
             .or_else(|| number.as_f64().map(|raw| raw.max(0.0).round() as u64)),
-        Value::String(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .or_else(|| raw.trim().parse::<f64>().ok().map(|parsed| parsed.max(0.0).round() as u64)),
+        Value::String(raw) => raw.trim().parse::<u64>().ok().or_else(|| {
+            raw.trim()
+                .parse::<f64>()
+                .ok()
+                .map(|parsed| parsed.max(0.0).round() as u64)
+        }),
         _ => None,
     }
 }
@@ -1114,7 +1282,11 @@ fn decode_grpc_frame_payloads(payload: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    if frames == 0 { None } else { Some(out) }
+    if frames == 0 {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn extract_field_path_value<'a>(root: &'a Value, raw_path: &str) -> Option<&'a Value> {
@@ -1242,7 +1414,7 @@ fn select_best_domain_match<'a>(
     entries: &'a [DomainIndexEntry],
     host: &str,
 ) -> Option<&'a DomainIndexEntry> {
-    let host = host.to_ascii_lowercase();
+    let host = normalize_host_for_matching(host);
 
     if let Some(exact) = entries
         .iter()
@@ -1280,8 +1452,8 @@ fn host_matches_any(host: &str, patterns: &[String]) -> bool {
 }
 
 fn host_matches_pattern(host: &str, pattern: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
+    let host = normalize_host_for_matching(host);
+    let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
 
     if !pattern.contains('*') {
         return host == pattern;
@@ -1297,6 +1469,44 @@ fn host_matches_pattern(host: &str, pattern: &str) -> bool {
     }
 
     false
+}
+
+fn normalize_host_for_matching(host: &str) -> String {
+    let mut value = host.trim();
+
+    if let Some(rest) = value.strip_prefix("http://") {
+        value = rest;
+    } else if let Some(rest) = value.strip_prefix("https://") {
+        value = rest;
+    }
+
+    if let Some((authority, _)) = value.split_once('/') {
+        value = authority;
+    }
+
+    if let Some(stripped) = value.strip_suffix('.') {
+        value = stripped;
+    }
+
+    // Bracketed IPv6 literal: [::1]:443 or [::1]
+    if let Some(inner) = value.strip_prefix('[').and_then(|rest| {
+        let end = rest.find(']')?;
+        Some(&rest[..end])
+    }) {
+        return inner.to_ascii_lowercase();
+    }
+
+    if let Some((host_part, port_part)) = value.rsplit_once(':') {
+        if !host_part.contains(':')
+            && !host_part.is_empty()
+            && !port_part.is_empty()
+            && port_part.chars().all(|ch| ch.is_ascii_digit())
+        {
+            value = host_part;
+        }
+    }
+
+    value.to_ascii_lowercase()
 }
 
 fn path_matches_any(path: &str, patterns: &[String]) -> bool {
@@ -1555,6 +1765,48 @@ mod tests {
     }
 
     #[test]
+    fn embedded_minimal_bundle_loads_and_classifies_core_hosts() {
+        let engine = OispEngine::load_embedded_minimal_bundle().unwrap();
+        assert!(!engine.bundle_version().trim().is_empty());
+        assert!(engine.provider_count() > 0);
+        assert!(engine.classify("api.openai.com").is_some());
+        assert!(engine.classify("chatgpt.com").is_some());
+        assert!(engine.classify("api.anthropic.com").is_some());
+    }
+
+    #[test]
+    fn embedded_overlay_adds_missing_baseline_coverage() {
+        let primary = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "version": "primary-v1",
+                "compiled_at": "2026-02-14T00:00:00Z",
+                "bundle_type": "cloud",
+                "domain_index": [
+                    { "host": "api.example.com", "provider_id": "example", "entry_type": "ai-inference" }
+                ],
+                "providers": {
+                    "example": { "id": "example", "name": "Example", "type": "ai-inference", "api_format": "openai" }
+                },
+                "filters": {},
+                "pricing": {},
+                "formats": {
+                    "openai": {
+                        "request": { "model": "$.model" },
+                        "response": { "json": { "extract": { "model": "$.model" } } }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let merged = primary.with_embedded_overlay().unwrap();
+        assert!(merged.classify("api.example.com").is_some());
+        assert!(merged.classify("chatgpt.com").is_some());
+        assert!(merged.classify("api.openai.com").is_some());
+    }
+
+    #[test]
     fn load_from_registry_cache_reads_envelope_bundle() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("registry_bundle_cache.json");
@@ -1624,6 +1876,23 @@ mod tests {
             "bedrock.amazonaws.com",
             "bedrock.*.amazonaws.com"
         ));
+    }
+
+    #[test]
+    fn host_matches_pattern_normalizes_host_port_and_trailing_dot() {
+        assert!(host_matches_pattern("chatgpt.com:443", "chatgpt.com"));
+        assert!(host_matches_pattern("CHATGPT.COM.", "chatgpt.com"));
+        assert!(host_matches_pattern(
+            "https://ws.chatgpt.com/backend-api",
+            "*.chatgpt.com"
+        ));
+    }
+
+    #[test]
+    fn classify_accepts_connect_authority_shape() {
+        let engine = OispEngine::new(sample_bundle()).unwrap();
+        assert!(engine.classify("api.openai.com:443").is_some());
+        assert!(engine.should_intercept_host("api.openai.com:443"));
     }
 
     #[test]

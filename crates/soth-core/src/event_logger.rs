@@ -219,7 +219,8 @@ impl MerkleAuditState {
         count: usize,
     ) -> std::io::Result<()> {
         let batch_len = count.min(self.pending.len());
-        let leaves: Vec<PersistedEventMeta> = self.pending.iter().take(batch_len).cloned().collect();
+        let leaves: Vec<PersistedEventMeta> =
+            self.pending.iter().take(batch_len).cloned().collect();
         if leaves.is_empty() {
             return Ok(());
         }
@@ -1112,10 +1113,11 @@ mod tests {
         conn.execute("DROP TABLE wrap_events", []).unwrap();
 
         let agent = AgentInfo::new("Test Agent", DetectionSource::CommandLine);
-        let mut pending = vec![
-            WrapEvent::new("session-fail", "api.openai.com", WrapDirection::Out, agent)
-                .with_method("POST /v1/chat/completions"),
-        ];
+        let mut pending =
+            vec![
+                WrapEvent::new("session-fail", "api.openai.com", WrapDirection::Out, agent)
+                    .with_method("POST /v1/chat/completions"),
+            ];
         let pending_id = pending[0].id.clone();
 
         let mut merkle_state =
@@ -1159,7 +1161,11 @@ mod tests {
         );
 
         assert!(result.is_err(), "expected merkle batch write to fail");
-        assert_eq!(merkle_state.pending.len(), 1, "pending leaf must be retained");
+        assert_eq!(
+            merkle_state.pending.len(),
+            1,
+            "pending leaf must be retained"
+        );
         assert_eq!(merkle_state.pending[0].seq, 1);
     }
 

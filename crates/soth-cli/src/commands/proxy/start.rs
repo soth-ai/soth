@@ -13,7 +13,7 @@ use anyhow::Context;
 use console::Term;
 use owo_colors::OwoColorize;
 use soth_collector::CollectorRuntime;
-use soth_core::config::{HostFilterMode, SothConfig};
+use soth_core::config::{HostFilterMode, ObserveCollectorConfig, SothConfig};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
 use soth_dashboard::server::DashboardServer;
@@ -709,6 +709,7 @@ fn spawn_proxy_runtime(
 
     let mut collector_shutdown_tx = None;
     let mut collector_task = None;
+    apply_collector_env_overrides(&config.observe.collector);
     if let Some(ref logger) = event_logger {
         if let Some(CollectorRuntime { shutdown_tx, task }) =
             soth_collector::spawn_from_env(logger.clone(), config.observe.event_tags.clone())
@@ -752,6 +753,53 @@ fn spawn_proxy_runtime(
         collector_shutdown_tx,
         collector_task,
     })
+}
+
+fn set_env_if_present<T: ToString>(key: &str, value: Option<T>) {
+    if let Some(value) = value {
+        std::env::set_var(key, value.to_string());
+    }
+}
+
+fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
+    if !collector.enabled {
+        return;
+    }
+
+    std::env::set_var("SOTH_COLLECTOR_ENABLED", "true");
+
+    if !collector.sources.is_empty() {
+        let sources = collector
+            .sources
+            .iter()
+            .map(|source| cli_config::expand_tilde(&source.path).to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        std::env::set_var("SOTH_COLLECTOR_SOURCES", sources);
+    }
+
+    set_env_if_present(
+        "SOTH_COLLECTOR_POLL_INTERVAL_SECS",
+        collector.poll_interval_secs,
+    );
+    set_env_if_present(
+        "SOTH_COLLECTOR_MAX_READ_BYTES",
+        collector.max_read_bytes_per_source,
+    );
+    set_env_if_present("SOTH_COLLECTOR_MAX_LINE_BYTES", collector.max_line_bytes);
+    set_env_if_present(
+        "SOTH_COLLECTOR_STATE_PATH",
+        collector
+            .state_path
+            .as_ref()
+            .map(cli_config::expand_tilde)
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    set_env_if_present("SOTH_COLLECTOR_AGENT", collector.agent_name.clone());
+    set_env_if_present(
+        "SOTH_COLLECTOR_EVENT_SOURCE",
+        collector.event_source.clone(),
+    );
 }
 
 async fn wait_for_dashboard_ready(port: u16, timeout: Duration) -> bool {

@@ -16,7 +16,7 @@ forward_proxy:
   port: 8080
   capture_max_body_bytes: 15728640
   hosts:
-    mode: "selective"  # selective | discovery
+    mode: "discovery"  # discovery | selective
     # Domain classes are loaded from dedicated files (recommended).
     # If a file is configured, it replaces the corresponding inline list.
     domain_files:

@@ -24,11 +24,12 @@ const MAX_EVENTS: usize = 1000;
 const MAX_AGENTS: usize = 100;
 
 /// Wait window for SQLite lock contention before failing a dashboard query/update.
-const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 /// Projection retries for transient lock contention.
-const SQLITE_PROJECTION_MAX_RETRIES: usize = 3;
-const SQLITE_PROJECTION_RETRY_BASE_MS: u64 = 40;
+const SQLITE_PROJECTION_MAX_RETRIES: usize = 8;
+const SQLITE_PROJECTION_RETRY_BASE_MS: u64 = 100;
+const SQLITE_PROJECTION_RETRY_MAX_MS: u64 = 2_000;
 const SQLITE_PROJECTION_VERSION: i64 = 3;
 
 /// Event store that watches wrap events and provides real-time streaming.
@@ -1029,7 +1030,11 @@ fn project_sqlite_events(db_path: &Path) -> std::io::Result<i64> {
         match project_sqlite_events_once(db_path) {
             Ok(projected_seq) => return Ok(projected_seq),
             Err(error) if retry < SQLITE_PROJECTION_MAX_RETRIES && is_sqlite_lock_error(&error) => {
-                let backoff_ms = SQLITE_PROJECTION_RETRY_BASE_MS * (retry as u64 + 1);
+                let exponent = (retry as u32).min(10);
+                let multiplier = 1_u64 << exponent;
+                let backoff_ms = SQLITE_PROJECTION_RETRY_BASE_MS
+                    .saturating_mul(multiplier)
+                    .min(SQLITE_PROJECTION_RETRY_MAX_MS);
                 std::thread::sleep(Duration::from_millis(backoff_ms));
             }
             Err(error) => return Err(error),

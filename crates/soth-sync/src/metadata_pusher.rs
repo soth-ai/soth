@@ -82,8 +82,8 @@ impl MetadataPusher {
 pub fn estimate_gzip_batch_size(request: &EventBatchRequest) -> anyhow::Result<usize> {
     let request_json =
         serde_json::to_vec(request).context("failed encoding metadata batch for sizing")?;
-    let request_gzip =
-        gzip_bytes(request_json.as_slice()).context("failed compressing metadata batch for sizing")?;
+    let request_gzip = gzip_bytes(request_json.as_slice())
+        .context("failed compressing metadata batch for sizing")?;
     Ok(request_gzip.len())
 }
 

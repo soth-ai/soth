@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "dashboard")]
 use soth_dashboard::{DashboardState, DenialEntry};
@@ -1361,8 +1361,8 @@ pub struct AiProxyHandler {
     process_attribution: Arc<ProcessAttribution>,
     /// Migration mode for registry-driven detection/interception.
     registry_mode: RegistryMode,
-    /// Bundle-driven classifier loaded from registry cache.
-    oisp_engine: Option<Arc<OispEngine>>,
+    /// Bundle-driven classifier loaded from registry cache or embedded fallback.
+    oisp_engine: Arc<OispEngine>,
     /// One-time-per-day limiter for catalog-domain discovery captures.
     catalog_discovery_limiter: Arc<CatalogDiscoveryLimiter>,
     /// Maximum request/response body bytes to capture in observability payloads.
@@ -1397,7 +1397,11 @@ impl Clone for AiProxyHandler {
 }
 
 impl AiProxyHandler {
-    pub fn new(config: &ForwardProxyConfig, observe: &ObserveConfig) -> Self {
+    pub fn new(
+        config: &ForwardProxyConfig,
+        observe: &ObserveConfig,
+        oisp_engine: Arc<OispEngine>,
+    ) -> Self {
         Self {
             hosts: Arc::new(config.hosts.clone()),
             #[cfg(feature = "dashboard")]
@@ -1416,7 +1420,7 @@ impl AiProxyHandler {
                 PROCESS_ATTR_CACHE_TTL,
             )),
             registry_mode: config.registry_mode,
-            oisp_engine: None,
+            oisp_engine,
             catalog_discovery_limiter: Arc::new(CatalogDiscoveryLimiter::default()),
             capture_max_body_bytes: config.capture_max_body_bytes,
             request_correlation_id: next_proxy_request_id(),
@@ -1460,42 +1464,33 @@ impl AiProxyHandler {
         self
     }
 
-    /// Set bundle-driven classifier.
-    pub fn with_oisp_engine(mut self, engine: Arc<OispEngine>) -> Self {
-        self.oisp_engine = Some(engine);
-        self
-    }
-
     /// Resolve action for host/path using registry engine decisions.
-    /// Falls back to configured host filters when the bundle is unavailable.
+    /// Uses bundle-driven decisions only (no host-list fallback).
     fn get_action(&self, host: &str, path: &str) -> HostAction {
         if matches!(self.hosts.action_for_host(host), HostAction::Block) {
             return HostAction::Block;
         }
 
-        if let Some(engine) = self.oisp_engine.as_ref() {
-            match engine.should_intercept(host, path) {
-                InterceptDecision::Intercept { .. } => HostAction::Intercept,
-                InterceptDecision::Passthrough
-                | InterceptDecision::Noise
-                | InterceptDecision::Tunnel => {
-                    if self.hosts.mode == HostFilterMode::Discovery
-                        && engine.classify(host).is_none()
-                        && engine.is_catalog_domain(host)
-                        && self.catalog_discovery_limiter.reserve_once_per_day(host)
-                    {
-                        info!(
-                            host = %host,
-                            "Catalog discovery interception enabled for first capture of the day"
-                        );
-                        HostAction::Intercept
-                    } else {
-                        HostAction::Tunnel
-                    }
+        let engine = self.oisp_engine.as_ref();
+        match engine.should_intercept(host, path) {
+            InterceptDecision::Intercept { .. } => HostAction::Intercept,
+            InterceptDecision::Passthrough
+            | InterceptDecision::Noise
+            | InterceptDecision::Tunnel => {
+                if self.hosts.mode == HostFilterMode::Discovery
+                    && engine.classify(host).is_none()
+                    && engine.is_catalog_domain(host)
+                    && self.catalog_discovery_limiter.reserve_once_per_day(host)
+                {
+                    info!(
+                        host = %host,
+                        "Catalog discovery interception enabled for first capture of the day"
+                    );
+                    HostAction::Intercept
+                } else {
+                    HostAction::Tunnel
                 }
             }
-        } else {
-            self.hosts.action_for_host(host)
         }
     }
 
@@ -1505,24 +1500,21 @@ impl AiProxyHandler {
             return HostAction::Block;
         }
 
-        if let Some(engine) = self.oisp_engine.as_ref() {
-            if engine.should_intercept_host(host) {
-                HostAction::Intercept
-            } else if self.hosts.mode == HostFilterMode::Discovery
-                && engine.classify(host).is_none()
-                && engine.is_catalog_domain(host)
-                && self.catalog_discovery_limiter.reserve_once_per_day(host)
-            {
-                info!(
-                    host = %host,
-                    "Catalog discovery CONNECT interception enabled for first capture of the day"
-                );
-                HostAction::Intercept
-            } else {
-                HostAction::Tunnel
-            }
+        let engine = self.oisp_engine.as_ref();
+        if engine.should_intercept_host(host) {
+            HostAction::Intercept
+        } else if self.hosts.mode == HostFilterMode::Discovery
+            && engine.classify(host).is_none()
+            && engine.is_catalog_domain(host)
+            && self.catalog_discovery_limiter.reserve_once_per_day(host)
+        {
+            info!(
+                host = %host,
+                "Catalog discovery CONNECT interception enabled for first capture of the day"
+            );
+            HostAction::Intercept
         } else {
-            self.hosts.action_for_host(host)
+            HostAction::Tunnel
         }
     }
 
@@ -1633,6 +1625,7 @@ impl AiProxyHandler {
         if method == "POST" {
             // Only skip obvious tracking POSTs
             if path_lower.contains("/v1/t")
+                || path_lower.contains("/event_logging")
                 || path_lower.contains("/analytics")
                 || path_lower.contains("/tracking")
                 || path_lower.contains("/segment")
@@ -1677,6 +1670,7 @@ impl AiProxyHandler {
 
         // Skip tracking/analytics
         if path_lower.contains("/v1/t")
+            || path_lower.contains("/event_logging")
             || path_lower.contains("/analytics")
             || path_lower.contains("/tracking")
             || path_lower.contains("/segment")
@@ -1722,23 +1716,15 @@ impl HttpHandler for AiProxyHandler {
         let host_mode = self.hosts.mode;
         let catalog_discovery_limiter = self.catalog_discovery_limiter.clone();
         let oisp_classification = if should_capture_observability {
-            self.oisp_engine
-                .as_ref()
-                .and_then(|engine| engine.classify(&host))
+            self.oisp_engine.classify(&host)
         } else {
             None
         };
         let is_catalog_discovery_host = should_capture_observability
             && host_mode == HostFilterMode::Discovery
             && oisp_classification.is_none()
-            && self
-                .oisp_engine
-                .as_ref()
-                .map(|engine| {
-                    engine.is_catalog_domain(&host)
-                        && catalog_discovery_limiter.was_reserved_today(&host)
-                })
-                .unwrap_or(false);
+            && self.oisp_engine.is_catalog_domain(&host)
+            && catalog_discovery_limiter.was_reserved_today(&host);
         let (host_is_ai_target, host_is_mcp_target, host_is_agent_target, provider) =
             if let Some(classification) = oisp_classification.as_ref() {
                 let (ai, mcp, agent) = match classification.entry_type_label() {
@@ -1865,68 +1851,71 @@ impl HttpHandler for AiProxyHandler {
             }
 
             // Capture body for AI/MCP requests and record payload-size metadata.
-            let (body_content, request_size_bytes, model, req, request_body_truncated) = if should_inspect_body {
-                let (parts, body) = req.into_parts();
-                match body.collect().await {
-                    Ok(collected) => {
-                        let bytes = collected.to_bytes();
-                        let body_len = bytes.len();
-                        let (decoded_bytes, body_str) =
-                            decode_payload_for_logging(&bytes, request_content_encoding.as_deref());
+            let (body_content, request_size_bytes, model, req, request_body_truncated) =
+                if should_inspect_body {
+                    let (parts, body) = req.into_parts();
+                    match body.collect().await {
+                        Ok(collected) => {
+                            let bytes = collected.to_bytes();
+                            let body_len = bytes.len();
+                            let (decoded_bytes, body_str) = decode_payload_for_logging(
+                                &bytes,
+                                request_content_encoding.as_deref(),
+                            );
 
-                        debug!(
-                            body_len = body_len,
-                            body_preview = %body_str.chars().take(100).collect::<String>(),
-                            "Captured request body"
-                        );
+                            debug!(
+                                body_len = body_len,
+                                body_preview = %body_str.chars().take(100).collect::<String>(),
+                                "Captured request body"
+                            );
 
-                        // Extract model from bundle parser first, then fallback to generic JSON.
-                        let model = provider
-                            .as_deref()
-                            .and_then(|provider_name| {
-                                extract_model_from_request_for_mode(
-                                    oisp_engine.as_deref(),
-                                    provider_name,
-                                    &host,
-                                    &decoded_bytes,
-                                )
-                            })
-                            .or_else(|| {
-                                serde_json::from_slice::<AiRequestBody>(&decoded_bytes)
-                                    .ok()
-                                    .and_then(|b| b.model)
-                            });
+                            // Extract model from bundle parser first, then fallback to generic JSON.
+                            let model = provider
+                                .as_deref()
+                                .and_then(|provider_name| {
+                                    extract_model_from_request_for_mode(
+                                        Some(oisp_engine.as_ref()),
+                                        provider_name,
+                                        &host,
+                                        &decoded_bytes,
+                                    )
+                                })
+                                .or_else(|| {
+                                    serde_json::from_slice::<AiRequestBody>(&decoded_bytes)
+                                        .ok()
+                                        .and_then(|b| b.model)
+                                });
 
-                        // Reconstruct request with body
-                        let new_body = Body::from(Full::new(bytes));
-                        let req = Request::from_parts(parts, new_body);
-                        (Some(body_str), Some(body_len as u64), model, req, false)
+                            // Reconstruct request with body
+                            let new_body = Body::from(Full::new(bytes));
+                            let req = Request::from_parts(parts, new_body);
+                            (Some(body_str), Some(body_len as u64), model, req, false)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to collect request body");
+                            let req = Request::from_parts(parts, Body::empty());
+                            (None, declared_request_size_bytes, None, req, false)
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to collect request body");
-                        let req = Request::from_parts(parts, Body::empty());
-                        (None, declared_request_size_bytes, None, req, false)
-                    }
-                }
-            } else {
-                debug!("Skipping body inspection");
-                let preview = if request_capture_oversized {
-                    Some(format!(
+                } else {
+                    debug!("Skipping body inspection");
+                    let preview = if request_capture_oversized {
+                        Some(format!(
                         "[request body truncated; declared size {} bytes exceeds capture limit {} bytes]",
                         declared_request_size_bytes.unwrap_or_default(),
                         capture_max_body_bytes
                     ))
-                } else {
-                    None
+                    } else {
+                        None
+                    };
+                    (
+                        preview,
+                        declared_request_size_bytes,
+                        None,
+                        req,
+                        request_capture_oversized,
+                    )
                 };
-                (
-                    preview,
-                    declared_request_size_bytes,
-                    None,
-                    req,
-                    request_capture_oversized,
-                )
-            };
             if !is_connect && !should_capture_observability {
                 debug!(
                     host = %host,
@@ -2485,7 +2474,7 @@ impl HttpHandler for AiProxyHandler {
                             decode_payload_for_logging(&bytes, content_encoding.as_deref());
 
                         let usage_outcome = extract_usage_meta_for_mode(
-                            oisp_engine.as_deref(),
+                            Some(oisp_engine.as_ref()),
                             registry_mode,
                             provider.as_str(),
                             &pending.host,
@@ -2548,7 +2537,7 @@ impl HttpHandler for AiProxyHandler {
                     let mut body = body;
                     let mut capture_limit_reported = false;
                     let mut stream_usage_parser: Option<OispStreamParser> = create_stream_usage_parser(
-                        log_oisp_engine.as_deref(),
+                        Some(log_oisp_engine.as_ref()),
                         log_provider.as_str(),
                         &log_pending.host,
                     );
@@ -2612,7 +2601,7 @@ impl HttpHandler for AiProxyHandler {
                     };
                     let stream_usage = stream_usage_parser.and_then(|parser| parser.finalize());
                     let mut usage_meta = extract_usage_meta_from_stream_usage(
-                        log_oisp_engine.as_deref(),
+                        Some(log_oisp_engine.as_ref()),
                         log_provider.as_str(),
                         &log_pending.host,
                         stream_usage,
@@ -2620,7 +2609,7 @@ impl HttpHandler for AiProxyHandler {
                     );
                     if !usage_meta.has_signal() {
                         let usage_outcome = extract_usage_meta_for_mode(
-                            log_oisp_engine.as_deref(),
+                            Some(log_oisp_engine.as_ref()),
                             log_registry_mode,
                             log_provider.as_str(),
                             &log_pending.host,
@@ -3017,8 +3006,8 @@ pub struct AiWebSocketHandler {
     session_id: String,
     /// Host filter config for source classification.
     hosts: Arc<HostFilterConfig>,
-    /// Optional bundle-driven classifier.
-    oisp_engine: Option<Arc<OispEngine>>,
+    /// Bundle-driven classifier.
+    oisp_engine: Arc<OispEngine>,
     /// User-defined tags attached to emitted events.
     event_tags: Arc<BTreeMap<String, String>>,
     /// Optional PII enrichment before events are written.
@@ -3030,7 +3019,7 @@ impl AiWebSocketHandler {
         session_id: String,
         event_logger: Option<Arc<EventLogger>>,
         hosts: Arc<HostFilterConfig>,
-        oisp_engine: Option<Arc<OispEngine>>,
+        oisp_engine: Arc<OispEngine>,
         event_tags: Arc<BTreeMap<String, String>>,
         pii_enricher: Arc<PiiEventEnricher>,
     ) -> Self {
@@ -3077,15 +3066,9 @@ impl WebSocketHandler for AiWebSocketHandler {
         };
 
         let is_discovery = hosts.mode == HostFilterMode::Discovery;
-        let oisp_classification = oisp_engine
-            .as_ref()
-            .and_then(|engine| engine.classify(&host));
-        let is_catalog_discovery_ws = is_discovery
-            && oisp_classification.is_none()
-            && oisp_engine
-                .as_ref()
-                .map(|engine| engine.is_catalog_domain(&host))
-                .unwrap_or(false);
+        let oisp_classification = oisp_engine.classify(&host);
+        let is_catalog_discovery_ws =
+            is_discovery && oisp_classification.is_none() && oisp_engine.is_catalog_domain(&host);
 
         let (host_is_ai_target, host_is_mcp_target, host_is_agent_target, provider) =
             if let Some(classification) = oisp_classification.as_ref() {
@@ -3229,34 +3212,65 @@ impl WebSocketHandler for AiWebSocketHandler {
     }
 }
 
-fn load_oisp_engine(cache_path: Option<&Path>) -> Option<Arc<OispEngine>> {
-    let path = cache_path?;
-    match OispEngine::load_from_registry_cache(path) {
-        Ok(Some(engine)) => {
+fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyError> {
+    if let Some(path) = cache_path {
+        match OispEngine::load_from_registry_cache(path) {
+            Ok(Some(engine)) => {
+                let engine = match engine.with_embedded_overlay() {
+                    Ok(overlaid) => overlaid,
+                    Err(error) => {
+                        warn!(
+                            cache = %path.display(),
+                            error = %error,
+                            "Failed applying embedded baseline overlay; continuing with cache bundle as-is"
+                        );
+                        engine
+                    }
+                };
+                info!(
+                    cache = %path.display(),
+                    bundle_version = %engine.bundle_version(),
+                    providers = engine.provider_count(),
+                    domains = engine.domain_count(),
+                    catalog_domains = engine.catalog_domain_count(),
+                    "Loaded OISP bundle for proxy classification (embedded baseline overlay applied)"
+                );
+                return Ok(Arc::new(engine));
+            }
+            Ok(None) => {
+                warn!(
+                    cache = %path.display(),
+                    "OISP registry cache not found; using embedded minimal fallback bundle"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    cache = %path.display(),
+                    error = %error,
+                    "Failed to load OISP registry cache; using embedded minimal fallback bundle"
+                );
+            }
+        }
+    } else {
+        warn!("OISP registry cache path not configured; using embedded minimal fallback bundle");
+    }
+
+    match OispEngine::load_embedded_minimal_bundle() {
+        Ok(engine) => {
             info!(
-                cache = %path.display(),
                 bundle_version = %engine.bundle_version(),
                 providers = engine.provider_count(),
                 domains = engine.domain_count(),
                 catalog_domains = engine.catalog_domain_count(),
-                "Loaded OISP bundle for proxy classification"
+                "Loaded embedded minimal OISP bundle"
             );
-            Some(Arc::new(engine))
-        }
-        Ok(None) => {
-            debug!(
-                cache = %path.display(),
-                "OISP registry cache not found; continuing without bundle-driven classification"
-            );
-            None
+            Ok(Arc::new(engine))
         }
         Err(error) => {
-            warn!(
-                cache = %path.display(),
-                error = %error,
-                "Failed to load OISP registry cache"
-            );
-            None
+            error!(error = %error, "Failed to load embedded minimal OISP bundle");
+            Err(ProxyError::transport(format!(
+                "Failed to load any OISP bundle (cache and embedded fallback both unavailable): {error}"
+            )))
         }
     }
 }
@@ -3340,17 +3354,7 @@ where
     let observe_config = observe_config.unwrap_or_default();
     let event_tags = Arc::new(observe_config.event_tags.clone());
     let pii_enricher = Arc::new(PiiEventEnricher::from_observe_config(&observe_config));
-    let oisp_engine = load_oisp_engine(oisp_registry_cache_path.as_deref());
-    if oisp_engine.is_none() {
-        let cache_path = oisp_registry_cache_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<unset>".to_string());
-        warn!(
-            cache = %cache_path,
-            "Compiled registry bundle unavailable; continuing with configured host filters"
-        );
-    }
+    let oisp_engine = load_oisp_engine(oisp_registry_cache_path.as_deref())?;
     let learned_passthrough = if config.tls.learned_passthrough.enabled {
         let learned = Arc::new(LearnedPassthrough::new(
             config.tls.learned_passthrough.state_path.clone(),
@@ -3366,7 +3370,7 @@ where
 
     #[cfg(feature = "dashboard")]
     let handler = {
-        let mut h = AiProxyHandler::new(&config, &observe_config);
+        let mut h = AiProxyHandler::new(&config, &observe_config, oisp_engine.clone());
         h.registry_mode = config.registry_mode;
         if let Some(d) = dashboard {
             h = h.with_dashboard(d);
@@ -3384,15 +3388,12 @@ where
                 config.tls.learned_passthrough.failure_window,
             );
         }
-        if let Some(ref oisp) = oisp_engine {
-            h = h.with_oisp_engine(oisp.clone());
-        }
         h
     };
 
     #[cfg(not(feature = "dashboard"))]
     let handler = {
-        let mut h = AiProxyHandler::new(&config, &observe_config);
+        let mut h = AiProxyHandler::new(&config, &observe_config, oisp_engine.clone());
         h.registry_mode = config.registry_mode;
         if let Some(ref logger) = event_logger_arc {
             h = h.with_event_logger_arc(logger.clone());
@@ -3406,9 +3407,6 @@ where
                 config.tls.learned_passthrough.failure_threshold,
                 config.tls.learned_passthrough.failure_window,
             );
-        }
-        if let Some(ref oisp) = oisp_engine {
-            h = h.with_oisp_engine(oisp.clone());
         }
         h
     };
@@ -3520,6 +3518,62 @@ mod tests {
     }
 
     #[test]
+    fn load_oisp_engine_falls_back_to_embedded_bundle_when_cache_missing() {
+        let engine = load_oisp_engine(None).expect("embedded fallback bundle should load");
+        assert!(engine.classify("api.openai.com").is_some());
+    }
+
+    #[test]
+    fn load_oisp_engine_overlays_embedded_baseline_for_chatgpt_subdomains() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "fetched_at": "2026-02-14T00:00:00Z",
+            "etag": "etag-1",
+            "metadata": {
+                "bundle_type": "cloud",
+                "version": "cache-v1",
+                "sha256": "abc",
+                "compiled_at": "2026-02-14T00:00:00Z",
+                "provider_count": 1,
+                "domain_count": 1,
+                "format_count": 1,
+                "size_bytes": 123
+            },
+            "bundle": {
+                "version": "cache-v1",
+                "compiled_at": "2026-02-14T00:00:00Z",
+                "bundle_type": "cloud",
+                "domain_index": {
+                    "chatgpt.com": {
+                        "category": "agent-apps",
+                        "provider": "chatgpt"
+                    }
+                },
+                "providers": {
+                    "chatgpt": {
+                        "name": "ChatGPT",
+                        "category": "agent-apps",
+                        "api_domains": ["chatgpt.com"],
+                        "api_format": "openai"
+                    }
+                },
+                "filters": {},
+                "pricing": {},
+                "formats": {}
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+        let engine = load_oisp_engine(Some(path.as_path())).expect("cache bundle should load");
+        assert!(engine.classify("chatgpt.com").is_some());
+        // This host is provided by embedded baseline overlay.
+        assert!(engine.classify("ws.chatgpt.com").is_some());
+        assert!(engine.should_intercept_host("ws.chatgpt.com:443"));
+    }
+
+    #[test]
     fn test_extract_mcp_request_method_with_rmcp_request() {
         let payload = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
         assert_eq!(
@@ -3564,7 +3618,7 @@ mod tests {
         config.hosts.mcp = vec![];
         config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
-        let handler = AiProxyHandler::new(&config, &observe).with_oisp_engine(test_oisp_engine());
+        let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
         assert_eq!(
             handler.get_action("api.openai.com", "/v1/chat/completions"),
@@ -3581,42 +3635,34 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_mode_without_bundle_tunnels_unclassified_hosts() {
+    fn test_registry_mode_tunnels_unclassified_hosts() {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::Registry;
         config.hosts.ai_inference = vec![];
         config.hosts.mcp = vec![];
         config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
-        let handler = AiProxyHandler::new(&config, &observe);
+        let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
         assert_eq!(
-            handler.get_action("api.openai.com", "/v1/chat/completions"),
+            handler.get_action("unknown.example.com", "/v1/chat/completions"),
             HostAction::Tunnel
         );
     }
 
     #[test]
-    fn test_registry_mode_without_bundle_falls_back_to_configured_hosts() {
+    fn test_registry_mode_does_not_fall_back_to_configured_hosts() {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::Registry;
-        config.hosts.ai_inference = vec!["api.openai.com".to_string()];
-        config.hosts.mcp = vec!["api.github.com".to_string()];
-        config.hosts.agent_apps = vec!["chatgpt.com".to_string()];
+        config.hosts.ai_inference = vec!["fallback-only.example".to_string()];
+        config.hosts.mcp = vec!["fallback-mcp.example".to_string()];
+        config.hosts.agent_apps = vec!["fallback-agent.example".to_string()];
         let observe = ObserveConfig::default();
-        let handler = AiProxyHandler::new(&config, &observe);
+        let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
         assert_eq!(
-            handler.get_action("api.openai.com", "/v1/chat/completions"),
-            HostAction::Intercept
-        );
-        assert_eq!(
-            handler.get_action("api.github.com", "/mcp"),
-            HostAction::Intercept
-        );
-        assert_eq!(
-            handler.get_action("chatgpt.com", "/backend-api/codex/responses"),
-            HostAction::Intercept
+            handler.get_action("fallback-only.example", "/v1/chat/completions"),
+            HostAction::Tunnel
         );
     }
 
@@ -3628,10 +3674,14 @@ mod tests {
         config.hosts.mcp = vec![];
         config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
-        let handler = AiProxyHandler::new(&config, &observe).with_oisp_engine(test_oisp_engine());
+        let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
         assert_eq!(
             handler.get_connect_action("api.openai.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(
+            handler.get_connect_action("api.openai.com:443"),
             HostAction::Intercept
         );
         assert_eq!(
@@ -3649,7 +3699,7 @@ mod tests {
         config.hosts.mcp = vec![];
         config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
-        let handler = AiProxyHandler::new(&config, &observe).with_oisp_engine(test_oisp_engine());
+        let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
         assert_eq!(
             handler.get_connect_action("server.codeium.com"),
@@ -3870,6 +3920,14 @@ mod tests {
     #[test]
     fn test_should_log_request_skips_connect() {
         assert!(!AiProxyHandler::should_log_request("/", "CONNECT"));
+    }
+
+    #[test]
+    fn test_should_log_request_skips_event_logging_paths() {
+        assert!(!AiProxyHandler::should_log_request(
+            "/api/event_logging/batch",
+            "POST"
+        ));
     }
 
     #[test]

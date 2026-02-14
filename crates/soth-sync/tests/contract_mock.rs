@@ -399,7 +399,10 @@ async fn events_batch_handler(
     )
 }
 
-fn decode_event_batch_request(headers: &HeaderMap, body: &[u8]) -> Result<EventBatchRequest, String> {
+fn decode_event_batch_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<EventBatchRequest, String> {
     let is_gzip = headers
         .get("content-encoding")
         .and_then(|value| value.to_str().ok())
@@ -411,8 +414,7 @@ fn decode_event_batch_request(headers: &HeaderMap, body: &[u8]) -> Result<EventB
 
     let mut decoder = GzDecoder::new(body);
     let mut decoded = Vec::new();
-    std::io::Read::read_to_end(&mut decoder, &mut decoded)
-        .map_err(|error| error.to_string())?;
+    std::io::Read::read_to_end(&mut decoder, &mut decoded).map_err(|error| error.to_string())?;
     serde_json::from_slice::<EventBatchRequest>(&decoded).map_err(|e| e.to_string())
 }
 

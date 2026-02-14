@@ -124,7 +124,9 @@ fn resolve_provider_id(engine: &OispEngine, provider: &str, host: &str) -> Optio
     {
         return Some(provider.to_string());
     }
-    engine.classify(host).map(|classification| classification.provider_id)
+    engine
+        .classify(host)
+        .map(|classification| classification.provider_id)
 }
 
 fn build_response_usage_meta_with_cost(
@@ -281,12 +283,8 @@ mod tests {
     fn request_model_is_extracted_via_bundle_format() {
         let engine = test_oisp_engine();
         let body = br#"{"model":"gpt-4o"}"#;
-        let model = extract_model_from_request_for_mode(
-            Some(&engine),
-            "openai",
-            "api.openai.com",
-            body,
-        );
+        let model =
+            extract_model_from_request_for_mode(Some(&engine), "openai", "api.openai.com", body);
         assert_eq!(model.as_deref(), Some("gpt-4o"));
     }
 }

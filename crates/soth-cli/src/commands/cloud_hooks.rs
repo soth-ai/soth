@@ -189,8 +189,7 @@ pub fn spawn_cloud_pull_runtime(
             let retry_in = config_pull_backoff.record_failure();
             warn!(
                 retry_in_secs = retry_in.as_secs(),
-                "Initial cloud config pull failed: {:#}",
-                error
+                "Initial cloud config pull failed: {:#}", error
             );
         } else {
             config_pull_backoff.record_success();

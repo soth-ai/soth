@@ -1,8 +1,9 @@
 use anyhow::Context;
 use base64::Engine as _;
 use rusqlite::{
-    Connection, OpenFlags, params, params_from_iter,
+    params, params_from_iter,
     types::{Value as SqlValue, ValueRef},
+    Connection, OpenFlags,
 };
 use serde::{Deserialize, Serialize};
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
@@ -230,16 +231,14 @@ fn parse_sqlite_sources_from_env() -> Vec<CollectorSqliteSource> {
                     Some(CollectorSqliteQuery {
                         file_type: query.file_type.trim().to_string(),
                         sql: query.sql,
-                        incremental_field: query
-                            .incremental_field
-                            .and_then(|value| {
-                                let trimmed = value.trim();
-                                if trimmed.is_empty() {
-                                    None
-                                } else {
-                                    Some(trimmed.to_string())
-                                }
-                            }),
+                        incremental_field: query.incremental_field.and_then(|value| {
+                            let trimmed = value.trim();
+                            if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed.to_string())
+                            }
+                        }),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -364,12 +363,7 @@ impl CollectorAgent {
 
         for source in &self.config.sources {
             let key = source.path.to_string_lossy().to_string();
-            let prior_state = self
-                .offsets
-                .files
-                .get(&key)
-                .cloned()
-                .unwrap_or_default();
+            let prior_state = self.offsets.files.get(&key).cloned().unwrap_or_default();
             let outcome = collect_source_events(
                 source,
                 &prior_state,
@@ -390,12 +384,7 @@ impl CollectorAgent {
 
         for source in &self.config.sqlite_sources {
             let key = source.db_path.to_string_lossy().to_string();
-            let prior_state = self
-                .offsets
-                .sqlite
-                .get(&key)
-                .cloned()
-                .unwrap_or_default();
+            let prior_state = self.offsets.sqlite.get(&key).cloned().unwrap_or_default();
             let outcome = collect_sqlite_events(source, &prior_state, self.config.max_line_bytes)?;
             if outcome.next_state != prior_state {
                 self.offsets.sqlite.insert(key, outcome.next_state);
@@ -514,7 +503,10 @@ impl CollectorAgent {
             AgentInfo::new(agent_name, DetectionSource::Environment),
         )
         .with_source(source_kind)
-        .with_collector_metadata(format!("{}:{}", source.name, line.file_type), line.end_offset);
+        .with_collector_metadata(
+            format!("{}:{}", source.name, line.file_type),
+            line.end_offset,
+        );
 
         if let Some(provider) = parsed.provider.as_ref().or(source.provider.as_ref()) {
             event = event.with_provider(provider.clone());
@@ -609,7 +601,10 @@ impl OffsetState {
             }
         }
         let legacy = serde_json::from_value::<LegacyOffsetState>(value).with_context(|| {
-            format!("failed parsing collector legacy offset state: {}", path.display())
+            format!(
+                "failed parsing collector legacy offset state: {}",
+                path.display()
+            )
         })?;
         let files = legacy
             .offsets
@@ -790,7 +785,10 @@ fn collect_sqlite_events(
         }
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("collector sqlite metadata failed: {}", source.db_path.display())
+                format!(
+                    "collector sqlite metadata failed: {}",
+                    source.db_path.display()
+                )
             });
         }
     };
@@ -822,12 +820,12 @@ fn collect_sqlite_events(
         let previous_incremental = previous_state.incremental.get(&query.file_type);
         let result = execute_sqlite_query(query, &conn, previous_incremental, max_line_bytes)
             .with_context(|| {
-            format!(
-                "collector sqlite query failed ({} on {})",
-                query.file_type,
-                source.db_path.display()
-            )
-        })?;
+                format!(
+                    "collector sqlite query failed ({} on {})",
+                    query.file_type,
+                    source.db_path.display()
+                )
+            })?;
         if let Some(value) = result.max_incremental {
             next_state
                 .incremental
@@ -948,10 +946,7 @@ fn json_value_from_sqlite_ref(value: ValueRef<'_>) -> serde_json::Value {
     }
 }
 
-fn incremental_value_for_query(
-    row: &serde_json::Value,
-    field: &str,
-) -> Option<serde_json::Value> {
+fn incremental_value_for_query(row: &serde_json::Value, field: &str) -> Option<serde_json::Value> {
     let object = row.as_object()?;
     if let Some(value) = object.get(field) {
         return Some(value.clone());
@@ -1242,11 +1237,7 @@ mod tests {
     fn offset_state_loads_legacy_offsets() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("collector_state.json");
-        std::fs::write(
-            &path,
-            r#"{"offsets":{"/tmp/demo.jsonl":12345}}"#.as_bytes(),
-        )
-        .unwrap();
+        std::fs::write(&path, r#"{"offsets":{"/tmp/demo.jsonl":12345}}"#.as_bytes()).unwrap();
         let loaded = OffsetState::load(&path).unwrap();
         let file = loaded.files.get("/tmp/demo.jsonl").unwrap();
         assert_eq!(file.offset, 12345);
@@ -1317,7 +1308,8 @@ mod tests {
                 incremental_field: Some("createdAt".to_string()),
             }],
         };
-        let initial = collect_sqlite_events(&source, &SqliteScanState::default(), 64 * 1024).unwrap();
+        let initial =
+            collect_sqlite_events(&source, &SqliteScanState::default(), 64 * 1024).unwrap();
         assert_eq!(initial.lines.len(), 2);
         assert_eq!(
             initial.next_state.incremental.get("messages"),
