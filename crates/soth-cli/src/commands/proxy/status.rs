@@ -70,7 +70,9 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let running = tokio::net::TcpStream::connect(proxy_addr.as_str())
         .await
         .is_ok();
-    let api_running = tokio::net::TcpStream::connect(api_addr.as_str()).await.is_ok();
+    let api_running = tokio::net::TcpStream::connect(api_addr.as_str())
+        .await
+        .is_ok();
     let status_display = if running {
         format!("{} Running", style::CHECK.green())
     } else {
@@ -109,7 +111,11 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     println!("  {}", "soth proxy ui start".bold());
     println!(
         "  {}",
-        format!("soth attach --api-url http://127.0.0.1:{}", config.dashboard.port).bold()
+        format!(
+            "soth attach --api-url http://127.0.0.1:{}",
+            config.dashboard.port
+        )
+        .bold()
     );
 
     // Environment variables

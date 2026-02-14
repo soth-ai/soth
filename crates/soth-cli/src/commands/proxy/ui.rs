@@ -25,7 +25,10 @@ pub async fn run_start(
         anyhow::bail!("UI directory not found: {}", ui_dir.display());
     }
     if !ui_dir.join("package.json").exists() {
-        anyhow::bail!("No package.json found in UI directory: {}", ui_dir.display());
+        anyhow::bail!(
+            "No package.json found in UI directory: {}",
+            ui_dir.display()
+        );
     }
 
     let mut cmd = Command::new(npm_executable());
@@ -33,8 +36,16 @@ pub async fn run_start(
         .arg("dev")
         .current_dir(&ui_dir)
         .stdin(Stdio::null())
-        .stdout(if quiet { Stdio::null() } else { Stdio::inherit() })
-        .stderr(if quiet { Stdio::null() } else { Stdio::inherit() })
+        .stdout(if quiet {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
+        .stderr(if quiet {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
         .env(
             "NEXT_PUBLIC_SOTH_API_BASE",
             format!("http://localhost:{resolved_api_port}/api"),
@@ -144,7 +155,10 @@ fn stop_ui_process(child: &mut Child, quiet: bool) {
 
     if let Err(error) = child.wait() {
         if !quiet {
-            style::warning(&format!("Failed waiting for UI process shutdown: {}", error));
+            style::warning(&format!(
+                "Failed waiting for UI process shutdown: {}",
+                error
+            ));
         }
     }
 }

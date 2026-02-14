@@ -395,8 +395,7 @@ fn test_connection_refused_scenario() {
          \n\
          Start the API service:\n  \
          soth proxy api start --port {}",
-        port,
-        port
+        port, port
     );
 
     assert!(error_msg.contains("Could not connect"));

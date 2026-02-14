@@ -16,12 +16,12 @@
 //! - `soth proxy rate-limit` - Rate limit status
 
 use crate::cli_config;
+mod api;
 mod ca_info;
 mod circuit;
 mod connections;
 mod env;
 mod metrics;
-mod api;
 mod ratelimit;
 mod retention;
 mod setup_ca;

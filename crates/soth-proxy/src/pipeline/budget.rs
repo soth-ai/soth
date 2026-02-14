@@ -6,7 +6,6 @@ use crate::metrics;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
 use soth_budget::{BudgetTracker, PricingCatalog, TokenUsage};
 use soth_core::types::budget::BudgetScope;
-use soth_dashboard::{BudgetAlert, DashboardState};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -41,8 +40,6 @@ pub struct BudgetLayer {
     tracker: Arc<BudgetTracker>,
     /// LiteLLM-compatible pricing catalog
     pricing_catalog: PricingCatalog,
-    /// Dashboard state for metrics (optional)
-    dashboard: Option<DashboardState>,
 }
 
 impl BudgetLayer {
@@ -52,7 +49,6 @@ impl BudgetLayer {
             config,
             tracker: Arc::new(BudgetTracker::new()),
             pricing_catalog: PricingCatalog::new(),
-            dashboard: None,
         }
     }
 
@@ -62,14 +58,7 @@ impl BudgetLayer {
             config,
             tracker: Arc::new(tracker),
             pricing_catalog: PricingCatalog::new(),
-            dashboard: None,
         }
-    }
-
-    /// Set dashboard state for metrics reporting
-    pub fn with_dashboard(mut self, state: DashboardState) -> Self {
-        self.dashboard = Some(state);
-        self
     }
 
     /// Set global budget limits
@@ -209,17 +198,6 @@ impl Layer for BudgetLayer {
                                 ctx.agent_id
                             );
 
-                            // Record alert to dashboard
-                            if let Some(ref dash) = self.dashboard {
-                                dash.set_budget_alert(BudgetAlert {
-                                    level: "error".to_string(),
-                                    message: format!(
-                                        "Budget limit exceeded ({}) - requests blocked",
-                                        Self::scope_label(scope)
-                                    ),
-                                });
-                            }
-
                             let id = get_request_id(&message);
                             return error_response(
                                 id,
@@ -275,12 +253,6 @@ impl Layer for BudgetLayer {
                     let cost = self.pricing_catalog.calculate_cost(&model, &usage);
                     ctx.metadata
                         .insert("budget_cost".to_string(), serde_json::json!(cost));
-
-                    // Record to dashboard
-                    if let Some(ref dash) = self.dashboard {
-                        let total_tokens = input_tokens + output_tokens;
-                        dash.record_token_usage(&model, total_tokens, cost);
-                    }
 
                     LayerResult::Continue(message)
                 }

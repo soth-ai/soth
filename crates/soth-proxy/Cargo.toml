@@ -5,10 +5,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-default = ["dashboard"]
-dashboard = ["dep:soth-dashboard"]
-
 [dependencies]
 soth-core = { workspace = true }
 soth-oisp = { workspace = true }
@@ -16,7 +12,6 @@ soth-identity = { workspace = true }
 soth-policy = { workspace = true }
 soth-observe = { workspace = true }
 soth-budget = { workspace = true }
-soth-dashboard = { workspace = true, optional = true }
 soth-tls = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

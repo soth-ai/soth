@@ -5,7 +5,6 @@ use crate::enforcement::core;
 use crate::metrics;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
 use soth_core::types::policy::{PolicyAction, PolicyDecision};
-use soth_dashboard::{DashboardState, DenialEntry};
 use soth_policy::PolicyEngine;
 use std::future::Future;
 use std::pin::Pin;
@@ -55,8 +54,6 @@ pub struct PolicyLayer {
     config: PolicyConfig,
     /// Policy engine
     engine: Arc<RwLock<PolicyEngine>>,
-    /// Dashboard state for metrics (optional)
-    dashboard: Option<DashboardState>,
 }
 
 impl PolicyLayer {
@@ -65,7 +62,6 @@ impl PolicyLayer {
         Self {
             config,
             engine: Arc::new(RwLock::new(PolicyEngine::new())),
-            dashboard: None,
         }
     }
 
@@ -74,14 +70,7 @@ impl PolicyLayer {
         Self {
             config,
             engine: Arc::new(RwLock::new(engine)),
-            dashboard: None,
         }
-    }
-
-    /// Set dashboard state for metrics reporting
-    pub fn with_dashboard(mut self, state: DashboardState) -> Self {
-        self.dashboard = Some(state);
-        self
     }
 
     /// Evaluate policy for a request
@@ -153,10 +142,6 @@ impl Layer for PolicyLayer {
                             serde_json::json!(policy_version.clone()),
                         );
 
-                        if let Some(ref dash) = self.dashboard {
-                            dash.set_policy_active_version(policy_version.clone());
-                        }
-
                         if self.config.mode == PolicyMode::Audit {
                             return LayerResult::Continue(message);
                         }
@@ -195,36 +180,9 @@ impl Layer for PolicyLayer {
             );
 
             match decision.action {
-                PolicyAction::Allow => {
-                    // Record allowed to dashboard
-                    if let Some(ref dash) = self.dashboard {
-                        dash.set_policy_active_version(policy_version.clone());
-                        dash.record_policy_evaluation(true, None);
-                    }
-                    LayerResult::Continue(message)
-                }
+                PolicyAction::Allow => LayerResult::Continue(message),
                 PolicyAction::Deny => {
                     let reason = core::decision_reason(&decision, "Policy denied");
-
-                    // Record denial to dashboard
-                    if let Some(ref dash) = self.dashboard {
-                        dash.set_policy_active_version(policy_version.clone());
-                        let tool = req
-                            .params
-                            .as_ref()
-                            .and_then(|p| p.get("name"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        dash.record_policy_evaluation(
-                            false,
-                            Some(DenialEntry {
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                method: req.method.clone(),
-                                tool,
-                                reason: reason.clone(),
-                            }),
-                        );
-                    }
 
                     if self.config.mode == PolicyMode::Audit {
                         warn!("Policy violation (audit mode): {}", reason);
@@ -236,11 +194,6 @@ impl Layer for PolicyLayer {
                     error_response(id, JsonRpcError::policy_denied(&reason))
                 }
                 PolicyAction::Log => {
-                    // Record as allowed for logging action
-                    if let Some(ref dash) = self.dashboard {
-                        dash.set_policy_active_version(policy_version.clone());
-                        dash.record_policy_evaluation(true, None);
-                    }
                     if let Some(reason) = &decision.reason {
                         info!("Policy log: {}", reason);
                     }
@@ -249,19 +202,11 @@ impl Layer for PolicyLayer {
                 PolicyAction::Redact => {
                     // For redaction, we'd need to modify the message
                     // For now, just log and continue
-                    if let Some(ref dash) = self.dashboard {
-                        dash.set_policy_active_version(policy_version.clone());
-                        dash.record_policy_evaluation(true, None);
-                    }
                     warn!("Redaction requested but not implemented");
                     LayerResult::Continue(message)
                 }
                 PolicyAction::RateLimit => {
                     // Rate limiting would need a separate tracking mechanism
-                    if let Some(ref dash) = self.dashboard {
-                        dash.set_policy_active_version(policy_version.clone());
-                        dash.record_policy_evaluation(true, None);
-                    }
                     warn!("Rate limiting requested but not implemented");
                     LayerResult::Continue(message)
                 }

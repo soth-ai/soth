@@ -467,7 +467,6 @@ fn spawn_proxy_runtime(
             async move {
                 shutdown_rx.await.ok();
             },
-            None,
             event_logger,
             Some(enforcer),
             Some(observe_config),

@@ -1566,12 +1566,14 @@ fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> 
         pid: envelope.process_pid,
         bundle_id: bundle_id.clone(),
         process_name: envelope.process_name.clone(),
-        app_type: event.collector_source.as_ref().map(|_| "collector".to_string()).or(
-            bundle_id
+        app_type: event
+            .collector_source
+            .as_ref()
+            .map(|_| "collector".to_string())
+            .or(bundle_id
                 .as_ref()
                 .map(|_| "desktop_app".to_string())
-                .or(Some("cli".to_string())),
-        ),
+                .or(Some("cli".to_string()))),
         referrer_origin: None,
     })
 }

@@ -3908,7 +3908,6 @@ dependencies = [
  "sha2",
  "soth-budget",
  "soth-core",
- "soth-dashboard",
  "soth-identity",
  "soth-observe",
  "soth-oisp",

@@ -4,7 +4,6 @@ use super::middleware::{Layer, LayerResult, RequestContext};
 use crate::protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 use soth_budget::TokenCounter;
 use soth_core::types::observation::{Direction, EventType, ObservationEvent};
-use soth_dashboard::DashboardState;
 use soth_observe::{ObservationLogger, PiiDetector, PiiRedactor};
 use std::future::Future;
 use std::pin::Pin;
@@ -48,8 +47,6 @@ pub struct ObserveLayer {
     pii_redactor: Option<PiiRedactor>,
     /// Logger (optional)
     logger: Option<Arc<ObservationLogger>>,
-    /// Dashboard state for metrics (optional)
-    dashboard: Option<DashboardState>,
 }
 
 impl ObserveLayer {
@@ -65,7 +62,6 @@ impl ObserveLayer {
             pii_detector,
             pii_redactor,
             logger: None,
-            dashboard: None,
         }
     }
 
@@ -81,14 +77,7 @@ impl ObserveLayer {
             pii_detector,
             pii_redactor,
             logger: Some(logger),
-            dashboard: None,
         }
-    }
-
-    /// Set dashboard state for metrics reporting
-    pub fn with_dashboard(mut self, state: DashboardState) -> Self {
-        self.dashboard = Some(state);
-        self
     }
 
     /// Create observation event from request
@@ -204,16 +193,6 @@ impl Layer for ObserveLayer {
                             serde_json::json!(event.token_count),
                         );
 
-                        // Record to dashboard
-                        if let Some(ref dash) = self.dashboard {
-                            dash.record_request();
-                            if event.pii_detected {
-                                for pii_type in &event.pii_types {
-                                    dash.record_pii_detection(&pii_type.to_string());
-                                }
-                            }
-                        }
-
                         self.log_event(event).await;
                     }
                 }
@@ -226,16 +205,6 @@ impl Layer for ObserveLayer {
                             "output_tokens".to_string(),
                             serde_json::json!(event.token_count),
                         );
-
-                        // Record to dashboard
-                        if let Some(ref dash) = self.dashboard {
-                            dash.record_response();
-                            if event.pii_detected {
-                                for pii_type in &event.pii_types {
-                                    dash.record_pii_detection(&pii_type.to_string());
-                                }
-                            }
-                        }
 
                         self.log_event(event).await;
                     }

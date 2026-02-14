@@ -3,7 +3,6 @@
 use super::middleware::{error_response, get_request_id, Layer, LayerResult, RequestContext};
 use crate::enforcement::core;
 use crate::protocol::{JsonRpcError, JsonRpcMessage};
-use soth_dashboard::DashboardState;
 use soth_identity::TrustStore;
 use std::collections::HashSet;
 use std::future::Future;
@@ -59,8 +58,6 @@ pub struct IdentityLayer {
     config: IdentityConfig,
     /// Trust store for verified DIDs
     trust_store: Arc<RwLock<TrustStore>>,
-    /// Dashboard state for metrics (optional)
-    dashboard: Option<DashboardState>,
 }
 
 impl IdentityLayer {
@@ -69,7 +66,6 @@ impl IdentityLayer {
         Self {
             config,
             trust_store: Arc::new(RwLock::new(TrustStore::in_memory())),
-            dashboard: None,
         }
     }
 
@@ -78,14 +74,7 @@ impl IdentityLayer {
         Self {
             config,
             trust_store: Arc::new(RwLock::new(trust_store)),
-            dashboard: None,
         }
-    }
-
-    /// Set dashboard state for metrics reporting
-    pub fn with_dashboard(mut self, state: DashboardState) -> Self {
-        self.dashboard = Some(state);
-        self
     }
 
     /// Add a trusted DID
@@ -183,13 +172,6 @@ impl Layer for IdentityLayer {
             // Try to verify identity
             match self.verify_identity(ctx, &message).await {
                 Ok(verified) => {
-                    // Record to dashboard if DID was present
-                    if let Some(ref did) = ctx.agent_did {
-                        if let Some(ref dash) = self.dashboard {
-                            dash.record_identity_verification(did, verified);
-                        }
-                    }
-
                     if strict_identity && !verified {
                         let id = get_request_id(&message);
                         return error_response(id, JsonRpcError::identity_required());
@@ -198,13 +180,6 @@ impl Layer for IdentityLayer {
                 }
                 Err(e) => {
                     warn!("Identity verification error: {}", e);
-
-                    // Record failed verification to dashboard
-                    if let Some(ref did) = ctx.agent_did {
-                        if let Some(ref dash) = self.dashboard {
-                            dash.record_identity_verification(did, false);
-                        }
-                    }
 
                     if strict_identity {
                         let id = get_request_id(&message);

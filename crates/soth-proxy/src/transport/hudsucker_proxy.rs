@@ -37,9 +37,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-#[cfg(feature = "dashboard")]
-use soth_dashboard::{DashboardState, DenialEntry};
-
 use crate::enforcement::core as enforcement_core;
 use crate::error::ProxyError;
 use crate::json_security::strip_json_security_prefix_text;
@@ -81,7 +78,6 @@ struct AiRequestBody {
 /// Pending request info for correlating with responses
 #[derive(Debug, Clone)]
 struct PendingRequest {
-    request_id: u64,
     exchange_id: String,
     envelope: Option<TrafficEnvelope>,
     host: String,
@@ -1741,9 +1737,6 @@ fn apply_process_identity(
 pub struct AiProxyHandler {
     /// Host filter config for selective interception
     hosts: Arc<HostFilterConfig>,
-    /// Dashboard state for metrics
-    #[cfg(feature = "dashboard")]
-    dashboard: Option<DashboardState>,
     /// Event logger for observability
     event_logger: Option<Arc<EventLogger>>,
     /// Session ID for this proxy instance
@@ -1782,8 +1775,6 @@ impl Clone for AiProxyHandler {
     fn clone(&self) -> Self {
         Self {
             hosts: self.hosts.clone(),
-            #[cfg(feature = "dashboard")]
-            dashboard: self.dashboard.clone(),
             event_logger: self.event_logger.clone(),
             session_id: self.session_id.clone(),
             pending_requests: self.pending_requests.clone(),
@@ -1812,8 +1803,6 @@ impl AiProxyHandler {
     ) -> Self {
         Self {
             hosts: Arc::new(config.hosts.clone()),
-            #[cfg(feature = "dashboard")]
-            dashboard: None,
             event_logger: None,
             session_id: uuid::Uuid::new_v4().to_string(),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
@@ -1834,12 +1823,6 @@ impl AiProxyHandler {
             capture_max_body_bytes: config.capture_max_body_bytes,
             request_correlation_id: next_proxy_request_id(),
         }
-    }
-
-    #[cfg(feature = "dashboard")]
-    pub fn with_dashboard(mut self, dashboard: DashboardState) -> Self {
-        self.dashboard = Some(dashboard);
-        self
     }
 
     /// Set event logger for observability
@@ -2236,8 +2219,6 @@ impl HttpHandler for AiProxyHandler {
             "Request inspection check"
         );
 
-        #[cfg(feature = "dashboard")]
-        let dashboard = self.dashboard.clone();
         let pending_requests = self.pending_requests.clone();
         let request_id = self.request_correlation_id;
 
@@ -2408,23 +2389,8 @@ impl HttpHandler for AiProxyHandler {
                         Ok(identity_result) => {
                             policy_allowed = Some(true);
                             policy_version = identity_result.policy_version.clone();
-                            #[cfg(feature = "dashboard")]
-                            if let Some(ref dashboard) = dashboard {
-                                if let Some(ref did) = identity_result.did {
-                                    dashboard.record_identity_verification(
-                                        did,
-                                        identity_result.verified,
-                                    );
-                                }
-                                if let Some(ref version) = identity_result.policy_version {
-                                    dashboard.set_policy_active_version(version.clone());
-                                }
-                                if enforcer.policy_mode != ProxyPolicyMode::Disabled {
-                                    dashboard.record_policy_evaluation(true, None);
-                                }
-                            }
                         }
-                        Err((status, reason, denied_policy_version)) => {
+                        Err((status, reason, _denied_policy_version)) => {
                             warn!(
                                 status = status,
                                 provider = provider,
@@ -2433,28 +2399,6 @@ impl HttpHandler for AiProxyHandler {
                                 reason = %reason,
                                 "Proxy request denied by enforcement"
                             );
-
-                            #[cfg(feature = "dashboard")]
-                            if let Some(ref dashboard) = dashboard {
-                                if let Some(ref did) = identity_did {
-                                    dashboard.record_identity_verification(did, false);
-                                }
-                                if let Some(ref version) = denied_policy_version {
-                                    dashboard.set_policy_active_version(version.clone());
-                                }
-                                if enforcer.policy_mode != ProxyPolicyMode::Disabled {
-                                    dashboard.record_policy_evaluation(
-                                        false,
-                                        Some(DenialEntry {
-                                            timestamp: chrono::Utc::now().to_rfc3339(),
-                                            method: format!("{} {}", http_method, path),
-                                            tool: Some(format!("{provider}:{path}")),
-                                            reason: reason.clone(),
-                                        }),
-                                    );
-                                }
-                            }
-
                             let response_body = serde_json::json!({
                                 "error": reason,
                                 "status": status,
@@ -2520,20 +2464,6 @@ impl HttpHandler for AiProxyHandler {
                     );
                 }
 
-                #[cfg(feature = "dashboard")]
-                if let Some(ref dashboard) = dashboard {
-                    if should_log {
-                        let request_id_str = request_id.to_string();
-                        dashboard.record_proxy_request(
-                            Some(&request_id_str),
-                            provider,
-                            &host,
-                            &http_method,
-                            &display_path,
-                        );
-                    }
-                }
-
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
                     let detection_reason = detection_reason_for_bucket(
@@ -2562,7 +2492,6 @@ impl HttpHandler for AiProxyHandler {
                     pending.insert(
                         request_id,
                         PendingRequest {
-                            request_id,
                             exchange_id: uuid::Uuid::new_v4().to_string(),
                             envelope: Some(envelope),
                             host: host.clone(),
@@ -2651,7 +2580,6 @@ impl HttpHandler for AiProxyHandler {
                 pending.insert(
                     request_id,
                     PendingRequest {
-                        request_id,
                         exchange_id: uuid::Uuid::new_v4().to_string(),
                         envelope: Some(apply_process_identity(
                             TrafficEnvelope::mcp_http(
@@ -2769,9 +2697,6 @@ impl HttpHandler for AiProxyHandler {
             .as_ref()
             .and_then(|enforcer| enforcer.budget_tracker.clone());
         let response_headers = capture_sanitized_headers(res.headers());
-
-        #[cfg(feature = "dashboard")]
-        let dashboard = self.dashboard.clone();
 
         // Check content type for body inspection
         let content_type = res
@@ -3032,9 +2957,6 @@ impl HttpHandler for AiProxyHandler {
                 } else {
                     "stream"
                 };
-                #[cfg(feature = "dashboard")]
-                let log_dashboard = dashboard.clone();
-
                 // Create a tee stream that yields frames while accumulating data
                 let tee_stream = stream! {
                     let mut body = body;
@@ -3155,24 +3077,6 @@ impl HttpHandler for AiProxyHandler {
                             log_is_sse,
                         )
                     });
-
-                    #[cfg(feature = "dashboard")]
-                    if let Some(ref dashboard) = log_dashboard {
-                        let request_id_str = log_pending.request_id.to_string();
-                        dashboard.record_proxy_response(
-                            Some(&request_id_str),
-                            log_provider.as_str(),
-                            status,
-                            log_latency_ms,
-                            usage_meta
-                                .model
-                                .as_deref()
-                                .or(log_pending.model.as_deref()),
-                            usage_meta.input_tokens,
-                            usage_meta.output_tokens,
-                            usage_meta.cost_usd,
-                        );
-                    }
 
                     if let Some(ref logger) = log_event_logger {
                         let mut enriched_tags = (*log_event_tags).clone();
@@ -3296,23 +3200,6 @@ impl HttpHandler for AiProxyHandler {
             if !logged_in_stream {
                 if let Some(ref tracker) = budget_tracker {
                     record_proxy_budget_spend(tracker, &session_id, &pending, &response_usage);
-                }
-            }
-
-            #[cfg(feature = "dashboard")]
-            if !logged_in_stream {
-                if let Some(ref dashboard) = dashboard {
-                    let request_id_str = pending.request_id.to_string();
-                    dashboard.record_proxy_response(
-                        Some(&request_id_str),
-                        provider.as_str(),
-                        status,
-                        latency_ms,
-                        response_usage.model.as_deref().or(pending.model.as_deref()),
-                        response_usage.input_tokens,
-                        response_usage.output_tokens,
-                        response_usage.cost_usd,
-                    );
                 }
             }
 
@@ -3863,7 +3750,6 @@ pub async fn start_proxy(
     config: ForwardProxyConfig,
     ca_cert_path: &Path,
     ca_key_path: &Path,
-    #[cfg(feature = "dashboard")] dashboard: Option<DashboardState>,
 ) -> Result<(), ProxyError> {
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -3881,8 +3767,6 @@ pub async fn start_proxy(
         async move {
             shutdown_rx.await.ok();
         },
-        #[cfg(feature = "dashboard")]
-        dashboard,
         None,
         None,
         None,
@@ -3898,7 +3782,6 @@ pub async fn start_proxy_with_shutdown<F>(
     ca_cert_path: &Path,
     ca_key_path: &Path,
     shutdown: F,
-    #[cfg(feature = "dashboard")] dashboard: Option<DashboardState>,
     event_logger: Option<EventLogger>,
     enforcer: Option<ProxyEnforcer>,
     observe_config: Option<ObserveConfig>,
@@ -3953,33 +3836,6 @@ where
         None
     };
 
-    #[cfg(feature = "dashboard")]
-    let handler = {
-        let mut h = AiProxyHandler::new(&config, &observe_config, oisp_engine.clone());
-        h.registry_mode = config.registry_mode;
-        if let Some(d) = dashboard {
-            h = h.with_dashboard(d);
-        }
-        if let Some(ref logger) = event_logger_arc {
-            h = h.with_event_logger_arc(logger.clone());
-        }
-        if let Some(ref proxy_enforcer) = enforcer {
-            h = h.with_enforcer(proxy_enforcer.clone());
-        }
-        if let Some(ref exchange_cfg) = exchange_v2_config {
-            h = h.with_exchange_v2(exchange_cfg.clone());
-        }
-        if let Some(ref learned) = learned_passthrough {
-            h = h.with_learned_passthrough(
-                learned.clone(),
-                config.tls.learned_passthrough.failure_threshold,
-                config.tls.learned_passthrough.failure_window,
-            );
-        }
-        h
-    };
-
-    #[cfg(not(feature = "dashboard"))]
     let handler = {
         let mut h = AiProxyHandler::new(&config, &observe_config, oisp_engine.clone());
         h.registry_mode = config.registry_mode;

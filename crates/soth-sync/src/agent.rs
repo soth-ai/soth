@@ -374,7 +374,6 @@ impl SyncAgent {
         }
     }
 
-
     fn load_exchange_queue_ready(&self, limit: usize) -> anyhow::Result<Vec<ExchangeQueueRow>> {
         let conn = open_read_conn(&self.config.event_db_path)?;
         let mut stmt = match conn.prepare(
