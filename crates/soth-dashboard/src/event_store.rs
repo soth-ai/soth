@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::types::exchange_v2::{ExchangeEventV2, ExchangeSourceClass};
-use soth_core::types::{EventSource, WrapDirection, WrapEvent};
+use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +31,7 @@ const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const SQLITE_PROJECTION_MAX_RETRIES: usize = 8;
 const SQLITE_PROJECTION_RETRY_BASE_MS: u64 = 100;
 const SQLITE_PROJECTION_RETRY_MAX_MS: u64 = 2_000;
-const SQLITE_PROJECTION_VERSION: i64 = 3;
+const SQLITE_PROJECTION_VERSION: i64 = 4;
 
 /// Event store that watches wrap events and provides real-time streaming.
 #[derive(Clone)]
@@ -585,6 +585,10 @@ fn read_sqlite_events(
     let conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
 
+    if has_exchange_rows_conn(&conn)? {
+        return read_sqlite_events_from_exchange(&conn, since_seq, initial_limit);
+    }
+
     let mut events = Vec::new();
     if let Some(cursor) = since_seq {
         let mut stmt = conn
@@ -667,6 +671,92 @@ fn read_sqlite_events(
         }
     }
 
+    Ok(events)
+}
+
+fn read_sqlite_events_from_exchange(
+    conn: &Connection,
+    since_seq: Option<i64>,
+    initial_limit: Option<usize>,
+) -> std::io::Result<Vec<(i64, WrapEvent)>> {
+    let mut events = Vec::new();
+
+    if let Some(cursor) = since_seq {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT seq, event_json
+                FROM exchange_events
+                WHERE seq > ?1
+                ORDER BY seq ASC
+                "#,
+            )
+            .map_err(to_io_err)?;
+        let rows = stmt
+            .query_map([cursor], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_err)?;
+        for row in rows {
+            let (seq, json) = row.map_err(to_io_err)?;
+            let Ok(exchange) = serde_json::from_str::<ExchangeEventV2>(&json) else {
+                continue;
+            };
+            events.push((seq, exchange_to_wrap_event(seq, exchange)));
+        }
+        return Ok(events);
+    }
+
+    if let Some(limit) = initial_limit {
+        let bounded_limit = limit.max(1) as i64;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT seq, event_json
+                FROM (
+                    SELECT seq, event_json
+                    FROM exchange_events
+                    ORDER BY seq DESC
+                    LIMIT ?1
+                )
+                ORDER BY seq ASC
+                "#,
+            )
+            .map_err(to_io_err)?;
+        let rows = stmt
+            .query_map([bounded_limit], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_err)?;
+        for row in rows {
+            let (seq, json) = row.map_err(to_io_err)?;
+            let Ok(exchange) = serde_json::from_str::<ExchangeEventV2>(&json) else {
+                continue;
+            };
+            events.push((seq, exchange_to_wrap_event(seq, exchange)));
+        }
+        return Ok(events);
+    }
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT seq, event_json
+            FROM exchange_events
+            ORDER BY seq ASC
+            "#,
+        )
+        .map_err(to_io_err)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(to_io_err)?;
+    for row in rows {
+        let (seq, json) = row.map_err(to_io_err)?;
+        let Ok(exchange) = serde_json::from_str::<ExchangeEventV2>(&json) else {
+            continue;
+        };
+        events.push((seq, exchange_to_wrap_event(seq, exchange)));
+    }
     Ok(events)
 }
 
@@ -838,6 +928,74 @@ fn read_sqlite_rollups_1m(db_path: &Path, limit: usize) -> std::io::Result<Vec<R
 fn read_sqlite_crypto_status(db_path: &Path) -> std::io::Result<CryptoStatusSummary> {
     let conn = open_sqlite_connection(db_path)?;
     ensure_wrap_events_schema(&conn)?;
+
+    if has_exchange_rows_conn(&conn)? {
+        let total_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM exchange_events", [], |row| row.get(0))
+            .map_err(to_io_err)?;
+        let signed_events: i64 = conn
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM exchange_events
+                WHERE json_extract(event_json, '$.integrity.signature') IS NOT NULL
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .map_err(to_io_err)?;
+        let latest_batch: Option<(String, String, String, String)> = conn
+            .query_row(
+                r#"
+                SELECT batch_id, root_hash, signer_did, sealed_at
+                FROM merkle_batches
+                ORDER BY seq_end DESC
+                LIMIT 1
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(to_io_err)?;
+        let merkle_batches: i64 = conn
+            .query_row("SELECT COUNT(*) FROM merkle_batches", [], |row| row.get(0))
+            .map_err(to_io_err)?;
+        let active_key_id: Option<String> = conn
+            .query_row(
+                r#"
+                SELECT key_id
+                FROM key_versions
+                WHERE status = 'active'
+                ORDER BY datetime(created_at) DESC
+                LIMIT 1
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_io_err)?;
+
+        let total_events_u = total_events.max(0) as u64;
+        let signed_events_u = signed_events.max(0) as u64;
+        let signature_coverage_pct = if total_events_u == 0 {
+            0.0
+        } else {
+            (signed_events_u as f64 / total_events_u as f64) * 100.0
+        };
+
+        return Ok(CryptoStatusSummary {
+            total_events: total_events_u,
+            signed_events: signed_events_u,
+            signature_coverage_pct,
+            verification_failures: 0,
+            active_key_id,
+            merkle_batches: merkle_batches.max(0) as u64,
+            latest_batch_id: latest_batch.as_ref().map(|v| v.0.clone()),
+            latest_root_hash: latest_batch.as_ref().map(|v| v.1.clone()),
+            latest_signer_did: latest_batch.as_ref().map(|v| v.2.clone()),
+            latest_sealed_at: latest_batch.as_ref().map(|v| v.3.clone()),
+        });
+    }
 
     let total_events: i64 = conn
         .query_row("SELECT COUNT(*) FROM wrap_events", [], |row| row.get(0))
@@ -1181,6 +1339,7 @@ fn project_sqlite_exchange_rows(tx: &rusqlite::Transaction<'_>) -> std::io::Resu
             continue;
         };
         update_rollup_1m_from_exchange(tx, &event)?;
+        upsert_cluster_from_exchange(tx, seq, &event)?;
         projected_seq = seq.max(projected_seq);
     }
 
@@ -1453,6 +1612,52 @@ fn update_rollup_1m_from_exchange(
             pii_events,
             total_tokens,
             total_cost
+        ],
+    )
+    .map_err(to_io_err)?;
+
+    Ok(())
+}
+
+fn upsert_cluster_from_exchange(
+    tx: &rusqlite::Transaction<'_>,
+    seq: i64,
+    event: &ExchangeEventV2,
+) -> std::io::Result<()> {
+    let source = match event.source_class {
+        ExchangeSourceClass::AiInference => "ai_proxy",
+        ExchangeSourceClass::AgentApp => "agent_app",
+        ExchangeSourceClass::Mcp => "mcp",
+        ExchangeSourceClass::Collector => "agent_app",
+    };
+    let status_code = event.status_code.map(i64::from);
+    let latency_ms = event.duration_ms.map(|value| value as i64);
+    let pii_detected = if event.flags.pii_detected { 1_i64 } else { 0_i64 };
+
+    tx.execute(
+        r#"
+        INSERT OR REPLACE INTO event_clusters (
+            cluster_id, request_event_id, response_event_id, request_seq, response_seq,
+            timestamp, source, provider, agent, method, status_code, latency_ms,
+            policy_allowed, pii_detected
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+        params![
+            event.exchange_id,
+            event.exchange_id,
+            event.exchange_id,
+            seq,
+            Some(seq),
+            event.observed_at.to_rfc3339(),
+            source,
+            event.provider.as_deref(),
+            event.agent.as_deref(),
+            event.method.as_deref(),
+            status_code,
+            latency_ms,
+            Option::<i64>::None,
+            pii_detected
         ],
     )
     .map_err(to_io_err)?;
@@ -1854,8 +2059,160 @@ fn read_sqlite_event_payload(
                 _ => None,
             })
         }
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            let mut exchange_stmt = conn
+                .prepare(
+                    r#"
+                    SELECT event_json
+                    FROM exchange_events
+                    WHERE exchange_id = ?1
+                    LIMIT 1
+                    "#,
+                )
+                .map_err(to_io_err)?;
+            let exchange_json =
+                exchange_stmt.query_row([event_id], |row| row.get::<_, String>(0));
+            match exchange_json {
+                Ok(json) => {
+                    let exchange = serde_json::from_str::<ExchangeEventV2>(&json).map_err(
+                        |error| std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )?;
+                    Ok(match payload_kind {
+                        "request" => exchange
+                            .request
+                            .body
+                            .inline
+                            .or(exchange.request.body.preview),
+                        "response" => exchange
+                            .response
+                            .body
+                            .inline
+                            .or(exchange.response.body.preview),
+                        "content" => exchange
+                            .response
+                            .body
+                            .inline
+                            .or(exchange.response.body.preview)
+                            .or(exchange.request.body.inline)
+                            .or(exchange.request.body.preview),
+                        _ => None,
+                    })
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(to_io_err(error)),
+            }
+        }
         Err(error) => Err(to_io_err(error)),
+    }
+}
+
+fn has_exchange_rows_conn(conn: &Connection) -> std::io::Result<bool> {
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'exchange_events' LIMIT 1",
+            [],
+            |_row| Ok(true),
+        )
+        .optional()
+        .map_err(to_io_err)?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(false);
+    }
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM exchange_events", [], |row| row.get(0))
+        .map_err(to_io_err)?;
+    Ok(count > 0)
+}
+
+fn exchange_to_wrap_event(seq: i64, event: ExchangeEventV2) -> WrapEvent {
+    let source = match event.source_class {
+        ExchangeSourceClass::AiInference => EventSource::AiProxy,
+        ExchangeSourceClass::AgentApp => EventSource::AgentApp,
+        ExchangeSourceClass::Mcp => EventSource::Mcp,
+        ExchangeSourceClass::Collector => EventSource::AgentApp,
+    };
+    let server_name = event
+        .endpoint
+        .as_deref()
+        .and_then(extract_host_from_endpoint)
+        .or_else(|| event.provider.clone())
+        .unwrap_or_else(|| "exchange".to_string());
+    let direction = if event.status_code.is_some() {
+        WrapDirection::Out
+    } else {
+        WrapDirection::In
+    };
+    let agent_name = event.agent.clone().unwrap_or_else(|| "Unknown".to_string());
+    let mut wrapped = WrapEvent::new(
+        event
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "exchange".to_string()),
+        server_name,
+        direction,
+        AgentInfo::new(agent_name, DetectionSource::Unknown),
+    )
+    .with_source(source);
+    wrapped.id = event.exchange_id.clone();
+    wrapped.seq = Some(seq);
+    wrapped.timestamp = event.observed_at;
+    if let Some(provider) = event.provider {
+        wrapped.provider = Some(provider);
+    }
+    if let Some(model) = event.model {
+        wrapped.model = Some(model);
+    }
+    if let Some(method) = event.method.clone() {
+        if let Some(endpoint) = event.endpoint.clone() {
+            wrapped.method = Some(format!("{method} {endpoint}"));
+        } else {
+            wrapped.method = Some(method);
+        }
+    } else {
+        wrapped.method = event.endpoint.clone();
+    }
+    wrapped.status_code = event.status_code;
+    wrapped.input_tokens = event.usage.input_tokens;
+    wrapped.output_tokens = event.usage.output_tokens;
+    wrapped.cache_read_tokens = event.usage.cache_read_tokens;
+    wrapped.cache_write_tokens = event.usage.cache_write_tokens;
+    wrapped.reasoning_tokens = event.usage.reasoning_tokens;
+    wrapped.token_count = Some(event.usage.input_tokens.unwrap_or(0) + event.usage.output_tokens.unwrap_or(0));
+    wrapped.cost_usd = event.cost.as_ref().map(|value| value.estimated_usd);
+    wrapped.request_size_bytes = event.request.body.bytes_raw;
+    wrapped.response_size_bytes = event.response.body.bytes_raw;
+    wrapped.request_preview = event.request.body.preview.clone();
+    wrapped.response_preview = event.response.body.preview.clone();
+    wrapped.request_content = event.request.body.inline.clone();
+    wrapped.response_content = event.response.body.inline.clone();
+    wrapped.request_content_ref = event.request.body.reference.clone();
+    wrapped.response_content_ref = event.response.body.reference.clone();
+    wrapped.pii_detected = event.flags.pii_detected;
+    wrapped.latency_ms = event.duration_ms.or(event.ttfb_ms);
+    wrapped.tags = event.tags;
+    wrapped.headers = event.request.headers.or(event.response.headers);
+    wrapped
+}
+
+fn extract_host_from_endpoint(endpoint: &str) -> Option<String> {
+    let value = endpoint.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with('/') {
+        return None;
+    }
+    let rest = if let Some((_, rest)) = value.split_once("://") {
+        rest
+    } else {
+        value
+    };
+    let host = rest.split('/').next().unwrap_or_default().trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 
