@@ -9,6 +9,8 @@
 //!   soth login                   - Store cloud API credentials locally
 //!   soth tui                     - Interactive TUI dashboard
 //!   soth attach                  - Attach TUI to a running proxy
+//!   soth proxy api start         - Start local API/WebSocket service
+//!   soth proxy ui start          - Start local UI dev service
 //!   soth identity generate       - Generate a new keypair
 //!   soth identity list           - List trusted agents
 //!   soth identity trust <did>    - Add DID to trust store

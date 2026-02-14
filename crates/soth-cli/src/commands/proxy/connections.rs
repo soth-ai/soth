@@ -1,6 +1,6 @@
 //! Proxy connections command
 //!
-//! Displays active connections from the running proxy.
+//! Displays active connections from the running proxy API service.
 
 use crate::cli_config;
 use crate::style;
@@ -67,12 +67,12 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             );
         }
         Err(e) => {
-            style::error("Could not connect to dashboard");
+            style::error("Could not connect to API service");
             eprintln!();
             style::kv("URL", &url);
             eprintln!();
-            style::info("Make sure the proxy is running with dashboard enabled:");
-            println!("  soth proxy start");
+            style::info("Start the API service:");
+            println!("  soth proxy api start --port {}", port);
             eprintln!();
             anyhow::bail!("Connection failed: {}", e);
         }

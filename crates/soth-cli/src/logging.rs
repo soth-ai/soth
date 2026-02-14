@@ -37,6 +37,7 @@ pub fn use_ansi_colors() -> bool {
 }
 
 /// Pause/resume formatted stdout log emission (used while TUI owns the screen).
+#[allow(dead_code)]
 pub fn set_log_output_paused(paused: bool) {
     LOG_OUTPUT_PAUSED.store(paused, Ordering::Relaxed);
 }

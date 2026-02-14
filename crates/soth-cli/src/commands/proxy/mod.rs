@@ -4,7 +4,9 @@
 //! - `soth proxy on` - Enable system proxy (route traffic through SOTH)
 //! - `soth proxy off` - Disable system proxy (direct connections)
 //! - `soth proxy setup-ca` - Generate CA certificate
-//! - `soth proxy start` - Start the soth proxy
+//! - `soth proxy start` - Start sensor-only proxy runtime
+//! - `soth proxy api start` - Start API/WebSocket service
+//! - `soth proxy ui start` - Start UI dev service
 //! - `soth proxy env` - Output environment variables
 //! - `soth proxy status` - Show proxy status
 //! - `soth proxy ca-info` - Show CA certificate info
@@ -19,26 +21,17 @@ mod circuit;
 mod connections;
 mod env;
 mod metrics;
+mod api;
 mod ratelimit;
 mod retention;
 mod setup_ca;
 mod start;
 mod status;
 mod system;
+mod ui;
 
-use clap::{Subcommand, ValueEnum};
+use clap::Subcommand;
 use std::path::PathBuf;
-
-/// UI mode for `proxy start`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum StartUiMode {
-    /// Auto-select TUI when terminal supports it, otherwise use logs.
-    Auto,
-    /// Force interactive TUI.
-    Tui,
-    /// Force plain log output.
-    Logs,
-}
 
 /// Proxy subcommands
 #[derive(Subcommand)]
@@ -68,7 +61,7 @@ pub enum ProxyCommands {
         output: Option<String>,
     },
 
-    /// Start the soth proxy
+    /// Start the sensor-only soth proxy
     Start {
         /// Port to listen on
         #[arg(short, long)]
@@ -78,13 +71,21 @@ pub enum ProxyCommands {
         #[arg(short, long)]
         config: Option<PathBuf>,
 
-        /// Startup UI mode (auto, tui, logs)
-        #[arg(long, value_enum, default_value_t = StartUiMode::Auto)]
-        ui: StartUiMode,
-
         /// Suppress startup banner and helper lines
         #[arg(short, long)]
         quiet: bool,
+    },
+
+    /// API service management (HTTP + WebSocket)
+    Api {
+        #[command(subcommand)]
+        action: ApiAction,
+    },
+
+    /// UI service management
+    Ui {
+        #[command(subcommand)]
+        action: UiAction,
     },
 
     /// Output shell environment variables for proxy configuration
@@ -148,6 +149,48 @@ pub enum ProxyCommands {
     },
 }
 
+/// API service actions
+#[derive(Subcommand)]
+pub enum ApiAction {
+    /// Start API service
+    Start {
+        /// API port override (uses configured port when omitted)
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Suppress startup helper lines
+        #[arg(short, long)]
+        quiet: bool,
+    },
+}
+
+/// UI service actions
+#[derive(Subcommand)]
+pub enum UiAction {
+    /// Start UI dev service
+    Start {
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// API port override used for NEXT_PUBLIC_SOTH_API_BASE/WS
+        #[arg(long)]
+        api_port: Option<u16>,
+
+        /// UI working directory (defaults to ./dashboard)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Suppress startup helper lines
+        #[arg(short, long)]
+        quiet: bool,
+    },
+}
+
 /// Circuit breaker actions
 #[derive(Subcommand)]
 pub enum CircuitAction {
@@ -189,9 +232,23 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
         ProxyCommands::Start {
             port,
             config,
-            ui,
             quiet,
-        } => start::run(port, config.or(global_config.clone()), ui, quiet).await,
+        } => start::run(port, config.or(global_config.clone()), quiet).await,
+        ProxyCommands::Api { action } => match action {
+            ApiAction::Start {
+                port,
+                config,
+                quiet,
+            } => api::run_start(port, config.or(global_config.clone()), quiet).await,
+        },
+        ProxyCommands::Ui { action } => match action {
+            UiAction::Start {
+                config,
+                api_port,
+                dir,
+                quiet,
+            } => ui::run_start(config.or(global_config.clone()), api_port, dir, quiet).await,
+        },
         ProxyCommands::Env {
             shell,
             ca_only,

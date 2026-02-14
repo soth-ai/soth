@@ -5,25 +5,16 @@ use crate::commands::cloud_hooks;
 use crate::commands::enforcement;
 use crate::commands::proxy::retention;
 use crate::commands::proxy::system;
-use crate::commands::proxy::StartUiMode;
-use crate::commands::tui::{self, TuiArgs};
-use crate::logging;
 use crate::style;
-use anyhow::Context;
 use console::Term;
 use owo_colors::OwoColorize;
 use soth_collector::CollectorRuntime;
 use soth_core::config::{HostFilterMode, ObserveCollectorConfig, SothConfig};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
-use soth_dashboard::server::DashboardServer;
-use soth_dashboard::DashboardState;
 use soth_proxy::metrics;
 use soth_proxy::transport::hudsucker_proxy;
-use std::fs::OpenOptions;
-use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -40,23 +31,15 @@ const SOTH_PROXY_ASCII: &[&str] = &[
 const SOTH_ACCENT: (u8, u8, u8) = (0xD9, 0x77, 0x57);
 const SOTH_MUTED: (u8, u8, u8) = (0x9F, 0x9F, 0x9F);
 const SOTH_TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
-const DEFAULT_DASHBOARD_UI_DIR: &str = "dashboard";
-const DEFAULT_DASHBOARD_UI_URL: &str = "http://localhost:3002";
-const DEFAULT_DASHBOARD_UI_LOG_FILE: &str = "dashboard-ui-dev.log";
 
 /// Run the start command
 pub async fn run(
     port: Option<u16>,
     config_path: Option<PathBuf>,
-    ui_mode: StartUiMode,
     quiet: bool,
 ) -> anyhow::Result<()> {
     let mut config = cli_config::load_effective_config(config_path.as_ref(), None)?;
     cloud_hooks::apply_cached_controls(&mut config)?;
-    let resolved_ui = resolve_ui_mode(ui_mode, &config, quiet);
-    if matches!(ui_mode, StartUiMode::Tui) && matches!(resolved_ui, StartUiMode::Logs) && !quiet {
-        style::warning("Dashboard API is disabled in config; falling back to log mode.");
-    }
 
     // Override port if specified
     let mut proxy_config = config.forward_proxy.clone();
@@ -137,11 +120,6 @@ pub async fn run(
             Err(_) => (None, "disabled".to_string()),
         };
 
-    let dashboard_display = if config.dashboard.enabled {
-        format!("http://localhost:{}", config.dashboard.port)
-    } else {
-        "disabled".to_string()
-    };
     let runtime_line = format!(
         "soth proxy | {} | {} | {}",
         proxy_config.registry_mode,
@@ -155,7 +133,11 @@ pub async fn run(
         proxy_config.hosts.agent_apps.len(),
         intercept_count
     );
-    let dashboard_line = format!("{dashboard_display}   Events {event_logging_status}");
+    let api_line = format!(
+        "off (run `soth proxy api start --port {}` to enable)",
+        config.dashboard.port
+    );
+    let ui_line = "off (run `soth proxy ui start` to enable)".to_string();
     let system_proxy_line = format!("enabled @ 127.0.0.1:{}", proxy_config.port);
 
     // Initialize Prometheus metrics
@@ -169,125 +151,31 @@ pub async fn run(
             &intercept_summary,
             "eval $(soth proxy env)",
             &compact_path(&ca_cert_path),
-            &dashboard_line,
+            &api_line,
+            &ui_line,
+            &event_logging_status,
             &system_proxy_line,
         );
-
-        if matches!(resolved_ui, StartUiMode::Logs) {
-            // Ready message (log mode)
-            println!(
-                "{} {}  |  AI/MCP → {}  |  Other → {}  |  {}",
-                style::CHECK.green(),
-                "Ready".bold(),
-                "MITM".cyan(),
-                "blind tunnel".dimmed(),
-                "Ctrl+C to stop".dimmed()
-            );
-            println!();
-        } else {
-            // TUI mode handoff message
-            println!(
-                "{} {}  |  {}",
-                style::CHECK.green(),
-                "Ready checks passed".bold(),
-                "Launching TUI…".cyan()
-            );
-            println!();
-        }
+        println!(
+            "{} {}  |  AI/MCP → {}  |  Other → {}  |  {}",
+            style::CHECK.green(),
+            "Ready".bold(),
+            "MITM".cyan(),
+            "blind tunnel".dimmed(),
+            "Ctrl+C to stop".dimmed()
+        );
+        println!();
     }
 
-    let dashboard_ui_process = if config.dashboard.enabled {
-        let dashboard_ui_dir = PathBuf::from(DEFAULT_DASHBOARD_UI_DIR);
-        match spawn_dashboard_ui_process(
-            &dashboard_ui_dir,
-            config.dashboard.port,
-            DEFAULT_DASHBOARD_UI_URL,
-            quiet,
-        ) {
-            Ok(child) => Some(child),
-            Err(error) => {
-                if !quiet {
-                    style::warning(&format!(
-                        "Failed to start dashboard UI dev server: {}",
-                        error
-                    ));
-                    style::info("Continuing with proxy only.");
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    match resolved_ui {
-        StartUiMode::Tui => {
-            if !quiet && matches!(ui_mode, StartUiMode::Auto) {
-                style::info("Launching interactive TUI (auto mode).");
-            }
-            run_forward_proxy_with_tui(
-                &config,
-                proxy_config,
-                ca_cert_path,
-                ca_key_path,
-                event_logger,
-                dashboard_ui_process,
-                quiet,
-            )
-            .await
-        }
-        StartUiMode::Logs | StartUiMode::Auto => {
-            run_forward_proxy(
-                &config,
-                proxy_config,
-                ca_cert_path,
-                ca_key_path,
-                event_logger,
-                dashboard_ui_process,
-                quiet,
-            )
-            .await
-        }
-    }
-}
-
-fn resolve_ui_mode(requested: StartUiMode, config: &SothConfig, quiet: bool) -> StartUiMode {
-    match requested {
-        StartUiMode::Auto => {
-            if quiet {
-                StartUiMode::Logs
-            } else if config.dashboard.enabled && terminal_supports_tui() {
-                StartUiMode::Tui
-            } else {
-                StartUiMode::Logs
-            }
-        }
-        StartUiMode::Tui => {
-            if config.dashboard.enabled {
-                StartUiMode::Tui
-            } else {
-                StartUiMode::Logs
-            }
-        }
-        StartUiMode::Logs => StartUiMode::Logs,
-    }
-}
-
-fn terminal_supports_tui() -> bool {
-    if !std::io::stdout().is_terminal() || !std::io::stderr().is_terminal() {
-        return false;
-    }
-
-    if std::env::var_os("CI").is_some() {
-        return false;
-    }
-
-    let term = std::env::var("TERM").unwrap_or_default();
-    if term.eq_ignore_ascii_case("dumb") || term.is_empty() {
-        return false;
-    }
-
-    true
+    run_forward_proxy(
+        &config,
+        proxy_config,
+        ca_cert_path,
+        ca_key_path,
+        event_logger,
+        quiet,
+    )
+    .await
 }
 
 fn render_startup_panel(
@@ -296,7 +184,9 @@ fn render_startup_panel(
     intercept: &str,
     env_line: &str,
     ca_path: &str,
-    dashboard_line: &str,
+    api_line: &str,
+    ui_line: &str,
+    events_line: &str,
     system_proxy_line: &str,
 ) {
     let term_width = Term::stdout().size().1 as usize;
@@ -308,7 +198,9 @@ fn render_startup_panel(
     print_panel_kv_row(inner_width, "Intercept", intercept);
     print_panel_kv_row(inner_width, "Env", env_line);
     print_panel_kv_row(inner_width, "CA", ca_path);
-    print_panel_kv_row(inner_width, "Dashboard", dashboard_line);
+    print_panel_kv_row(inner_width, "API", api_line);
+    print_panel_kv_row(inner_width, "UI", ui_line);
+    print_panel_kv_row(inner_width, "Events", events_line);
     print_panel_kv_row(inner_width, "System", system_proxy_line);
 
     print_panel_bottom(inner_width);
@@ -433,8 +325,6 @@ struct ProxyRuntime {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     proxy_task: JoinHandle<anyhow::Result<()>>,
     event_logger: Option<EventLogger>,
-    dashboard_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    dashboard_task: Option<JoinHandle<()>>,
     retention_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     retention_task: Option<JoinHandle<()>>,
     cloud_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -450,10 +340,8 @@ async fn run_forward_proxy(
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
     event_logger: Option<EventLogger>,
-    dashboard_ui_process: Option<Child>,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    logging::set_log_output_paused(false);
     let runtime = match spawn_proxy_runtime(
         config,
         proxy_config,
@@ -467,8 +355,6 @@ async fn run_forward_proxy(
             return Err(error);
         }
     };
-    let mut dashboard_shutdown_tx = runtime.dashboard_shutdown_tx;
-    let mut dashboard_task = runtime.dashboard_task;
     let mut retention_shutdown_tx = runtime.retention_shutdown_tx;
     let mut retention_task = runtime.retention_task;
     let mut cloud_shutdown_tx = runtime.cloud_shutdown_tx;
@@ -508,17 +394,6 @@ async fn run_forward_proxy(
         shutdown_timeout,
     )
     .await;
-    shutdown_dashboard_runtime(
-        &mut dashboard_shutdown_tx,
-        &mut dashboard_task,
-        quiet,
-        shutdown_timeout,
-    )
-    .await;
-
-    if let Some(mut child) = dashboard_ui_process {
-        stop_dashboard_ui_process(&mut child);
-    }
     disable_system_proxy_after_run(quiet).await;
 
     match result {
@@ -528,121 +403,6 @@ async fn run_forward_proxy(
             }
             Ok(())
         }
-        Err(e) => {
-            style::error(&format!("Proxy error: {}", e));
-            Err(anyhow::anyhow!("Proxy error: {}", e))
-        }
-    }
-}
-
-async fn run_forward_proxy_with_tui(
-    config: &SothConfig,
-    proxy_config: soth_core::config::ForwardProxyConfig,
-    ca_cert_path: PathBuf,
-    ca_key_path: PathBuf,
-    event_logger: Option<EventLogger>,
-    dashboard_ui_process: Option<Child>,
-    quiet: bool,
-) -> anyhow::Result<()> {
-    let dashboard_port = config.dashboard.port;
-    let runtime = match spawn_proxy_runtime(
-        config,
-        proxy_config,
-        ca_cert_path,
-        ca_key_path,
-        event_logger,
-    ) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            disable_system_proxy_after_run(quiet).await;
-            return Err(error);
-        }
-    };
-    let mut shutdown_tx = Some(runtime.shutdown_tx);
-    let mut proxy_task = runtime.proxy_task;
-    let mut dashboard_shutdown_tx = runtime.dashboard_shutdown_tx;
-    let mut dashboard_task = runtime.dashboard_task;
-    let mut retention_shutdown_tx = runtime.retention_shutdown_tx;
-    let mut retention_task = runtime.retention_task;
-    let mut cloud_shutdown_tx = runtime.cloud_shutdown_tx;
-    let mut cloud_task = runtime.cloud_task;
-    let mut collector_shutdown_tx = runtime.collector_shutdown_tx;
-    let mut collector_task = runtime.collector_task;
-    let mut event_logger = runtime.event_logger;
-    let shutdown_timeout = runtime_shutdown_timeout(config);
-
-    // Pause stdout logs before waiting + entering alternate screen to avoid overlap.
-    logging::set_log_output_paused(true);
-
-    if !wait_for_dashboard_ready(dashboard_port, Duration::from_secs(25)).await && !quiet {
-        style::warning("Dashboard API not ready yet; opening TUI and retrying in background.");
-    }
-
-    let tui_result = tui::run(TuiArgs {
-        api_url: format!("http://127.0.0.1:{dashboard_port}"),
-        refresh: 2,
-    })
-    .await;
-    logging::set_log_output_paused(false);
-
-    match tui_result {
-        Ok(()) => {
-            if !quiet {
-                style::info("TUI closed. Proxy is still running (log mode). Press Ctrl+C to stop.");
-            }
-        }
-        Err(error) => {
-            if !quiet {
-                style::warning(&format!(
-                    "TUI exited with error: {}. Continuing in log mode; press Ctrl+C to stop.",
-                    error
-                ));
-            }
-        }
-    }
-
-    // Keep proxy alive after TUI exits; stop only on Ctrl+C or runtime termination.
-    let result = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            if let Some(tx) = shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-            proxy_task.await.context("proxy runtime task join failed")?
-        }
-        join_result = &mut proxy_task => {
-            join_result.context("proxy runtime task join failed")?
-        }
-    };
-
-    shutdown_collector_runtime(
-        &mut collector_shutdown_tx,
-        &mut collector_task,
-        shutdown_timeout,
-    )
-    .await;
-    flush_local_event_buffers(&mut event_logger, shutdown_timeout, quiet).await;
-    shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task, shutdown_timeout).await;
-    shutdown_retention_runtime(
-        &mut retention_shutdown_tx,
-        &mut retention_task,
-        shutdown_timeout,
-    )
-    .await;
-    shutdown_dashboard_runtime(
-        &mut dashboard_shutdown_tx,
-        &mut dashboard_task,
-        quiet,
-        shutdown_timeout,
-    )
-    .await;
-
-    if let Some(mut child) = dashboard_ui_process {
-        stop_dashboard_ui_process(&mut child);
-    }
-    disable_system_proxy_after_run(quiet).await;
-
-    match result {
-        Ok(()) => Ok(()),
         Err(e) => {
             style::error(&format!("Proxy error: {}", e));
             Err(anyhow::anyhow!("Proxy error: {}", e))
@@ -666,32 +426,6 @@ fn spawn_proxy_runtime(
     let _policy_reload_task = enforcer
         .policy_engine()
         .and_then(|engine| enforcement::spawn_policy_hot_reload(config, engine));
-
-    let dashboard_state = if let Some(path) = event_db_path.as_deref() {
-        DashboardState::new_with_rollup_warm_start(path)
-    } else {
-        DashboardState::new()
-    };
-
-    let mut dashboard_shutdown_tx = None;
-    let mut dashboard_task = None;
-    if config.dashboard.enabled {
-        let state_clone = dashboard_state.clone();
-        let dashboard_port = config.dashboard.port;
-        let (dashboard_tx, dashboard_rx) = tokio::sync::oneshot::channel::<()>();
-        dashboard_shutdown_tx = Some(dashboard_tx);
-        dashboard_task = Some(tokio::spawn(async move {
-            let server = DashboardServer::new(state_clone, dashboard_port).with_event_store();
-            if let Err(e) = server
-                .run_with_shutdown(async move {
-                    let _ = dashboard_rx.await;
-                })
-                .await
-            {
-                tracing::error!("Dashboard server error: {}", e);
-            }
-        }));
-    }
 
     let mut retention_shutdown_tx = None;
     let mut retention_task = None;
@@ -733,7 +467,7 @@ fn spawn_proxy_runtime(
             async move {
                 shutdown_rx.await.ok();
             },
-            Some(dashboard_state),
+            None,
             event_logger,
             Some(enforcer),
             Some(observe_config),
@@ -748,8 +482,6 @@ fn spawn_proxy_runtime(
         shutdown_tx,
         proxy_task: handle,
         event_logger: shutdown_event_logger,
-        dashboard_shutdown_tx,
-        dashboard_task,
         retention_shutdown_tx,
         retention_task,
         cloud_shutdown_tx,
@@ -808,229 +540,6 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
         "SOTH_COLLECTOR_EVENT_SOURCE",
         collector.event_source.clone(),
     );
-}
-
-async fn wait_for_dashboard_ready(port: u16, timeout: Duration) -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .no_proxy()
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-
-    let url = format!("http://127.0.0.1:{port}/readyz");
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(response) = client.get(&url).send().await {
-            if response.status().is_success() {
-                return true;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(120)).await;
-    }
-    false
-}
-
-fn spawn_dashboard_ui_process(
-    dashboard_ui_dir: &std::path::Path,
-    dashboard_port: u16,
-    dashboard_ui_url: &str,
-    quiet: bool,
-) -> anyhow::Result<Child> {
-    if !dashboard_ui_dir.exists() {
-        anyhow::bail!(
-            "Dashboard UI directory not found: {}",
-            dashboard_ui_dir.display()
-        );
-    }
-
-    if !dashboard_ui_dir.join("package.json").exists() {
-        anyhow::bail!(
-            "No package.json found in dashboard UI directory: {}",
-            dashboard_ui_dir.display()
-        );
-    }
-
-    let (stdout_stdio, stderr_stdio, log_path) = match open_dashboard_ui_log_stdio() {
-        Ok((stdout, stderr, path)) => (stdout, stderr, Some(path)),
-        Err(error) => {
-            if !quiet {
-                style::warning(&format!(
-                    "Could not open dashboard UI log file: {}. Suppressing UI output.",
-                    error
-                ));
-            }
-            (Stdio::null(), Stdio::null(), None)
-        }
-    };
-
-    let mut cmd = Command::new(npm_executable());
-    cmd.arg("run")
-        .arg("dev")
-        .current_dir(dashboard_ui_dir)
-        .stdin(Stdio::null())
-        .stdout(stdout_stdio)
-        .stderr(stderr_stdio)
-        .env(
-            "NEXT_PUBLIC_SOTH_API_BASE",
-            format!("http://localhost:{}/api", dashboard_port),
-        )
-        .env(
-            "NEXT_PUBLIC_SOTH_WS_BASE",
-            format!("ws://localhost:{}", dashboard_port),
-        );
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    let child = cmd
-        .spawn()
-        .with_context(|| "failed to spawn dashboard UI dev server (`npm run dev`)")?;
-
-    if !quiet {
-        if let Some(log_path) = log_path {
-            style::info(&format!(
-                "Dashboard UI dev server: {} (PID {}, dir: {}, logs: {})",
-                dashboard_ui_url,
-                child.id(),
-                dashboard_ui_dir.display(),
-                log_path.display(),
-            ));
-        } else {
-            style::info(&format!(
-                "Dashboard UI dev server: {} (PID {}, dir: {})",
-                dashboard_ui_url,
-                child.id(),
-                dashboard_ui_dir.display(),
-            ));
-        }
-    }
-
-    Ok(child)
-}
-
-fn open_dashboard_ui_log_stdio() -> anyhow::Result<(Stdio, Stdio, PathBuf)> {
-    let log_path = dashboard_ui_log_path();
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create dashboard UI log directory: {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    let stdout_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| {
-            format!(
-                "failed to open dashboard UI log file: {}",
-                log_path.display()
-            )
-        })?;
-
-    let stderr_file = stdout_file.try_clone().with_context(|| {
-        format!(
-            "failed to clone dashboard UI log file: {}",
-            log_path.display()
-        )
-    })?;
-
-    Ok((Stdio::from(stdout_file), Stdio::from(stderr_file), log_path))
-}
-
-fn dashboard_ui_log_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        return home
-            .join(".soth")
-            .join("logs")
-            .join(DEFAULT_DASHBOARD_UI_LOG_FILE);
-    }
-
-    PathBuf::from(DEFAULT_DASHBOARD_UI_LOG_FILE)
-}
-
-fn stop_dashboard_ui_process(child: &mut Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
-        Err(error) => {
-            style::warning(&format!(
-                "Failed to check dashboard UI process status: {}",
-                error
-            ));
-            return;
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        let process_group = format!("-{}", child.id());
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(&process_group)
-            .status();
-        for _ in 0..10 {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(120)),
-                Err(_) => break,
-            }
-        }
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(&process_group)
-            .status();
-        if child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-    }
-
-    if let Err(error) = child.kill() {
-        style::warning(&format!("Failed to stop dashboard UI process: {}", error));
-        return;
-    }
-
-    if let Err(error) = child.wait() {
-        style::warning(&format!(
-            "Failed waiting for dashboard UI process shutdown: {}",
-            error
-        ));
-    }
-}
-
-async fn shutdown_dashboard_runtime(
-    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    dashboard_task: &mut Option<JoinHandle<()>>,
-    quiet: bool,
-    timeout_budget: Duration,
-) {
-    if let Some(tx) = shutdown_tx.take() {
-        let _ = tx.send(());
-    }
-
-    if let Some(mut task) = dashboard_task.take() {
-        match tokio::time::timeout(timeout_budget, &mut task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                if !quiet {
-                    style::warning(&format!("Dashboard task join error: {}", error));
-                }
-            }
-            Err(_) => {
-                task.abort();
-                if !quiet {
-                    style::warning("Dashboard server shutdown timed out; aborted task.");
-                }
-            }
-        }
-    }
 }
 
 async fn shutdown_retention_runtime(
@@ -1162,14 +671,6 @@ async fn flush_local_event_buffers(
                 style::warning("Timed out closing local event logger; continuing shutdown.");
             }
         }
-    }
-}
-
-fn npm_executable() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "npm.cmd"
-    } else {
-        "npm"
     }
 }
 
