@@ -43,12 +43,6 @@ blocked_edges=(
   "soth-sync->soth-dashboard"
 )
 
-# Transitional exception tracked for P1:
-# Remove this allow-list entry once API state emission is moved out of soth-proxy.
-transitional_edges=(
-  "soth-proxy->soth-dashboard"
-)
-
 echo "crate dependency edges:"
 echo "$edges" | sed 's/^/  - /'
 echo
@@ -58,12 +52,6 @@ for edge in "${blocked_edges[@]}"; do
   if has_edge "$edge"; then
     echo "error: blocked dependency edge present: $edge" >&2
     failed=1
-  fi
-done
-
-for edge in "${transitional_edges[@]}"; do
-  if has_edge "$edge"; then
-    echo "warn: transitional dependency edge still present: $edge" >&2
   fi
 done
 

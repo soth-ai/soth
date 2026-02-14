@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/soth-core",
+    "crates/soth-storage",
     "crates/soth-oisp",
     "crates/soth-oisp-types",
     "crates/soth-identity",
@@ -32,6 +33,7 @@ authors = ["Labterminal"]
 [workspace.dependencies]
 # Internal crates
 soth-core = { path = "crates/soth-core" }
+soth-storage = { path = "crates/soth-storage" }
 soth-oisp = { path = "crates/soth-oisp" }
 soth-oisp-types = { path = "crates/soth-oisp-types" }
 soth-identity = { path = "crates/soth-identity" }

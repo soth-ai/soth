@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::types::exchange_v2::{ExchangeEventV2, ExchangeSourceClass};
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
+use soth_storage::open_sqlite_read_write_with_timeout;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2236,10 +2237,7 @@ fn to_io_err(error: rusqlite::Error) -> std::io::Error {
 }
 
 fn open_sqlite_connection(db_path: &Path) -> std::io::Result<Connection> {
-    let conn = Connection::open(db_path).map_err(to_io_err)?;
-    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
-        .map_err(to_io_err)?;
-    Ok(conn)
+    open_sqlite_read_write_with_timeout(db_path, Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
 }
 
 fn is_sqlite_lock_error(error: &std::io::Error) -> bool {

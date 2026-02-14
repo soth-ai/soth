@@ -3750,6 +3750,7 @@ dependencies = [
  "serde_json",
  "soth-core",
  "soth-observe",
+ "soth-storage",
  "tempfile",
  "tokio",
  "tracing",
@@ -3774,6 +3775,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "soth-storage",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3796,6 +3798,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soth-core",
+ "soth-storage",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.21.0",
@@ -3936,6 +3939,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "soth-storage"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+]
+
+[[package]]
 name = "soth-sync"
 version = "0.1.0"
 dependencies = [
@@ -3953,6 +3963,7 @@ dependencies = [
  "soth-core",
  "soth-observe",
  "soth-oisp-types",
+ "soth-storage",
  "tempfile",
  "tokio",
  "tracing",
