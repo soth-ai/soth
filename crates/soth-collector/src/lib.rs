@@ -6,6 +6,8 @@ use rusqlite::{
     Connection, OpenFlags,
 };
 use serde::{Deserialize, Serialize};
+use soth_core::config::types::ExchangeV2Config;
+use soth_core::types::exchange_v2::ExchangeSourceClass;
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
 use soth_observe::PiiRedactor;
@@ -34,6 +36,7 @@ pub struct CollectorConfig {
     pub max_line_bytes: usize,
     pub agent_name: String,
     pub event_source: EventSource,
+    pub exchange_v2: ExchangeV2Config,
     pub sources: Vec<CollectorSource>,
     pub sqlite_sources: Vec<CollectorSqliteSource>,
 }
@@ -192,6 +195,7 @@ impl CollectorConfig {
             max_line_bytes,
             agent_name,
             event_source,
+            exchange_v2: ExchangeV2Config::default(),
             sources,
             sqlite_sources,
         })
@@ -282,8 +286,10 @@ fn parse_sqlite_sources_from_env() -> Vec<CollectorSqliteSource> {
 pub fn spawn_from_env(
     event_logger: EventLogger,
     global_tags: BTreeMap<String, String>,
+    exchange_v2: ExchangeV2Config,
 ) -> Option<CollectorRuntime> {
-    let config = CollectorConfig::from_env()?;
+    let mut config = CollectorConfig::from_env()?;
+    config.exchange_v2 = exchange_v2;
     Some(spawn_runtime(event_logger, global_tags, config))
 }
 
@@ -378,6 +384,19 @@ impl CollectorAgent {
             for source_line in outcome.lines {
                 if let Some(event) = self.build_event(source, source_line) {
                     logger.log(&event);
+                    if self.config.exchange_v2.enabled {
+                        if let Err(error) = logger.enqueue_exchange_from_wrap_event(
+                            &event,
+                            &self.config.exchange_v2,
+                            Some(ExchangeSourceClass::Collector),
+                        ) {
+                            warn!(
+                                event_id = %event.id,
+                                error = %error,
+                                "Collector failed to enqueue exchange.v2 payload"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -394,6 +413,19 @@ impl CollectorAgent {
             for source_line in outcome.lines {
                 if let Some(event) = self.build_sqlite_event(source, source_line) {
                     logger.log(&event);
+                    if self.config.exchange_v2.enabled {
+                        if let Err(error) = logger.enqueue_exchange_from_wrap_event(
+                            &event,
+                            &self.config.exchange_v2,
+                            Some(ExchangeSourceClass::Collector),
+                        ) {
+                            warn!(
+                                event_id = %event.id,
+                                error = %error,
+                                "Collector failed to enqueue exchange.v2 payload"
+                            );
+                        }
+                    }
                 }
             }
         }

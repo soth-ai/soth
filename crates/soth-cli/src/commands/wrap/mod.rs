@@ -8,13 +8,15 @@
 pub mod agent_detect;
 
 use crate::cli_config;
+use crate::commands::cloud_hooks;
 use crate::commands::enforcement;
 use anyhow::{Context, Result};
 use clap::Args;
 use soth_core::config::SothConfig;
 use soth_core::types::{AgentInfo, DetectionSource, TrafficEnvelope, WrapDirection, WrapEvent};
 use soth_core::{
-    generate_session_name, EventLogger, MessageDirection, SessionRecorder, SessionStorage,
+    generate_session_name, EventLogger, ExchangeSourceClass, MessageDirection, SessionRecorder,
+    SessionStorage,
 };
 use soth_proxy::pipeline::middleware::RequestContext as PipelineRequestContext;
 use soth_proxy::transport::pii_enrichment::PiiEventEnricher;
@@ -26,7 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{timeout, Duration};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Arguments for the wrap command
 #[derive(Args, Debug)]
@@ -70,6 +72,7 @@ struct WrapSession {
     server_name: String,
     agent: RwLock<AgentInfo>,
     event_logger: Option<EventLogger>,
+    exchange_v2: soth_core::config::types::ExchangeV2Config,
     request_contexts: RwLock<std::collections::HashMap<String, WrapRequestContext>>,
     enforcement: Option<Arc<WrapEnforcement>>,
     fail_open: bool,
@@ -133,6 +136,7 @@ impl WrapSession {
         server_name: String,
         agent: AgentInfo,
         event_logger: Option<EventLogger>,
+        exchange_v2: soth_core::config::types::ExchangeV2Config,
         enforcement: Option<Arc<WrapEnforcement>>,
         fail_open: bool,
         pii_enricher: PiiEventEnricher,
@@ -160,6 +164,7 @@ impl WrapSession {
             server_name,
             agent: RwLock::new(agent),
             event_logger,
+            exchange_v2,
             enforcement,
             fail_open,
             pii_enricher,
@@ -173,6 +178,19 @@ impl WrapSession {
             let mut event = event.clone();
             self.pii_enricher.enrich(&mut event);
             logger.log(&event);
+            if self.exchange_v2.enabled {
+                if let Err(error) = logger.enqueue_exchange_from_wrap_event(
+                    &event,
+                    &self.exchange_v2,
+                    Some(ExchangeSourceClass::Mcp),
+                ) {
+                    warn!(
+                        event_id = %event.id,
+                        error = %error,
+                        "Failed to enqueue wrap exchange.v2 payload"
+                    );
+                }
+            }
         }
     }
 
@@ -419,11 +437,14 @@ pub async fn run(args: WrapArgs) -> Result<()> {
             .context("Failed to initialize event logger")?,
         )
     };
+    let event_db_path = event_logger.as_ref().map(|logger| logger.path().clone());
+    let mut cloud_runtime = cloud_hooks::spawn_cloud_pull_runtime(&config, event_db_path);
 
     let session = Arc::new(WrapSession::new(
         server_name.clone(),
         initial_agent,
         event_logger,
+        config.exchange_v2.clone(),
         enforcement,
         fail_open,
         pii_enricher,
@@ -552,6 +573,11 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     // Finalize session recording if enabled
     if let Some(path) = session.finalize_recording().await? {
         eprintln!("Session saved to: {}", path.display());
+    }
+
+    if let Some(runtime) = cloud_runtime.take() {
+        let _ = runtime.shutdown_tx.send(());
+        let _ = runtime.task.await;
     }
 
     Ok(())

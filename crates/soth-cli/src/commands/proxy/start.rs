@@ -711,9 +711,11 @@ fn spawn_proxy_runtime(
     let mut collector_task = None;
     apply_collector_env_overrides(&config.observe.collector);
     if let Some(ref logger) = event_logger {
-        if let Some(CollectorRuntime { shutdown_tx, task }) =
-            soth_collector::spawn_from_env(logger.clone(), config.observe.event_tags.clone())
-        {
+        if let Some(CollectorRuntime { shutdown_tx, task }) = soth_collector::spawn_from_env(
+            logger.clone(),
+            config.observe.event_tags.clone(),
+            config.exchange_v2.clone(),
+        ) {
             collector_shutdown_tx = Some(shutdown_tx);
             collector_task = Some(task);
         }
@@ -774,7 +776,11 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
         let sources = collector
             .sources
             .iter()
-            .map(|source| cli_config::expand_tilde(&source.path).to_string_lossy().to_string())
+            .map(|source| {
+                cli_config::expand_tilde(&source.path)
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join(",");
         std::env::set_var("SOTH_COLLECTOR_SOURCES", sources);

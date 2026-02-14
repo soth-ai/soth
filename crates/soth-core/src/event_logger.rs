@@ -5,8 +5,13 @@
 //! Used by both `soth wrap` (stdio interception) and soth proxy (HTTP interception)
 //! to emit events that appear in the observability dashboard.
 
-use crate::config::types::CryptoIdentityConfig;
-use crate::types::WrapEvent;
+use crate::config::types::{CryptoIdentityConfig, ExchangeV2Config};
+use crate::types::exchange_v2::{
+    ExchangeBody, ExchangeBodyMode, ExchangeClient, ExchangeCost, ExchangeEventV2, ExchangeFlags,
+    ExchangeIntegrity, ExchangeParse, ExchangeSide, ExchangeSourceClass, ExchangeTransport,
+    ExchangeUsage,
+};
+use crate::types::{EventSource, WrapDirection, WrapEvent};
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
@@ -569,7 +574,11 @@ impl EventLogger {
     }
 
     /// Enqueue or refresh a finalized exchange upload payload.
-    pub fn enqueue_exchange_upload(&self, exchange_id: &str, payload_json: &str) -> std::io::Result<()> {
+    pub fn enqueue_exchange_upload(
+        &self,
+        exchange_id: &str,
+        payload_json: &str,
+    ) -> std::io::Result<()> {
         self.enqueue_exchange_upload_with_blobs(exchange_id, payload_json, None)
     }
 
@@ -612,6 +621,27 @@ impl EventLogger {
         )
         .map_err(to_io_err)?;
         Ok(())
+    }
+
+    /// Convert a [`WrapEvent`] into an `exchange.v2` payload and enqueue it for cloud upload.
+    ///
+    /// This is used by wrap/collector paths so they share the same cloud upload mechanism
+    /// as proxy traffic (`exchange_upload_queue` -> `/api/v1/exchanges/batch`).
+    pub fn enqueue_exchange_from_wrap_event(
+        &self,
+        event: &WrapEvent,
+        exchange_cfg: &ExchangeV2Config,
+        source_class_override: Option<ExchangeSourceClass>,
+    ) -> std::io::Result<()> {
+        if !exchange_cfg.enabled {
+            return Ok(());
+        }
+
+        let exchange_id = event.id.clone();
+        let payload = wrap_event_to_exchange_v2(event, exchange_cfg, source_class_override);
+        let payload_json = serde_json::to_string(&payload)
+            .map_err(|error| std::io::Error::other(format!("serialize exchange.v2: {error}")))?;
+        self.enqueue_exchange_upload(exchange_id.as_str(), payload_json.as_str())
     }
 
     /// List upload queue entries that are ready for dispatch.
@@ -1349,6 +1379,294 @@ fn extract_exchange_observed_at(payload_json: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn wrap_event_to_exchange_v2(
+    event: &WrapEvent,
+    exchange_cfg: &ExchangeV2Config,
+    source_class_override: Option<ExchangeSourceClass>,
+) -> ExchangeEventV2 {
+    let source_class = source_class_override.unwrap_or_else(|| source_class_from_wrap_event(event));
+    let transport = transport_from_wrap_event(event);
+    let mut payload = ExchangeEventV2::new(
+        event.id.clone(),
+        source_class,
+        transport,
+        ExchangeBodyMode::MetadataOnly,
+        ExchangeBodyMode::MetadataOnly,
+    );
+
+    payload.session_id = Some(event.session_id.clone());
+    payload.observed_at = event.timestamp;
+    payload.started_at = Some(event.timestamp);
+    payload.completed_at = Some(event.timestamp);
+    payload.duration_ms = event.latency_ms;
+    payload.ttfb_ms = event.latency_ms;
+
+    payload.provider = event.provider.clone().or_else(|| {
+        event
+            .traffic_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.provider.clone())
+    });
+    payload.agent = Some(event.agent.name.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            event
+                .traffic_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.agent.clone())
+        });
+    payload.model = event.model.clone().or_else(|| {
+        event
+            .traffic_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.model.clone())
+    });
+    payload.endpoint = event
+        .traffic_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.path.clone())
+        .or_else(|| Some(event.server_name.clone()));
+    payload.method = event.method.clone().or_else(|| {
+        event
+            .traffic_envelope
+            .as_ref()
+            .map(|envelope| envelope.method.clone())
+    });
+    payload.status_code = event.status_code;
+    payload.client = exchange_client_from_wrap_event(event);
+
+    let request_text = event
+        .request_content
+        .as_deref()
+        .or_else(|| match event.direction {
+            WrapDirection::In => event.content.as_deref(),
+            WrapDirection::Out => None,
+        });
+    let response_text = event
+        .response_content
+        .as_deref()
+        .or_else(|| match event.direction {
+            WrapDirection::Out => event.content.as_deref(),
+            WrapDirection::In => None,
+        });
+
+    let (request_body, request_truncated) = exchange_body_from_text(
+        request_text,
+        event
+            .request_preview
+            .as_deref()
+            .or(event.content_preview.as_deref()),
+        event.request_size_bytes,
+        None,
+        exchange_cfg,
+    );
+    let (response_body, response_truncated) = exchange_body_from_text(
+        response_text,
+        event
+            .response_preview
+            .as_deref()
+            .or(event.content_preview.as_deref()),
+        event.response_size_bytes,
+        None,
+        exchange_cfg,
+    );
+
+    payload.request = ExchangeSide {
+        headers: if request_text.is_some() || event.request_content.is_some() {
+            event.headers.clone()
+        } else {
+            None
+        },
+        body: request_body,
+    };
+    payload.response = ExchangeSide {
+        headers: if response_text.is_some() || event.response_content.is_some() {
+            event.headers.clone()
+        } else {
+            None
+        },
+        body: response_body,
+    };
+
+    payload.usage = ExchangeUsage {
+        input_tokens: event.input_tokens,
+        output_tokens: event.output_tokens,
+        cache_read_tokens: event.cache_read_tokens,
+        cache_write_tokens: event.cache_write_tokens,
+        reasoning_tokens: event.reasoning_tokens,
+    };
+    payload.cost = event.cost_usd.map(|estimated_usd| ExchangeCost {
+        estimated_usd,
+        currency: "USD".to_string(),
+        pricing_version: None,
+    });
+    payload.flags = ExchangeFlags {
+        truncated: request_truncated || response_truncated,
+        metadata_only: payload.request.body.mode == ExchangeBodyMode::MetadataOnly
+            && payload.response.body.mode == ExchangeBodyMode::MetadataOnly,
+        discovery_capture: false,
+        blacklist_match: false,
+        pii_detected: event.pii_detected,
+    };
+    payload.integrity = Some(ExchangeIntegrity {
+        event_hash: event.event_hash.clone(),
+        signature: event
+            .traffic_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.signature.clone()),
+        signature_key_id: event
+            .traffic_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.key_id.clone()),
+    });
+    payload.parse = Some(ExchangeParse {
+        parser_version: Some("exchange_v2_wrap".to_string()),
+        bundle_version: None,
+        parse_confidence: None,
+        detection_reason: Some(format!("{:?}", event.agent.detected_from).to_ascii_lowercase()),
+    });
+    payload.tags = merge_exchange_tags(event);
+
+    payload
+}
+
+fn source_class_from_wrap_event(event: &WrapEvent) -> ExchangeSourceClass {
+    if event.collector_source.is_some() {
+        return ExchangeSourceClass::Collector;
+    }
+    match event.source {
+        EventSource::Mcp => ExchangeSourceClass::Mcp,
+        EventSource::AiProxy => ExchangeSourceClass::AiInference,
+        EventSource::AgentApp => ExchangeSourceClass::AgentApp,
+    }
+}
+
+fn transport_from_wrap_event(event: &WrapEvent) -> ExchangeTransport {
+    use crate::types::TrafficSource;
+
+    if let Some(envelope) = event.traffic_envelope.as_ref() {
+        return match envelope.source {
+            TrafficSource::McpStdio => ExchangeTransport::Stdio,
+            TrafficSource::McpHttp => ExchangeTransport::Jsonrpc,
+            TrafficSource::ProxyHudsucker => ExchangeTransport::Https,
+        };
+    }
+    if matches!(event.source, EventSource::Mcp) {
+        ExchangeTransport::Stdio
+    } else {
+        ExchangeTransport::Https
+    }
+}
+
+fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> {
+    let envelope = event.traffic_envelope.as_ref()?;
+    Some(ExchangeClient {
+        pid: envelope.process_pid,
+        bundle_id: None,
+        process_name: envelope.process_name.clone(),
+        app_type: event
+            .collector_source
+            .as_ref()
+            .map(|_| "collector".to_string()),
+        referrer_origin: None,
+    })
+}
+
+fn exchange_body_from_text(
+    text: Option<&str>,
+    preview: Option<&str>,
+    size_hint: Option<u64>,
+    content_type: Option<String>,
+    exchange_cfg: &ExchangeV2Config,
+) -> (ExchangeBody, bool) {
+    if let Some(value) = text {
+        let bytes = value.as_bytes();
+        if bytes.len() > exchange_cfg.max_body_bytes as usize {
+            return (
+                ExchangeBody {
+                    mode: ExchangeBodyMode::PreviewOnly,
+                    inline: None,
+                    reference: None,
+                    preview: Some(build_preview(value)),
+                    bytes_raw: Some(bytes.len() as u64),
+                    bytes_gzip: None,
+                    sha256: Some(hex_encode(&Sha256::digest(bytes))),
+                    content_type,
+                    truncated_reason: Some("max_body_bytes_exceeded".to_string()),
+                },
+                true,
+            );
+        }
+        return (
+            ExchangeBody {
+                mode: ExchangeBodyMode::Inline,
+                inline: Some(value.to_string()),
+                reference: None,
+                preview: None,
+                bytes_raw: Some(bytes.len() as u64),
+                bytes_gzip: None,
+                sha256: Some(hex_encode(&Sha256::digest(bytes))),
+                content_type,
+                truncated_reason: None,
+            },
+            false,
+        );
+    }
+
+    if let Some(preview) = preview {
+        return (
+            ExchangeBody {
+                mode: ExchangeBodyMode::PreviewOnly,
+                inline: None,
+                reference: None,
+                preview: Some(preview.to_string()),
+                bytes_raw: size_hint,
+                bytes_gzip: None,
+                sha256: None,
+                content_type,
+                truncated_reason: None,
+            },
+            false,
+        );
+    }
+
+    (
+        ExchangeBody {
+            mode: ExchangeBodyMode::MetadataOnly,
+            inline: None,
+            reference: None,
+            preview: None,
+            bytes_raw: size_hint,
+            bytes_gzip: None,
+            sha256: None,
+            content_type,
+            truncated_reason: None,
+        },
+        false,
+    )
+}
+
+fn merge_exchange_tags(event: &WrapEvent) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut tags = event.tags.clone().unwrap_or_default();
+    if let Some(source) = event.collector_source.as_ref() {
+        tags.entry("collector.source".to_string())
+            .or_insert_with(|| source.clone());
+    }
+    if let Some(offset) = event.collector_offset {
+        tags.entry("collector.offset".to_string())
+            .or_insert_with(|| offset.to_string());
+    }
+    if let Some(operation) = event.graphql_operation.as_ref() {
+        tags.entry("graphql.operation".to_string())
+            .or_insert_with(|| operation.clone());
+    }
+    if tags.is_empty() {
+        None
+    } else {
+        Some(tags)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1831,5 +2149,40 @@ mod tests {
         let ready_after_delete = logger.load_exchange_upload_queue_ready(10).unwrap();
         assert!(ready_after_delete.is_empty());
         logger.close();
+    }
+
+    #[test]
+    fn test_enqueue_exchange_from_wrap_event() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path).unwrap();
+
+        let mut cfg = ExchangeV2Config::default();
+        cfg.enabled = true;
+
+        let event = WrapEvent::new(
+            "session-wrap",
+            "mcp-server",
+            WrapDirection::In,
+            AgentInfo::new("claude-code", DetectionSource::CommandLine),
+        )
+        .with_source(EventSource::Mcp)
+        .with_method("tools/call")
+        .with_content(r#"{"jsonrpc":"2.0","method":"tools/call"}"#)
+        .with_usage_tokens(12, 34)
+        .with_cost(0.0042);
+
+        logger
+            .enqueue_exchange_from_wrap_event(&event, &cfg, Some(ExchangeSourceClass::Mcp))
+            .unwrap();
+
+        let ready = logger.load_exchange_upload_queue_ready(10).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].exchange_id, event.id);
+        assert!(ready[0].payload_json.contains("\"schema_version\":\"2.0\""));
+        assert!(ready[0].payload_json.contains("\"source_class\":\"mcp\""));
+        assert!(ready[0].payload_json.contains("\"method\":\"tools/call\""));
+        assert!(ready[0].payload_json.contains("\"input_tokens\":12"));
+        assert!(ready[0].payload_json.contains("\"output_tokens\":34"));
     }
 }
