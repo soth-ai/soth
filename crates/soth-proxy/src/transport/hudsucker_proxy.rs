@@ -1339,7 +1339,11 @@ fn source_class_for_pending(pending: &PendingRequest) -> ExchangeSourceClass {
     }
 }
 
-fn transport_for_pending(pending: &PendingRequest, is_stream: bool, is_sse: bool) -> ExchangeTransport {
+fn transport_for_pending(
+    pending: &PendingRequest,
+    is_stream: bool,
+    is_sse: bool,
+) -> ExchangeTransport {
     if pending.is_mcp_jsonrpc {
         return ExchangeTransport::Jsonrpc;
     }
@@ -1377,7 +1381,11 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
                 Some(format!(
                     "macos.{}",
                     app.chars()
-                        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '_' })
+                        .map(|ch| if ch.is_ascii_alphanumeric() {
+                            ch.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        })
                         .collect::<String>()
                         .trim_matches('_')
                 ))
@@ -1428,10 +1436,7 @@ fn finalize_and_enqueue_exchange_v2(
     assembler.set_route(
         pending.provider.clone(),
         pending.agent.map(|value| value.to_string()),
-        usage_meta
-            .model
-            .clone()
-            .or_else(|| pending.model.clone()),
+        usage_meta.model.clone().or_else(|| pending.model.clone()),
         Some(pending.path.clone()),
         Some(pending.method.clone()),
     );
@@ -1445,7 +1450,11 @@ fn finalize_and_enqueue_exchange_v2(
     assembler.set_request(
         pending.headers.clone(),
         pending.request_content_type.clone(),
-        pending.request_content.as_deref().unwrap_or_default().as_bytes(),
+        pending
+            .request_content
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
     );
     assembler.set_response_meta(
         response_headers,
@@ -1475,18 +1484,14 @@ fn finalize_and_enqueue_exchange_v2(
         assembler.mark_truncated("request_body_truncated");
     }
     if response_truncated {
-        assembler.mark_truncated(
-            response_truncated_reason.unwrap_or("response_body_truncated"),
-        );
+        assembler.mark_truncated(response_truncated_reason.unwrap_or("response_body_truncated"));
     }
     if let Some(envelope) = pending.envelope.as_ref() {
         assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
     }
     assembler.set_tags(tags.cloned());
 
-    let result = if response_truncated
-        && response_truncated_reason == Some("partial_timeout")
-    {
+    let result = if response_truncated && response_truncated_reason == Some("partial_timeout") {
         assembler.finalize_timeout_with_blobs()
     } else {
         assembler.finalize_complete_with_blobs()
@@ -1560,7 +1565,11 @@ fn seed_exchange_v2_spool(
     assembler.set_request(
         pending.headers.clone(),
         pending.request_content_type.clone(),
-        pending.request_content.as_deref().unwrap_or_default().as_bytes(),
+        pending
+            .request_content
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
     );
     assembler.set_discovery_capture(pending.catalog_discovery);
     assembler.set_parse(Some(ExchangeParse {
@@ -1584,11 +1593,9 @@ fn seed_exchange_v2_spool(
         }
     };
     let started_at = assembler.snapshot().started_at.to_rfc3339();
-    if let Err(error) = logger.upsert_exchange_spool(
-        &pending.exchange_id,
-        &snapshot_json,
-        &started_at,
-    ) {
+    if let Err(error) =
+        logger.upsert_exchange_spool(&pending.exchange_id, &snapshot_json, &started_at)
+    {
         warn!(
             exchange_id = %pending.exchange_id,
             error = %error,
@@ -2429,7 +2436,7 @@ impl HttpHandler for AiProxyHandler {
                         request_id,
                         PendingRequest {
                             request_id,
-                            exchange_id: format!("ex-{}", request_id),
+                            exchange_id: uuid::Uuid::new_v4().to_string(),
                             envelope: Some(envelope),
                             host: host.clone(),
                             path: display_path.clone(),
@@ -2510,7 +2517,7 @@ impl HttpHandler for AiProxyHandler {
                     request_id,
                     PendingRequest {
                         request_id,
-                        exchange_id: format!("ex-{}", request_id),
+                        exchange_id: uuid::Uuid::new_v4().to_string(),
                         envelope: Some(apply_process_identity(
                             TrafficEnvelope::mcp_http(
                                 &session_id,

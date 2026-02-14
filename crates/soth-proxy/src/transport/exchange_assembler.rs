@@ -157,7 +157,10 @@ impl ExchangeAssembler {
         }
     }
 
-    pub fn from_snapshot(cfg: ExchangeAssemblerConfig, snapshot: ExchangeAssemblerSnapshot) -> Self {
+    pub fn from_snapshot(
+        cfg: ExchangeAssemblerConfig,
+        snapshot: ExchangeAssemblerSnapshot,
+    ) -> Self {
         Self {
             cfg,
             state: snapshot,
@@ -252,7 +255,9 @@ impl ExchangeAssembler {
         if chunk.len() <= remaining {
             self.state.response_body.extend_from_slice(chunk);
         } else {
-            self.state.response_body.extend_from_slice(&chunk[..remaining]);
+            self.state
+                .response_body
+                .extend_from_slice(&chunk[..remaining]);
             self.mark_truncated("stream_buffer_limit_reached");
         }
     }
@@ -365,11 +370,9 @@ impl ExchangeAssembler {
         event.duration_ms = state
             .completed_at
             .map(|completed| (completed - state.started_at).num_milliseconds().max(0) as u64);
-        event.ttfb_ms = state.first_response_at.map(|first| {
-            (first - state.started_at)
-                .num_milliseconds()
-                .max(0) as u64
-        });
+        event.ttfb_ms = state
+            .first_response_at
+            .map(|first| (first - state.started_at).num_milliseconds().max(0) as u64);
         event.trace_id = state.trace_id;
         event.span_id = state.span_id;
         event.parent_span_id = state.parent_span_id;
@@ -613,15 +616,13 @@ mod tests {
         let event = a.finalize_complete();
         assert_eq!(event.request.body.mode, ExchangeBodyMode::Offloaded);
         assert_eq!(event.response.body.mode, ExchangeBodyMode::Offloaded);
-        assert!(
-            event
-                .request
-                .body
-                .reference
-                .as_deref()
-                .unwrap_or_default()
-                .starts_with("blob://exchange/ex2/request/")
-        );
+        assert!(event
+            .request
+            .body
+            .reference
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("blob://exchange/ex2/request/"));
     }
 
     #[test]
@@ -671,10 +672,7 @@ mod tests {
         let raw = a.snapshot_json().expect("snapshot json");
         let restored = ExchangeAssembler::from_snapshot_json(cfg(), &raw).expect("restore");
         assert_eq!(restored.snapshot().exchange_id, "ex5");
-        assert_eq!(
-            restored.snapshot().transport,
-            ExchangeTransport::Jsonrpc
-        );
+        assert_eq!(restored.snapshot().transport, ExchangeTransport::Jsonrpc);
     }
 
     #[test]
@@ -692,14 +690,11 @@ mod tests {
         assert_eq!(result.event.request.body.mode, ExchangeBodyMode::Offloaded);
         assert_eq!(result.event.response.body.mode, ExchangeBodyMode::Offloaded);
         assert_eq!(result.blobs.len(), 2);
-        assert!(result.blobs.iter().all(|blob| !blob.payload_gzip_b64.is_empty()));
         assert!(result
-            .event
-            .request
-            .body
-            .bytes_gzip
-            .unwrap_or_default()
-            > 0);
+            .blobs
+            .iter()
+            .all(|blob| !blob.payload_gzip_b64.is_empty()));
+        assert!(result.event.request.body.bytes_gzip.unwrap_or_default() > 0);
     }
 
     #[test]

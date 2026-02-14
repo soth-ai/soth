@@ -2237,17 +2237,17 @@ exchange_v2:
         assert_eq!(config.exchange_v2.inline_max_bytes, 131_072);
         assert_eq!(config.exchange_v2.max_body_bytes, 15 * 1024 * 1024);
         assert_eq!(config.exchange_v2.max_stream_buffer_bytes, 8 * 1024 * 1024);
-        assert_eq!(config.exchange_v2.stream_idle_timeout, Duration::from_secs(45));
+        assert_eq!(
+            config.exchange_v2.stream_idle_timeout,
+            Duration::from_secs(45)
+        );
         assert_eq!(
             config.exchange_v2.stream_max_duration,
             Duration::from_secs(900)
         );
         assert_eq!(config.exchange_v2.spool_max_inflight, 5000);
         assert_eq!(config.exchange_v2.upload_queue_max_items, 12000);
-        assert_eq!(
-            config.exchange_v2.upload_queue_max_bytes,
-            256 * 1024 * 1024
-        );
+        assert_eq!(config.exchange_v2.upload_queue_max_bytes, 256 * 1024 * 1024);
         assert!(config.exchange_v2.recover_inflight_on_start);
     }
 

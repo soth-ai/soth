@@ -748,7 +748,9 @@ fn read_sqlite_events_from_exchange(
         )
         .map_err(to_io_err)?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(to_io_err)?;
     for row in rows {
         let (seq, json) = row.map_err(to_io_err)?;
@@ -1570,13 +1572,21 @@ fn update_rollup_1m_from_exchange(
     let provider = event.provider.as_deref().unwrap_or("unknown");
     let agent = event.agent.as_deref().unwrap_or("unknown");
     let requests = 1_i64;
-    let responses = if event.status_code.is_some() { 1_i64 } else { 0_i64 };
+    let responses = if event.status_code.is_some() {
+        1_i64
+    } else {
+        0_i64
+    };
     let error_events = if event.status_code.map(|code| code >= 400).unwrap_or(false) {
         1_i64
     } else {
         0_i64
     };
-    let pii_events = if event.flags.pii_detected { 1_i64 } else { 0_i64 };
+    let pii_events = if event.flags.pii_detected {
+        1_i64
+    } else {
+        0_i64
+    };
     let total_tokens =
         (event.usage.input_tokens.unwrap_or(0) + event.usage.output_tokens.unwrap_or(0)) as i64;
     let total_cost = event
@@ -1632,7 +1642,11 @@ fn upsert_cluster_from_exchange(
     };
     let status_code = event.status_code.map(i64::from);
     let latency_ms = event.duration_ms.map(|value| value as i64);
-    let pii_detected = if event.flags.pii_detected { 1_i64 } else { 0_i64 };
+    let pii_detected = if event.flags.pii_detected {
+        1_i64
+    } else {
+        0_i64
+    };
 
     tx.execute(
         r#"
@@ -2070,13 +2084,13 @@ fn read_sqlite_event_payload(
                     "#,
                 )
                 .map_err(to_io_err)?;
-            let exchange_json =
-                exchange_stmt.query_row([event_id], |row| row.get::<_, String>(0));
+            let exchange_json = exchange_stmt.query_row([event_id], |row| row.get::<_, String>(0));
             match exchange_json {
                 Ok(json) => {
-                    let exchange = serde_json::from_str::<ExchangeEventV2>(&json).map_err(
-                        |error| std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )?;
+                    let exchange =
+                        serde_json::from_str::<ExchangeEventV2>(&json).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
                     Ok(match payload_kind {
                         "request" => exchange
                             .request
@@ -2178,7 +2192,8 @@ fn exchange_to_wrap_event(seq: i64, event: ExchangeEventV2) -> WrapEvent {
     wrapped.cache_read_tokens = event.usage.cache_read_tokens;
     wrapped.cache_write_tokens = event.usage.cache_write_tokens;
     wrapped.reasoning_tokens = event.usage.reasoning_tokens;
-    wrapped.token_count = Some(event.usage.input_tokens.unwrap_or(0) + event.usage.output_tokens.unwrap_or(0));
+    wrapped.token_count =
+        Some(event.usage.input_tokens.unwrap_or(0) + event.usage.output_tokens.unwrap_or(0));
     wrapped.cost_usd = event.cost.as_ref().map(|value| value.estimated_usd);
     wrapped.request_size_bytes = event.request.body.bytes_raw;
     wrapped.response_size_bytes = event.response.body.bytes_raw;

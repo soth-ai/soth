@@ -2,10 +2,8 @@ use crate::body_uploader::BodyUploader;
 use crate::cache;
 use crate::config_puller::ConfigPuller;
 use crate::heartbeat::HeartbeatSender;
-use crate::metadata_pusher::{
-    estimate_gzip_batch_size, estimate_gzip_exchange_batch_size, MetadataPusher,
-};
-use crate::retry_queue::{BodyRetryQueue, RetryQueueEntry};
+use crate::metadata_pusher::{estimate_gzip_exchange_batch_size, MetadataPusher};
+use crate::retry_queue::BodyRetryQueue;
 use anyhow::Context;
 use base64::Engine as _;
 use chrono::Utc;
@@ -14,10 +12,7 @@ use soth_core::api::{
     BlobUploadRequest, EventBatchRequest, EventClientMetadata, EventEnvelopeMetadata, EventError,
     EventMetadata, ExchangeBatchRequest, ExchangeMetadata, HeartbeatRequest,
 };
-use soth_core::event_logger::{
-    SYNC_KEY_LAST_BODY_SYNCED_SEQ, SYNC_KEY_LAST_SYNCED_SEQ, SYNC_KEY_LAST_SYNC_TIMESTAMP,
-    SYNC_KEY_SYNC_ERRORS,
-};
+use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
 use soth_core::types::exchange_v2::{ExchangeBodyMode, ExchangeEventV2};
 use soth_core::types::{CaptureSource, EventSource, TrafficSource, WrapDirection, WrapEvent};
 use soth_observe::PiiRedactor;
@@ -25,6 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::warn;
+use uuid::Uuid;
 
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
 const MAX_RETRY_UPLOADS_PER_TICK: usize = 32;
@@ -52,6 +48,7 @@ pub struct SyncAgentConfig {
     pub metadata_max_compressed_batch_bytes: usize,
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
+    pub exchange_v2_only: bool,
 }
 
 pub struct SyncAgent {
@@ -183,15 +180,11 @@ impl SyncAgent {
     }
 
     pub async fn tick(&self) -> anyhow::Result<SyncTickSummary> {
-        let metadata_sent = self.sync_metadata_once().await?;
+        let metadata_sent = 0;
         let (exchange_sent, exchange_blob_uploaded) = self.sync_exchange_queue_once().await?;
 
-        let mut retry_uploaded = 0;
-        let mut body_uploaded = 0;
-        if self.body_upload_allowed() {
-            retry_uploaded = self.process_retry_queue_once().await?;
-            body_uploaded = self.sync_bodies_once().await?;
-        }
+        let retry_uploaded = 0;
+        let body_uploaded = 0;
 
         Ok(SyncTickSummary {
             metadata_sent,
@@ -265,163 +258,23 @@ impl SyncAgent {
     }
 
     async fn sync_metadata_once(&self) -> anyhow::Result<usize> {
-        let last_seq = self.read_cursor(SYNC_KEY_LAST_SYNCED_SEQ)?;
-        let fetch_limit = self
-            .config
-            .batch_size
-            .max(1)
-            .min(self.config.metadata_max_events_per_batch);
-        let loaded = self.load_event_rows(last_seq, fetch_limit)?;
-        let Some(max_seq_seen) = loaded.max_seq_seen else {
-            return Ok(0);
-        };
-
-        if loaded.rows.is_empty() {
-            self.write_cursor(SYNC_KEY_LAST_SYNCED_SEQ, max_seq_seen)?;
-            return Ok(0);
-        }
-
-        let config_version = self.cached_config_version();
-        match self
-            .push_rows_with_size_limits(&loaded.rows, config_version.as_ref())
-            .await
-        {
-            Ok(push) => {
-                if push.config_changed {
-                    if let Some(puller) = &self.config_puller {
-                        if let Err(error) = puller.pull_once().await {
-                            warn!("Cloud config refresh after metadata hint failed: {}", error);
-                        }
-                    }
-                }
-
-                if let Some(ack_seq) = push.ack_seq {
-                    self.write_cursor(SYNC_KEY_LAST_SYNCED_SEQ, ack_seq)?;
-                    self.mark_sync_success()?;
-                    Ok(push.sent)
-                } else {
-                    self.set_sync_error("metadata_push_rejected_initial_event")?;
-                    Ok(0)
-                }
-            }
-            Err(error) => {
-                self.set_sync_error(&format!("metadata_push_error: {error}"))?;
-                Err(error)
-            }
-        }
+        Ok(0)
     }
 
     async fn push_rows_with_size_limits(
         &self,
-        rows: &[SyncedEventRow],
-        config_version: Option<&String>,
+        _rows: &[SyncedEventRow],
+        _config_version: Option<&String>,
     ) -> anyhow::Result<MetadataPushResult> {
-        if rows.is_empty() {
-            return Ok(MetadataPushResult::default());
-        }
-        let mut overall = MetadataPushResult {
-            fully_processed: true,
-            ..MetadataPushResult::default()
-        };
-        let mut stack: Vec<&[SyncedEventRow]> = vec![rows];
-        while let Some(chunk) = stack.pop() {
-            if chunk.is_empty() {
-                continue;
-            }
-
-            if chunk.len() > self.config.metadata_max_events_per_batch {
-                let split = self.config.metadata_max_events_per_batch.min(chunk.len());
-                stack.push(&chunk[split..]);
-                stack.push(&chunk[..split]);
-                continue;
-            }
-
-            let batch = chunk
-                .iter()
-                .map(|row| self.wrap_event_to_metadata_with_sync_tags(&row.event))
-                .collect::<Vec<_>>();
-            let request = EventBatchRequest {
-                agent_instance_id: self.config.agent_instance_id.clone(),
-                config_version: config_version.cloned(),
-                batch,
-            };
-            let compressed_size = estimate_gzip_batch_size(&request)?;
-            if compressed_size > self.config.metadata_max_compressed_batch_bytes {
-                if chunk.len() == 1 {
-                    let mut fallback = self.wrap_event_to_metadata_with_sync_tags(&chunk[0].event);
-                    mark_metadata_only_fallback(
-                        &mut fallback,
-                        "compressed_batch_limit",
-                        self.config.metadata_max_compressed_batch_bytes,
-                    );
-                    let fallback_request = EventBatchRequest {
-                        agent_instance_id: self.config.agent_instance_id.clone(),
-                        config_version: config_version.cloned(),
-                        batch: vec![fallback],
-                    };
-                    let fallback_size = estimate_gzip_batch_size(&fallback_request)?;
-                    if fallback_size > self.config.metadata_max_compressed_batch_bytes {
-                        warn!(
-                            event_id = %chunk[0].event.id,
-                            compressed_size = fallback_size,
-                            limit = self.config.metadata_max_compressed_batch_bytes,
-                            "Metadata-only fallback still exceeds compressed batch limit; deferring event"
-                        );
-                        overall.fully_processed = false;
-                        return Ok(overall);
-                    }
-
-                    let single = self.push_metadata_request(&fallback_request, chunk).await?;
-                    overall = overall.merge(single.clone());
-                    if !single.fully_processed {
-                        overall.fully_processed = false;
-                        return Ok(overall);
-                    }
-                    continue;
-                }
-
-                let mid = chunk.len() / 2;
-                stack.push(&chunk[mid..]);
-                stack.push(&chunk[..mid]);
-                continue;
-            }
-
-            let result = self.push_metadata_request(&request, chunk).await?;
-            overall = overall.merge(result.clone());
-            if !result.fully_processed {
-                overall.fully_processed = false;
-                return Ok(overall);
-            }
-        }
-        Ok(overall)
+        Ok(MetadataPushResult::default())
     }
 
     async fn push_metadata_request(
         &self,
-        request: &EventBatchRequest,
-        rows: &[SyncedEventRow],
+        _request: &EventBatchRequest,
+        _rows: &[SyncedEventRow],
     ) -> anyhow::Result<MetadataPushResult> {
-        match self.metadata_pusher.push_batch(request).await? {
-            Some(response) => {
-                if let Some(ack_seq) = contiguous_ack_seq(rows, &response.errors) {
-                    let sent = rows.iter().take_while(|row| row.seq <= ack_seq).count();
-                    Ok(MetadataPushResult {
-                        ack_seq: Some(ack_seq),
-                        sent,
-                        config_changed: response.config_changed,
-                        fully_processed: sent == rows.len(),
-                    })
-                } else {
-                    Ok(MetadataPushResult {
-                        ack_seq: None,
-                        sent: 0,
-                        config_changed: response.config_changed,
-                        fully_processed: false,
-                    })
-                }
-            }
-            None => Ok(MetadataPushResult::default()),
-        }
+        Ok(MetadataPushResult::default())
     }
 
     async fn sync_exchange_queue_once(&self) -> anyhow::Result<(usize, usize)> {
@@ -435,6 +288,7 @@ impl SyncAgent {
         let config_version = self.cached_config_version();
 
         for row in rows {
+            let cloud_exchange_id = normalize_exchange_id_for_cloud(row.exchange_id.as_str());
             match self
                 .process_exchange_queue_row(&row, config_version.as_ref())
                 .await
@@ -450,6 +304,7 @@ impl SyncAgent {
                     self.mark_exchange_queue_attempt(&row.exchange_id, row.attempt_count)?;
                     warn!(
                         exchange_id = %row.exchange_id,
+                        cloud_exchange_id = %cloud_exchange_id,
                         attempt = row.attempt_count.saturating_add(1),
                         reason = %reason,
                         "Exchange upload deferred with retry backoff"
@@ -458,6 +313,7 @@ impl SyncAgent {
                 Ok(ExchangeQueueOutcome::Drop { reason }) => {
                     warn!(
                         exchange_id = %row.exchange_id,
+                        cloud_exchange_id = %cloud_exchange_id,
                         reason = %reason,
                         "Dropping malformed exchange upload entry"
                     );
@@ -493,6 +349,24 @@ impl SyncAgent {
                 });
             }
         };
+        let canonical_exchange_id = normalize_exchange_id_for_cloud(event.exchange_id.as_str());
+        if canonical_exchange_id != event.exchange_id {
+            event.exchange_id = canonical_exchange_id.clone();
+            if let Some(reference) = event.request.body.reference.as_mut() {
+                *reference = replace_legacy_exchange_ref(
+                    reference,
+                    row.exchange_id.as_str(),
+                    canonical_exchange_id.as_str(),
+                );
+            }
+            if let Some(reference) = event.response.body.reference.as_mut() {
+                *reference = replace_legacy_exchange_ref(
+                    reference,
+                    row.exchange_id.as_str(),
+                    canonical_exchange_id.as_str(),
+                );
+            }
+        }
 
         let blobs = match row.blobs_json.as_deref() {
             Some(raw) if !raw.trim().is_empty() => {
@@ -511,7 +385,7 @@ impl SyncAgent {
         let mut blob_uploaded = 0usize;
         for blob in blobs {
             let request = BlobUploadRequest {
-                exchange_id: row.exchange_id.clone(),
+                exchange_id: canonical_exchange_id.clone(),
                 side: blob.side.clone(),
                 reference: Some(blob.reference.clone()),
                 content_encoding: Some(blob.content_encoding.clone()),
@@ -566,9 +440,9 @@ impl SyncAgent {
         }
 
         match self.metadata_pusher.push_exchange_batch(&request).await? {
-            Some(response) if response.rejected == 0 => Ok(ExchangeQueueOutcome::Synced {
-                blob_uploaded,
-            }),
+            Some(response) if response.rejected == 0 => {
+                Ok(ExchangeQueueOutcome::Synced { blob_uploaded })
+            }
             Some(response) => Ok(ExchangeQueueOutcome::Retry {
                 reason: format!("exchange_rejected_count={}", response.rejected),
             }),
@@ -579,139 +453,11 @@ impl SyncAgent {
     }
 
     async fn sync_bodies_once(&self) -> anyhow::Result<usize> {
-        let last_seq = self.read_cursor(SYNC_KEY_LAST_BODY_SYNCED_SEQ)?;
-        let loaded = self.load_body_rows(last_seq, self.config.body_batch_size)?;
-        let Some(max_seq_seen) = loaded.max_seq_seen else {
-            return Ok(0);
-        };
-
-        if loaded.rows.is_empty() {
-            self.write_cursor(SYNC_KEY_LAST_BODY_SYNCED_SEQ, max_seq_seen)?;
-            return Ok(0);
-        }
-
-        let mut ack_seq: Option<i64> = None;
-        let mut uploaded = 0usize;
-
-        for row in &loaded.rows {
-            if row.metadata_only_reason.is_some() {
-                ack_seq = Some(row.seq);
-                continue;
-            }
-
-            let request_body = self.cap_payload_for_upload(
-                &row.event_id,
-                "request",
-                self.redact_payload(row.request_body.clone()),
-            );
-            let response_body = self.cap_payload_for_upload(
-                &row.event_id,
-                "response",
-                self.redact_payload(row.response_body.clone()),
-            );
-
-            if request_body.is_none() && response_body.is_none() {
-                ack_seq = Some(row.seq);
-                continue;
-            }
-
-            match self
-                .body_uploader
-                .upload(&row.event_id, request_body.clone(), response_body.clone())
-                .await
-            {
-                Ok(Some(_)) => {
-                    ack_seq = Some(row.seq);
-                    uploaded += 1;
-                }
-                Ok(None) => {
-                    let entry = RetryQueueEntry::from_payloads(
-                        row.event_id.clone(),
-                        request_body,
-                        response_body,
-                    );
-                    self.retry_queue.enqueue(&entry)?;
-                    ack_seq = Some(row.seq);
-                }
-                Err(error) => {
-                    let entry = RetryQueueEntry::from_payloads(
-                        row.event_id.clone(),
-                        request_body,
-                        response_body,
-                    );
-                    self.retry_queue.enqueue(&entry)?;
-                    self.retry_queue
-                        .mark_error(&row.event_id, error.to_string())?;
-                    ack_seq = Some(row.seq);
-                }
-            }
-        }
-
-        if let Some(seq) = ack_seq {
-            self.write_cursor(SYNC_KEY_LAST_BODY_SYNCED_SEQ, seq)?;
-            self.mark_sync_success()?;
-        }
-
-        Ok(uploaded)
+        Ok(0)
     }
 
     async fn process_retry_queue_once(&self) -> anyhow::Result<usize> {
-        let entries = self.retry_queue.list()?;
-        let mut uploaded = 0usize;
-        for entry in entries.into_iter().take(MAX_RETRY_UPLOADS_PER_TICK) {
-            if self
-                .metadata_only_reason_for_event_id(&entry.event_id)?
-                .is_some()
-            {
-                self.retry_queue.remove(&entry.event_id)?;
-                continue;
-            }
-
-            let request_payload =
-                load_retry_payload(&entry.request_body_b64, entry.request_body_path.as_ref());
-            let response_payload =
-                load_retry_payload(&entry.response_body_b64, entry.response_body_path.as_ref());
-
-            if request_payload.is_none() && response_payload.is_none() {
-                self.retry_queue.remove(&entry.event_id)?;
-                continue;
-            }
-
-            let request_payload = self.cap_payload_for_upload(
-                &entry.event_id,
-                "request",
-                self.redact_payload(request_payload),
-            );
-            let response_payload = self.cap_payload_for_upload(
-                &entry.event_id,
-                "response",
-                self.redact_payload(response_payload),
-            );
-            if request_payload.is_none() && response_payload.is_none() {
-                self.retry_queue.remove(&entry.event_id)?;
-                continue;
-            }
-
-            match self
-                .body_uploader
-                .upload(&entry.event_id, request_payload, response_payload)
-                .await
-            {
-                Ok(Some(_)) => {
-                    self.retry_queue.remove(&entry.event_id)?;
-                    uploaded += 1;
-                }
-                Ok(None) => {
-                    self.retry_queue
-                        .mark_error(&entry.event_id, "body_upload_non_success_status")?;
-                }
-                Err(error) => {
-                    self.retry_queue
-                        .mark_error(&entry.event_id, error.to_string())?;
-                }
-            }
-        }
-        Ok(uploaded)
+        Ok(0)
     }
 
     fn wrap_event_to_metadata_with_sync_tags(&self, event: &WrapEvent) -> EventMetadata {
@@ -1137,6 +883,25 @@ impl SyncAgent {
     }
 }
 
+fn normalize_exchange_id_for_cloud(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if Uuid::parse_str(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("soth-legacy-exchange:{trimmed}").as_bytes(),
+    )
+    .to_string()
+}
+
+fn replace_legacy_exchange_ref(reference: &str, legacy: &str, canonical: &str) -> String {
+    if legacy.is_empty() || legacy == canonical {
+        return reference.to_string();
+    }
+    reference.replace(legacy, canonical)
+}
+
 fn open_read_conn(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed opening sqlite read connection {}", path.display()))?;
@@ -1294,7 +1059,10 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         reasoning_tokens: event.usage.reasoning_tokens,
         cost_usd: event.cost.as_ref().map(|cost| cost.estimated_usd),
         cost_currency: event.cost.as_ref().map(|cost| cost.currency.clone()),
-        pricing_version: event.cost.as_ref().and_then(|cost| cost.pricing_version.clone()),
+        pricing_version: event
+            .cost
+            .as_ref()
+            .and_then(|cost| cost.pricing_version.clone()),
         request_size_bytes: event.request.body.bytes_raw,
         response_size_bytes: event.response.body.bytes_raw,
         request_body_mode: Some(exchange_body_mode_to_str(event.request.body.mode).to_string()),
@@ -1309,15 +1077,30 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         blacklist_match: event.flags.blacklist_match,
         pii_detected: event.flags.pii_detected,
         pii_types: Vec::new(),
-        event_hash: event.integrity.as_ref().and_then(|value| value.event_hash.clone()),
-        signature: event.integrity.as_ref().and_then(|value| value.signature.clone()),
+        event_hash: event
+            .integrity
+            .as_ref()
+            .and_then(|value| value.event_hash.clone()),
+        signature: event
+            .integrity
+            .as_ref()
+            .and_then(|value| value.signature.clone()),
         signature_key_id: event
             .integrity
             .as_ref()
             .and_then(|value| value.signature_key_id.clone()),
-        parser_version: event.parse.as_ref().and_then(|value| value.parser_version.clone()),
-        bundle_version: event.parse.as_ref().and_then(|value| value.bundle_version.clone()),
-        parse_confidence: event.parse.as_ref().and_then(|value| value.parse_confidence),
+        parser_version: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.parser_version.clone()),
+        bundle_version: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.bundle_version.clone()),
+        parse_confidence: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.parse_confidence),
         detection_reason: event
             .parse
             .as_ref()
@@ -1334,7 +1117,9 @@ fn merge_tags_for_exchange(
     merge_tags(global_tags, event_tags)
 }
 
-fn build_exchange_event_envelope_metadata(event: &ExchangeEventV2) -> Option<EventEnvelopeMetadata> {
+fn build_exchange_event_envelope_metadata(
+    event: &ExchangeEventV2,
+) -> Option<EventEnvelopeMetadata> {
     let (host, path) = split_endpoint_host_path(event.endpoint.as_deref());
     let client = event.client.as_ref().map(|value| EventClientMetadata {
         pid: value.pid,
@@ -1376,8 +1161,14 @@ fn build_exchange_event_envelope_metadata(event: &ExchangeEventV2) -> Option<Eve
             .and_then(|value| value.signature_key_id.clone()),
         signature_alg: None,
         signed_fields_version: None,
-        signature: event.integrity.as_ref().and_then(|value| value.signature.clone()),
-        body_hash: event.integrity.as_ref().and_then(|value| value.event_hash.clone()),
+        signature: event
+            .integrity
+            .as_ref()
+            .and_then(|value| value.signature.clone()),
+        body_hash: event
+            .integrity
+            .as_ref()
+            .and_then(|value| value.event_hash.clone()),
         headers,
         client,
         collector_source: None,
@@ -1435,7 +1226,9 @@ fn exchange_source_class_to_str(
     }
 }
 
-fn exchange_transport_to_str(transport: soth_core::types::exchange_v2::ExchangeTransport) -> &'static str {
+fn exchange_transport_to_str(
+    transport: soth_core::types::exchange_v2::ExchangeTransport,
+) -> &'static str {
     match transport {
         soth_core::types::exchange_v2::ExchangeTransport::Http => "http",
         soth_core::types::exchange_v2::ExchangeTransport::Https => "https",
