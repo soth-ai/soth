@@ -72,7 +72,7 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             style::kv("URL", &url);
             eprintln!();
             style::info("Start the API service:");
-            println!("  soth proxy api start --port {}", port);
+            println!("  soth dev api start --port {}", port);
             eprintln!();
             anyhow::bail!("Connection failed: {}", e);
         }

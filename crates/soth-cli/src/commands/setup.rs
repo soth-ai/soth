@@ -5,7 +5,6 @@
 
 use crate::cli_config;
 use crate::commands;
-use crate::commands::proxy::ProxyCommands;
 use crate::style;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -450,14 +449,8 @@ async fn run_wizard_steps(
             .parent()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| ".".to_string());
-        commands::proxy::run(
-            ProxyCommands::SetupCa {
-                no_trust: false,
-                output: Some(ca_output_dir),
-            },
-            global_config_path.clone(),
-        )
-        .await?;
+        commands::proxy::run_setup_ca(false, Some(ca_output_dir), global_config_path.clone())
+            .await?;
         if let Some(ref mut transaction) = tx {
             transaction.set_step_ca_generated()?;
         }
@@ -470,13 +463,8 @@ async fn run_wizard_steps(
     } else if args.dry_run {
         style::step_done(2, 5, "Would enable system proxy");
     } else {
-        commands::proxy::run(
-            ProxyCommands::On {
-                port: Some(config.forward_proxy.port),
-            },
-            global_config_path.clone(),
-        )
-        .await?;
+        commands::proxy::run_on(Some(config.forward_proxy.port), global_config_path.clone())
+            .await?;
         if let Some(ref mut transaction) = tx {
             transaction.set_step_proxy_enabled()?;
         }
@@ -638,9 +626,7 @@ async fn run_doctor(config: &SothConfig, global_config_path: Option<PathBuf>) ->
 
     println!();
     style::subtitle("Proxy Status");
-    if let Err(error) =
-        commands::proxy::run(ProxyCommands::Status { config: None }, global_config_path).await
-    {
+    if let Err(error) = commands::proxy::run_status(global_config_path).await {
         style::warning(&format!("Proxy status command failed: {error}"));
         healthy = false;
     }
@@ -668,7 +654,7 @@ async fn run_rollback(
     setup_id: Option<String>,
     yes: bool,
     config: &SothConfig,
-    global_config_path: Option<PathBuf>,
+    _global_config_path: Option<PathBuf>,
 ) -> Result<()> {
     let preflight = run_preflight(None, config)?;
     let resolved_setup_id = resolve_setup_id(setup_id, &preflight.state_path)?;
@@ -693,9 +679,7 @@ async fn run_rollback(
     restore_backup_entries(&manifest.backups)?;
 
     if manifest.steps.proxy_enabled {
-        if let Err(error) =
-            commands::proxy::run(ProxyCommands::Off, global_config_path.clone()).await
-        {
+        if let Err(error) = commands::proxy::run_off().await {
             style::warning(&format!("Failed to disable proxy during rollback: {error}"));
         }
     }
@@ -713,7 +697,7 @@ async fn run_rollback(
 async fn run_uninstall(
     yes: bool,
     config: &SothConfig,
-    global_config_path: Option<PathBuf>,
+    _global_config_path: Option<PathBuf>,
 ) -> Result<()> {
     let preflight = run_preflight(None, config)?;
 
@@ -724,18 +708,14 @@ async fn run_uninstall(
         return Ok(());
     }
 
-    run_uninstall_internal(&preflight, true, global_config_path).await?;
+    run_uninstall_internal(&preflight, true).await?;
     style::success("Uninstall completed.");
     style::footer();
     Ok(())
 }
 
-async fn run_uninstall_internal(
-    preflight: &PreflightContext,
-    remove_state: bool,
-    global_config_path: Option<PathBuf>,
-) -> Result<()> {
-    if let Err(error) = commands::proxy::run(ProxyCommands::Off, global_config_path).await {
+async fn run_uninstall_internal(preflight: &PreflightContext, remove_state: bool) -> Result<()> {
+    if let Err(error) = commands::proxy::run_off().await {
         style::warning(&format!("Failed to disable proxy: {error}"));
     }
 

@@ -1,26 +1,11 @@
-//! Soth proxy CLI commands
-//!
-//! Commands for managing the HTTP/HTTPS soth proxy:
-//! - `soth proxy on` - Enable system proxy (route traffic through SOTH)
-//! - `soth proxy off` - Disable system proxy (direct connections)
-//! - `soth proxy setup-ca` - Generate CA certificate
-//! - `soth proxy start` - Start sensor-only proxy runtime
-//! - `soth proxy api start` - Start API/WebSocket service
-//! - `soth proxy ui start` - Start UI dev service
-//! - `soth proxy profile start` - Start runtime profile (sensor/api/ui/dev stack)
-//! - `soth proxy env` - Output environment variables
-//! - `soth proxy status` - Show proxy status
-//! - `soth proxy ca-info` - Show CA certificate info
-//! - `soth proxy metrics` - Show proxy metrics
-//! - `soth proxy connections` - Show active connections
-//! - `soth proxy circuit` - Circuit breaker status
-//! - `soth proxy rate-limit` - Rate limit status
+//! Shared runtime/dev command handlers used by the SOTH CLI command tree.
 
 use crate::cli_config;
 mod api;
 mod ca_info;
 mod circuit;
 mod connections;
+mod daemon;
 mod env;
 mod metrics;
 mod profile;
@@ -38,20 +23,6 @@ use std::path::PathBuf;
 /// Proxy subcommands
 #[derive(Subcommand)]
 pub enum ProxyCommands {
-    /// Enable system proxy (route traffic through SOTH)
-    ///
-    /// Configures the system to route HTTPS traffic through SOTH proxy.
-    /// AI traffic (OpenAI, Anthropic, Google) will be intercepted for
-    /// inspection. All other traffic tunnels through without inspection.
-    On {
-        /// Proxy port override (uses configured port when omitted)
-        #[arg(short, long)]
-        port: Option<u16>,
-    },
-
-    /// Disable system proxy (restore direct connections)
-    Off,
-
     /// Generate and optionally install CA certificate
     SetupCa {
         /// Don't add CA to system trust store
@@ -63,19 +34,10 @@ pub enum ProxyCommands {
         output: Option<String>,
     },
 
-    /// Start the sensor-only soth proxy
-    Start {
-        /// Port to listen on
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Config file path
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-
-        /// Suppress startup banner and helper lines
-        #[arg(short, long)]
-        quiet: bool,
+    /// Advanced diagnostics and controls
+    Advanced {
+        #[command(subcommand)]
+        action: AdvancedAction,
     },
 
     /// API service management (HTTP + WebSocket)
@@ -124,37 +86,58 @@ pub enum ProxyCommands {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+}
 
-    /// Show Prometheus metrics from running proxy
-    Metrics {
-        /// Config file path
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+pub async fn run_on(port: Option<u16>, global_config: Option<PathBuf>) -> anyhow::Result<()> {
+    let selected_port = if port.is_some() {
+        port
+    } else {
+        let config = cli_config::load_effective_config(None, global_config.as_ref())?;
+        Some(config.forward_proxy.port)
+    };
+    system::enable(selected_port).await
+}
 
-        /// Output raw Prometheus format
-        #[arg(long)]
-        raw: bool,
-    },
+pub async fn run_off() -> anyhow::Result<()> {
+    system::disable().await
+}
 
-    /// Show active connections and recent requests
-    Connections {
-        /// Config file path
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-    },
+pub async fn run_start_internal(
+    port: Option<u16>,
+    config: Option<PathBuf>,
+    quiet: bool,
+    foreground: bool,
+    daemon_child: bool,
+) -> anyhow::Result<()> {
+    start::run(port, config, quiet, foreground, daemon_child).await
+}
 
-    /// Circuit breaker management
-    Circuit {
-        #[command(subcommand)]
-        action: CircuitAction,
-    },
+pub async fn run_stop() -> anyhow::Result<()> {
+    daemon::run_stop().await
+}
 
-    /// Show rate limit status
-    RateLimit {
-        /// Config file path
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-    },
+pub async fn run_logs(follow: bool, lines: usize) -> anyhow::Result<()> {
+    daemon::run_logs(follow, lines).await
+}
+
+pub async fn run_setup_ca(
+    no_trust: bool,
+    output: Option<String>,
+    global_config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    setup_ca::run(output, no_trust, global_config).await
+}
+
+pub async fn run_env(shell: &str, ca_only: bool, config: Option<PathBuf>) -> anyhow::Result<()> {
+    env::run(shell, ca_only, config).await
+}
+
+pub async fn run_status(config: Option<PathBuf>) -> anyhow::Result<()> {
+    status::run(config).await
+}
+
+pub async fn run_ca_info(config: Option<PathBuf>) -> anyhow::Result<()> {
+    ca_info::run(config).await
 }
 
 /// API service actions
@@ -234,6 +217,41 @@ pub enum ProfileAction {
     },
 }
 
+/// Advanced diagnostics actions
+#[derive(Subcommand)]
+pub enum AdvancedAction {
+    /// Show Prometheus metrics from running proxy
+    Metrics {
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Output raw Prometheus format
+        #[arg(long)]
+        raw: bool,
+    },
+
+    /// Show active connections and recent requests
+    Connections {
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Circuit breaker management
+    Circuit {
+        #[command(subcommand)]
+        action: CircuitAction,
+    },
+
+    /// Show rate limit status
+    RateLimit {
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+}
+
 /// Circuit breaker actions
 #[derive(Subcommand)]
 pub enum CircuitAction {
@@ -247,7 +265,7 @@ pub enum CircuitAction {
     /// Reset circuit breaker for a host
     Reset {
         /// Host to reset (all hosts if not specified)
-        #[arg(short, long)]
+        #[arg(short = 'H', long)]
         host: Option<String>,
 
         /// Config file path
@@ -259,24 +277,28 @@ pub enum CircuitAction {
 /// Run proxy command
 pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::Result<()> {
     match cmd {
-        ProxyCommands::On { port } => {
-            let selected_port = if port.is_some() {
-                port
-            } else {
-                let config = cli_config::load_effective_config(None, global_config.as_ref())?;
-                Some(config.forward_proxy.port)
-            };
-            system::enable(selected_port).await
-        }
-        ProxyCommands::Off => system::disable().await,
         ProxyCommands::SetupCa { no_trust, output } => {
             setup_ca::run(output, no_trust, global_config.clone()).await
         }
-        ProxyCommands::Start {
-            port,
-            config,
-            quiet,
-        } => start::run(port, config.or(global_config.clone()), quiet).await,
+        ProxyCommands::Advanced { action } => match action {
+            AdvancedAction::Metrics { config, raw } => {
+                metrics::run(config.or(global_config.clone()), raw).await
+            }
+            AdvancedAction::Connections { config } => {
+                connections::run(config.or(global_config.clone())).await
+            }
+            AdvancedAction::Circuit { action } => match action {
+                CircuitAction::Status { config } => {
+                    circuit::run_status(config.or(global_config.clone())).await
+                }
+                CircuitAction::Reset { host, config } => {
+                    circuit::run_reset(host, config.or(global_config.clone())).await
+                }
+            },
+            AdvancedAction::RateLimit { config } => {
+                ratelimit::run(config.or(global_config.clone())).await
+            }
+        },
         ProxyCommands::Api { action } => match action {
             ApiAction::Start {
                 port,
@@ -321,21 +343,6 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
         } => env::run(&shell, ca_only, config.or(global_config.clone())).await,
         ProxyCommands::Status { config } => status::run(config.or(global_config.clone())).await,
         ProxyCommands::CaInfo { config } => ca_info::run(config.or(global_config.clone())).await,
-        ProxyCommands::Metrics { config, raw } => {
-            metrics::run(config.or(global_config.clone()), raw).await
-        }
-        ProxyCommands::Connections { config } => {
-            connections::run(config.or(global_config.clone())).await
-        }
-        ProxyCommands::Circuit { action } => match action {
-            CircuitAction::Status { config } => {
-                circuit::run_status(config.or(global_config.clone())).await
-            }
-            CircuitAction::Reset { host, config } => {
-                circuit::run_reset(host, config.or(global_config.clone())).await
-            }
-        },
-        ProxyCommands::RateLimit { config } => ratelimit::run(config.or(global_config)).await,
     }
 }
 

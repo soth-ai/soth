@@ -584,7 +584,7 @@ impl App {
             || error.contains("operation timed out")
         {
             format!(
-                "{error} | hint: ensure `soth proxy start` is running and API is reachable at http://127.0.0.1:3001"
+                "{error} | hint: ensure `soth start` is running and API is reachable at http://127.0.0.1:3001"
             )
         } else {
             error

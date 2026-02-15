@@ -50,7 +50,7 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         style::warning("CA certificate not installed");
         println!();
         style::info("Run the following to set up:");
-        println!("  {}", "soth proxy setup-ca".bold());
+        println!("  {}", "soth runtime setup-ca".bold());
     }
 
     // Runtime service status
@@ -96,23 +96,20 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     if !running {
         println!();
         style::info("Start sensor runtime with:");
-        println!("  {}", "soth proxy start".bold());
+        println!("  {}", "soth start".bold());
     }
     if !api_running {
         println!();
         style::info("Start API service with:");
         println!(
             "  {}",
-            format!("soth proxy api start --port {}", config.dashboard.port).bold()
+            format!("soth dev api start --port {}", config.dashboard.port).bold()
         );
     }
     println!();
     style::info("Optional UI/TUI surfaces:");
-    println!("  {}", "soth proxy ui start".bold());
-    println!(
-        "  {}",
-        "soth proxy profile start --profile dev-stack".bold()
-    );
+    println!("  {}", "soth dev ui start".bold());
+    println!("  {}", "soth dev profile start --profile dev-stack".bold());
     println!(
         "  {}",
         format!(
@@ -203,7 +200,7 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     println!();
     style::info("To configure environment for this proxy:");
-    println!("  {}", "eval $(soth proxy env)".bold());
+    println!("  {}", "eval $(soth runtime env)".bold());
 
     style::footer();
     Ok(())

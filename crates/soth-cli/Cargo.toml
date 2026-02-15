@@ -54,6 +54,7 @@ crossterm = "0.28"
 
 # System utilities
 which = "6.0"
+libc = "0.2"
 
 # File watching
 notify = { workspace = true }

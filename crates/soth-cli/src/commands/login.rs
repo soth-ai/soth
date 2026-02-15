@@ -54,6 +54,7 @@ pub async fn run(args: LoginArgs, global_config: Option<PathBuf>) -> anyhow::Res
     println!("Saved cloud credentials to {}", config_path.display());
     println!("Cloud sync enabled: {}", config.cloud.enabled);
     println!("Cloud endpoint: {}", config.cloud.endpoint);
+    println!("For enterprise invites, use: soth enroll <token>");
     Ok(())
 }
 

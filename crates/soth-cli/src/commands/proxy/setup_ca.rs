@@ -178,7 +178,7 @@ pub async fn run(
 
     println!();
     style::info("To configure your shell, run:");
-    println!("    {}", "eval $(soth proxy env)".bold());
+    println!("    {}", "eval $(soth runtime env)".bold());
 
     style::footer();
     Ok(())

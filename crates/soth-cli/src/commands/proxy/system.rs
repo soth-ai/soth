@@ -1,8 +1,8 @@
 //! System proxy auto-configuration
 //!
 //! Commands for configuring the system to route traffic through SOTH proxy:
-//! - `soth proxy on` - Enable system proxy settings
-//! - `soth proxy off` - Disable system proxy settings
+//! - `soth on` - Enable system proxy settings
+//! - `soth off` - Disable system proxy settings
 
 use crate::style;
 use anyhow::{Context, Result};
@@ -75,7 +75,7 @@ async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<(
             println!(
                 "\n{} CA certificate not found. Run: {}",
                 style::WARNING,
-                style::highlight("soth proxy setup-ca")
+                style::highlight("soth runtime setup-ca")
             );
         }
     }

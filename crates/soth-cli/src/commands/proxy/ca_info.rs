@@ -16,7 +16,7 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             "CA certificate not found at {}",
             cert_path.display()
         ));
-        style::info("Run: soth proxy setup-ca");
+        style::info("Run: soth runtime setup-ca");
         return Ok(());
     }
 

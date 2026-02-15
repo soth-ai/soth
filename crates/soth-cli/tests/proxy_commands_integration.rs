@@ -1,10 +1,10 @@
-//! Integration tests for Phase J CLI proxy commands
+//! Integration tests for Phase J CLI diagnostics commands
 //!
 //! Tests for:
-//! - `soth proxy metrics` - displays metrics from /metrics endpoint
-//! - `soth proxy connections` - shows active connections from /api/proxy
-//! - `soth proxy circuit status` - circuit breaker status
-//! - `soth proxy rate-limit` - rate limit status
+//! - `soth dev advanced metrics` - displays metrics from /metrics endpoint
+//! - `soth dev advanced connections` - shows active connections from /api/proxy
+//! - `soth dev advanced circuit status` - circuit breaker status
+//! - `soth dev advanced rate-limit` - rate limit status
 //!
 //! These tests focus on parsing and display logic. Full HTTP integration
 //! requires a running API service (tested in E2E tests).
@@ -394,12 +394,12 @@ fn test_connection_refused_scenario() {
         "Error: Could not connect to API service at http://127.0.0.1:{}/metrics\n\
          \n\
          Start the API service:\n  \
-         soth proxy api start --port {}",
+         soth dev api start --port {}",
         port, port
     );
 
     assert!(error_msg.contains("Could not connect"));
-    assert!(error_msg.contains("soth proxy api start"));
+    assert!(error_msg.contains("soth dev api start"));
 }
 
 /// Test handling HTTP error responses

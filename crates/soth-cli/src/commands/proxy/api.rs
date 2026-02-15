@@ -7,7 +7,7 @@ use soth_dashboard::server::DashboardServer;
 use soth_dashboard::DashboardState;
 use std::path::PathBuf;
 
-/// Run `soth proxy api start`.
+/// Run `soth dev api start`.
 pub async fn run_start(
     port: Option<u16>,
     config_path: Option<PathBuf>,

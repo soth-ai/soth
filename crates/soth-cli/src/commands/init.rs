@@ -277,7 +277,7 @@ pub async fn run(output: PathBuf) -> Result<()> {
     println!("  1. Edit domains/*.yaml (ai_inference, mcp, agent_apps)");
     println!("  2. Edit soth.yaml for runtime/proxy settings");
     println!("  3. Generate an identity: soth identity generate");
-    println!("  4. Start the proxy: soth proxy start");
+    println!("  4. Start the sensor lifecycle: soth up");
     println!();
 
     Ok(())

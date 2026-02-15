@@ -971,7 +971,7 @@ export function MessageStream() {
                   </p>
                   <p className="text-sm text-muted-foreground mb-4 max-w-xs mx-auto">
                     Use <code className="font-mono bg-muted px-1 rounded">soth wrap</code> for MCP,
-                    or <code className="font-mono bg-muted px-1 rounded">soth proxy on</code> for AI API calls.
+                    or <code className="font-mono bg-muted px-1 rounded">soth on</code> for AI API calls.
                   </p>
                   <p className="text-[11px] text-muted-foreground/60 mt-4">
                     Press{" "}

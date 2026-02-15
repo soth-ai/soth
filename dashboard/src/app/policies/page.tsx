@@ -764,7 +764,7 @@ export default function PoliciesPage() {
       `     mode: ${modeHint}`,
       "     data_file: ./policies/generated_policy_data.json",
       "     watch_for_changes: true",
-      "3. Restart `soth proxy start` or keep watch mode enabled for hot reload.",
+      "3. Restart `soth start` or keep watch mode enabled for hot reload.",
       "4. Validate behavior in Observability using denied/allowed events and policy reasons.",
     ].join("\n");
   }, [selectedPolicy]);

@@ -1,5 +1,6 @@
-//! Start soth proxy command
+//! Start sensor runtime command
 
+use super::daemon;
 use crate::cli_config;
 use crate::commands::cloud_hooks;
 use crate::commands::enforcement;
@@ -17,6 +18,7 @@ use soth_proxy::transport::hudsucker_proxy;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tracing::{info, warn};
 
 const SOTH_PROXY_ASCII: &[&str] = &[
     "  █████████     ███████    ███████████ █████   █████",
@@ -31,13 +33,80 @@ const SOTH_PROXY_ASCII: &[&str] = &[
 const SOTH_ACCENT: (u8, u8, u8) = (0xD9, 0x77, 0x57);
 const SOTH_MUTED: (u8, u8, u8) = (0x9F, 0x9F, 0x9F);
 const SOTH_TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+const MIN_NOFILE_SOFT_LIMIT: u64 = 8192;
+const WARN_NOFILE_SOFT_LIMIT: u64 = 2048;
+
+#[cfg(unix)]
+fn ensure_fd_budget() {
+    unsafe {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
+            warn!("Failed to read RLIMIT_NOFILE");
+            return;
+        }
+
+        let initial_soft = limits.rlim_cur as u64;
+        let hard = limits.rlim_max as u64;
+
+        if initial_soft < MIN_NOFILE_SOFT_LIMIT {
+            let target = std::cmp::min(hard, MIN_NOFILE_SOFT_LIMIT) as libc::rlim_t;
+            if target > limits.rlim_cur {
+                limits.rlim_cur = target;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == 0 {
+                    info!(
+                        previous_soft = initial_soft,
+                        new_soft = target as u64,
+                        hard_limit = hard,
+                        "Raised RLIMIT_NOFILE soft limit"
+                    );
+                } else {
+                    warn!(
+                        soft_limit = initial_soft,
+                        hard_limit = hard,
+                        "Failed to raise RLIMIT_NOFILE soft limit"
+                    );
+                }
+            }
+        }
+
+        let mut verify = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut verify) == 0 {
+            let effective_soft = verify.rlim_cur as u64;
+            let effective_hard = verify.rlim_max as u64;
+            if effective_soft < WARN_NOFILE_SOFT_LIMIT {
+                warn!(
+                    soft_limit = effective_soft,
+                    hard_limit = effective_hard,
+                    "Low RLIMIT_NOFILE soft limit may cause EMFILE under bursty traffic"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_fd_budget() {}
 
 /// Run the start command
 pub async fn run(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     quiet: bool,
+    foreground: bool,
+    daemon_child: bool,
 ) -> anyhow::Result<()> {
+    if !foreground && !daemon_child {
+        return daemon::run_start_daemon(port, config_path, quiet).await;
+    }
+
+    ensure_fd_budget();
+
     let mut config = cli_config::load_effective_config(config_path.as_ref(), None)?;
     cloud_hooks::apply_cached_controls(&mut config)?;
 
@@ -66,7 +135,7 @@ pub async fn run(
         if let Some(pb) = spinner {
             pb.finish_and_clear();
         }
-        style::error("CA certificate not found. Run: soth proxy setup-ca");
+        style::error("CA certificate not found. Run: soth runtime setup-ca");
         return Ok(());
     }
 
@@ -77,7 +146,7 @@ pub async fn run(
     // Best-effort startup refresh: try cloud registry fetch first, then fall back to cache.
     cloud_hooks::refresh_registry_bundle_on_start(&config).await;
 
-    // Auto-enable system proxy when soth proxy starts without extra console noise.
+    // Auto-enable system proxy when soth starts without extra console noise.
     system::enable_quiet(Some(proxy_config.port)).await?;
 
     let intercept_count = proxy_config.hosts.intercept_domain_count();
@@ -121,7 +190,7 @@ pub async fn run(
         };
 
     let runtime_line = format!(
-        "soth proxy | {} | {} | {}",
+        "soth sensor | {} | {} | {}",
         proxy_config.registry_mode,
         proxy_config.hosts.mode,
         proxy_config.socket_addr()
@@ -134,10 +203,10 @@ pub async fn run(
         intercept_count
     );
     let api_line = format!(
-        "off (run `soth proxy api start --port {}` to enable)",
+        "off (run `soth dev api start --port {}` to enable)",
         config.dashboard.port
     );
-    let ui_line = "off (run `soth proxy ui start` to enable)".to_string();
+    let ui_line = "off (run `soth dev ui start` to enable)".to_string();
     let system_proxy_line = format!("enabled @ 127.0.0.1:{}", proxy_config.port);
 
     // Initialize Prometheus metrics
@@ -149,7 +218,7 @@ pub async fn run(
             &runtime_line,
             &rules_line,
             &intercept_summary,
-            "eval $(soth proxy env)",
+            "eval $(soth runtime env)",
             &compact_path(&ca_cert_path),
             &api_line,
             &ui_line,
@@ -333,7 +402,7 @@ struct ProxyRuntime {
     collector_task: Option<JoinHandle<()>>,
 }
 
-/// Run the soth proxy transport.
+/// Run the sensor transport.
 async fn run_forward_proxy(
     config: &SothConfig,
     proxy_config: soth_core::config::ForwardProxyConfig,

@@ -26,7 +26,9 @@ pub async fn run_start(
     quiet: bool,
 ) -> anyhow::Result<()> {
     match profile {
-        RuntimeProfile::SensorOnly => start::run(sensor_port, config_path, quiet).await,
+        RuntimeProfile::SensorOnly => {
+            start::run(sensor_port, config_path, quiet, true, false).await
+        }
         RuntimeProfile::ApiOnly => api::run_start(api_port, config_path, quiet).await,
         RuntimeProfile::UiOnly => ui::run_start(config_path, api_port, ui_dir, quiet).await,
         RuntimeProfile::DevStack => {
@@ -48,6 +50,7 @@ async fn run_dev_stack(
     let mut sensor_args = vec![
         "proxy".to_string(),
         "start".to_string(),
+        "--foreground".to_string(),
         "--quiet".to_string(),
     ];
     if let Some(port) = sensor_port {

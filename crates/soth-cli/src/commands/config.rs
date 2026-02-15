@@ -74,7 +74,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
-    // Validate soth proxy section
+    // Validate sensor runtime section
     validate_forward_proxy(&config, &mut warnings, &mut errors);
 
     // Validate identity section
@@ -203,7 +203,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Validate soth proxy configuration
+/// Validate sensor runtime configuration
 fn validate_forward_proxy(
     config: &SothConfig,
     warnings: &mut Vec<String>,

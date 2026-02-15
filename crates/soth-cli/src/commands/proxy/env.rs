@@ -30,7 +30,7 @@ pub async fn run(shell: &str, ca_only: bool, config_path: Option<PathBuf>) -> an
             println!("export CURL_CA_BUNDLE={}", ca_path);
             println!("export GIT_SSL_CAINFO={}", ca_path);
             println!("export AWS_CA_BUNDLE={}", ca_path);
-            println!("# Run: eval $(soth proxy env)");
+            println!("# Run: eval $(soth runtime env)");
         }
         "fish" => {
             println!("set -gx HTTP_PROXY {}", proxy_addr);
@@ -45,7 +45,7 @@ pub async fn run(shell: &str, ca_only: bool, config_path: Option<PathBuf>) -> an
             println!("set -gx CURL_CA_BUNDLE {}", ca_path);
             println!("set -gx GIT_SSL_CAINFO {}", ca_path);
             println!("set -gx AWS_CA_BUNDLE {}", ca_path);
-            println!("# Run: eval (soth proxy env --shell fish)");
+            println!("# Run: eval (soth runtime env --shell fish)");
         }
         "powershell" | "pwsh" => {
             println!("$env:HTTP_PROXY = \"{}\"", proxy_addr);

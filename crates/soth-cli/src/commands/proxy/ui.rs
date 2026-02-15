@@ -10,7 +10,7 @@ use std::time::Duration;
 const DEFAULT_UI_DIR: &str = "dashboard";
 const DEFAULT_UI_URL: &str = "http://localhost:3002";
 
-/// Run `soth proxy ui start`.
+/// Run `soth dev ui start`.
 pub async fn run_start(
     config_path: Option<PathBuf>,
     api_port: Option<u16>,
