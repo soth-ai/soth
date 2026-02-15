@@ -85,11 +85,16 @@ fn send_term(pid: u32) {
     #[cfg(unix)]
     {
         let group = format!("-{pid}");
-        let group_status = Command::new("kill").arg("-TERM").arg(&group).status();
+        let group_status = Command::new("kill")
+            .arg("-TERM")
+            .arg(&group)
+            .stderr(Stdio::null())
+            .status();
         if !group_status.map(|status| status.success()).unwrap_or(false) {
             let _ = Command::new("kill")
                 .arg("-TERM")
                 .arg(pid.to_string())
+                .stderr(Stdio::null())
                 .status();
         }
     }
@@ -99,11 +104,16 @@ fn send_kill(pid: u32) {
     #[cfg(unix)]
     {
         let group = format!("-{pid}");
-        let group_status = Command::new("kill").arg("-KILL").arg(&group).status();
+        let group_status = Command::new("kill")
+            .arg("-KILL")
+            .arg(&group)
+            .stderr(Stdio::null())
+            .status();
         if !group_status.map(|status| status.success()).unwrap_or(false) {
             let _ = Command::new("kill")
                 .arg("-KILL")
                 .arg(pid.to_string())
+                .stderr(Stdio::null())
                 .status();
         }
     }
