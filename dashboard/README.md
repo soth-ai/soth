@@ -1,166 +1,106 @@
 # SOTH Dashboard
 
-Real-time metrics dashboard for the SOTH edge proxy.
+Real-time UI for SOTH sensor telemetry.
 
 ## Tech Stack
 
-- **Next.js 15** - React framework with App Router
-- **TanStack Query** - Data fetching with auto-refresh
-- **Tailwind CSS v4** - Styling
-- **Radix UI** - Accessible primitives
-- **shadcn/ui (configured)** - Canonical UI primitive workflow
-- **Phosphor Icons** - Icon set
+- Next.js 15 (App Router)
+- TanStack Query
+- Tailwind CSS v4
+- Radix UI + shadcn/ui primitives
+- Phosphor Icons
 
-## Development
+## Runtime Model
 
-### Backend Endpoint Configuration
+The dashboard uses two services:
 
-By default, the dashboard uses same-origin `/api` for HTTP and same-origin `/api/events/stream` for WebSocket.
-In local dev on port `3002`, WebSocket defaults to `ws://localhost:3001`.
+- API service (Rust): `soth dev api start`
+- UI service (Next.js): `soth dev ui start`
 
-Override these when your API/WS endpoint is not same-origin:
+The sensor proxy is independent and can run with or without the dashboard.
+
+## Quick Start (Current CLI)
+
+1. Start sensor lifecycle:
 
 ```bash
-# .env.local
+soth up
+```
+
+2. Start API service (default `:3001`):
+
+```bash
+soth dev api start
+```
+
+3. Start UI dev service (default `:3002`):
+
+```bash
+soth dev ui start
+```
+
+4. Open `http://localhost:3002`
+
+To stop sensor lifecycle:
+
+```bash
+soth down
+```
+
+## Endpoint Configuration
+
+By default the UI uses same-origin `/api`, and local dev expects API on `localhost:3001`.
+
+Override with `.env.local` when needed:
+
+```bash
 NEXT_PUBLIC_SOTH_API_BASE=http://localhost:3001/api
 NEXT_PUBLIC_SOTH_WS_BASE=ws://localhost:3001
 ```
 
-### UI Primitive Workflow (shadcn)
+## UI Primitive Workflow
 
-This dashboard is now configured for shadcn (`components.json`).
-
-- Add a new shadcn component:
-  ```bash
-  npm run ui:add -- button
-  ```
-- Generated components should live in `src/components/ui`.
-- Keep performance-critical stream/panel views custom; use shadcn primitives for shared controls/surfaces.
-
-### With MCP Proxy
-
-1. Start the SOTH proxy with dashboard enabled:
-   ```yaml
-   # soth.yaml
-   dashboard:
-     enabled: true
-     port: 3001
-   ```
-
-2. Run the proxy:
-   ```bash
-   cargo run -- -c soth.yaml start
-   ```
-
-3. In a separate terminal, start the dashboard:
-   ```bash
-   cd dashboard
-   npm install
-   npm run dev
-   ```
-
-4. Open [http://localhost:3002](http://localhost:3002)
-
-### With Forward Proxy
-
-1. Configure both forward proxy and dashboard:
-   ```yaml
-   # soth.yaml
-   forward_proxy:
-     enabled: true
-     port: 8080
-     hosts:
-       allow:
-         - "api.openai.com"
-         - "api.anthropic.com"
-
-   dashboard:
-     enabled: true
-     port: 3001
-
-   production:
-     rate_limit:
-       enabled: true
-     circuit_breaker:
-       enabled: true
-   ```
-
-2. Set up the CA certificate:
-   ```bash
-   soth proxy setup-ca
-   ```
-
-3. Start the forward proxy:
-   ```bash
-   soth proxy start --config soth.yaml
-   ```
-
-4. Start the dashboard:
-   ```bash
-   cd dashboard
-   npm run dev
-   ```
-
-5. Configure your shell and make requests:
-   ```bash
-   eval $(soth proxy env)
-   curl https://api.openai.com/v1/models
-   ```
-
-6. View metrics at [http://localhost:3002](http://localhost:3002)
-
-## Production
-
-For production, you can build and embed the dashboard:
+Add shadcn components:
 
 ```bash
+npm run ui:add -- button
+```
+
+Generated components should live in `src/components/ui`.
+
+## Minimal Config Example
+
+```yaml
+dashboard:
+  enabled: true
+  port: 3001
+
+forward_proxy:
+  enabled: true
+  port: 8080
+  hosts:
+    mode: selective
+    domain_files:
+      ai_inference: "./domains/ai_inference.yaml"
+      mcp: "./domains/mcp.yaml"
+      agent_apps: "./domains/agent_apps.yaml"
+```
+
+## Production Build
+
+```bash
+cd dashboard
 npm run build
 ```
 
-The static files in `.next/` can be served from the Rust backend.
+## API Endpoints Used by UI
 
-## Architecture
-
-```
-dashboard/
-├── src/
-│   ├── app/
-│   │   ├── globals.css      # Theme + animations
-│   │   ├── layout.tsx       # Root layout
-│   │   └── page.tsx         # Main dashboard
-│   ├── components/
-│   │   ├── panels/          # Metric panels
-│   │   │   ├── identity-panel.tsx
-│   │   │   ├── policy-panel.tsx
-│   │   │   ├── observe-panel.tsx
-│   │   │   ├── budget-panel.tsx
-│   │   │   └── proxy-panel.tsx   # Forward proxy metrics
-│   │   ├── providers.tsx    # React Query provider
-│   │   └── ui/              # Reusable components
-│   ├── hooks/
-│   │   └── useDashboardData.ts  # API hooks
-│   ├── lib/
-│   │   └── utils.ts         # Utilities
-│   └── types/
-│       └── index.ts         # API types
-```
-
-## API Endpoints
-
-The dashboard fetches from these endpoints (proxied to `:3001`):
-
-### Core Metrics
-- `GET /api/health` - Server health + uptime
-- `GET /api/identity` - Identity verification metrics
-- `GET /api/policy` - Policy evaluation metrics
-- `GET /api/observe` - Request/response + PII metrics
-- `GET /api/budget` - Token usage + cost metrics
-
-### Forward Proxy Metrics
-- `GET /api/proxy` - Proxy connection and request metrics
-- `GET /metrics` - Prometheus metrics (raw format)
-
-### Live Feed
-- `GET /api/events` - Recent events
-- `WS /api/events/stream` - WebSocket event stream
-- `GET /api/agents` - Connected agent statistics
+- `GET /api/health`
+- `GET /api/identity`
+- `GET /api/policy`
+- `GET /api/observe`
+- `GET /api/budget`
+- `GET /api/proxy`
+- `GET /api/events`
+- `GET /api/agents`
+- `WS /api/events/stream`
