@@ -156,6 +156,19 @@ fn is_benign_proxy_forward_error(err: &LegacyClientError) -> bool {
     false
 }
 
+fn is_emfile_proxy_forward_error(err: &LegacyClientError) -> bool {
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            if io_error.raw_os_error().is_some_and(|code| code == 24 || code == 10024) {
+                return true;
+            }
+        }
+        source = cause.source();
+    }
+    false
+}
+
 const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
 const STREAM_CAPTURE_INITIAL_CAPACITY: usize = 64 * 1024;
 const STREAM_BUFFER_POOL_MAX_BUFFERS: usize = 32;
@@ -3662,6 +3675,7 @@ impl HttpHandler for AiProxyHandler {
         let client_addr = ctx.client_addr;
         let request_id = self.request_correlation_id;
         let benign = is_benign_proxy_forward_error(&err);
+        let emfile_like = is_emfile_proxy_forward_error(&err);
         let error = err.to_string();
         let pending_requests = self.pending_requests.clone();
         let event_logger = self.event_logger.clone();
@@ -3680,6 +3694,10 @@ impl HttpHandler for AiProxyHandler {
                 let mut requests = pending_requests.lock();
                 requests.remove(&request_id)
             };
+
+            if emfile_like {
+                metrics::record_emfile_forward_error();
+            }
 
             if let (Some(logger), Some(pending_req)) = (event_logger.as_ref(), pending.as_ref()) {
                 let provider = pending_req
@@ -3761,6 +3779,12 @@ impl HttpHandler for AiProxyHandler {
                     client_addr = %client_addr,
                     error = %error,
                     "Transient proxy forward failure (client/upstream disconnect)"
+                );
+            } else if emfile_like {
+                error!(
+                    client_addr = %client_addr,
+                    error = %error,
+                    "Forward request failed due to file descriptor exhaustion (EMFILE)"
                 );
             } else {
                 warn!(

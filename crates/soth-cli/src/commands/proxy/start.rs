@@ -16,7 +16,7 @@ use soth_core::EventLogger;
 use soth_proxy::metrics;
 use soth_proxy::transport::hudsucker_proxy;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -35,6 +35,8 @@ const SOTH_MUTED: (u8, u8, u8) = (0x9F, 0x9F, 0x9F);
 const SOTH_TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 const MIN_NOFILE_SOFT_LIMIT: u64 = 8192;
 const WARN_NOFILE_SOFT_LIMIT: u64 = 2048;
+const FD_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
+const FD_MONITOR_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
 fn ensure_fd_budget() {
@@ -394,6 +396,8 @@ struct ProxyRuntime {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     proxy_task: JoinHandle<anyhow::Result<()>>,
     event_logger: Option<EventLogger>,
+    fd_monitor_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    fd_monitor_task: Option<JoinHandle<()>>,
     retention_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     retention_task: Option<JoinHandle<()>>,
     cloud_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -426,6 +430,8 @@ async fn run_forward_proxy(
     };
     let mut retention_shutdown_tx = runtime.retention_shutdown_tx;
     let mut retention_task = runtime.retention_task;
+    let mut fd_monitor_shutdown_tx = runtime.fd_monitor_shutdown_tx;
+    let mut fd_monitor_task = runtime.fd_monitor_task;
     let mut cloud_shutdown_tx = runtime.cloud_shutdown_tx;
     let mut cloud_task = runtime.cloud_task;
     let mut collector_shutdown_tx = runtime.collector_shutdown_tx;
@@ -452,6 +458,12 @@ async fn run_forward_proxy(
     shutdown_collector_runtime(
         &mut collector_shutdown_tx,
         &mut collector_task,
+        shutdown_timeout,
+    )
+    .await;
+    shutdown_fd_monitor_runtime(
+        &mut fd_monitor_shutdown_tx,
+        &mut fd_monitor_task,
         shutdown_timeout,
     )
     .await;
@@ -503,6 +515,13 @@ fn spawn_proxy_runtime(
         retention_task = Some(runtime.task);
     }
 
+    let mut fd_monitor_shutdown_tx = None;
+    let mut fd_monitor_task = None;
+    if let Some(runtime) = spawn_fd_monitor_runtime() {
+        fd_monitor_shutdown_tx = Some(runtime.shutdown_tx);
+        fd_monitor_task = Some(runtime.task);
+    }
+
     let mut cloud_shutdown_tx = None;
     let mut cloud_task = None;
     if let Some(runtime) = cloud_hooks::spawn_cloud_pull_runtime(config, event_db_path.clone()) {
@@ -550,6 +569,8 @@ fn spawn_proxy_runtime(
         shutdown_tx,
         proxy_task: handle,
         event_logger: shutdown_event_logger,
+        fd_monitor_shutdown_tx,
+        fd_monitor_task,
         retention_shutdown_tx,
         retention_task,
         cloud_shutdown_tx,
@@ -557,6 +578,91 @@ fn spawn_proxy_runtime(
         collector_shutdown_tx,
         collector_task,
     })
+}
+
+struct FdMonitorRuntime {
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+#[cfg(unix)]
+fn spawn_fd_monitor_runtime() -> Option<FdMonitorRuntime> {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(FD_MONITOR_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_warn_at: Option<Instant> = None;
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                _ = interval.tick() => {
+                    if let Some((open_fds, soft_limit, hard_limit)) = current_fd_snapshot() {
+                        metrics::set_runtime_fd_snapshot(open_fds, soft_limit, hard_limit);
+                        if soft_limit > 0 {
+                            let utilization = (open_fds as f64) / (soft_limit as f64);
+                            if utilization >= 0.9 {
+                                let should_warn = last_warn_at
+                                    .map(|last| last.elapsed() >= FD_MONITOR_WARN_INTERVAL)
+                                    .unwrap_or(true);
+                                if should_warn {
+                                    last_warn_at = Some(Instant::now());
+                                    warn!(
+                                        open_fds = open_fds,
+                                        soft_limit = soft_limit,
+                                        hard_limit = hard_limit,
+                                        utilization_pct = format!("{:.1}", utilization * 100.0),
+                                        "High file-descriptor utilization detected"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Some(FdMonitorRuntime { shutdown_tx, task })
+}
+
+#[cfg(not(unix))]
+fn spawn_fd_monitor_runtime() -> Option<FdMonitorRuntime> {
+    None
+}
+
+#[cfg(unix)]
+fn current_fd_snapshot() -> Option<(u64, u64, u64)> {
+    let (soft_limit, hard_limit) = current_nofile_limits()?;
+    let open_fds = current_open_fd_count()?;
+    Some((open_fds, soft_limit, hard_limit))
+}
+
+#[cfg(unix)]
+fn current_nofile_limits() -> Option<(u64, u64)> {
+    unsafe {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
+            return None;
+        }
+        Some((limits.rlim_cur as u64, limits.rlim_max as u64))
+    }
+}
+
+#[cfg(unix)]
+fn current_open_fd_count() -> Option<u64> {
+    for path in ["/proc/self/fd", "/dev/fd"] {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            let count = entries.filter_map(Result::ok).count() as u64;
+            if count > 0 {
+                return Some(count);
+            }
+        }
+    }
+    None
 }
 
 fn set_env_if_present<T: ToString>(key: &str, value: Option<T>) {
@@ -628,6 +734,29 @@ async fn shutdown_retention_runtime(
             Err(_) => {
                 handle.abort();
                 tracing::warn!("Retention task shutdown timed out; aborted task.");
+            }
+        }
+    }
+}
+
+async fn shutdown_fd_monitor_runtime(
+    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    task: &mut Option<JoinHandle<()>>,
+    timeout_budget: Duration,
+) {
+    if let Some(tx) = shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+
+    if let Some(mut handle) = task.take() {
+        match tokio::time::timeout(timeout_budget, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("FD monitor task join error: {}", error);
+            }
+            Err(_) => {
+                handle.abort();
+                tracing::warn!("FD monitor task shutdown timed out; aborted task.");
             }
         }
     }

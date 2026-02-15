@@ -20,6 +20,10 @@ static DISCOVERY_CATALOG_CAP_SKIP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REGISTRY_SOURCE_STATE: AtomicU64 = AtomicU64::new(0);
 static REGISTRY_REFRESH_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_OPEN_FDS: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_FD_SOFT_LIMIT: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_FD_HARD_LIMIT: AtomicU64 = AtomicU64::new(0);
+static EMFILE_FORWARD_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the Prometheus metrics exporter
 ///
@@ -77,6 +81,10 @@ pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
 pub const CIRCUIT_BREAKER_STATE: &str = "soth_proxy_circuit_breaker_state";
 pub const POLICY_ACTIVE_VERSION: &str = "soth_policy_active_version";
 pub const TLS_LEARNED_PASSTHROUGH_ACTIVE: &str = "soth_tls_learned_passthrough_active";
+pub const RUNTIME_OPEN_FDS_GAUGE: &str = "soth_runtime_open_fds";
+pub const RUNTIME_FD_SOFT_LIMIT_GAUGE: &str = "soth_runtime_fd_soft_limit";
+pub const RUNTIME_FD_HARD_LIMIT_GAUGE: &str = "soth_runtime_fd_hard_limit";
+pub const RUNTIME_FD_UTILIZATION_GAUGE: &str = "soth_runtime_fd_utilization_ratio";
 
 // Histograms
 pub const REQUEST_DURATION: &str = "soth_proxy_request_duration_seconds";
@@ -131,6 +139,10 @@ fn describe_counters() {
         FILTER_DECISIONS_TOTAL,
         "Total host filter decisions by phase and decision"
     );
+    describe_counter!(
+        "soth_runtime_emfile_forward_errors_total",
+        "Total forwarded request failures attributed to EMFILE-like conditions"
+    );
 }
 
 fn describe_gauges() {
@@ -146,6 +158,19 @@ fn describe_gauges() {
     describe_gauge!(
         TLS_LEARNED_PASSTHROUGH_ACTIVE,
         "Current number of learned passthrough hosts"
+    );
+    describe_gauge!(RUNTIME_OPEN_FDS_GAUGE, "Current open file descriptor count");
+    describe_gauge!(
+        RUNTIME_FD_SOFT_LIMIT_GAUGE,
+        "Current RLIMIT_NOFILE soft limit"
+    );
+    describe_gauge!(
+        RUNTIME_FD_HARD_LIMIT_GAUGE,
+        "Current RLIMIT_NOFILE hard limit"
+    );
+    describe_gauge!(
+        RUNTIME_FD_UTILIZATION_GAUGE,
+        "Open/soft-limit file descriptor utilization ratio"
     );
 }
 
@@ -323,6 +348,22 @@ pub fn heartbeat_telemetry_snapshot() -> HeartbeatTelemetry {
         "edge.registry.refresh.last_success_unix_secs".to_string(),
         REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS.load(Ordering::Relaxed),
     );
+    counters.insert(
+        "edge.runtime.open_fds".to_string(),
+        RUNTIME_OPEN_FDS.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.runtime.fd_soft_limit".to_string(),
+        RUNTIME_FD_SOFT_LIMIT.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.runtime.fd_hard_limit".to_string(),
+        RUNTIME_FD_HARD_LIMIT.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.runtime.emfile_forward_errors_total".to_string(),
+        EMFILE_FORWARD_ERROR_TOTAL.load(Ordering::Relaxed),
+    );
     HeartbeatTelemetry { counters }
 }
 
@@ -344,6 +385,26 @@ pub fn set_registry_refresh_consecutive_failures(count: u64) {
 
 pub fn set_registry_refresh_last_success_unix_secs(unix_secs: u64) {
     REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS.store(unix_secs, Ordering::Relaxed);
+}
+
+pub fn set_runtime_fd_snapshot(open_fds: u64, soft_limit: u64, hard_limit: u64) {
+    RUNTIME_OPEN_FDS.store(open_fds, Ordering::Relaxed);
+    RUNTIME_FD_SOFT_LIMIT.store(soft_limit, Ordering::Relaxed);
+    RUNTIME_FD_HARD_LIMIT.store(hard_limit, Ordering::Relaxed);
+    gauge!(RUNTIME_OPEN_FDS_GAUGE).set(open_fds as f64);
+    gauge!(RUNTIME_FD_SOFT_LIMIT_GAUGE).set(soft_limit as f64);
+    gauge!(RUNTIME_FD_HARD_LIMIT_GAUGE).set(hard_limit as f64);
+    let utilization = if soft_limit == 0 {
+        0.0
+    } else {
+        (open_fds as f64) / (soft_limit as f64)
+    };
+    gauge!(RUNTIME_FD_UTILIZATION_GAUGE).set(utilization);
+}
+
+pub fn record_emfile_forward_error() {
+    EMFILE_FORWARD_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    counter!("soth_runtime_emfile_forward_errors_total").increment(1);
 }
 
 /// Set active connections gauge
