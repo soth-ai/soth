@@ -17,6 +17,9 @@ static BLACKLIST_GRAPHQL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DISCOVERY_CATALOG_INTERCEPT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DISCOVERY_CATALOG_SEEN_SKIP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DISCOVERY_CATALOG_CAP_SKIP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REGISTRY_SOURCE_STATE: AtomicU64 = AtomicU64::new(0);
+static REGISTRY_REFRESH_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the Prometheus metrics exporter
 ///
@@ -308,7 +311,39 @@ pub fn heartbeat_telemetry_snapshot() -> HeartbeatTelemetry {
         "edge.discovery.catalog.daily_cap_skip_total".to_string(),
         DISCOVERY_CATALOG_CAP_SKIP_TOTAL.load(Ordering::Relaxed),
     );
+    counters.insert(
+        "edge.registry.source_state".to_string(),
+        REGISTRY_SOURCE_STATE.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.registry.refresh.consecutive_failures".to_string(),
+        REGISTRY_REFRESH_CONSECUTIVE_FAILURES.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.registry.refresh.last_success_unix_secs".to_string(),
+        REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS.load(Ordering::Relaxed),
+    );
     HeartbeatTelemetry { counters }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum RegistryBundleSourceState {
+    DegradedEmbedded = 0,
+    DegradedCached = 1,
+    HealthyCloud = 2,
+}
+
+pub fn set_registry_source_state(state: RegistryBundleSourceState) {
+    REGISTRY_SOURCE_STATE.store(state as u64, Ordering::Relaxed);
+}
+
+pub fn set_registry_refresh_consecutive_failures(count: u64) {
+    REGISTRY_REFRESH_CONSECUTIVE_FAILURES.store(count, Ordering::Relaxed);
+}
+
+pub fn set_registry_refresh_last_success_unix_secs(unix_secs: u64) {
+    REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS.store(unix_secs, Ordering::Relaxed);
 }
 
 /// Set active connections gauge
