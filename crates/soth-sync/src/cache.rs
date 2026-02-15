@@ -140,8 +140,40 @@ pub fn save_registry_bundle_cache(
 }
 
 fn validate_registry_bundle_payload(bundle: &Value) -> anyhow::Result<()> {
+    validate_registry_bundle_contract(bundle)
+        .context("bundle payload failed contract validation")?;
     parse_compiled_bundle(bundle)
         .context("bundle payload must match supported OISP bundle schema")?;
+    Ok(())
+}
+
+fn validate_registry_bundle_contract(bundle: &Value) -> anyhow::Result<()> {
+    let object = bundle
+        .as_object()
+        .context("bundle payload root must be a JSON object")?;
+
+    let schema_version = object
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .context("bundle payload missing required `schema_version`")?;
+    if schema_version == 0 {
+        anyhow::bail!("bundle payload `schema_version` must be greater than 0");
+    }
+
+    let filters = object
+        .get("filters")
+        .and_then(Value::as_object)
+        .context("bundle payload missing required `filters` object")?;
+
+    for key in ["whitelist", "blacklist", "passthrough", "noise_keywords"] {
+        let value = filters
+            .get(key)
+            .with_context(|| format!("bundle payload filters missing required `{key}`"))?;
+        if !value.is_array() {
+            anyhow::bail!("bundle payload filters.{key} must be an array");
+        }
+    }
+
     Ok(())
 }
 
@@ -235,6 +267,7 @@ mod tests {
         let path = dir.path().join("registry_bundle_cache.json");
         let metadata = sample_registry_metadata("v1");
         let bundle = serde_json::json!({
+            "schema_version": 2,
             "version": "v1",
             "compiled_at": "2026-02-13T00:00:00Z",
             "bundle_type": "cloud",
@@ -247,7 +280,12 @@ mod tests {
                 }
             },
             "domain_index": [],
-            "filters": {},
+            "filters": {
+                "whitelist": [],
+                "blacklist": [],
+                "passthrough": [],
+                "noise_keywords": []
+            },
             "pricing": {}
         });
 
@@ -265,6 +303,7 @@ mod tests {
         let path = dir.path().join("registry_bundle_cache.json");
         let metadata = sample_registry_metadata("catalog-v1");
         let bundle = serde_json::json!({
+            "schema_version": 2,
             "version": "catalog-v1",
             "compiled_at": "2026-02-13T00:00:00Z",
             "bundle_type": "local",
@@ -286,6 +325,12 @@ mod tests {
                 "api.openai.com": [
                     { "action": "intercept", "path": "/v1/chat/completions" }
                 ]
+            },
+            "filters": {
+                "whitelist": ["api.openai.com"],
+                "blacklist": [],
+                "passthrough": [],
+                "noise_keywords": []
             }
         });
 
@@ -321,12 +366,50 @@ mod tests {
     }
 
     #[test]
+    fn save_registry_bundle_cache_rejects_missing_canonical_filters() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("v1");
+        let bundle = serde_json::json!({
+            "schema_version": 2,
+            "version": "v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "type": "ai-inference",
+                    "domains": ["api.openai.com"]
+                }
+            },
+            "domain_index": [],
+            "filters": {
+                "whitelist": []
+            },
+            "pricing": {}
+        });
+
+        let err =
+            save_registry_bundle_cache(&path, &metadata, "etag-1", bundle.to_string().as_bytes())
+                .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("registry bundle payload failed schema validation")
+                || message.contains("bundle payload failed contract validation")
+                || message.contains("filters missing required"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
     fn save_registry_bundle_cache_accepts_wrapped_bundle_payload() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("registry_bundle_cache.json");
         let metadata = sample_registry_metadata("wrapped-v1");
         let wrapped = serde_json::json!({
             "bundle": {
+                "schema_version": 2,
                 "version": "wrapped-v1",
                 "compiled_at": "2026-02-13T00:00:00Z",
                 "bundle_type": "cloud",
@@ -339,7 +422,12 @@ mod tests {
                     }
                 },
                 "domain_index": [],
-                "filters": {},
+                "filters": {
+                    "whitelist": [],
+                    "blacklist": [],
+                    "passthrough": [],
+                    "noise_keywords": []
+                },
                 "pricing": {}
             }
         });
@@ -364,6 +452,7 @@ mod tests {
         let path = dir.path().join("registry_bundle_cache.json");
         let metadata = sample_registry_metadata("v1");
         let valid_bundle = serde_json::json!({
+            "schema_version": 2,
             "version": "v1",
             "compiled_at": "2026-02-13T00:00:00Z",
             "bundle_type": "cloud",
@@ -376,7 +465,12 @@ mod tests {
                 }
             },
             "domain_index": [],
-            "filters": {},
+            "filters": {
+                "whitelist": [],
+                "blacklist": [],
+                "passthrough": [],
+                "noise_keywords": []
+            },
             "pricing": {}
         });
         save_registry_bundle_cache(
