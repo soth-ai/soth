@@ -205,6 +205,7 @@ mod tests {
                 "size_bytes": 123
             },
             "bundle": {
+                "schema_version": 2,
                 "version": "v1",
                 "compiled_at": "2026-02-13T00:00:00Z",
                 "bundle_type": "local",
@@ -219,7 +220,12 @@ mod tests {
                         "api_format": "openai"
                     }
                 },
-                "filters": {},
+                "filters": {
+                    "whitelist": ["api.openai.com"],
+                    "blacklist": [],
+                    "passthrough": [],
+                    "noise_keywords": []
+                },
                 "pricing": {
                     "openai": {
                         "gpt-4o": {

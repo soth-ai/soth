@@ -59,6 +59,7 @@ pub const BUDGET_BLOCKS_TOTAL: &str = "soth_budget_blocks_total";
 pub const ENFORCEMENT_FAILOPEN_TOTAL: &str = "soth_enforcement_failopen_total";
 pub const STREAM_CAPTURE_LIMIT_REACHED_TOTAL: &str = "soth_stream_capture_limit_reached_total";
 pub const TLS_LEARNED_PASSTHROUGH_TOTAL: &str = "soth_tls_learned_passthrough_total";
+pub const FILTER_DECISIONS_TOTAL: &str = "soth_filter_decisions_total";
 
 // Gauges
 pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
@@ -114,6 +115,10 @@ fn describe_counters() {
     describe_counter!(
         TLS_LEARNED_PASSTHROUGH_TOTAL,
         "Total learned TLS passthrough events by action"
+    );
+    describe_counter!(
+        FILTER_DECISIONS_TOTAL,
+        "Total host filter decisions by phase and decision"
     );
 }
 
@@ -244,6 +249,16 @@ pub fn record_tls_learned_passthrough(action: &str) {
 /// Set current learned passthrough active host count.
 pub fn set_tls_learned_passthrough_active(count: f64) {
     gauge!(TLS_LEARNED_PASSTHROUGH_ACTIVE).set(count);
+}
+
+/// Record host-filter decision at HTTP/CONNECT phase.
+pub fn record_filter_decision(phase: &str, decision: &str) {
+    counter!(
+        FILTER_DECISIONS_TOTAL,
+        "phase" => phase.to_string(),
+        "decision" => decision.to_string()
+    )
+    .increment(1);
 }
 
 /// Set active connections gauge

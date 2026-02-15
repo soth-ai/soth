@@ -1870,26 +1870,64 @@ impl AiProxyHandler {
     /// Uses bundle-driven decisions only (no host-list fallback).
     fn get_action(&self, host: &str, path: &str) -> HostAction {
         if matches!(self.hosts.action_for_host(host), HostAction::Block) {
+            metrics::record_filter_decision("http", "block");
             return HostAction::Block;
         }
 
         let engine = self.oisp_engine.as_ref();
         match engine.should_intercept(host, path) {
-            InterceptDecision::Intercept { .. } => HostAction::Intercept,
-            InterceptDecision::Passthrough
-            | InterceptDecision::Noise
-            | InterceptDecision::Tunnel => {
+            InterceptDecision::Intercept { .. } => {
+                metrics::record_filter_decision("http", "intercept");
+                HostAction::Intercept
+            }
+            InterceptDecision::Passthrough => {
                 if self.hosts.mode == HostFilterMode::Discovery
                     && engine.classify(host).is_none()
                     && engine.is_catalog_domain(host)
                     && self.catalog_discovery_limiter.reserve_once_per_day(host)
                 {
+                    metrics::record_filter_decision("http", "catalog_discovery_intercept");
                     info!(
                         host = %host,
                         "Catalog discovery interception enabled for first capture of the day"
                     );
                     HostAction::Intercept
                 } else {
+                    metrics::record_filter_decision("http", "passthrough");
+                    HostAction::Tunnel
+                }
+            }
+            InterceptDecision::Noise => {
+                if self.hosts.mode == HostFilterMode::Discovery
+                    && engine.classify(host).is_none()
+                    && engine.is_catalog_domain(host)
+                    && self.catalog_discovery_limiter.reserve_once_per_day(host)
+                {
+                    metrics::record_filter_decision("http", "catalog_discovery_intercept");
+                    info!(
+                        host = %host,
+                        "Catalog discovery interception enabled for first capture of the day"
+                    );
+                    HostAction::Intercept
+                } else {
+                    metrics::record_filter_decision("http", "noise");
+                    HostAction::Tunnel
+                }
+            }
+            InterceptDecision::Tunnel => {
+                if self.hosts.mode == HostFilterMode::Discovery
+                    && engine.classify(host).is_none()
+                    && engine.is_catalog_domain(host)
+                    && self.catalog_discovery_limiter.reserve_once_per_day(host)
+                {
+                    metrics::record_filter_decision("http", "catalog_discovery_intercept");
+                    info!(
+                        host = %host,
+                        "Catalog discovery interception enabled for first capture of the day"
+                    );
+                    HostAction::Intercept
+                } else {
+                    metrics::record_filter_decision("http", "tunnel");
                     HostAction::Tunnel
                 }
             }
@@ -1899,23 +1937,27 @@ impl AiProxyHandler {
     /// Resolve action for CONNECT/TLS handshake where request path is not available yet.
     fn get_connect_action(&self, host: &str) -> HostAction {
         if matches!(self.hosts.action_for_host(host), HostAction::Block) {
+            metrics::record_filter_decision("connect", "block");
             return HostAction::Block;
         }
 
         let engine = self.oisp_engine.as_ref();
         if engine.should_intercept_host(host) {
+            metrics::record_filter_decision("connect", "intercept");
             HostAction::Intercept
         } else if self.hosts.mode == HostFilterMode::Discovery
             && engine.classify(host).is_none()
             && engine.is_catalog_domain(host)
             && self.catalog_discovery_limiter.reserve_once_per_day(host)
         {
+            metrics::record_filter_decision("connect", "catalog_discovery_intercept");
             info!(
                 host = %host,
                 "Catalog discovery CONNECT interception enabled for first capture of the day"
             );
             HostAction::Intercept
         } else {
+            metrics::record_filter_decision("connect", "tunnel");
             HostAction::Tunnel
         }
     }
@@ -2177,12 +2219,14 @@ impl HttpHandler for AiProxyHandler {
         let request_capture_oversized = declared_request_size_bytes
             .map(|size| size > self.capture_max_body_bytes)
             .unwrap_or(false);
+        let should_log_inference_request = Self::should_log_request(&path, &http_method);
         // Only inspect request bodies for relevant host classes (or discovery mode).
         let should_inspect_body = is_post
             && should_capture_observability
-            && ((host_is_ai_target || host_is_agent_target)
-                || host_is_mcp_target
-                || (host_mode == HostFilterMode::Discovery && is_json))
+            && (host_is_mcp_target
+                || (((host_is_ai_target || host_is_agent_target)
+                    || (host_mode == HostFilterMode::Discovery && is_json))
+                    && should_log_inference_request))
             && !is_catalog_discovery_host
             && !request_capture_oversized;
         let oisp_engine = self.oisp_engine.clone();
@@ -2430,8 +2474,7 @@ impl HttpHandler for AiProxyHandler {
                 };
 
                 // Check if this request should be logged (blacklist non-inference content)
-                let should_log = is_catalog_discovery_host
-                    || Self::should_log_request(&display_path, &http_method);
+                let should_log = is_catalog_discovery_host || should_log_inference_request;
 
                 if should_log {
                     info!(
@@ -3941,6 +3984,7 @@ mod tests {
                 "size_bytes": 123
             },
             "bundle": {
+                "schema_version": 2,
                 "version": "v1",
                 "compiled_at": "2026-02-13T00:00:00Z",
                 "bundle_type": "local",
@@ -3952,7 +3996,12 @@ mod tests {
                     "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" },
                     "github-mcp": { "id": "github-mcp", "name": "GitHub MCP", "type": "mcp" }
                 },
-                "filters": {},
+                "filters": {
+                    "whitelist": ["api.openai.com", "api.github.com"],
+                    "blacklist": [],
+                    "passthrough": [],
+                    "noise_keywords": []
+                },
                 "pricing": {},
                 "catalog_domains": ["server.codeium.com", "*.githubcopilot.com"]
             }
@@ -3989,6 +4038,7 @@ mod tests {
                 "size_bytes": 123
             },
             "bundle": {
+                "schema_version": 2,
                 "version": "cache-v1",
                 "compiled_at": "2026-02-14T00:00:00Z",
                 "bundle_type": "cloud",
@@ -4006,7 +4056,12 @@ mod tests {
                         "api_format": "openai"
                     }
                 },
-                "filters": {},
+                "filters": {
+                    "whitelist": ["chatgpt.com"],
+                    "blacklist": [],
+                    "passthrough": [],
+                    "noise_keywords": []
+                },
                 "pricing": {},
                 "formats": {}
             }
