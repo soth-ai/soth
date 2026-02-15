@@ -110,6 +110,8 @@ struct PendingRequest {
     detection_reason: Option<String>,
     /// Confidence score for detection reason.
     parse_confidence: Option<f64>,
+    /// Whether interception matched blacklist/noise criteria.
+    blacklist_match: bool,
     /// Policy decision metadata captured at request enforcement time.
     policy_allowed: Option<bool>,
     policy_reason: Option<String>,
@@ -258,6 +260,13 @@ fn detection_reason_for_bucket(
         return Some("bundle.whitelist.agent_apps");
     }
     None
+}
+
+fn is_blacklist_detection_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("bundle.blacklist.keyword" | "bundle.blacklist.graphql")
+    )
 }
 
 fn parse_confidence_for_reason(reason: Option<&str>) -> Option<f64> {
@@ -1487,6 +1496,7 @@ fn finalize_and_enqueue_exchange_v2(
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
     }));
+    assembler.set_blacklist_match(pending.blacklist_match);
     assembler.set_request(
         pending.headers.clone(),
         pending.request_content_type.clone(),
@@ -1695,6 +1705,7 @@ fn seed_exchange_v2_spool(
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
     }));
+    assembler.set_blacklist_match(pending.blacklist_match);
     if let Some(envelope) = pending.envelope.as_ref() {
         assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
     }
@@ -2140,6 +2151,10 @@ impl HttpHandler for AiProxyHandler {
         let host = Self::extract_host(&req);
         let uri = req.uri().clone();
         let path = uri.path().to_string();
+        let path_for_filter = uri
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| path.clone());
         let http_method = req.method().to_string();
         let is_connect = req.method() == hyper::Method::CONNECT;
 
@@ -2153,7 +2168,7 @@ impl HttpHandler for AiProxyHandler {
         let host_action = if is_connect {
             self.get_connect_action(&host)
         } else {
-            self.get_action(&host, &path)
+            self.get_action(&host, &path_for_filter)
         };
         let is_blocked = matches!(host_action, HostAction::Block);
         let should_capture_observability = matches!(host_action, HostAction::Intercept);
@@ -2397,6 +2412,19 @@ impl HttpHandler for AiProxyHandler {
             } else {
                 None
             };
+            let graphql_blacklisted = graphql_operation
+                .as_deref()
+                .map(|operation| oisp_engine.matches_noise_keyword(operation))
+                .unwrap_or(false);
+            if graphql_blacklisted {
+                metrics::record_filter_decision("http", "blacklist_graphql");
+                info!(
+                    host = %host,
+                    path = %path,
+                    graphql_operation = ?graphql_operation,
+                    "Skipping observability capture for blacklisted GraphQL operation"
+                );
+            }
             let mut policy_allowed = None;
             let mut policy_version = None;
 
@@ -2474,7 +2502,9 @@ impl HttpHandler for AiProxyHandler {
                 };
 
                 // Check if this request should be logged (blacklist non-inference content)
-                let should_log = is_catalog_discovery_host || should_log_inference_request;
+                let should_log =
+                    (is_catalog_discovery_host || should_log_inference_request)
+                        && !graphql_blacklisted;
 
                 if should_log {
                     info!(
@@ -2491,7 +2521,8 @@ impl HttpHandler for AiProxyHandler {
                     debug!(
                         provider = provider,
                         path = %display_path,
-                        "Skipping non-inference endpoint"
+                        graphql_blacklisted = graphql_blacklisted,
+                        "Skipping non-inference or blacklisted endpoint"
                     );
                 }
 
@@ -2515,6 +2546,7 @@ impl HttpHandler for AiProxyHandler {
                         host_is_agent_target,
                         is_catalog_discovery_host,
                     );
+                    let blacklist_match = is_blacklist_detection_reason(detection_reason);
                     let envelope = apply_process_identity(
                         TrafficEnvelope::proxy(
                             &session_id,
@@ -2556,6 +2588,7 @@ impl HttpHandler for AiProxyHandler {
                             catalog_discovery: is_catalog_discovery_host,
                             detection_reason: detection_reason.map(ToString::to_string),
                             parse_confidence: parse_confidence_for_reason(detection_reason),
+                            blacklist_match,
                             policy_allowed,
                             policy_reason: None,
                             policy_version,
@@ -2620,6 +2653,7 @@ impl HttpHandler for AiProxyHandler {
                     host_is_agent_target,
                     is_catalog_discovery_host,
                 );
+                let blacklist_match = is_blacklist_detection_reason(detection_reason);
                 pending.insert(
                     request_id,
                     PendingRequest {
@@ -2657,6 +2691,7 @@ impl HttpHandler for AiProxyHandler {
                         catalog_discovery: is_catalog_discovery_host,
                         detection_reason: detection_reason.map(ToString::to_string),
                         parse_confidence: parse_confidence_for_reason(detection_reason),
+                        blacklist_match,
                         policy_allowed: None,
                         policy_reason: None,
                         policy_version: None,

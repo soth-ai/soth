@@ -5,10 +5,15 @@
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
+use soth_core::api::HeartbeatTelemetry;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Global Prometheus handle for rendering metrics
 static PROMETHEUS_HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
+static BLACKLIST_KEYWORD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLACKLIST_GRAPHQL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the Prometheus metrics exporter
 ///
@@ -259,6 +264,27 @@ pub fn record_filter_decision(phase: &str, decision: &str) {
         "decision" => decision.to_string()
     )
     .increment(1);
+
+    if phase.eq_ignore_ascii_case("http") && decision.eq_ignore_ascii_case("noise") {
+        BLACKLIST_KEYWORD_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if phase.eq_ignore_ascii_case("http") && decision.eq_ignore_ascii_case("blacklist_graphql") {
+        BLACKLIST_GRAPHQL_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot heartbeat telemetry counters useful for cloud-side aggregate analytics.
+pub fn heartbeat_telemetry_snapshot() -> HeartbeatTelemetry {
+    let mut counters = BTreeMap::new();
+    counters.insert(
+        "edge.blacklist.keyword_dropped_total".to_string(),
+        BLACKLIST_KEYWORD_DROPPED_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.blacklist.graphql_dropped_total".to_string(),
+        BLACKLIST_GRAPHQL_DROPPED_TOTAL.load(Ordering::Relaxed),
+    );
+    HeartbeatTelemetry { counters }
 }
 
 /// Set active connections gauge

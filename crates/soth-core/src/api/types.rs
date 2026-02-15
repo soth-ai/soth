@@ -286,6 +286,8 @@ pub struct HeartbeatRequest {
     pub os: Option<String>,
     pub hostname: Option<String>,
     pub active_connections: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<HeartbeatTelemetry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +295,12 @@ pub struct HeartbeatResponse {
     pub ok: bool,
     pub config_changed: bool,
     pub server_time: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeartbeatTelemetry {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub counters: std::collections::BTreeMap<String, u64>,
 }
 
 // ============================================================================

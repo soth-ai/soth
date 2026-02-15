@@ -164,6 +164,8 @@ impl OispEngine {
 
     pub fn should_intercept(&self, host: &str, path: &str) -> InterceptDecision {
         let host = normalize_host_for_matching(host);
+        let path_only = path.split_once('?').map(|(raw, _)| raw).unwrap_or(path);
+
         if contains_noise_keyword(path, &self.bundle.filters.noise_keywords) {
             return InterceptDecision::Noise;
         }
@@ -186,7 +188,7 @@ impl OispEngine {
             return InterceptDecision::Tunnel;
         };
 
-        if !entry.paths.is_empty() && !path_matches_any(path, &entry.paths) {
+        if !entry.paths.is_empty() && !path_matches_any(path_only, &entry.paths) {
             return InterceptDecision::Tunnel;
         }
 
@@ -219,6 +221,11 @@ impl OispEngine {
         }
 
         self.classify(host.as_str()).is_some()
+    }
+
+    /// Returns true when `text` contains any bundle noise keyword.
+    pub fn matches_noise_keyword(&self, text: &str) -> bool {
+        contains_noise_keyword(text, &self.bundle.filters.noise_keywords)
     }
 
     /// Calculate request cost using bundle pricing for a provider/model pair.
@@ -1782,6 +1789,40 @@ mod tests {
     }
 
     #[test]
+    fn should_intercept_honors_path_filters_with_query_string() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "version": "v1",
+                "compiled_at": "2026-02-13T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference",
+                        "paths": ["/v1/chat/completions"]
+                    }
+                ],
+                "providers": {
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine.should_intercept("api.openai.com", "/v1/chat/completions?trace=1"),
+            InterceptDecision::Intercept {
+                provider_id: "openai".to_string(),
+                entry_type: EntryType::AiInference
+            }
+        );
+    }
+
+    #[test]
     fn catalog_domains_are_available_for_discovery_checks() {
         let engine = OispEngine::new(
             parse_compiled_bundle(&json!({
@@ -1950,6 +1991,13 @@ mod tests {
         let keywords = vec!["Analytics".to_string()];
         assert!(contains_noise_keyword("/v1/ANALYTICS/query", &keywords));
         assert!(!contains_noise_keyword("/v1/messages", &keywords));
+    }
+
+    #[test]
+    fn matches_noise_keyword_uses_bundle_keywords() {
+        let engine = OispEngine::new(sample_bundle()).unwrap();
+        assert!(engine.matches_noise_keyword("GetAnalyticsDashboard"));
+        assert!(!engine.matches_noise_keyword("CreateConversation"));
     }
 
     #[test]

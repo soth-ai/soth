@@ -18,7 +18,10 @@ use soth_core::api::{
     ConfigTeam, ConfigUser, EventBatchRequest, EventBatchResponse, HeartbeatRequest,
     HeartbeatResponse, RegistryVersionResponse,
 };
-use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
+use soth_core::types::{
+    exchange_v2::{ExchangeBodyMode, ExchangeEventV2, ExchangeSourceClass, ExchangeTransport},
+    AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent,
+};
 use soth_sync::agent::{SyncAgent, SyncAgentConfig};
 use soth_sync::config_puller::ConfigPuller;
 use soth_sync::registry_puller::RegistryPuller;
@@ -105,6 +108,7 @@ async fn contract_sync_endpoints_and_cursors() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
         exchange_v2_only: true,
+        heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
@@ -207,7 +211,7 @@ async fn contract_retry_queue_on_body_upload_failure() {
     let config = SyncAgentConfig {
         endpoint: server_url,
         api_key: "test-key".to_string(),
-        event_db_path: db_path,
+        event_db_path: db_path.clone(),
         cache_path,
         agent_instance_id: "agent-instance-retry".to_string(),
         proxy_version: "0.1.0-test".to_string(),
@@ -222,6 +226,7 @@ async fn contract_retry_queue_on_body_upload_failure() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         exchange_v2_only: true,
+        heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
@@ -285,6 +290,7 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         exchange_v2_only: true,
+        heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
@@ -308,11 +314,12 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, false);
+    seed_exchange_upload_queue(&db_path, "ex-failure-1");
 
     let config = SyncAgentConfig {
         endpoint: "http://127.0.0.1:1".to_string(),
         api_key: "test-key".to_string(),
-        event_db_path: db_path,
+        event_db_path: db_path.clone(),
         cache_path: temp.path().join("cloud_cache.json"),
         agent_instance_id: "agent-instance-failure".to_string(),
         proxy_version: "0.1.0-test".to_string(),
@@ -327,6 +334,7 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         exchange_v2_only: true,
+        heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, None).unwrap();
     let error = agent.flush_for_shutdown(2).await.unwrap_err();
@@ -334,6 +342,20 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         !error.to_string().is_empty(),
         "expected non-empty sync failure error"
     );
+    assert!(
+        error.to_string().contains("exchange push failed"),
+        "expected exchange push failure, got: {error}"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let attempt_count: i64 = conn
+        .query_row(
+            "SELECT attempt_count FROM exchange_upload_queue WHERE exchange_id = 'ex-failure-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_count, 1);
 }
 
 async fn start_mock_server(state: SharedState) -> Option<String> {
@@ -648,6 +670,41 @@ fn create_test_db(path: &Path, with_second_event: bool) {
     }
 }
 
+fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS exchange_upload_queue (
+            exchange_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            blobs_json TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+
+    let event = make_exchange_event(exchange_id);
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r#"
+        INSERT INTO exchange_upload_queue (
+            exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
+        )
+        VALUES (?1, ?2, NULL, 0, NULL, ?3, ?3)
+        "#,
+        (
+            exchange_id,
+            serde_json::to_string(&event).unwrap(),
+            now,
+        ),
+    )
+    .unwrap();
+}
+
 fn make_event(id: &str) -> WrapEvent {
     let mut event = WrapEvent::new(
         "session-1",
@@ -671,5 +728,22 @@ fn make_event(id: &str) -> WrapEvent {
         "x-request-id".to_string(),
         "req_123".to_string(),
     )]));
+    event
+}
+
+fn make_exchange_event(exchange_id: &str) -> ExchangeEventV2 {
+    let mut event = ExchangeEventV2::new(
+        exchange_id,
+        ExchangeSourceClass::AiInference,
+        ExchangeTransport::Https,
+        ExchangeBodyMode::MetadataOnly,
+        ExchangeBodyMode::MetadataOnly,
+    );
+    event.provider = Some("openai".to_string());
+    event.agent = Some("codex".to_string());
+    event.model = Some("gpt-5".to_string());
+    event.endpoint = Some("/v1/responses".to_string());
+    event.method = Some("POST".to_string());
+    event.status_code = Some(200);
     event
 }

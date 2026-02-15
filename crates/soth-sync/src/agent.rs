@@ -9,13 +9,14 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use soth_core::api::{
     BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
-    ExchangeMetadata, HeartbeatRequest,
+    ExchangeMetadata, HeartbeatRequest, HeartbeatTelemetry,
 };
 use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
 use soth_core::types::exchange_v2::{ExchangeBodyMode, ExchangeEventV2};
 use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 use uuid::Uuid;
@@ -24,6 +25,9 @@ const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
 const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
 const MAX_EXCHANGE_RETRY_BACKOFF_SECS: u64 = 15 * 60;
 const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
+
+pub type HeartbeatTelemetryProvider =
+    Arc<dyn Fn() -> Option<HeartbeatTelemetry> + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct SyncAgentConfig {
@@ -44,6 +48,7 @@ pub struct SyncAgentConfig {
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
     pub exchange_v2_only: bool,
+    pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
 }
 
 pub struct SyncAgent {
@@ -175,6 +180,11 @@ impl SyncAgent {
             os: Some(std::env::consts::OS.to_string()),
             hostname: resolve_hostname(),
             active_connections: None,
+            telemetry: self
+                .config
+                .heartbeat_telemetry
+                .as_ref()
+                .and_then(|provider| provider()),
         };
 
         match self.heartbeat_sender.send(&request).await {
