@@ -497,6 +497,27 @@ fn append_capture_tags(
     }
 }
 
+fn append_process_attribution_tags(
+    tags: &mut BTreeMap<String, String>,
+    envelope: Option<&TrafficEnvelope>,
+) {
+    let Some(envelope) = envelope else {
+        return;
+    };
+    if let Some(source) = envelope.process_attribution_source.as_ref() {
+        tags.insert("metadata.attribution_source".to_string(), source.clone());
+    }
+    if let Some(confidence) = envelope.process_attribution_confidence {
+        tags.insert(
+            "metadata.attribution_confidence".to_string(),
+            format!("{confidence:.3}"),
+        );
+    }
+    if let Some(app_type) = envelope.process_app_type.as_ref() {
+        tags.insert("metadata.process_app_type".to_string(), app_type.clone());
+    }
+}
+
 /// Identity verification mode for proxy enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyIdentityMode {
@@ -1640,11 +1661,10 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
         })
     });
 
-    let app_type = if bundle_id.is_some() {
-        Some("desktop_app".to_string())
-    } else {
-        Some("cli".to_string())
-    };
+    let app_type = envelope
+        .process_app_type
+        .clone()
+        .or_else(|| classify_process_app_type(envelope.process_name.as_deref(), bundle_id.as_ref()));
 
     Some(ExchangeClient {
         pid: envelope.process_pid,
@@ -1653,6 +1673,44 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
         app_type,
         referrer_origin: None,
     })
+}
+
+fn classify_process_app_type(
+    process_name: Option<&str>,
+    bundle_id: Option<&String>,
+) -> Option<String> {
+    if let Some(name) = process_name {
+        let lower = name.to_ascii_lowercase();
+        let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+        if has_any(&["chrome", "firefox", "safari", "edge", "brave", "arc", "opera"]) {
+            return Some("browser".to_string());
+        }
+        if has_any(&["cursor", "code", "windsurf", "jetbrains", "zed", "xcode", "vim"]) {
+            return Some("editor".to_string());
+        }
+        if has_any(&[
+            "claude-code",
+            "codex",
+            "terminal",
+            "bash",
+            "zsh",
+            "fish",
+            "python",
+            "node",
+            "npm",
+            "cargo",
+        ]) {
+            return Some("cli".to_string());
+        }
+        if has_any(&["service", "daemon", "launchd", "systemd"]) {
+            return Some("service".to_string());
+        }
+    }
+    if bundle_id.is_some() {
+        Some("desktop_app".to_string())
+    } else {
+        Some("unknown".to_string())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1939,6 +1997,9 @@ fn apply_process_identity(
         envelope.process_pid = Some(process.pid);
         envelope.process_name = Some(process.name.clone());
         envelope.process_executable = process.executable.clone();
+        envelope.process_app_type = Some(process.app_type.clone());
+        envelope.process_attribution_source = Some(process.attribution_source.clone());
+        envelope.process_attribution_confidence = Some(process.attribution_confidence);
     }
     envelope
 }
@@ -2838,6 +2899,10 @@ impl HttpHandler for AiProxyHandler {
                         if is_catalog_discovery_host {
                             append_catalog_discovery_tags(&mut tags, &host);
                         }
+                        append_process_attribution_tags(
+                            &mut tags,
+                            event.traffic_envelope.as_ref(),
+                        );
                         if !tags.is_empty() {
                             event = event.with_tags(tags);
                         }
@@ -3081,6 +3146,7 @@ impl HttpHandler for AiProxyHandler {
                     if pending.catalog_discovery {
                         append_catalog_discovery_tags(&mut tags, &pending.host);
                     }
+                    append_process_attribution_tags(&mut tags, pending.envelope.as_ref());
                     append_capture_tags(
                         &mut tags,
                         pending.request_body_truncated,
@@ -3361,6 +3427,10 @@ impl HttpHandler for AiProxyHandler {
                         if log_pending.catalog_discovery {
                             append_catalog_discovery_tags(&mut enriched_tags, &log_pending.host);
                         }
+                        append_process_attribution_tags(
+                            &mut enriched_tags,
+                            log_pending.envelope.as_ref(),
+                        );
                         append_capture_tags(
                             &mut enriched_tags,
                             log_pending.request_body_truncated,
@@ -3498,6 +3568,7 @@ impl HttpHandler for AiProxyHandler {
                     if pending.catalog_discovery {
                         append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
                     }
+                    append_process_attribution_tags(&mut enriched_tags, pending.envelope.as_ref());
                     append_capture_tags(
                         &mut enriched_tags,
                         pending.request_body_truncated,
@@ -3628,6 +3699,7 @@ impl HttpHandler for AiProxyHandler {
                 if pending_req.catalog_discovery {
                     append_catalog_discovery_tags(&mut tags, &pending_req.host);
                 }
+                append_process_attribution_tags(&mut tags, pending_req.envelope.as_ref());
                 let usage_meta = ResponseUsageMeta::default();
                 if legacy_wrap_events_enabled {
                     let mut event = build_paired_response_event(ResponseEventInput {
@@ -3922,9 +3994,6 @@ impl WebSocketHandler for AiWebSocketHandler {
                             if is_catalog_discovery_ws {
                                 append_catalog_discovery_tags(&mut tags, &host);
                             }
-                            if !tags.is_empty() {
-                                event = event.with_tags(tags);
-                            }
                             if matches!(source, EventSource::Mcp) {
                                 let envelope = TrafficEnvelope::mcp_http(
                                     &session_id,
@@ -3937,7 +4006,11 @@ impl WebSocketHandler for AiWebSocketHandler {
                                     None,
                                     Some(text.as_ref()),
                                 );
+                                append_process_attribution_tags(&mut tags, Some(&envelope));
                                 event = event.with_traffic_envelope(envelope);
+                            }
+                            if !tags.is_empty() {
+                                event = event.with_tags(tags);
                             }
                             pii_enricher.enrich(&mut event);
                             logger.log(&event);

@@ -62,6 +62,15 @@ pub struct TrafficEnvelope {
     /// Optional executable/command path for the source process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_executable: Option<String>,
+    /// Optional normalized source application type (browser/editor/cli/desktop_app/service/unknown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_app_type: Option<String>,
+    /// Optional process-attribution source hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_attribution_source: Option<String>,
+    /// Optional process-attribution confidence score in [0,1].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_attribution_confidence: Option<f64>,
     /// Optional identity DID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub did: Option<String>,
@@ -117,6 +126,9 @@ impl TrafficEnvelope {
             process_pid: None,
             process_name: None,
             process_executable: None,
+            process_app_type: None,
+            process_attribution_source: None,
+            process_attribution_confidence: None,
             did: did.map(ToString::to_string),
             key_id: None,
             signature_alg: None,
@@ -153,6 +165,9 @@ impl TrafficEnvelope {
             process_pid: None,
             process_name: None,
             process_executable: None,
+            process_app_type: None,
+            process_attribution_source: None,
+            process_attribution_confidence: None,
             did: did.map(ToString::to_string),
             key_id: None,
             signature_alg: None,
@@ -192,6 +207,9 @@ impl TrafficEnvelope {
             process_pid: None,
             process_name: None,
             process_executable: None,
+            process_app_type: None,
+            process_attribution_source: None,
+            process_attribution_confidence: None,
             did: did.map(ToString::to_string),
             key_id: None,
             signature_alg: None,
