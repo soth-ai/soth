@@ -20,6 +20,6 @@ pub use routes::{api_router, api_router_with_events, AppState};
 pub use server::DashboardServer;
 pub use state::{
     BudgetAlert, BudgetMetrics, BudgetPrimitives, BudgetRequestPrimitive, DashboardState,
-    DenialEntry, DidEntry, IdentityMetrics, ObserveMetrics, PolicyMetrics, ProviderBudgetPrimitive,
-    ProviderTokens, ProxyMetrics, ProxyRequestEntry, ProxyStatus,
+    DenialEntry, DidEntry, FilterDecisionMetrics, IdentityMetrics, ObserveMetrics, PolicyMetrics,
+    ProviderBudgetPrimitive, ProviderTokens, ProxyMetrics, ProxyRequestEntry, ProxyStatus,
 };

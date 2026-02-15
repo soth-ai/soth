@@ -238,6 +238,7 @@ export interface HealthResponse {
   status: string;
   uptime_secs: number;
   event_store_enabled?: boolean;
+  filter_decisions?: FilterDecisionMetrics;
 }
 
 // Wrap Events (from soth wrap)
@@ -335,6 +336,12 @@ export interface ProxyStatus {
   ca_installed: boolean;
 }
 
+export interface FilterDecisionMetrics {
+  total: number;
+  by_phase: Record<string, number>;
+  by_decision: Record<string, number>;
+}
+
 export interface ProxyMetrics {
   total_requests: number;
   total_responses: number;
@@ -346,6 +353,7 @@ export interface ProxyMetrics {
   total_cost_usd: number;
   recent_requests: ProxyRequestEntry[];
   status: ProxyStatus;
+  filter_decisions?: FilterDecisionMetrics;
 }
 
 export interface DashboardSnapshot {

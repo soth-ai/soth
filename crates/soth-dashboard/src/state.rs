@@ -140,6 +140,9 @@ pub struct ProxyMetrics {
     pub recent_requests: VecDeque<ProxyRequestEntry>,
     /// Proxy status
     pub status: ProxyStatus,
+    /// Host filter decision counters scraped from Prometheus metrics.
+    #[serde(default)]
+    pub filter_decisions: FilterDecisionMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -169,6 +172,13 @@ pub struct ProxyStatus {
     pub enabled: bool,
     pub listen_address: Option<String>,
     pub ca_installed: bool,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FilterDecisionMetrics {
+    pub total: u64,
+    pub by_phase: HashMap<String, u64>,
+    pub by_decision: HashMap<String, u64>,
 }
 
 /// Canonical budget primitives derived from proxy + budget state.

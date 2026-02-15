@@ -500,4 +500,40 @@ mod tests {
             Some("v1")
         );
     }
+
+    #[test]
+    fn save_registry_bundle_cache_accepts_cloud_contract_fixture() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("cloud-contract-fixture-v2");
+        let fixture = include_str!("../tests/fixtures/cloud_bundle_contract_v2.json");
+        let fixture_json: serde_json::Value = serde_json::from_str(fixture).unwrap();
+
+        save_registry_bundle_cache(
+            &path,
+            &metadata,
+            "etag-fixture",
+            fixture_json.to_string().as_bytes(),
+        )
+        .unwrap();
+
+        let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
+        assert_eq!(loaded.metadata.version, "cloud-contract-fixture-v2");
+        assert_eq!(
+            loaded
+                .bundle
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            loaded
+                .bundle
+                .get("filters")
+                .and_then(|filters| filters.get("blacklist"))
+                .and_then(serde_json::Value::as_array)
+                .map(|values| values.len()),
+            Some(1)
+        );
+    }
 }
