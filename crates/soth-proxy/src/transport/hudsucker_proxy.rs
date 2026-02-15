@@ -5,7 +5,7 @@
 
 use async_stream::stream;
 use brotli::Decompressor as BrotliDecoder;
-use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use flate2::read::GzDecoder;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hudsucker::{
@@ -22,7 +22,7 @@ use hudsucker::{
 };
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use soth_budget::{BudgetTracker, TokenCounter};
 use soth_crypto::tls::LearnedPassthrough;
 use soth_oisp::{InterceptDecision, OispEngine, OispStreamParser};
@@ -196,41 +196,240 @@ fn append_stream_capture(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
     write_len < chunk.len()
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DiscoveryKind {
+    Catalog,
+}
+
+impl DiscoveryKind {
+    fn as_key_segment(self) -> &'static str {
+        match self {
+            Self::Catalog => "catalog",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryReserveResult {
+    Reserved,
+    AlreadySeen,
+    DailyCapReached,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDiscoveryState {
+    day: String,
+    seen: Vec<String>,
+    count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveryState {
+    day: NaiveDate,
+    seen: HashSet<String>,
+    count: u32,
+}
+
+impl DiscoveryState {
+    fn empty(day: NaiveDate) -> Self {
+        Self {
+            day,
+            seen: HashSet::new(),
+            count: 0,
+        }
+    }
+}
+
 struct CatalogDiscoveryLimiter {
-    seen_by_host_day: Mutex<HashMap<String, NaiveDate>>,
+    state_by_kind: Mutex<HashMap<DiscoveryKind, DiscoveryState>>,
+    event_logger: Mutex<Option<Arc<EventLogger>>>,
+    catalog_daily_cap: u32,
+}
+
+impl Default for CatalogDiscoveryLimiter {
+    fn default() -> Self {
+        Self {
+            state_by_kind: Mutex::new(HashMap::new()),
+            event_logger: Mutex::new(None),
+            catalog_daily_cap: 250,
+        }
+    }
 }
 
 impl CatalogDiscoveryLimiter {
-    fn normalized_host(host: &str) -> String {
-        host.trim().to_ascii_lowercase()
+    fn normalized_key(value: &str) -> String {
+        value.trim().to_ascii_lowercase()
     }
 
-    fn reserve_once_per_day(&self, host: &str) -> bool {
-        let normalized = Self::normalized_host(host);
+    fn sync_state_key(kind: DiscoveryKind) -> String {
+        format!("discovery.{}.state", kind.as_key_segment())
+    }
+
+    fn set_event_logger(&self, logger: Arc<EventLogger>) {
+        *self.event_logger.lock() = Some(logger);
+    }
+
+    fn current_day() -> NaiveDate {
+        Utc::now().date_naive()
+    }
+
+    fn cap_for_kind(&self, kind: DiscoveryKind) -> u32 {
+        match kind {
+            DiscoveryKind::Catalog => self.catalog_daily_cap,
+        }
+    }
+
+    fn reserve_once_per_day(&self, kind: DiscoveryKind, value: &str) -> DiscoveryReserveResult {
+        let normalized = Self::normalized_key(value);
+        if normalized.is_empty() {
+            return DiscoveryReserveResult::AlreadySeen;
+        }
+
+        let today = Self::current_day();
+        let logger = self.event_logger.lock().clone();
+
+        let mut states = self.state_by_kind.lock();
+        let state = states
+            .entry(kind)
+            .or_insert_with(|| Self::load_state(kind, today, logger.as_ref()))
+            .clone();
+
+        let mut state = if state.day == today {
+            state
+        } else {
+            Self::load_state(kind, today, logger.as_ref())
+        };
+
+        if state.seen.contains(normalized.as_str()) {
+            states.insert(kind, state);
+            return DiscoveryReserveResult::AlreadySeen;
+        }
+
+        if state.count >= self.cap_for_kind(kind) {
+            states.insert(kind, state);
+            return DiscoveryReserveResult::DailyCapReached;
+        }
+
+        state.seen.insert(normalized);
+        state.count = state.count.saturating_add(1);
+        let persisted = Self::encode_state(&state);
+        states.insert(kind, state);
+        drop(states);
+
+        if let (Some(logger), Some(payload)) = (logger, persisted) {
+            if let Err(error) = logger.set_sync_state(&Self::sync_state_key(kind), payload.as_str())
+            {
+                debug!(
+                    kind = %kind.as_key_segment(),
+                    ?error,
+                    "Failed persisting discovery limiter state; continuing with in-memory state"
+                );
+            }
+        }
+
+        DiscoveryReserveResult::Reserved
+    }
+
+    fn was_reserved_today(&self, kind: DiscoveryKind, value: &str) -> bool {
+        let normalized = Self::normalized_key(value);
         if normalized.is_empty() {
             return false;
         }
 
-        let today = Utc::now().date_naive();
-        let mut seen = self.seen_by_host_day.lock();
-        let cutoff = today - ChronoDuration::days(1);
-        seen.retain(|_, day| *day >= cutoff);
-        if seen.get(normalized.as_str()) == Some(&today) {
-            return false;
-        }
-        seen.insert(normalized, today);
-        true
+        let today = Self::current_day();
+        let logger = self.event_logger.lock().clone();
+        let mut states = self.state_by_kind.lock();
+        let state = states
+            .entry(kind)
+            .or_insert_with(|| Self::load_state(kind, today, logger.as_ref()))
+            .clone();
+        let state = if state.day == today {
+            state
+        } else {
+            Self::load_state(kind, today, logger.as_ref())
+        };
+        let reserved = state.seen.contains(normalized.as_str());
+        states.insert(kind, state);
+        reserved
     }
 
-    fn was_reserved_today(&self, host: &str) -> bool {
-        let normalized = Self::normalized_host(host);
-        if normalized.is_empty() {
-            return false;
+    fn load_state(
+        kind: DiscoveryKind,
+        today: NaiveDate,
+        logger: Option<&Arc<EventLogger>>,
+    ) -> DiscoveryState {
+        let Some(logger) = logger else {
+            return DiscoveryState::empty(today);
+        };
+
+        let raw = match logger.get_sync_state(&Self::sync_state_key(kind)) {
+            Ok(value) => value,
+            Err(error) => {
+                debug!(
+                    kind = %kind.as_key_segment(),
+                    ?error,
+                    "Failed reading persisted discovery limiter state"
+                );
+                None
+            }
+        };
+
+        let Some(raw) = raw else {
+            return DiscoveryState::empty(today);
+        };
+
+        let parsed: PersistedDiscoveryState = match serde_json::from_str(raw.as_str()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                debug!(
+                    kind = %kind.as_key_segment(),
+                    ?error,
+                    "Failed parsing persisted discovery limiter state"
+                );
+                return DiscoveryState::empty(today);
+            }
+        };
+
+        let parsed_day = match NaiveDate::parse_from_str(parsed.day.as_str(), "%Y-%m-%d") {
+            Ok(day) => day,
+            Err(error) => {
+                debug!(
+                    kind = %kind.as_key_segment(),
+                    ?error,
+                    "Invalid persisted discovery limiter day format"
+                );
+                return DiscoveryState::empty(today);
+            }
+        };
+
+        if parsed_day != today {
+            return DiscoveryState::empty(today);
         }
-        let today = Utc::now().date_naive();
-        let seen = self.seen_by_host_day.lock();
-        seen.get(normalized.as_str()) == Some(&today)
+
+        let mut seen = HashSet::with_capacity(parsed.seen.len());
+        for item in parsed.seen {
+            let normalized = Self::normalized_key(item.as_str());
+            if !normalized.is_empty() {
+                seen.insert(normalized);
+            }
+        }
+        let count = parsed.count.max(seen.len() as u32);
+        DiscoveryState {
+            day: today,
+            seen,
+            count,
+        }
+    }
+
+    fn encode_state(state: &DiscoveryState) -> Option<String> {
+        let mut seen: Vec<String> = state.seen.iter().cloned().collect();
+        seen.sort();
+        serde_json::to_string(&PersistedDiscoveryState {
+            day: state.day.format("%Y-%m-%d").to_string(),
+            seen,
+            count: state.count,
+        })
+        .ok()
     }
 }
 
@@ -1838,12 +2037,17 @@ impl AiProxyHandler {
 
     /// Set event logger for observability
     pub fn with_event_logger(mut self, logger: EventLogger) -> Self {
-        self.event_logger = Some(Arc::new(logger));
+        let logger = Arc::new(logger);
+        self.catalog_discovery_limiter
+            .set_event_logger(logger.clone());
+        self.event_logger = Some(logger);
         self
     }
 
     /// Set event logger for observability (Arc version for sharing)
     pub fn with_event_logger_arc(mut self, logger: Arc<EventLogger>) -> Self {
+        self.catalog_discovery_limiter
+            .set_event_logger(logger.clone());
         self.event_logger = Some(logger);
         self
     }
@@ -1892,16 +2096,7 @@ impl AiProxyHandler {
                 HostAction::Intercept
             }
             InterceptDecision::Passthrough => {
-                if self.hosts.mode == HostFilterMode::Discovery
-                    && engine.classify(host).is_none()
-                    && engine.is_catalog_domain(host)
-                    && self.catalog_discovery_limiter.reserve_once_per_day(host)
-                {
-                    metrics::record_filter_decision("http", "catalog_discovery_intercept");
-                    info!(
-                        host = %host,
-                        "Catalog discovery interception enabled for first capture of the day"
-                    );
+                if self.try_catalog_discovery_intercept(host, "http") {
                     HostAction::Intercept
                 } else {
                     metrics::record_filter_decision("http", "passthrough");
@@ -1909,16 +2104,7 @@ impl AiProxyHandler {
                 }
             }
             InterceptDecision::Noise => {
-                if self.hosts.mode == HostFilterMode::Discovery
-                    && engine.classify(host).is_none()
-                    && engine.is_catalog_domain(host)
-                    && self.catalog_discovery_limiter.reserve_once_per_day(host)
-                {
-                    metrics::record_filter_decision("http", "catalog_discovery_intercept");
-                    info!(
-                        host = %host,
-                        "Catalog discovery interception enabled for first capture of the day"
-                    );
+                if self.try_catalog_discovery_intercept(host, "http") {
                     HostAction::Intercept
                 } else {
                     metrics::record_filter_decision("http", "noise");
@@ -1926,16 +2112,7 @@ impl AiProxyHandler {
                 }
             }
             InterceptDecision::Tunnel => {
-                if self.hosts.mode == HostFilterMode::Discovery
-                    && engine.classify(host).is_none()
-                    && engine.is_catalog_domain(host)
-                    && self.catalog_discovery_limiter.reserve_once_per_day(host)
-                {
-                    metrics::record_filter_decision("http", "catalog_discovery_intercept");
-                    info!(
-                        host = %host,
-                        "Catalog discovery interception enabled for first capture of the day"
-                    );
+                if self.try_catalog_discovery_intercept(host, "http") {
                     HostAction::Intercept
                 } else {
                     metrics::record_filter_decision("http", "tunnel");
@@ -1956,20 +2133,43 @@ impl AiProxyHandler {
         if engine.should_intercept_host(host) {
             metrics::record_filter_decision("connect", "intercept");
             HostAction::Intercept
-        } else if self.hosts.mode == HostFilterMode::Discovery
-            && engine.classify(host).is_none()
-            && engine.is_catalog_domain(host)
-            && self.catalog_discovery_limiter.reserve_once_per_day(host)
-        {
-            metrics::record_filter_decision("connect", "catalog_discovery_intercept");
-            info!(
-                host = %host,
-                "Catalog discovery CONNECT interception enabled for first capture of the day"
-            );
+        } else if self.try_catalog_discovery_intercept(host, "connect") {
             HostAction::Intercept
         } else {
             metrics::record_filter_decision("connect", "tunnel");
             HostAction::Tunnel
+        }
+    }
+
+    fn try_catalog_discovery_intercept(&self, host: &str, phase: &str) -> bool {
+        if self.hosts.mode != HostFilterMode::Discovery {
+            return false;
+        }
+        let engine = self.oisp_engine.as_ref();
+        if engine.classify(host).is_some() || !engine.is_catalog_domain(host) {
+            return false;
+        }
+
+        match self
+            .catalog_discovery_limiter
+            .reserve_once_per_day(DiscoveryKind::Catalog, host)
+        {
+            DiscoveryReserveResult::Reserved => {
+                metrics::record_filter_decision(phase, "catalog_discovery_intercept");
+                info!(
+                    host = %host,
+                    "Catalog discovery interception enabled for first capture of the day"
+                );
+                true
+            }
+            DiscoveryReserveResult::AlreadySeen => {
+                metrics::record_filter_decision(phase, "catalog_discovery_seen_skip");
+                false
+            }
+            DiscoveryReserveResult::DailyCapReached => {
+                metrics::record_filter_decision(phase, "catalog_discovery_cap_skip");
+                false
+            }
         }
     }
 
@@ -2183,7 +2383,7 @@ impl HttpHandler for AiProxyHandler {
             && host_mode == HostFilterMode::Discovery
             && oisp_classification.is_none()
             && self.oisp_engine.is_catalog_domain(&host)
-            && catalog_discovery_limiter.was_reserved_today(&host);
+            && catalog_discovery_limiter.was_reserved_today(DiscoveryKind::Catalog, &host);
         let (host_is_ai_target, host_is_mcp_target, host_is_agent_target, provider) =
             if let Some(classification) = oisp_classification.as_ref() {
                 let (ai, mcp, agent) = match classification.entry_type_label() {
@@ -4258,6 +4458,52 @@ mod tests {
         assert_eq!(
             handler.get_connect_action("api.openai.com"),
             HostAction::Intercept
+        );
+    }
+
+    #[test]
+    fn test_catalog_discovery_limiter_persists_once_per_day_state() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let logger = Arc::new(EventLogger::new(db_path).unwrap());
+
+        let limiter = CatalogDiscoveryLimiter::default();
+        limiter.set_event_logger(logger.clone());
+        assert_eq!(
+            limiter.reserve_once_per_day(DiscoveryKind::Catalog, "server.codeium.com"),
+            DiscoveryReserveResult::Reserved
+        );
+        assert_eq!(
+            limiter.reserve_once_per_day(DiscoveryKind::Catalog, "server.codeium.com"),
+            DiscoveryReserveResult::AlreadySeen
+        );
+
+        let limiter_after_restart = CatalogDiscoveryLimiter::default();
+        limiter_after_restart.set_event_logger(logger);
+        assert_eq!(
+            limiter_after_restart.reserve_once_per_day(
+                DiscoveryKind::Catalog,
+                "server.codeium.com"
+            ),
+            DiscoveryReserveResult::AlreadySeen
+        );
+    }
+
+    #[test]
+    fn test_catalog_discovery_limiter_enforces_daily_cap() {
+        let limiter = CatalogDiscoveryLimiter {
+            state_by_kind: Mutex::new(HashMap::new()),
+            event_logger: Mutex::new(None),
+            catalog_daily_cap: 1,
+        };
+
+        assert_eq!(
+            limiter.reserve_once_per_day(DiscoveryKind::Catalog, "server.codeium.com"),
+            DiscoveryReserveResult::Reserved
+        );
+        assert_eq!(
+            limiter.reserve_once_per_day(DiscoveryKind::Catalog, "api.githubcopilot.com"),
+            DiscoveryReserveResult::DailyCapReached
         );
     }
 

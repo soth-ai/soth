@@ -14,6 +14,9 @@ use std::time::Duration;
 static PROMETHEUS_HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
 static BLACKLIST_KEYWORD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLACKLIST_GRAPHQL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_CATALOG_INTERCEPT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_CATALOG_SEEN_SKIP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_CATALOG_CAP_SKIP_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the Prometheus metrics exporter
 ///
@@ -271,6 +274,15 @@ pub fn record_filter_decision(phase: &str, decision: &str) {
     if phase.eq_ignore_ascii_case("http") && decision.eq_ignore_ascii_case("blacklist_graphql") {
         BLACKLIST_GRAPHQL_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
+    if decision.eq_ignore_ascii_case("catalog_discovery_intercept") {
+        DISCOVERY_CATALOG_INTERCEPT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if decision.eq_ignore_ascii_case("catalog_discovery_seen_skip") {
+        DISCOVERY_CATALOG_SEEN_SKIP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if decision.eq_ignore_ascii_case("catalog_discovery_cap_skip") {
+        DISCOVERY_CATALOG_CAP_SKIP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Snapshot heartbeat telemetry counters useful for cloud-side aggregate analytics.
@@ -283,6 +295,18 @@ pub fn heartbeat_telemetry_snapshot() -> HeartbeatTelemetry {
     counters.insert(
         "edge.blacklist.graphql_dropped_total".to_string(),
         BLACKLIST_GRAPHQL_DROPPED_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.discovery.catalog.intercept_total".to_string(),
+        DISCOVERY_CATALOG_INTERCEPT_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.discovery.catalog.already_seen_skip_total".to_string(),
+        DISCOVERY_CATALOG_SEEN_SKIP_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.discovery.catalog.daily_cap_skip_total".to_string(),
+        DISCOVERY_CATALOG_CAP_SKIP_TOTAL.load(Ordering::Relaxed),
     );
     HeartbeatTelemetry { counters }
 }

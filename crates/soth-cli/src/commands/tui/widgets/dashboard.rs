@@ -1799,12 +1799,19 @@ fn filter_decision_hint(proxy: &soth_dashboard::state::ProxyMetrics) -> Option<S
         .get("block")
         .copied()
         .unwrap_or(0);
+    let discovery = proxy
+        .filter_decisions
+        .by_decision
+        .get("catalog_discovery_intercept")
+        .copied()
+        .unwrap_or(0);
 
     Some(format!(
-        "flt i:{} t:{} b:{}",
+        "flt i:{} t:{} b:{} d:{}",
         short_number(intercept),
         short_number(tunnel),
-        short_number(block)
+        short_number(block),
+        short_number(discovery)
     ))
 }
 
