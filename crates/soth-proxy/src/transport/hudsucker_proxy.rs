@@ -3746,6 +3746,10 @@ fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyE
                     providers = engine.provider_count(),
                     domains = engine.domain_count(),
                     catalog_domains = engine.catalog_domain_count(),
+                    whitelist = engine.whitelist_count(),
+                    blacklist = engine.blacklist_count(),
+                    passthrough = engine.passthrough_count(),
+                    noise_keywords = engine.noise_keyword_count(),
                     "Loaded OISP bundle for proxy classification (embedded baseline overlay applied)"
                 );
                 return Ok(Arc::new(engine));
@@ -3775,6 +3779,10 @@ fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyE
                 providers = engine.provider_count(),
                 domains = engine.domain_count(),
                 catalog_domains = engine.catalog_domain_count(),
+                whitelist = engine.whitelist_count(),
+                blacklist = engine.blacklist_count(),
+                passthrough = engine.passthrough_count(),
+                noise_keywords = engine.noise_keyword_count(),
                 "Loaded embedded minimal OISP bundle"
             );
             Ok(Arc::new(engine))

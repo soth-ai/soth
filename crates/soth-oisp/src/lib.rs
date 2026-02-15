@@ -127,6 +127,22 @@ impl OispEngine {
         self.bundle.catalog_domains.len()
     }
 
+    pub fn whitelist_count(&self) -> usize {
+        self.bundle.filters.whitelist.len()
+    }
+
+    pub fn blacklist_count(&self) -> usize {
+        self.bundle.filters.blacklist.len()
+    }
+
+    pub fn passthrough_count(&self) -> usize {
+        self.bundle.filters.passthrough.len()
+    }
+
+    pub fn noise_keyword_count(&self) -> usize {
+        self.bundle.filters.noise_keywords.len()
+    }
+
     pub fn is_catalog_domain(&self, host: &str) -> bool {
         let host = normalize_host_for_matching(host);
         host_matches_any(host.as_str(), &self.bundle.catalog_domains)

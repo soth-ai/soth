@@ -7,6 +7,8 @@ use crate::cli_config;
 use crate::ConfigCommands;
 use crate::ConfigRegistryCommands;
 use anyhow::{Context, Result};
+#[cfg(feature = "cloud-sync")]
+use serde_json::Value;
 use soth_core::config::{HostFilterMode, SothConfig};
 #[cfg(feature = "cloud-sync")]
 use std::path::Path;
@@ -459,6 +461,24 @@ async fn show_registry_status(global_config: Option<PathBuf>) -> Result<()> {
                 bundle_cache.metadata.format_count
             );
             println!("  Bundle size bytes: {}", bundle_cache.metadata.size_bytes);
+            let bundle_schema = bundle_cache
+                .bundle
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            println!("  Bundle payload schema_version: {bundle_schema}");
+
+            let whitelist = bundle_array_len(&bundle_cache.bundle, &["filters", "whitelist"]);
+            let blacklist = bundle_array_len(&bundle_cache.bundle, &["filters", "blacklist"]);
+            let passthrough = bundle_array_len(&bundle_cache.bundle, &["filters", "passthrough"]);
+            let noise_keywords =
+                bundle_array_len(&bundle_cache.bundle, &["filters", "noise_keywords"]);
+            println!(
+                "  Filters (whitelist/blacklist/passthrough/noise): {whitelist}/{blacklist}/{passthrough}/{noise_keywords}"
+            );
+
+            let catalog_count = bundle_array_len(&bundle_cache.bundle, &["catalog_domains"]);
+            println!("  Catalog domains: {catalog_count}");
         }
         Ok(None) => {
             println!("  Registry cache: missing");
@@ -476,6 +496,18 @@ async fn show_registry_status(global_config: Option<PathBuf>) -> Result<()> {
 async fn show_registry_status(_global_config: Option<PathBuf>) -> Result<()> {
     println!("Registry status is unavailable: soth-cli built without cloud-sync feature.");
     Ok(())
+}
+
+#[cfg(feature = "cloud-sync")]
+fn bundle_array_len(root: &Value, path: &[&str]) -> usize {
+    let mut cursor = root;
+    for key in path {
+        let Some(next) = cursor.get(*key) else {
+            return 0;
+        };
+        cursor = next;
+    }
+    cursor.as_array().map(|arr| arr.len()).unwrap_or(0)
 }
 
 #[cfg(feature = "cloud-sync")]
