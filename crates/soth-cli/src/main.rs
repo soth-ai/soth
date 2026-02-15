@@ -667,14 +667,8 @@ async fn main() -> anyhow::Result<()> {
 
             if foreground {
                 commands::proxy::run_on(port, effective_config.clone()).await?;
-                commands::proxy::run_start_internal(
-                    port,
-                    effective_config,
-                    quiet,
-                    true,
-                    false,
-                )
-                .await?;
+                commands::proxy::run_start_internal(port, effective_config, quiet, true, false)
+                    .await?;
             } else {
                 commands::proxy::run_start_internal(
                     port,

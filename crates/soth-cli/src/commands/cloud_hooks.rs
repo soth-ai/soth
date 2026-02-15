@@ -270,7 +270,9 @@ pub fn spawn_cloud_pull_runtime(
         let mut registry_source = resolve_registry_runtime_source(&registry_cache_path);
         let mut registry_consecutive_failures = 0_u64;
         soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
-        soth_proxy::metrics::set_registry_refresh_consecutive_failures(registry_consecutive_failures);
+        soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+            registry_consecutive_failures,
+        );
         info!(
             source = registry_source.as_label(),
             "Registry runtime source initialized"
@@ -296,7 +298,8 @@ pub fn spawn_cloud_pull_runtime(
                 source = registry_source.as_label(),
                 consecutive_failures = registry_consecutive_failures,
                 retry_in_secs = retry_in.as_secs(),
-                "Initial cloud config pull failed: {:#}", error
+                "Initial cloud config pull failed: {:#}",
+                error
             );
         } else {
             config_pull_backoff.record_success();

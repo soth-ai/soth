@@ -263,7 +263,10 @@ async fn get_budget_primitives(
 
 /// Get proxy metrics
 async fn get_proxy(State(state): State<AppState>) -> Json<ApiResponse<ProxyMetrics>> {
-    Json(ApiResponse::new(&state.dashboard, proxy_metrics_for_state(&state)))
+    Json(ApiResponse::new(
+        &state.dashboard,
+        proxy_metrics_for_state(&state),
+    ))
 }
 
 /// Get advanced budget metrics (for Developer and CFO views)

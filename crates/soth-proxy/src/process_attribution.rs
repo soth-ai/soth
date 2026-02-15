@@ -225,14 +225,7 @@ fn classify_app_type(name: &str, executable: Option<&str>) -> String {
 
     let contains_any = |items: &[&str]| items.iter().any(|item| haystack.contains(item));
     if contains_any(&[
-        "chrome",
-        "firefox",
-        "safari",
-        "edge",
-        "brave",
-        "arc",
-        "opera",
-        "chromium",
+        "chrome", "firefox", "safari", "edge", "brave", "arc", "opera", "chromium",
     ]) {
         return "browser".to_string();
     }
@@ -308,7 +301,10 @@ mod tests {
         assert_eq!(classify_app_type("Cursor", None), "editor");
         assert_eq!(classify_app_type("claude-code", None), "cli");
         assert_eq!(
-            classify_app_type("Unknown", Some("/Applications/Figma.app/Contents/MacOS/Figma")),
+            classify_app_type(
+                "Unknown",
+                Some("/Applications/Figma.app/Contents/MacOS/Figma")
+            ),
             "desktop_app"
         );
     }

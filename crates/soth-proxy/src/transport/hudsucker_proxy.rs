@@ -160,7 +160,10 @@ fn is_emfile_proxy_forward_error(err: &LegacyClientError) -> bool {
     let mut source = err.source();
     while let Some(cause) = source {
         if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
-            if io_error.raw_os_error().is_some_and(|code| code == 24 || code == 10024) {
+            if io_error
+                .raw_os_error()
+                .is_some_and(|code| code == 24 || code == 10024)
+            {
                 return true;
             }
         }
@@ -1674,10 +1677,9 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
         })
     });
 
-    let app_type = envelope
-        .process_app_type
-        .clone()
-        .or_else(|| classify_process_app_type(envelope.process_name.as_deref(), bundle_id.as_ref()));
+    let app_type = envelope.process_app_type.clone().or_else(|| {
+        classify_process_app_type(envelope.process_name.as_deref(), bundle_id.as_ref())
+    });
 
     Some(ExchangeClient {
         pid: envelope.process_pid,
@@ -1695,10 +1697,20 @@ fn classify_process_app_type(
     if let Some(name) = process_name {
         let lower = name.to_ascii_lowercase();
         let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-        if has_any(&["chrome", "firefox", "safari", "edge", "brave", "arc", "opera"]) {
+        if has_any(&[
+            "chrome", "firefox", "safari", "edge", "brave", "arc", "opera",
+        ]) {
             return Some("browser".to_string());
         }
-        if has_any(&["cursor", "code", "windsurf", "jetbrains", "zed", "xcode", "vim"]) {
+        if has_any(&[
+            "cursor",
+            "code",
+            "windsurf",
+            "jetbrains",
+            "zed",
+            "xcode",
+            "vim",
+        ]) {
             return Some("editor".to_string());
         }
         if has_any(&[
@@ -2776,9 +2788,8 @@ impl HttpHandler for AiProxyHandler {
                 };
 
                 // Check if this request should be logged (blacklist non-inference content)
-                let should_log =
-                    (is_catalog_discovery_host || should_log_inference_request)
-                        && !graphql_blacklisted;
+                let should_log = (is_catalog_discovery_host || should_log_inference_request)
+                    && !graphql_blacklisted;
 
                 if should_log {
                     info!(
@@ -2912,10 +2923,7 @@ impl HttpHandler for AiProxyHandler {
                         if is_catalog_discovery_host {
                             append_catalog_discovery_tags(&mut tags, &host);
                         }
-                        append_process_attribution_tags(
-                            &mut tags,
-                            event.traffic_envelope.as_ref(),
-                        );
+                        append_process_attribution_tags(&mut tags, event.traffic_envelope.as_ref());
                         if !tags.is_empty() {
                             event = event.with_tags(tags);
                         }
@@ -4578,10 +4586,8 @@ mod tests {
         let limiter_after_restart = CatalogDiscoveryLimiter::default();
         limiter_after_restart.set_event_logger(logger);
         assert_eq!(
-            limiter_after_restart.reserve_once_per_day(
-                DiscoveryKind::Catalog,
-                "server.codeium.com"
-            ),
+            limiter_after_restart
+                .reserve_once_per_day(DiscoveryKind::Catalog, "server.codeium.com"),
             DiscoveryReserveResult::AlreadySeen
         );
     }
