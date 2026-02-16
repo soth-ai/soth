@@ -4,7 +4,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 #[cfg(feature = "cloud-sync")]
-use soth_core::config::BudgetLimit;
+use soth_core::config::{BudgetLimit, RegistryMode};
 #[cfg(feature = "cloud-sync")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "cloud-sync")]
@@ -95,6 +95,7 @@ pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
 
     apply_budget_from_cache(config, &cached.budget.limits);
     apply_policy_from_cache(config, &cached.config_version, &cached.policies)?;
+    apply_registry_mode_from_cache(config, cached.registry_mode.as_deref());
 
     info!(
         config_version = %cached.config_version,
@@ -592,6 +593,18 @@ fn apply_policy_from_cache(
     config.policy.enabled = true;
     config.policy.policy_dir = Some(dir);
     Ok(())
+}
+
+#[cfg(feature = "cloud-sync")]
+fn apply_registry_mode_from_cache(config: &mut SothConfig, mode: Option<&str>) {
+    let Some(mode) = mode else {
+        return;
+    };
+    let normalized = mode.trim().to_ascii_lowercase();
+    config.forward_proxy.registry_mode = match normalized.as_str() {
+        "bundle_only" | "strict" => RegistryMode::BundleOnly,
+        _ => RegistryMode::Registry,
+    };
 }
 
 #[cfg(feature = "cloud-sync")]

@@ -2616,6 +2616,7 @@ impl HttpHandler for AiProxyHandler {
             None
         };
         let legacy_wrap_events_enabled = exchange_v2_cfg.is_none();
+        let bundle_only_mode = matches!(self.registry_mode, RegistryMode::BundleOnly);
         let should_resolve_process = !is_connect
             && should_capture_observability
             && (host_is_ai_target
@@ -2745,23 +2746,28 @@ impl HttpHandler for AiProxyHandler {
                     "Skipping observability capture for tunneled/noise request"
                 );
             }
-            let legacy_agent = Self::detect_agent_with_context_gated(
-                ua_agent,
-                &host,
-                &path,
-                model.as_deref(),
-                host_is_agent_target || (host_mode == HostFilterMode::Discovery),
-            )
-            .map(ToString::to_string);
-            let legacy_detection_reason = detection_reason_for_bucket(
-                host_is_ai_target,
-                host_is_mcp_target,
-                host_is_agent_target,
-                is_catalog_discovery_host,
-            )
-            .map(ToString::to_string);
-            let legacy_parse_confidence =
-                parse_confidence_for_reason(legacy_detection_reason.as_deref());
+            let (legacy_agent, legacy_detection_reason, legacy_parse_confidence) =
+                if bundle_only_mode {
+                    (None, None, None)
+                } else {
+                    let agent = Self::detect_agent_with_context_gated(
+                        ua_agent,
+                        &host,
+                        &path,
+                        model.as_deref(),
+                        host_is_agent_target || (host_mode == HostFilterMode::Discovery),
+                    )
+                    .map(ToString::to_string);
+                    let reason = detection_reason_for_bucket(
+                        host_is_ai_target,
+                        host_is_mcp_target,
+                        host_is_agent_target,
+                        is_catalog_discovery_host,
+                    )
+                    .map(ToString::to_string);
+                    let confidence = parse_confidence_for_reason(reason.as_deref());
+                    (agent, reason, confidence)
+                };
             let detection_context = DetectionContext {
                 host: Some(host.clone()),
                 path: Some(path.clone()),
@@ -2769,7 +2775,11 @@ impl HttpHandler for AiProxyHandler {
                 model: model.clone(),
                 process_name: process_identity.as_ref().map(|value| value.name.clone()),
                 bundle_id: None,
-                client_name: legacy_agent.clone(),
+                client_name: if bundle_only_mode {
+                    None
+                } else {
+                    legacy_agent.clone()
+                },
                 client_version: None,
                 env_keys: Vec::new(),
             };
@@ -2782,36 +2792,55 @@ impl HttpHandler for AiProxyHandler {
             let bundle_agent = bundle_detection
                 .as_ref()
                 .and_then(|value| value.agent.clone());
-            let agent = bundle_agent.clone().or_else(|| legacy_agent.clone());
-            let detection_reason = bundle_detection
-                .as_ref()
-                .map(|value| value.detection_reason.clone())
-                .or(legacy_detection_reason.clone());
-            let parse_confidence = bundle_detection
-                .as_ref()
-                .map(|value| value.parse_confidence)
-                .or(legacy_parse_confidence);
+            let agent = if bundle_only_mode {
+                bundle_agent.clone()
+            } else {
+                bundle_agent.clone().or_else(|| legacy_agent.clone())
+            };
+            let (detection_reason, parse_confidence, detection_source) =
+                if let Some(value) = bundle_detection.as_ref() {
+                    (
+                        Some(value.detection_reason.clone()),
+                        Some(value.parse_confidence),
+                        Some("bundle".to_string()),
+                    )
+                } else if bundle_only_mode {
+                    (
+                        Some("fallback_unknown".to_string()),
+                        Some(0.0),
+                        Some("bundle".to_string()),
+                    )
+                } else {
+                    (
+                        legacy_detection_reason.clone(),
+                        legacy_parse_confidence,
+                        Some("legacy_fallback".to_string()),
+                    )
+                };
             let target_entity_id = bundle_detection
                 .as_ref()
                 .and_then(|value| value.target_entity_id.clone());
-            let detection_source = Some(if bundle_detection.is_some() {
-                "bundle".to_string()
-            } else {
-                "legacy_fallback".to_string()
-            });
-            let shadow_mismatch = match (bundle_agent.as_deref(), legacy_agent.as_deref()) {
-                (Some(bundle_value), Some(legacy_value)) => {
-                    !bundle_value.eq_ignore_ascii_case(legacy_value)
-                }
-                _ => false,
-            };
-            let shadow_agent = bundle_detection.as_ref().and_then(|_| legacy_agent.clone());
-            let shadow_detection_reason = bundle_detection
-                .as_ref()
-                .and_then(|_| legacy_detection_reason.clone());
-            let shadow_parse_confidence = bundle_detection
-                .as_ref()
-                .and_then(|_| legacy_parse_confidence);
+            let (shadow_mismatch, shadow_agent, shadow_detection_reason, shadow_parse_confidence) =
+                if bundle_only_mode {
+                    (false, None, None, None)
+                } else {
+                    let mismatch = match (bundle_agent.as_deref(), legacy_agent.as_deref()) {
+                        (Some(bundle_value), Some(legacy_value)) => {
+                            !bundle_value.eq_ignore_ascii_case(legacy_value)
+                        }
+                        _ => false,
+                    };
+                    (
+                        mismatch,
+                        bundle_detection.as_ref().and_then(|_| legacy_agent.clone()),
+                        bundle_detection
+                            .as_ref()
+                            .and_then(|_| legacy_detection_reason.clone()),
+                        bundle_detection
+                            .as_ref()
+                            .and_then(|_| legacy_parse_confidence),
+                    )
+                };
             let mcp_request_method = if !is_connect
                 && should_capture_observability
                 && (host_is_mcp_target || (host_mode == HostFilterMode::Discovery))

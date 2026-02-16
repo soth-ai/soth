@@ -12,7 +12,7 @@ use crate::commands::cloud_hooks;
 use crate::commands::enforcement;
 use anyhow::{Context, Result};
 use clap::Args;
-use soth_core::config::SothConfig;
+use soth_core::config::{types::RegistryMode, SothConfig};
 use soth_core::types::{AgentInfo, DetectionSource, TrafficEnvelope, WrapDirection, WrapEvent};
 use soth_core::{
     generate_session_name, EventLogger, ExchangeSourceClass, MessageDirection, SessionRecorder,
@@ -82,6 +82,7 @@ struct WrapSession {
     enforcement: Option<Arc<WrapEnforcement>>,
     fail_open: bool,
     pii_enricher: PiiEventEnricher,
+    bundle_only_detection: bool,
     /// Session recorder for full message capture (optional)
     recorder: Option<Arc<SessionRecorder>>,
 }
@@ -174,6 +175,19 @@ fn legacy_detection_metadata(agent: &AgentInfo) -> WrapDetectionMetadata {
         parse_confidence: Some(detection_confidence_from_source(agent.detected_from)),
         target_entity_id: None,
         detection_source: Some("legacy_fallback".to_string()),
+        shadow_agent: None,
+        shadow_detection_reason: None,
+        shadow_parse_confidence: None,
+        shadow_mismatch: false,
+    }
+}
+
+fn bundle_only_unknown_detection_metadata() -> WrapDetectionMetadata {
+    WrapDetectionMetadata {
+        detection_reason: Some("fallback_unknown".to_string()),
+        parse_confidence: Some(0.0),
+        target_entity_id: None,
+        detection_source: Some("bundle".to_string()),
         shadow_agent: None,
         shadow_detection_reason: None,
         shadow_parse_confidence: None,
@@ -290,6 +304,7 @@ fn evaluate_bundle_detection(
     params: Option<&serde_json::Value>,
     env_keys: &[String],
     legacy_agent: &AgentInfo,
+    include_legacy_shadow: bool,
 ) -> Option<WrapDetectionResolution> {
     let context = build_bundle_detection_context(params, env_keys);
     let scoped = oisp_engine
@@ -305,9 +320,20 @@ fn evaluate_bundle_detection(
         agent = agent.with_version(version);
     }
 
-    let legacy_reason = detection_reason_from_source(legacy_agent.detected_from);
-    let legacy_confidence = detection_confidence_from_source(legacy_agent.detected_from);
-    let shadow_mismatch = !legacy_agent.name.eq_ignore_ascii_case(agent.name.as_str());
+    let (shadow_agent, shadow_detection_reason, shadow_parse_confidence, shadow_mismatch) =
+        if include_legacy_shadow {
+            let legacy_reason = detection_reason_from_source(legacy_agent.detected_from);
+            let legacy_confidence = detection_confidence_from_source(legacy_agent.detected_from);
+            let mismatch = !legacy_agent.name.eq_ignore_ascii_case(agent.name.as_str());
+            (
+                Some(legacy_agent.name.clone()),
+                Some(legacy_reason),
+                Some(legacy_confidence),
+                mismatch,
+            )
+        } else {
+            (None, None, None, false)
+        };
 
     Some(WrapDetectionResolution {
         agent,
@@ -316,9 +342,9 @@ fn evaluate_bundle_detection(
             parse_confidence: Some(scoped.outcome.parse_confidence),
             target_entity_id: scoped.outcome.target_entity_id,
             detection_source: Some("bundle".to_string()),
-            shadow_agent: Some(legacy_agent.name.clone()),
-            shadow_detection_reason: Some(legacy_reason),
-            shadow_parse_confidence: Some(legacy_confidence),
+            shadow_agent,
+            shadow_detection_reason,
+            shadow_parse_confidence,
             shadow_mismatch,
         },
     })
@@ -333,6 +359,7 @@ impl WrapSession {
         env_keys: Arc<Vec<String>>,
         event_logger: Option<EventLogger>,
         exchange_v2: soth_core::config::types::ExchangeV2Config,
+        bundle_only_detection: bool,
         enforcement: Option<Arc<WrapEnforcement>>,
         fail_open: bool,
         pii_enricher: PiiEventEnricher,
@@ -364,6 +391,7 @@ impl WrapSession {
             env_keys,
             event_logger,
             exchange_v2,
+            bundle_only_detection,
             enforcement,
             fail_open,
             pii_enricher,
@@ -654,6 +682,7 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     };
 
     let config = load_wrap_config(config.as_ref())?;
+    let bundle_only_detection = matches!(config.forward_proxy.registry_mode, RegistryMode::BundleOnly);
     let oisp_engine = load_wrap_oisp_engine(&config);
     let env_keys = collect_environment_keys();
     let initial_resolution = if matches!(
@@ -665,15 +694,37 @@ pub async fn run(args: WrapArgs) -> Result<()> {
             metadata: legacy_detection_metadata(&legacy_initial_agent),
         }
     } else if let Some(engine) = oisp_engine.as_ref() {
-        evaluate_bundle_detection(engine, None, env_keys.as_ref(), &legacy_initial_agent)
+        evaluate_bundle_detection(
+            engine,
+            None,
+            env_keys.as_ref(),
+            &legacy_initial_agent,
+            !bundle_only_detection,
+        )
             .unwrap_or_else(|| WrapDetectionResolution {
-                agent: legacy_initial_agent.clone(),
-                metadata: legacy_detection_metadata(&legacy_initial_agent),
+                agent: if bundle_only_detection {
+                    AgentInfo::unknown()
+                } else {
+                    legacy_initial_agent.clone()
+                },
+                metadata: if bundle_only_detection {
+                    bundle_only_unknown_detection_metadata()
+                } else {
+                    legacy_detection_metadata(&legacy_initial_agent)
+                },
             })
     } else {
         WrapDetectionResolution {
-            agent: legacy_initial_agent.clone(),
-            metadata: legacy_detection_metadata(&legacy_initial_agent),
+            agent: if bundle_only_detection {
+                AgentInfo::unknown()
+            } else {
+                legacy_initial_agent.clone()
+            },
+            metadata: if bundle_only_detection {
+                bundle_only_unknown_detection_metadata()
+            } else {
+                legacy_detection_metadata(&legacy_initial_agent)
+            },
         }
     };
 
@@ -715,6 +766,7 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         env_keys,
         event_logger,
         config.exchange_v2.clone(),
+        bundle_only_detection,
         enforcement,
         fail_open,
         pii_enricher,
@@ -1007,15 +1059,24 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
                             Some(params),
                             session.env_keys.as_ref(),
                             &legacy_shadow,
+                            !session.bundle_only_detection,
                         ) {
                             session.update_agent(resolution.agent).await;
                             session.update_detection_metadata(resolution.metadata).await;
+                        } else if session.bundle_only_detection {
+                            session
+                                .update_detection_metadata(bundle_only_unknown_detection_metadata())
+                                .await;
                         } else if let Some(agent) = legacy_initialize_agent {
                             session.update_agent(agent.clone()).await;
                             session
                                 .update_detection_metadata(legacy_detection_metadata(&agent))
                                 .await;
                         }
+                    } else if session.bundle_only_detection {
+                        session
+                            .update_detection_metadata(bundle_only_unknown_detection_metadata())
+                            .await;
                     } else if let Some(agent) = legacy_initialize_agent {
                         session.update_agent(agent.clone()).await;
                         session

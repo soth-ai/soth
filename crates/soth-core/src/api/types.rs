@@ -223,6 +223,8 @@ pub struct ConfigResponse {
     pub config_version: String,
     #[serde(default)]
     pub bundle_version: Option<String>,
+    #[serde(default)]
+    pub registry_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
