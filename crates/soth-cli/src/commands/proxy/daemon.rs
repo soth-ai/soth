@@ -4,12 +4,14 @@ use crate::style;
 use anyhow::{anyhow, Context};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const PID_FILE: &str = "proxy.pid";
 const LOG_FILE: &str = "proxy.log";
+const DEFAULT_PROXY_PORT: u16 = 8080;
 
 fn soth_home_dir() -> PathBuf {
     dirs::home_dir()
@@ -81,6 +83,29 @@ fn is_process_running(pid: u32) -> bool {
     }
 }
 
+#[cfg(unix)]
+fn running_daemon_pids() -> Vec<u32> {
+    let output = Command::new("pgrep")
+        .args(["-f", "soth start --daemon-child"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| is_process_running(*pid))
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn running_daemon_pids() -> Vec<u32> {
+    Vec::new()
+}
+
 fn send_term(pid: u32) {
     #[cfg(unix)]
     {
@@ -119,6 +144,37 @@ fn send_kill(pid: u32) {
     }
 }
 
+fn stop_pid_and_wait(pid: u32, timeout: Duration) -> bool {
+    if !is_process_running(pid) {
+        return true;
+    }
+
+    send_term(pid);
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if !is_process_running(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    send_kill(pid);
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if !is_process_running(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    !is_process_running(pid)
+}
+
+fn is_local_listener_ready(port: u16) -> bool {
+    let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok()
+}
+
 fn compact_path(path: &Path) -> String {
     let full = path.display().to_string();
     if let Some(home) = dirs::home_dir() {
@@ -134,8 +190,12 @@ pub async fn run_start_daemon(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     quiet: bool,
+    intercept_all: bool,
+    intercept_all_for: Option<u64>,
 ) -> anyhow::Result<()> {
     ensure_runtime_dirs()?;
+
+    let expected_port = port.unwrap_or(DEFAULT_PROXY_PORT);
 
     if let Some(pid) = read_pid()? {
         if is_process_running(pid) {
@@ -149,6 +209,29 @@ pub async fn run_start_daemon(
             return Ok(());
         }
         remove_pid_file();
+    }
+
+    // Handle orphaned daemon-child processes from prior runs where pid tracking drifted.
+    let orphaned = running_daemon_pids();
+    if !orphaned.is_empty() {
+        if !quiet {
+            style::warning(&format!(
+                "Found {} orphan daemon process(es); cleaning up before start.",
+                orphaned.len()
+            ));
+        }
+        for pid in orphaned {
+            let stopped = stop_pid_and_wait(pid, Duration::from_secs(4));
+            if !quiet {
+                if stopped {
+                    style::info(&format!("Stopped orphan daemon pid {pid}."));
+                } else {
+                    style::warning(&format!(
+                        "Could not stop orphan daemon pid {pid}; startup may fail."
+                    ));
+                }
+            }
+        }
     }
 
     let log_file_path = log_path();
@@ -172,6 +255,12 @@ pub async fn run_start_daemon(
     if quiet {
         cmd.arg("--quiet");
     }
+    if intercept_all {
+        cmd.arg("--intercept-all");
+    }
+    if let Some(seconds) = intercept_all_for {
+        cmd.arg("--intercept-all-for").arg(seconds.to_string());
+    }
 
     if let Some(port) = port {
         cmd.arg("--port").arg(port.to_string());
@@ -192,16 +281,33 @@ pub async fn run_start_daemon(
     }
 
     let mut child = cmd.spawn().context("failed spawning proxy daemon")?;
-    std::thread::sleep(Duration::from_millis(300));
+    let startup_deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed checking proxy daemon startup status")?
+        {
+            return Err(anyhow!(
+                "proxy daemon exited early with status {status}; check {}",
+                compact_path(&log_file_path)
+            ));
+        }
 
-    if let Some(status) = child
-        .try_wait()
-        .context("failed checking proxy daemon startup status")?
-    {
-        return Err(anyhow!(
-            "proxy daemon exited early with status {status}; check {}",
-            compact_path(&log_file_path)
-        ));
+        if is_local_listener_ready(expected_port) {
+            break;
+        }
+
+        if std::time::Instant::now() >= startup_deadline {
+            let pid = child.id();
+            let _ = stop_pid_and_wait(pid, Duration::from_secs(2));
+            return Err(anyhow!(
+                "proxy daemon did not open 127.0.0.1:{} within startup timeout; check {}",
+                expected_port,
+                compact_path(&log_file_path)
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(120));
     }
 
     let pid = child.id();
@@ -218,14 +324,32 @@ pub async fn run_start_daemon(
 
 pub async fn run_stop() -> anyhow::Result<()> {
     let Some(pid) = read_pid()? else {
-        style::warning("Proxy daemon is not running (no pid file).");
+        let orphaned = running_daemon_pids();
+        if orphaned.is_empty() {
+            style::warning("Proxy daemon is not running (no pid file).");
+            return Ok(());
+        }
+        for orphan_pid in orphaned {
+            let _ = stop_pid_and_wait(orphan_pid, Duration::from_secs(4));
+        }
+        let _ = super::system::disable_quiet().await;
+        style::success("Stopped orphaned proxy daemon process(es).");
         return Ok(());
     };
 
     if !is_process_running(pid) {
         remove_pid_file();
-        style::warning("Proxy daemon pid file was stale; cleaned up.");
+        let orphaned = running_daemon_pids();
+        if orphaned.is_empty() {
+            style::warning("Proxy daemon pid file was stale; cleaned up.");
+            let _ = super::system::disable_quiet().await;
+            return Ok(());
+        }
+        for orphan_pid in orphaned {
+            let _ = stop_pid_and_wait(orphan_pid, Duration::from_secs(4));
+        }
         let _ = super::system::disable_quiet().await;
+        style::success("Stopped proxy daemon process(es) after stale pid cleanup.");
         return Ok(());
     }
 

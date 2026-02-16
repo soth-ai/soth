@@ -29,9 +29,9 @@ struct CacheEntry {
 }
 
 impl ProcessAttribution {
-    pub fn new(lookup_timeout: Duration, cache_ttl: Duration) -> Self {
+    pub fn new(requested_enabled: bool, lookup_timeout: Duration, cache_ttl: Duration) -> Self {
         Self {
-            enabled: cfg!(target_os = "macos") || cfg!(target_os = "linux"),
+            enabled: requested_enabled && (cfg!(target_os = "macos") || cfg!(target_os = "linux")),
             lookup_timeout,
             cache_ttl,
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -95,7 +95,8 @@ impl ProcessAttribution {
 async fn resolve_with_lsof(client_addr: SocketAddr, timeout: Duration) -> Option<ProcessIdentity> {
     use tokio::process::Command;
 
-    let selector = format!("-iTCP@{}:{}", client_addr.ip(), client_addr.port());
+    // Query by TCP port to avoid IPv4/IPv6 formatting mismatches in lsof filters.
+    let selector = format!("-iTCP:{}", client_addr.port());
     let output = tokio::time::timeout(
         timeout,
         Command::new("lsof")
@@ -176,11 +177,14 @@ async fn lookup_executable(pid: u32, timeout: Duration) -> Option<String> {
 
 fn parse_lsof_output(stdout: &[u8], client_addr: SocketAddr) -> Option<(u32, String, bool)> {
     let text = String::from_utf8_lossy(stdout);
-    let selector = format!("{}:{}", client_addr.ip(), client_addr.port());
+    let raw_selector = format!("{}:{}", client_addr.ip(), client_addr.port());
+    let bracketed_selector = format!("[{}]:{}", client_addr.ip(), client_addr.port());
+    let selector_candidates = [raw_selector.as_str(), bracketed_selector.as_str()];
+    let self_pid = std::process::id();
 
     let mut current_pid: Option<u32> = None;
     let mut current_cmd: Option<String> = None;
-    let mut fallback: Option<(u32, String)> = None;
+    let mut generic_match: Option<(u32, String, bool)> = None;
 
     for line in text.lines() {
         let mut chars = line.chars();
@@ -201,11 +205,27 @@ fn parse_lsof_output(stdout: &[u8], client_addr: SocketAddr) -> Option<(u32, Str
             'n' => {
                 if let Some(pid) = current_pid {
                     let cmd = current_cmd.clone().unwrap_or_else(|| "unknown".to_string());
-                    if fallback.is_none() {
-                        fallback = Some((pid, cmd.clone()));
+                    let matches_selector = selector_candidates
+                        .iter()
+                        .any(|selector| value.contains(selector));
+                    if pid == self_pid || !matches_selector {
+                        continue;
                     }
-                    if value.contains(&selector) {
+                    // Never attribute traffic to the proxy binary itself, even if a sibling
+                    // process shares the same command name.
+                    if cmd.eq_ignore_ascii_case("soth") {
+                        continue;
+                    }
+                    // Prefer the client-side socket owner entry:
+                    //   "<client_ip:client_port>-><proxy_ip:proxy_port>"
+                    let prefers_client_owner = selector_candidates
+                        .iter()
+                        .any(|selector| value.starts_with(selector));
+                    if prefers_client_owner {
                         return Some((pid, cmd, true));
+                    }
+                    if generic_match.is_none() {
+                        generic_match = Some((pid, cmd, true));
                     }
                 }
             }
@@ -213,7 +233,7 @@ fn parse_lsof_output(stdout: &[u8], client_addr: SocketAddr) -> Option<(u32, Str
         }
     }
 
-    fallback.map(|(pid, cmd)| (pid, cmd, false))
+    generic_match
 }
 
 fn classify_app_type(name: &str, executable: Option<&str>) -> String {
@@ -286,13 +306,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_lsof_falls_back_to_first_seen_process() {
+    fn parse_lsof_requires_matching_socket_line() {
         let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let sample = b"p1234\ncCodex\nn127.0.0.1:7777->127.0.0.1:3001\n";
+        assert!(parse_lsof_output(sample, addr).is_none());
+    }
+
+    #[test]
+    fn parse_lsof_ignores_proxy_self_pid_and_selects_client_owner() {
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let self_pid = std::process::id();
+        let sample = format!(
+            "p{self_pid}\ncSoth\nn127.0.0.1:3001->127.0.0.1:8081\np9876\ncWarp\nn127.0.0.1:8081->127.0.0.1:3001\n"
+        );
+        let parsed = parse_lsof_output(sample.as_bytes(), addr).unwrap();
+        assert_eq!(parsed.0, 9876);
+        assert_eq!(parsed.1, "Warp");
+        assert!(parsed.2);
+    }
+
+    #[test]
+    fn parse_lsof_ignores_sibling_soth_process_name() {
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let sample =
+            b"p3456\ncsoth\nn127.0.0.1:8081->127.0.0.1:3001\np9876\ncWarp\nn127.0.0.1:8081->127.0.0.1:3001\n";
         let parsed = parse_lsof_output(sample, addr).unwrap();
-        assert_eq!(parsed.0, 1234);
-        assert_eq!(parsed.1, "Codex");
-        assert!(!parsed.2);
+        assert_eq!(parsed.0, 9876);
+        assert_eq!(parsed.1, "Warp");
+        assert!(parsed.2);
     }
 
     #[test]

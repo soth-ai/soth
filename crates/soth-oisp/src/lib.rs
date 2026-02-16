@@ -1,14 +1,15 @@
 use anyhow::Context;
+use regex::Regex;
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub mod types;
 
 use types::bundle::{parse_compiled_bundle, CompiledBundle, DomainIndexEntry};
-use types::provider::{EntryType, ModelPricing, StreamFormat};
-
-const EMBEDDED_MINIMAL_BUNDLE_JSON: &str = include_str!("../assets/minimal_registry_bundle.json");
+use types::provider::{DetectionRule, EntryType, ModelPricing, StreamFormat};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
@@ -46,6 +47,41 @@ pub struct ProviderUsage {
     pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DetectionContext {
+    pub host: Option<String>,
+    pub path: Option<String>,
+    pub user_agent: Option<String>,
+    pub model: Option<String>,
+    pub process_name: Option<String>,
+    pub bundle_id: Option<String>,
+    pub client_name: Option<String>,
+    pub client_version: Option<String>,
+    pub env_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetectionOutcome {
+    pub agent: Option<String>,
+    pub detection_reason: String,
+    pub parse_confidence: f64,
+    pub target_entity_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedDetectionOutcome {
+    pub provider_id: String,
+    pub entry_type: EntryType,
+    pub outcome: DetectionOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct DetectionCandidate {
+    outcome: DetectionOutcome,
+    precedence: i32,
+    stable_key: String,
 }
 
 impl ProviderUsage {
@@ -101,6 +137,8 @@ impl OispStreamParser {
 #[derive(Clone)]
 pub struct OispEngine {
     bundle: Arc<CompiledBundle>,
+    classification_cache: Arc<Mutex<BoundedCache<String, Option<Classification>>>>,
+    detection_cache: Arc<Mutex<BoundedCache<u64, Option<DetectionOutcome>>>>,
 }
 
 impl OispEngine {
@@ -108,6 +146,8 @@ impl OispEngine {
         bundle.validate()?;
         Ok(Self {
             bundle: Arc::new(bundle),
+            classification_cache: Arc::new(Mutex::new(BoundedCache::new(2_048))),
+            detection_cache: Arc::new(Mutex::new(BoundedCache::new(8_192))),
         })
     }
 
@@ -153,20 +193,249 @@ impl OispEngine {
         if host.is_empty() {
             return None;
         }
-        let entry = select_best_domain_match(&self.bundle.domain_index, host.as_str())?;
-        let provider = self.bundle.providers.get(&entry.provider_id)?;
-        Some(Classification {
-            provider_id: entry.provider_id.clone(),
-            entry_type: provider.entry_type.clone(),
-            api_format: provider.api_format.clone(),
-        })
+        if let Some(cached) = self
+            .classification_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&host))
+        {
+            return cached;
+        }
+        let outcome =
+            select_best_domain_match(&self.bundle.domain_index, host.as_str()).and_then(|entry| {
+                self.bundle
+                    .providers
+                    .get(&entry.provider_id)
+                    .map(|provider| Classification {
+                        provider_id: entry.provider_id.clone(),
+                        entry_type: provider.entry_type.clone(),
+                        api_format: provider.api_format.clone(),
+                    })
+            });
+        if let Ok(mut cache) = self.classification_cache.lock() {
+            cache.insert(host, outcome.clone());
+        }
+        outcome
+    }
+
+    pub fn evaluate_detection_for_host(
+        &self,
+        host: &str,
+        context: &DetectionContext,
+    ) -> Option<DetectionOutcome> {
+        let classification = self.classify(host)?;
+        self.evaluate_detection(classification.provider_id.as_str(), context)
+    }
+
+    pub fn evaluate_detection(
+        &self,
+        provider_id: &str,
+        context: &DetectionContext,
+    ) -> Option<DetectionOutcome> {
+        self.evaluate_detection_with_fallback(provider_id, context, true)
+    }
+
+    pub fn evaluate_detection_rules_only(
+        &self,
+        provider_id: &str,
+        context: &DetectionContext,
+    ) -> Option<DetectionOutcome> {
+        self.evaluate_detection_with_fallback(provider_id, context, false)
+    }
+
+    pub fn evaluate_detection_across_entry_types(
+        &self,
+        context: &DetectionContext,
+        entry_types: &[EntryType],
+    ) -> Option<ScopedDetectionOutcome> {
+        if entry_types.is_empty() {
+            return None;
+        }
+
+        let mut provider_ids = self
+            .bundle
+            .providers
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>();
+        provider_ids.sort();
+
+        let mut best: Option<(String, EntryType, DetectionCandidate)> = None;
+        for provider_id in provider_ids {
+            let Some(provider) = self.resolve_provider(provider_id.as_str()) else {
+                continue;
+            };
+            if !entry_types
+                .iter()
+                .any(|entry| *entry == provider.entry_type)
+            {
+                continue;
+            }
+            let mut candidates = Vec::<DetectionCandidate>::new();
+            if let Some(detection) = provider.detection.as_ref() {
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Model,
+                    &detection.model_rules,
+                    provider,
+                    context,
+                );
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Path,
+                    &detection.path_rules,
+                    provider,
+                    context,
+                );
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Ua,
+                    &detection.ua_rules,
+                    provider,
+                    context,
+                );
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Process,
+                    &detection.process_rules,
+                    provider,
+                    context,
+                );
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Env,
+                    &detection.env_rules,
+                    provider,
+                    context,
+                );
+            }
+
+            let Some(candidate) = candidates
+                .into_iter()
+                .max_by(|left, right| compare_detection_candidates(left, right))
+            else {
+                continue;
+            };
+
+            let should_replace = match best.as_ref() {
+                None => true,
+                Some((best_provider_id, _, best_candidate)) => {
+                    compare_detection_candidates(&candidate, best_candidate)
+                        .then_with(|| best_provider_id.cmp(&provider_id))
+                        .is_gt()
+                }
+            };
+
+            if should_replace {
+                best = Some((provider_id, provider.entry_type.clone(), candidate));
+            }
+        }
+
+        best.map(
+            |(provider_id, entry_type, candidate)| ScopedDetectionOutcome {
+                provider_id,
+                entry_type,
+                outcome: candidate.outcome,
+            },
+        )
+    }
+
+    fn evaluate_detection_with_fallback(
+        &self,
+        provider_id: &str,
+        context: &DetectionContext,
+        include_fallback: bool,
+    ) -> Option<DetectionOutcome> {
+        let cache_key = detection_cache_key_hash(provider_id, context, include_fallback);
+        if let Some(cached) = self
+            .detection_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key))
+        {
+            return cached;
+        }
+
+        let provider = self.resolve_provider(provider_id)?;
+        let mut candidates = Vec::<DetectionCandidate>::new();
+
+        if let Some(detection) = provider.detection.as_ref() {
+            collect_detection_candidates(
+                &mut candidates,
+                DetectionRuleGroup::Model,
+                &detection.model_rules,
+                provider,
+                context,
+            );
+            collect_detection_candidates(
+                &mut candidates,
+                DetectionRuleGroup::Path,
+                &detection.path_rules,
+                provider,
+                context,
+            );
+            collect_detection_candidates(
+                &mut candidates,
+                DetectionRuleGroup::Ua,
+                &detection.ua_rules,
+                provider,
+                context,
+            );
+            collect_detection_candidates(
+                &mut candidates,
+                DetectionRuleGroup::Process,
+                &detection.process_rules,
+                provider,
+                context,
+            );
+            collect_detection_candidates(
+                &mut candidates,
+                DetectionRuleGroup::Env,
+                &detection.env_rules,
+                provider,
+                context,
+            );
+        }
+
+        let outcome = if let Some(best) = candidates
+            .into_iter()
+            .max_by(|left, right| compare_detection_candidates(left, right))
+        {
+            Some(best.outcome)
+        } else {
+            if !include_fallback {
+                None
+            } else {
+                let fallback_agent =
+                    (provider.entry_type == EntryType::AgentApp).then(|| provider.id.clone());
+                let fallback_reason = if fallback_agent.is_some() {
+                    "host_classification"
+                } else {
+                    "fallback_unknown"
+                };
+                let fallback_confidence = if fallback_agent.is_some() { 0.70 } else { 0.0 };
+
+                Some(DetectionOutcome {
+                    agent: fallback_agent,
+                    detection_reason: fallback_reason.to_string(),
+                    parse_confidence: fallback_confidence,
+                    target_entity_id: provider.entity_id.clone(),
+                })
+            }
+        };
+
+        if let Ok(mut cache) = self.detection_cache.lock() {
+            cache.insert(cache_key, outcome.clone());
+        }
+        outcome
     }
 
     pub fn should_intercept(&self, host: &str, path: &str) -> InterceptDecision {
         let host = normalize_host_for_matching(host);
         let path_only = path.split_once('?').map(|(raw, _)| raw).unwrap_or(path);
 
-        if contains_noise_keyword(path, &self.bundle.filters.noise_keywords) {
+        if contains_noise_keyword_for_host(host.as_str(), path, &self.bundle.filters.noise_keywords)
+        {
             return InterceptDecision::Noise;
         }
 
@@ -225,7 +494,7 @@ impl OispEngine {
 
     /// Returns true when `text` contains any bundle noise keyword.
     pub fn matches_noise_keyword(&self, text: &str) -> bool {
-        contains_noise_keyword(text, &self.bundle.filters.noise_keywords)
+        contains_noise_keyword_text(text, &self.bundle.filters.noise_keywords)
     }
 
     /// Calculate request cost using bundle pricing for a provider/model pair.
@@ -363,28 +632,6 @@ impl OispEngine {
         }
     }
 
-    /// Load the repository-shipped minimal bundle used as local fallback when cache/cloud bundle
-    /// is missing or invalid.
-    pub fn load_embedded_minimal_bundle() -> anyhow::Result<Self> {
-        let root: Value = serde_json::from_str(EMBEDDED_MINIMAL_BUNDLE_JSON)
-            .context("failed parsing embedded minimal bundle JSON")?;
-        let bundle_value = extract_compiled_bundle_value(&root)
-            .context("embedded minimal bundle missing compiled payload")?;
-        build_engine_from_bundle_value(&bundle_value)
-            .context("failed loading embedded minimal bundle")
-    }
-
-    /// Overlay embedded minimal bundle coverage onto a loaded bundle engine.
-    ///
-    /// This preserves cloud/cache bundle behavior while ensuring baseline host/format coverage
-    /// for core providers is always present.
-    pub fn with_embedded_overlay(&self) -> anyhow::Result<Self> {
-        let mut merged = (*self.bundle).clone();
-        let embedded = embedded_minimal_compiled_bundle()?;
-        merge_compiled_bundle(&mut merged, embedded);
-        OispEngine::new(merged)
-    }
-
     fn resolve_provider_format(&self, provider_id: &str) -> Option<&Value> {
         let provider = self.bundle.providers.get(provider_id)?;
         let mut keys = Vec::with_capacity(2);
@@ -410,6 +657,424 @@ impl OispEngine {
 
         None
     }
+
+    fn resolve_provider(&self, provider_id: &str) -> Option<&types::bundle::ResolvedProvider> {
+        self.bundle.providers.get(provider_id).or_else(|| {
+            self.bundle
+                .providers
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(provider_id))
+                .map(|(_, provider)| provider)
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetectionRuleGroup {
+    Model,
+    Path,
+    Ua,
+    Process,
+    Env,
+}
+
+fn compare_detection_candidates(
+    left: &DetectionCandidate,
+    right: &DetectionCandidate,
+) -> std::cmp::Ordering {
+    left.precedence
+        .cmp(&right.precedence)
+        .then_with(|| {
+            left.outcome
+                .parse_confidence
+                .total_cmp(&right.outcome.parse_confidence)
+        })
+        // Keep stable deterministic tie-breaks: lexical-min wins.
+        .then_with(|| right.stable_key.cmp(&left.stable_key))
+}
+
+#[derive(Debug)]
+struct BoundedCache<K, V>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    cap: usize,
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+}
+
+impl<K, V> BoundedCache<K, V>
+where
+    K: std::hash::Hash + Eq + Clone,
+    V: Clone,
+{
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, value);
+            return;
+        }
+
+        while self.map.len() >= self.cap {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+}
+
+fn detection_cache_key_hash(
+    provider_id: &str,
+    context: &DetectionContext,
+    include_fallback: bool,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    provider_id.trim().to_ascii_lowercase().hash(&mut hasher);
+    include_fallback.hash(&mut hasher);
+
+    hash_opt_trim(context.host.as_deref(), &mut hasher);
+    hash_opt_trim(context.path.as_deref(), &mut hasher);
+    hash_opt_trim(context.user_agent.as_deref(), &mut hasher);
+    hash_opt_trim(context.model.as_deref(), &mut hasher);
+    hash_opt_trim(context.process_name.as_deref(), &mut hasher);
+    hash_opt_trim(context.bundle_id.as_deref(), &mut hasher);
+    hash_opt_trim(context.client_name.as_deref(), &mut hasher);
+    hash_opt_trim(context.client_version.as_deref(), &mut hasher);
+
+    for key in &context.env_keys {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            trimmed.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_opt_trim(value: Option<&str>, state: &mut impl Hasher) {
+    match value
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+    {
+        Some(normalized) => normalized.hash(state),
+        None => 0u8.hash(state),
+    }
+}
+
+fn collect_detection_candidates(
+    out: &mut Vec<DetectionCandidate>,
+    group: DetectionRuleGroup,
+    rules: &[DetectionRule],
+    provider: &types::bundle::ResolvedProvider,
+    context: &DetectionContext,
+) {
+    for rule in rules {
+        if !rule.enabled.unwrap_or(true) {
+            continue;
+        }
+        if !detection_rule_matches_context(rule, group, context) {
+            continue;
+        }
+
+        let detection_reason = normalize_string(rule.reason.clone())
+            .unwrap_or_else(|| detection_group_default_reason(group).to_string());
+        let parse_confidence = rule
+            .confidence
+            .map(|value| value.clamp(0.0, 1.0))
+            .unwrap_or_else(|| detection_group_default_confidence(group));
+        let agent = normalize_string(rule.agent.clone())
+            .or_else(|| (provider.entry_type == EntryType::AgentApp).then(|| provider.id.clone()));
+        let stable_key = format!(
+            "{}|{}|{}|{}",
+            rule.id.clone().unwrap_or_default(),
+            detection_reason,
+            agent.clone().unwrap_or_default(),
+            serialize_matchers_for_key(rule)
+        );
+
+        out.push(DetectionCandidate {
+            outcome: DetectionOutcome {
+                agent,
+                detection_reason,
+                parse_confidence,
+                target_entity_id: provider.entity_id.clone(),
+            },
+            precedence: detection_group_precedence(group) + rule.priority.unwrap_or(0),
+            stable_key,
+        });
+    }
+}
+
+fn detection_group_precedence(group: DetectionRuleGroup) -> i32 {
+    match group {
+        DetectionRuleGroup::Model => 5_000,
+        DetectionRuleGroup::Path => 4_000,
+        DetectionRuleGroup::Ua => 3_000,
+        DetectionRuleGroup::Process => 2_000,
+        DetectionRuleGroup::Env => 1_000,
+    }
+}
+
+fn detection_group_default_reason(group: DetectionRuleGroup) -> &'static str {
+    match group {
+        DetectionRuleGroup::Model => "model_match",
+        DetectionRuleGroup::Path => "path_match",
+        DetectionRuleGroup::Ua => "ua_match",
+        DetectionRuleGroup::Process => "process_match",
+        DetectionRuleGroup::Env => "env_match",
+    }
+}
+
+fn detection_group_default_confidence(group: DetectionRuleGroup) -> f64 {
+    match group {
+        DetectionRuleGroup::Model => 0.98,
+        DetectionRuleGroup::Path => 0.95,
+        DetectionRuleGroup::Ua => 0.90,
+        DetectionRuleGroup::Process => 0.85,
+        DetectionRuleGroup::Env => 0.80,
+    }
+}
+
+fn detection_rule_matches_context(
+    rule: &DetectionRule,
+    group: DetectionRuleGroup,
+    context: &DetectionContext,
+) -> bool {
+    if rule.matchers.is_empty() {
+        return false;
+    }
+
+    let mut matched_any = false;
+    for (raw_key, value) in &rule.matchers {
+        let key = raw_key.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let is_match = match key.as_str() {
+            "contains" | "pattern" | "value" => {
+                match_group_values(group, context, value, string_contains_case_insensitive)
+            }
+            "equals" => match_group_values(group, context, value, string_equals_case_insensitive),
+            "prefix" => match_group_values(group, context, value, string_prefix_case_insensitive),
+            "suffix" => match_group_values(group, context, value, string_suffix_case_insensitive),
+            "regex" => match_group_values(group, context, value, string_regex_match),
+            "path" => context
+                .path
+                .as_deref()
+                .is_some_and(|path| match_patterns(path, value, path_matches_pattern)),
+            "host" => context
+                .host
+                .as_deref()
+                .is_some_and(|host| match_patterns(host, value, host_matches_pattern)),
+            "model" => context
+                .model
+                .as_deref()
+                .is_some_and(|model| match_patterns(model, value, wildcard_or_exact_match)),
+            "process" => context
+                .process_name
+                .as_deref()
+                .is_some_and(|name| match_patterns(name, value, wildcard_or_exact_match)),
+            "bundle_id" => context
+                .bundle_id
+                .as_deref()
+                .is_some_and(|bundle_id| match_patterns(bundle_id, value, wildcard_or_exact_match)),
+            "env" | "env_key" => match_env_keys(context, value),
+            "client_name" => context
+                .client_name
+                .as_deref()
+                .is_some_and(|name| match_patterns(name, value, wildcard_or_exact_match)),
+            "client_version" => context
+                .client_version
+                .as_deref()
+                .is_some_and(|version| match_patterns(version, value, wildcard_or_exact_match)),
+            _ => false,
+        };
+        matched_any = true;
+        if !is_match {
+            return false;
+        }
+    }
+
+    matched_any
+}
+
+fn match_group_values(
+    group: DetectionRuleGroup,
+    context: &DetectionContext,
+    matcher_value: &Value,
+    matcher: fn(&str, &str) -> bool,
+) -> bool {
+    let subjects = detection_group_subjects(group, context);
+    if subjects.is_empty() {
+        return false;
+    }
+    let patterns = detection_matcher_patterns(matcher_value);
+    if patterns.is_empty() {
+        return false;
+    }
+
+    subjects
+        .iter()
+        .any(|subject| patterns.iter().any(|pattern| matcher(subject, pattern)))
+}
+
+fn detection_group_subjects<'a>(
+    group: DetectionRuleGroup,
+    context: &'a DetectionContext,
+) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    match group {
+        DetectionRuleGroup::Model => {
+            if let Some(model) = context.model.as_deref() {
+                out.push(model);
+            }
+        }
+        DetectionRuleGroup::Path => {
+            if let Some(path) = context.path.as_deref() {
+                out.push(path);
+            }
+        }
+        DetectionRuleGroup::Ua => {
+            if let Some(ua) = context.user_agent.as_deref() {
+                out.push(ua);
+            }
+            if let Some(client) = context.client_name.as_deref() {
+                out.push(client);
+            }
+        }
+        DetectionRuleGroup::Process => {
+            if let Some(name) = context.process_name.as_deref() {
+                out.push(name);
+            }
+            if let Some(bundle_id) = context.bundle_id.as_deref() {
+                out.push(bundle_id);
+            }
+        }
+        DetectionRuleGroup::Env => {
+            for key in &context.env_keys {
+                if !key.trim().is_empty() {
+                    out.push(key.as_str());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn match_env_keys(context: &DetectionContext, matcher_value: &Value) -> bool {
+    if context.env_keys.is_empty() {
+        return false;
+    }
+    let patterns = detection_matcher_patterns(matcher_value);
+    if patterns.is_empty() {
+        return false;
+    }
+    context.env_keys.iter().any(|entry| {
+        patterns
+            .iter()
+            .any(|pattern| wildcard_or_exact_match(entry.as_str(), pattern))
+    })
+}
+
+fn match_patterns(subject: &str, matcher_value: &Value, matcher: fn(&str, &str) -> bool) -> bool {
+    let patterns = detection_matcher_patterns(matcher_value);
+    if patterns.is_empty() {
+        return false;
+    }
+    patterns.iter().any(|pattern| matcher(subject, pattern))
+}
+
+fn detection_matcher_patterns(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(raw) => normalize_string(Some(raw.clone())).into_iter().collect(),
+        Value::Array(entries) => entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Value::String(raw) => normalize_string(Some(raw.clone())),
+                Value::Number(number) => Some(number.to_string()),
+                Value::Bool(flag) => Some(flag.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn wildcard_or_exact_match(text: &str, pattern: &str) -> bool {
+    let text = text.trim().to_ascii_lowercase();
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if text.is_empty() || pattern.is_empty() {
+        return false;
+    }
+    if pattern.contains('*') {
+        wildcard_match(text.as_str(), pattern.as_str())
+    } else {
+        text == pattern
+    }
+}
+
+fn string_contains_case_insensitive(subject: &str, pattern: &str) -> bool {
+    subject
+        .to_ascii_lowercase()
+        .contains(pattern.trim().to_ascii_lowercase().as_str())
+}
+
+fn string_equals_case_insensitive(subject: &str, pattern: &str) -> bool {
+    subject.trim().eq_ignore_ascii_case(pattern.trim())
+}
+
+fn string_prefix_case_insensitive(subject: &str, pattern: &str) -> bool {
+    subject
+        .to_ascii_lowercase()
+        .starts_with(pattern.trim().to_ascii_lowercase().as_str())
+}
+
+fn string_suffix_case_insensitive(subject: &str, pattern: &str) -> bool {
+    subject
+        .to_ascii_lowercase()
+        .ends_with(pattern.trim().to_ascii_lowercase().as_str())
+}
+
+fn string_regex_match(subject: &str, pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    Regex::new(trimmed)
+        .ok()
+        .is_some_and(|regex| regex.is_match(subject))
+}
+
+fn serialize_matchers_for_key(rule: &DetectionRule) -> String {
+    let mut keys = rule.matchers.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut items = Vec::new();
+    for key in keys {
+        let value = rule
+            .matchers
+            .get(key.as_str())
+            .map(serde_json::to_string)
+            .transpose()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        items.push(format!("{key}={value}"));
+    }
+    items.join("|")
 }
 
 fn registry_cache_last_good_path(path: &Path) -> std::path::PathBuf {
@@ -497,103 +1162,6 @@ fn validate_runtime_bundle_contract(bundle_value: &Value) -> anyhow::Result<()> 
     }
 
     Ok(())
-}
-
-fn embedded_minimal_compiled_bundle() -> anyhow::Result<CompiledBundle> {
-    let root: Value = serde_json::from_str(EMBEDDED_MINIMAL_BUNDLE_JSON)
-        .context("failed parsing embedded minimal bundle JSON")?;
-    let bundle_value = extract_compiled_bundle_value(&root)
-        .context("embedded minimal bundle missing compiled payload")?;
-    parse_compiled_bundle(&bundle_value).context("failed parsing embedded minimal bundle")
-}
-
-fn entry_type_key(entry_type: &EntryType) -> &'static str {
-    match entry_type {
-        EntryType::AiInference => "ai_inference",
-        EntryType::AgentApp => "agent_app",
-        EntryType::Mcp => "mcp",
-    }
-}
-
-fn dedupe_sort(values: &mut Vec<String>) {
-    values.sort();
-    values.dedup();
-}
-
-fn merge_compiled_bundle(primary: &mut CompiledBundle, baseline: CompiledBundle) {
-    for (provider_id, provider) in baseline.providers {
-        primary.providers.entry(provider_id).or_insert(provider);
-    }
-
-    let mut index_pos: std::collections::HashMap<(String, String, String), usize> =
-        std::collections::HashMap::new();
-    for (idx, entry) in primary.domain_index.iter().enumerate() {
-        index_pos.insert(
-            (
-                entry.host.clone(),
-                entry.provider_id.clone(),
-                entry_type_key(&entry.entry_type).to_string(),
-            ),
-            idx,
-        );
-    }
-    for mut entry in baseline.domain_index {
-        let key = (
-            entry.host.clone(),
-            entry.provider_id.clone(),
-            entry_type_key(&entry.entry_type).to_string(),
-        );
-        if let Some(existing_idx) = index_pos.get(&key).copied() {
-            if let Some(existing) = primary.domain_index.get_mut(existing_idx) {
-                existing.paths.append(&mut entry.paths);
-                dedupe_sort(&mut existing.paths);
-            }
-        } else {
-            index_pos.insert(key, primary.domain_index.len());
-            primary.domain_index.push(entry);
-        }
-    }
-
-    for (format_key, format_value) in baseline.formats {
-        primary.formats.entry(format_key).or_insert(format_value);
-    }
-
-    for (provider_id, models) in baseline.pricing {
-        let provider_models = primary.pricing.entry(provider_id).or_default();
-        for (model, price) in models {
-            provider_models.entry(model).or_insert(price);
-        }
-    }
-
-    primary
-        .filters
-        .whitelist
-        .extend(baseline.filters.whitelist.into_iter());
-    primary
-        .filters
-        .blacklist
-        .extend(baseline.filters.blacklist.into_iter());
-    primary
-        .filters
-        .passthrough
-        .extend(baseline.filters.passthrough.into_iter());
-    primary
-        .filters
-        .noise_keywords
-        .extend(baseline.filters.noise_keywords.into_iter());
-    dedupe_sort(&mut primary.filters.whitelist);
-    dedupe_sort(&mut primary.filters.blacklist);
-    dedupe_sort(&mut primary.filters.passthrough);
-    dedupe_sort(&mut primary.filters.noise_keywords);
-
-    primary
-        .catalog_domains
-        .extend(baseline.catalog_domains.into_iter());
-    dedupe_sort(&mut primary.catalog_domains);
-
-    primary.stats.providers = primary.providers.len();
-    primary.stats.domains = primary.domain_index.len();
-    primary.stats.formats = primary.formats.len();
 }
 
 fn format_uses_strip_xssi(format_value: &Value) -> bool {
@@ -1491,15 +2059,52 @@ fn wildcard_specificity(pattern: &str) -> usize {
     pattern.chars().filter(|ch| *ch != '*').count()
 }
 
-fn contains_noise_keyword(path: &str, keywords: &[String]) -> bool {
+fn contains_noise_keyword_for_host(host: &str, path: &str, keywords: &[String]) -> bool {
     if keywords.is_empty() {
         return false;
     }
 
+    let lower_host = normalize_host_for_matching(host);
     let lower_path = path.to_ascii_lowercase();
-    keywords
-        .iter()
-        .any(|keyword| lower_path.contains(&keyword.to_ascii_lowercase()))
+    keywords.iter().any(|keyword| {
+        let candidate = keyword.trim().to_ascii_lowercase();
+        if candidate.is_empty() {
+            return false;
+        }
+
+        // Host-scoped noise rule: "<host-pattern>/<path-fragment>".
+        // Example: "api.anthropic.com/api/hello" or "*.chatgpt.com/backend-api/wham/usage".
+        if let Some(slash_idx) = candidate.find('/') {
+            if slash_idx > 0 {
+                let host_pattern = &candidate[..slash_idx];
+                let path_fragment = &candidate[slash_idx..];
+                return host_matches_pattern(lower_host.as_str(), host_pattern)
+                    && lower_path.contains(path_fragment);
+            }
+        }
+
+        lower_path.contains(&candidate)
+    })
+}
+
+fn contains_noise_keyword_text(text: &str, keywords: &[String]) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    keywords.iter().any(|keyword| {
+        let candidate = keyword.trim().to_ascii_lowercase();
+        if candidate.is_empty() {
+            return false;
+        }
+
+        // Host-scoped entries are only evaluated in host+path context.
+        if candidate.find('/').is_some_and(|idx| idx > 0) {
+            return false;
+        }
+        lower.contains(&candidate)
+    })
 }
 
 fn host_matches_any(host: &str, patterns: &[String]) -> bool {
@@ -1856,17 +2461,42 @@ mod tests {
     }
 
     #[test]
-    fn embedded_minimal_bundle_loads_and_classifies_core_hosts() {
-        let engine = OispEngine::load_embedded_minimal_bundle().unwrap();
+    fn bundle_classification_depends_on_loaded_bundle_content() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "version": "v1",
+                "compiled_at": "2026-02-14T00:00:00Z",
+                "bundle_type": "cloud",
+                "domain_index": [
+                    { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" },
+                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
+                    { "host": "api.anthropic.com", "provider_id": "anthropic", "entry_type": "ai-inference" },
+                    { "host": "app.warp.dev", "provider_id": "warp", "entry_type": "agent-app" },
+                    { "host": "api.warp.dev", "provider_id": "warp", "entry_type": "agent-app" }
+                ],
+                "providers": {
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" },
+                    "chatgpt": { "id": "chatgpt", "name": "ChatGPT", "type": "agent-app" },
+                    "anthropic": { "id": "anthropic", "name": "Anthropic", "type": "ai-inference" },
+                    "warp": { "id": "warp", "name": "Warp", "type": "agent-app" }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         assert!(!engine.bundle_version().trim().is_empty());
         assert!(engine.provider_count() > 0);
         assert!(engine.classify("api.openai.com").is_some());
         assert!(engine.classify("chatgpt.com").is_some());
+        assert!(engine.classify("app.warp.dev").is_some());
+        assert!(engine.classify("api.warp.dev").is_some());
         assert!(engine.classify("api.anthropic.com").is_some());
     }
 
     #[test]
-    fn embedded_overlay_adds_missing_baseline_coverage() {
+    fn bundle_classification_does_not_include_implicit_overlay_hosts() {
         let primary = OispEngine::new(
             parse_compiled_bundle(&json!({
                 "version": "primary-v1",
@@ -1891,10 +2521,88 @@ mod tests {
         )
         .unwrap();
 
-        let merged = primary.with_embedded_overlay().unwrap();
-        assert!(merged.classify("api.example.com").is_some());
-        assert!(merged.classify("chatgpt.com").is_some());
-        assert!(merged.classify("api.openai.com").is_some());
+        assert!(primary.classify("api.example.com").is_some());
+        assert!(primary.classify("chatgpt.com").is_none());
+        assert!(primary.classify("app.warp.dev").is_none());
+        assert!(primary.classify("api.warp.dev").is_none());
+        assert!(primary.classify("api.openai.com").is_none());
+    }
+
+    #[test]
+    fn detection_rules_work_for_codex_and_warp_when_declared_in_bundle() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "version": "v1",
+                "compiled_at": "2026-02-14T00:00:00Z",
+                "bundle_type": "cloud",
+                "domain_index": [
+                    { "host": "ws.chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
+                    { "host": "api.warp.dev", "provider_id": "warp", "entry_type": "agent-app" }
+                ],
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "name": "ChatGPT",
+                        "type": "agent-app",
+                        "detection": {
+                            "path_rules": [
+                                {
+                                    "id": "chatgpt_codex_path",
+                                    "agent": "codex",
+                                    "reason": "path_contains_codex",
+                                    "confidence": 0.96,
+                                    "path": "/backend-api/codex/*"
+                                }
+                            ]
+                        }
+                    },
+                    "warp": {
+                        "id": "warp",
+                        "name": "Warp",
+                        "type": "agent-app",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "warp_ua",
+                                    "agent": "warp",
+                                    "reason": "ua_prefix_warp",
+                                    "confidence": 0.9,
+                                    "prefix": "warp/"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let codex = engine
+            .evaluate_detection_for_host(
+                "ws.chatgpt.com",
+                &DetectionContext {
+                    host: Some("ws.chatgpt.com".to_string()),
+                    path: Some("/backend-api/codex/responses".to_string()),
+                    ..DetectionContext::default()
+                },
+            )
+            .expect("codex detection should exist");
+        assert_eq!(codex.agent.as_deref(), Some("codex"));
+
+        let warp = engine
+            .evaluate_detection_for_host(
+                "api.warp.dev",
+                &DetectionContext {
+                    host: Some("api.warp.dev".to_string()),
+                    path: Some("/graphql/v2".to_string()),
+                    user_agent: Some("Warp/0.2026.01".to_string()),
+                    ..DetectionContext::default()
+                },
+            )
+            .expect("warp detection should exist");
+        assert_eq!(warp.agent.as_deref(), Some("warp"));
     }
 
     #[test]
@@ -1989,8 +2697,31 @@ mod tests {
     #[test]
     fn contains_noise_keyword_matches_case_insensitive() {
         let keywords = vec!["Analytics".to_string()];
-        assert!(contains_noise_keyword("/v1/ANALYTICS/query", &keywords));
-        assert!(!contains_noise_keyword("/v1/messages", &keywords));
+        assert!(contains_noise_keyword_for_host(
+            "api.openai.com",
+            "/v1/ANALYTICS/query",
+            &keywords
+        ));
+        assert!(!contains_noise_keyword_for_host(
+            "api.openai.com",
+            "/v1/messages",
+            &keywords
+        ));
+    }
+
+    #[test]
+    fn contains_noise_keyword_host_scoped_pattern_requires_host_match() {
+        let keywords = vec!["api.anthropic.com/api/hello".to_string()];
+        assert!(contains_noise_keyword_for_host(
+            "api.anthropic.com",
+            "/api/hello",
+            &keywords
+        ));
+        assert!(!contains_noise_keyword_for_host(
+            "chatgpt.com",
+            "/api/hello",
+            &keywords
+        ));
     }
 
     #[test]
@@ -2006,12 +2737,14 @@ mod tests {
             DomainIndexEntry {
                 host: "*.openai.com".to_string(),
                 provider_id: "broad".to_string(),
+                provider_entity_id: None,
                 entry_type: EntryType::AiInference,
                 paths: Vec::new(),
             },
             DomainIndexEntry {
                 host: "api.*.openai.com".to_string(),
                 provider_id: "specific".to_string(),
+                provider_entity_id: None,
                 entry_type: EntryType::AiInference,
                 paths: Vec::new(),
             },
@@ -2028,17 +2761,20 @@ mod tests {
             "openai".to_string(),
             types::bundle::ResolvedProvider {
                 id: "openai".to_string(),
+                entity_id: None,
                 name: "OpenAI".to_string(),
                 entry_type: EntryType::Mcp,
                 api_format: None,
                 domains: vec!["api.openai.com".to_string()],
                 user_agent_patterns: Vec::new(),
+                detection: None,
             },
         )]);
         bundle.providers = providers;
         bundle.domain_index = vec![DomainIndexEntry {
             host: "api.openai.com".to_string(),
             provider_id: "openai".to_string(),
+            provider_entity_id: None,
             entry_type: EntryType::AiInference,
             paths: Vec::new(),
         }];
@@ -2080,6 +2816,259 @@ mod tests {
         );
         assert!(cost.is_some());
         assert!((cost.unwrap() - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_detection_prefers_model_rule_with_entity_id() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v1",
+                "compiled_at": "2026-02-16T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_abc123" }
+                ],
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "entity_id": "agt_abc123",
+                        "name": "ChatGPT",
+                        "type": "agent-app",
+                        "api_format": "openai",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "ua-1",
+                                    "reason": "ua_match",
+                                    "confidence": 0.80,
+                                    "agent": "chatgpt",
+                                    "contains": "chatgpt"
+                                }
+                            ],
+                            "model_rules": [
+                                {
+                                    "id": "model-1",
+                                    "reason": "model_match",
+                                    "confidence": 0.99,
+                                    "priority": 10,
+                                    "agent": "codex",
+                                    "model": "*codex*"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = engine
+            .evaluate_detection(
+                "chatgpt",
+                &DetectionContext {
+                    host: Some("chatgpt.com".to_string()),
+                    user_agent: Some("chatgpt desktop".to_string()),
+                    model: Some("gpt-5.3-codex".to_string()),
+                    ..DetectionContext::default()
+                },
+            )
+            .expect("outcome");
+
+        assert_eq!(outcome.agent.as_deref(), Some("codex"));
+        assert_eq!(outcome.detection_reason, "model_match");
+        assert!((outcome.parse_confidence - 0.99).abs() < 1e-9);
+        assert_eq!(outcome.target_entity_id.as_deref(), Some("agt_abc123"));
+    }
+
+    #[test]
+    fn evaluate_detection_is_deterministic_for_same_context() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v1",
+                "compiled_at": "2026-02-16T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_abc123" }
+                ],
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "entity_id": "agt_abc123",
+                        "name": "ChatGPT",
+                        "type": "agent-app",
+                        "api_format": "openai",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "z-rule",
+                                    "reason": "ua_match",
+                                    "confidence": 0.90,
+                                    "agent": "chatgpt",
+                                    "contains": "desktop"
+                                },
+                                {
+                                    "id": "a-rule",
+                                    "reason": "ua_match",
+                                    "confidence": 0.90,
+                                    "agent": "codex",
+                                    "contains": "desktop"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context = DetectionContext {
+            host: Some("chatgpt.com".to_string()),
+            user_agent: Some("chatgpt desktop".to_string()),
+            ..DetectionContext::default()
+        };
+
+        let first = engine
+            .evaluate_detection("chatgpt", &context)
+            .expect("first outcome");
+        let second = engine
+            .evaluate_detection("chatgpt", &context)
+            .expect("second outcome");
+
+        assert_eq!(first, second);
+        assert_eq!(first.agent.as_deref(), Some("codex"));
+        assert_eq!(first.detection_reason, "ua_match");
+        assert_eq!(first.target_entity_id.as_deref(), Some("agt_abc123"));
+    }
+
+    #[test]
+    fn evaluate_detection_rules_only_returns_none_without_match() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v1",
+                "compiled_at": "2026-02-16T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_abc123" }
+                ],
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "entity_id": "agt_abc123",
+                        "name": "ChatGPT",
+                        "type": "agent-app",
+                        "api_format": "openai",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "ua-chatgpt",
+                                    "reason": "ua_match",
+                                    "confidence": 0.90,
+                                    "agent": "chatgpt",
+                                    "contains": "chatgpt"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context = DetectionContext {
+            user_agent: Some("unknown-client".to_string()),
+            ..DetectionContext::default()
+        };
+
+        assert!(engine
+            .evaluate_detection_rules_only("chatgpt", &context)
+            .is_none());
+    }
+
+    #[test]
+    fn evaluate_detection_across_entry_types_prefers_highest_confidence_rule() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v1",
+                "compiled_at": "2026-02-16T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_chatgpt" },
+                    { "host": "claude.ai", "provider_id": "claude", "entry_type": "agent-app", "provider_entity_id": "agt_claude" }
+                ],
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "entity_id": "agt_chatgpt",
+                        "name": "ChatGPT",
+                        "type": "agent-app",
+                        "api_format": "openai",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "ua-chatgpt",
+                                    "reason": "ua_match",
+                                    "confidence": 0.91,
+                                    "agent": "chatgpt",
+                                    "contains": "assistant-client"
+                                }
+                            ]
+                        }
+                    },
+                    "claude": {
+                        "id": "claude",
+                        "entity_id": "agt_claude",
+                        "name": "Claude",
+                        "type": "agent-app",
+                        "api_format": "anthropic",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "ua-claude",
+                                    "reason": "ua_match",
+                                    "confidence": 0.97,
+                                    "agent": "claude",
+                                    "contains": "assistant-client"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context = DetectionContext {
+            user_agent: Some("assistant-client/1.0".to_string()),
+            ..DetectionContext::default()
+        };
+
+        let outcome = engine
+            .evaluate_detection_across_entry_types(&context, &[EntryType::AgentApp])
+            .expect("detection outcome");
+        assert_eq!(outcome.provider_id, "claude");
+        assert_eq!(outcome.entry_type, EntryType::AgentApp);
+        assert_eq!(outcome.outcome.agent.as_deref(), Some("claude"));
+        assert!((outcome.outcome.parse_confidence - 0.97).abs() < 1e-9);
+        assert_eq!(
+            outcome.outcome.target_entity_id.as_deref(),
+            Some("agt_claude")
+        );
     }
 
     #[test]

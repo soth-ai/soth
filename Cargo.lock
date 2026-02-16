@@ -3724,6 +3724,7 @@ dependencies = [
  "soth-crypto",
  "soth-dashboard",
  "soth-observe",
+ "soth-oisp",
  "soth-policy",
  "soth-proxy",
  "soth-sync",
@@ -3859,6 +3860,7 @@ name = "soth-oisp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

@@ -519,6 +519,7 @@ async fn config_handler(
             body_sync_level: "bodies_redacted".to_string(),
             config_version: "cfg_v1".to_string(),
             bundle_version: Some(TEST_BUNDLE_VERSION.to_string()),
+            registry_mode: Some("registry".to_string()),
         }),
     )
 }

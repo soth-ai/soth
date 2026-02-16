@@ -112,6 +112,10 @@ pub struct ExchangeMetadata {
     pub bundle_version: Option<String>,
     pub parse_confidence: Option<f64>,
     pub detection_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_entity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_source: Option<String>,
     pub tags: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_envelope: Option<EventEnvelopeMetadata>,
@@ -219,6 +223,8 @@ pub struct ConfigResponse {
     pub config_version: String,
     #[serde(default)]
     pub bundle_version: Option<String>,
+    #[serde(default)]
+    pub registry_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1070,6 +1076,8 @@ mod tests {
                 bundle_version: Some("bundle-1".to_string()),
                 parse_confidence: Some(0.98),
                 detection_reason: Some("model_marker".to_string()),
+                target_entity_id: Some("agt_abc123".to_string()),
+                detection_source: Some("bundle".to_string()),
                 tags: None,
                 event_envelope: None,
             }],

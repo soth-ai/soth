@@ -136,6 +136,10 @@ pub struct ExchangeParse {
     pub parse_confidence: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detection_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_entity_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detection_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

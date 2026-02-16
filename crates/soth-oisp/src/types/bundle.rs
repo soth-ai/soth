@@ -1,4 +1,4 @@
-use super::provider::{EntryType, ModelPricing, ProviderDefinition};
+use super::provider::{DetectionRule, DetectionSpec, EntryType, ModelPricing, ProviderDefinition};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -24,6 +24,8 @@ pub enum FilterAction {
 pub struct DomainIndexEntry {
     pub host: String,
     pub provider_id: String,
+    #[serde(default)]
+    pub provider_entity_id: Option<String>,
     pub entry_type: EntryType,
     #[serde(default)]
     pub paths: Vec<String>,
@@ -54,6 +56,8 @@ pub struct BundleStats {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedProvider {
     pub id: String,
+    #[serde(default)]
+    pub entity_id: Option<String>,
     pub name: String,
     #[serde(rename = "type")]
     pub entry_type: EntryType,
@@ -63,14 +67,16 @@ pub struct ResolvedProvider {
     pub domains: Vec<String>,
     #[serde(default)]
     pub user_agent_patterns: Vec<String>,
+    #[serde(default)]
+    pub detection: Option<DetectionSpec>,
 }
 
 pub fn compiled_bundle_schema_version() -> u32 {
-    2
+    3
 }
 
 fn is_supported_compiled_bundle_schema_version(schema_version: u32) -> bool {
-    matches!(schema_version, 1 | 2)
+    matches!(schema_version, 1 | 2 | 3)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -104,7 +110,7 @@ impl CompiledBundle {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !is_supported_compiled_bundle_schema_version(self.schema_version) {
             anyhow::bail!(
-                "unsupported compiled bundle schema_version {} (supported: 1, 2)",
+                "unsupported compiled bundle schema_version {} (supported: 1, 2, 3)",
                 self.schema_version,
             );
         }
@@ -129,6 +135,13 @@ impl CompiledBundle {
                     "provider map key `{provider_id}` does not match provider.id `{}`",
                     provider.id
                 );
+            }
+            if provider
+                .entity_id
+                .as_ref()
+                .is_some_and(|entity_id| entity_id.trim().is_empty())
+            {
+                anyhow::bail!("provider `{provider_id}` has empty entity_id");
             }
         }
         for entry in &self.domain_index {
@@ -411,12 +424,31 @@ fn parse_catalog_providers(
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToString::to_string);
+        let entity_id = provider_obj
+            .get("entity_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string);
 
         let mut domains = extract_string_array(provider_obj.get("api_domains"));
         let mut user_agent_patterns = extract_string_array(provider_obj.get("user_agent_patterns"));
-        if let Some(detection) = provider_obj.get("detection").and_then(Value::as_object) {
-            domains.extend(extract_string_array(detection.get("host_patterns")));
-            user_agent_patterns.extend(extract_string_array(detection.get("header_hints")));
+        let detection = provider_obj
+            .get("detection")
+            .and_then(|value| serde_json::from_value::<DetectionSpec>(value.clone()).ok());
+        if let Some(detection_obj) = provider_obj.get("detection").and_then(Value::as_object) {
+            domains.extend(extract_string_array(detection_obj.get("host_patterns")));
+            user_agent_patterns.extend(extract_string_array(detection_obj.get("header_hints")));
+            domains.extend(extract_detection_rule_strings(
+                detection_obj,
+                "host_rules",
+                &["host", "pattern", "contains", "suffix", "regex", "value"],
+            ));
+            user_agent_patterns.extend(extract_detection_rule_strings(
+                detection_obj,
+                "ua_rules",
+                &["contains", "equals", "pattern", "regex", "value"],
+            ));
         }
         dedup_sort_strings(&mut domains);
         dedup_sort_strings(&mut user_agent_patterns);
@@ -425,11 +457,13 @@ fn parse_catalog_providers(
             provider_id.clone(),
             ResolvedProvider {
                 id: provider_id.clone(),
+                entity_id,
                 name,
                 entry_type,
                 api_format,
                 domains,
                 user_agent_patterns,
+                detection,
             },
         );
     }
@@ -447,18 +481,16 @@ fn collect_provider_path_hints(
         let mut paths = Vec::new();
         if let Some(detection) = provider_obj.get("detection").and_then(Value::as_object) {
             paths.extend(extract_string_array(detection.get("path_patterns")));
+            paths.extend(extract_detection_rule_strings(
+                detection,
+                "path_rules",
+                &["path", "pattern", "contains", "prefix", "regex", "value"],
+            ));
         }
         if let Some(features) = provider_obj.get("features").and_then(Value::as_object) {
             for feature in features.values() {
-                if let Some(patterns) = feature.get("patterns").and_then(Value::as_array) {
-                    for pattern in patterns {
-                        if let Some(raw) = pattern.as_str() {
-                            let value = raw.trim();
-                            if !value.is_empty() {
-                                paths.push(value.to_string());
-                            }
-                        }
-                    }
+                if let Some(patterns) = feature.get("patterns") {
+                    collect_feature_pattern_paths(patterns, &mut paths);
                 }
             }
         }
@@ -468,6 +500,38 @@ fn collect_provider_path_hints(
         }
     }
     out
+}
+
+fn collect_feature_pattern_paths(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(raw) => {
+            let path = raw.trim();
+            if !path.is_empty() {
+                out.push(path.to_string());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_feature_pattern_paths(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["url", "path", "pattern", "route", "endpoint"] {
+                if let Some(raw) = map.get(key).and_then(Value::as_str) {
+                    let path = raw.trim();
+                    if !path.is_empty() {
+                        out.push(path.to_string());
+                    }
+                }
+            }
+            for nested_key in ["request", "response"] {
+                if let Some(nested) = map.get(nested_key) {
+                    collect_feature_pattern_paths(nested, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn parse_catalog_domain_index(
@@ -497,6 +561,11 @@ fn parse_catalog_domain_index(
         for entry in &mut entries {
             if let Some(extra) = provider_path_hints.get(&entry.provider_id) {
                 entry.paths.extend(extra.iter().cloned());
+            }
+            if entry.provider_entity_id.is_none() {
+                entry.provider_entity_id = providers
+                    .get(&entry.provider_id)
+                    .and_then(|provider| provider.entity_id.clone());
             }
             if let Some(host_rules) = interception_patterns
                 .and_then(|patterns| patterns.get(&entry.host))
@@ -564,10 +633,14 @@ fn parse_catalog_domain_index(
         }
         prune_catch_all_path_rules(&mut paths, &entry_type);
         dedup_sort_strings(&mut paths);
+        let provider_entity_id = providers
+            .get(&provider_id)
+            .and_then(|provider| provider.entity_id.clone());
 
         out.push(DomainIndexEntry {
             host: host.clone(),
             provider_id,
+            provider_entity_id,
             entry_type,
             paths,
         });
@@ -639,10 +712,14 @@ fn parse_catalog_domain_index_array_entry(
     }
     prune_catch_all_path_rules(&mut paths, &entry_type);
     dedup_sort_strings(&mut paths);
+    let provider_entity_id = providers
+        .get(&provider_id)
+        .and_then(|provider| provider.entity_id.clone());
 
     Ok(DomainIndexEntry {
         host,
         provider_id,
+        provider_entity_id,
         entry_type,
         paths,
     })
@@ -854,10 +931,15 @@ fn has_any_pricing_field(pricing: &ModelPricing) -> bool {
 
 fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
     for provider in bundle.providers.values_mut() {
+        provider.entity_id = normalize_optional_string(provider.entity_id.take());
         dedup_sort_strings(&mut provider.domains);
         dedup_sort_strings(&mut provider.user_agent_patterns);
+        if let Some(detection) = provider.detection.as_mut() {
+            normalize_detection_spec(detection);
+        }
     }
     for entry in &mut bundle.domain_index {
+        entry.provider_entity_id = normalize_optional_string(entry.provider_entity_id.take());
         dedup_sort_strings(&mut entry.paths);
     }
     normalize_domain_filters(&mut bundle.filters);
@@ -875,6 +957,113 @@ fn normalize_domain_filters(filters: &mut DomainFilters) {
     dedup_sort_strings(&mut filters.blacklist);
     dedup_sort_strings(&mut filters.passthrough);
     dedup_sort_strings(&mut filters.noise_keywords);
+}
+
+fn normalize_detection_spec(detection: &mut DetectionSpec) {
+    dedup_sort_strings(&mut detection.host_patterns);
+    dedup_sort_strings(&mut detection.path_patterns);
+    dedup_sort_strings(&mut detection.header_hints);
+    normalize_detection_rules(&mut detection.ua_rules, "ua_match");
+    normalize_detection_rules(&mut detection.path_rules, "path_match");
+    normalize_detection_rules(&mut detection.model_rules, "model_match");
+    normalize_detection_rules(&mut detection.process_rules, "process_match");
+    normalize_detection_rules(&mut detection.env_rules, "env_match");
+}
+
+fn normalize_detection_rules(rules: &mut Vec<DetectionRule>, default_reason: &str) {
+    for rule in rules.iter_mut() {
+        rule.id = normalize_optional_string(rule.id.take());
+        rule.agent = normalize_optional_string(rule.agent.take());
+        rule.reason = normalize_optional_string(rule.reason.take())
+            .or_else(|| Some(default_reason.to_string()));
+        if let Some(confidence) = rule.confidence {
+            rule.confidence = Some(confidence.clamp(0.0, 1.0));
+        }
+        if rule.enabled.is_none() {
+            rule.enabled = Some(true);
+        }
+
+        let mut cleaned = std::collections::HashMap::new();
+        for (key, value) in std::mem::take(&mut rule.matchers) {
+            let normalized_key = key.trim().to_ascii_lowercase();
+            if normalized_key.is_empty() {
+                continue;
+            }
+            let normalized_value = normalize_detection_matcher_value(value);
+            if !normalized_value.is_null() {
+                cleaned.insert(normalized_key, normalized_value);
+            }
+        }
+        rule.matchers = cleaned;
+    }
+
+    rules.retain(|rule| {
+        rule.enabled.unwrap_or(true)
+            && !rule.matchers.is_empty()
+            && rule
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+    });
+    rules.sort_by(|left, right| detection_rule_sort_key(right).cmp(&detection_rule_sort_key(left)));
+    rules.dedup_by(|left, right| detection_rule_sort_key(left) == detection_rule_sort_key(right));
+}
+
+fn detection_rule_sort_key(rule: &DetectionRule) -> (i32, i32, String, String, String) {
+    let confidence = (rule.confidence.unwrap_or(0.0).clamp(0.0, 1.0) * 1000.0).round() as i32;
+    (
+        rule.priority.unwrap_or(0),
+        confidence,
+        rule.id.clone().unwrap_or_default(),
+        rule.reason.clone().unwrap_or_default(),
+        rule.agent.clone().unwrap_or_default(),
+    )
+}
+
+fn normalize_detection_matcher_value(value: Value) -> Value {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Value::Null
+            } else {
+                Value::String(trimmed.to_string())
+            }
+        }
+        Value::Array(entries) => {
+            let mut out = Vec::new();
+            for entry in entries {
+                let normalized = normalize_detection_matcher_value(entry);
+                if !normalized.is_null() {
+                    out.push(normalized);
+                }
+            }
+            if out.is_empty() {
+                Value::Null
+            } else {
+                Value::Array(out)
+            }
+        }
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, entry) in map {
+                let normalized_key = key.trim().to_ascii_lowercase();
+                if normalized_key.is_empty() {
+                    continue;
+                }
+                let normalized = normalize_detection_matcher_value(entry);
+                if !normalized.is_null() {
+                    out.insert(normalized_key, normalized);
+                }
+            }
+            if out.is_empty() {
+                Value::Null
+            } else {
+                Value::Object(out)
+            }
+        }
+        other => other,
+    }
 }
 
 fn parse_bundle_type(raw: Option<&str>) -> BundleType {
@@ -910,6 +1099,62 @@ fn extract_string_array(value: Option<&Value>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn extract_detection_rule_strings(
+    detection: &Map<String, Value>,
+    rule_key: &str,
+    field_candidates: &[&str],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(rules) = detection.get(rule_key).and_then(Value::as_array) else {
+        return out;
+    };
+    for rule in rules {
+        if let Some(text) = rule.as_str() {
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push(text.to_string());
+            }
+            continue;
+        }
+        let Some(obj) = rule.as_object() else {
+            continue;
+        };
+        for field in field_candidates {
+            if let Some(values) = obj.get(*field) {
+                out.extend(extract_strings_from_value(values));
+            }
+        }
+    }
+    out
+}
+
+fn extract_strings_from_value(value: &Value) -> Vec<String> {
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![text.to_string()]
+        };
+    }
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+    }
+    Vec::new()
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn dedup_sort_strings(values: &mut Vec<String>) {
@@ -1037,6 +1282,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_compiled_bundle_collects_feature_object_pattern_paths() {
+        let value = json!({
+            "version": "catalog-v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "local",
+            "domain_index": {
+                "claude.ai": {
+                    "category": "agent-apps",
+                    "pattern_type": "exact",
+                    "provider": "claude"
+                }
+            },
+            "providers": {
+                "claude": {
+                    "name": "Claude",
+                    "category": "agent-apps",
+                    "api_domains": ["claude.ai"],
+                    "features": {
+                        "chat": {
+                            "patterns": {
+                                "request": { "url": "/api/organizations/*/chat_conversations/*/completion", "method": "POST" },
+                                "response": { "url": "/api/organizations/*/chat_conversations/*", "method": "GET" }
+                            }
+                        }
+                    }
+                }
+            },
+            "pricing": {}
+        });
+
+        let parsed = parse_compiled_bundle(&value).unwrap();
+        assert_eq!(parsed.domain_index.len(), 1);
+        let entry = parsed.domain_index.first().unwrap();
+        assert!(entry
+            .paths
+            .contains(&"/api/organizations/*/chat_conversations/*/completion".to_string()));
+        assert!(entry
+            .paths
+            .contains(&"/api/organizations/*/chat_conversations/*".to_string()));
+    }
+
+    #[test]
     fn parse_compiled_bundle_rejects_missing_providers() {
         let value = json!({
             "version": "2026.02.13-r1",
@@ -1138,5 +1425,68 @@ mod tests {
             .catalog_domains
             .contains(&"server.codeium.com".to_string()));
         assert!(parsed.meta.is_some());
+    }
+
+    #[test]
+    fn parse_compiled_bundle_accepts_sectioned_v3_shape_with_entity_ids() {
+        let value = json!({
+            "schema_version": 3,
+            "version": "2026.02.13-r3",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "meta": {
+                "release_id": "rel-2",
+                "sections": {
+                    "core": { "required": true },
+                    "filters": { "required": true }
+                }
+            },
+            "core": {
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "entity_id": "prv_4n7k2q9m1x",
+                        "name": "OpenAI",
+                        "type": "ai-inference",
+                        "api_format": "openai",
+                        "detection": {
+                            "ua_rules": [{ "contains": "openai", "agent": "openai" }],
+                            "path_rules": [{ "path": "/v1/chat/completions" }]
+                        }
+                    }
+                },
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference"
+                    }
+                ],
+                "pricing": {}
+            },
+            "filters": {
+                "whitelist": ["api.openai.com"],
+                "blacklist": ["tracking"],
+                "passthrough": [],
+                "noise_keywords": []
+            }
+        });
+
+        let parsed = parse_compiled_bundle(&value).unwrap();
+        assert_eq!(parsed.schema_version, 3);
+        let provider = parsed.providers.get("openai").unwrap();
+        assert_eq!(provider.entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
+        let detection = provider
+            .detection
+            .as_ref()
+            .expect("detection should be parsed");
+        assert_eq!(detection.ua_rules.len(), 1);
+        assert_eq!(detection.path_rules.len(), 1);
+        assert_eq!(
+            detection.path_rules[0].reason.as_deref(),
+            Some("path_match")
+        );
+        let entry = parsed.domain_index.first().unwrap();
+        assert_eq!(entry.provider_entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
     }
 }

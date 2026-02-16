@@ -25,7 +25,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use soth_budget::{BudgetTracker, TokenCounter};
 use soth_crypto::tls::LearnedPassthrough;
-use soth_oisp::{InterceptDecision, OispEngine, OispStreamParser};
+use soth_oisp::types::provider::EntryType;
+use soth_oisp::{DetectionContext, InterceptDecision, OispEngine, OispStreamParser};
 use soth_policy::PolicyEngine;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
@@ -34,7 +35,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, error, info, warn};
 
 use crate::enforcement::core as enforcement_core;
@@ -84,7 +85,7 @@ struct PendingRequest {
     path: String,
     method: String,
     provider: Option<String>,
-    agent: Option<&'static str>,
+    agent: Option<String>,
     model: Option<String>,
     graphql_operation: Option<String>,
     started_at: Instant,
@@ -110,12 +111,84 @@ struct PendingRequest {
     detection_reason: Option<String>,
     /// Confidence score for detection reason.
     parse_confidence: Option<f64>,
+    /// Provider/agent entity id derived from bundle detection.
+    target_entity_id: Option<String>,
+    /// Source of detection metadata (bundle/legacy_fallback).
+    detection_source: Option<String>,
+    /// Shadow legacy agent label used for mismatch diagnostics.
+    shadow_agent: Option<String>,
+    /// Shadow legacy detection reason used for mismatch diagnostics.
+    shadow_detection_reason: Option<String>,
+    /// Shadow legacy parse confidence used for mismatch diagnostics.
+    shadow_parse_confidence: Option<f64>,
+    /// Indicates bundle-primary detection diverged from legacy shadow detection.
+    shadow_mismatch: bool,
     /// Whether interception matched blacklist/noise criteria.
     blacklist_match: bool,
     /// Policy decision metadata captured at request enforcement time.
     policy_allowed: Option<bool>,
     policy_reason: Option<String>,
     policy_version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TunnelDebugRuntime {
+    enabled: bool,
+    include_noise: bool,
+    min_log_interval: Duration,
+    last_log_by_key: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl TunnelDebugRuntime {
+    fn new(enabled: bool, include_noise: bool, min_log_interval: Duration) -> Self {
+        Self {
+            enabled,
+            include_noise,
+            min_log_interval,
+            last_log_by_key: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn should_log(
+        &self,
+        decision_label: &str,
+        host: &str,
+        process_pid: Option<u32>,
+        process_name: Option<&str>,
+    ) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if decision_label == "noise" && !self.include_noise {
+            return false;
+        }
+        let key = format!(
+            "{}|{}|{}|{}",
+            decision_label,
+            host.to_ascii_lowercase(),
+            process_pid
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            process_name.unwrap_or("unknown").to_ascii_lowercase()
+        );
+        let now = Instant::now();
+        let mut map = self.last_log_by_key.lock();
+        if map.len() > 4096 {
+            map.retain(|_, logged_at| {
+                now.saturating_duration_since(*logged_at) < self.min_log_interval
+            });
+            if map.len() > 8192 {
+                map.clear();
+            }
+        }
+        if let Some(previous) = map.get(&key) {
+            if now.saturating_duration_since(*previous) < self.min_log_interval {
+                return false;
+            }
+        }
+        map.insert(key, now);
+        true
+    }
 }
 
 /// Thread-safe store for pending requests
@@ -175,8 +248,6 @@ fn is_emfile_proxy_forward_error(err: &LegacyClientError) -> bool {
 const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
 const STREAM_CAPTURE_INITIAL_CAPACITY: usize = 64 * 1024;
 const STREAM_BUFFER_POOL_MAX_BUFFERS: usize = 32;
-const PROCESS_ATTR_LOOKUP_TIMEOUT: Duration = Duration::from_millis(25);
-const PROCESS_ATTR_CACHE_TTL: Duration = Duration::from_secs(30);
 
 static STREAM_BUFFER_POOL: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -487,9 +558,51 @@ fn is_blacklist_detection_reason(reason: Option<&str>) -> bool {
 fn parse_confidence_for_reason(reason: Option<&str>) -> Option<f64> {
     match reason {
         Some("bundle.discovery.catalog") => Some(0.7),
+        Some("discovery.heuristic.user_agent") => Some(0.72),
+        Some("discovery.heuristic.process_name") => Some(0.68),
         Some(_) => Some(1.0),
         None => None,
     }
+}
+
+fn decision_label_from_intercept_decision(decision: InterceptDecision) -> &'static str {
+    match decision {
+        InterceptDecision::Intercept { .. } => "intercept",
+        InterceptDecision::Passthrough => "passthrough",
+        InterceptDecision::Noise => "noise",
+        InterceptDecision::Tunnel => "tunnel",
+    }
+}
+
+fn process_bundle_id_from_executable(path: Option<&str>) -> Option<String> {
+    let path = path?;
+    let lower = path.to_ascii_lowercase();
+    lower.find(".app/").and_then(|idx| {
+        let app_root = &path[..idx + 4];
+        let app = app_root
+            .rsplit('/')
+            .next()
+            .unwrap_or(app_root)
+            .trim_end_matches(".app")
+            .trim();
+        if app.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "macos.{}",
+                app.chars()
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() {
+                            ch.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect::<String>()
+                    .trim_matches('_')
+            ))
+        }
+    })
 }
 
 fn append_capture_tags(
@@ -531,6 +644,66 @@ fn append_process_attribution_tags(
     }
     if let Some(app_type) = envelope.process_app_type.as_ref() {
         tags.insert("metadata.process_app_type".to_string(), app_type.clone());
+    }
+}
+
+fn append_detection_tags(tags: &mut BTreeMap<String, String>, pending: &PendingRequest) {
+    append_detection_tags_from_values(
+        tags,
+        pending.detection_source.as_deref(),
+        pending.detection_reason.as_deref(),
+        pending.parse_confidence,
+        pending.target_entity_id.as_deref(),
+        pending.shadow_mismatch,
+        pending.shadow_agent.as_deref(),
+        pending.shadow_detection_reason.as_deref(),
+        pending.shadow_parse_confidence,
+    );
+}
+
+fn append_detection_tags_from_values(
+    tags: &mut BTreeMap<String, String>,
+    detection_source: Option<&str>,
+    detection_reason: Option<&str>,
+    parse_confidence: Option<f64>,
+    target_entity_id: Option<&str>,
+    shadow_mismatch: bool,
+    shadow_agent: Option<&str>,
+    shadow_detection_reason: Option<&str>,
+    shadow_parse_confidence: Option<f64>,
+) {
+    if let Some(source) = detection_source {
+        tags.insert("detection.source".to_string(), source.to_string());
+    }
+    if let Some(reason) = detection_reason {
+        tags.insert("detection.reason".to_string(), reason.to_string());
+    }
+    if let Some(confidence) = parse_confidence {
+        tags.insert(
+            "detection.parse_confidence".to_string(),
+            format!("{confidence:.3}"),
+        );
+    }
+    if let Some(entity_id) = target_entity_id {
+        tags.insert(
+            "detection.target_entity_id".to_string(),
+            entity_id.to_string(),
+        );
+    }
+    if shadow_mismatch {
+        tags.insert("detection.shadow_mismatch".to_string(), "true".to_string());
+    }
+    if let Some(agent) = shadow_agent {
+        tags.insert("detection.shadow_agent".to_string(), agent.to_string());
+    }
+    if let Some(reason) = shadow_detection_reason {
+        tags.insert("detection.shadow_reason".to_string(), reason.to_string());
+    }
+    if let Some(confidence) = shadow_parse_confidence {
+        tags.insert(
+            "detection.shadow_confidence".to_string(),
+            format!("{confidence:.3}"),
+        );
     }
 }
 
@@ -1591,7 +1764,7 @@ fn record_proxy_budget_spend(
         .envelope
         .as_ref()
         .and_then(|envelope| envelope.did.as_deref())
-        .or(pending.agent);
+        .or(pending.agent.as_deref());
 
     tracker.record_spend_with_cost(
         session_id,
@@ -1649,33 +1822,7 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
         return None;
     }
 
-    let bundle_id = envelope.process_executable.as_deref().and_then(|path| {
-        let lower = path.to_ascii_lowercase();
-        lower.find(".app/").and_then(|idx| {
-            let app_root = &path[..idx + 4];
-            let app = app_root
-                .rsplit('/')
-                .next()
-                .unwrap_or(app_root)
-                .trim_end_matches(".app")
-                .trim();
-            if app.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "macos.{}",
-                    app.chars()
-                        .map(|ch| if ch.is_ascii_alphanumeric() {
-                            ch.to_ascii_lowercase()
-                        } else {
-                            '_'
-                        })
-                        .collect::<String>()
-                        .trim_matches('_')
-                ))
-            }
-        })
-    });
+    let bundle_id = process_bundle_id_from_executable(envelope.process_executable.as_deref());
 
     let app_type = envelope.process_app_type.clone().or_else(|| {
         classify_process_app_type(envelope.process_name.as_deref(), bundle_id.as_ref())
@@ -1766,7 +1913,7 @@ fn finalize_and_enqueue_exchange_v2(
     assembler.set_session_id(session_id.to_string());
     assembler.set_route(
         pending.provider.clone(),
-        pending.agent.map(|value| value.to_string()),
+        pending.agent.clone(),
         usage_meta.model.clone().or_else(|| pending.model.clone()),
         Some(pending.path.clone()),
         Some(pending.method.clone()),
@@ -1777,6 +1924,8 @@ fn finalize_and_enqueue_exchange_v2(
         bundle_version: bundle_version.map(ToString::to_string),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
+        target_entity_id: pending.target_entity_id.clone(),
+        detection_source: pending.detection_source.clone(),
     }));
     assembler.set_blacklist_match(pending.blacklist_match);
     assembler.set_request(
@@ -1844,6 +1993,7 @@ fn finalize_and_enqueue_exchange_v2(
             .entry("mcp.method".to_string())
             .or_insert_with(|| method.clone());
     }
+    append_detection_tags(&mut exchange_tags, pending);
     if let Some(envelope) = pending.envelope.as_ref() {
         assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
         if let Some(did) = envelope.did.as_ref() {
@@ -1873,7 +2023,7 @@ fn finalize_and_enqueue_exchange_v2(
         &pending.host,
         WrapDirection::Out,
         AgentInfo::new(
-            pending.agent.unwrap_or("unknown"),
+            pending.agent.as_deref().unwrap_or("unknown"),
             DetectionSource::Environment,
         ),
     )
@@ -1965,7 +2115,7 @@ fn seed_exchange_v2_spool(
     assembler.set_session_id(session_id.to_string());
     assembler.set_route(
         pending.provider.clone(),
-        pending.agent.map(|value| value.to_string()),
+        pending.agent.clone(),
         pending.model.clone(),
         Some(pending.path.clone()),
         Some(pending.method.clone()),
@@ -1986,6 +2136,8 @@ fn seed_exchange_v2_spool(
         bundle_version: bundle_version.map(ToString::to_string),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
+        target_entity_id: pending.target_entity_id.clone(),
+        detection_source: pending.detection_source.clone(),
     }));
     assembler.set_blacklist_match(pending.blacklist_match);
     if let Some(envelope) = pending.envelope.as_ref() {
@@ -2055,7 +2207,7 @@ pub struct AiProxyHandler {
     process_attribution: Arc<ProcessAttribution>,
     /// Migration mode for registry-driven detection/interception.
     registry_mode: RegistryMode,
-    /// Bundle-driven classifier loaded from registry cache or embedded fallback.
+    /// Bundle-driven classifier loaded from registry cache.
     oisp_engine: Arc<OispEngine>,
     /// Optional exchange.v2 assembly config (disabled when None).
     exchange_v2: Option<ExchangeAssemblerConfig>,
@@ -2063,8 +2215,14 @@ pub struct AiProxyHandler {
     catalog_discovery_limiter: Arc<CatalogDiscoveryLimiter>,
     /// Maximum request/response body bytes to capture in observability payloads.
     capture_max_body_bytes: u64,
+    /// Optional metadata-only diagnostics for tunneled/noise requests.
+    tunnel_debug: TunnelDebugRuntime,
     /// Stable request/response correlation key for this handler clone lifecycle.
     request_correlation_id: u64,
+    /// Debug override to force MITM interception for all non-local hosts.
+    force_intercept_all: bool,
+    /// Optional expiry for the debug force-intercept-all override.
+    force_intercept_all_until: Option<SystemTime>,
 }
 
 impl Clone for AiProxyHandler {
@@ -2086,7 +2244,10 @@ impl Clone for AiProxyHandler {
             exchange_v2: self.exchange_v2.clone(),
             catalog_discovery_limiter: self.catalog_discovery_limiter.clone(),
             capture_max_body_bytes: self.capture_max_body_bytes,
+            tunnel_debug: self.tunnel_debug.clone(),
             request_correlation_id: next_proxy_request_id(),
+            force_intercept_all: self.force_intercept_all,
+            force_intercept_all_until: self.force_intercept_all_until,
         }
     }
 }
@@ -2109,15 +2270,23 @@ impl AiProxyHandler {
             learned_failure_threshold: config.tls.learned_passthrough.failure_threshold.max(1),
             learned_failure_window: config.tls.learned_passthrough.failure_window,
             process_attribution: Arc::new(ProcessAttribution::new(
-                PROCESS_ATTR_LOOKUP_TIMEOUT,
-                PROCESS_ATTR_CACHE_TTL,
+                config.process_attribution.enabled,
+                config.process_attribution.lookup_timeout,
+                config.process_attribution.cache_ttl,
             )),
             registry_mode: config.registry_mode,
             oisp_engine,
             exchange_v2: None,
             catalog_discovery_limiter: Arc::new(CatalogDiscoveryLimiter::default()),
             capture_max_body_bytes: config.capture_max_body_bytes,
+            tunnel_debug: TunnelDebugRuntime::new(
+                config.tunnel_debug.enabled,
+                config.tunnel_debug.include_noise,
+                config.tunnel_debug.min_log_interval,
+            ),
             request_correlation_id: next_proxy_request_id(),
+            force_intercept_all: false,
+            force_intercept_all_until: None,
         }
     }
 
@@ -2167,12 +2336,52 @@ impl AiProxyHandler {
         self
     }
 
+    /// Enable debug catch-all interception for all non-local hosts.
+    pub fn with_force_intercept_all(
+        mut self,
+        enabled: bool,
+        expires_at: Option<SystemTime>,
+    ) -> Self {
+        self.force_intercept_all = enabled;
+        self.force_intercept_all_until = expires_at;
+        self
+    }
+
+    fn is_force_intercept_all_active(&self) -> bool {
+        if !self.force_intercept_all {
+            return false;
+        }
+        match self.force_intercept_all_until {
+            Some(deadline) => SystemTime::now() <= deadline,
+            None => true,
+        }
+    }
+
+    fn force_intercept_all_action(&self, host: &str, phase: &str) -> Option<HostAction> {
+        if !self.is_force_intercept_all_active() {
+            return None;
+        }
+        let mut debug_hosts = (*self.hosts).clone();
+        debug_hosts.mode = HostFilterMode::Discovery;
+        let action = debug_hosts.action_for_host(host);
+        let metric = match action {
+            HostAction::Intercept => "debug_intercept_all",
+            HostAction::Tunnel => "debug_intercept_all_tunnel",
+            HostAction::Block => "block",
+        };
+        metrics::record_filter_decision(phase, metric);
+        Some(action)
+    }
+
     /// Resolve action for host/path using registry engine decisions.
     /// Uses bundle-driven decisions only (no host-list fallback).
     fn get_action(&self, host: &str, path: &str) -> HostAction {
         if matches!(self.hosts.action_for_host(host), HostAction::Block) {
             metrics::record_filter_decision("http", "block");
             return HostAction::Block;
+        }
+        if let Some(action) = self.force_intercept_all_action(host, "http") {
+            return action;
         }
 
         let engine = self.oisp_engine.as_ref();
@@ -2213,6 +2422,9 @@ impl AiProxyHandler {
         if matches!(self.hosts.action_for_host(host), HostAction::Block) {
             metrics::record_filter_decision("connect", "block");
             return HostAction::Block;
+        }
+        if let Some(action) = self.force_intercept_all_action(host, "connect") {
+            return action;
         }
 
         let engine = self.oisp_engine.as_ref();
@@ -2290,6 +2502,8 @@ impl AiProxyHandler {
 
         if ua_lower.contains("openai-codex") || ua_lower.contains("codex/") {
             Some("codex")
+        } else if ua_lower.contains("warp") {
+            Some("warp")
         } else if ua_lower.contains("claude-code")
             || ua_lower.contains("claude_code")
             || ua_lower.contains("claude code")
@@ -2319,6 +2533,59 @@ impl AiProxyHandler {
             Some("chatgpt")
         } else {
             // Unrecognized/non-empty User-Agent currently has no stable agent mapping.
+            None
+        }
+    }
+
+    fn is_anthropic_api_host(host: &str) -> bool {
+        let normalized = host.trim().to_ascii_lowercase();
+        normalized == "api.anthropic.com"
+            || normalized.ends_with(".api.anthropic.com")
+            || normalized == "api.claude.ai"
+            || normalized.ends_with(".api.claude.ai")
+    }
+
+    fn has_anthropic_api_key_header<T>(req: &Request<T>) -> bool {
+        if req.headers().contains_key("x-api-key") {
+            return true;
+        }
+
+        req.headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_ascii_lowercase().contains("sk-ant-"))
+            .unwrap_or(false)
+    }
+
+    /// Anthropic API hosts can represent either direct inference traffic
+    /// (API key present) or agent-orchestrated traffic (no API key).
+    fn should_treat_anthropic_api_as_agent<T>(host: &str, req: &Request<T>) -> bool {
+        Self::is_anthropic_api_host(host) && !Self::has_anthropic_api_key_header(req)
+    }
+
+    /// Best-effort local process-name heuristic for discovery-mode agent labeling.
+    fn detect_agent_from_process_name(process_name: &str) -> Option<&'static str> {
+        let lower = process_name.to_ascii_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+        if lower.contains("warp") {
+            Some("warp")
+        } else if lower.contains("openai-codex") || lower.contains("codex") {
+            Some("codex")
+        } else if lower.contains("claude-code") || lower.contains("claude code") {
+            Some("claude-code")
+        } else if lower.contains("claude") {
+            Some("claude")
+        } else if lower.contains("cursor") {
+            Some("cursor")
+        } else if lower.contains("windsurf") || lower.contains("codeium") {
+            Some("windsurf")
+        } else if lower.contains("copilot") {
+            Some("github-copilot")
+        } else if lower.contains("chatgpt") || lower.contains("openai") {
+            Some("chatgpt")
+        } else {
             None
         }
     }
@@ -2470,7 +2737,7 @@ impl HttpHandler for AiProxyHandler {
             && oisp_classification.is_none()
             && self.oisp_engine.is_catalog_domain(&host)
             && catalog_discovery_limiter.was_reserved_today(DiscoveryKind::Catalog, &host);
-        let (host_is_ai_target, host_is_mcp_target, host_is_agent_target, provider) =
+        let (mut host_is_ai_target, host_is_mcp_target, mut host_is_agent_target, provider) =
             if let Some(classification) = oisp_classification.as_ref() {
                 let (ai, mcp, agent) = match classification.entry_type_label() {
                     "ai_inference" => (true, false, false),
@@ -2484,6 +2751,18 @@ impl HttpHandler for AiProxyHandler {
             } else {
                 (false, false, false, None)
             };
+        let anthropic_agent_override = should_capture_observability
+            && !is_connect
+            && Self::should_treat_anthropic_api_as_agent(&host, &req);
+        if anthropic_agent_override {
+            host_is_ai_target = false;
+            host_is_agent_target = true;
+        }
+        let ua_header = req
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
         let ua_agent = Self::detect_agent_from_user_agent(&req);
         let enforcer = self.enforcer.clone();
         let session_id = self.session_id.clone();
@@ -2539,6 +2818,7 @@ impl HttpHandler for AiProxyHandler {
         let learned_failure_window = self.learned_failure_window;
         let process_attribution = self.process_attribution.clone();
         let capture_max_body_bytes = self.capture_max_body_bytes;
+        let tunnel_debug = self.tunnel_debug.clone();
         let client_addr = ctx.client_addr;
         let exchange_v2_cfg = self.exchange_v2.clone();
         let exchange_bundle_version = if exchange_v2_cfg.is_some() {
@@ -2547,12 +2827,14 @@ impl HttpHandler for AiProxyHandler {
             None
         };
         let legacy_wrap_events_enabled = exchange_v2_cfg.is_none();
+        let bundle_only_mode = matches!(self.registry_mode, RegistryMode::BundleOnly);
         let should_resolve_process = !is_connect
-            && should_capture_observability
-            && (host_is_ai_target
-                || host_is_mcp_target
-                || host_is_agent_target
-                || (host_mode == HostFilterMode::Discovery));
+            && ((should_capture_observability
+                && (host_is_ai_target
+                    || host_is_mcp_target
+                    || host_is_agent_target
+                    || (host_mode == HostFilterMode::Discovery)))
+                || (tunnel_debug.enabled && !should_capture_observability));
 
         debug!(
             is_post = is_post,
@@ -2581,6 +2863,35 @@ impl HttpHandler for AiProxyHandler {
             } else {
                 None
             };
+
+            if is_connect && !matches!(host_action, HostAction::Intercept) {
+                let decision_label = match host_action {
+                    HostAction::Tunnel => "tunnel",
+                    HostAction::Block => "block",
+                    HostAction::Intercept => "intercept",
+                };
+                let process_pid = process_identity.as_ref().map(|value| value.pid);
+                let process_name = process_identity.as_ref().map(|value| value.name.as_str());
+                if tunnel_debug.should_log(decision_label, &host, process_pid, process_name) {
+                    let process_bundle_id = process_identity.as_ref().and_then(|value| {
+                        process_bundle_id_from_executable(value.executable.as_deref())
+                    });
+                    info!(
+                        host = %host,
+                        method = "CONNECT",
+                        decision = %decision_label,
+                        client_addr = %client_addr,
+                        process_pid = ?process_pid,
+                        process_name = %process_name.unwrap_or("-"),
+                        process_app_type = %process_identity
+                            .as_ref()
+                            .map(|value| value.app_type.as_str())
+                            .unwrap_or("-"),
+                        process_bundle_id = ?process_bundle_id,
+                        "Tunnel debug CONNECT metadata (no body capture)"
+                    );
+                }
+            }
 
             if is_connect && matches!(host_action, HostAction::Intercept) {
                 if let Some(ref learned) = learned_passthrough {
@@ -2669,20 +2980,241 @@ impl HttpHandler for AiProxyHandler {
                     )
                 };
             if !is_connect && !should_capture_observability {
-                debug!(
-                    host = %host,
-                    path = %path,
-                    method = %http_method,
-                    "Skipping observability capture for tunneled/noise request"
+                let decision_label = decision_label_from_intercept_decision(
+                    oisp_engine.should_intercept(&host, &path_for_filter),
                 );
+                let process_pid = process_identity.as_ref().map(|value| value.pid);
+                let process_name = process_identity.as_ref().map(|value| value.name.as_str());
+                if tunnel_debug.should_log(decision_label, &host, process_pid, process_name) {
+                    let process_bundle_id = process_identity.as_ref().and_then(|value| {
+                        process_bundle_id_from_executable(value.executable.as_deref())
+                    });
+                    info!(
+                        host = %host,
+                        path = %path,
+                        method = %http_method,
+                        decision = %decision_label,
+                        client_addr = %client_addr,
+                        provider_hint = ?provider,
+                        agent_hint = ?ua_agent,
+                        process_pid = ?process_pid,
+                        process_name = %process_name.unwrap_or("-"),
+                        process_app_type = %process_identity
+                            .as_ref()
+                            .map(|value| value.app_type.as_str())
+                            .unwrap_or("-"),
+                        process_bundle_id = ?process_bundle_id,
+                        user_agent = ?ua_header,
+                        "Tunnel debug metadata (no body capture)"
+                    );
+                } else {
+                    debug!(
+                        host = %host,
+                        path = %path,
+                        method = %http_method,
+                        "Skipping observability capture for tunneled/noise request"
+                    );
+                }
             }
-            let agent = Self::detect_agent_with_context_gated(
-                ua_agent,
-                &host,
-                &path,
-                model.as_deref(),
-                host_is_agent_target || (host_mode == HostFilterMode::Discovery),
-            );
+            let (legacy_agent, legacy_detection_reason, legacy_parse_confidence) =
+                if bundle_only_mode {
+                    (None, None, None)
+                } else {
+                    let agent = Self::detect_agent_with_context_gated(
+                        ua_agent,
+                        &host,
+                        &path,
+                        model.as_deref(),
+                        host_is_agent_target || (host_mode == HostFilterMode::Discovery),
+                    )
+                    .map(ToString::to_string);
+                    let reason = detection_reason_for_bucket(
+                        host_is_ai_target,
+                        host_is_mcp_target,
+                        host_is_agent_target,
+                        is_catalog_discovery_host,
+                    )
+                    .map(ToString::to_string);
+                    let confidence = parse_confidence_for_reason(reason.as_deref());
+                    (agent, reason, confidence)
+                };
+            let process_bundle_id = process_identity
+                .as_ref()
+                .and_then(|value| process_bundle_id_from_executable(value.executable.as_deref()));
+            let process_agent = process_identity
+                .as_ref()
+                .and_then(|value| Self::detect_agent_from_process_name(&value.name))
+                .map(ToString::to_string);
+            let detection_context = DetectionContext {
+                host: Some(host.clone()),
+                path: Some(path.clone()),
+                user_agent: ua_header.clone(),
+                model: model.clone(),
+                process_name: process_identity.as_ref().map(|value| value.name.clone()),
+                bundle_id: process_bundle_id,
+                client_name: if bundle_only_mode {
+                    process_agent.clone()
+                } else {
+                    legacy_agent.clone().or_else(|| process_agent.clone())
+                },
+                client_version: None,
+                env_keys: Vec::new(),
+            };
+            let provider_scoped_detection = provider
+                .as_deref()
+                .and_then(|provider_id| {
+                    oisp_engine.evaluate_detection(provider_id, &detection_context)
+                })
+                .or_else(|| oisp_engine.evaluate_detection_for_host(&host, &detection_context));
+            let provider_scoped_is_generic = provider_scoped_detection
+                .as_ref()
+                .map(|value| {
+                    value
+                        .detection_reason
+                        .eq_ignore_ascii_case("fallback_unknown")
+                        || value
+                            .detection_reason
+                            .eq_ignore_ascii_case("host_classification")
+                })
+                .unwrap_or(true);
+            let cross_entry_detection =
+                if provider_scoped_detection.is_none() || provider_scoped_is_generic {
+                    oisp_engine.evaluate_detection_across_entry_types(
+                        &detection_context,
+                        &[EntryType::AgentApp],
+                    )
+                } else {
+                    None
+                };
+            let bundle_detection = provider_scoped_detection.clone().or_else(|| {
+                cross_entry_detection
+                    .as_ref()
+                    .map(|value| value.outcome.clone())
+            });
+            let bundle_agent = bundle_detection
+                .as_ref()
+                .and_then(|value| value.agent.clone())
+                .or_else(|| {
+                    cross_entry_detection.as_ref().and_then(|value| {
+                        value
+                            .outcome
+                            .agent
+                            .clone()
+                            .or_else(|| Some(value.provider_id.clone()))
+                    })
+                });
+            let bundle_detection_is_generic = bundle_detection
+                .as_ref()
+                .map(|value| {
+                    value
+                        .detection_reason
+                        .eq_ignore_ascii_case("fallback_unknown")
+                        || value
+                            .detection_reason
+                            .eq_ignore_ascii_case("host_classification")
+                })
+                .unwrap_or(true);
+            let discovery_heuristic = if bundle_detection.is_none() || bundle_detection_is_generic {
+                if let Some(agent) = ua_agent.map(ToString::to_string) {
+                    Some((agent, "discovery.heuristic.user_agent".to_string()))
+                } else if let Some(agent) = process_agent.clone() {
+                    Some((agent, "discovery.heuristic.process_name".to_string()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let heuristic_agent = discovery_heuristic.as_ref().map(|value| value.0.clone());
+            let should_prefer_heuristic = heuristic_agent.is_some()
+                && (bundle_agent.is_none() || bundle_detection_is_generic);
+            let agent = if bundle_only_mode {
+                if should_prefer_heuristic {
+                    heuristic_agent.clone().or_else(|| bundle_agent.clone())
+                } else {
+                    bundle_agent.clone()
+                }
+            } else if should_prefer_heuristic {
+                heuristic_agent
+                    .clone()
+                    .or_else(|| bundle_agent.clone())
+                    .or_else(|| legacy_agent.clone())
+            } else {
+                bundle_agent
+                    .clone()
+                    .or_else(|| legacy_agent.clone())
+                    .or_else(|| heuristic_agent.clone())
+            };
+            let (detection_reason, parse_confidence, detection_source) = if should_prefer_heuristic
+            {
+                if let Some((_, reason)) = discovery_heuristic.as_ref() {
+                    (
+                        Some(reason.clone()),
+                        parse_confidence_for_reason(Some(reason.as_str())),
+                        Some("discovery_fallback".to_string()),
+                    )
+                } else if let Some(value) = bundle_detection.as_ref() {
+                    (
+                        Some(value.detection_reason.clone()),
+                        Some(value.parse_confidence),
+                        Some("bundle".to_string()),
+                    )
+                } else {
+                    (
+                        Some("fallback_unknown".to_string()),
+                        Some(0.0),
+                        Some("bundle".to_string()),
+                    )
+                }
+            } else if let Some(value) = bundle_detection.as_ref() {
+                (
+                    Some(value.detection_reason.clone()),
+                    Some(value.parse_confidence),
+                    Some("bundle".to_string()),
+                )
+            } else if let Some((_, reason)) = discovery_heuristic.as_ref() {
+                (
+                    Some(reason.clone()),
+                    parse_confidence_for_reason(Some(reason.as_str())),
+                    Some("discovery_fallback".to_string()),
+                )
+            } else if bundle_only_mode {
+                (
+                    Some("fallback_unknown".to_string()),
+                    Some(0.0),
+                    Some("bundle".to_string()),
+                )
+            } else {
+                (
+                    legacy_detection_reason.clone(),
+                    legacy_parse_confidence,
+                    Some("legacy_fallback".to_string()),
+                )
+            };
+            let target_entity_id = bundle_detection
+                .as_ref()
+                .and_then(|value| value.target_entity_id.clone());
+            let (shadow_mismatch, shadow_agent, shadow_detection_reason, shadow_parse_confidence) =
+                if bundle_only_mode {
+                    (false, None, None, None)
+                } else {
+                    let mismatch = match (bundle_agent.as_deref(), legacy_agent.as_deref()) {
+                        (Some(bundle_value), Some(legacy_value)) => {
+                            !bundle_value.eq_ignore_ascii_case(legacy_value)
+                        }
+                        _ => false,
+                    };
+                    (
+                        mismatch,
+                        bundle_detection.as_ref().and_then(|_| legacy_agent.clone()),
+                        bundle_detection
+                            .as_ref()
+                            .and_then(|_| legacy_detection_reason.clone()),
+                        bundle_detection
+                            .as_ref()
+                            .and_then(|_| legacy_parse_confidence),
+                    )
+                };
             let mcp_request_method = if !is_connect
                 && should_capture_observability
                 && (host_is_mcp_target || (host_mode == HostFilterMode::Discovery))
@@ -2734,7 +3266,7 @@ impl HttpHandler for AiProxyHandler {
                             &http_method,
                             &path,
                             model.as_deref(),
-                            agent,
+                            agent.as_deref(),
                             identity_did.as_deref(),
                             identity_signature.as_deref(),
                             body_content.as_deref(),
@@ -2825,13 +3357,8 @@ impl HttpHandler for AiProxyHandler {
 
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
-                    let detection_reason = detection_reason_for_bucket(
-                        host_is_ai_target,
-                        host_is_mcp_target,
-                        host_is_agent_target,
-                        is_catalog_discovery_host,
-                    );
-                    let blacklist_match = is_blacklist_detection_reason(detection_reason);
+                    let blacklist_match =
+                        is_blacklist_detection_reason(detection_reason.as_deref());
                     let envelope = apply_process_identity(
                         TrafficEnvelope::proxy(
                             &session_id,
@@ -2841,7 +3368,7 @@ impl HttpHandler for AiProxyHandler {
                             &http_method,
                             &display_path,
                             model.as_deref(),
-                            agent,
+                            agent.as_deref(),
                             identity_did.as_deref(),
                             identity_signature.as_deref(),
                             body_content.as_deref(),
@@ -2858,7 +3385,7 @@ impl HttpHandler for AiProxyHandler {
                             path: display_path.clone(),
                             method: http_method.clone(),
                             provider: Some(provider.to_string()),
-                            agent,
+                            agent: agent.clone(),
                             model: model.clone(),
                             graphql_operation: graphql_operation.clone(),
                             started_at: Instant::now(),
@@ -2871,8 +3398,14 @@ impl HttpHandler for AiProxyHandler {
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
                             catalog_discovery: is_catalog_discovery_host,
-                            detection_reason: detection_reason.map(ToString::to_string),
-                            parse_confidence: parse_confidence_for_reason(detection_reason),
+                            detection_reason: detection_reason.clone(),
+                            parse_confidence,
+                            target_entity_id: target_entity_id.clone(),
+                            detection_source: detection_source.clone(),
+                            shadow_agent: shadow_agent.clone(),
+                            shadow_detection_reason: shadow_detection_reason.clone(),
+                            shadow_parse_confidence,
+                            shadow_mismatch,
                             blacklist_match,
                             policy_allowed,
                             policy_reason: None,
@@ -2894,8 +3427,10 @@ impl HttpHandler for AiProxyHandler {
 
                 if legacy_wrap_events_enabled {
                     if let Some(ref logger) = event_logger {
-                        let mcp_agent =
-                            AgentInfo::new(agent.unwrap_or("mcp"), DetectionSource::Environment);
+                        let mcp_agent = AgentInfo::new(
+                            agent.as_deref().unwrap_or("mcp"),
+                            DetectionSource::Environment,
+                        );
                         let mut event =
                             WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
                                 .with_source(EventSource::Mcp)
@@ -2907,7 +3442,7 @@ impl HttpHandler for AiProxyHandler {
                                 mcp_method.clone(),
                                 &host,
                                 &path,
-                                agent,
+                                agent.as_deref(),
                                 identity_did.as_deref(),
                                 identity_signature.as_deref(),
                                 body_content.as_deref(),
@@ -2924,6 +3459,17 @@ impl HttpHandler for AiProxyHandler {
                             append_catalog_discovery_tags(&mut tags, &host);
                         }
                         append_process_attribution_tags(&mut tags, event.traffic_envelope.as_ref());
+                        append_detection_tags_from_values(
+                            &mut tags,
+                            detection_source.as_deref(),
+                            detection_reason.as_deref(),
+                            parse_confidence,
+                            target_entity_id.as_deref(),
+                            shadow_mismatch,
+                            shadow_agent.as_deref(),
+                            shadow_detection_reason.as_deref(),
+                            shadow_parse_confidence,
+                        );
                         if !tags.is_empty() {
                             event = event.with_tags(tags);
                         }
@@ -2933,13 +3479,7 @@ impl HttpHandler for AiProxyHandler {
                 }
 
                 let mut pending = pending_requests.lock();
-                let detection_reason = detection_reason_for_bucket(
-                    host_is_ai_target,
-                    host_is_mcp_target,
-                    host_is_agent_target,
-                    is_catalog_discovery_host,
-                );
-                let blacklist_match = is_blacklist_detection_reason(detection_reason);
+                let blacklist_match = is_blacklist_detection_reason(detection_reason.as_deref());
                 pending.insert(
                     request_id,
                     PendingRequest {
@@ -2951,7 +3491,7 @@ impl HttpHandler for AiProxyHandler {
                                 mcp_method.clone(),
                                 &host,
                                 &path,
-                                agent,
+                                agent.as_deref(),
                                 identity_did.as_deref(),
                                 identity_signature.as_deref(),
                                 body_content.as_deref(),
@@ -2962,7 +3502,7 @@ impl HttpHandler for AiProxyHandler {
                         path: path.clone(),
                         method: http_method.clone(),
                         provider: None,
-                        agent,
+                        agent: agent.clone(),
                         model: None,
                         graphql_operation: None,
                         started_at: Instant::now(),
@@ -2975,8 +3515,14 @@ impl HttpHandler for AiProxyHandler {
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
                         catalog_discovery: is_catalog_discovery_host,
-                        detection_reason: detection_reason.map(ToString::to_string),
-                        parse_confidence: parse_confidence_for_reason(detection_reason),
+                        detection_reason: detection_reason.clone(),
+                        parse_confidence,
+                        target_entity_id: target_entity_id.clone(),
+                        detection_source: detection_source.clone(),
+                        shadow_agent: shadow_agent.clone(),
+                        shadow_detection_reason: shadow_detection_reason.clone(),
+                        shadow_parse_confidence,
+                        shadow_mismatch,
                         blacklist_match,
                         policy_allowed: None,
                         policy_reason: None,
@@ -3128,7 +3674,7 @@ impl HttpHandler for AiProxyHandler {
 
                 if let Some(ref logger) = event_logger {
                     let mcp_agent = AgentInfo::new(
-                        pending.agent.unwrap_or("mcp"),
+                        pending.agent.as_deref().unwrap_or("mcp"),
                         DetectionSource::Environment,
                     );
                     let method_name = pending
@@ -3168,6 +3714,7 @@ impl HttpHandler for AiProxyHandler {
                         append_catalog_discovery_tags(&mut tags, &pending.host);
                     }
                     append_process_attribution_tags(&mut tags, pending.envelope.as_ref());
+                    append_detection_tags(&mut tags, &pending);
                     append_capture_tags(
                         &mut tags,
                         pending.request_body_truncated,
@@ -3452,6 +3999,7 @@ impl HttpHandler for AiProxyHandler {
                             &mut enriched_tags,
                             log_pending.envelope.as_ref(),
                         );
+                        append_detection_tags(&mut enriched_tags, &log_pending);
                         append_capture_tags(
                             &mut enriched_tags,
                             log_pending.request_body_truncated,
@@ -3482,7 +4030,7 @@ impl HttpHandler for AiProxyHandler {
                                 session_id: &log_session_id,
                                 host: &log_pending.host,
                                 provider: log_provider.as_str(),
-                                agent: log_pending.agent,
+                                agent: log_pending.agent.as_deref(),
                                 method: &log_pending.method,
                                 path: &log_pending.path,
                                 graphql_operation: log_pending.graphql_operation.as_deref(),
@@ -3590,6 +4138,7 @@ impl HttpHandler for AiProxyHandler {
                         append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
                     }
                     append_process_attribution_tags(&mut enriched_tags, pending.envelope.as_ref());
+                    append_detection_tags(&mut enriched_tags, &pending);
                     append_capture_tags(
                         &mut enriched_tags,
                         pending.request_body_truncated,
@@ -3617,7 +4166,7 @@ impl HttpHandler for AiProxyHandler {
                             session_id: &session_id,
                             host: &pending.host,
                             provider: provider.as_str(),
-                            agent: pending.agent,
+                            agent: pending.agent.as_deref(),
                             method: &pending.method,
                             path: &pending.path,
                             graphql_operation: pending.graphql_operation.as_deref(),
@@ -3726,13 +4275,14 @@ impl HttpHandler for AiProxyHandler {
                     append_catalog_discovery_tags(&mut tags, &pending_req.host);
                 }
                 append_process_attribution_tags(&mut tags, pending_req.envelope.as_ref());
+                append_detection_tags(&mut tags, pending_req);
                 let usage_meta = ResponseUsageMeta::default();
                 if legacy_wrap_events_enabled {
                     let mut event = build_paired_response_event(ResponseEventInput {
                         session_id: &session_id,
                         host: &pending_req.host,
                         provider: provider.as_str(),
-                        agent: pending_req.agent,
+                        agent: pending_req.agent.as_deref(),
                         method: &pending_req.method,
                         path: &pending_req.path,
                         graphql_operation: pending_req.graphql_operation.as_deref(),
@@ -3818,19 +4368,27 @@ impl HttpHandler for AiProxyHandler {
         let host = Self::extract_host(req);
         let action = self.get_connect_action(&host);
         let learned_passthrough = self.learned_passthrough.clone();
+        let debug_force_intercept = self.is_force_intercept_all_active();
 
         async move {
             match action {
                 HostAction::Intercept => {
-                    if let Some(learned) = learned_passthrough.as_ref() {
-                        if learned.should_passthrough(&host) {
-                            metrics::record_tls_learned_passthrough("bypass");
-                            metrics::set_tls_learned_passthrough_active(
-                                learned.active_count() as f64
-                            );
-                            debug!(host = %host, "Learned passthrough: blind tunnel");
-                            return false;
+                    if !debug_force_intercept {
+                        if let Some(learned) = learned_passthrough.as_ref() {
+                            if learned.should_passthrough(&host) {
+                                metrics::record_tls_learned_passthrough("bypass");
+                                metrics::set_tls_learned_passthrough_active(
+                                    learned.active_count() as f64
+                                );
+                                debug!(host = %host, "Learned passthrough: blind tunnel");
+                                return false;
+                            }
                         }
+                    } else {
+                        debug!(
+                            host = %host,
+                            "Debug catch-all interception bypassing learned passthrough"
+                        );
                     }
                     debug!(host = %host, "MITM intercept");
                     true
@@ -4066,55 +4624,16 @@ impl WebSocketHandler for AiWebSocketHandler {
 }
 
 fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyError> {
-    if let Some(path) = cache_path {
-        match OispEngine::load_from_registry_cache(path) {
-            Ok(Some(engine)) => {
-                let engine = match engine.with_embedded_overlay() {
-                    Ok(overlaid) => overlaid,
-                    Err(error) => {
-                        warn!(
-                            cache = %path.display(),
-                            error = %error,
-                            "Failed applying embedded baseline overlay; continuing with cache bundle as-is"
-                        );
-                        engine
-                    }
-                };
-                info!(
-                    cache = %path.display(),
-                    bundle_version = %engine.bundle_version(),
-                    providers = engine.provider_count(),
-                    domains = engine.domain_count(),
-                    catalog_domains = engine.catalog_domain_count(),
-                    whitelist = engine.whitelist_count(),
-                    blacklist = engine.blacklist_count(),
-                    passthrough = engine.passthrough_count(),
-                    noise_keywords = engine.noise_keyword_count(),
-                    "Loaded OISP bundle for proxy classification (embedded baseline overlay applied)"
-                );
-                return Ok(Arc::new(engine));
-            }
-            Ok(None) => {
-                warn!(
-                    cache = %path.display(),
-                    "OISP registry cache not found; using embedded minimal fallback bundle"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    cache = %path.display(),
-                    error = %error,
-                    "Failed to load OISP registry cache; using embedded minimal fallback bundle"
-                );
-            }
-        }
-    } else {
-        warn!("OISP registry cache path not configured; using embedded minimal fallback bundle");
-    }
+    let Some(path) = cache_path else {
+        return Err(ProxyError::transport(
+            "compiled registry bundle is required for proxy start; run `soth init` (or cloud sync) to populate registry cache".to_string(),
+        ));
+    };
 
-    match OispEngine::load_embedded_minimal_bundle() {
-        Ok(engine) => {
+    match OispEngine::load_from_registry_cache(path) {
+        Ok(Some(engine)) => {
             info!(
+                cache = %path.display(),
                 bundle_version = %engine.bundle_version(),
                 providers = engine.provider_count(),
                 domains = engine.domain_count(),
@@ -4123,14 +4642,23 @@ fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyE
                 blacklist = engine.blacklist_count(),
                 passthrough = engine.passthrough_count(),
                 noise_keywords = engine.noise_keyword_count(),
-                "Loaded embedded minimal OISP bundle"
+                "Loaded OISP bundle for proxy classification"
             );
             Ok(Arc::new(engine))
         }
+        Ok(None) => Err(ProxyError::transport(format!(
+            "compiled registry bundle is required for proxy start; cache not found at {}",
+            path.display()
+        ))),
         Err(error) => {
-            error!(error = %error, "Failed to load embedded minimal OISP bundle");
+            error!(
+                cache = %path.display(),
+                error = %error,
+                "Failed to load OISP registry cache"
+            );
             Err(ProxyError::transport(format!(
-                "Failed to load any OISP bundle (cache and embedded fallback both unavailable): {error}"
+                "compiled registry bundle is required for proxy start; failed loading cache {}: {error}",
+                path.display()
             )))
         }
     }
@@ -4163,6 +4691,8 @@ pub async fn start_proxy(
         None,
         None,
         None,
+        false,
+        None,
     )
     .await
 }
@@ -4178,6 +4708,8 @@ pub async fn start_proxy_with_shutdown<F>(
     observe_config: Option<ObserveConfig>,
     oisp_registry_cache_path: Option<PathBuf>,
     exchange_v2_config: Option<ExchangeV2Config>,
+    force_intercept_all: bool,
+    force_intercept_all_for: Option<Duration>,
 ) -> Result<(), ProxyError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -4204,6 +4736,17 @@ where
         .parse()
         .map_err(|e| ProxyError::transport(format!("Invalid listen address: {}", e)))?;
 
+    // Preflight socket bind to surface actionable OS error details (e.g. EADDRINUSE).
+    {
+        let preflight = std::net::TcpListener::bind(listen_addr).map_err(|error| {
+            ProxyError::transport(format!(
+                "Proxy preflight bind failed on {}: {}",
+                listen_addr, error
+            ))
+        })?;
+        drop(preflight);
+    }
+
     // Create a shared session ID for both handlers
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -4226,6 +4769,8 @@ where
     } else {
         None
     };
+    let force_intercept_all_until =
+        force_intercept_all_for.and_then(|window| SystemTime::now().checked_add(window));
 
     let handler = {
         let mut h = AiProxyHandler::new(&config, &observe_config, oisp_engine.clone());
@@ -4246,6 +4791,9 @@ where
                 config.tls.learned_passthrough.failure_window,
             );
         }
+        if force_intercept_all {
+            h = h.with_force_intercept_all(force_intercept_all, force_intercept_all_until);
+        }
         h
     };
 
@@ -4263,6 +4811,22 @@ where
     info!("  Registry mode -> {}", config.registry_mode);
     info!("  AI+MCP domains -> MITM intercept");
     info!("  Other domains -> blind tunnel");
+    if config.tunnel_debug.enabled {
+        info!(
+            include_noise = config.tunnel_debug.include_noise,
+            min_log_interval_secs = config.tunnel_debug.min_log_interval.as_secs(),
+            "  Tunnel debug -> metadata logging enabled for tunneled traffic"
+        );
+    }
+    if force_intercept_all {
+        match force_intercept_all_for {
+            Some(window) => info!(
+                window_secs = window.as_secs(),
+                "  Debug catch-all -> MITM intercept all non-local hosts (temporary)"
+            ),
+            None => info!("  Debug catch-all -> MITM intercept all non-local hosts"),
+        }
+    }
 
     // ChatGPT web requests can carry extremely large sentinel/auth headers.
     // Raise parser budgets so requests are accepted and then sanitized in handler logic.
@@ -4286,10 +4850,12 @@ where
         .build()
         .map_err(|e| ProxyError::transport(format!("Failed to build proxy: {}", e)))?;
 
-    proxy
-        .start()
-        .await
-        .map_err(|e| ProxyError::transport(format!("Proxy error: {}", e)))?;
+    proxy.start().await.map_err(|error| {
+        ProxyError::transport(format!(
+            "Proxy start failed on {}: {} (debug: {:?})",
+            listen_addr, error, error
+        ))
+    })?;
 
     if let Some(ref learned) = learned_passthrough {
         learned.persist();
@@ -4362,13 +4928,18 @@ mod tests {
     }
 
     #[test]
-    fn load_oisp_engine_falls_back_to_embedded_bundle_when_cache_missing() {
-        let engine = load_oisp_engine(None).expect("embedded fallback bundle should load");
-        assert!(engine.classify("api.openai.com").is_some());
+    fn load_oisp_engine_requires_configured_cache_path() {
+        let error = match load_oisp_engine(None) {
+            Ok(_) => panic!("expected missing cache path to fail"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("compiled registry bundle is required"));
     }
 
     #[test]
-    fn load_oisp_engine_overlays_embedded_baseline_for_chatgpt_subdomains() {
+    fn load_oisp_engine_uses_cache_bundle_without_embedded_overlay() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("registry_bundle_cache.json");
         let envelope = serde_json::json!({
@@ -4418,9 +4989,21 @@ mod tests {
 
         let engine = load_oisp_engine(Some(path.as_path())).expect("cache bundle should load");
         assert!(engine.classify("chatgpt.com").is_some());
-        // This host is provided by embedded baseline overlay.
-        assert!(engine.classify("ws.chatgpt.com").is_some());
-        assert!(engine.should_intercept_host("ws.chatgpt.com:443"));
+        assert!(engine.classify("ws.chatgpt.com").is_none());
+        assert!(!engine.should_intercept_host("ws.chatgpt.com:443"));
+    }
+
+    #[test]
+    fn load_oisp_engine_requires_existing_cache_bundle() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing_registry_bundle_cache.json");
+        let error = match load_oisp_engine(Some(path.as_path())) {
+            Ok(_) => panic!("expected missing cache bundle to fail"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("compiled registry bundle is required"));
     }
 
     #[test]
@@ -4541,6 +5124,48 @@ mod tests {
     }
 
     #[test]
+    fn test_debug_force_intercept_all_intercepts_unknown_remote_hosts() {
+        let mut config = ForwardProxyConfig::default();
+        config.registry_mode = RegistryMode::Registry;
+        config.hosts.mode = HostFilterMode::Selective;
+        config.hosts.ai_inference = vec![];
+        config.hosts.mcp = vec![];
+        config.hosts.agent_apps = vec![];
+        let observe = ObserveConfig::default();
+
+        let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine())
+            .with_force_intercept_all(true, None);
+
+        assert_eq!(
+            handler.get_connect_action("unknown.example.com"),
+            HostAction::Intercept
+        );
+        assert_eq!(handler.get_connect_action("localhost"), HostAction::Tunnel);
+    }
+
+    #[test]
+    fn test_debug_force_intercept_all_respects_expiry() {
+        let mut config = ForwardProxyConfig::default();
+        config.registry_mode = RegistryMode::Registry;
+        config.hosts.mode = HostFilterMode::Selective;
+        config.hosts.ai_inference = vec![];
+        config.hosts.mcp = vec![];
+        config.hosts.agent_apps = vec![];
+        let observe = ObserveConfig::default();
+
+        let expired = SystemTime::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("system clock should support one-second subtraction");
+        let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine())
+            .with_force_intercept_all(true, Some(expired));
+
+        assert_eq!(
+            handler.get_connect_action("unknown.example.com"),
+            HostAction::Tunnel
+        );
+    }
+
+    #[test]
     fn test_discovery_mode_catalog_intercept_is_limited_to_first_daily_capture() {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::Registry;
@@ -4624,6 +5249,19 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_agent_from_user_agent_warp() {
+        let req = Request::builder()
+            .uri("https://api.anthropic.com/v1/messages")
+            .header("user-agent", "Warp/0.2026.01")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            AiProxyHandler::detect_agent_from_user_agent(&req),
+            Some("warp")
+        );
+    }
+
+    #[test]
     fn test_detect_agent_from_user_agent_claude_code() {
         let req = Request::builder()
             .uri("https://api.anthropic.com/v1/messages")
@@ -4647,6 +5285,34 @@ mod tests {
             AiProxyHandler::detect_agent_from_user_agent(&req),
             Some("claude-code")
         );
+    }
+
+    #[test]
+    fn test_anthropic_api_key_header_marks_inference() {
+        let req = Request::builder()
+            .uri("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", "sk-ant-test")
+            .body(())
+            .unwrap();
+        assert!(AiProxyHandler::has_anthropic_api_key_header(&req));
+        assert!(!AiProxyHandler::should_treat_anthropic_api_as_agent(
+            "api.anthropic.com",
+            &req
+        ));
+    }
+
+    #[test]
+    fn test_anthropic_without_api_key_marks_agent() {
+        let req = Request::builder()
+            .uri("https://api.anthropic.com/v1/messages")
+            .header("user-agent", "Warp/0.2026.01")
+            .body(())
+            .unwrap();
+        assert!(!AiProxyHandler::has_anthropic_api_key_header(&req));
+        assert!(AiProxyHandler::should_treat_anthropic_api_as_agent(
+            "api.anthropic.com",
+            &req
+        ));
     }
 
     #[test]

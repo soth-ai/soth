@@ -16,6 +16,8 @@ use soth_core::EventLogger;
 use soth_proxy::metrics;
 use soth_proxy::transport::hudsucker_proxy;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -101,10 +103,19 @@ pub async fn run(
     config_path: Option<PathBuf>,
     quiet: bool,
     foreground: bool,
+    intercept_all: bool,
+    intercept_all_for: Option<u64>,
     daemon_child: bool,
 ) -> anyhow::Result<()> {
     if !foreground && !daemon_child {
-        return daemon::run_start_daemon(port, config_path, quiet).await;
+        return daemon::run_start_daemon(
+            port,
+            config_path,
+            quiet,
+            intercept_all,
+            intercept_all_for,
+        )
+        .await;
     }
 
     ensure_fd_budget();
@@ -117,6 +128,8 @@ pub async fn run(
     if let Some(p) = port {
         proxy_config.port = p;
     }
+    let debug_intercept_all_for = intercept_all_for.map(Duration::from_secs);
+    let debug_intercept_all_enabled = intercept_all || debug_intercept_all_for.is_some();
 
     // Ensure proxy is enabled
     proxy_config.enabled = true;
@@ -227,6 +240,15 @@ pub async fn run(
             &event_logging_status,
             &system_proxy_line,
         );
+        if debug_intercept_all_enabled {
+            match debug_intercept_all_for {
+                Some(window) => style::warning(&format!(
+                    "Debug intercept-all enabled for {}s (non-local hosts)",
+                    window.as_secs()
+                )),
+                None => style::warning("Debug intercept-all enabled (non-local hosts)"),
+            }
+        }
         println!(
             "{} {}  |  AI/MCP → {}  |  Other → {}  |  {}",
             style::CHECK.green(),
@@ -245,6 +267,8 @@ pub async fn run(
         ca_key_path,
         event_logger,
         quiet,
+        debug_intercept_all_enabled,
+        debug_intercept_all_for,
     )
     .await
 }
@@ -414,6 +438,8 @@ async fn run_forward_proxy(
     ca_key_path: PathBuf,
     event_logger: Option<EventLogger>,
     quiet: bool,
+    debug_intercept_all_enabled: bool,
+    debug_intercept_all_for: Option<Duration>,
 ) -> anyhow::Result<()> {
     let runtime = match spawn_proxy_runtime(
         config,
@@ -421,6 +447,8 @@ async fn run_forward_proxy(
         ca_cert_path,
         ca_key_path,
         event_logger,
+        debug_intercept_all_enabled,
+        debug_intercept_all_for,
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -440,9 +468,13 @@ async fn run_forward_proxy(
     let shutdown_tx = runtime.shutdown_tx;
     let proxy_task = runtime.proxy_task;
     let shutdown_timeout = runtime_shutdown_timeout(config);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let run_started_at = Instant::now();
 
+    let shutdown_requested_signal = shutdown_requested.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
+        shutdown_requested_signal.store(true, Ordering::SeqCst);
         if !quiet {
             println!();
             style::warning("Initiating graceful shutdown...");
@@ -484,6 +516,16 @@ async fn run_forward_proxy(
             }
             Ok(())
         }
+        Err(error)
+            if is_expected_shutdown_transport_error(&error)
+                && (shutdown_requested.load(Ordering::SeqCst)
+                    || run_started_at.elapsed() >= Duration::from_secs(2)) =>
+        {
+            if !quiet {
+                style::success("Proxy stopped.");
+            }
+            Ok(())
+        }
         Err(e) => {
             style::error(&format!("Proxy error: {}", e));
             Err(anyhow::anyhow!("Proxy error: {}", e))
@@ -497,6 +539,8 @@ fn spawn_proxy_runtime(
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
     event_logger: Option<EventLogger>,
+    debug_intercept_all_enabled: bool,
+    debug_intercept_all_for: Option<Duration>,
 ) -> anyhow::Result<ProxyRuntime> {
     let enforcer = enforcement::build_proxy_enforcer(config)?;
     let observe_config = config.observe.clone();
@@ -560,6 +604,8 @@ fn spawn_proxy_runtime(
             Some(observe_config),
             Some(oisp_registry_cache_path),
             Some(exchange_v2_config),
+            debug_intercept_all_enabled,
+            debug_intercept_all_for,
         )
         .await
         .map_err(|error| anyhow::anyhow!("Proxy error: {}", error))
@@ -880,4 +926,12 @@ async fn disable_system_proxy_after_run(quiet: bool) {
             ));
         }
     }
+}
+
+fn is_expected_shutdown_transport_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    (text.contains("transport error") && text.contains("io error"))
+        || text.contains("operation canceled")
+        || text.contains("broken pipe")
+        || text.contains("connection closed")
 }

@@ -130,6 +130,14 @@ enum Commands {
         #[arg(long)]
         foreground: bool,
 
+        /// Debug: intercept all non-local hosts (full MITM) while this process runs.
+        #[arg(long)]
+        intercept_all: bool,
+
+        /// Debug: limit intercept-all window to N seconds (implies --intercept-all).
+        #[arg(long, value_name = "SECONDS")]
+        intercept_all_for: Option<u64>,
+
         /// Internal daemon child execution mode (hidden)
         #[arg(long, hide = true)]
         daemon_child: bool,
@@ -152,6 +160,14 @@ enum Commands {
         /// Run in the foreground (do not daemonize)
         #[arg(long)]
         foreground: bool,
+
+        /// Debug: intercept all non-local hosts (full MITM) while this process runs.
+        #[arg(long)]
+        intercept_all: bool,
+
+        /// Debug: limit intercept-all window to N seconds (implies --intercept-all).
+        #[arg(long, value_name = "SECONDS")]
+        intercept_all_for: Option<u64>,
     },
 
     /// Stop the sensor lifecycle and restore direct network path
@@ -645,6 +661,8 @@ async fn main() -> anyhow::Result<()> {
             config,
             quiet,
             foreground,
+            intercept_all,
+            intercept_all_for,
             daemon_child,
         } => {
             commands::proxy::run_start_internal(
@@ -652,6 +670,8 @@ async fn main() -> anyhow::Result<()> {
                 config.or(cli.config.clone()),
                 quiet,
                 foreground,
+                intercept_all,
+                intercept_all_for,
                 daemon_child,
             )
             .await?;
@@ -661,20 +681,32 @@ async fn main() -> anyhow::Result<()> {
             config,
             quiet,
             foreground,
+            intercept_all,
+            intercept_all_for,
         } => {
             let effective_config = ensure_config_for_up(config, cli.config.clone(), quiet).await?;
             ensure_ca_for_up(effective_config.clone(), quiet).await?;
 
             if foreground {
                 commands::proxy::run_on(port, effective_config.clone()).await?;
-                commands::proxy::run_start_internal(port, effective_config, quiet, true, false)
-                    .await?;
+                commands::proxy::run_start_internal(
+                    port,
+                    effective_config,
+                    quiet,
+                    true,
+                    intercept_all,
+                    intercept_all_for,
+                    false,
+                )
+                .await?;
             } else {
                 commands::proxy::run_start_internal(
                     port,
                     effective_config.clone(),
                     quiet,
                     false,
+                    intercept_all,
+                    intercept_all_for,
                     false,
                 )
                 .await?;

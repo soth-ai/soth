@@ -22,6 +22,11 @@ pub fn detect_from_initialize(params: &Value) -> Option<AgentInfo> {
     Some(agent)
 }
 
+/// Canonicalize arbitrary agent labels to the same naming convention used by wrap detection.
+pub fn canonicalize_agent_name(raw: &str) -> String {
+    normalize_agent_name(raw)
+}
+
 /// Detect agent from environment variables
 pub fn detect_from_env() -> Option<AgentInfo> {
     // Claude Code
