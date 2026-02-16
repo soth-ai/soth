@@ -36,11 +36,14 @@ pub async fn run_status(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             );
         }
         Err(e) => {
-            style::error("Could not connect to dashboard");
+            style::error("Could not connect to API service");
             eprintln!();
             style::kv("URL", &url);
             eprintln!();
-            style::warning("Make sure the proxy is running with dashboard enabled.");
+            style::warning(&format!(
+                "Start the API service first: soth dev api start --port {}",
+                port
+            ));
             anyhow::bail!("Connection failed: {}", e);
         }
     }
@@ -63,7 +66,7 @@ pub async fn run_reset(host: Option<String>, _config_path: Option<PathBuf>) -> a
     println!();
     println!("To reset circuits, restart the proxy:");
     style::step(1, 2, "Stop the proxy (Ctrl+C)");
-    style::step(2, 2, "Start it again: soth proxy start");
+    style::step(2, 2, "Start it again: soth start");
     println!();
     println!(
         "Circuit breakers will automatically recover after the configured {}.",

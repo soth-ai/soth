@@ -1,262 +1,148 @@
-# SOTH Testing Tools
+# SOTH Runtime Testing Tools
 
-This directory contains tools for testing SOTH in practical settings.
+This folder documents practical runtime testing with the current SOTH CLI.
 
----
+## Recommended Lifecycle Commands
 
-## Forward Proxy
-
-SOTH includes a TLS MITM forward proxy for intercepting and inspecting AI provider traffic (OpenAI, Anthropic, Google). This enables policy enforcement, cost tracking, and observability for all AI API calls.
-
-### Quick Start
+Use the lifecycle pair for day-to-day operation:
 
 ```bash
-# 1. Generate CA certificate
-soth proxy setup-ca
+# Bootstrap config/CA (if needed), start daemon, and enable system proxy
+soth up
 
-# 2. Start the proxy
-soth proxy start
+# Stop daemon and disable system proxy
+soth down
+```
 
-# 3. Configure your shell (in another terminal)
-eval $(soth proxy env)
+Foreground mode (no daemonization):
 
-# 4. Test with curl
+```bash
+soth up --foreground
+```
+
+Direct daemon controls:
+
+```bash
+soth start
+soth stop
+soth logs -f
+```
+
+## Quick Verification Flow
+
+```bash
+# 1) Start lifecycle
+soth up
+
+# 2) Export env in a second terminal
+eval $(soth runtime env)
+
+# 3) Send test request
 curl https://api.openai.com/v1/models
+
+# 4) Inspect logs
+soth logs -f
 ```
 
-### CLI Commands
+## Runtime Commands
 
-#### `soth proxy setup-ca`
+### `soth runtime setup-ca`
 
-Generate and optionally install the CA certificate for TLS interception.
+Generate CA certificate/key used for TLS interception.
 
 ```bash
-# Generate CA (default location: ~/.soth/ca/)
-soth proxy setup-ca
-
-# Custom output directory
-soth proxy setup-ca --output /path/to/ca
-
-# Skip trust store instructions
-soth proxy setup-ca --no-trust
+soth runtime setup-ca
+soth runtime setup-ca --output /path/to/ca
+soth runtime setup-ca --no-trust
 ```
 
-The CA files are:
-- `~/.soth/ca/ca.crt` - CA certificate (share this with clients)
-- `~/.soth/ca/ca.key` - CA private key (keep this secret)
+Generated files:
 
-#### `soth proxy start`
+- `~/.soth/ca/ca.crt`
+- `~/.soth/ca/ca.key`
 
-Start the forward proxy server.
+### `soth runtime env`
+
+Print shell exports for proxy routing.
 
 ```bash
-# Start with defaults (port 8080)
-soth proxy start
-
-# Custom port
-soth proxy start --port 9090
-
-# With config file
-soth proxy start --config soth.yaml
+eval $(soth runtime env)
+eval (soth runtime env --shell fish)
+soth runtime env --shell powershell
+soth runtime env --ca-only
 ```
 
-The proxy will display:
-- Listen address
-- Allowed hosts
-- Environment variable commands
-- Rate limiting and circuit breaker status
+### `soth runtime status`
 
-#### `soth proxy env`
-
-Output shell environment variables for configuring HTTP clients.
+Show runtime status and CA readiness.
 
 ```bash
-# Bash/Zsh (default)
-eval $(soth proxy env)
-
-# Fish shell
-eval (soth proxy env --shell fish)
-
-# PowerShell
-soth proxy env --shell powershell
-
-# Just the CA cert path
-soth proxy env --ca-only
+soth runtime status
 ```
 
-Environment variables set:
-- `HTTP_PROXY` / `http_proxy` - Proxy URL
-- `HTTPS_PROXY` / `https_proxy` - Proxy URL
-- `SSL_CERT_FILE` - CA certificate path
-- `REQUESTS_CA_BUNDLE` - For Python requests library
-- `NODE_EXTRA_CA_CERTS` - For Node.js
+### `soth runtime ca-info`
 
-#### `soth proxy status`
-
-Show proxy status including CA certificate and connection state.
+Show certificate metadata and validity.
 
 ```bash
-soth proxy status
+soth runtime ca-info
 ```
 
-#### `soth proxy ca-info`
-
-Display detailed CA certificate information.
+## System Proxy Controls
 
 ```bash
-soth proxy ca-info
+soth on
+soth off
 ```
 
-Shows:
-- Subject/Issuer
-- Validity dates
-- Serial number
-- Public key algorithm
-- Days remaining
+These are useful when daemon is already running and you only want to toggle routing.
 
-#### `soth proxy metrics`
-
-Show Prometheus metrics from the running proxy.
+## API/UI Services for Local Dashboard
 
 ```bash
-# Human-readable summary
-soth proxy metrics
-
-# Raw Prometheus format
-soth proxy metrics --raw
-
-# With config file
-soth proxy metrics --config soth.yaml
+soth dev api start --port 3001
+soth dev ui start --api-port 3001
 ```
 
-#### `soth proxy connections`
-
-Show active connections and recent requests.
+## Advanced Diagnostics
 
 ```bash
-soth proxy connections
+soth dev advanced metrics
+soth dev advanced metrics --raw
+soth dev advanced connections
+soth dev advanced circuit status
+soth dev advanced circuit reset --host api.openai.com
+soth dev advanced rate-limit
 ```
 
-Shows:
-- Active connection count
-- Requests by provider
-- Recent request history with latency and token counts
-
-#### `soth proxy circuit status`
-
-Show circuit breaker status for upstream providers.
-
-```bash
-soth proxy circuit status
-```
-
-States:
-- **CLOSED** (green) - Normal operation
-- **HALF-OPEN** (yellow) - Testing recovery
-- **OPEN** (red) - Blocking requests
-
-#### `soth proxy circuit reset`
-
-Reset circuit breaker for a host.
-
-```bash
-# Reset specific host
-soth proxy circuit reset --host api.openai.com
-
-# Reset all hosts
-soth proxy circuit reset
-```
-
-#### `soth proxy rate-limit`
-
-Show rate limit status.
-
-```bash
-soth proxy rate-limit
-```
-
-### Configuration
-
-Add to your `soth.yaml`:
+## Config Shape (Current)
 
 ```yaml
 forward_proxy:
   enabled: true
   port: 8080
-  address: "127.0.0.1"
-  request_timeout: "5m"
-
-  ca:
-    cert_path: "~/.soth/ca/ca.crt"
-    key_path: "~/.soth/ca/ca.key"
-
   hosts:
-    allow:
-      - "api.openai.com"
-      - "api.anthropic.com"
-      - "generativelanguage.googleapis.com"
+    mode: selective
+    domain_files:
+      ai_inference: "./domains/ai_inference.yaml"
+      mcp: "./domains/mcp.yaml"
+      agent_apps: "./domains/agent_apps.yaml"
 
 production:
   rate_limit:
     enabled: true
-    requests_per_second: 100
-    burst_size: 200
-
   circuit_breaker:
     enabled: true
-    failure_threshold: 5
-    open_duration: "30s"
 ```
 
-See `soth.example.yaml` for all configuration options.
+See `soth.example.yaml` for full options.
 
-### Platform-Specific CA Trust
+## SDK/CLI Usage Example
 
-**macOS:**
-```bash
-sudo security add-trusted-cert -d -r trustRoot \
-  -k /Library/Keychains/System.keychain \
-  ~/.soth/ca/ca.crt
-```
-
-**Linux (Ubuntu/Debian):**
-```bash
-sudo cp ~/.soth/ca/ca.crt /usr/local/share/ca-certificates/soth-ca.crt
-sudo update-ca-certificates
-```
-
-**Linux (Fedora/RHEL):**
-```bash
-sudo cp ~/.soth/ca/ca.crt /etc/pki/ca-trust/source/anchors/
-sudo update-ca-trust
-```
-
-**Windows (Admin PowerShell):**
-```powershell
-Import-Certificate -FilePath "$HOME\.soth\ca\ca.crt" -CertStoreLocation Cert:\LocalMachine\Root
-```
-
-### Using with AI SDKs
-
-**Python (OpenAI):**
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:8080
 export SSL_CERT_FILE=~/.soth/ca/ca.crt
-python your_script.py
-```
-
-**Node.js (OpenAI):**
-```bash
-export HTTPS_PROXY=http://127.0.0.1:8080
-export NODE_EXTRA_CA_CERTS=~/.soth/ca/ca.crt
-node your_script.js
-```
-
-**curl:**
-```bash
-curl --proxy http://127.0.0.1:8080 \
-     --cacert ~/.soth/ca/ca.crt \
-     https://api.openai.com/v1/models
+curl https://api.openai.com/v1/models
 ```
 
 ---

@@ -34,6 +34,7 @@ export function TopBar() {
   const { open: openCommandPalette } = useCommandPalette();
 
   const isConnected = health?.status === "ok";
+  const filterDecisions = health?.filter_decisions;
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -49,6 +50,15 @@ export function TopBar() {
       {/* Left: Environment Badge */}
       <div className="flex items-center gap-3">
         <EnvironmentBadge env="production" isConnected={isConnected} />
+        <FilterDecisionBadge
+          intercept={
+            (filterDecisions?.by_decision?.intercept ?? 0) +
+            (filterDecisions?.by_decision?.catalog_discovery_intercept ?? 0)
+          }
+          tunnel={filterDecisions?.by_decision?.tunnel ?? 0}
+          block={filterDecisions?.by_decision?.block ?? 0}
+          total={filterDecisions?.total ?? 0}
+        />
       </div>
 
       {/* Center: Time Range Selector */}
@@ -160,6 +170,31 @@ function EnvironmentBadge({
         />
         {config.label}
       </div>
+    </div>
+  );
+}
+
+function FilterDecisionBadge({
+  intercept,
+  tunnel,
+  block,
+  total,
+}: {
+  intercept: number;
+  tunnel: number;
+  block: number;
+  total: number;
+}) {
+  if (total <= 0) {
+    return null;
+  }
+
+  return (
+    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-border text-[11px] font-medium text-muted-foreground">
+      <span>FLT</span>
+      <span className="text-success">i:{intercept}</span>
+      <span className="text-accent">t:{tunnel}</span>
+      <span className={cn(block > 0 ? "text-warning" : "text-muted-foreground")}>b:{block}</span>
     </div>
   );
 }

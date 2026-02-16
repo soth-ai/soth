@@ -6,24 +6,28 @@ use crate::metadata_pusher::{estimate_gzip_exchange_batch_size, MetadataPusher};
 use crate::retry_queue::BodyRetryQueue;
 use anyhow::Context;
 use chrono::Utc;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection};
 use soth_core::api::{
     BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
-    ExchangeMetadata, HeartbeatRequest,
+    ExchangeMetadata, HeartbeatRequest, HeartbeatTelemetry,
 };
 use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
 use soth_core::types::exchange_v2::{ExchangeBodyMode, ExchangeEventV2};
+use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 use uuid::Uuid;
 
-const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
 const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
 const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
 const MAX_EXCHANGE_RETRY_BACKOFF_SECS: u64 = 15 * 60;
 const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
+
+pub type HeartbeatTelemetryProvider =
+    Arc<dyn Fn() -> Option<HeartbeatTelemetry> + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct SyncAgentConfig {
@@ -44,6 +48,7 @@ pub struct SyncAgentConfig {
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
     pub exchange_v2_only: bool,
+    pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
 }
 
 pub struct SyncAgent {
@@ -175,6 +180,11 @@ impl SyncAgent {
             os: Some(std::env::consts::OS.to_string()),
             hostname: resolve_hostname(),
             active_connections: None,
+            telemetry: self
+                .config
+                .heartbeat_telemetry
+                .as_ref()
+                .and_then(|provider| provider()),
         };
 
         match self.heartbeat_sender.send(&request).await {
@@ -374,7 +384,6 @@ impl SyncAgent {
         }
     }
 
-
     fn load_exchange_queue_ready(&self, limit: usize) -> anyhow::Result<Vec<ExchangeQueueRow>> {
         let conn = open_read_conn(&self.config.event_db_path)?;
         let mut stmt = match conn.prepare(
@@ -482,17 +491,7 @@ impl SyncAgent {
 
     fn write_sync_value(&self, key: &str, value: &str) -> anyhow::Result<()> {
         let conn = open_rw_conn(&self.config.event_db_path)?;
-        ensure_sync_state_table(&conn)?;
-        conn.execute(
-            r#"
-            INSERT INTO sync_state (key, value, updated_at)
-            VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            "#,
-            params![key, value],
-        )?;
+        write_sync_state(&conn, key, value)?;
         Ok(())
     }
 
@@ -527,30 +526,15 @@ fn replace_legacy_exchange_ref(reference: &str, legacy: &str, canonical: &str) -
 }
 
 fn open_read_conn(path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = open_sqlite_read_only(path)
         .with_context(|| format!("failed opening sqlite read connection {}", path.display()))?;
-    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
     Ok(conn)
 }
 
 fn open_rw_conn(path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open(path)
+    let conn = open_sqlite_read_write(path)
         .with_context(|| format!("failed opening sqlite rw connection {}", path.display()))?;
-    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
     Ok(conn)
-}
-
-fn ensure_sync_state_table(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS sync_state (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        "#,
-    )?;
-    Ok(())
 }
 
 fn merge_tags(

@@ -17,6 +17,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use soth_storage::{open_sqlite_read_write, read_sync_state, write_sync_state};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -34,7 +35,6 @@ const SQLITE_QUEUE_CAPACITY: usize = 4096;
 const SQLITE_BATCH_SIZE: usize = 64;
 const SQLITE_FLUSH_INTERVAL_MS: u64 = 20;
 const INLINE_PAYLOAD_MAX_BYTES: usize = 16 * 1024;
-const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
 
 /// Event logger runtime options.
 #[derive(Debug, Clone)]
@@ -427,30 +427,13 @@ impl EventLogger {
     /// Read a sync-state value from SQLite.
     pub fn get_sync_state(&self, key: &str) -> std::io::Result<Option<String>> {
         let conn = self.open_sqlite_metadata_conn()?;
-        conn.query_row(
-            "SELECT value FROM sync_state WHERE key = ?1",
-            [key],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(to_io_err)
+        read_sync_state(&conn, key)
     }
 
     /// Upsert a sync-state value in SQLite.
     pub fn set_sync_state(&self, key: &str, value: &str) -> std::io::Result<()> {
         let conn = self.open_sqlite_metadata_conn()?;
-        conn.execute(
-            r#"
-            INSERT INTO sync_state (key, value, updated_at)
-            VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            "#,
-            params![key, value],
-        )
-        .map_err(to_io_err)?;
-        Ok(())
+        write_sync_state(&conn, key, value)
     }
 
     /// Read the current sync cursor snapshot.
@@ -796,9 +779,7 @@ impl EventLogger {
     }
 
     fn open_sqlite_metadata_conn(&self) -> std::io::Result<Connection> {
-        let conn = Connection::open(&self.path).map_err(to_io_err)?;
-        conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
-            .map_err(to_io_err)?;
+        let conn = open_sqlite_read_write(&self.path)?;
         init_sqlite_schema(&conn)?;
         Ok(conn)
     }
@@ -1566,12 +1547,15 @@ fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> 
         pid: envelope.process_pid,
         bundle_id: bundle_id.clone(),
         process_name: envelope.process_name.clone(),
-        app_type: event.collector_source.as_ref().map(|_| "collector".to_string()).or(
-            bundle_id
+        app_type: event
+            .collector_source
+            .as_ref()
+            .map(|_| "collector".to_string())
+            .or(envelope.process_app_type.clone())
+            .or(bundle_id
                 .as_ref()
                 .map(|_| "desktop_app".to_string())
-                .or(Some("cli".to_string())),
-        ),
+                .or(Some("unknown".to_string()))),
         referrer_origin: None,
     })
 }

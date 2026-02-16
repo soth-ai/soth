@@ -3,7 +3,7 @@ use base64::Engine as _;
 use rusqlite::{
     params, params_from_iter,
     types::{Value as SqlValue, ValueRef},
-    Connection, OpenFlags,
+    Connection,
 };
 use serde::{Deserialize, Serialize};
 use soth_core::config::types::ExchangeV2Config;
@@ -11,6 +11,7 @@ use soth_core::types::exchange_v2::ExchangeSourceClass;
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
 use soth_observe::PiiRedactor;
+use soth_storage::open_sqlite_read_only;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -843,11 +844,8 @@ fn collect_sqlite_events(
 
     let mut next_state = previous_state.clone();
     let mut lines = Vec::new();
-    let conn = Connection::open_with_flags(
-        &source.db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("collector sqlite open failed: {}", source.db_path.display()))?;
+    let conn = open_sqlite_read_only(&source.db_path)
+        .with_context(|| format!("collector sqlite open failed: {}", source.db_path.display()))?;
     for query in &source.queries {
         let previous_incremental = previous_state.incremental.get(&query.file_type);
         let result = execute_sqlite_query(query, &conn, previous_incremental, max_line_bytes)

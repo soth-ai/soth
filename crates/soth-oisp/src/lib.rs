@@ -1,9 +1,12 @@
 use anyhow::Context;
 use serde_json::Value;
-use soth_oisp_types::bundle::{parse_compiled_bundle, CompiledBundle, DomainIndexEntry};
-use soth_oisp_types::provider::{EntryType, ModelPricing, StreamFormat};
 use std::path::Path;
 use std::sync::Arc;
+
+pub mod types;
+
+use types::bundle::{parse_compiled_bundle, CompiledBundle, DomainIndexEntry};
+use types::provider::{EntryType, ModelPricing, StreamFormat};
 
 const EMBEDDED_MINIMAL_BUNDLE_JSON: &str = include_str!("../assets/minimal_registry_bundle.json");
 
@@ -124,6 +127,22 @@ impl OispEngine {
         self.bundle.catalog_domains.len()
     }
 
+    pub fn whitelist_count(&self) -> usize {
+        self.bundle.filters.whitelist.len()
+    }
+
+    pub fn blacklist_count(&self) -> usize {
+        self.bundle.filters.blacklist.len()
+    }
+
+    pub fn passthrough_count(&self) -> usize {
+        self.bundle.filters.passthrough.len()
+    }
+
+    pub fn noise_keyword_count(&self) -> usize {
+        self.bundle.filters.noise_keywords.len()
+    }
+
     pub fn is_catalog_domain(&self, host: &str) -> bool {
         let host = normalize_host_for_matching(host);
         host_matches_any(host.as_str(), &self.bundle.catalog_domains)
@@ -145,6 +164,8 @@ impl OispEngine {
 
     pub fn should_intercept(&self, host: &str, path: &str) -> InterceptDecision {
         let host = normalize_host_for_matching(host);
+        let path_only = path.split_once('?').map(|(raw, _)| raw).unwrap_or(path);
+
         if contains_noise_keyword(path, &self.bundle.filters.noise_keywords) {
             return InterceptDecision::Noise;
         }
@@ -167,7 +188,7 @@ impl OispEngine {
             return InterceptDecision::Tunnel;
         };
 
-        if !entry.paths.is_empty() && !path_matches_any(path, &entry.paths) {
+        if !entry.paths.is_empty() && !path_matches_any(path_only, &entry.paths) {
             return InterceptDecision::Tunnel;
         }
 
@@ -200,6 +221,11 @@ impl OispEngine {
         }
 
         self.classify(host.as_str()).is_some()
+    }
+
+    /// Returns true when `text` contains any bundle noise keyword.
+    pub fn matches_noise_keyword(&self, text: &str) -> bool {
+        contains_noise_keyword(text, &self.bundle.filters.noise_keywords)
     }
 
     /// Calculate request cost using bundle pricing for a provider/model pair.
@@ -438,8 +464,39 @@ fn extract_compiled_bundle_value(root: &Value) -> anyhow::Result<Value> {
 }
 
 fn build_engine_from_bundle_value(bundle_value: &Value) -> anyhow::Result<OispEngine> {
+    validate_runtime_bundle_contract(bundle_value)
+        .context("bundle payload failed runtime contract validation")?;
     let bundle = parse_compiled_bundle(bundle_value).context("failed parsing OISP bundle")?;
     OispEngine::new(bundle).context("failed constructing OISP engine")
+}
+
+fn validate_runtime_bundle_contract(bundle_value: &Value) -> anyhow::Result<()> {
+    let object = bundle_value
+        .as_object()
+        .context("bundle payload root must be an object")?;
+
+    let schema_version = object
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .context("bundle payload missing required `schema_version`")?;
+    if schema_version == 0 {
+        anyhow::bail!("bundle payload `schema_version` must be greater than 0");
+    }
+
+    let filters = object
+        .get("filters")
+        .and_then(Value::as_object)
+        .context("bundle payload missing required `filters` object")?;
+    for key in ["whitelist", "blacklist", "passthrough", "noise_keywords"] {
+        let value = filters
+            .get(key)
+            .with_context(|| format!("bundle payload filters missing required `{key}`"))?;
+        if !value.is_array() {
+            anyhow::bail!("bundle payload filters.{key} must be an array");
+        }
+    }
+
+    Ok(())
 }
 
 fn embedded_minimal_compiled_bundle() -> anyhow::Result<CompiledBundle> {
@@ -1732,6 +1789,40 @@ mod tests {
     }
 
     #[test]
+    fn should_intercept_honors_path_filters_with_query_string() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "version": "v1",
+                "compiled_at": "2026-02-13T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference",
+                        "paths": ["/v1/chat/completions"]
+                    }
+                ],
+                "providers": {
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine.should_intercept("api.openai.com", "/v1/chat/completions?trace=1"),
+            InterceptDecision::Intercept {
+                provider_id: "openai".to_string(),
+                entry_type: EntryType::AiInference
+            }
+        );
+    }
+
+    #[test]
     fn catalog_domains_are_available_for_discovery_checks() {
         let engine = OispEngine::new(
             parse_compiled_bundle(&json!({
@@ -1903,6 +1994,13 @@ mod tests {
     }
 
     #[test]
+    fn matches_noise_keyword_uses_bundle_keywords() {
+        let engine = OispEngine::new(sample_bundle()).unwrap();
+        assert!(engine.matches_noise_keyword("GetAnalyticsDashboard"));
+        assert!(!engine.matches_noise_keyword("CreateConversation"));
+    }
+
+    #[test]
     fn select_best_domain_match_prefers_longer_wildcard() {
         let entries = vec![
             DomainIndexEntry {
@@ -1928,7 +2026,7 @@ mod tests {
         let mut bundle = sample_bundle();
         let providers = BTreeMap::from([(
             "openai".to_string(),
-            soth_oisp_types::bundle::ResolvedProvider {
+            types::bundle::ResolvedProvider {
                 id: "openai".to_string(),
                 name: "OpenAI".to_string(),
                 entry_type: EntryType::Mcp,
@@ -2002,6 +2100,7 @@ mod tests {
                 "size_bytes": 123
             },
             "bundle": {
+                "schema_version": 2,
                 "version": "catalog-v1",
                 "compiled_at": "2026-02-13T00:00:00Z",
                 "bundle_type": "local",
@@ -2030,6 +2129,12 @@ mod tests {
                 },
                 "noise_filter": { "words": [], "paths": [] },
                 "passthrough": { "domains": [], "patterns": [] },
+                "filters": {
+                    "whitelist": ["api.openai.com"],
+                    "blacklist": [],
+                    "passthrough": [],
+                    "noise_keywords": []
+                },
                 "pricing": {
                     "openai": [
                         {

@@ -188,7 +188,7 @@ pub async fn run_install(target: Option<String>, dry_run: bool) -> Result<()> {
             Err(_) => style::kv("Log file", "~/.soth/logs/events.db"),
         }
         println!();
-        style::info("Run 'soth tail' to see live events.");
+        style::info("Run 'soth logs -f' to follow runtime logs.");
     }
 
     style::footer();

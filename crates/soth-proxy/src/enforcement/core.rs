@@ -8,7 +8,7 @@ use soth_core::types::{
     policy::{PolicyDecision, PolicyInput, PolicyInputBuilder},
     TrafficEnvelope,
 };
-use soth_identity::{signing::verify_bytes, signing::SignatureBlock, Did};
+use soth_crypto::identity::{signing::verify_bytes, signing::SignatureBlock, Did};
 use soth_policy::PolicyEngine;
 
 use crate::metrics;
@@ -121,7 +121,7 @@ pub fn canonical_proxy_request_bytes(
         "path": path,
         "body": body.unwrap_or(""),
     });
-    soth_identity::canonicalize_json(&value)
+    soth_crypto::identity::canonicalize_json(&value)
         .map_err(|e| format!("Failed to canonicalize proxy request for signing: {e}"))
 }
 
@@ -133,7 +133,7 @@ pub fn canonical_jsonrpc_message_bytes(message: &JsonRpcMessage) -> Result<Vec<u
             .map_err(|e| format!("Failed to serialize response for signing: {e}"))?,
     };
 
-    soth_identity::canonicalize_json(&value)
+    soth_crypto::identity::canonicalize_json(&value)
         .map_err(|e| format!("Failed to canonicalize message for signing: {e}"))
 }
 

@@ -3708,6 +3708,7 @@ dependencies = [
  "dirs",
  "hex",
  "indicatif",
+ "libc",
  "notify",
  "owo-colors",
  "ratatui",
@@ -3720,14 +3721,12 @@ dependencies = [
  "soth-budget",
  "soth-collector",
  "soth-core",
+ "soth-crypto",
  "soth-dashboard",
- "soth-identity",
  "soth-observe",
  "soth-policy",
  "soth-proxy",
  "soth-sync",
- "soth-test-utils",
- "soth-tls",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -3750,6 +3749,7 @@ dependencies = [
  "serde_json",
  "soth-core",
  "soth-observe",
+ "soth-storage",
  "tempfile",
  "tokio",
  "tracing",
@@ -3774,12 +3774,42 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "soth-storage",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "soth-crypto"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bs58",
+ "chrono",
+ "dashmap",
+ "ed25519-dalek",
+ "hex",
+ "parking_lot",
+ "rand 0.8.5",
+ "rcgen 0.13.2",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "soth-core",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots 0.26.11",
+ "x509-parser 0.16.0",
 ]
 
 [[package]]
@@ -3796,29 +3826,12 @@ dependencies = [
  "serde",
  "serde_json",
  "soth-core",
+ "soth-storage",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.21.0",
  "tower 0.4.13",
  "tower-http 0.5.2",
- "tracing",
-]
-
-[[package]]
-name = "soth-identity"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bs58",
- "chrono",
- "ed25519-dalek",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "sha2",
- "soth-core",
- "tempfile",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -3846,18 +3859,9 @@ name = "soth-oisp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "serde_json",
- "soth-oisp-types",
- "tempfile",
-]
-
-[[package]]
-name = "soth-oisp-types"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -3908,12 +3912,10 @@ dependencies = [
  "sha2",
  "soth-budget",
  "soth-core",
- "soth-dashboard",
- "soth-identity",
+ "soth-crypto",
  "soth-observe",
  "soth-oisp",
  "soth-policy",
- "soth-tls",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3929,11 +3931,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "soth-registry"
+name = "soth-storage"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
+ "rusqlite",
 ]
 
 [[package]]
@@ -3953,52 +3954,12 @@ dependencies = [
  "sha2",
  "soth-core",
  "soth-observe",
- "soth-oisp-types",
+ "soth-oisp",
+ "soth-storage",
  "tempfile",
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "soth-test-utils"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "soth-core",
- "soth-proxy",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "soth-tls"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dashmap",
- "hex",
- "parking_lot",
- "rcgen 0.13.2",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "soth-core",
- "tempfile",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tokio-rustls",
- "tracing",
- "webpki-roots 0.26.11",
- "x509-parser 0.16.0",
 ]
 
 [[package]]

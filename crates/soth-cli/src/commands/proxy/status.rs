@@ -50,23 +50,27 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         style::warning("CA certificate not installed");
         println!();
         style::info("Run the following to set up:");
-        println!("  {}", "soth proxy setup-ca".bold());
+        println!("  {}", "soth runtime setup-ca".bold());
     }
 
-    // Proxy server status
+    // Runtime service status
     println!();
-    style::subtitle("Runtime");
+    style::subtitle("Services");
 
     let proxy_addr = config.forward_proxy.socket_addr();
+    let api_addr = format!("127.0.0.1:{}", config.dashboard.port);
     let mut server_table = style::table();
     server_table.set_header(vec!["Property", "Value"]);
 
     server_table.add_row(vec![
-        Cell::new("Configured Address"),
+        Cell::new("Sensor Address"),
         Cell::new(proxy_addr.to_string().cyan().to_string()),
     ]);
 
     let running = tokio::net::TcpStream::connect(proxy_addr.as_str())
+        .await
+        .is_ok();
+    let api_running = tokio::net::TcpStream::connect(api_addr.as_str())
         .await
         .is_ok();
     let status_display = if running {
@@ -74,14 +78,46 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     } else {
         format!("{} Not running", style::CROSS.red())
     };
-    server_table.add_row(vec![Cell::new("Status"), Cell::new(status_display)]);
+    server_table.add_row(vec![Cell::new("Sensor Status"), Cell::new(status_display)]);
+    server_table.add_row(vec![
+        Cell::new("API Address"),
+        Cell::new(format!("http://{}", api_addr).cyan().to_string()),
+    ]);
+    server_table.add_row(vec![
+        Cell::new("API Status"),
+        Cell::new(if api_running {
+            format!("{} Running", style::CHECK.green())
+        } else {
+            format!("{} Not running", style::CROSS.red())
+        }),
+    ]);
     println!("{server_table}");
 
     if !running {
         println!();
-        style::info("Start the proxy with:");
-        println!("  {}", "soth proxy start".bold());
+        style::info("Start sensor runtime with:");
+        println!("  {}", "soth start".bold());
     }
+    if !api_running {
+        println!();
+        style::info("Start API service with:");
+        println!(
+            "  {}",
+            format!("soth dev api start --port {}", config.dashboard.port).bold()
+        );
+    }
+    println!();
+    style::info("Optional UI/TUI surfaces:");
+    println!("  {}", "soth dev ui start".bold());
+    println!("  {}", "soth dev profile start --profile dev-stack".bold());
+    println!(
+        "  {}",
+        format!(
+            "soth attach --api-url http://127.0.0.1:{}",
+            config.dashboard.port
+        )
+        .bold()
+    );
 
     // Environment variables
     println!();
@@ -164,7 +200,7 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     println!();
     style::info("To configure environment for this proxy:");
-    println!("  {}", "eval $(soth proxy env)".bold());
+    println!("  {}", "eval $(soth runtime env)".bold());
 
     style::footer();
     Ok(())

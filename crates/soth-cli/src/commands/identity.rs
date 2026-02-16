@@ -2,7 +2,7 @@
 
 use crate::IdentityCommands;
 use anyhow::Result;
-use soth_identity::{Did, KeyPair, TrustStore};
+use soth_crypto::identity::{Did, KeyPair, TrustStore};
 use std::path::PathBuf;
 use tokio::fs;
 

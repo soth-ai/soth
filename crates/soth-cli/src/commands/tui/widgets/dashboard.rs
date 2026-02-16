@@ -93,13 +93,17 @@ fn render_signal_strip(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             "recent -/-".to_string()
         };
+        let filter_hint = filter_decision_hint(p)
+            .map(|hint| format!(" | {hint}"))
+            .unwrap_or_default();
         (
             format!("{} req", format_number(p.total_requests)),
             format!(
-                "{} res | {} | p95 {}",
+                "{} res | {} | p95 {}{}",
                 format_number(p.total_responses),
                 recent_hint,
-                p95
+                p95,
+                filter_hint,
             ),
             Theme::get().info_style(),
         )
@@ -1764,6 +1768,51 @@ fn p95_recent_latency_ms(proxy: &soth_dashboard::state::ProxyMetrics) -> Option<
     latencies.sort_unstable();
     let idx = (((latencies.len() - 1) as f64) * 0.95).round() as usize;
     latencies.get(idx).copied()
+}
+
+fn filter_decision_hint(proxy: &soth_dashboard::state::ProxyMetrics) -> Option<String> {
+    if proxy.filter_decisions.total == 0 {
+        return None;
+    }
+
+    let intercept = proxy
+        .filter_decisions
+        .by_decision
+        .get("intercept")
+        .copied()
+        .unwrap_or(0)
+        + proxy
+            .filter_decisions
+            .by_decision
+            .get("catalog_discovery_intercept")
+            .copied()
+            .unwrap_or(0);
+    let tunnel = proxy
+        .filter_decisions
+        .by_decision
+        .get("tunnel")
+        .copied()
+        .unwrap_or(0);
+    let block = proxy
+        .filter_decisions
+        .by_decision
+        .get("block")
+        .copied()
+        .unwrap_or(0);
+    let discovery = proxy
+        .filter_decisions
+        .by_decision
+        .get("catalog_discovery_intercept")
+        .copied()
+        .unwrap_or(0);
+
+    Some(format!(
+        "flt i:{} t:{} b:{} d:{}",
+        short_number(intercept),
+        short_number(tunnel),
+        short_number(block),
+        short_number(discovery)
+    ))
 }
 
 fn short_number(n: u64) -> String {

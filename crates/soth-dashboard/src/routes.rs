@@ -5,8 +5,8 @@ use crate::event_store::{
     EventsSummary, RollupsSummary, StreamStats,
 };
 use crate::state::{
-    AdvancedBudgetMetrics, BudgetMetrics, BudgetPrimitives, DashboardState, IdentityMetrics,
-    ObserveMetrics, PolicyMetrics, ProxyMetrics,
+    AdvancedBudgetMetrics, BudgetMetrics, BudgetPrimitives, DashboardState, FilterDecisionMetrics,
+    IdentityMetrics, ObserveMetrics, PolicyMetrics, ProxyMetrics,
 };
 use crate::websocket::event_stream_handler;
 use axum::{
@@ -55,6 +55,15 @@ fn observe_metrics_for_state(state: &AppState) -> ObserveMetrics {
         }
     }
     state.dashboard.observe()
+}
+
+fn proxy_metrics_for_state(state: &AppState) -> ProxyMetrics {
+    let mut proxy = state.dashboard.proxy();
+    if let Some(renderer) = state.metrics_renderer {
+        let metrics_text = renderer();
+        proxy.filter_decisions = parse_filter_decisions_metric(metrics_text.as_str());
+    }
+    proxy
 }
 
 /// Combined application state
@@ -160,7 +169,7 @@ async fn get_snapshot(State(state): State<AppState>) -> Json<ApiResponse<Dashboa
             policy: state.dashboard.policy(),
             observe: observe_metrics_for_state(&state),
             budget: state.dashboard.budget(),
-            proxy: state.dashboard.proxy(),
+            proxy: proxy_metrics_for_state(&state),
         },
     ))
 }
@@ -254,7 +263,10 @@ async fn get_budget_primitives(
 
 /// Get proxy metrics
 async fn get_proxy(State(state): State<AppState>) -> Json<ApiResponse<ProxyMetrics>> {
-    Json(ApiResponse::new(&state.dashboard, state.dashboard.proxy()))
+    Json(ApiResponse::new(
+        &state.dashboard,
+        proxy_metrics_for_state(&state),
+    ))
 }
 
 /// Get advanced budget metrics (for Developer and CFO views)
@@ -424,15 +436,85 @@ pub struct HealthResponse {
     pub status: String,
     pub uptime_secs: u64,
     pub event_store_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_decisions: Option<FilterDecisionMetrics>,
 }
 
 /// Health check endpoint
 async fn get_health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let filter_decisions = state.metrics_renderer.map(|renderer| {
+        let metrics_text = renderer();
+        parse_filter_decisions_metric(metrics_text.as_str())
+    });
+
     Json(HealthResponse {
         status: "ok".to_string(),
         uptime_secs: state.dashboard.uptime_secs(),
         event_store_enabled: state.events.is_some(),
+        filter_decisions,
     })
+}
+
+fn parse_filter_decisions_metric(metrics_text: &str) -> FilterDecisionMetrics {
+    let mut out = FilterDecisionMetrics::default();
+
+    for line in metrics_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || !trimmed.starts_with("soth_filter_decisions_total")
+        {
+            continue;
+        }
+
+        let (head, value_raw) = match trimmed.rsplit_once(' ') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let value = match value_raw.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => v as u64,
+            _ => continue,
+        };
+
+        out.total = out.total.saturating_add(value);
+
+        let labels = match parse_prometheus_labels(head) {
+            Some(v) => v,
+            None => continue,
+        };
+        if let Some(phase) = labels.get("phase") {
+            *out.by_phase.entry(phase.clone()).or_insert(0) += value;
+        }
+        if let Some(decision) = labels.get("decision") {
+            *out.by_decision.entry(decision.clone()).or_insert(0) += value;
+        }
+    }
+
+    out
+}
+
+fn parse_prometheus_labels(metric_head: &str) -> Option<std::collections::HashMap<String, String>> {
+    let start = metric_head.find('{')?;
+    let end = metric_head.rfind('}')?;
+    if end <= start + 1 {
+        return Some(std::collections::HashMap::new());
+    }
+
+    let mut out = std::collections::HashMap::new();
+    let body = &metric_head[start + 1..end];
+    for pair in body.split(',') {
+        let (key_raw, value_raw) = match pair.split_once('=') {
+            Some(v) => v,
+            None => continue,
+        };
+        let key = key_raw.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value_raw.trim().trim_matches('"').to_string();
+        out.insert(key.to_string(), value);
+    }
+    Some(out)
 }
 
 // === Production Health Check Endpoints ===
@@ -702,6 +784,25 @@ mod tests {
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "NOT READY");
+    }
+
+    #[test]
+    fn test_parse_filter_decisions_metric_aggregates_labels() {
+        let metrics = r#"
+# HELP soth_filter_decisions_total Total host filter decisions by phase and decision
+# TYPE soth_filter_decisions_total counter
+soth_filter_decisions_total{phase="http",decision="intercept"} 11
+soth_filter_decisions_total{phase="http",decision="tunnel"} 3
+soth_filter_decisions_total{phase="connect",decision="block"} 1
+"#;
+
+        let parsed = parse_filter_decisions_metric(metrics);
+        assert_eq!(parsed.total, 15);
+        assert_eq!(parsed.by_decision.get("intercept").copied(), Some(11));
+        assert_eq!(parsed.by_decision.get("tunnel").copied(), Some(3));
+        assert_eq!(parsed.by_decision.get("block").copied(), Some(1));
+        assert_eq!(parsed.by_phase.get("http").copied(), Some(14));
+        assert_eq!(parsed.by_phase.get("connect").copied(), Some(1));
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use soth_core::config::BudgetLimit;
 #[cfg(feature = "cloud-sync")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "cloud-sync")]
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "cloud-sync")]
 use tracing::info;
 
@@ -28,6 +28,52 @@ const FINAL_CLOUD_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 const FINAL_CLOUD_SYNC_MAX_ROUNDS: usize = 3;
 #[cfg(feature = "cloud-sync")]
 const CLOUD_BACKOFF_MAX_CAP: Duration = Duration::from_secs(15 * 60);
+
+#[cfg(feature = "cloud-sync")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryRuntimeSource {
+    HealthyCloud,
+    DegradedCached,
+    DegradedEmbedded,
+}
+
+#[cfg(feature = "cloud-sync")]
+impl RegistryRuntimeSource {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::HealthyCloud => "healthy_cloud",
+            Self::DegradedCached => "degraded_cached",
+            Self::DegradedEmbedded => "degraded_embedded",
+        }
+    }
+
+    fn as_metric(self) -> soth_proxy::metrics::RegistryBundleSourceState {
+        match self {
+            Self::HealthyCloud => soth_proxy::metrics::RegistryBundleSourceState::HealthyCloud,
+            Self::DegradedCached => soth_proxy::metrics::RegistryBundleSourceState::DegradedCached,
+            Self::DegradedEmbedded => {
+                soth_proxy::metrics::RegistryBundleSourceState::DegradedEmbedded
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cloud-sync")]
+fn resolve_registry_runtime_source(registry_cache_path: &Path) -> RegistryRuntimeSource {
+    match soth_sync::cache::load_registry_bundle_cache(registry_cache_path) {
+        Ok(Some(_)) => RegistryRuntimeSource::DegradedCached,
+        _ => RegistryRuntimeSource::DegradedEmbedded,
+    }
+}
+
+#[cfg(feature = "cloud-sync")]
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[cfg(feature = "cloud-sync")]
 pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
@@ -82,11 +128,23 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
 
     let cache_path = resolve_cache_path(config);
     let registry_cache_path = resolve_registry_cache_path(config, &cache_path);
+    let mut runtime_source = resolve_registry_runtime_source(&registry_cache_path);
+    let mut consecutive_failures = 0_u64;
+
+    soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
+    soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+
     let puller = RegistryPuller::new(config.cloud.endpoint.clone(), api_key, registry_cache_path);
 
     match tokio::time::timeout(STARTUP_REGISTRY_REFRESH_TIMEOUT, puller.refresh_now()).await {
         Ok(Ok(outcome)) => {
+            runtime_source = RegistryRuntimeSource::HealthyCloud;
+            consecutive_failures = 0;
+            soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
+            soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+            soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(current_unix_secs());
             info!(
+                source = runtime_source.as_label(),
                 checked = outcome.checked,
                 downloaded = outcome.downloaded,
                 bundle_version = outcome.version.as_deref().unwrap_or("unknown"),
@@ -94,13 +152,25 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
             );
         }
         Ok(Err(error)) => {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            runtime_source = resolve_registry_runtime_source(puller.cache_path());
+            soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
+            soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
             warn!(
+                source = runtime_source.as_label(),
+                consecutive_failures = consecutive_failures,
                 error = %format!("{:#}", error),
                 "Startup registry bundle refresh failed; continuing with cached bundle"
             );
         }
         Err(_) => {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            runtime_source = resolve_registry_runtime_source(puller.cache_path());
+            soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
+            soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
             warn!(
+                source = runtime_source.as_label(),
+                consecutive_failures = consecutive_failures,
                 timeout_secs = STARTUP_REGISTRY_REFRESH_TIMEOUT.as_secs(),
                 "Startup registry bundle refresh timed out; continuing with cached bundle"
             );
@@ -131,8 +201,11 @@ pub fn spawn_cloud_pull_runtime(
     let sync_interval_secs = config.cloud.sync_interval_secs.max(5);
     let interval_secs = config.cloud.config_pull_interval_secs.max(15);
     let debounce_secs = config.cloud.config_debounce_secs.max(1);
-    let registry_puller =
-        RegistryPuller::new(endpoint.clone(), api_key.clone(), registry_cache_path);
+    let registry_puller = RegistryPuller::new(
+        endpoint.clone(),
+        api_key.clone(),
+        registry_cache_path.clone(),
+    );
     let puller = ConfigPuller::new(endpoint, api_key, cache_path)
         .with_registry_puller(registry_puller)
         .with_debounce(std::time::Duration::from_secs(debounce_secs));
@@ -165,6 +238,14 @@ pub fn spawn_cloud_pull_runtime(
             body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
             global_tags: config.cloud.tags.clone(),
             exchange_v2_only: config.exchange_v2.enabled,
+            heartbeat_telemetry: Some(std::sync::Arc::new(|| {
+                let snapshot = soth_proxy::metrics::heartbeat_telemetry_snapshot();
+                if snapshot.counters.values().all(|value| *value == 0) {
+                    None
+                } else {
+                    Some(snapshot)
+                }
+            })),
         };
         match SyncAgent::new(sync_config, Some(puller.clone())) {
             Ok(agent) => Some(agent),
@@ -186,14 +267,56 @@ pub fn spawn_cloud_pull_runtime(
         let mut heartbeat_backoff =
             ExponentialBackoff::new(heartbeat_base, bounded_backoff_max(heartbeat_base));
 
+        let mut registry_source = resolve_registry_runtime_source(&registry_cache_path);
+        let mut registry_consecutive_failures = 0_u64;
+        soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
+        soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+            registry_consecutive_failures,
+        );
+        info!(
+            source = registry_source.as_label(),
+            "Registry runtime source initialized"
+        );
+
         if let Err(error) = puller.pull_once().await {
             let retry_in = config_pull_backoff.record_failure();
+            registry_consecutive_failures = registry_consecutive_failures.saturating_add(1);
+            soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+                registry_consecutive_failures,
+            );
+            let degraded = resolve_registry_runtime_source(&registry_cache_path);
+            if degraded != registry_source {
+                warn!(
+                    previous_source = registry_source.as_label(),
+                    source = degraded.as_label(),
+                    "Registry runtime source transitioned after initial pull failure"
+                );
+            }
+            registry_source = degraded;
+            soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
             warn!(
+                source = registry_source.as_label(),
+                consecutive_failures = registry_consecutive_failures,
                 retry_in_secs = retry_in.as_secs(),
-                "Initial cloud config pull failed: {:#}", error
+                "Initial cloud config pull failed: {:#}",
+                error
             );
         } else {
             config_pull_backoff.record_success();
+            if registry_source != RegistryRuntimeSource::HealthyCloud {
+                info!(
+                    previous_source = registry_source.as_label(),
+                    source = RegistryRuntimeSource::HealthyCloud.as_label(),
+                    "Registry runtime source transitioned to healthy cloud"
+                );
+            }
+            registry_source = RegistryRuntimeSource::HealthyCloud;
+            registry_consecutive_failures = 0;
+            soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
+            soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+                registry_consecutive_failures,
+            );
+            soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(current_unix_secs());
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -247,13 +370,45 @@ pub fn spawn_cloud_pull_runtime(
                     }
                     if let Err(error) = puller.pull_once().await {
                         let retry_in = config_pull_backoff.record_failure();
+                        registry_consecutive_failures = registry_consecutive_failures.saturating_add(1);
+                        soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+                            registry_consecutive_failures,
+                        );
+                        let degraded = resolve_registry_runtime_source(&registry_cache_path);
+                        if degraded != registry_source {
+                            warn!(
+                                previous_source = registry_source.as_label(),
+                                source = degraded.as_label(),
+                                "Registry runtime source transitioned after periodic pull failure"
+                            );
+                        }
+                        registry_source = degraded;
+                        soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
                         warn!(
+                            source = registry_source.as_label(),
+                            consecutive_failures = registry_consecutive_failures,
                             retry_in_secs = retry_in.as_secs(),
                             "Periodic cloud config pull failed: {:#}",
                             error
                         );
                     } else {
                         config_pull_backoff.record_success();
+                        if registry_source != RegistryRuntimeSource::HealthyCloud {
+                            info!(
+                                previous_source = registry_source.as_label(),
+                                source = RegistryRuntimeSource::HealthyCloud.as_label(),
+                                "Registry runtime source transitioned to healthy cloud"
+                            );
+                        }
+                        registry_source = RegistryRuntimeSource::HealthyCloud;
+                        registry_consecutive_failures = 0;
+                        soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
+                        soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+                            registry_consecutive_failures,
+                        );
+                        soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(
+                            current_unix_secs(),
+                        );
                     }
                 }
                 _ = sync_interval.tick() => {
@@ -356,11 +511,23 @@ impl ExponentialBackoff {
         self.failures = self.failures.saturating_add(1);
         let shift = self.failures.saturating_sub(1).min(10);
         let multiplier = 1_u32 << shift;
-        let delay = self
+        let base_delay = self
             .base
             .checked_mul(multiplier)
             .unwrap_or(self.max)
             .min(self.max);
+        // Add small bounded jitter (80-120%) to avoid synchronized retry bursts.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let jitter_percent = 80 + (nanos % 41); // 80..120
+        let jittered = base_delay
+            .as_millis()
+            .saturating_mul(jitter_percent as u128)
+            / 100;
+        let delay = Duration::from_millis(jittered as u64).min(self.max);
         self.blocked_until = Some(Instant::now() + delay);
         delay
     }

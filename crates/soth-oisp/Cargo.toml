@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 serde_json = { workspace = true }
-soth-oisp-types = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

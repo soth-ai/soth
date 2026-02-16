@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "version": "cloud-contract-fixture-v2",
+  "compiled_at": "2026-02-15T00:00:00Z",
+  "bundle_type": "local",
+  "stats": {
+    "providers": 1,
+    "domains": 1,
+    "formats": 1
+  },
+  "filters": {
+    "whitelist": [
+      "api.openai.com"
+    ],
+    "blacklist": [
+      "telemetry"
+    ],
+    "passthrough": [],
+    "noise_keywords": [
+      "telemetry"
+    ]
+  },
+  "core": {
+    "providers": {
+      "openai": {
+        "id": "openai",
+        "name": "OpenAI",
+        "type": "ai-inference",
+        "domains": [
+          "api.openai.com"
+        ],
+        "api_format": "openai",
+        "user_agent_patterns": []
+      }
+    },
+    "domain_index": [
+      {
+        "host": "api.openai.com",
+        "provider_id": "openai",
+        "entry_type": "ai-inference",
+        "paths": [
+          "/v1/chat/completions"
+        ]
+      }
+    ],
+    "interception_patterns": {
+      "api.openai.com": [
+        {
+          "path": "/v1/chat/completions",
+          "action": "intercept"
+        }
+      ]
+    },
+    "pricing": {
+      "openai": {
+        "gpt-4o": {
+          "input_per_million_usd": 5.0,
+          "output_per_million_usd": 15.0
+        }
+      }
+    }
+  },
+  "catalog_domains": [
+    "server.codeium.com"
+  ],
+  "meta": {
+    "sections": {
+      "core": {
+        "required": true
+      },
+      "filters": {
+        "required": true
+      },
+      "catalog": {
+        "required": false,
+        "count": 1
+      },
+      "formats": {
+        "required": false,
+        "count": 1
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-//! TUI Dashboard - Terminal user interface for SOTH monitoring
+//! TUI Dashboard - Terminal UI backed by the SOTH API service
 //!
 //! Provides real-time monitoring of proxy traffic, policy decisions,
 //! PII detections, and budget tracking in the terminal.
@@ -29,7 +29,7 @@ pub use event::EventHandler;
 /// Arguments for the TUI command
 #[derive(Args, Debug)]
 pub struct TuiArgs {
-    /// Dashboard API URL
+    /// SOTH API URL
     #[arg(long, default_value = "http://127.0.0.1:3001")]
     pub api_url: String,
 

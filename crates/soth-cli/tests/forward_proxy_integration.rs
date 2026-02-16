@@ -3,7 +3,7 @@
 use soth_core::config::{
     ForwardProxyConfig, HostDomainFilesConfig, HostFilterConfig, HostFilterMode,
 };
-use soth_tls::CertificateAuthority;
+use soth_crypto::tls::CertificateAuthority;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -165,7 +165,7 @@ fn test_config_defaults() {
 /// Test SNI extraction
 #[test]
 fn test_sni_extraction() {
-    use soth_tls::extract_sni;
+    use soth_crypto::tls::extract_sni;
 
     // Create a minimal TLS ClientHello with SNI
     let client_hello = create_test_client_hello("api.openai.com");

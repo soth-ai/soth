@@ -1,6 +1,6 @@
 //! Proxy metrics command
 //!
-//! Displays Prometheus metrics from the running proxy/dashboard.
+//! Displays Prometheus metrics from the running proxy API service.
 
 use crate::cli_config;
 use crate::style;
@@ -43,17 +43,12 @@ pub async fn run(config_path: Option<PathBuf>, raw: bool) -> anyhow::Result<()> 
             );
         }
         Err(e) => {
-            style::error("Could not connect to dashboard");
+            style::error("Could not connect to API service");
             eprintln!();
             style::kv("URL", &url);
             eprintln!();
-            style::info("Make sure the proxy is running with dashboard enabled:");
-            println!("  soth proxy start");
-            eprintln!();
-            style::info("Or check your config has dashboard enabled:");
-            println!("  dashboard:");
-            println!("    enabled: true");
-            println!("    port: {}", port);
+            style::info("Start the API service:");
+            println!("  soth dev api start --port {}", port);
             eprintln!();
             anyhow::bail!("Connection failed: {}", e);
         }

@@ -757,7 +757,7 @@ export function AiInferenceStream() {
                   </p>
                   <p className="text-sm text-muted-foreground mb-4 max-w-xs mx-auto">
                     Enable the forward proxy with{" "}
-                    <code className="font-mono bg-muted px-1 rounded">soth proxy on</code> to
+                    <code className="font-mono bg-muted px-1 rounded">soth on</code> to
                     capture AI API requests.
                   </p>
                   <p className="text-[11px] text-muted-foreground/60 mt-4">

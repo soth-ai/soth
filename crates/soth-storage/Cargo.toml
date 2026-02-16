@@ -1,0 +1,9 @@
+[package]
+name = "soth-storage"
+description = "Shared storage primitives for SOTH SQLite-backed services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }

@@ -36,11 +36,14 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             );
         }
         Err(e) => {
-            style::error("Could not connect to dashboard");
+            style::error("Could not connect to API service");
             eprintln!();
             style::kv("URL", &url);
             eprintln!();
-            style::warning("Make sure the proxy is running with dashboard enabled.");
+            style::warning(&format!(
+                "Start the API service first: soth dev api start --port {}",
+                port
+            ));
             anyhow::bail!("Connection failed: {}", e);
         }
     }

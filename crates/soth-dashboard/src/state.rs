@@ -2,11 +2,13 @@
 
 use chrono::{Duration as ChronoDuration, Utc};
 use parking_lot::RwLock;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use soth_storage::open_sqlite_read_write_with_timeout;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use tracing::debug;
 
@@ -19,7 +21,6 @@ const MAX_RECENT_PROXY_REQUESTS: usize = 50;
 /// Maximum number of daily trend points to keep
 const MAX_DAILY_TREND_POINTS: usize = 30;
 const ROLLUP_WARM_START_WINDOW_HOURS: i64 = 24;
-const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
 
 /// Thread-safe dashboard state that layers push updates to
 #[derive(Clone)]
@@ -139,6 +140,9 @@ pub struct ProxyMetrics {
     pub recent_requests: VecDeque<ProxyRequestEntry>,
     /// Proxy status
     pub status: ProxyStatus,
+    /// Host filter decision counters scraped from Prometheus metrics.
+    #[serde(default)]
+    pub filter_decisions: FilterDecisionMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -168,6 +172,13 @@ pub struct ProxyStatus {
     pub enabled: bool,
     pub listen_address: Option<String>,
     pub ca_installed: bool,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FilterDecisionMetrics {
+    pub total: u64,
+    pub by_phase: HashMap<String, u64>,
+    pub by_decision: HashMap<String, u64>,
 }
 
 /// Canonical budget primitives derived from proxy + budget state.
@@ -365,9 +376,7 @@ impl DashboardState {
             .format("%Y-%m-%dT%H:%M:00Z")
             .to_string();
 
-        let conn = Connection::open(db_path).map_err(to_io_error)?;
-        conn.busy_timeout(std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
-            .map_err(to_io_error)?;
+        let conn = open_sqlite_read_write_with_timeout(db_path, Duration::from_millis(2_000))?;
 
         let has_rollups: i64 = conn
             .query_row(

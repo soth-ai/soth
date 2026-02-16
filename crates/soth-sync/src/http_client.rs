@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::time::Duration;
 
 fn should_bypass_proxy(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
@@ -20,7 +21,12 @@ fn should_bypass_proxy(endpoint: &str) -> bool {
 }
 
 pub fn build_cloud_client(endpoint: &str) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(20))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .pool_max_idle_per_host(2)
+        .pool_idle_timeout(Duration::from_secs(30));
     if should_bypass_proxy(endpoint) {
         builder = builder.no_proxy();
     }

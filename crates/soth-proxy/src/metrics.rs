@@ -5,10 +5,25 @@
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
+use soth_core::api::HeartbeatTelemetry;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Global Prometheus handle for rendering metrics
 static PROMETHEUS_HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
+static BLACKLIST_KEYWORD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLACKLIST_GRAPHQL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_CATALOG_INTERCEPT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_CATALOG_SEEN_SKIP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_CATALOG_CAP_SKIP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REGISTRY_SOURCE_STATE: AtomicU64 = AtomicU64::new(0);
+static REGISTRY_REFRESH_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_OPEN_FDS: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_FD_SOFT_LIMIT: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_FD_HARD_LIMIT: AtomicU64 = AtomicU64::new(0);
+static EMFILE_FORWARD_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the Prometheus metrics exporter
 ///
@@ -59,12 +74,17 @@ pub const BUDGET_BLOCKS_TOTAL: &str = "soth_budget_blocks_total";
 pub const ENFORCEMENT_FAILOPEN_TOTAL: &str = "soth_enforcement_failopen_total";
 pub const STREAM_CAPTURE_LIMIT_REACHED_TOTAL: &str = "soth_stream_capture_limit_reached_total";
 pub const TLS_LEARNED_PASSTHROUGH_TOTAL: &str = "soth_tls_learned_passthrough_total";
+pub const FILTER_DECISIONS_TOTAL: &str = "soth_filter_decisions_total";
 
 // Gauges
 pub const ACTIVE_CONNECTIONS: &str = "soth_proxy_active_connections";
 pub const CIRCUIT_BREAKER_STATE: &str = "soth_proxy_circuit_breaker_state";
 pub const POLICY_ACTIVE_VERSION: &str = "soth_policy_active_version";
 pub const TLS_LEARNED_PASSTHROUGH_ACTIVE: &str = "soth_tls_learned_passthrough_active";
+pub const RUNTIME_OPEN_FDS_GAUGE: &str = "soth_runtime_open_fds";
+pub const RUNTIME_FD_SOFT_LIMIT_GAUGE: &str = "soth_runtime_fd_soft_limit";
+pub const RUNTIME_FD_HARD_LIMIT_GAUGE: &str = "soth_runtime_fd_hard_limit";
+pub const RUNTIME_FD_UTILIZATION_GAUGE: &str = "soth_runtime_fd_utilization_ratio";
 
 // Histograms
 pub const REQUEST_DURATION: &str = "soth_proxy_request_duration_seconds";
@@ -115,6 +135,14 @@ fn describe_counters() {
         TLS_LEARNED_PASSTHROUGH_TOTAL,
         "Total learned TLS passthrough events by action"
     );
+    describe_counter!(
+        FILTER_DECISIONS_TOTAL,
+        "Total host filter decisions by phase and decision"
+    );
+    describe_counter!(
+        "soth_runtime_emfile_forward_errors_total",
+        "Total forwarded request failures attributed to EMFILE-like conditions"
+    );
 }
 
 fn describe_gauges() {
@@ -130,6 +158,19 @@ fn describe_gauges() {
     describe_gauge!(
         TLS_LEARNED_PASSTHROUGH_ACTIVE,
         "Current number of learned passthrough hosts"
+    );
+    describe_gauge!(RUNTIME_OPEN_FDS_GAUGE, "Current open file descriptor count");
+    describe_gauge!(
+        RUNTIME_FD_SOFT_LIMIT_GAUGE,
+        "Current RLIMIT_NOFILE soft limit"
+    );
+    describe_gauge!(
+        RUNTIME_FD_HARD_LIMIT_GAUGE,
+        "Current RLIMIT_NOFILE hard limit"
+    );
+    describe_gauge!(
+        RUNTIME_FD_UTILIZATION_GAUGE,
+        "Open/soft-limit file descriptor utilization ratio"
     );
 }
 
@@ -244,6 +285,126 @@ pub fn record_tls_learned_passthrough(action: &str) {
 /// Set current learned passthrough active host count.
 pub fn set_tls_learned_passthrough_active(count: f64) {
     gauge!(TLS_LEARNED_PASSTHROUGH_ACTIVE).set(count);
+}
+
+/// Record host-filter decision at HTTP/CONNECT phase.
+pub fn record_filter_decision(phase: &str, decision: &str) {
+    counter!(
+        FILTER_DECISIONS_TOTAL,
+        "phase" => phase.to_string(),
+        "decision" => decision.to_string()
+    )
+    .increment(1);
+
+    if phase.eq_ignore_ascii_case("http") && decision.eq_ignore_ascii_case("noise") {
+        BLACKLIST_KEYWORD_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if phase.eq_ignore_ascii_case("http") && decision.eq_ignore_ascii_case("blacklist_graphql") {
+        BLACKLIST_GRAPHQL_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if decision.eq_ignore_ascii_case("catalog_discovery_intercept") {
+        DISCOVERY_CATALOG_INTERCEPT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if decision.eq_ignore_ascii_case("catalog_discovery_seen_skip") {
+        DISCOVERY_CATALOG_SEEN_SKIP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if decision.eq_ignore_ascii_case("catalog_discovery_cap_skip") {
+        DISCOVERY_CATALOG_CAP_SKIP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot heartbeat telemetry counters useful for cloud-side aggregate analytics.
+pub fn heartbeat_telemetry_snapshot() -> HeartbeatTelemetry {
+    let mut counters = BTreeMap::new();
+    counters.insert(
+        "edge.blacklist.keyword_dropped_total".to_string(),
+        BLACKLIST_KEYWORD_DROPPED_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.blacklist.graphql_dropped_total".to_string(),
+        BLACKLIST_GRAPHQL_DROPPED_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.discovery.catalog.intercept_total".to_string(),
+        DISCOVERY_CATALOG_INTERCEPT_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.discovery.catalog.already_seen_skip_total".to_string(),
+        DISCOVERY_CATALOG_SEEN_SKIP_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.discovery.catalog.daily_cap_skip_total".to_string(),
+        DISCOVERY_CATALOG_CAP_SKIP_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.registry.source_state".to_string(),
+        REGISTRY_SOURCE_STATE.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.registry.refresh.consecutive_failures".to_string(),
+        REGISTRY_REFRESH_CONSECUTIVE_FAILURES.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.registry.refresh.last_success_unix_secs".to_string(),
+        REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.runtime.open_fds".to_string(),
+        RUNTIME_OPEN_FDS.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.runtime.fd_soft_limit".to_string(),
+        RUNTIME_FD_SOFT_LIMIT.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.runtime.fd_hard_limit".to_string(),
+        RUNTIME_FD_HARD_LIMIT.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.runtime.emfile_forward_errors_total".to_string(),
+        EMFILE_FORWARD_ERROR_TOTAL.load(Ordering::Relaxed),
+    );
+    HeartbeatTelemetry { counters }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum RegistryBundleSourceState {
+    DegradedEmbedded = 0,
+    DegradedCached = 1,
+    HealthyCloud = 2,
+}
+
+pub fn set_registry_source_state(state: RegistryBundleSourceState) {
+    REGISTRY_SOURCE_STATE.store(state as u64, Ordering::Relaxed);
+}
+
+pub fn set_registry_refresh_consecutive_failures(count: u64) {
+    REGISTRY_REFRESH_CONSECUTIVE_FAILURES.store(count, Ordering::Relaxed);
+}
+
+pub fn set_registry_refresh_last_success_unix_secs(unix_secs: u64) {
+    REGISTRY_REFRESH_LAST_SUCCESS_UNIX_SECS.store(unix_secs, Ordering::Relaxed);
+}
+
+pub fn set_runtime_fd_snapshot(open_fds: u64, soft_limit: u64, hard_limit: u64) {
+    RUNTIME_OPEN_FDS.store(open_fds, Ordering::Relaxed);
+    RUNTIME_FD_SOFT_LIMIT.store(soft_limit, Ordering::Relaxed);
+    RUNTIME_FD_HARD_LIMIT.store(hard_limit, Ordering::Relaxed);
+    gauge!(RUNTIME_OPEN_FDS_GAUGE).set(open_fds as f64);
+    gauge!(RUNTIME_FD_SOFT_LIMIT_GAUGE).set(soft_limit as f64);
+    gauge!(RUNTIME_FD_HARD_LIMIT_GAUGE).set(hard_limit as f64);
+    let utilization = if soft_limit == 0 {
+        0.0
+    } else {
+        (open_fds as f64) / (soft_limit as f64)
+    };
+    gauge!(RUNTIME_FD_UTILIZATION_GAUGE).set(utilization);
+}
+
+pub fn record_emfile_forward_error() {
+    EMFILE_FORWARD_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    counter!("soth_runtime_emfile_forward_errors_total").increment(1);
 }
 
 /// Set active connections gauge

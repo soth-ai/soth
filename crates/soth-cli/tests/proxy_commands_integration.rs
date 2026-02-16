@@ -1,13 +1,13 @@
-//! Integration tests for Phase J CLI proxy commands
+//! Integration tests for Phase J CLI diagnostics commands
 //!
 //! Tests for:
-//! - `soth proxy metrics` - displays metrics from /metrics endpoint
-//! - `soth proxy connections` - shows active connections from /api/proxy
-//! - `soth proxy circuit status` - circuit breaker status
-//! - `soth proxy rate-limit` - rate limit status
+//! - `soth dev advanced metrics` - displays metrics from /metrics endpoint
+//! - `soth dev advanced connections` - shows active connections from /api/proxy
+//! - `soth dev advanced circuit status` - circuit breaker status
+//! - `soth dev advanced rate-limit` - rate limit status
 //!
 //! These tests focus on parsing and display logic. Full HTTP integration
-//! requires a running dashboard server (tested in E2E tests).
+//! requires a running API service (tested in E2E tests).
 
 use soth_core::config::SothConfig;
 use std::collections::HashMap;
@@ -287,7 +287,7 @@ fn test_extract_label() {
 // CONFIG FILE TESTS
 // ============================================================================
 
-/// Test loading custom config for dashboard port
+/// Test loading custom config for API port
 #[test]
 fn test_load_custom_config_for_dashboard_port() {
     let config_content = r#"
@@ -309,7 +309,7 @@ dashboard:
     assert!(config.dashboard.enabled);
 }
 
-/// Test default dashboard port when not specified
+/// Test default API port when not specified
 #[test]
 fn test_default_dashboard_port() {
     let config_content = r#"
@@ -381,25 +381,25 @@ production:
 // ERROR HANDLING TESTS
 // ============================================================================
 
-/// Test handling connection refused (dashboard not running)
+/// Test handling connection refused (API service not running)
 #[test]
 fn test_connection_refused_scenario() {
-    // When dashboard is not running, commands should provide helpful error messages
+    // When API service is not running, commands should provide helpful error messages
     // This is tested in the actual command implementation which checks for
     // connection errors and prints guidance
 
     // We verify the error message formatting is appropriate
     let port = 3001;
     let error_msg = format!(
-        "Error: Could not connect to dashboard at http://127.0.0.1:{}/metrics\n\
+        "Error: Could not connect to API service at http://127.0.0.1:{}/metrics\n\
          \n\
-         Make sure the proxy is running with dashboard enabled:\n  \
-         soth proxy start",
-        port
+         Start the API service:\n  \
+         soth dev api start --port {}",
+        port, port
     );
 
     assert!(error_msg.contains("Could not connect"));
-    assert!(error_msg.contains("soth proxy start"));
+    assert!(error_msg.contains("soth dev api start"));
 }
 
 /// Test handling HTTP error responses

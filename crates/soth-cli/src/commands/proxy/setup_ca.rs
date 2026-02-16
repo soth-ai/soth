@@ -3,7 +3,7 @@
 use crate::cli_config;
 use crate::style;
 use owo_colors::OwoColorize;
-use soth_tls::CertificateAuthority;
+use soth_crypto::tls::CertificateAuthority;
 use std::path::PathBuf;
 
 /// Expand tilde in path
@@ -178,7 +178,7 @@ pub async fn run(
 
     println!();
     style::info("To configure your shell, run:");
-    println!("    {}", "eval $(soth proxy env)".bold());
+    println!("    {}", "eval $(soth runtime env)".bold());
 
     style::footer();
     Ok(())

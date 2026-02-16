@@ -286,6 +286,8 @@ pub struct HeartbeatRequest {
     pub os: Option<String>,
     pub hostname: Option<String>,
     pub active_connections: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<HeartbeatTelemetry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +295,115 @@ pub struct HeartbeatResponse {
     pub ok: bool,
     pub config_changed: bool,
     pub server_time: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeartbeatTelemetry {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub counters: std::collections::BTreeMap<String, u64>,
+}
+
+// ============================================================================
+// Edge Enrollment (Fleet bootstrap)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollExchangeRequest {
+    pub enroll_token: String,
+    pub machine_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<EnrollExchangeClient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollExchangeClient {
+    pub hostname: Option<String>,
+    pub platform: Option<String>,
+    pub arch: Option<String>,
+    pub soth_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollExchangeResponse {
+    pub success: bool,
+    pub data: EnrollExchangeData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollExchangeData {
+    pub api_key: String,
+    pub endpoint: String,
+    /// Workspace scope hint for edge; currently set to team_id by cloud.
+    pub workspace_id: String,
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+}
+
+/// Status lifecycle for enrollment token records.
+/// Values: "active" | "revoked" | "expired" | "depleted"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollmentTokenRecord {
+    pub id: String,
+    pub org_id: String,
+    pub team_id: String,
+    pub issued_by_user_id: String,
+    pub token_prefix: String,
+    pub status: String,
+    pub expires_at: String,
+    pub max_uses: u32,
+    pub used_count: u32,
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub revoked_by: Option<String>,
+}
+
+/// POST /api/v1/enroll/tokens request payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateEnrollmentTokenRequest {
+    pub team_id: String,
+    pub expires_at: String,
+    #[serde(default = "default_enrollment_token_max_uses")]
+    pub max_uses: u32,
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
+}
+
+/// POST /api/v1/enroll/tokens response payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateEnrollmentTokenResponse {
+    /// Plain token material is returned exactly once at creation.
+    pub token: String,
+    pub record: EnrollmentTokenRecord,
+}
+
+/// GET /api/v1/enroll/tokens response payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListEnrollmentTokensResponse {
+    pub tokens: Vec<EnrollmentTokenRecord>,
+}
+
+/// POST /api/v1/enroll/tokens/{id}/revoke request payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeEnrollmentTokenRequest {
+    pub reason: Option<String>,
+}
+
+/// POST /api/v1/enroll/tokens/{id}/revoke response payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeEnrollmentTokenResponse {
+    pub revoked: bool,
+    pub id: String,
+}
+
+fn default_enrollment_token_max_uses() -> u32 {
+    1
 }
 
 // ============================================================================
@@ -800,6 +911,56 @@ pub struct OrgAdminMemberRoleResponse {
 mod tests {
     use super::*;
 
+    #[test]
+    fn enroll_exchange_roundtrip() {
+        let request = EnrollExchangeRequest {
+            enroll_token: "enroll_live_abc123".to_string(),
+            machine_name: Some("devbox".to_string()),
+            client: Some(EnrollExchangeClient {
+                hostname: Some("devbox".to_string()),
+                platform: Some("macos".to_string()),
+                arch: Some("arm64".to_string()),
+                soth_version: Some("0.1.0".to_string()),
+                device_id: Some("device_123".to_string()),
+            }),
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize enroll request");
+        let parsed: EnrollExchangeRequest =
+            serde_json::from_str(&json).expect("deserialize enroll request");
+        assert_eq!(parsed.enroll_token, "enroll_live_abc123");
+
+        let response = EnrollExchangeResponse {
+            success: true,
+            data: EnrollExchangeData {
+                api_key: "soth_live_team_abcdef0123456789abcdef0123456789".to_string(),
+                endpoint: "https://api.soth.ai".to_string(),
+                workspace_id: "team_123".to_string(),
+                tags: HashMap::from([("workspace_id".to_string(), "team_123".to_string())]),
+                device_id: Some("device_123".to_string()),
+            },
+        };
+
+        let json = serde_json::to_string(&response).expect("serialize enroll response");
+        let parsed: EnrollExchangeResponse =
+            serde_json::from_str(&json).expect("deserialize enroll response");
+        assert!(parsed.success);
+        assert_eq!(parsed.data.workspace_id, "team_123");
+    }
+
+    #[test]
+    fn create_enrollment_token_defaults_max_uses() {
+        let payload = serde_json::json!({
+            "team_id": "team_123",
+            "expires_at": "2026-03-01T00:00:00Z"
+        });
+
+        let parsed: CreateEnrollmentTokenRequest =
+            serde_json::from_value(payload).expect("deserialize create token request");
+
+        assert_eq!(parsed.max_uses, 1);
+        assert!(parsed.tags.is_empty());
+    }
     #[test]
     fn event_batch_roundtrip() {
         let req = EventBatchRequest {
