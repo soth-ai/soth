@@ -127,14 +127,7 @@ impl BudgetLayer {
 
     fn estimate_cost_usd(&self, model: &str, input_tokens: u64, output_tokens: u64) -> Option<f64> {
         self.oisp_engine.as_ref().and_then(|engine| {
-            engine.calculate_cost(
-                &[],
-                model,
-                input_tokens,
-                output_tokens,
-                None,
-                None,
-            )
+            engine.calculate_cost(&[], model, input_tokens, output_tokens, None, None)
         })
     }
 

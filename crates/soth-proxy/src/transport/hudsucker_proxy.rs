@@ -112,7 +112,7 @@ struct PendingRequest {
     parse_confidence: Option<f64>,
     /// Provider/agent entity id derived from bundle detection.
     target_entity_id: Option<String>,
-    /// Source of detection metadata (bundle/discovery_fallback).
+    /// Source of detection metadata (bundle).
     detection_source: Option<String>,
     /// Whether interception matched blacklist/noise criteria.
     blacklist_match: bool,
@@ -523,16 +523,6 @@ fn is_blacklist_detection_reason(reason: Option<&str>) -> bool {
         reason,
         Some("bundle.blacklist.keyword" | "bundle.blacklist.graphql")
     )
-}
-
-fn parse_confidence_for_reason(reason: Option<&str>) -> Option<f64> {
-    match reason {
-        Some("bundle.discovery.catalog") => Some(0.7),
-        Some("discovery.heuristic.user_agent") => Some(0.72),
-        Some("discovery.heuristic.process_name") => Some(0.68),
-        Some(_) => Some(1.0),
-        None => None,
-    }
 }
 
 fn decision_label_from_intercept_decision(decision: InterceptDecision) -> &'static str {
@@ -3020,45 +3010,9 @@ impl HttpHandler for AiProxyHandler {
                             .or_else(|| Some(value.provider_id.clone()))
                     })
                 });
-            let bundle_detection_is_generic = bundle_detection
-                .as_ref()
-                .map(|value| {
-                    value
-                        .detection_reason
-                        .eq_ignore_ascii_case("bundle_unclassified")
-                        || value
-                            .detection_reason
-                            .eq_ignore_ascii_case("host_classification")
-                })
-                .unwrap_or(true);
-            let discovery_heuristic = if bundle_detection.is_none() || bundle_detection_is_generic {
-                if let Some(agent) = ua_agent.map(ToString::to_string) {
-                    Some((agent, "discovery.heuristic.user_agent".to_string()))
-                } else if let Some(agent) = process_agent.clone() {
-                    Some((agent, "discovery.heuristic.process_name".to_string()))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let heuristic_agent = discovery_heuristic.as_ref().map(|value| value.0.clone());
-            let should_prefer_heuristic = heuristic_agent.is_some()
-                && (bundle_agent.is_none() || bundle_detection_is_generic);
-            let agent = if should_prefer_heuristic {
-                heuristic_agent.clone().or_else(|| bundle_agent.clone())
-            } else {
-                bundle_agent.clone().or_else(|| heuristic_agent.clone())
-            };
-            let (detection_reason, parse_confidence, detection_source) = if should_prefer_heuristic
-            {
-                if let Some((_, reason)) = discovery_heuristic.as_ref() {
-                    (
-                        Some(reason.clone()),
-                        parse_confidence_for_reason(Some(reason.as_str())),
-                        Some("discovery_fallback".to_string()),
-                    )
-                } else if let Some(value) = bundle_detection.as_ref() {
+            let agent = bundle_agent.clone();
+            let (detection_reason, parse_confidence, detection_source) =
+                if let Some(value) = bundle_detection.as_ref() {
                     (
                         Some(value.detection_reason.clone()),
                         Some(value.parse_confidence),
@@ -3070,26 +3024,7 @@ impl HttpHandler for AiProxyHandler {
                         Some(0.0),
                         Some("bundle".to_string()),
                     )
-                }
-            } else if let Some(value) = bundle_detection.as_ref() {
-                (
-                    Some(value.detection_reason.clone()),
-                    Some(value.parse_confidence),
-                    Some("bundle".to_string()),
-                )
-            } else if let Some((_, reason)) = discovery_heuristic.as_ref() {
-                (
-                    Some(reason.clone()),
-                    parse_confidence_for_reason(Some(reason.as_str())),
-                    Some("discovery_fallback".to_string()),
-                )
-            } else {
-                (
-                    Some("bundle_unclassified".to_string()),
-                    Some(0.0),
-                    Some("bundle".to_string()),
-                )
-            };
+                };
             let target_entity_id = bundle_detection
                 .as_ref()
                 .and_then(|value| value.target_entity_id.clone());

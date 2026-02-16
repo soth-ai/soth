@@ -1,110 +1,56 @@
 # AGENTS.md
 
-This file is an operational guide for new Codex instances working in this repository.
+Operational guide for Codex instances working in this repository.
 
 ## Scope
-SOTH is an edge proxy + wrap system for AI agent traffic.
+SOTH is an edge sensor for AI traffic with three capture paths:
 
-- `soth proxy` captures HTTP/HTTPS + WebSocket traffic.
-- `soth wrap` captures MCP stdio traffic by wrapping MCP server processes.
-- Identity/policy/budget/observe pipelines can be applied to both paths.
+- `soth start` / `soth up`: HTTP/HTTPS + WebSocket proxy capture.
+- `soth wrap`: MCP stdio capture by wrapping MCP server processes.
+- collector pipeline (config-driven): local session artifact ingestion.
+
+Policy, budget, identity/crypto, and observability apply across all paths and normalize into Exchange V2 records.
 
 ## Workspace Map
-- `crates/soth-core`: shared config, core types (`WrapEvent`, `TrafficEnvelope`), domain filters.
-- `crates/soth-proxy`: proxy transport, host/provider/agent fingerprinting, enforcement pipeline.
-- `crates/soth-cli`: commands (`proxy`, `wrap`, `init`, `config`, etc.).
-- `crates/soth-identity`, `crates/soth-policy`, `crates/soth-budget`, `crates/soth-observe`: enforcement subsystems.
-- `crates/soth-dashboard`: dashboard backend.
+- `crates/soth-cli`: CLI surface and runtime lifecycle (`start/up/down/stop/logs/on/off`, `wrap`, `runtime`, `dev`).
+- `crates/soth-proxy`: MITM transport + exchange assembly.
+- `crates/soth-oisp`: bundle-driven classification, detection, filters, parsing, pricing.
+- `crates/soth-sync`: cloud sync, exchange upload queue, registry bundle cache refresh.
+- `crates/soth-dashboard`: API + WS backend for local dashboard/TUI data.
+- `crates/soth-collector`: local session collectors and incremental scans.
+- `crates/soth-core`: shared config, event/exchange schemas, sqlite logger/storage primitives.
+- `crates/soth-crypto`: key management, signatures, TLS helpers.
+- `crates/soth-policy`: policy engine/wrappers.
+- `crates/soth-budget`: spend tracking and budget enforcement primitives.
+- `crates/soth-observe`: enrichment/parsing helpers (PII, JSONL, storage adapters).
+- `crates/soth-storage`: shared storage helpers.
 
-## Canonical Domain Classes
-Forward proxy interception is now explicitly split into 3 classes:
+## Canonical Host Classes
+Bundle classification splits traffic into:
 
-1. `ai_inference`: direct model API domains.
-2. `mcp`: MCP transport/service domains.
-3. `agent_apps`: end-user agent surfaces (ChatGPT/Claude/Gemini/web IDE agents).
+1. `ai_inference`
+2. `mcp`
+3. `agent_apps`
 
-Config lives under `forward_proxy.hosts`:
+Host lists can still be configured under `forward_proxy.hosts`, but runtime interception/classification is bundle-driven through OISP.
 
-- inline lists: `ai_inference`, `mcp`, `agent_apps`
-- optional external files: `forward_proxy.hosts.domain_files.{ai_inference,mcp,agent_apps}`
+## Detection Model
+- Proxy: OISP bundle rules are primary (`ua_rules`, `path_rules`, `model_rules`, `process_rules`, `env_rules`).
+- Wrap: precedence is `--agent` override, MCP `initialize.clientInfo`, env/process hints, then unknown.
+- Events carry detection metadata (`detection_reason`, `parse_confidence`, `target_entity_id`, `detection_source`).
 
-When a `domain_files.*` entry is set, that file replaces the corresponding inline list.
+## Event Encoding
+- MCP stdio: `EventSource::Mcp` + `TrafficSource::McpStdio`.
+- MCP over HTTP/WS: `EventSource::Mcp` + `TrafficSource::McpHttp`.
+- Proxy AI/agent traffic: `EventSource::AiProxy` or `EventSource::AgentApp` + `TrafficSource::ProxyHudsucker`.
 
-## Where the 3 Files Come From
-`soth init` now scaffolds:
+## Operational Notes
+- Primary local DB path defaults to `~/.soth/logs/events.db`.
+- Cloud sync uploads Exchange V2 batches to `/api/v1/exchanges/batch`.
+- Registry bundle cache is read from local cache path and hot-reloaded by runtime components.
 
-- `domains/ai_inference.yaml`
-- `domains/mcp.yaml`
-- `domains/agent_apps.yaml`
-
-and wires them in `soth.yaml` via `forward_proxy.hosts.domain_files`.
-
-## System Definitions (MCP vs AI Inference vs Agent)
-- **MCP traffic**: JSON-RPC MCP methods (`tools/*`, `resources/*`, `prompts/*`, etc.) over stdio/HTTP/WS.
-- **AI inference traffic**: direct provider inference endpoints (`api.openai.com`, `api.anthropic.com`, etc.).
-- **Agent app traffic**: app surfaces that orchestrate user interactions (ChatGPT/Claude/Gemini/Cursor/Copilot/etc.).
-
-Event-level encoding:
-
-- `EventSource::Mcp` + `TrafficSource::McpStdio` for wrap stdio.
-- `EventSource::Mcp` + `TrafficSource::McpHttp` for MCP over HTTP/WS.
-- `EventSource::AiProxy` or `EventSource::AgentApp` + `TrafficSource::ProxyHudsucker` for proxy AI/agent traffic.
-
-## Agent Detection: Current Behavior
-
-### Proxy path (`crates/soth-proxy/src/transport/hudsucker_proxy.rs`)
-Detection order:
-
-1. User-Agent heuristic (`detect_agent_from_user_agent`).
-2. Host/path/model fingerprint (`host_fingerprint`).
-3. Provider fallback where applicable.
-
-Important: host-driven inference is now **gated by configured agent domains**.
-
-- Host/path fallback (including Codex host+path promotion) only applies when:
-  - host matches configured `agent_apps`, or
-  - host mode is `discovery`.
-- Strong explicit signals still work without host fallback:
-  - Codex model marker (`model` contains `codex`),
-  - explicit User-Agent markers.
-
-This prevents hardcoded domain fingerprints from silently overriding selective domain configuration.
-
-### Wrap path (`crates/soth-cli/src/commands/wrap/agent_detect.rs`)
-Detection precedence:
-
-1. CLI override (`--agent`) [highest].
-2. MCP `initialize.params.clientInfo`.
-3. Environment variables.
-4. Parent process tree.
-5. Unknown.
-
-## Codex / ChatGPT / Claude / Gemini Notes
-- Codex can be detected by:
-  - User-Agent markers (`openai-codex`, `codex/`),
-  - model marker (`*codex*`),
-  - ChatGPT host + Codex path markers (host-gated as above).
-- ChatGPT/Claude/Gemini host fallbacks are present but now controlled by `agent_apps` host config.
-- Claude API hosts (`api.claude.ai`, `api.anthropic.com`) are explicitly excluded from `agent_apps` classification.
-
-## Known Gaps
-1. Host/provider fingerprints are still hardcoded in code (`host_fingerprint.rs`), not fully declarative.
-2. User-Agent/process/env detection signatures are hardcoded, not config-driven.
-3. Proxy events do not yet carry a structured "detection reason" payload (which heuristic won).
-4. Discovery mode intentionally bypasses selective host constraints; this can surprise users if enabled.
-5. Wildcard matching in host filters is simple single-`*` pattern matching and not full glob/regex.
-
-## Recommended Next Iteration
-1. Add a declarative `forward_proxy.detection.rules_file` for UA/path/model/host signatures.
-2. Share one detection engine between proxy and wrap (single rule source).
-3. Emit structured `agent_detection_reason` in event metadata for debugging.
-4. Add end-to-end tests proving per-agent detection behavior from config-only inputs.
-
-## Practical Checklist When Adding a New Agent
-1. Add/verify host domains in `domains/agent_apps.yaml` (and maybe `ai_inference.yaml` for direct APIs).
-2. Add provider/agent fingerprints in `host_fingerprint.rs` if host heuristics are required.
-3. Add wrap-side env/process/initialize normalization in `agent_detect.rs`.
-4. Add tests in:
-   - `crates/soth-proxy/src/transport/hudsucker_proxy.rs`
-   - `crates/soth-cli/src/commands/wrap/agent_detect.rs`
-   - `crates/soth-core/src/config/types.rs`
+## Practical Checklist for New Provider/Agent
+1. Add/update provider + domain + detection rules in cloud bundle seed/compiler.
+2. Ensure entity IDs are present and stable in compiled bundle (`provider_entity_id` / `entity_id`).
+3. Validate local classification with OISP tests and proxy integration tests.
+4. Verify detection metadata appears in local DB and dashboard/TUI views.

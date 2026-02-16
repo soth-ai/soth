@@ -2051,72 +2051,43 @@ fn read_sqlite_event_payload(
         Err(error) => return Err(to_io_err(error)),
     }
 
-    let mut fallback_stmt = conn
+    let mut exchange_stmt = conn
         .prepare(
             r#"
             SELECT event_json
-            FROM wrap_events
-            WHERE id = ?1
+            FROM exchange_events
+            WHERE exchange_id = ?1
             LIMIT 1
             "#,
         )
         .map_err(to_io_err)?;
-
-    let event_json = fallback_stmt.query_row([event_id], |row| row.get::<_, String>(0));
-    match event_json {
+    let exchange_json = exchange_stmt.query_row([event_id], |row| row.get::<_, String>(0));
+    match exchange_json {
         Ok(json) => {
-            let event = serde_json::from_str::<WrapEvent>(&json)
+            let exchange = serde_json::from_str::<ExchangeEventV2>(&json)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             Ok(match payload_kind {
-                "request" => event.request_content,
-                "response" => event.response_content,
-                "content" => event.content,
+                "request" => exchange
+                    .request
+                    .body
+                    .inline
+                    .or(exchange.request.body.preview),
+                "response" => exchange
+                    .response
+                    .body
+                    .inline
+                    .or(exchange.response.body.preview),
+                "content" => exchange
+                    .response
+                    .body
+                    .inline
+                    .or(exchange.response.body.preview)
+                    .or(exchange.request.body.inline)
+                    .or(exchange.request.body.preview),
                 _ => None,
             })
         }
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            let mut exchange_stmt = conn
-                .prepare(
-                    r#"
-                    SELECT event_json
-                    FROM exchange_events
-                    WHERE exchange_id = ?1
-                    LIMIT 1
-                    "#,
-                )
-                .map_err(to_io_err)?;
-            let exchange_json = exchange_stmt.query_row([event_id], |row| row.get::<_, String>(0));
-            match exchange_json {
-                Ok(json) => {
-                    let exchange =
-                        serde_json::from_str::<ExchangeEventV2>(&json).map_err(|error| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                        })?;
-                    Ok(match payload_kind {
-                        "request" => exchange
-                            .request
-                            .body
-                            .inline
-                            .or(exchange.request.body.preview),
-                        "response" => exchange
-                            .response
-                            .body
-                            .inline
-                            .or(exchange.response.body.preview),
-                        "content" => exchange
-                            .response
-                            .body
-                            .inline
-                            .or(exchange.response.body.preview)
-                            .or(exchange.request.body.inline)
-                            .or(exchange.request.body.preview),
-                        _ => None,
-                    })
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(error) => Err(to_io_err(error)),
-            }
-        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(to_io_err(error)),
     }
 }

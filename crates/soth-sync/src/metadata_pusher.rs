@@ -52,30 +52,7 @@ impl MetadataPusher {
                 .context("failed decoding exchange batch response")?;
             return Ok(Some(decoded));
         }
-
-        if !should_fallback_to_plain(gzip_response.status()) {
-            return Ok(None);
-        }
-
-        let plain_response = self
-            .client
-            .post(&url)
-            .header(API_VERSION_HEADER, API_VERSION)
-            .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .body(request_json)
-            .send()
-            .await
-            .with_context(|| format!("exchange push fallback failed for {url}"))?;
-        if !plain_response.status().is_success() {
-            return Ok(None);
-        }
-
-        let decoded = plain_response
-            .json::<ExchangeBatchResponse>()
-            .await
-            .context("failed decoding fallback exchange batch response")?;
-        Ok(Some(decoded))
+        Ok(None)
     }
 }
 
@@ -93,10 +70,4 @@ fn gzip_bytes(input: &[u8]) -> anyhow::Result<Vec<u8>> {
         .write_all(input)
         .context("failed writing gzip encoder input")?;
     encoder.finish().context("failed finalizing gzip payload")
-}
-
-fn should_fallback_to_plain(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::BAD_REQUEST
-        || status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
-        || status == reqwest::StatusCode::NOT_IMPLEMENTED
 }
