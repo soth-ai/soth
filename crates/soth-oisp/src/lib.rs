@@ -2006,12 +2006,14 @@ mod tests {
             DomainIndexEntry {
                 host: "*.openai.com".to_string(),
                 provider_id: "broad".to_string(),
+                provider_entity_id: None,
                 entry_type: EntryType::AiInference,
                 paths: Vec::new(),
             },
             DomainIndexEntry {
                 host: "api.*.openai.com".to_string(),
                 provider_id: "specific".to_string(),
+                provider_entity_id: None,
                 entry_type: EntryType::AiInference,
                 paths: Vec::new(),
             },
@@ -2028,6 +2030,7 @@ mod tests {
             "openai".to_string(),
             types::bundle::ResolvedProvider {
                 id: "openai".to_string(),
+                entity_id: None,
                 name: "OpenAI".to_string(),
                 entry_type: EntryType::Mcp,
                 api_format: None,
@@ -2039,6 +2042,7 @@ mod tests {
         bundle.domain_index = vec![DomainIndexEntry {
             host: "api.openai.com".to_string(),
             provider_id: "openai".to_string(),
+            provider_entity_id: None,
             entry_type: EntryType::AiInference,
             paths: Vec::new(),
         }];

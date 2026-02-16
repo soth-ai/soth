@@ -24,6 +24,8 @@ pub enum FilterAction {
 pub struct DomainIndexEntry {
     pub host: String,
     pub provider_id: String,
+    #[serde(default)]
+    pub provider_entity_id: Option<String>,
     pub entry_type: EntryType,
     #[serde(default)]
     pub paths: Vec<String>,
@@ -54,6 +56,8 @@ pub struct BundleStats {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedProvider {
     pub id: String,
+    #[serde(default)]
+    pub entity_id: Option<String>,
     pub name: String,
     #[serde(rename = "type")]
     pub entry_type: EntryType,
@@ -66,11 +70,11 @@ pub struct ResolvedProvider {
 }
 
 pub fn compiled_bundle_schema_version() -> u32 {
-    2
+    3
 }
 
 fn is_supported_compiled_bundle_schema_version(schema_version: u32) -> bool {
-    matches!(schema_version, 1 | 2)
+    matches!(schema_version, 1 | 2 | 3)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -104,7 +108,7 @@ impl CompiledBundle {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !is_supported_compiled_bundle_schema_version(self.schema_version) {
             anyhow::bail!(
-                "unsupported compiled bundle schema_version {} (supported: 1, 2)",
+                "unsupported compiled bundle schema_version {} (supported: 1, 2, 3)",
                 self.schema_version,
             );
         }
@@ -129,6 +133,13 @@ impl CompiledBundle {
                     "provider map key `{provider_id}` does not match provider.id `{}`",
                     provider.id
                 );
+            }
+            if provider
+                .entity_id
+                .as_ref()
+                .is_some_and(|entity_id| entity_id.trim().is_empty())
+            {
+                anyhow::bail!("provider `{provider_id}` has empty entity_id");
             }
         }
         for entry in &self.domain_index {
@@ -411,12 +422,28 @@ fn parse_catalog_providers(
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToString::to_string);
+        let entity_id = provider_obj
+            .get("entity_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string);
 
         let mut domains = extract_string_array(provider_obj.get("api_domains"));
         let mut user_agent_patterns = extract_string_array(provider_obj.get("user_agent_patterns"));
         if let Some(detection) = provider_obj.get("detection").and_then(Value::as_object) {
             domains.extend(extract_string_array(detection.get("host_patterns")));
             user_agent_patterns.extend(extract_string_array(detection.get("header_hints")));
+            domains.extend(extract_detection_rule_strings(
+                detection,
+                "host_rules",
+                &["host", "pattern", "contains", "suffix", "regex", "value"],
+            ));
+            user_agent_patterns.extend(extract_detection_rule_strings(
+                detection,
+                "ua_rules",
+                &["contains", "equals", "pattern", "regex", "value"],
+            ));
         }
         dedup_sort_strings(&mut domains);
         dedup_sort_strings(&mut user_agent_patterns);
@@ -425,6 +452,7 @@ fn parse_catalog_providers(
             provider_id.clone(),
             ResolvedProvider {
                 id: provider_id.clone(),
+                entity_id,
                 name,
                 entry_type,
                 api_format,
@@ -447,6 +475,11 @@ fn collect_provider_path_hints(
         let mut paths = Vec::new();
         if let Some(detection) = provider_obj.get("detection").and_then(Value::as_object) {
             paths.extend(extract_string_array(detection.get("path_patterns")));
+            paths.extend(extract_detection_rule_strings(
+                detection,
+                "path_rules",
+                &["path", "pattern", "contains", "prefix", "regex", "value"],
+            ));
         }
         if let Some(features) = provider_obj.get("features").and_then(Value::as_object) {
             for feature in features.values() {
@@ -497,6 +530,11 @@ fn parse_catalog_domain_index(
         for entry in &mut entries {
             if let Some(extra) = provider_path_hints.get(&entry.provider_id) {
                 entry.paths.extend(extra.iter().cloned());
+            }
+            if entry.provider_entity_id.is_none() {
+                entry.provider_entity_id = providers
+                    .get(&entry.provider_id)
+                    .and_then(|provider| provider.entity_id.clone());
             }
             if let Some(host_rules) = interception_patterns
                 .and_then(|patterns| patterns.get(&entry.host))
@@ -564,10 +602,14 @@ fn parse_catalog_domain_index(
         }
         prune_catch_all_path_rules(&mut paths, &entry_type);
         dedup_sort_strings(&mut paths);
+        let provider_entity_id = providers
+            .get(&provider_id)
+            .and_then(|provider| provider.entity_id.clone());
 
         out.push(DomainIndexEntry {
             host: host.clone(),
             provider_id,
+            provider_entity_id,
             entry_type,
             paths,
         });
@@ -639,10 +681,14 @@ fn parse_catalog_domain_index_array_entry(
     }
     prune_catch_all_path_rules(&mut paths, &entry_type);
     dedup_sort_strings(&mut paths);
+    let provider_entity_id = providers
+        .get(&provider_id)
+        .and_then(|provider| provider.entity_id.clone());
 
     Ok(DomainIndexEntry {
         host,
         provider_id,
+        provider_entity_id,
         entry_type,
         paths,
     })
@@ -854,10 +900,12 @@ fn has_any_pricing_field(pricing: &ModelPricing) -> bool {
 
 fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
     for provider in bundle.providers.values_mut() {
+        provider.entity_id = normalize_optional_string(provider.entity_id.take());
         dedup_sort_strings(&mut provider.domains);
         dedup_sort_strings(&mut provider.user_agent_patterns);
     }
     for entry in &mut bundle.domain_index {
+        entry.provider_entity_id = normalize_optional_string(entry.provider_entity_id.take());
         dedup_sort_strings(&mut entry.paths);
     }
     normalize_domain_filters(&mut bundle.filters);
@@ -910,6 +958,62 @@ fn extract_string_array(value: Option<&Value>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn extract_detection_rule_strings(
+    detection: &Map<String, Value>,
+    rule_key: &str,
+    field_candidates: &[&str],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(rules) = detection.get(rule_key).and_then(Value::as_array) else {
+        return out;
+    };
+    for rule in rules {
+        if let Some(text) = rule.as_str() {
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push(text.to_string());
+            }
+            continue;
+        }
+        let Some(obj) = rule.as_object() else {
+            continue;
+        };
+        for field in field_candidates {
+            if let Some(values) = obj.get(*field) {
+                out.extend(extract_strings_from_value(values));
+            }
+        }
+    }
+    out
+}
+
+fn extract_strings_from_value(value: &Value) -> Vec<String> {
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![text.to_string()]
+        };
+    }
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+    }
+    Vec::new()
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn dedup_sort_strings(values: &mut Vec<String>) {
@@ -1138,5 +1242,58 @@ mod tests {
             .catalog_domains
             .contains(&"server.codeium.com".to_string()));
         assert!(parsed.meta.is_some());
+    }
+
+    #[test]
+    fn parse_compiled_bundle_accepts_sectioned_v3_shape_with_entity_ids() {
+        let value = json!({
+            "schema_version": 3,
+            "version": "2026.02.13-r3",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "meta": {
+                "release_id": "rel-2",
+                "sections": {
+                    "core": { "required": true },
+                    "filters": { "required": true }
+                }
+            },
+            "core": {
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "entity_id": "prv_4n7k2q9m1x",
+                        "name": "OpenAI",
+                        "type": "ai-inference",
+                        "api_format": "openai",
+                        "detection": {
+                            "ua_rules": [{ "contains": "openai", "agent": "openai" }],
+                            "path_rules": [{ "path": "/v1/chat/completions" }]
+                        }
+                    }
+                },
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference"
+                    }
+                ],
+                "pricing": {}
+            },
+            "filters": {
+                "whitelist": ["api.openai.com"],
+                "blacklist": ["tracking"],
+                "passthrough": [],
+                "noise_keywords": []
+            }
+        });
+
+        let parsed = parse_compiled_bundle(&value).unwrap();
+        assert_eq!(parsed.schema_version, 3);
+        let provider = parsed.providers.get("openai").unwrap();
+        assert_eq!(provider.entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
+        let entry = parsed.domain_index.first().unwrap();
+        assert_eq!(entry.provider_entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
     }
 }
