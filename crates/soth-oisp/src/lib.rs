@@ -203,8 +203,8 @@ impl OispEngine {
         {
             return cached;
         }
-        let outcome = select_best_domain_match(&self.bundle.domain_index, host.as_str())
-            .and_then(|entry| {
+        let outcome =
+            select_best_domain_match(&self.bundle.domain_index, host.as_str()).and_then(|entry| {
                 self.bundle
                     .providers
                     .get(&entry.provider_id)
@@ -436,7 +436,8 @@ impl OispEngine {
         let host = normalize_host_for_matching(host);
         let path_only = path.split_once('?').map(|(raw, _)| raw).unwrap_or(path);
 
-        if contains_noise_keyword(path, &self.bundle.filters.noise_keywords) {
+        if contains_noise_keyword_for_host(host.as_str(), path, &self.bundle.filters.noise_keywords)
+        {
             return InterceptDecision::Noise;
         }
 
@@ -495,7 +496,7 @@ impl OispEngine {
 
     /// Returns true when `text` contains any bundle noise keyword.
     pub fn matches_noise_keyword(&self, text: &str) -> bool {
-        contains_noise_keyword(text, &self.bundle.filters.noise_keywords)
+        contains_noise_keyword_text(text, &self.bundle.filters.noise_keywords)
     }
 
     /// Calculate request cost using bundle pricing for a provider/model pair.
@@ -761,7 +762,11 @@ where
     }
 }
 
-fn detection_cache_key_hash(provider_id: &str, context: &DetectionContext, include_fallback: bool) -> u64 {
+fn detection_cache_key_hash(
+    provider_id: &str,
+    context: &DetectionContext,
+    include_fallback: bool,
+) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     provider_id.trim().to_ascii_lowercase().hash(&mut hasher);
     include_fallback.hash(&mut hasher);
@@ -785,7 +790,10 @@ fn detection_cache_key_hash(provider_id: &str, context: &DetectionContext, inclu
 }
 
 fn hash_opt_trim(value: Option<&str>, state: &mut impl Hasher) {
-    match value.map(str::trim).filter(|candidate| !candidate.is_empty()) {
+    match value
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+    {
         Some(normalized) => normalized.hash(state),
         None => 0u8.hash(state),
     }
@@ -2172,15 +2180,52 @@ fn wildcard_specificity(pattern: &str) -> usize {
     pattern.chars().filter(|ch| *ch != '*').count()
 }
 
-fn contains_noise_keyword(path: &str, keywords: &[String]) -> bool {
+fn contains_noise_keyword_for_host(host: &str, path: &str, keywords: &[String]) -> bool {
     if keywords.is_empty() {
         return false;
     }
 
+    let lower_host = normalize_host_for_matching(host);
     let lower_path = path.to_ascii_lowercase();
-    keywords
-        .iter()
-        .any(|keyword| lower_path.contains(&keyword.to_ascii_lowercase()))
+    keywords.iter().any(|keyword| {
+        let candidate = keyword.trim().to_ascii_lowercase();
+        if candidate.is_empty() {
+            return false;
+        }
+
+        // Host-scoped noise rule: "<host-pattern>/<path-fragment>".
+        // Example: "api.anthropic.com/api/hello" or "*.chatgpt.com/backend-api/wham/usage".
+        if let Some(slash_idx) = candidate.find('/') {
+            if slash_idx > 0 {
+                let host_pattern = &candidate[..slash_idx];
+                let path_fragment = &candidate[slash_idx..];
+                return host_matches_pattern(lower_host.as_str(), host_pattern)
+                    && lower_path.contains(path_fragment);
+            }
+        }
+
+        lower_path.contains(&candidate)
+    })
+}
+
+fn contains_noise_keyword_text(text: &str, keywords: &[String]) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    keywords.iter().any(|keyword| {
+        let candidate = keyword.trim().to_ascii_lowercase();
+        if candidate.is_empty() {
+            return false;
+        }
+
+        // Host-scoped entries are only evaluated in host+path context.
+        if candidate.find('/').is_some_and(|idx| idx > 0) {
+            return false;
+        }
+        lower.contains(&candidate)
+    })
 }
 
 fn host_matches_any(host: &str, patterns: &[String]) -> bool {
@@ -2543,6 +2588,8 @@ mod tests {
         assert!(engine.provider_count() > 0);
         assert!(engine.classify("api.openai.com").is_some());
         assert!(engine.classify("chatgpt.com").is_some());
+        assert!(engine.classify("app.warp.dev").is_some());
+        assert!(engine.classify("api.warp.dev").is_some());
         assert!(engine.classify("api.anthropic.com").is_some());
     }
 
@@ -2575,7 +2622,38 @@ mod tests {
         let merged = primary.with_embedded_overlay().unwrap();
         assert!(merged.classify("api.example.com").is_some());
         assert!(merged.classify("chatgpt.com").is_some());
+        assert!(merged.classify("app.warp.dev").is_some());
+        assert!(merged.classify("api.warp.dev").is_some());
         assert!(merged.classify("api.openai.com").is_some());
+    }
+
+    #[test]
+    fn embedded_minimal_bundle_detects_codex_and_warp_agents() {
+        let engine = OispEngine::load_embedded_minimal_bundle().unwrap();
+        let codex = engine
+            .evaluate_detection_for_host(
+                "ws.chatgpt.com",
+                &DetectionContext {
+                    host: Some("ws.chatgpt.com".to_string()),
+                    path: Some("/backend-api/codex/responses".to_string()),
+                    ..DetectionContext::default()
+                },
+            )
+            .expect("codex detection should exist");
+        assert_eq!(codex.agent.as_deref(), Some("codex"));
+
+        let warp = engine
+            .evaluate_detection_for_host(
+                "api.warp.dev",
+                &DetectionContext {
+                    host: Some("api.warp.dev".to_string()),
+                    path: Some("/v1/chat/completions".to_string()),
+                    user_agent: Some("Warp/0.2026.01".to_string()),
+                    ..DetectionContext::default()
+                },
+            )
+            .expect("warp detection should exist");
+        assert_eq!(warp.agent.as_deref(), Some("warp"));
     }
 
     #[test]
@@ -2670,8 +2748,31 @@ mod tests {
     #[test]
     fn contains_noise_keyword_matches_case_insensitive() {
         let keywords = vec!["Analytics".to_string()];
-        assert!(contains_noise_keyword("/v1/ANALYTICS/query", &keywords));
-        assert!(!contains_noise_keyword("/v1/messages", &keywords));
+        assert!(contains_noise_keyword_for_host(
+            "api.openai.com",
+            "/v1/ANALYTICS/query",
+            &keywords
+        ));
+        assert!(!contains_noise_keyword_for_host(
+            "api.openai.com",
+            "/v1/messages",
+            &keywords
+        ));
+    }
+
+    #[test]
+    fn contains_noise_keyword_host_scoped_pattern_requires_host_match() {
+        let keywords = vec!["api.anthropic.com/api/hello".to_string()];
+        assert!(contains_noise_keyword_for_host(
+            "api.anthropic.com",
+            "/api/hello",
+            &keywords
+        ));
+        assert!(!contains_noise_keyword_for_host(
+            "chatgpt.com",
+            "/api/hello",
+            &keywords
+        ));
     }
 
     #[test]

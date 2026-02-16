@@ -682,7 +682,8 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     };
 
     let config = load_wrap_config(config.as_ref())?;
-    let bundle_only_detection = matches!(config.forward_proxy.registry_mode, RegistryMode::BundleOnly);
+    let bundle_only_detection =
+        matches!(config.forward_proxy.registry_mode, RegistryMode::BundleOnly);
     let oisp_engine = load_wrap_oisp_engine(&config);
     let env_keys = collect_environment_keys();
     let initial_resolution = if matches!(
@@ -701,18 +702,18 @@ pub async fn run(args: WrapArgs) -> Result<()> {
             &legacy_initial_agent,
             !bundle_only_detection,
         )
-            .unwrap_or_else(|| WrapDetectionResolution {
-                agent: if bundle_only_detection {
-                    AgentInfo::unknown()
-                } else {
-                    legacy_initial_agent.clone()
-                },
-                metadata: if bundle_only_detection {
-                    bundle_only_unknown_detection_metadata()
-                } else {
-                    legacy_detection_metadata(&legacy_initial_agent)
-                },
-            })
+        .unwrap_or_else(|| WrapDetectionResolution {
+            agent: if bundle_only_detection {
+                AgentInfo::unknown()
+            } else {
+                legacy_initial_agent.clone()
+            },
+            metadata: if bundle_only_detection {
+                bundle_only_unknown_detection_metadata()
+            } else {
+                legacy_detection_metadata(&legacy_initial_agent)
+            },
+        })
     } else {
         WrapDetectionResolution {
             agent: if bundle_only_detection {

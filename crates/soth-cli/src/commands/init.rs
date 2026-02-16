@@ -15,6 +15,14 @@ forward_proxy:
   address: "127.0.0.1"
   port: 8080
   capture_max_body_bytes: 15728640
+  process_attribution:
+    enabled: true
+    lookup_timeout: "200ms"
+    cache_ttl: "30s"
+  tunnel_debug:
+    enabled: false
+    include_noise: false
+    min_log_interval: "30s"
   hosts:
     mode: "discovery"  # discovery | selective
     # Domain classes are loaded from dedicated files (recommended).

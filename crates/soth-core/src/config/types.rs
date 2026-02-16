@@ -1253,6 +1253,14 @@ pub struct ForwardProxyConfig {
     /// Maximum HTTP request/response body size to capture for observability.
     #[serde(default = "default_forward_proxy_capture_max_body_bytes")]
     pub capture_max_body_bytes: u64,
+
+    /// Process attribution controls (socket -> pid/process lookup).
+    #[serde(default)]
+    pub process_attribution: ProcessAttributionConfig,
+
+    /// Tunnel-only debug logging controls (metadata only; no body capture).
+    #[serde(default)]
+    pub tunnel_debug: TunnelDebugConfig,
 }
 
 fn default_forward_proxy_port() -> u16 {
@@ -1265,6 +1273,22 @@ fn default_ai_timeout() -> Duration {
 
 fn default_forward_proxy_capture_max_body_bytes() -> u64 {
     15 * 1024 * 1024
+}
+
+fn default_process_attr_enabled() -> bool {
+    true
+}
+
+fn default_process_attr_lookup_timeout() -> Duration {
+    Duration::from_millis(200)
+}
+
+fn default_process_attr_cache_ttl() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_tunnel_debug_min_log_interval() -> Duration {
+    Duration::from_secs(30)
 }
 
 impl Default for ForwardProxyConfig {
@@ -1280,6 +1304,8 @@ impl Default for ForwardProxyConfig {
             request_timeout: default_ai_timeout(),
             registry_mode: RegistryMode::default(),
             capture_max_body_bytes: default_forward_proxy_capture_max_body_bytes(),
+            process_attribution: ProcessAttributionConfig::default(),
+            tunnel_debug: TunnelDebugConfig::default(),
         }
     }
 }
@@ -1288,6 +1314,64 @@ impl ForwardProxyConfig {
     /// Get the socket address for the proxy
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.address, self.port)
+    }
+}
+
+/// Process attribution configuration for proxy traffic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessAttributionConfig {
+    /// Enable socket-owner process attribution where supported (macOS/Linux).
+    #[serde(default = "default_process_attr_enabled")]
+    pub enabled: bool,
+
+    /// Timeout for process lookup command(s) like `lsof`.
+    #[serde(
+        default = "default_process_attr_lookup_timeout",
+        with = "humantime_serde"
+    )]
+    pub lookup_timeout: Duration,
+
+    /// Cache TTL for resolved client socket -> process identity.
+    #[serde(default = "default_process_attr_cache_ttl", with = "humantime_serde")]
+    pub cache_ttl: Duration,
+}
+
+impl Default for ProcessAttributionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_process_attr_enabled(),
+            lookup_timeout: default_process_attr_lookup_timeout(),
+            cache_ttl: default_process_attr_cache_ttl(),
+        }
+    }
+}
+
+/// Debug logging controls for tunneled/noise requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelDebugConfig {
+    /// Emit periodic metadata logs for traffic that is tunneled (not captured).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Include noise-filtered requests in tunnel debug logs.
+    #[serde(default)]
+    pub include_noise: bool,
+
+    /// Minimum interval between repeated logs for the same host/process key.
+    #[serde(
+        default = "default_tunnel_debug_min_log_interval",
+        with = "humantime_serde"
+    )]
+    pub min_log_interval: Duration,
+}
+
+impl Default for TunnelDebugConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_noise: false,
+            min_log_interval: default_tunnel_debug_min_log_interval(),
+        }
     }
 }
 
@@ -2321,6 +2405,21 @@ crypto_identity:
         assert_eq!(config.address, "127.0.0.1");
         assert_eq!(config.socket_addr(), "127.0.0.1:8080");
         assert_eq!(config.registry_mode, RegistryMode::Registry);
+        assert!(config.process_attribution.enabled);
+        assert_eq!(
+            config.process_attribution.lookup_timeout,
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            config.process_attribution.cache_ttl,
+            Duration::from_secs(30)
+        );
+        assert!(!config.tunnel_debug.enabled);
+        assert!(!config.tunnel_debug.include_noise);
+        assert_eq!(
+            config.tunnel_debug.min_log_interval,
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
@@ -2798,6 +2897,47 @@ forward_proxy:
             let config: SothConfig = serde_yaml::from_str(&yaml).unwrap();
             assert_eq!(config.forward_proxy.registry_mode, RegistryMode::BundleOnly);
         }
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_process_attribution_yaml() {
+        let yaml = r#"
+forward_proxy:
+  enabled: true
+  process_attribution:
+    enabled: true
+    lookup_timeout: "350ms"
+    cache_ttl: "45s"
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.forward_proxy.process_attribution.enabled);
+        assert_eq!(
+            config.forward_proxy.process_attribution.lookup_timeout,
+            Duration::from_millis(350)
+        );
+        assert_eq!(
+            config.forward_proxy.process_attribution.cache_ttl,
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_tunnel_debug_yaml() {
+        let yaml = r#"
+forward_proxy:
+  enabled: true
+  tunnel_debug:
+    enabled: true
+    include_noise: true
+    min_log_interval: "5s"
+"#;
+        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.forward_proxy.tunnel_debug.enabled);
+        assert!(config.forward_proxy.tunnel_debug.include_noise);
+        assert_eq!(
+            config.forward_proxy.tunnel_debug.min_log_interval,
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

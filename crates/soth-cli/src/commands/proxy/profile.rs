@@ -27,7 +27,7 @@ pub async fn run_start(
 ) -> anyhow::Result<()> {
     match profile {
         RuntimeProfile::SensorOnly => {
-            start::run(sensor_port, config_path, quiet, true, false).await
+            start::run(sensor_port, config_path, quiet, true, false, None, false).await
         }
         RuntimeProfile::ApiOnly => api::run_start(api_port, config_path, quiet).await,
         RuntimeProfile::UiOnly => ui::run_start(config_path, api_port, ui_dir, quiet).await,

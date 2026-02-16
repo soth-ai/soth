@@ -489,15 +489,8 @@ fn collect_provider_path_hints(
         }
         if let Some(features) = provider_obj.get("features").and_then(Value::as_object) {
             for feature in features.values() {
-                if let Some(patterns) = feature.get("patterns").and_then(Value::as_array) {
-                    for pattern in patterns {
-                        if let Some(raw) = pattern.as_str() {
-                            let value = raw.trim();
-                            if !value.is_empty() {
-                                paths.push(value.to_string());
-                            }
-                        }
-                    }
+                if let Some(patterns) = feature.get("patterns") {
+                    collect_feature_pattern_paths(patterns, &mut paths);
                 }
             }
         }
@@ -507,6 +500,38 @@ fn collect_provider_path_hints(
         }
     }
     out
+}
+
+fn collect_feature_pattern_paths(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(raw) => {
+            let path = raw.trim();
+            if !path.is_empty() {
+                out.push(path.to_string());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_feature_pattern_paths(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["url", "path", "pattern", "route", "endpoint"] {
+                if let Some(raw) = map.get(key).and_then(Value::as_str) {
+                    let path = raw.trim();
+                    if !path.is_empty() {
+                        out.push(path.to_string());
+                    }
+                }
+            }
+            for nested_key in ["request", "response"] {
+                if let Some(nested) = map.get(nested_key) {
+                    collect_feature_pattern_paths(nested, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn parse_catalog_domain_index(
@@ -1254,6 +1279,48 @@ mod tests {
             parsed.pricing["openai"]["gpt-5"].input_per_million_usd,
             Some(1.0)
         );
+    }
+
+    #[test]
+    fn parse_compiled_bundle_collects_feature_object_pattern_paths() {
+        let value = json!({
+            "version": "catalog-v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "local",
+            "domain_index": {
+                "claude.ai": {
+                    "category": "agent-apps",
+                    "pattern_type": "exact",
+                    "provider": "claude"
+                }
+            },
+            "providers": {
+                "claude": {
+                    "name": "Claude",
+                    "category": "agent-apps",
+                    "api_domains": ["claude.ai"],
+                    "features": {
+                        "chat": {
+                            "patterns": {
+                                "request": { "url": "/api/organizations/*/chat_conversations/*/completion", "method": "POST" },
+                                "response": { "url": "/api/organizations/*/chat_conversations/*", "method": "GET" }
+                            }
+                        }
+                    }
+                }
+            },
+            "pricing": {}
+        });
+
+        let parsed = parse_compiled_bundle(&value).unwrap();
+        assert_eq!(parsed.domain_index.len(), 1);
+        let entry = parsed.domain_index.first().unwrap();
+        assert!(entry
+            .paths
+            .contains(&"/api/organizations/*/chat_conversations/*/completion".to_string()));
+        assert!(entry
+            .paths
+            .contains(&"/api/organizations/*/chat_conversations/*".to_string()));
     }
 
     #[test]

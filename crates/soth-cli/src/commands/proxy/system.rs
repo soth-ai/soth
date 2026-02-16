@@ -220,13 +220,34 @@ fn get_macos_network_services() -> Result<Vec<String>> {
         .output()
         .context("Failed to list network services")?;
 
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!(
+            "networksetup -listallnetworkservices failed: {} {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("AuthorizationCreate() failed")
+        || stdout.contains("requires admin privileges")
+    {
+        anyhow::bail!("unable to read macOS network services: {}", stdout.trim());
+    }
     let mut services = Vec::new();
 
     for line in stdout.lines() {
         let line = line.trim();
         // Skip the header line and disabled services (marked with *)
-        if line.is_empty() || line.starts_with('*') || line.contains("denotes") {
+        if line.is_empty()
+            || line.starts_with('*')
+            || line.contains("denotes")
+            || line.contains("AuthorizationCreate() failed")
+            || line.contains("requires admin privileges")
+            || line.starts_with("** Error")
+        {
             continue;
         }
         // Check if this is a known/common service we should configure
@@ -239,7 +260,13 @@ fn get_macos_network_services() -> Result<Vec<String>> {
     if services.is_empty() {
         for line in stdout.lines() {
             let line = line.trim();
-            if !line.is_empty() && !line.starts_with('*') && !line.contains("denotes") {
+            if !line.is_empty()
+                && !line.starts_with('*')
+                && !line.contains("denotes")
+                && !line.contains("AuthorizationCreate() failed")
+                && !line.contains("requires admin privileges")
+                && !line.starts_with("** Error")
+            {
                 services.push(line.to_string());
             }
         }
@@ -259,10 +286,17 @@ fn run_networksetup(args: &[&str]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Some errors are expected (e.g., service doesn't exist)
-        if !stderr.contains("not recognized") && !stderr.contains("not exist") {
-            debug!("networksetup warning: {}", stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{} {}", stdout.trim(), stderr.trim());
+
+        // Skip known non-fatal "service not found" cases only.
+        if combined.contains("not recognized") || combined.contains("not exist") {
+            debug!("networksetup warning: {}", combined);
+            return Ok(());
         }
+
+        // Fail fast on auth/permission errors and other command failures.
+        anyhow::bail!("networksetup {:?} failed: {}", args, combined.trim());
     }
     Ok(())
 }

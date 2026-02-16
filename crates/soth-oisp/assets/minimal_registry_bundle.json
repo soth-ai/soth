@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "version": "embedded-minimal-v1",
+  "version": "embedded-minimal-v2",
   "compiled_at": "2026-02-14T00:00:00Z",
   "bundle_type": "local",
   "domain_index": [
@@ -9,6 +9,9 @@
     { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
     { "host": "ws.chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
     { "host": "*.chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
+    { "host": "api.warp.dev", "provider_id": "warp", "entry_type": "agent-app" },
+    { "host": "warp.dev", "provider_id": "warp", "entry_type": "agent-app" },
+    { "host": "*.warp.dev", "provider_id": "warp", "entry_type": "agent-app" },
     { "host": "api.anthropic.com", "provider_id": "anthropic", "entry_type": "ai-inference" },
     { "host": "api.claude.ai", "provider_id": "anthropic", "entry_type": "ai-inference" },
     { "host": "claude.ai", "provider_id": "claude", "entry_type": "agent-app" },
@@ -42,13 +45,105 @@
       "id": "chatgpt",
       "name": "ChatGPT",
       "type": "agent-app",
-      "api_format": "openai"
+      "api_format": "openai",
+      "detection": {
+        "host_patterns": ["chatgpt.com", "chat.openai.com", "ws.chatgpt.com"],
+        "ua_rules": [
+          {
+            "id": "chatgpt_codex_ua",
+            "agent": "codex",
+            "reason": "ua_codex",
+            "confidence": 0.95,
+            "contains": ["openai-codex", "codex/"]
+          }
+        ],
+        "path_rules": [
+          {
+            "id": "chatgpt_codex_path",
+            "agent": "codex",
+            "reason": "path_codex",
+            "confidence": 0.98,
+            "contains": ["/backend-api/codex/", "/codex/"]
+          }
+        ],
+        "model_rules": [
+          {
+            "id": "chatgpt_codex_model",
+            "agent": "codex",
+            "reason": "model_codex",
+            "confidence": 0.99,
+            "contains": "codex"
+          }
+        ]
+      }
+    },
+    "warp": {
+      "id": "warp",
+      "name": "Warp",
+      "type": "agent-app",
+      "api_format": "openai",
+      "detection": {
+        "host_patterns": ["api.warp.dev", "warp.dev", "*.warp.dev"],
+        "ua_rules": [
+          {
+            "id": "warp_ua",
+            "agent": "warp",
+            "reason": "ua_warp",
+            "confidence": 0.92,
+            "contains": "warp"
+          }
+        ],
+        "process_rules": [
+          {
+            "id": "warp_process",
+            "agent": "warp",
+            "reason": "process_warp",
+            "confidence": 0.9,
+            "contains": "warp"
+          }
+        ]
+      }
     },
     "anthropic": {
       "id": "anthropic",
       "name": "Anthropic",
       "type": "ai-inference",
-      "api_format": "anthropic"
+      "api_format": "anthropic",
+      "detection": {
+        "host_patterns": ["api.anthropic.com", "api.claude.ai"],
+        "ua_rules": [
+          {
+            "id": "anthropic_ua_claude_code",
+            "agent": "claude-code",
+            "reason": "ua_claude_code",
+            "confidence": 0.93,
+            "contains": ["claude-code", "claude_code", "claude code"]
+          },
+          {
+            "id": "anthropic_ua_claude",
+            "agent": "claude",
+            "reason": "ua_claude",
+            "confidence": 0.86,
+            "contains": "claude"
+          }
+        ],
+        "process_rules": [
+          {
+            "id": "anthropic_process_claude_code",
+            "agent": "claude-code",
+            "reason": "process_claude_code",
+            "confidence": 0.9,
+            "contains": ["claude-code", "claude code"]
+          },
+          {
+            "id": "anthropic_process_claude",
+            "agent": "claude",
+            "reason": "process_claude",
+            "confidence": 0.84,
+            "contains": "claude"
+          }
+        ]
+      }
     },
     "claude": {
       "id": "claude",
@@ -124,6 +219,9 @@
       "chatgpt.com",
       "ws.chatgpt.com",
       "*.chatgpt.com",
+      "api.warp.dev",
+      "warp.dev",
+      "*.warp.dev",
       "api.anthropic.com",
       "api.claude.ai",
       "claude.ai",
@@ -323,7 +421,7 @@
   ],
   "stats": {
     "providers": 14,
-    "domains": 21,
+    "domains": 22,
     "formats": 4
   }
 }

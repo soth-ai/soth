@@ -107,9 +107,20 @@ pub async fn run_start_internal(
     config: Option<PathBuf>,
     quiet: bool,
     foreground: bool,
+    intercept_all: bool,
+    intercept_all_for: Option<u64>,
     daemon_child: bool,
 ) -> anyhow::Result<()> {
-    start::run(port, config, quiet, foreground, daemon_child).await
+    start::run(
+        port,
+        config,
+        quiet,
+        foreground,
+        intercept_all,
+        intercept_all_for,
+        daemon_child,
+    )
+    .await
 }
 
 pub async fn run_stop() -> anyhow::Result<()> {
