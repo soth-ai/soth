@@ -922,7 +922,7 @@ impl ProxyEnforcer {
     ) -> Result<EnforcementResult, (u16, String, Option<String>)> {
         let envelope = TrafficEnvelope::proxy(
             session_id,
-            "legacy-request",
+            "proxy-request",
             provider,
             host,
             http_method,
