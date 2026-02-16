@@ -780,13 +780,6 @@ pub struct StorageConfig {
     /// Inline payload threshold (bytes) before payload side-table offload.
     #[serde(default = "default_inline_threshold_bytes")]
     pub inline_threshold_bytes: usize,
-
-    /// Deprecated single retention days setting (0 = forever).
-    /// Read for backward compatibility from existing configs.
-    #[serde(default)]
-    #[serde(rename = "retention_days")]
-    #[serde(skip_serializing)]
-    pub legacy_retention_days: Option<u32>,
 }
 
 fn default_storage_backend() -> String {
@@ -808,21 +801,6 @@ impl Default for StorageConfig {
             path: default_storage_path(),
             retention: RetentionConfig::default(),
             inline_threshold_bytes: default_inline_threshold_bytes(),
-            legacy_retention_days: None,
-        }
-    }
-}
-
-impl StorageConfig {
-    /// Applies deprecated `retention_days` when present and no explicit
-    /// source-aware retention values were configured.
-    pub fn apply_legacy_retention_days(&mut self) {
-        let Some(days) = self.legacy_retention_days.take() else {
-            return;
-        };
-
-        if self.retention.is_default() {
-            self.retention = RetentionConfig::uniform(days);
         }
     }
 }
@@ -1604,17 +1582,10 @@ pub enum HostFilterMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RegistryMode {
-    /// Registry bundle-driven detection/intercept with legacy detector kept
-    /// in shadow mode for mismatch telemetry.
-    ///
-    /// `legacy` and `shadow` are accepted as compatibility aliases and map to this mode.
+    /// Registry bundle-driven detection/intercept (standard mode).
     #[default]
-    #[serde(alias = "legacy", alias = "shadow")]
     Registry,
-    /// Registry bundle-driven detection only (cutover mode).
-    ///
-    /// No legacy detector fallback/shadow comparison is executed.
-    #[serde(alias = "strict")]
+    /// Registry bundle-driven detection only (strict cutover mode).
     BundleOnly,
 }
 
@@ -2870,23 +2841,8 @@ forward_proxy:
     }
 
     #[test]
-    fn test_parse_forward_proxy_registry_mode_legacy_aliases_yaml() {
-        for mode in ["legacy", "shadow"] {
-            let yaml = format!(
-                r#"
-forward_proxy:
-  enabled: true
-  registry_mode: {mode}
-"#
-            );
-            let config: SothConfig = serde_yaml::from_str(&yaml).unwrap();
-            assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
-        }
-    }
-
-    #[test]
     fn test_parse_forward_proxy_registry_mode_bundle_only_yaml() {
-        for mode in ["bundle_only", "strict"] {
+        for mode in ["bundle_only"] {
             let yaml = format!(
                 r#"
 forward_proxy:

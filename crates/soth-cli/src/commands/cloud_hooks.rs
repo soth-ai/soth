@@ -238,7 +238,6 @@ pub fn spawn_cloud_pull_runtime(
                 .max(1) as usize,
             body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
             global_tags: config.cloud.tags.clone(),
-            exchange_v2_only: config.exchange_v2.enabled,
             heartbeat_telemetry: Some(std::sync::Arc::new(|| {
                 let snapshot = soth_proxy::metrics::heartbeat_telemetry_snapshot();
                 if snapshot.counters.values().all(|value| *value == 0) {

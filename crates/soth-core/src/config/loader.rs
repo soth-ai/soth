@@ -18,7 +18,6 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 
     let content = std::fs::read_to_string(path)?;
     let mut config: SothConfig = serde_yaml::from_str(&content)?;
-    config.observe.storage.apply_legacy_retention_days();
     apply_host_domain_file_overrides(&mut config, path.parent())?;
 
     // Apply environment variable overrides
@@ -32,7 +31,6 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 /// Load configuration from a string
 pub fn load_config_from_str(content: &str) -> Result<SothConfig> {
     let mut config: SothConfig = serde_yaml::from_str(content)?;
-    config.observe.storage.apply_legacy_retention_days();
     apply_host_domain_file_overrides(&mut config, None)?;
     apply_env_overrides(&mut config);
     normalize_cloud_config(&mut config);
@@ -358,44 +356,6 @@ server:
 "#;
         let config = load_config_from_str(yaml).unwrap();
         assert_eq!(config.server.listen.port, 8080);
-    }
-
-    #[test]
-    fn test_legacy_retention_days_migrates_to_source_aware_retention() {
-        let yaml = r#"
-observe:
-  storage:
-    retention_days: 5
-"#;
-        let config = load_config_from_str(yaml).unwrap();
-        assert_eq!(config.observe.storage.retention.ai_proxy_days, 5);
-        assert_eq!(config.observe.storage.retention.mcp_days, 5);
-        assert_eq!(config.observe.storage.retention.agent_app_days, 5);
-        assert_eq!(config.observe.storage.retention.clusters_days, 5);
-        assert_eq!(config.observe.storage.retention.rollups_days, 5);
-    }
-
-    #[test]
-    fn test_explicit_retention_config_wins_over_legacy_retention_days() {
-        let yaml = r#"
-observe:
-  storage:
-    retention:
-      ai_proxy_days: 9
-      mcp_days: 8
-      agent_app_days: 2
-      clusters_days: 20
-      rollups_days: 120
-      vacuum_after_cleanup: false
-    retention_days: 3
-"#;
-        let config = load_config_from_str(yaml).unwrap();
-        assert_eq!(config.observe.storage.retention.ai_proxy_days, 9);
-        assert_eq!(config.observe.storage.retention.mcp_days, 8);
-        assert_eq!(config.observe.storage.retention.agent_app_days, 2);
-        assert_eq!(config.observe.storage.retention.clusters_days, 20);
-        assert_eq!(config.observe.storage.retention.rollups_days, 120);
-        assert!(!config.observe.storage.retention.vacuum_after_cleanup);
     }
 
     #[test]

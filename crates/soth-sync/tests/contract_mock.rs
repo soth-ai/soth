@@ -1,5 +1,5 @@
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::State;
 use axum::http::{
     header::{CONTENT_TYPE, ETAG},
     HeaderMap, HeaderValue, StatusCode,
@@ -14,9 +14,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use soth_core::api::{
     version::{API_VERSION, API_VERSION_HEADER},
-    BodyUploadResponse, ConfigBudget, ConfigBudgetLimit, ConfigOrg, ConfigPolicy, ConfigResponse,
-    ConfigTeam, ConfigUser, EventBatchRequest, EventBatchResponse, HeartbeatRequest,
-    HeartbeatResponse, RegistryVersionResponse,
+    BlobUploadRequest, BlobUploadResponse, ConfigBudget, ConfigBudgetLimit, ConfigOrg,
+    ConfigPolicy, ConfigResponse, ConfigTeam, ConfigUser, ExchangeBatchRequest,
+    ExchangeBatchResponse, HeartbeatRequest, HeartbeatResponse, RegistryVersionResponse,
 };
 use soth_core::types::{
     exchange_v2::{ExchangeBodyMode, ExchangeEventV2, ExchangeSourceClass, ExchangeTransport},
@@ -56,7 +56,7 @@ fn test_bundle_sha() -> String {
 
 #[derive(Debug, Clone, Default)]
 struct CapturedState {
-    metadata_requests: Vec<EventBatchRequest>,
+    metadata_requests: Vec<ExchangeBatchRequest>,
     body_upload_payloads: Vec<String>,
     heartbeat_requests: Vec<HeartbeatRequest>,
     registry_version_requests: usize,
@@ -107,7 +107,6 @@ async fn contract_sync_endpoints_and_cursors() {
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
-        exchange_v2_only: true,
         heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
@@ -225,7 +224,6 @@ async fn contract_retry_queue_on_body_upload_failure() {
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
-        exchange_v2_only: true,
         heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
@@ -289,7 +287,6 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
-        exchange_v2_only: true,
         heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
@@ -333,7 +330,6 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
-        exchange_v2_only: true,
         heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, None).unwrap();
@@ -360,8 +356,8 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
 
 async fn start_mock_server(state: SharedState) -> Option<String> {
     let app = Router::new()
-        .route("/api/v1/events/batch", post(events_batch_handler))
-        .route("/api/v1/events/:id/body", post(body_upload_handler))
+        .route("/api/v1/exchanges/batch", post(exchange_batch_handler))
+        .route("/api/v1/blobs", post(blob_upload_handler))
         .route("/api/v1/config", get(config_handler))
         .route("/api/v1/heartbeat", post(heartbeat_handler))
         .route("/api/v1/registry/version", get(registry_version_handler))
@@ -384,18 +380,18 @@ async fn start_mock_server(state: SharedState) -> Option<String> {
     Some(format!("http://{}", addr))
 }
 
-async fn events_batch_handler(
+async fn exchange_batch_handler(
     State(state): State<SharedState>,
     headers: HeaderMap,
     body: Bytes,
-) -> (StatusCode, Json<EventBatchResponse>) {
+) -> (StatusCode, Json<ExchangeBatchResponse>) {
     record_headers(&state, &headers);
-    let request = match decode_event_batch_request(&headers, body.as_ref()) {
+    let request = match decode_exchange_batch_request(&headers, body.as_ref()) {
         Ok(request) => request,
         Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(EventBatchResponse {
+                Json(ExchangeBatchResponse {
                     accepted: 0,
                     rejected: 1,
                     errors: vec![soth_core::api::EventError {
@@ -415,7 +411,7 @@ async fn events_batch_handler(
         .push(request.clone());
     (
         StatusCode::OK,
-        Json(EventBatchResponse {
+        Json(ExchangeBatchResponse {
             accepted: request.batch.len() as u64,
             rejected: 0,
             errors: Vec::new(),
@@ -425,53 +421,58 @@ async fn events_batch_handler(
     )
 }
 
-fn decode_event_batch_request(
+fn decode_exchange_batch_request(
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<EventBatchRequest, String> {
+) -> Result<ExchangeBatchRequest, String> {
     let is_gzip = headers
         .get("content-encoding")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.eq_ignore_ascii_case("gzip"))
         .unwrap_or(false);
     if !is_gzip {
-        return serde_json::from_slice::<EventBatchRequest>(body).map_err(|e| e.to_string());
+        return serde_json::from_slice::<ExchangeBatchRequest>(body).map_err(|e| e.to_string());
     }
 
     let mut decoder = GzDecoder::new(body);
     let mut decoded = Vec::new();
     std::io::Read::read_to_end(&mut decoder, &mut decoded).map_err(|error| error.to_string())?;
-    serde_json::from_slice::<EventBatchRequest>(&decoded).map_err(|e| e.to_string())
+    serde_json::from_slice::<ExchangeBatchRequest>(&decoded).map_err(|e| e.to_string())
 }
 
-async fn body_upload_handler(
+async fn blob_upload_handler(
     State(state): State<SharedState>,
-    AxumPath(_event_id): AxumPath<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> (StatusCode, Json<BodyUploadResponse>) {
+) -> (StatusCode, Json<BlobUploadResponse>) {
     record_headers(&state, &headers);
     let mut guard = state.lock().unwrap();
     if guard.body_failures_remaining > 0 {
         guard.body_failures_remaining -= 1;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(BodyUploadResponse {
+            Json(BlobUploadResponse {
                 stored: false,
-                request_key: None,
-                response_key: None,
+                blob_key: None,
+                key: None,
+                sha256: None,
             }),
         );
     }
     guard
         .body_upload_payloads
         .push(String::from_utf8_lossy(&body).to_string());
+    let request = serde_json::from_slice::<BlobUploadRequest>(body.as_ref())
+        .ok()
+        .and_then(|value| value.reference)
+        .unwrap_or_else(|| "blob://stored/mock".to_string());
     (
         StatusCode::OK,
-        Json(BodyUploadResponse {
+        Json(BlobUploadResponse {
             stored: true,
-            request_key: Some("r2/request".to_string()),
-            response_key: Some("r2/response".to_string()),
+            blob_key: Some(request.clone()),
+            key: Some(request),
+            sha256: None,
         }),
     )
 }

@@ -113,16 +113,8 @@ struct PendingRequest {
     parse_confidence: Option<f64>,
     /// Provider/agent entity id derived from bundle detection.
     target_entity_id: Option<String>,
-    /// Source of detection metadata (bundle/legacy_fallback).
+    /// Source of detection metadata (bundle/discovery_fallback).
     detection_source: Option<String>,
-    /// Shadow legacy agent label used for mismatch diagnostics.
-    shadow_agent: Option<String>,
-    /// Shadow legacy detection reason used for mismatch diagnostics.
-    shadow_detection_reason: Option<String>,
-    /// Shadow legacy parse confidence used for mismatch diagnostics.
-    shadow_parse_confidence: Option<f64>,
-    /// Indicates bundle-primary detection diverged from legacy shadow detection.
-    shadow_mismatch: bool,
     /// Whether interception matched blacklist/noise criteria.
     blacklist_match: bool,
     /// Policy decision metadata captured at request enforcement time.
@@ -527,27 +519,6 @@ fn append_catalog_discovery_tags(tags: &mut BTreeMap<String, String>, host: &str
     tags.insert("discovery_host".to_string(), host.to_string());
 }
 
-fn detection_reason_for_bucket(
-    host_is_ai_target: bool,
-    host_is_mcp_target: bool,
-    host_is_agent_target: bool,
-    is_catalog_discovery: bool,
-) -> Option<&'static str> {
-    if is_catalog_discovery {
-        return Some("bundle.discovery.catalog");
-    }
-    if host_is_ai_target {
-        return Some("bundle.whitelist.ai_inference");
-    }
-    if host_is_mcp_target {
-        return Some("bundle.whitelist.mcp");
-    }
-    if host_is_agent_target {
-        return Some("bundle.whitelist.agent_apps");
-    }
-    None
-}
-
 fn is_blacklist_detection_reason(reason: Option<&str>) -> bool {
     matches!(
         reason,
@@ -654,10 +625,6 @@ fn append_detection_tags(tags: &mut BTreeMap<String, String>, pending: &PendingR
         pending.detection_reason.as_deref(),
         pending.parse_confidence,
         pending.target_entity_id.as_deref(),
-        pending.shadow_mismatch,
-        pending.shadow_agent.as_deref(),
-        pending.shadow_detection_reason.as_deref(),
-        pending.shadow_parse_confidence,
     );
 }
 
@@ -667,10 +634,6 @@ fn append_detection_tags_from_values(
     detection_reason: Option<&str>,
     parse_confidence: Option<f64>,
     target_entity_id: Option<&str>,
-    shadow_mismatch: bool,
-    shadow_agent: Option<&str>,
-    shadow_detection_reason: Option<&str>,
-    shadow_parse_confidence: Option<f64>,
 ) {
     if let Some(source) = detection_source {
         tags.insert("detection.source".to_string(), source.to_string());
@@ -688,21 +651,6 @@ fn append_detection_tags_from_values(
         tags.insert(
             "detection.target_entity_id".to_string(),
             entity_id.to_string(),
-        );
-    }
-    if shadow_mismatch {
-        tags.insert("detection.shadow_mismatch".to_string(), "true".to_string());
-    }
-    if let Some(agent) = shadow_agent {
-        tags.insert("detection.shadow_agent".to_string(), agent.to_string());
-    }
-    if let Some(reason) = shadow_detection_reason {
-        tags.insert("detection.shadow_reason".to_string(), reason.to_string());
-    }
-    if let Some(confidence) = shadow_parse_confidence {
-        tags.insert(
-            "detection.shadow_confidence".to_string(),
-            format!("{confidence:.3}"),
         );
     }
 }
@@ -2826,8 +2774,7 @@ impl HttpHandler for AiProxyHandler {
         } else {
             None
         };
-        let legacy_wrap_events_enabled = exchange_v2_cfg.is_none();
-        let bundle_only_mode = matches!(self.registry_mode, RegistryMode::BundleOnly);
+        let wrap_event_fallback_enabled = exchange_v2_cfg.is_none();
         let should_resolve_process = !is_connect
             && ((should_capture_observability
                 && (host_is_ai_target
@@ -3016,28 +2963,6 @@ impl HttpHandler for AiProxyHandler {
                     );
                 }
             }
-            let (legacy_agent, legacy_detection_reason, legacy_parse_confidence) =
-                if bundle_only_mode {
-                    (None, None, None)
-                } else {
-                    let agent = Self::detect_agent_with_context_gated(
-                        ua_agent,
-                        &host,
-                        &path,
-                        model.as_deref(),
-                        host_is_agent_target || (host_mode == HostFilterMode::Discovery),
-                    )
-                    .map(ToString::to_string);
-                    let reason = detection_reason_for_bucket(
-                        host_is_ai_target,
-                        host_is_mcp_target,
-                        host_is_agent_target,
-                        is_catalog_discovery_host,
-                    )
-                    .map(ToString::to_string);
-                    let confidence = parse_confidence_for_reason(reason.as_deref());
-                    (agent, reason, confidence)
-                };
             let process_bundle_id = process_identity
                 .as_ref()
                 .and_then(|value| process_bundle_id_from_executable(value.executable.as_deref()));
@@ -3052,11 +2977,7 @@ impl HttpHandler for AiProxyHandler {
                 model: model.clone(),
                 process_name: process_identity.as_ref().map(|value| value.name.clone()),
                 bundle_id: process_bundle_id,
-                client_name: if bundle_only_mode {
-                    process_agent.clone()
-                } else {
-                    legacy_agent.clone().or_else(|| process_agent.clone())
-                },
+                client_name: process_agent.clone(),
                 client_version: None,
                 env_keys: Vec::new(),
             };
@@ -3128,21 +3049,13 @@ impl HttpHandler for AiProxyHandler {
             let heuristic_agent = discovery_heuristic.as_ref().map(|value| value.0.clone());
             let should_prefer_heuristic = heuristic_agent.is_some()
                 && (bundle_agent.is_none() || bundle_detection_is_generic);
-            let agent = if bundle_only_mode {
-                if should_prefer_heuristic {
-                    heuristic_agent.clone().or_else(|| bundle_agent.clone())
-                } else {
-                    bundle_agent.clone()
-                }
-            } else if should_prefer_heuristic {
+            let agent = if should_prefer_heuristic {
                 heuristic_agent
                     .clone()
                     .or_else(|| bundle_agent.clone())
-                    .or_else(|| legacy_agent.clone())
             } else {
                 bundle_agent
                     .clone()
-                    .or_else(|| legacy_agent.clone())
                     .or_else(|| heuristic_agent.clone())
             };
             let (detection_reason, parse_confidence, detection_source) = if should_prefer_heuristic
@@ -3178,43 +3091,16 @@ impl HttpHandler for AiProxyHandler {
                     parse_confidence_for_reason(Some(reason.as_str())),
                     Some("discovery_fallback".to_string()),
                 )
-            } else if bundle_only_mode {
+            } else {
                 (
                     Some("fallback_unknown".to_string()),
                     Some(0.0),
                     Some("bundle".to_string()),
                 )
-            } else {
-                (
-                    legacy_detection_reason.clone(),
-                    legacy_parse_confidence,
-                    Some("legacy_fallback".to_string()),
-                )
             };
             let target_entity_id = bundle_detection
                 .as_ref()
                 .and_then(|value| value.target_entity_id.clone());
-            let (shadow_mismatch, shadow_agent, shadow_detection_reason, shadow_parse_confidence) =
-                if bundle_only_mode {
-                    (false, None, None, None)
-                } else {
-                    let mismatch = match (bundle_agent.as_deref(), legacy_agent.as_deref()) {
-                        (Some(bundle_value), Some(legacy_value)) => {
-                            !bundle_value.eq_ignore_ascii_case(legacy_value)
-                        }
-                        _ => false,
-                    };
-                    (
-                        mismatch,
-                        bundle_detection.as_ref().and_then(|_| legacy_agent.clone()),
-                        bundle_detection
-                            .as_ref()
-                            .and_then(|_| legacy_detection_reason.clone()),
-                        bundle_detection
-                            .as_ref()
-                            .and_then(|_| legacy_parse_confidence),
-                    )
-                };
             let mcp_request_method = if !is_connect
                 && should_capture_observability
                 && (host_is_mcp_target || (host_mode == HostFilterMode::Discovery))
@@ -3402,10 +3288,6 @@ impl HttpHandler for AiProxyHandler {
                             parse_confidence,
                             target_entity_id: target_entity_id.clone(),
                             detection_source: detection_source.clone(),
-                            shadow_agent: shadow_agent.clone(),
-                            shadow_detection_reason: shadow_detection_reason.clone(),
-                            shadow_parse_confidence,
-                            shadow_mismatch,
                             blacklist_match,
                             policy_allowed,
                             policy_reason: None,
@@ -3425,7 +3307,7 @@ impl HttpHandler for AiProxyHandler {
                     "MCP JSON-RPC request"
                 );
 
-                if legacy_wrap_events_enabled {
+                if wrap_event_fallback_enabled {
                     if let Some(ref logger) = event_logger {
                         let mcp_agent = AgentInfo::new(
                             agent.as_deref().unwrap_or("mcp"),
@@ -3465,10 +3347,6 @@ impl HttpHandler for AiProxyHandler {
                             detection_reason.as_deref(),
                             parse_confidence,
                             target_entity_id.as_deref(),
-                            shadow_mismatch,
-                            shadow_agent.as_deref(),
-                            shadow_detection_reason.as_deref(),
-                            shadow_parse_confidence,
                         );
                         if !tags.is_empty() {
                             event = event.with_tags(tags);
@@ -3519,10 +3397,6 @@ impl HttpHandler for AiProxyHandler {
                         parse_confidence,
                         target_entity_id: target_entity_id.clone(),
                         detection_source: detection_source.clone(),
-                        shadow_agent: shadow_agent.clone(),
-                        shadow_detection_reason: shadow_detection_reason.clone(),
-                        shadow_parse_confidence,
-                        shadow_mismatch,
                         blacklist_match,
                         policy_allowed: None,
                         policy_reason: None,
@@ -3600,7 +3474,7 @@ impl HttpHandler for AiProxyHandler {
         } else {
             None
         };
-        let legacy_wrap_events_enabled = exchange_v2_cfg.is_none();
+        let wrap_event_fallback_enabled = exchange_v2_cfg.is_none();
         let capture_max_body_bytes = self.capture_max_body_bytes;
         let budget_tracker = self
             .enforcer
@@ -3727,7 +3601,7 @@ impl HttpHandler for AiProxyHandler {
                         },
                     );
                     let exchange_tags = tags.clone();
-                    if legacy_wrap_events_enabled {
+                    if wrap_event_fallback_enabled {
                         if !tags.is_empty() {
                             event = event.with_tags(tags);
                         }
@@ -4025,7 +3899,7 @@ impl HttpHandler for AiProxyHandler {
                             enriched_tags.extend(subscription_tags);
                         }
                         let content_for_exchange = content.clone();
-                        if legacy_wrap_events_enabled {
+                        if wrap_event_fallback_enabled {
                             let mut event = build_paired_response_event(ResponseEventInput {
                                 session_id: &log_session_id,
                                 host: &log_pending.host,
@@ -4161,7 +4035,7 @@ impl HttpHandler for AiProxyHandler {
                             enriched_tags.extend(subscription_tags);
                         }
                     }
-                    if legacy_wrap_events_enabled {
+                    if wrap_event_fallback_enabled {
                         let mut event = build_paired_response_event(ResponseEventInput {
                             session_id: &session_id,
                             host: &pending.host,
@@ -4245,7 +4119,7 @@ impl HttpHandler for AiProxyHandler {
         } else {
             None
         };
-        let legacy_wrap_events_enabled = exchange_v2_cfg.is_none();
+        let wrap_event_fallback_enabled = exchange_v2_cfg.is_none();
         async move {
             let pending = {
                 let mut requests = pending_requests.lock();
@@ -4277,7 +4151,7 @@ impl HttpHandler for AiProxyHandler {
                 append_process_attribution_tags(&mut tags, pending_req.envelope.as_ref());
                 append_detection_tags(&mut tags, pending_req);
                 let usage_meta = ResponseUsageMeta::default();
-                if legacy_wrap_events_enabled {
+                if wrap_event_fallback_enabled {
                     let mut event = build_paired_response_event(ResponseEventInput {
                         session_id: &session_id,
                         host: &pending_req.host,

@@ -47,7 +47,6 @@ pub struct SyncAgentConfig {
     pub metadata_max_compressed_batch_bytes: usize,
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
-    pub exchange_v2_only: bool,
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
 }
 
