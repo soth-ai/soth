@@ -22,6 +22,7 @@ soth-budget = { workspace = true }
 soth-collector = { workspace = true }
 soth-proxy = { workspace = true }
 soth-dashboard = { workspace = true }
+soth-oisp = { workspace = true }
 soth-sync = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }

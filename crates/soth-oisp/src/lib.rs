@@ -70,6 +70,13 @@ pub struct DetectionOutcome {
     pub target_entity_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedDetectionOutcome {
+    pub provider_id: String,
+    pub entry_type: EntryType,
+    pub outcome: DetectionOutcome,
+}
+
 #[derive(Debug, Clone)]
 struct DetectionCandidate {
     outcome: DetectionOutcome,
@@ -205,6 +212,120 @@ impl OispEngine {
         provider_id: &str,
         context: &DetectionContext,
     ) -> Option<DetectionOutcome> {
+        self.evaluate_detection_with_fallback(provider_id, context, true)
+    }
+
+    pub fn evaluate_detection_rules_only(
+        &self,
+        provider_id: &str,
+        context: &DetectionContext,
+    ) -> Option<DetectionOutcome> {
+        self.evaluate_detection_with_fallback(provider_id, context, false)
+    }
+
+    pub fn evaluate_detection_across_entry_types(
+        &self,
+        context: &DetectionContext,
+        entry_types: &[EntryType],
+    ) -> Option<ScopedDetectionOutcome> {
+        if entry_types.is_empty() {
+            return None;
+        }
+
+        let mut provider_ids = self
+            .bundle
+            .providers
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>();
+        provider_ids.sort();
+
+        let mut best: Option<(String, EntryType, DetectionCandidate)> = None;
+        for provider_id in provider_ids {
+            let Some(provider) = self.resolve_provider(provider_id.as_str()) else {
+                continue;
+            };
+            if !entry_types
+                .iter()
+                .any(|entry| *entry == provider.entry_type)
+            {
+                continue;
+            }
+            let mut candidates = Vec::<DetectionCandidate>::new();
+            if let Some(detection) = provider.detection.as_ref() {
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Model,
+                    &detection.model_rules,
+                    provider,
+                    context,
+                );
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Path,
+                    &detection.path_rules,
+                    provider,
+                    context,
+                );
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Ua,
+                    &detection.ua_rules,
+                    provider,
+                    context,
+                );
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Process,
+                    &detection.process_rules,
+                    provider,
+                    context,
+                );
+                collect_detection_candidates(
+                    &mut candidates,
+                    DetectionRuleGroup::Env,
+                    &detection.env_rules,
+                    provider,
+                    context,
+                );
+            }
+
+            let Some(candidate) = candidates
+                .into_iter()
+                .max_by(|left, right| compare_detection_candidates(left, right))
+            else {
+                continue;
+            };
+
+            let should_replace = match best.as_ref() {
+                None => true,
+                Some((best_provider_id, _, best_candidate)) => {
+                    compare_detection_candidates(&candidate, best_candidate)
+                        .then_with(|| best_provider_id.cmp(&provider_id))
+                        .is_gt()
+                }
+            };
+
+            if should_replace {
+                best = Some((provider_id, provider.entry_type.clone(), candidate));
+            }
+        }
+
+        best.map(
+            |(provider_id, entry_type, candidate)| ScopedDetectionOutcome {
+                provider_id,
+                entry_type,
+                outcome: candidate.outcome,
+            },
+        )
+    }
+
+    fn evaluate_detection_with_fallback(
+        &self,
+        provider_id: &str,
+        context: &DetectionContext,
+        include_fallback: bool,
+    ) -> Option<DetectionOutcome> {
         let provider = self.resolve_provider(provider_id)?;
         let mut candidates = Vec::<DetectionCandidate>::new();
 
@@ -251,6 +372,10 @@ impl OispEngine {
             .max_by(|left, right| compare_detection_candidates(left, right))
         {
             return Some(best.outcome);
+        }
+
+        if !include_fallback {
+            return None;
         }
 
         let fallback_agent =
@@ -2659,6 +2784,129 @@ mod tests {
         assert_eq!(first.agent.as_deref(), Some("codex"));
         assert_eq!(first.detection_reason, "ua_match");
         assert_eq!(first.target_entity_id.as_deref(), Some("agt_abc123"));
+    }
+
+    #[test]
+    fn evaluate_detection_rules_only_returns_none_without_match() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v1",
+                "compiled_at": "2026-02-16T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_abc123" }
+                ],
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "entity_id": "agt_abc123",
+                        "name": "ChatGPT",
+                        "type": "agent-app",
+                        "api_format": "openai",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "ua-chatgpt",
+                                    "reason": "ua_match",
+                                    "confidence": 0.90,
+                                    "agent": "chatgpt",
+                                    "contains": "chatgpt"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context = DetectionContext {
+            user_agent: Some("unknown-client".to_string()),
+            ..DetectionContext::default()
+        };
+
+        assert!(engine
+            .evaluate_detection_rules_only("chatgpt", &context)
+            .is_none());
+    }
+
+    #[test]
+    fn evaluate_detection_across_entry_types_prefers_highest_confidence_rule() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v1",
+                "compiled_at": "2026-02-16T00:00:00Z",
+                "bundle_type": "local",
+                "domain_index": [
+                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_chatgpt" },
+                    { "host": "claude.ai", "provider_id": "claude", "entry_type": "agent-app", "provider_entity_id": "agt_claude" }
+                ],
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "entity_id": "agt_chatgpt",
+                        "name": "ChatGPT",
+                        "type": "agent-app",
+                        "api_format": "openai",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "ua-chatgpt",
+                                    "reason": "ua_match",
+                                    "confidence": 0.91,
+                                    "agent": "chatgpt",
+                                    "contains": "assistant-client"
+                                }
+                            ]
+                        }
+                    },
+                    "claude": {
+                        "id": "claude",
+                        "entity_id": "agt_claude",
+                        "name": "Claude",
+                        "type": "agent-app",
+                        "api_format": "anthropic",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "ua-claude",
+                                    "reason": "ua_match",
+                                    "confidence": 0.97,
+                                    "agent": "claude",
+                                    "contains": "assistant-client"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context = DetectionContext {
+            user_agent: Some("assistant-client/1.0".to_string()),
+            ..DetectionContext::default()
+        };
+
+        let outcome = engine
+            .evaluate_detection_across_entry_types(&context, &[EntryType::AgentApp])
+            .expect("detection outcome");
+        assert_eq!(outcome.provider_id, "claude");
+        assert_eq!(outcome.entry_type, EntryType::AgentApp);
+        assert_eq!(outcome.outcome.agent.as_deref(), Some("claude"));
+        assert!((outcome.outcome.parse_confidence - 0.97).abs() < 1e-9);
+        assert_eq!(
+            outcome.outcome.target_entity_id.as_deref(),
+            Some("agt_claude")
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@ use soth_core::{
     generate_session_name, EventLogger, ExchangeSourceClass, MessageDirection, SessionRecorder,
     SessionStorage,
 };
+use soth_oisp::types::provider::EntryType;
+use soth_oisp::{DetectionContext, OispEngine};
 use soth_proxy::pipeline::middleware::RequestContext as PipelineRequestContext;
 use soth_proxy::transport::pii_enrichment::PiiEventEnricher;
 use soth_proxy::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
@@ -71,6 +73,9 @@ struct WrapSession {
     session_id: String,
     server_name: String,
     agent: RwLock<AgentInfo>,
+    detection_metadata: RwLock<WrapDetectionMetadata>,
+    oisp_engine: Option<Arc<OispEngine>>,
+    env_keys: Arc<Vec<String>>,
     event_logger: Option<EventLogger>,
     exchange_v2: soth_core::config::types::ExchangeV2Config,
     request_contexts: RwLock<std::collections::HashMap<String, WrapRequestContext>>,
@@ -102,6 +107,24 @@ struct OutboundProcessResult {
     forward_to_client: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct WrapDetectionMetadata {
+    detection_reason: Option<String>,
+    parse_confidence: Option<f64>,
+    target_entity_id: Option<String>,
+    detection_source: Option<String>,
+    shadow_agent: Option<String>,
+    shadow_detection_reason: Option<String>,
+    shadow_parse_confidence: Option<f64>,
+    shadow_mismatch: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WrapDetectionResolution {
+    agent: AgentInfo,
+    metadata: WrapDetectionMetadata,
+}
+
 fn detection_source_rank(source: DetectionSource) -> u8 {
     match source {
         DetectionSource::CommandLine => 4,
@@ -131,10 +154,183 @@ fn should_promote_agent(current: &AgentInfo, candidate: &AgentInfo) -> bool {
         && candidate.version.is_some()
 }
 
+fn detection_reason_from_source(source: DetectionSource) -> String {
+    format!("{source:?}").to_ascii_lowercase()
+}
+
+fn detection_confidence_from_source(source: DetectionSource) -> f64 {
+    match source {
+        DetectionSource::CommandLine => 1.0,
+        DetectionSource::McpInitialize => 0.92,
+        DetectionSource::Environment => 0.85,
+        DetectionSource::ProcessTree => 0.72,
+        DetectionSource::Unknown => 0.0,
+    }
+}
+
+fn legacy_detection_metadata(agent: &AgentInfo) -> WrapDetectionMetadata {
+    WrapDetectionMetadata {
+        detection_reason: Some(detection_reason_from_source(agent.detected_from)),
+        parse_confidence: Some(detection_confidence_from_source(agent.detected_from)),
+        target_entity_id: None,
+        detection_source: Some("legacy_fallback".to_string()),
+        shadow_agent: None,
+        shadow_detection_reason: None,
+        shadow_parse_confidence: None,
+        shadow_mismatch: false,
+    }
+}
+
+fn collect_environment_keys() -> Arc<Vec<String>> {
+    let mut keys = std::env::vars()
+        .map(|(key, _)| key)
+        .filter(|key| !key.trim().is_empty())
+        .collect::<Vec<String>>();
+    keys.sort();
+    keys.dedup();
+    Arc::new(keys)
+}
+
+fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
+    if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
+        if let Some(parent) = config_cache_path.parent() {
+            return parent.join("registry_bundle_cache.json");
+        }
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join("registry_bundle_cache.json"))
+        .unwrap_or_else(|| PathBuf::from(".soth/registry_bundle_cache.json"))
+}
+
+fn load_wrap_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
+    let cache_path = resolve_registry_bundle_cache_path(config);
+    let engine = match OispEngine::load_from_registry_cache(cache_path.as_path()) {
+        Ok(Some(engine)) => match engine.with_embedded_overlay() {
+            Ok(overlaid) => {
+                info!(
+                    cache = %cache_path.display(),
+                    bundle_version = %overlaid.bundle_version(),
+                    providers = overlaid.provider_count(),
+                    "Loaded OISP bundle for wrap detection (embedded overlay applied)"
+                );
+                overlaid
+            }
+            Err(error) => {
+                warn!(
+                    cache = %cache_path.display(),
+                    error = %error,
+                    "Failed applying embedded overlay for wrap detection; using cache bundle as-is"
+                );
+                engine
+            }
+        },
+        Ok(None) => {
+            warn!(
+                cache = %cache_path.display(),
+                "Wrap detection registry cache missing; using embedded minimal bundle"
+            );
+            match OispEngine::load_embedded_minimal_bundle() {
+                Ok(engine) => engine,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Embedded fallback bundle unavailable for wrap detection"
+                    );
+                    return None;
+                }
+            }
+        }
+        Err(error) => {
+            warn!(
+                cache = %cache_path.display(),
+                error = %error,
+                "Failed loading wrap detection registry cache; using embedded minimal bundle"
+            );
+            match OispEngine::load_embedded_minimal_bundle() {
+                Ok(engine) => engine,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Embedded fallback bundle unavailable for wrap detection"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    Some(Arc::new(engine))
+}
+
+fn build_bundle_detection_context(
+    params: Option<&serde_json::Value>,
+    env_keys: &[String],
+) -> DetectionContext {
+    let client_name = params
+        .and_then(|value| value.get("clientInfo"))
+        .and_then(|info| info.get("name"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    let client_version = params
+        .and_then(|value| value.get("clientInfo"))
+        .and_then(|info| info.get("version"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+
+    DetectionContext {
+        client_name,
+        client_version,
+        env_keys: env_keys.to_vec(),
+        ..DetectionContext::default()
+    }
+}
+
+fn evaluate_bundle_detection(
+    oisp_engine: &OispEngine,
+    params: Option<&serde_json::Value>,
+    env_keys: &[String],
+    legacy_agent: &AgentInfo,
+) -> Option<WrapDetectionResolution> {
+    let context = build_bundle_detection_context(params, env_keys);
+    let scoped = oisp_engine
+        .evaluate_detection_across_entry_types(&context, &[EntryType::AgentApp, EntryType::Mcp])?;
+    let detected_name = scoped
+        .outcome
+        .agent
+        .clone()
+        .unwrap_or(scoped.provider_id.clone());
+    let normalized = agent_detect::canonicalize_agent_name(detected_name.as_str());
+    let mut agent = AgentInfo::new(normalized, DetectionSource::McpInitialize);
+    if let Some(version) = context.client_version {
+        agent = agent.with_version(version);
+    }
+
+    let legacy_reason = detection_reason_from_source(legacy_agent.detected_from);
+    let legacy_confidence = detection_confidence_from_source(legacy_agent.detected_from);
+    let shadow_mismatch = !legacy_agent.name.eq_ignore_ascii_case(agent.name.as_str());
+
+    Some(WrapDetectionResolution {
+        agent,
+        metadata: WrapDetectionMetadata {
+            detection_reason: Some(scoped.outcome.detection_reason),
+            parse_confidence: Some(scoped.outcome.parse_confidence),
+            target_entity_id: scoped.outcome.target_entity_id,
+            detection_source: Some("bundle".to_string()),
+            shadow_agent: Some(legacy_agent.name.clone()),
+            shadow_detection_reason: Some(legacy_reason),
+            shadow_parse_confidence: Some(legacy_confidence),
+            shadow_mismatch,
+        },
+    })
+}
+
 impl WrapSession {
     fn new(
         server_name: String,
         agent: AgentInfo,
+        detection_metadata: WrapDetectionMetadata,
+        oisp_engine: Option<Arc<OispEngine>>,
+        env_keys: Arc<Vec<String>>,
         event_logger: Option<EventLogger>,
         exchange_v2: soth_core::config::types::ExchangeV2Config,
         enforcement: Option<Arc<WrapEnforcement>>,
@@ -163,6 +359,9 @@ impl WrapSession {
             session_id,
             server_name,
             agent: RwLock::new(agent),
+            detection_metadata: RwLock::new(detection_metadata),
+            oisp_engine,
+            env_keys,
             event_logger,
             exchange_v2,
             enforcement,
@@ -218,6 +417,51 @@ impl WrapSession {
             recorder
                 .set_agent_info(effective_agent.name, effective_agent.version)
                 .await;
+        }
+    }
+
+    async fn update_detection_metadata(&self, metadata: WrapDetectionMetadata) {
+        let mut current = self.detection_metadata.write().await;
+        *current = metadata;
+    }
+
+    async fn add_detection_tags(&self, event: &mut WrapEvent) {
+        let metadata = self.detection_metadata.read().await.clone();
+        let mut tags = event.tags.clone().unwrap_or_default();
+
+        if let Some(source) = metadata.detection_source {
+            tags.insert("detection.source".to_string(), source);
+        }
+        if let Some(reason) = metadata.detection_reason {
+            tags.insert("detection.reason".to_string(), reason);
+        }
+        if let Some(confidence) = metadata.parse_confidence {
+            tags.insert(
+                "detection.parse_confidence".to_string(),
+                format!("{confidence:.4}"),
+            );
+        }
+        if let Some(entity_id) = metadata.target_entity_id {
+            tags.insert("detection.target_entity_id".to_string(), entity_id);
+        }
+        if let Some(shadow_agent) = metadata.shadow_agent {
+            tags.insert("detection.shadow_agent".to_string(), shadow_agent);
+        }
+        if let Some(shadow_reason) = metadata.shadow_detection_reason {
+            tags.insert("detection.shadow_reason".to_string(), shadow_reason);
+        }
+        if let Some(shadow_confidence) = metadata.shadow_parse_confidence {
+            tags.insert(
+                "detection.shadow_parse_confidence".to_string(),
+                format!("{shadow_confidence:.4}"),
+            );
+        }
+        if metadata.shadow_mismatch {
+            tags.insert("detection.shadow_mismatch".to_string(), "true".to_string());
+        }
+
+        if !tags.is_empty() {
+            event.tags = Some(tags);
         }
     }
 
@@ -402,14 +646,37 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     // Derive server name
     let server_name = name.unwrap_or_else(|| derive_server_name(cmd, cmd_args));
 
-    // Get initial agent info
-    let initial_agent = if let Some(ref agent_name) = agent {
+    // Get initial agent info from legacy detector (used as shadow baseline).
+    let legacy_initial_agent = if let Some(ref agent_name) = agent {
         AgentInfo::new(agent_name.clone(), DetectionSource::CommandLine)
     } else {
         agent_detect::detect_agent()
     };
 
     let config = load_wrap_config(config.as_ref())?;
+    let oisp_engine = load_wrap_oisp_engine(&config);
+    let env_keys = collect_environment_keys();
+    let initial_resolution = if matches!(
+        legacy_initial_agent.detected_from,
+        DetectionSource::CommandLine
+    ) {
+        WrapDetectionResolution {
+            agent: legacy_initial_agent.clone(),
+            metadata: legacy_detection_metadata(&legacy_initial_agent),
+        }
+    } else if let Some(engine) = oisp_engine.as_ref() {
+        evaluate_bundle_detection(engine, None, env_keys.as_ref(), &legacy_initial_agent)
+            .unwrap_or_else(|| WrapDetectionResolution {
+                agent: legacy_initial_agent.clone(),
+                metadata: legacy_detection_metadata(&legacy_initial_agent),
+            })
+    } else {
+        WrapDetectionResolution {
+            agent: legacy_initial_agent.clone(),
+            metadata: legacy_detection_metadata(&legacy_initial_agent),
+        }
+    };
+
     let pii_enricher = PiiEventEnricher::from_observe_config(&config.observe);
     let enforcement = enforcement::build_wrap_enforcement_runtime(&config)?
         .map(|runtime| Arc::new(WrapEnforcement { runtime }));
@@ -442,7 +709,10 @@ pub async fn run(args: WrapArgs) -> Result<()> {
 
     let session = Arc::new(WrapSession::new(
         server_name.clone(),
-        initial_agent,
+        initial_resolution.agent,
+        initial_resolution.metadata,
+        oisp_engine,
+        env_keys,
         event_logger,
         config.exchange_v2.clone(),
         enforcement,
@@ -725,12 +995,35 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
             // Handle initialize message - extract agent info
             if method == "initialize" {
                 if let Some(params) = msg.get("params") {
-                    if let Some(agent) = agent_detect::detect_from_initialize(params) {
-                        session.update_agent(agent).await;
-                        // Update event with new agent info
-                        let updated_agent = session.agent.read().await.clone();
-                        event.agent = updated_agent;
+                    let legacy_initialize_agent = agent_detect::detect_from_initialize(params);
+                    let legacy_shadow = match legacy_initialize_agent.as_ref() {
+                        Some(agent) => agent.clone(),
+                        None => session.agent.read().await.clone(),
+                    };
+
+                    if let Some(engine) = session.oisp_engine.as_ref() {
+                        if let Some(resolution) = evaluate_bundle_detection(
+                            engine,
+                            Some(params),
+                            session.env_keys.as_ref(),
+                            &legacy_shadow,
+                        ) {
+                            session.update_agent(resolution.agent).await;
+                            session.update_detection_metadata(resolution.metadata).await;
+                        } else if let Some(agent) = legacy_initialize_agent {
+                            session.update_agent(agent.clone()).await;
+                            session
+                                .update_detection_metadata(legacy_detection_metadata(&agent))
+                                .await;
+                        }
+                    } else if let Some(agent) = legacy_initialize_agent {
+                        session.update_agent(agent.clone()).await;
+                        session
+                            .update_detection_metadata(legacy_detection_metadata(&agent))
+                            .await;
                     }
+                    // Update event with latest agent info.
+                    event.agent = session.agent.read().await.clone();
                 }
             }
 
@@ -878,6 +1171,7 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
         .record_message(content, MessageDirection::ToServer)
         .await;
 
+    session.add_detection_tags(&mut event).await;
     session.log_event(&event).await;
     debug!(
         "→ {} {}",
@@ -996,6 +1290,7 @@ async fn process_outbound_message(session: &WrapSession, content: &str) -> Outbo
         .record_message(content, MessageDirection::ToClient)
         .await;
 
+    session.add_detection_tags(&mut event).await;
     session.log_event(&event).await;
     debug!(
         "← {} ({}ms)",

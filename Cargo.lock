@@ -3724,6 +3724,7 @@ dependencies = [
  "soth-crypto",
  "soth-dashboard",
  "soth-observe",
+ "soth-oisp",
  "soth-policy",
  "soth-proxy",
  "soth-sync",

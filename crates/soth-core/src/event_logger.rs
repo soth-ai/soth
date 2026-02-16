@@ -1514,11 +1514,20 @@ fn wrap_event_to_exchange_v2(
         .tags
         .as_ref()
         .and_then(|tags| tags.get("detection.target_entity_id").cloned());
+    let detection_reason = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("detection.reason").cloned())
+        .or_else(|| Some(format!("{:?}", event.agent.detected_from).to_ascii_lowercase()));
+    let parse_confidence = event.tags.as_ref().and_then(|tags| {
+        tags.get("detection.parse_confidence")
+            .and_then(|raw| raw.parse::<f64>().ok())
+    });
     payload.parse = Some(ExchangeParse {
         parser_version: Some("exchange_v2_wrap".to_string()),
         bundle_version: None,
-        parse_confidence: None,
-        detection_reason: Some(format!("{:?}", event.agent.detected_from).to_ascii_lowercase()),
+        parse_confidence,
+        detection_reason,
         target_entity_id,
         detection_source,
     });
@@ -2236,7 +2245,19 @@ mod tests {
         .with_method("tools/call")
         .with_content(r#"{"jsonrpc":"2.0","method":"tools/call"}"#)
         .with_usage_tokens(12, 34)
-        .with_cost(0.0042);
+        .with_cost(0.0042)
+        .with_tags(std::collections::BTreeMap::from([
+            ("detection.source".to_string(), "bundle".to_string()),
+            ("detection.reason".to_string(), "mcp_initialize".to_string()),
+            (
+                "detection.parse_confidence".to_string(),
+                "0.9300".to_string(),
+            ),
+            (
+                "detection.target_entity_id".to_string(),
+                "agt_bundle01".to_string(),
+            ),
+        ]));
 
         logger
             .enqueue_exchange_from_wrap_event(&event, &cfg, Some(ExchangeSourceClass::Mcp))
@@ -2250,5 +2271,14 @@ mod tests {
         assert!(ready[0].payload_json.contains("\"method\":\"tools/call\""));
         assert!(ready[0].payload_json.contains("\"input_tokens\":12"));
         assert!(ready[0].payload_json.contains("\"output_tokens\":34"));
+        assert!(ready[0]
+            .payload_json
+            .contains("\"detection_source\":\"bundle\""));
+        assert!(ready[0]
+            .payload_json
+            .contains("\"detection_reason\":\"mcp_initialize\""));
+        assert!(ready[0]
+            .payload_json
+            .contains("\"target_entity_id\":\"agt_bundle01\""));
     }
 }
