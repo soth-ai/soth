@@ -311,7 +311,8 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, false);
-    seed_exchange_upload_queue(&db_path, "ex-failure-1");
+    let exchange_id = "11111111-2222-3333-4444-555555555555";
+    seed_exchange_upload_queue(&db_path, exchange_id);
 
     let config = SyncAgentConfig {
         endpoint: "http://127.0.0.1:1".to_string(),
@@ -346,8 +347,8 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
     let conn = Connection::open(&db_path).unwrap();
     let attempt_count: i64 = conn
         .query_row(
-            "SELECT attempt_count FROM exchange_upload_queue WHERE exchange_id = 'ex-failure-1'",
-            [],
+            "SELECT attempt_count FROM exchange_upload_queue WHERE exchange_id = ?1",
+            [exchange_id],
             |row| row.get(0),
         )
         .unwrap();

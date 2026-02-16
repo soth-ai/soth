@@ -49,8 +49,7 @@ use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
 use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::response_event_builder::{
-    build_paired_response_event, empty_response_placeholder, normalize_response_content,
-    ResponseEventInput, ResponseKind,
+    empty_response_placeholder, normalize_response_content,
 };
 use crate::transport::tier_enrichment::extract_subscription_tags;
 use crate::transport::usage_enrichment::{
@@ -2759,8 +2758,6 @@ impl HttpHandler for AiProxyHandler {
             && !request_capture_oversized;
         let oisp_engine = self.oisp_engine.clone();
         let event_logger = self.event_logger.clone();
-        let event_tags = self.event_tags.clone();
-        let pii_enricher = self.pii_enricher.clone();
         let learned_passthrough = self.learned_passthrough.clone();
         let learned_failure_threshold = self.learned_failure_threshold;
         let learned_failure_window = self.learned_failure_window;
@@ -2774,7 +2771,6 @@ impl HttpHandler for AiProxyHandler {
         } else {
             None
         };
-        let wrap_event_fallback_enabled = exchange_v2_cfg.is_none();
         let should_resolve_process = !is_connect
             && ((should_capture_observability
                 && (host_is_ai_target
@@ -3050,13 +3046,9 @@ impl HttpHandler for AiProxyHandler {
             let should_prefer_heuristic = heuristic_agent.is_some()
                 && (bundle_agent.is_none() || bundle_detection_is_generic);
             let agent = if should_prefer_heuristic {
-                heuristic_agent
-                    .clone()
-                    .or_else(|| bundle_agent.clone())
+                heuristic_agent.clone().or_else(|| bundle_agent.clone())
             } else {
-                bundle_agent
-                    .clone()
-                    .or_else(|| heuristic_agent.clone())
+                bundle_agent.clone().or_else(|| heuristic_agent.clone())
             };
             let (detection_reason, parse_confidence, detection_source) = if should_prefer_heuristic
             {
@@ -3307,55 +3299,6 @@ impl HttpHandler for AiProxyHandler {
                     "MCP JSON-RPC request"
                 );
 
-                if wrap_event_fallback_enabled {
-                    if let Some(ref logger) = event_logger {
-                        let mcp_agent = AgentInfo::new(
-                            agent.as_deref().unwrap_or("mcp"),
-                            DetectionSource::Environment,
-                        );
-                        let mut event =
-                            WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
-                                .with_source(EventSource::Mcp)
-                                .with_method(mcp_method.clone());
-                        let envelope = apply_process_identity(
-                            TrafficEnvelope::mcp_http(
-                                &session_id,
-                                Some(request_id.to_string()),
-                                mcp_method.clone(),
-                                &host,
-                                &path,
-                                agent.as_deref(),
-                                identity_did.as_deref(),
-                                identity_signature.as_deref(),
-                                body_content.as_deref(),
-                            ),
-                            process_identity.as_ref(),
-                        );
-                        event = event.with_traffic_envelope(envelope);
-                        if let Some(ref request_body) = body_content {
-                            event = event.with_content(request_body.clone());
-                        }
-                        event = event.with_content_preview(format!("→ {} {}", http_method, path));
-                        let mut tags = (*event_tags).clone();
-                        if is_catalog_discovery_host {
-                            append_catalog_discovery_tags(&mut tags, &host);
-                        }
-                        append_process_attribution_tags(&mut tags, event.traffic_envelope.as_ref());
-                        append_detection_tags_from_values(
-                            &mut tags,
-                            detection_source.as_deref(),
-                            detection_reason.as_deref(),
-                            parse_confidence,
-                            target_entity_id.as_deref(),
-                        );
-                        if !tags.is_empty() {
-                            event = event.with_tags(tags);
-                        }
-                        pii_enricher.enrich(&mut event);
-                        logger.log(&event);
-                    }
-                }
-
                 let mut pending = pending_requests.lock();
                 let blacklist_match = is_blacklist_detection_reason(detection_reason.as_deref());
                 pending.insert(
@@ -3474,7 +3417,6 @@ impl HttpHandler for AiProxyHandler {
         } else {
             None
         };
-        let wrap_event_fallback_enabled = exchange_v2_cfg.is_none();
         let capture_max_body_bytes = self.capture_max_body_bytes;
         let budget_tracker = self
             .enforcer
@@ -3547,15 +3489,6 @@ impl HttpHandler for AiProxyHandler {
                 };
 
                 if let Some(ref logger) = event_logger {
-                    let mcp_agent = AgentInfo::new(
-                        pending.agent.as_deref().unwrap_or("mcp"),
-                        DetectionSource::Environment,
-                    );
-                    let method_name = pending
-                        .mcp_method
-                        .clone()
-                        .unwrap_or_else(|| format!("{} {}", pending.method, pending.path));
-                    let response_size_bytes = body_content.as_ref().map(|body| body.len() as u64);
                     let response_payload = body_content.unwrap_or_else(|| {
                         format!(
                             "[no JSON-RPC response body captured for {} {} (HTTP {})]",
@@ -3563,26 +3496,6 @@ impl HttpHandler for AiProxyHandler {
                         )
                     });
 
-                    let mut event =
-                        WrapEvent::new(&session_id, &pending.host, WrapDirection::Out, mcp_agent)
-                            .with_source(EventSource::Mcp)
-                            .with_method(method_name.clone())
-                            .with_status_code(status)
-                            .with_latency(latency_ms)
-                            .with_content(response_payload.clone());
-                    if let Some(envelope) = pending.envelope.clone() {
-                        event = event.with_traffic_envelope(envelope);
-                    }
-                    event =
-                        event.with_payload_sizes(pending.request_size_bytes, response_size_bytes);
-                    event =
-                        event.with_content_preview(format!("← {} (HTTP {})", method_name, status));
-                    if let Some(allowed) = pending.policy_allowed {
-                        event = event.with_policy(allowed, pending.policy_reason.clone());
-                    }
-                    if let Some(ref version) = pending.policy_version {
-                        event = event.with_policy_version(version.clone());
-                    }
                     let mut tags = (*event_tags).clone();
                     if pending.catalog_discovery {
                         append_catalog_discovery_tags(&mut tags, &pending.host);
@@ -3600,14 +3513,7 @@ impl HttpHandler for AiProxyHandler {
                             None
                         },
                     );
-                    let exchange_tags = tags.clone();
-                    if wrap_event_fallback_enabled {
-                        if !tags.is_empty() {
-                            event = event.with_tags(tags);
-                        }
-                        pii_enricher.enrich(&mut event);
-                        logger.log(&event);
-                    }
+                    let exchange_tags = tags;
 
                     if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
                         finalize_and_enqueue_exchange_v2(
@@ -3668,7 +3574,6 @@ impl HttpHandler for AiProxyHandler {
 
             // For JSON responses, capture the body for logging (with decompression)
             // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
-            let mut response_size_bytes: Option<u64> = None;
             let (body_content, res, logged_in_stream) = if !skip_response_capture
                 && (is_json || is_grpc)
                 && !is_sse
@@ -3679,8 +3584,6 @@ impl HttpHandler for AiProxyHandler {
                 match body.collect().await {
                     Ok(collected) => {
                         let bytes = collected.to_bytes();
-                        response_size_bytes = Some(bytes.len() as u64);
-
                         let (decoded_bytes, body_str) =
                             decode_payload_for_logging(&bytes, content_encoding.as_deref());
 
@@ -3720,7 +3623,6 @@ impl HttpHandler for AiProxyHandler {
                 let log_event_logger = event_logger.clone();
                 let log_session_id = session_id.clone();
                 let log_pending = pending.clone();
-                let log_latency_ms = latency_ms;
                 let log_content_encoding = content_encoding.clone();
                 let log_content_type = content_type.clone();
                 let log_grpc_message_encoding = grpc_message_encoding.clone();
@@ -3792,7 +3694,7 @@ impl HttpHandler for AiProxyHandler {
                     }
 
                     // Stream ended - decompress and log the accumulated content
-                    let (decoded_bytes, raw_content, streamed_response_size_bytes) = {
+                    let (decoded_bytes, raw_content) = {
                         let raw_bytes = {
                             let mut guard = accumulated_clone.lock();
                             guard.take().unwrap_or_default()
@@ -3808,7 +3710,7 @@ impl HttpHandler for AiProxyHandler {
                         // Decode once and reuse decoded bytes for usage extraction.
                         let decoded = decode_payload_for_logging(&raw_bytes, log_content_encoding.as_deref());
                         release_stream_buffer(raw_bytes);
-                        (decoded.0, decoded.1, raw_len as u64)
+                        (decoded.0, decoded.1)
                     };
                     let stream_usage = stream_usage_parser.and_then(|parser| parser.finalize());
                     let mut usage_meta = extract_usage_meta_from_stream_usage(
@@ -3899,39 +3801,6 @@ impl HttpHandler for AiProxyHandler {
                             enriched_tags.extend(subscription_tags);
                         }
                         let content_for_exchange = content.clone();
-                        if wrap_event_fallback_enabled {
-                            let mut event = build_paired_response_event(ResponseEventInput {
-                                session_id: &log_session_id,
-                                host: &log_pending.host,
-                                provider: log_provider.as_str(),
-                                agent: log_pending.agent.as_deref(),
-                                method: &log_pending.method,
-                                path: &log_pending.path,
-                                graphql_operation: log_pending.graphql_operation.as_deref(),
-                                is_agent_app: log_pending.is_agent_app,
-                                status,
-                                latency_ms: log_latency_ms,
-                                request_content: log_pending.request_content.as_deref(),
-                                response_content: Some(content),
-                                request_size_bytes: log_pending.request_size_bytes,
-                                response_size_bytes: Some(streamed_response_size_bytes),
-                                headers: log_pending.headers.clone(),
-                                tags: Some(&enriched_tags),
-                                usage_meta: &usage_meta,
-                                fallback_model: log_pending.model.as_deref(),
-                                response_kind: ResponseKind::Stream { is_sse: log_is_sse },
-                                traffic_envelope: log_pending.envelope.clone(),
-                            });
-                            if let Some(allowed) = log_pending.policy_allowed {
-                                event = event.with_policy(allowed, log_pending.policy_reason.clone());
-                            }
-                            if let Some(ref version) = log_pending.policy_version {
-                                event = event.with_policy_version(version.clone());
-                            }
-
-                            log_pii_enricher.enrich(&mut event);
-                            logger.log(&event);
-                        }
                         if let Some(exchange_cfg) = log_exchange_v2_cfg.as_ref() {
                             finalize_and_enqueue_exchange_v2(
                                 logger,
@@ -3968,7 +3837,6 @@ impl HttpHandler for AiProxyHandler {
                 // Return None for body_content - stream logging happens in tee stream.
                 (None, res, true)
             } else {
-                response_size_bytes = declared_response_size_bytes;
                 let placeholder = response_capture_reason.map(|reason| {
                     format!(
                         "[response body capture skipped: {} for {} {} (HTTP {})]",
@@ -4035,42 +3903,6 @@ impl HttpHandler for AiProxyHandler {
                             enriched_tags.extend(subscription_tags);
                         }
                     }
-                    if wrap_event_fallback_enabled {
-                        let mut event = build_paired_response_event(ResponseEventInput {
-                            session_id: &session_id,
-                            host: &pending.host,
-                            provider: provider.as_str(),
-                            agent: pending.agent.as_deref(),
-                            method: &pending.method,
-                            path: &pending.path,
-                            graphql_operation: pending.graphql_operation.as_deref(),
-                            is_agent_app: pending.is_agent_app,
-                            status,
-                            latency_ms,
-                            request_content: pending.request_content.as_deref(),
-                            response_content: normalized_response,
-                            request_size_bytes: pending.request_size_bytes,
-                            response_size_bytes,
-                            headers: pending.headers.clone(),
-                            tags: Some(&enriched_tags),
-                            usage_meta: &response_usage,
-                            fallback_model: pending.model.as_deref(),
-                            response_kind: if is_stream_response {
-                                ResponseKind::Stream { is_sse }
-                            } else {
-                                ResponseKind::Http
-                            },
-                            traffic_envelope: pending.envelope.clone(),
-                        });
-                        if let Some(allowed) = pending.policy_allowed {
-                            event = event.with_policy(allowed, pending.policy_reason.clone());
-                        }
-                        if let Some(ref version) = pending.policy_version {
-                            event = event.with_policy_version(version.clone());
-                        }
-                        pii_enricher.enrich(&mut event);
-                        logger.log(&event);
-                    }
                     if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
                         finalize_and_enqueue_exchange_v2(
                             logger,
@@ -4119,7 +3951,6 @@ impl HttpHandler for AiProxyHandler {
         } else {
             None
         };
-        let wrap_event_fallback_enabled = exchange_v2_cfg.is_none();
         async move {
             let pending = {
                 let mut requests = pending_requests.lock();
@@ -4131,11 +3962,6 @@ impl HttpHandler for AiProxyHandler {
             }
 
             if let (Some(logger), Some(pending_req)) = (event_logger.as_ref(), pending.as_ref()) {
-                let provider = pending_req
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let latency_ms = pending_req.started_at.elapsed().as_millis() as u64;
                 let failure_status = hyper::StatusCode::BAD_GATEWAY.as_u16();
                 let mut tags = (*event_tags).clone();
                 tags.insert("transport_forward_error".to_string(), "true".to_string());
@@ -4151,38 +3977,6 @@ impl HttpHandler for AiProxyHandler {
                 append_process_attribution_tags(&mut tags, pending_req.envelope.as_ref());
                 append_detection_tags(&mut tags, pending_req);
                 let usage_meta = ResponseUsageMeta::default();
-                if wrap_event_fallback_enabled {
-                    let mut event = build_paired_response_event(ResponseEventInput {
-                        session_id: &session_id,
-                        host: &pending_req.host,
-                        provider: provider.as_str(),
-                        agent: pending_req.agent.as_deref(),
-                        method: &pending_req.method,
-                        path: &pending_req.path,
-                        graphql_operation: pending_req.graphql_operation.as_deref(),
-                        is_agent_app: pending_req.is_agent_app,
-                        status: failure_status,
-                        latency_ms,
-                        request_content: pending_req.request_content.as_deref(),
-                        response_content: Some(format!("[forward error] {error}")),
-                        request_size_bytes: pending_req.request_size_bytes,
-                        response_size_bytes: None,
-                        headers: pending_req.headers.clone(),
-                        tags: Some(&tags),
-                        usage_meta: &usage_meta,
-                        fallback_model: pending_req.model.as_deref(),
-                        response_kind: ResponseKind::Http,
-                        traffic_envelope: pending_req.envelope.clone(),
-                    });
-                    if let Some(allowed) = pending_req.policy_allowed {
-                        event = event.with_policy(allowed, pending_req.policy_reason.clone());
-                    }
-                    if let Some(ref version) = pending_req.policy_version {
-                        event = event.with_policy_version(version.clone());
-                    }
-                    pii_enricher.enrich(&mut event);
-                    logger.log(&event);
-                }
                 if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
                     let error_content = format!("[forward error] {error}");
                     finalize_and_enqueue_exchange_v2(

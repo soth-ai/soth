@@ -612,42 +612,14 @@ struct OffsetState {
     sqlite: HashMap<String, SqliteScanState>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct LegacyOffsetState {
-    #[serde(default)]
-    offsets: HashMap<String, u64>,
-}
-
 impl OffsetState {
     fn load(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let data = std::fs::read(path)?;
-        let value = serde_json::from_slice::<serde_json::Value>(&data).with_context(|| {
-            format!("failed parsing collector offset state: {}", path.display())
-        })?;
-        if let Ok(parsed) = serde_json::from_value::<Self>(value.clone()) {
-            let has_legacy_offsets = value.get("offsets").is_some();
-            if !parsed.files.is_empty() || !parsed.sqlite.is_empty() || !has_legacy_offsets {
-                return Ok(parsed);
-            }
-        }
-        let legacy = serde_json::from_value::<LegacyOffsetState>(value).with_context(|| {
-            format!(
-                "failed parsing collector legacy offset state: {}",
-                path.display()
-            )
-        })?;
-        let files = legacy
-            .offsets
-            .into_iter()
-            .map(|(path, offset)| (path, FileScanState { offset, mtime: 0 }))
-            .collect::<HashMap<_, _>>();
-        Ok(Self {
-            files,
-            sqlite: HashMap::new(),
-        })
+        serde_json::from_slice(&data)
+            .with_context(|| format!("failed parsing collector offset state: {}", path.display()))
     }
 
     fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -1261,18 +1233,6 @@ mod tests {
             parse_event_source("agent_apps"),
             Some(EventSource::AgentApp)
         );
-    }
-
-    #[test]
-    fn offset_state_loads_legacy_offsets() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("collector_state.json");
-        std::fs::write(&path, r#"{"offsets":{"/tmp/demo.jsonl":12345}}"#.as_bytes()).unwrap();
-        let loaded = OffsetState::load(&path).unwrap();
-        let file = loaded.files.get("/tmp/demo.jsonl").unwrap();
-        assert_eq!(file.offset, 12345);
-        assert_eq!(file.mtime, 0);
-        assert!(loaded.sqlite.is_empty());
     }
 
     #[test]

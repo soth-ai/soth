@@ -18,7 +18,7 @@ pub struct SpendTracker {
 impl SpendTracker {
     /// Create a new spend tracker
     pub fn new() -> Self {
-        Self::with_pricing_catalog(PricingCatalog::with_defaults())
+        Self::with_pricing_catalog(PricingCatalog::new())
     }
 
     /// Create a spend tracker with an explicit pricing catalog.
@@ -164,8 +164,13 @@ struct BudgetLimits {
 impl BudgetTracker {
     /// Create a new budget tracker
     pub fn new() -> Self {
+        Self::with_pricing_catalog(PricingCatalog::new())
+    }
+
+    /// Create a new budget tracker with an explicit pricing catalog.
+    pub fn with_pricing_catalog(pricing_catalog: PricingCatalog) -> Self {
         Self {
-            spend_tracker: Arc::new(SpendTracker::new()),
+            spend_tracker: Arc::new(SpendTracker::with_pricing_catalog(pricing_catalog)),
             budgets: RwLock::new(HashMap::new()),
             session_budgets: RwLock::new(HashMap::new()),
             session_budget_template: RwLock::new(None),
@@ -419,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_spend_tracker() {
-        let tracker = SpendTracker::new();
+        let tracker = SpendTracker::with_pricing_catalog(PricingCatalog::with_defaults());
 
         tracker.record(
             "session-1",
@@ -440,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_session_spend() {
-        let tracker = SpendTracker::new();
+        let tracker = SpendTracker::with_pricing_catalog(PricingCatalog::with_defaults());
 
         tracker.record("session-1", None, "gpt-4o", 1000, 500, None);
         tracker.record("session-2", None, "gpt-4o", 2000, 1000, None);
@@ -453,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_budget_tracker() {
-        let tracker = BudgetTracker::new();
+        let tracker = BudgetTracker::with_pricing_catalog(PricingCatalog::with_defaults());
 
         tracker.set_global_budget(Some(10.0), None, None);
 
@@ -470,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_agent_budget() {
-        let tracker = BudgetTracker::new();
+        let tracker = BudgetTracker::with_pricing_catalog(PricingCatalog::with_defaults());
 
         tracker.set_agent_budget("agent-1", Some(1.0), None, None);
 
@@ -482,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_session_budget_scope() {
-        let tracker = BudgetTracker::new();
+        let tracker = BudgetTracker::with_pricing_catalog(PricingCatalog::with_defaults());
         tracker.set_session_budget(Some(0.01), None, None);
 
         tracker.record_spend("session-a", None, "gpt-4o", 1_000_000, 500_000);
@@ -496,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_model_budget_scope() {
-        let tracker = BudgetTracker::new();
+        let tracker = BudgetTracker::with_pricing_catalog(PricingCatalog::with_defaults());
         tracker.set_model_budget("gpt-4o", Some(0.01), None, None);
 
         tracker.record_spend("session-a", None, "gpt-4o", 1_000_000, 500_000);

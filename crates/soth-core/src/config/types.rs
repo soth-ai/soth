@@ -1535,15 +1535,15 @@ pub struct HostFilterConfig {
     pub mode: HostFilterMode,
 
     /// Hosts classified as AI inference/app traffic.
-    #[serde(default = "default_ai_inference_hosts")]
+    #[serde(default)]
     pub ai_inference: Vec<String>,
 
     /// Hosts classified as MCP transport/service traffic.
-    #[serde(default = "default_mcp_service_hosts")]
+    #[serde(default)]
     pub mcp: Vec<String>,
 
     /// Hosts classified as agent app traffic (ChatGPT, Claude, Gemini web apps, IDE agents).
-    #[serde(default = "default_agent_app_hosts")]
+    #[serde(default)]
     pub agent_apps: Vec<String>,
 
     /// Optional external domain-list files.
@@ -1607,52 +1607,13 @@ impl std::fmt::Display for HostFilterMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct DomainSeedFile {
-    #[serde(default)]
-    domains: Vec<String>,
-}
-
-fn default_ai_inference_hosts() -> Vec<String> {
-    load_seed_domains(include_str!("../../../../domains/ai_inference.yaml"))
-}
-
-fn default_mcp_service_hosts() -> Vec<String> {
-    load_seed_domains(include_str!("../../../../domains/mcp.yaml"))
-}
-
-fn default_agent_app_hosts() -> Vec<String> {
-    load_seed_domains(include_str!("../../../../domains/agent_apps.yaml"))
-}
-
-fn load_seed_domains(contents: &str) -> Vec<String> {
-    match serde_yaml::from_str::<DomainSeedFile>(contents) {
-        Ok(seed) => dedupe_hosts(seed.domains),
-        Err(error) => {
-            tracing::warn!("Failed to parse embedded domain seed list: {error}");
-            Vec::new()
-        }
-    }
-}
-
-fn dedupe_hosts(hosts: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::with_capacity(hosts.len());
-    let mut deduped = Vec::with_capacity(hosts.len());
-    for host in hosts {
-        if seen.insert(host.clone()) {
-            deduped.push(host);
-        }
-    }
-    deduped
-}
-
 impl Default for HostFilterConfig {
     fn default() -> Self {
         Self {
             mode: HostFilterMode::default(),
-            ai_inference: default_ai_inference_hosts(),
-            mcp: default_mcp_service_hosts(),
-            agent_apps: default_agent_app_hosts(),
+            ai_inference: Vec::new(),
+            mcp: Vec::new(),
+            agent_apps: Vec::new(),
             domain_files: HostDomainFilesConfig::default(),
             block: Vec::new(),
         }
@@ -2514,118 +2475,11 @@ crypto_identity:
     }
 
     #[test]
-    fn test_default_ai_domains_coverage() {
+    fn test_default_host_filter_lists_are_empty() {
         let filter = HostFilterConfig::default();
-
-        // Major AI providers should be intercepted by default
-        let ai_domains = vec![
-            // OpenAI
-            "api.openai.com",
-            "chat.openai.com",
-            "ws.chat.openai.com",
-            "myinstance.openai.azure.com",
-            // Anthropic
-            "api.anthropic.com",
-            // Google
-            "gemini.google.com",
-            "generativelanguage.googleapis.com",
-            "aiplatform.googleapis.com",
-            "us-central1-aiplatform.googleapis.com",
-            // AWS Bedrock
-            "bedrock.us-east-1.amazonaws.com",
-            "bedrock-runtime.us-west-2.amazonaws.com",
-            // Amazon Q / CodeWhisperer
-            "codewhisperer.us-east-1.amazonaws.com",
-            // GitHub Copilot
-            "api.githubcopilot.com",
-            "enterprise.githubcopilot.com",
-            // Cursor / Windsurf / Zed / Junie
-            "api2.cursor.sh",
-            "server.codeium.com",
-            "cloud.zed.dev",
-            "api.jetbrains.ai",
-            // Mistral
-            "api.mistral.ai",
-            // Cohere
-            "api.cohere.ai",
-            // xAI
-            "api.x.ai",
-            // Groq
-            "api.groq.com",
-            // Together
-            "api.together.xyz",
-            // Perplexity
-            "api.perplexity.ai",
-            // Replicate
-            "api.replicate.com",
-            // Hugging Face
-            "api-inference.huggingface.co",
-            // Fireworks
-            "api.fireworks.ai",
-            // OpenRouter
-            "openrouter.ai",
-        ];
-
-        for domain in ai_domains {
-            assert!(
-                filter.should_intercept(domain),
-                "Expected {domain} to be intercepted"
-            );
-        }
-
-        // Non-AI domains should NOT be intercepted (tunneled instead)
-        let non_ai_domains = vec![
-            "google.com",
-            "example.org",
-            "stackoverflow.com",
-            "example.com",
-        ];
-
-        for domain in non_ai_domains {
-            assert!(
-                !filter.should_intercept(domain),
-                "Expected {domain} to NOT be intercepted"
-            );
-        }
-    }
-
-    #[test]
-    fn test_default_mcp_domain_seed_coverage() {
-        let mcp_hosts = default_mcp_service_hosts();
-        assert!(
-            mcp_hosts.len() >= 100,
-            "Expected >=100 MCP service hosts, got {}",
-            mcp_hosts.len()
-        );
-        assert!(
-            mcp_hosts.contains(&"api.github.com".to_string()),
-            "api.github.com should be in MCP seed list"
-        );
-        assert!(
-            mcp_hosts.contains(&"api.slack.com".to_string()),
-            "api.slack.com should be in MCP seed list"
-        );
-        assert!(
-            mcp_hosts.contains(&"api.notion.com".to_string()),
-            "api.notion.com should be in MCP seed list"
-        );
-    }
-
-    #[test]
-    fn test_default_agent_app_domain_seed_coverage() {
-        let agent_hosts = default_agent_app_hosts();
-        assert!(
-            agent_hosts.contains(&"chatgpt.com".to_string()),
-            "chatgpt.com should be in agent app seed list"
-        );
-        assert!(
-            agent_hosts.contains(&"claude.ai".to_string()),
-            "claude.ai should be in agent app seed list"
-        );
-        assert!(
-            agent_hosts.contains(&"gemini.google.com".to_string()),
-            "gemini.google.com should be in agent app seed list"
-        );
+        assert!(filter.ai_inference.is_empty());
+        assert!(filter.mcp.is_empty());
+        assert!(filter.agent_apps.is_empty());
     }
 
     #[test]
@@ -2667,7 +2521,14 @@ crypto_identity:
 
     #[test]
     fn test_agent_app_class_excludes_claude_api_host() {
-        let filter = HostFilterConfig::default();
+        let filter = HostFilterConfig {
+            mode: HostFilterMode::Selective,
+            ai_inference: vec![],
+            mcp: vec![],
+            agent_apps: vec!["claude.ai".to_string(), "api.claude.ai".to_string()],
+            domain_files: HostDomainFilesConfig::default(),
+            block: vec![],
+        };
         assert!(!filter.should_check_agent_app("api.claude.ai"));
         assert!(filter.should_check_agent_app("claude.ai"));
     }

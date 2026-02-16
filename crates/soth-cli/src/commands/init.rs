@@ -1,7 +1,6 @@
 //! Initialize command
 
 use anyhow::Result;
-use soth_core::config::HostFilterConfig;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::info;
@@ -197,16 +196,9 @@ rules:
     action: allow
 "#;
 
-fn render_domain_list(comment: &str, domains: &[String]) -> String {
-    let mut out = String::new();
-    out.push_str(comment);
-    out.push('\n');
-    out.push_str("domains:\n");
-    for domain in domains {
-        out.push_str(&format!("  - \"{}\"\n", domain));
-    }
-    out
-}
+const DEFAULT_AI_DOMAINS: &str = include_str!("../../../../domains/ai_inference.yaml");
+const DEFAULT_MCP_DOMAINS: &str = include_str!("../../../../domains/mcp.yaml");
+const DEFAULT_AGENT_APP_DOMAINS: &str = include_str!("../../../../domains/agent_apps.yaml");
 
 /// Run the init command
 pub async fn run(output: PathBuf) -> Result<()> {
@@ -240,32 +232,22 @@ pub async fn run(output: PathBuf) -> Result<()> {
     fs::create_dir_all(&logs_dir).await?;
     info!("Created logs directory: {:?}", logs_dir);
 
-    // Create domain-list files from canonical defaults.
-    let default_hosts = HostFilterConfig::default();
-    let ai_domain_content =
-        render_domain_list("# AI inference/API domains", &default_hosts.ai_inference);
-    let mcp_domain_content =
-        render_domain_list("# MCP transport/service domains", &default_hosts.mcp);
-    let agent_domain_content = render_domain_list(
-        "# Agent app domains (chat/web/IDE agents)",
-        &default_hosts.agent_apps,
-    );
-
+    // Create domain-list files from canonical seed files.
     let domains_dir = output.join("domains");
     fs::create_dir_all(&domains_dir).await?;
     let ai_domains_path = domains_dir.join("ai_inference.yaml");
     if !ai_domains_path.exists() {
-        fs::write(&ai_domains_path, ai_domain_content).await?;
+        fs::write(&ai_domains_path, DEFAULT_AI_DOMAINS).await?;
         info!("Created AI domain list: {:?}", ai_domains_path);
     }
     let mcp_domains_path = domains_dir.join("mcp.yaml");
     if !mcp_domains_path.exists() {
-        fs::write(&mcp_domains_path, mcp_domain_content).await?;
+        fs::write(&mcp_domains_path, DEFAULT_MCP_DOMAINS).await?;
         info!("Created MCP domain list: {:?}", mcp_domains_path);
     }
     let agent_domains_path = domains_dir.join("agent_apps.yaml");
     if !agent_domains_path.exists() {
-        fs::write(&agent_domains_path, agent_domain_content).await?;
+        fs::write(&agent_domains_path, DEFAULT_AGENT_APP_DOMAINS).await?;
         info!("Created agent app domain list: {:?}", agent_domains_path);
     }
 

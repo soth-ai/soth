@@ -219,7 +219,6 @@ impl SyncAgent {
         let config_version = self.cached_config_version();
 
         for row in rows {
-            let cloud_exchange_id = normalize_exchange_id_for_cloud(row.exchange_id.as_str());
             match self
                 .process_exchange_queue_row(&row, config_version.as_ref())
                 .await
@@ -235,7 +234,6 @@ impl SyncAgent {
                     self.mark_exchange_queue_attempt(&row.exchange_id, row.attempt_count)?;
                     warn!(
                         exchange_id = %row.exchange_id,
-                        cloud_exchange_id = %cloud_exchange_id,
                         attempt = row.attempt_count.saturating_add(1),
                         reason = %reason,
                         "Exchange upload deferred with retry backoff"
@@ -244,7 +242,6 @@ impl SyncAgent {
                 Ok(ExchangeQueueOutcome::Drop { reason }) => {
                     warn!(
                         exchange_id = %row.exchange_id,
-                        cloud_exchange_id = %cloud_exchange_id,
                         reason = %reason,
                         "Dropping malformed exchange upload entry"
                     );
@@ -280,24 +277,13 @@ impl SyncAgent {
                 });
             }
         };
-        let canonical_exchange_id = normalize_exchange_id_for_cloud(event.exchange_id.as_str());
-        if canonical_exchange_id != event.exchange_id {
-            event.exchange_id = canonical_exchange_id.clone();
-            if let Some(reference) = event.request.body.reference.as_mut() {
-                *reference = replace_legacy_exchange_ref(
-                    reference,
-                    row.exchange_id.as_str(),
-                    canonical_exchange_id.as_str(),
-                );
-            }
-            if let Some(reference) = event.response.body.reference.as_mut() {
-                *reference = replace_legacy_exchange_ref(
-                    reference,
-                    row.exchange_id.as_str(),
-                    canonical_exchange_id.as_str(),
-                );
-            }
+        let exchange_id = event.exchange_id.trim().to_string();
+        if Uuid::parse_str(&exchange_id).is_err() {
+            return Ok(ExchangeQueueOutcome::Drop {
+                reason: format!("invalid_exchange_id:{exchange_id}"),
+            });
         }
+        event.exchange_id = exchange_id.clone();
 
         let blobs = match row.blobs_json.as_deref() {
             Some(raw) if !raw.trim().is_empty() => {
@@ -316,7 +302,7 @@ impl SyncAgent {
         let mut blob_uploaded = 0usize;
         for blob in blobs {
             let request = BlobUploadRequest {
-                exchange_id: canonical_exchange_id.clone(),
+                exchange_id: exchange_id.clone(),
                 side: blob.side.clone(),
                 reference: Some(blob.reference.clone()),
                 content_encoding: Some(blob.content_encoding.clone()),
@@ -399,30 +385,6 @@ impl SyncAgent {
             Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => {
                 return Ok(Vec::new());
             }
-            Err(error) if is_missing_column_error(&error, "blobs_json") => {
-                let mut fallback_stmt = conn.prepare(
-                    r#"
-                    SELECT exchange_id, payload_json, attempt_count
-                    FROM exchange_upload_queue
-                    WHERE next_attempt_at IS NULL
-                       OR next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    ORDER BY updated_at ASC
-                    LIMIT ?1
-                    "#,
-                )?;
-                let mut rows = fallback_stmt.query([limit.max(1) as i64])?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next()? {
-                    let attempt_count_i64: i64 = row.get(2)?;
-                    out.push(ExchangeQueueRow {
-                        exchange_id: row.get(0)?,
-                        payload_json: row.get(1)?,
-                        blobs_json: None,
-                        attempt_count: attempt_count_i64.max(0) as u32,
-                    });
-                }
-                return Ok(out);
-            }
             Err(error) => return Err(error.into()),
         };
 
@@ -503,25 +465,6 @@ impl SyncAgent {
     fn set_sync_error(&self, error: &str) -> anyhow::Result<()> {
         self.write_sync_value(SYNC_KEY_SYNC_ERRORS, error)
     }
-}
-
-fn normalize_exchange_id_for_cloud(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if Uuid::parse_str(trimmed).is_ok() {
-        return trimmed.to_string();
-    }
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("soth-legacy-exchange:{trimmed}").as_bytes(),
-    )
-    .to_string()
-}
-
-fn replace_legacy_exchange_ref(reference: &str, legacy: &str, canonical: &str) -> String {
-    if legacy.is_empty() || legacy == canonical {
-        return reference.to_string();
-    }
-    reference.replace(legacy, canonical)
 }
 
 fn open_read_conn(path: &Path) -> anyhow::Result<Connection> {
@@ -836,15 +779,6 @@ fn is_missing_table_error(error: &rusqlite::Error, table: &str) -> bool {
         return message
             .to_ascii_lowercase()
             .contains(&format!("no such table: {}", table.to_ascii_lowercase()));
-    }
-    false
-}
-
-fn is_missing_column_error(error: &rusqlite::Error, column: &str) -> bool {
-    if let rusqlite::Error::SqliteFailure(_, Some(message)) = error {
-        return message
-            .to_ascii_lowercase()
-            .contains(&format!("no such column: {}", column.to_ascii_lowercase()));
     }
     false
 }
