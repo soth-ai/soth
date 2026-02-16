@@ -1,8 +1,10 @@
 use anyhow::Context;
 use regex::Regex;
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub mod types;
 
@@ -137,6 +139,8 @@ impl OispStreamParser {
 #[derive(Clone)]
 pub struct OispEngine {
     bundle: Arc<CompiledBundle>,
+    classification_cache: Arc<Mutex<BoundedCache<String, Option<Classification>>>>,
+    detection_cache: Arc<Mutex<BoundedCache<u64, Option<DetectionOutcome>>>>,
 }
 
 impl OispEngine {
@@ -144,6 +148,8 @@ impl OispEngine {
         bundle.validate()?;
         Ok(Self {
             bundle: Arc::new(bundle),
+            classification_cache: Arc::new(Mutex::new(BoundedCache::new(2_048))),
+            detection_cache: Arc::new(Mutex::new(BoundedCache::new(8_192))),
         })
     }
 
@@ -189,13 +195,29 @@ impl OispEngine {
         if host.is_empty() {
             return None;
         }
-        let entry = select_best_domain_match(&self.bundle.domain_index, host.as_str())?;
-        let provider = self.bundle.providers.get(&entry.provider_id)?;
-        Some(Classification {
-            provider_id: entry.provider_id.clone(),
-            entry_type: provider.entry_type.clone(),
-            api_format: provider.api_format.clone(),
-        })
+        if let Some(cached) = self
+            .classification_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&host))
+        {
+            return cached;
+        }
+        let outcome = select_best_domain_match(&self.bundle.domain_index, host.as_str())
+            .and_then(|entry| {
+                self.bundle
+                    .providers
+                    .get(&entry.provider_id)
+                    .map(|provider| Classification {
+                        provider_id: entry.provider_id.clone(),
+                        entry_type: provider.entry_type.clone(),
+                        api_format: provider.api_format.clone(),
+                    })
+            });
+        if let Ok(mut cache) = self.classification_cache.lock() {
+            cache.insert(host, outcome.clone());
+        }
+        outcome
     }
 
     pub fn evaluate_detection_for_host(
@@ -326,6 +348,16 @@ impl OispEngine {
         context: &DetectionContext,
         include_fallback: bool,
     ) -> Option<DetectionOutcome> {
+        let cache_key = detection_cache_key_hash(provider_id, context, include_fallback);
+        if let Some(cached) = self
+            .detection_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key))
+        {
+            return cached;
+        }
+
         let provider = self.resolve_provider(provider_id)?;
         let mut candidates = Vec::<DetectionCandidate>::new();
 
@@ -367,32 +399,37 @@ impl OispEngine {
             );
         }
 
-        if let Some(best) = candidates
+        let outcome = if let Some(best) = candidates
             .into_iter()
             .max_by(|left, right| compare_detection_candidates(left, right))
         {
-            return Some(best.outcome);
-        }
-
-        if !include_fallback {
-            return None;
-        }
-
-        let fallback_agent =
-            (provider.entry_type == EntryType::AgentApp).then(|| provider.id.clone());
-        let fallback_reason = if fallback_agent.is_some() {
-            "host_classification"
+            Some(best.outcome)
         } else {
-            "fallback_unknown"
-        };
-        let fallback_confidence = if fallback_agent.is_some() { 0.70 } else { 0.0 };
+            if !include_fallback {
+                None
+            } else {
+                let fallback_agent =
+                    (provider.entry_type == EntryType::AgentApp).then(|| provider.id.clone());
+                let fallback_reason = if fallback_agent.is_some() {
+                    "host_classification"
+                } else {
+                    "fallback_unknown"
+                };
+                let fallback_confidence = if fallback_agent.is_some() { 0.70 } else { 0.0 };
 
-        Some(DetectionOutcome {
-            agent: fallback_agent,
-            detection_reason: fallback_reason.to_string(),
-            parse_confidence: fallback_confidence,
-            target_entity_id: provider.entity_id.clone(),
-        })
+                Some(DetectionOutcome {
+                    agent: fallback_agent,
+                    detection_reason: fallback_reason.to_string(),
+                    parse_confidence: fallback_confidence,
+                    target_entity_id: provider.entity_id.clone(),
+                })
+            }
+        };
+
+        if let Ok(mut cache) = self.detection_cache.lock() {
+            cache.insert(cache_key, outcome.clone());
+        }
+        outcome
     }
 
     pub fn should_intercept(&self, host: &str, path: &str) -> InterceptDecision {
@@ -677,6 +714,81 @@ fn compare_detection_candidates(
         })
         // Keep stable deterministic tie-breaks: lexical-min wins.
         .then_with(|| right.stable_key.cmp(&left.stable_key))
+}
+
+#[derive(Debug)]
+struct BoundedCache<K, V>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    cap: usize,
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+}
+
+impl<K, V> BoundedCache<K, V>
+where
+    K: std::hash::Hash + Eq + Clone,
+    V: Clone,
+{
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, value);
+            return;
+        }
+
+        while self.map.len() >= self.cap {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+}
+
+fn detection_cache_key_hash(provider_id: &str, context: &DetectionContext, include_fallback: bool) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    provider_id.trim().to_ascii_lowercase().hash(&mut hasher);
+    include_fallback.hash(&mut hasher);
+
+    hash_opt_trim(context.host.as_deref(), &mut hasher);
+    hash_opt_trim(context.path.as_deref(), &mut hasher);
+    hash_opt_trim(context.user_agent.as_deref(), &mut hasher);
+    hash_opt_trim(context.model.as_deref(), &mut hasher);
+    hash_opt_trim(context.process_name.as_deref(), &mut hasher);
+    hash_opt_trim(context.bundle_id.as_deref(), &mut hasher);
+    hash_opt_trim(context.client_name.as_deref(), &mut hasher);
+    hash_opt_trim(context.client_version.as_deref(), &mut hasher);
+
+    for key in &context.env_keys {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            trimmed.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_opt_trim(value: Option<&str>, state: &mut impl Hasher) {
+    match value.map(str::trim).filter(|candidate| !candidate.is_empty()) {
+        Some(normalized) => normalized.hash(state),
+        None => 0u8.hash(state),
+    }
 }
 
 fn collect_detection_candidates(

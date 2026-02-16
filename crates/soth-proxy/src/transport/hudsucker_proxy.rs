@@ -550,6 +550,8 @@ fn append_detection_tags(tags: &mut BTreeMap<String, String>, pending: &PendingR
     append_detection_tags_from_values(
         tags,
         pending.detection_source.as_deref(),
+        pending.detection_reason.as_deref(),
+        pending.parse_confidence,
         pending.target_entity_id.as_deref(),
         pending.shadow_mismatch,
         pending.shadow_agent.as_deref(),
@@ -561,6 +563,8 @@ fn append_detection_tags(tags: &mut BTreeMap<String, String>, pending: &PendingR
 fn append_detection_tags_from_values(
     tags: &mut BTreeMap<String, String>,
     detection_source: Option<&str>,
+    detection_reason: Option<&str>,
+    parse_confidence: Option<f64>,
     target_entity_id: Option<&str>,
     shadow_mismatch: bool,
     shadow_agent: Option<&str>,
@@ -569,6 +573,15 @@ fn append_detection_tags_from_values(
 ) {
     if let Some(source) = detection_source {
         tags.insert("detection.source".to_string(), source.to_string());
+    }
+    if let Some(reason) = detection_reason {
+        tags.insert("detection.reason".to_string(), reason.to_string());
+    }
+    if let Some(confidence) = parse_confidence {
+        tags.insert(
+            "detection.parse_confidence".to_string(),
+            format!("{confidence:.3}"),
+        );
     }
     if let Some(entity_id) = target_entity_id {
         tags.insert(
@@ -3088,6 +3101,8 @@ impl HttpHandler for AiProxyHandler {
                         append_detection_tags_from_values(
                             &mut tags,
                             detection_source.as_deref(),
+                            detection_reason.as_deref(),
+                            parse_confidence,
                             target_entity_id.as_deref(),
                             shadow_mismatch,
                             shadow_agent.as_deref(),
