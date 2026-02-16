@@ -219,57 +219,29 @@ fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
 fn load_wrap_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
     let cache_path = resolve_registry_bundle_cache_path(config);
     let engine = match OispEngine::load_from_registry_cache(cache_path.as_path()) {
-        Ok(Some(engine)) => match engine.with_embedded_overlay() {
-            Ok(overlaid) => {
-                info!(
-                    cache = %cache_path.display(),
-                    bundle_version = %overlaid.bundle_version(),
-                    providers = overlaid.provider_count(),
-                    "Loaded OISP bundle for wrap detection (embedded overlay applied)"
-                );
-                overlaid
-            }
-            Err(error) => {
-                warn!(
-                    cache = %cache_path.display(),
-                    error = %error,
-                    "Failed applying embedded overlay for wrap detection; using cache bundle as-is"
-                );
-                engine
-            }
-        },
+        Ok(Some(engine)) => {
+            info!(
+                cache = %cache_path.display(),
+                bundle_version = %engine.bundle_version(),
+                providers = engine.provider_count(),
+                "Loaded OISP bundle for wrap detection"
+            );
+            engine
+        }
         Ok(None) => {
             warn!(
                 cache = %cache_path.display(),
-                "Wrap detection registry cache missing; using embedded minimal bundle"
+                "Wrap detection registry cache missing; detection bundle unavailable"
             );
-            match OispEngine::load_embedded_minimal_bundle() {
-                Ok(engine) => engine,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "Embedded fallback bundle unavailable for wrap detection"
-                    );
-                    return None;
-                }
-            }
+            return None;
         }
         Err(error) => {
             warn!(
                 cache = %cache_path.display(),
                 error = %error,
-                "Failed loading wrap detection registry cache; using embedded minimal bundle"
+                "Failed loading wrap detection registry cache; detection bundle unavailable"
             );
-            match OispEngine::load_embedded_minimal_bundle() {
-                Ok(engine) => engine,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "Embedded fallback bundle unavailable for wrap detection"
-                    );
-                    return None;
-                }
-            }
+            return None;
         }
     };
 

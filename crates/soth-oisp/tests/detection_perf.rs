@@ -1,3 +1,5 @@
+use serde_json::json;
+use soth_oisp::types::bundle::parse_compiled_bundle;
 use soth_oisp::{DetectionContext, OispEngine};
 use std::time::Instant;
 
@@ -39,10 +41,54 @@ fn sample_contexts() -> Vec<DetectionContext> {
     ]
 }
 
+fn sample_engine() -> OispEngine {
+    OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "version": "perf-v1",
+            "compiled_at": "2026-02-15T00:00:00Z",
+            "bundle_type": "cloud",
+            "domain_index": [
+                { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
+                { "host": "ws.chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
+                { "host": "api.anthropic.com", "provider_id": "anthropic", "entry_type": "ai-inference" }
+            ],
+            "providers": {
+                "chatgpt": {
+                    "id": "chatgpt",
+                    "name": "ChatGPT",
+                    "type": "agent-app",
+                    "detection": {
+                        "ua_rules": [
+                            { "id": "chatgpt_ua", "agent": "chatgpt", "reason": "ua", "confidence": 0.8, "contains": "chatgpt" }
+                        ],
+                        "path_rules": [
+                            { "id": "codex_path", "agent": "codex", "reason": "path", "confidence": 0.96, "path": "/backend-api/codex/*" }
+                        ]
+                    }
+                },
+                "anthropic": {
+                    "id": "anthropic",
+                    "name": "Anthropic",
+                    "type": "ai-inference",
+                    "detection": {
+                        "ua_rules": [
+                            { "id": "claude_ua", "agent": "claude", "reason": "ua", "confidence": 0.85, "contains": "claude" }
+                        ]
+                    }
+                }
+            },
+            "filters": {},
+            "pricing": {}
+        }))
+        .expect("valid detection benchmark bundle"),
+    )
+    .expect("engine should build for benchmark")
+}
+
 #[test]
 #[ignore = "manual benchmark; run explicitly when tuning detection path"]
 fn benchmark_detection_cache_hot_path() {
-    let engine = OispEngine::load_embedded_minimal_bundle().expect("embedded bundle should load");
+    let engine = sample_engine();
     let contexts = sample_contexts();
     let rounds = 50_000usize;
 

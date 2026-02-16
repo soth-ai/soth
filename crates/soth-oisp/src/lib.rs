@@ -11,8 +11,6 @@ pub mod types;
 use types::bundle::{parse_compiled_bundle, CompiledBundle, DomainIndexEntry};
 use types::provider::{DetectionRule, EntryType, ModelPricing, StreamFormat};
 
-const EMBEDDED_MINIMAL_BUNDLE_JSON: &str = include_str!("../assets/minimal_registry_bundle.json");
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub provider_id: String,
@@ -634,28 +632,6 @@ impl OispEngine {
         }
     }
 
-    /// Load the repository-shipped minimal bundle used as local fallback when cache/cloud bundle
-    /// is missing or invalid.
-    pub fn load_embedded_minimal_bundle() -> anyhow::Result<Self> {
-        let root: Value = serde_json::from_str(EMBEDDED_MINIMAL_BUNDLE_JSON)
-            .context("failed parsing embedded minimal bundle JSON")?;
-        let bundle_value = extract_compiled_bundle_value(&root)
-            .context("embedded minimal bundle missing compiled payload")?;
-        build_engine_from_bundle_value(&bundle_value)
-            .context("failed loading embedded minimal bundle")
-    }
-
-    /// Overlay embedded minimal bundle coverage onto a loaded bundle engine.
-    ///
-    /// This preserves cloud/cache bundle behavior while ensuring baseline host/format coverage
-    /// for core providers is always present.
-    pub fn with_embedded_overlay(&self) -> anyhow::Result<Self> {
-        let mut merged = (*self.bundle).clone();
-        let embedded = embedded_minimal_compiled_bundle()?;
-        merge_compiled_bundle(&mut merged, embedded);
-        OispEngine::new(merged)
-    }
-
     fn resolve_provider_format(&self, provider_id: &str) -> Option<&Value> {
         let provider = self.bundle.providers.get(provider_id)?;
         let mut keys = Vec::with_capacity(2);
@@ -1186,103 +1162,6 @@ fn validate_runtime_bundle_contract(bundle_value: &Value) -> anyhow::Result<()> 
     }
 
     Ok(())
-}
-
-fn embedded_minimal_compiled_bundle() -> anyhow::Result<CompiledBundle> {
-    let root: Value = serde_json::from_str(EMBEDDED_MINIMAL_BUNDLE_JSON)
-        .context("failed parsing embedded minimal bundle JSON")?;
-    let bundle_value = extract_compiled_bundle_value(&root)
-        .context("embedded minimal bundle missing compiled payload")?;
-    parse_compiled_bundle(&bundle_value).context("failed parsing embedded minimal bundle")
-}
-
-fn entry_type_key(entry_type: &EntryType) -> &'static str {
-    match entry_type {
-        EntryType::AiInference => "ai_inference",
-        EntryType::AgentApp => "agent_app",
-        EntryType::Mcp => "mcp",
-    }
-}
-
-fn dedupe_sort(values: &mut Vec<String>) {
-    values.sort();
-    values.dedup();
-}
-
-fn merge_compiled_bundle(primary: &mut CompiledBundle, baseline: CompiledBundle) {
-    for (provider_id, provider) in baseline.providers {
-        primary.providers.entry(provider_id).or_insert(provider);
-    }
-
-    let mut index_pos: std::collections::HashMap<(String, String, String), usize> =
-        std::collections::HashMap::new();
-    for (idx, entry) in primary.domain_index.iter().enumerate() {
-        index_pos.insert(
-            (
-                entry.host.clone(),
-                entry.provider_id.clone(),
-                entry_type_key(&entry.entry_type).to_string(),
-            ),
-            idx,
-        );
-    }
-    for mut entry in baseline.domain_index {
-        let key = (
-            entry.host.clone(),
-            entry.provider_id.clone(),
-            entry_type_key(&entry.entry_type).to_string(),
-        );
-        if let Some(existing_idx) = index_pos.get(&key).copied() {
-            if let Some(existing) = primary.domain_index.get_mut(existing_idx) {
-                existing.paths.append(&mut entry.paths);
-                dedupe_sort(&mut existing.paths);
-            }
-        } else {
-            index_pos.insert(key, primary.domain_index.len());
-            primary.domain_index.push(entry);
-        }
-    }
-
-    for (format_key, format_value) in baseline.formats {
-        primary.formats.entry(format_key).or_insert(format_value);
-    }
-
-    for (provider_id, models) in baseline.pricing {
-        let provider_models = primary.pricing.entry(provider_id).or_default();
-        for (model, price) in models {
-            provider_models.entry(model).or_insert(price);
-        }
-    }
-
-    primary
-        .filters
-        .whitelist
-        .extend(baseline.filters.whitelist.into_iter());
-    primary
-        .filters
-        .blacklist
-        .extend(baseline.filters.blacklist.into_iter());
-    primary
-        .filters
-        .passthrough
-        .extend(baseline.filters.passthrough.into_iter());
-    primary
-        .filters
-        .noise_keywords
-        .extend(baseline.filters.noise_keywords.into_iter());
-    dedupe_sort(&mut primary.filters.whitelist);
-    dedupe_sort(&mut primary.filters.blacklist);
-    dedupe_sort(&mut primary.filters.passthrough);
-    dedupe_sort(&mut primary.filters.noise_keywords);
-
-    primary
-        .catalog_domains
-        .extend(baseline.catalog_domains.into_iter());
-    dedupe_sort(&mut primary.catalog_domains);
-
-    primary.stats.providers = primary.providers.len();
-    primary.stats.domains = primary.domain_index.len();
-    primary.stats.formats = primary.formats.len();
 }
 
 fn format_uses_strip_xssi(format_value: &Value) -> bool {
@@ -2582,8 +2461,31 @@ mod tests {
     }
 
     #[test]
-    fn embedded_minimal_bundle_loads_and_classifies_core_hosts() {
-        let engine = OispEngine::load_embedded_minimal_bundle().unwrap();
+    fn bundle_classification_depends_on_loaded_bundle_content() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "version": "v1",
+                "compiled_at": "2026-02-14T00:00:00Z",
+                "bundle_type": "cloud",
+                "domain_index": [
+                    { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" },
+                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
+                    { "host": "api.anthropic.com", "provider_id": "anthropic", "entry_type": "ai-inference" },
+                    { "host": "app.warp.dev", "provider_id": "warp", "entry_type": "agent-app" },
+                    { "host": "api.warp.dev", "provider_id": "warp", "entry_type": "agent-app" }
+                ],
+                "providers": {
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" },
+                    "chatgpt": { "id": "chatgpt", "name": "ChatGPT", "type": "agent-app" },
+                    "anthropic": { "id": "anthropic", "name": "Anthropic", "type": "ai-inference" },
+                    "warp": { "id": "warp", "name": "Warp", "type": "agent-app" }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         assert!(!engine.bundle_version().trim().is_empty());
         assert!(engine.provider_count() > 0);
         assert!(engine.classify("api.openai.com").is_some());
@@ -2594,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_overlay_adds_missing_baseline_coverage() {
+    fn bundle_classification_does_not_include_implicit_overlay_hosts() {
         let primary = OispEngine::new(
             parse_compiled_bundle(&json!({
                 "version": "primary-v1",
@@ -2619,17 +2521,64 @@ mod tests {
         )
         .unwrap();
 
-        let merged = primary.with_embedded_overlay().unwrap();
-        assert!(merged.classify("api.example.com").is_some());
-        assert!(merged.classify("chatgpt.com").is_some());
-        assert!(merged.classify("app.warp.dev").is_some());
-        assert!(merged.classify("api.warp.dev").is_some());
-        assert!(merged.classify("api.openai.com").is_some());
+        assert!(primary.classify("api.example.com").is_some());
+        assert!(primary.classify("chatgpt.com").is_none());
+        assert!(primary.classify("app.warp.dev").is_none());
+        assert!(primary.classify("api.warp.dev").is_none());
+        assert!(primary.classify("api.openai.com").is_none());
     }
 
     #[test]
-    fn embedded_minimal_bundle_detects_codex_and_warp_agents() {
-        let engine = OispEngine::load_embedded_minimal_bundle().unwrap();
+    fn detection_rules_work_for_codex_and_warp_when_declared_in_bundle() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "version": "v1",
+                "compiled_at": "2026-02-14T00:00:00Z",
+                "bundle_type": "cloud",
+                "domain_index": [
+                    { "host": "ws.chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
+                    { "host": "api.warp.dev", "provider_id": "warp", "entry_type": "agent-app" }
+                ],
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "name": "ChatGPT",
+                        "type": "agent-app",
+                        "detection": {
+                            "path_rules": [
+                                {
+                                    "id": "chatgpt_codex_path",
+                                    "agent": "codex",
+                                    "reason": "path_contains_codex",
+                                    "confidence": 0.96,
+                                    "path": "/backend-api/codex/*"
+                                }
+                            ]
+                        }
+                    },
+                    "warp": {
+                        "id": "warp",
+                        "name": "Warp",
+                        "type": "agent-app",
+                        "detection": {
+                            "ua_rules": [
+                                {
+                                    "id": "warp_ua",
+                                    "agent": "warp",
+                                    "reason": "ua_prefix_warp",
+                                    "confidence": 0.9,
+                                    "prefix": "warp/"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "filters": {},
+                "pricing": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let codex = engine
             .evaluate_detection_for_host(
                 "ws.chatgpt.com",
@@ -2647,7 +2596,7 @@ mod tests {
                 "api.warp.dev",
                 &DetectionContext {
                     host: Some("api.warp.dev".to_string()),
-                    path: Some("/v1/chat/completions".to_string()),
+                    path: Some("/graphql/v2".to_string()),
                     user_agent: Some("Warp/0.2026.01".to_string()),
                     ..DetectionContext::default()
                 },

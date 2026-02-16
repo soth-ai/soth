@@ -2207,7 +2207,7 @@ pub struct AiProxyHandler {
     process_attribution: Arc<ProcessAttribution>,
     /// Migration mode for registry-driven detection/interception.
     registry_mode: RegistryMode,
-    /// Bundle-driven classifier loaded from registry cache or embedded fallback.
+    /// Bundle-driven classifier loaded from registry cache.
     oisp_engine: Arc<OispEngine>,
     /// Optional exchange.v2 assembly config (disabled when None).
     exchange_v2: Option<ExchangeAssemblerConfig>,
@@ -2873,9 +2873,9 @@ impl HttpHandler for AiProxyHandler {
                 let process_pid = process_identity.as_ref().map(|value| value.pid);
                 let process_name = process_identity.as_ref().map(|value| value.name.as_str());
                 if tunnel_debug.should_log(decision_label, &host, process_pid, process_name) {
-                    let process_bundle_id = process_identity
-                        .as_ref()
-                        .and_then(|value| process_bundle_id_from_executable(value.executable.as_deref()));
+                    let process_bundle_id = process_identity.as_ref().and_then(|value| {
+                        process_bundle_id_from_executable(value.executable.as_deref())
+                    });
                     info!(
                         host = %host,
                         method = "CONNECT",
@@ -4624,55 +4624,16 @@ impl WebSocketHandler for AiWebSocketHandler {
 }
 
 fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyError> {
-    if let Some(path) = cache_path {
-        match OispEngine::load_from_registry_cache(path) {
-            Ok(Some(engine)) => {
-                let engine = match engine.with_embedded_overlay() {
-                    Ok(overlaid) => overlaid,
-                    Err(error) => {
-                        warn!(
-                            cache = %path.display(),
-                            error = %error,
-                            "Failed applying embedded baseline overlay; continuing with cache bundle as-is"
-                        );
-                        engine
-                    }
-                };
-                info!(
-                    cache = %path.display(),
-                    bundle_version = %engine.bundle_version(),
-                    providers = engine.provider_count(),
-                    domains = engine.domain_count(),
-                    catalog_domains = engine.catalog_domain_count(),
-                    whitelist = engine.whitelist_count(),
-                    blacklist = engine.blacklist_count(),
-                    passthrough = engine.passthrough_count(),
-                    noise_keywords = engine.noise_keyword_count(),
-                    "Loaded OISP bundle for proxy classification (embedded baseline overlay applied)"
-                );
-                return Ok(Arc::new(engine));
-            }
-            Ok(None) => {
-                warn!(
-                    cache = %path.display(),
-                    "OISP registry cache not found; using embedded minimal fallback bundle"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    cache = %path.display(),
-                    error = %error,
-                    "Failed to load OISP registry cache; using embedded minimal fallback bundle"
-                );
-            }
-        }
-    } else {
-        warn!("OISP registry cache path not configured; using embedded minimal fallback bundle");
-    }
+    let Some(path) = cache_path else {
+        return Err(ProxyError::transport(
+            "compiled registry bundle is required for proxy start; run `soth init` (or cloud sync) to populate registry cache".to_string(),
+        ));
+    };
 
-    match OispEngine::load_embedded_minimal_bundle() {
-        Ok(engine) => {
+    match OispEngine::load_from_registry_cache(path) {
+        Ok(Some(engine)) => {
             info!(
+                cache = %path.display(),
                 bundle_version = %engine.bundle_version(),
                 providers = engine.provider_count(),
                 domains = engine.domain_count(),
@@ -4681,14 +4642,23 @@ fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyE
                 blacklist = engine.blacklist_count(),
                 passthrough = engine.passthrough_count(),
                 noise_keywords = engine.noise_keyword_count(),
-                "Loaded embedded minimal OISP bundle"
+                "Loaded OISP bundle for proxy classification"
             );
             Ok(Arc::new(engine))
         }
+        Ok(None) => Err(ProxyError::transport(format!(
+            "compiled registry bundle is required for proxy start; cache not found at {}",
+            path.display()
+        ))),
         Err(error) => {
-            error!(error = %error, "Failed to load embedded minimal OISP bundle");
+            error!(
+                cache = %path.display(),
+                error = %error,
+                "Failed to load OISP registry cache"
+            );
             Err(ProxyError::transport(format!(
-                "Failed to load any OISP bundle (cache and embedded fallback both unavailable): {error}"
+                "compiled registry bundle is required for proxy start; failed loading cache {}: {error}",
+                path.display()
             )))
         }
     }
@@ -4958,13 +4928,18 @@ mod tests {
     }
 
     #[test]
-    fn load_oisp_engine_falls_back_to_embedded_bundle_when_cache_missing() {
-        let engine = load_oisp_engine(None).expect("embedded fallback bundle should load");
-        assert!(engine.classify("api.openai.com").is_some());
+    fn load_oisp_engine_requires_configured_cache_path() {
+        let error = match load_oisp_engine(None) {
+            Ok(_) => panic!("expected missing cache path to fail"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("compiled registry bundle is required"));
     }
 
     #[test]
-    fn load_oisp_engine_overlays_embedded_baseline_for_chatgpt_subdomains() {
+    fn load_oisp_engine_uses_cache_bundle_without_embedded_overlay() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("registry_bundle_cache.json");
         let envelope = serde_json::json!({
@@ -5014,14 +4989,21 @@ mod tests {
 
         let engine = load_oisp_engine(Some(path.as_path())).expect("cache bundle should load");
         assert!(engine.classify("chatgpt.com").is_some());
-        // This host is provided by embedded baseline overlay.
-        assert!(engine.classify("ws.chatgpt.com").is_some());
-        assert!(engine.should_intercept_host("ws.chatgpt.com:443"));
-        // Warp app hosts are also provided by embedded baseline overlay.
-        assert!(engine.classify("app.warp.dev").is_some());
-        assert!(engine.classify("api.warp.dev").is_some());
-        assert!(engine.should_intercept_host("app.warp.dev:443"));
-        assert!(engine.should_intercept_host("api.warp.dev:443"));
+        assert!(engine.classify("ws.chatgpt.com").is_none());
+        assert!(!engine.should_intercept_host("ws.chatgpt.com:443"));
+    }
+
+    #[test]
+    fn load_oisp_engine_requires_existing_cache_bundle() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing_registry_bundle_cache.json");
+        let error = match load_oisp_engine(Some(path.as_path())) {
+            Ok(_) => panic!("expected missing cache bundle to fail"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("compiled registry bundle is required"));
     }
 
     #[test]
