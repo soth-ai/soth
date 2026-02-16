@@ -4353,10 +4353,11 @@ where
     let event_tags = Arc::new(observe_config.event_tags.clone());
     let pii_enricher = Arc::new(PiiEventEnricher::from_observe_config(&observe_config));
     let oisp_engine = load_oisp_engine(oisp_registry_cache_path.as_deref())?;
+    let ai_protected_patterns = oisp_engine.ai_inference_domain_patterns();
     let learned_passthrough = if config.tls.learned_passthrough.enabled {
         let learned = Arc::new(LearnedPassthrough::new(
             config.tls.learned_passthrough.state_path.clone(),
-            config.hosts.ai_inference.clone(),
+            ai_protected_patterns,
             config.tls.learned_passthrough.max_age,
         ));
         learned.load();
@@ -4643,9 +4644,6 @@ mod tests {
     fn test_registry_mode_action_uses_oisp_engine() {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::BundleOnly;
-        config.hosts.ai_inference = vec![];
-        config.hosts.mcp = vec![];
-        config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
         let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
@@ -4667,9 +4665,6 @@ mod tests {
     fn test_registry_mode_tunnels_unclassified_hosts() {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::BundleOnly;
-        config.hosts.ai_inference = vec![];
-        config.hosts.mcp = vec![];
-        config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
         let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
@@ -4683,15 +4678,13 @@ mod tests {
     fn test_registry_mode_does_not_fall_back_to_configured_hosts() {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::BundleOnly;
-        config.hosts.ai_inference = vec!["fallback-only.example".to_string()];
-        config.hosts.mcp = vec!["fallback-mcp.example".to_string()];
-        config.hosts.agent_apps = vec!["fallback-agent.example".to_string()];
+        config.hosts.block = vec!["fallback-only.example".to_string()];
         let observe = ObserveConfig::default();
         let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
         assert_eq!(
             handler.get_action("fallback-only.example", "/v1/chat/completions"),
-            HostAction::Tunnel
+            HostAction::Block
         );
     }
 
@@ -4699,9 +4692,6 @@ mod tests {
     fn test_connect_action_uses_host_only_oisp_decision() {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::BundleOnly;
-        config.hosts.ai_inference = vec![];
-        config.hosts.mcp = vec![];
-        config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
         let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
@@ -4724,9 +4714,6 @@ mod tests {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.mode = HostFilterMode::Selective;
-        config.hosts.ai_inference = vec![];
-        config.hosts.mcp = vec![];
-        config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
 
         let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine())
@@ -4744,9 +4731,6 @@ mod tests {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.mode = HostFilterMode::Selective;
-        config.hosts.ai_inference = vec![];
-        config.hosts.mcp = vec![];
-        config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
 
         let expired = SystemTime::now()
@@ -4766,9 +4750,6 @@ mod tests {
         let mut config = ForwardProxyConfig::default();
         config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.mode = HostFilterMode::Discovery;
-        config.hosts.ai_inference = vec![];
-        config.hosts.mcp = vec![];
-        config.hosts.agent_apps = vec![];
         let observe = ObserveConfig::default();
         let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 

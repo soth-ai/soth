@@ -132,15 +132,7 @@ async fn validate_config(config_path: &PathBuf, verbose: bool) -> Result<()> {
             },
             config.forward_proxy.socket_addr()
         );
-        println!(
-            "  AI hosts:    {}",
-            config.forward_proxy.hosts.ai_inference.len()
-        );
-        println!("  MCP hosts:   {}", config.forward_proxy.hosts.mcp.len());
-        println!(
-            "  Agent hosts: {}",
-            config.forward_proxy.hosts.agent_apps.len()
-        );
+        println!("  Rules:       cloud bundle");
         println!("  Host mode:   {}", config.forward_proxy.hosts.mode);
         println!(
             "  Block:       {} hosts",
@@ -224,15 +216,6 @@ fn validate_forward_proxy(
             "Port {} may require elevated privileges",
             proxy.port
         ));
-    }
-    if proxy.hosts.mode == HostFilterMode::Selective
-        && proxy.hosts.ai_inference.is_empty()
-        && proxy.hosts.mcp.is_empty()
-        && proxy.hosts.agent_apps.is_empty()
-    {
-        warnings.push(
-            "No AI/MCP/Agent host patterns configured; traffic will mostly tunnel".to_string(),
-        );
     }
     if proxy.hosts.mode == HostFilterMode::Discovery {
         warnings.push(

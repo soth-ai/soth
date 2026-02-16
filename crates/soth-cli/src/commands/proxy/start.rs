@@ -164,31 +164,9 @@ pub async fn run(
     // Auto-enable system proxy when soth starts without extra console noise.
     system::enable_quiet(Some(proxy_config.port)).await?;
 
-    let intercept_count = proxy_config.hosts.intercept_domain_count();
-    let mut intercept_hosts: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for host in proxy_config
-        .hosts
-        .ai_inference
-        .iter()
-        .chain(proxy_config.hosts.mcp.iter())
-        .chain(proxy_config.hosts.agent_apps.iter())
-    {
-        if seen.insert(host.clone()) {
-            intercept_hosts.push(host.clone());
-        }
-    }
-
     let intercept_summary = match proxy_config.hosts.mode {
-        HostFilterMode::Discovery => {
-            let seed_preview = summarize_hosts(&intercept_hosts, 2);
-            if intercept_count > 0 {
-                format!("all non-local hosts (discovery), seeds: {seed_preview}")
-            } else {
-                "all non-local hosts (discovery mode)".to_string()
-            }
-        }
-        HostFilterMode::Selective => summarize_hosts(&intercept_hosts, 3),
+        HostFilterMode::Discovery => "all non-local hosts (discovery mode)".to_string(),
+        HostFilterMode::Selective => "bundle-classified hosts (registry cache)".to_string(),
     };
 
     let inline_threshold = config.observe.storage.inline_threshold_bytes;
@@ -210,13 +188,7 @@ pub async fn run(
         proxy_config.hosts.mode,
         proxy_config.socket_addr()
     );
-    let rules_line = format!(
-        "AI:{}  MCP:{}  Agent:{}  Total:{}",
-        proxy_config.hosts.ai_inference.len(),
-        proxy_config.hosts.mcp.len(),
-        proxy_config.hosts.agent_apps.len(),
-        intercept_count
-    );
+    let rules_line = "source=cloud bundle (ai/mcp/agent classification)".to_string();
     let api_line = format!(
         "off (run `soth dev api start --port {}` to enable)",
         config.dashboard.port
@@ -373,23 +345,6 @@ fn truncate_display(value: &str, max_width: usize) -> String {
 
 fn display_width(value: &str) -> usize {
     value.chars().count()
-}
-
-fn summarize_hosts(hosts: &[String], take: usize) -> String {
-    if hosts.is_empty() {
-        return "none".to_string();
-    }
-
-    let mut preview = hosts
-        .iter()
-        .take(take)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if hosts.len() > take {
-        preview.push_str(&format!(", +{}", hosts.len() - take));
-    }
-    preview
 }
 
 fn compact_path(path: &std::path::Path) -> String {

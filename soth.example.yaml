@@ -151,15 +151,8 @@ forward_proxy:
   # Host filtering
   hosts:
     mode: "selective"   # selective | discovery
-    # Domain classes are loaded from dedicated files.
-    # If a file is configured, it replaces the corresponding inline list.
-    domain_files:
-      ai_inference: "./domains/ai_inference.yaml"
-      mcp: "./domains/mcp.yaml"
-      agent_apps: "./domains/agent_apps.yaml"
-    ai_inference: []
-    mcp: []
-    agent_apps: []
+    # Classification/interception is bundle-driven from cloud registry cache.
+    # Keep only explicit local block rules here.
     block: []
 
   # Adaptive TLS passthrough for cert-pinned hosts that fail repeated MITM.

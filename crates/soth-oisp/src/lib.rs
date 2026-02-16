@@ -1,7 +1,7 @@
 use anyhow::Context;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -165,6 +165,16 @@ impl OispEngine {
 
     pub fn catalog_domain_count(&self) -> usize {
         self.bundle.catalog_domains.len()
+    }
+
+    pub fn ai_inference_domain_patterns(&self) -> Vec<String> {
+        let mut patterns = BTreeSet::new();
+        for entry in &self.bundle.domain_index {
+            if entry.entry_type == EntryType::AiInference {
+                patterns.insert(entry.host.clone());
+            }
+        }
+        patterns.into_iter().collect()
     }
 
     pub fn whitelist_count(&self) -> usize {

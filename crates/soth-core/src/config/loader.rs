@@ -4,7 +4,6 @@
 
 use crate::config::types::SothConfig;
 use crate::error::{Result, SothError};
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -18,7 +17,6 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 
     let content = std::fs::read_to_string(path)?;
     let mut config: SothConfig = serde_yaml::from_str(&content)?;
-    apply_host_domain_file_overrides(&mut config, path.parent())?;
 
     // Apply environment variable overrides
     apply_env_overrides(&mut config);
@@ -31,7 +29,6 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 /// Load configuration from a string
 pub fn load_config_from_str(content: &str) -> Result<SothConfig> {
     let mut config: SothConfig = serde_yaml::from_str(content)?;
-    apply_host_domain_file_overrides(&mut config, None)?;
     apply_env_overrides(&mut config);
     normalize_cloud_config(&mut config);
     normalize_budget_db_path(&mut config);
@@ -51,87 +48,6 @@ fn normalize_cloud_config(config: &mut SothConfig) {
     if config.cloud.api_key.is_none() {
         config.cloud.enabled = false;
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum DomainListFile {
-    List(Vec<String>),
-    Object { domains: Vec<String> },
-}
-
-fn normalize_domains(domains: Vec<String>) -> Vec<String> {
-    let mut out = Vec::with_capacity(domains.len());
-    let mut seen = std::collections::HashSet::with_capacity(domains.len());
-    for entry in domains {
-        let trimmed = entry.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if seen.insert(trimmed.to_string()) {
-            out.push(trimmed.to_string());
-        }
-    }
-    out
-}
-
-fn resolve_domain_file_path(raw_path: &Path, base_dir: Option<&Path>) -> std::path::PathBuf {
-    let expanded = expand_path(raw_path);
-    if expanded.is_absolute() {
-        expanded
-    } else if let Some(base) = base_dir {
-        base.join(expanded)
-    } else {
-        expanded
-    }
-}
-
-fn load_domain_list_file(path: &Path) -> Result<Vec<String>> {
-    if !path.exists() {
-        return Err(SothError::ConfigInvalid(format!(
-            "Domain list file not found: {}",
-            path.display()
-        )));
-    }
-
-    let content = std::fs::read_to_string(path)?;
-    let parsed: DomainListFile = serde_yaml::from_str(&content).map_err(|e| {
-        SothError::ConfigInvalid(format!(
-            "Invalid domain list file {}: {}",
-            path.display(),
-            e
-        ))
-    })?;
-
-    let domains = match parsed {
-        DomainListFile::List(domains) => domains,
-        DomainListFile::Object { domains } => domains,
-    };
-    Ok(normalize_domains(domains))
-}
-
-fn apply_host_domain_file_overrides(
-    config: &mut SothConfig,
-    base_dir: Option<&Path>,
-) -> Result<()> {
-    let domain_files = config.forward_proxy.hosts.domain_files.clone();
-
-    if let Some(path) = domain_files.ai_inference.as_ref() {
-        let resolved = resolve_domain_file_path(path, base_dir);
-        config.forward_proxy.hosts.ai_inference = load_domain_list_file(&resolved)?;
-    }
-
-    if let Some(path) = domain_files.mcp.as_ref() {
-        let resolved = resolve_domain_file_path(path, base_dir);
-        config.forward_proxy.hosts.mcp = load_domain_list_file(&resolved)?;
-    }
-
-    if let Some(path) = domain_files.agent_apps.as_ref() {
-        let resolved = resolve_domain_file_path(path, base_dir);
-        config.forward_proxy.hosts.agent_apps = load_domain_list_file(&resolved)?;
-    }
-
-    Ok(())
 }
 
 /// Apply environment variable overrides to the configuration
@@ -332,7 +248,6 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
-    use tempfile::TempDir;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -403,96 +318,6 @@ budget:
         let expanded = expand_path(path);
         assert_eq!(expanded.to_string_lossy(), "/etc/soth/config.yaml");
         restore_env_var("SOTH_CONFIG_DIR", prev);
-    }
-
-    #[test]
-    fn test_load_config_with_domain_files_replaces_inline_lists() {
-        let temp = TempDir::new().unwrap();
-        let domains_dir = temp.path().join("domains");
-        std::fs::create_dir_all(&domains_dir).unwrap();
-
-        std::fs::write(
-            domains_dir.join("ai.yaml"),
-            "domains:\n  - api.openai.com\n  - chatgpt.com\n",
-        )
-        .unwrap();
-        std::fs::write(
-            domains_dir.join("mcp.yaml"),
-            "domains:\n  - api.github.com\n  - api.notion.com\n",
-        )
-        .unwrap();
-        std::fs::write(
-            domains_dir.join("agent.yaml"),
-            "domains:\n  - chatgpt.com\n  - claude.ai\n",
-        )
-        .unwrap();
-
-        let config_path = temp.path().join("soth.yaml");
-        std::fs::write(
-            &config_path,
-            r#"
-forward_proxy:
-  hosts:
-    ai_inference: ["legacy.ai.example"]
-    mcp: ["legacy.mcp.example"]
-    agent_apps: ["legacy.agent.example"]
-    domain_files:
-      ai_inference: "./domains/ai.yaml"
-      mcp: "./domains/mcp.yaml"
-      agent_apps: "./domains/agent.yaml"
-"#,
-        )
-        .unwrap();
-
-        let config = load_config(&config_path).unwrap();
-        assert_eq!(
-            config.forward_proxy.hosts.ai_inference,
-            vec!["api.openai.com".to_string(), "chatgpt.com".to_string()]
-        );
-        assert_eq!(
-            config.forward_proxy.hosts.mcp,
-            vec!["api.github.com".to_string(), "api.notion.com".to_string()]
-        );
-        assert_eq!(
-            config.forward_proxy.hosts.agent_apps,
-            vec!["chatgpt.com".to_string(), "claude.ai".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_load_config_with_missing_domain_file_fails() {
-        let temp = TempDir::new().unwrap();
-        let config_path = temp.path().join("soth.yaml");
-        std::fs::write(
-            &config_path,
-            r#"
-forward_proxy:
-  hosts:
-    domain_files:
-      ai_inference: "./domains/missing-ai.yaml"
-"#,
-        )
-        .unwrap();
-
-        let err = load_config(&config_path).unwrap_err();
-        assert!(matches!(err, SothError::ConfigInvalid(_)));
-    }
-
-    #[test]
-    fn test_domain_list_file_supports_root_sequence() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("domains.yaml");
-        std::fs::write(
-            &path,
-            "- api.openai.com\n- api.openai.com\n- \"  \"\n- chatgpt.com\n",
-        )
-        .unwrap();
-
-        let domains = load_domain_list_file(&path).unwrap();
-        assert_eq!(
-            domains,
-            vec!["api.openai.com".to_string(), "chatgpt.com".to_string()]
-        );
     }
 
     #[test]

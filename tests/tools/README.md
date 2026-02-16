@@ -123,10 +123,7 @@ forward_proxy:
   port: 8080
   hosts:
     mode: selective
-    domain_files:
-      ai_inference: "./domains/ai_inference.yaml"
-      mcp: "./domains/mcp.yaml"
-      agent_apps: "./domains/agent_apps.yaml"
+    block: []
 
 production:
   rate_limit:
