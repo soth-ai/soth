@@ -232,7 +232,7 @@ impl OispEngine {
         provider_id: &str,
         context: &DetectionContext,
     ) -> Option<DetectionOutcome> {
-        self.evaluate_detection_with_fallback(provider_id, context, true)
+        self.evaluate_detection_rules(provider_id, context)
     }
 
     pub fn evaluate_detection_rules_only(
@@ -240,7 +240,7 @@ impl OispEngine {
         provider_id: &str,
         context: &DetectionContext,
     ) -> Option<DetectionOutcome> {
-        self.evaluate_detection_with_fallback(provider_id, context, false)
+        self.evaluate_detection_rules(provider_id, context)
     }
 
     pub fn evaluate_detection_across_entry_types(
@@ -340,13 +340,12 @@ impl OispEngine {
         )
     }
 
-    fn evaluate_detection_with_fallback(
+    fn evaluate_detection_rules(
         &self,
         provider_id: &str,
         context: &DetectionContext,
-        include_fallback: bool,
     ) -> Option<DetectionOutcome> {
-        let cache_key = detection_cache_key_hash(provider_id, context, include_fallback);
+        let cache_key = detection_cache_key_hash(provider_id, context);
         if let Some(cached) = self
             .detection_cache
             .lock()
@@ -403,25 +402,7 @@ impl OispEngine {
         {
             Some(best.outcome)
         } else {
-            if !include_fallback {
-                None
-            } else {
-                let fallback_agent =
-                    (provider.entry_type == EntryType::AgentApp).then(|| provider.id.clone());
-                let fallback_reason = if fallback_agent.is_some() {
-                    "host_classification"
-                } else {
-                    "bundle_unclassified"
-                };
-                let fallback_confidence = if fallback_agent.is_some() { 0.70 } else { 0.0 };
-
-                Some(DetectionOutcome {
-                    agent: fallback_agent,
-                    detection_reason: fallback_reason.to_string(),
-                    parse_confidence: fallback_confidence,
-                    target_entity_id: provider.entity_id.clone(),
-                })
-            }
+            None
         };
 
         if let Ok(mut cache) = self.detection_cache.lock() {
@@ -738,14 +719,9 @@ where
     }
 }
 
-fn detection_cache_key_hash(
-    provider_id: &str,
-    context: &DetectionContext,
-    include_fallback: bool,
-) -> u64 {
+fn detection_cache_key_hash(provider_id: &str, context: &DetectionContext) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     provider_id.trim().to_ascii_lowercase().hash(&mut hasher);
-    include_fallback.hash(&mut hasher);
 
     hash_opt_trim(context.host.as_deref(), &mut hasher);
     hash_opt_trim(context.path.as_deref(), &mut hasher);

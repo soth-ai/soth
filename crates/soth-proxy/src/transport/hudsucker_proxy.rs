@@ -2979,9 +2979,6 @@ impl HttpHandler for AiProxyHandler {
                     value
                         .detection_reason
                         .eq_ignore_ascii_case("bundle_unclassified")
-                        || value
-                            .detection_reason
-                            .eq_ignore_ascii_case("host_classification")
                 })
                 .unwrap_or(true);
             let cross_entry_detection =
