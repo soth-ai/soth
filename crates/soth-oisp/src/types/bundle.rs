@@ -1,4 +1,4 @@
-use super::provider::{EntryType, ModelPricing, ProviderDefinition};
+use super::provider::{DetectionRule, DetectionSpec, EntryType, ModelPricing, ProviderDefinition};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -67,6 +67,8 @@ pub struct ResolvedProvider {
     pub domains: Vec<String>,
     #[serde(default)]
     pub user_agent_patterns: Vec<String>,
+    #[serde(default)]
+    pub detection: Option<DetectionSpec>,
 }
 
 pub fn compiled_bundle_schema_version() -> u32 {
@@ -431,16 +433,19 @@ fn parse_catalog_providers(
 
         let mut domains = extract_string_array(provider_obj.get("api_domains"));
         let mut user_agent_patterns = extract_string_array(provider_obj.get("user_agent_patterns"));
-        if let Some(detection) = provider_obj.get("detection").and_then(Value::as_object) {
-            domains.extend(extract_string_array(detection.get("host_patterns")));
-            user_agent_patterns.extend(extract_string_array(detection.get("header_hints")));
+        let detection = provider_obj
+            .get("detection")
+            .and_then(|value| serde_json::from_value::<DetectionSpec>(value.clone()).ok());
+        if let Some(detection_obj) = provider_obj.get("detection").and_then(Value::as_object) {
+            domains.extend(extract_string_array(detection_obj.get("host_patterns")));
+            user_agent_patterns.extend(extract_string_array(detection_obj.get("header_hints")));
             domains.extend(extract_detection_rule_strings(
-                detection,
+                detection_obj,
                 "host_rules",
                 &["host", "pattern", "contains", "suffix", "regex", "value"],
             ));
             user_agent_patterns.extend(extract_detection_rule_strings(
-                detection,
+                detection_obj,
                 "ua_rules",
                 &["contains", "equals", "pattern", "regex", "value"],
             ));
@@ -458,6 +463,7 @@ fn parse_catalog_providers(
                 api_format,
                 domains,
                 user_agent_patterns,
+                detection,
             },
         );
     }
@@ -903,6 +909,9 @@ fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
         provider.entity_id = normalize_optional_string(provider.entity_id.take());
         dedup_sort_strings(&mut provider.domains);
         dedup_sort_strings(&mut provider.user_agent_patterns);
+        if let Some(detection) = provider.detection.as_mut() {
+            normalize_detection_spec(detection);
+        }
     }
     for entry in &mut bundle.domain_index {
         entry.provider_entity_id = normalize_optional_string(entry.provider_entity_id.take());
@@ -923,6 +932,113 @@ fn normalize_domain_filters(filters: &mut DomainFilters) {
     dedup_sort_strings(&mut filters.blacklist);
     dedup_sort_strings(&mut filters.passthrough);
     dedup_sort_strings(&mut filters.noise_keywords);
+}
+
+fn normalize_detection_spec(detection: &mut DetectionSpec) {
+    dedup_sort_strings(&mut detection.host_patterns);
+    dedup_sort_strings(&mut detection.path_patterns);
+    dedup_sort_strings(&mut detection.header_hints);
+    normalize_detection_rules(&mut detection.ua_rules, "ua_match");
+    normalize_detection_rules(&mut detection.path_rules, "path_match");
+    normalize_detection_rules(&mut detection.model_rules, "model_match");
+    normalize_detection_rules(&mut detection.process_rules, "process_match");
+    normalize_detection_rules(&mut detection.env_rules, "env_match");
+}
+
+fn normalize_detection_rules(rules: &mut Vec<DetectionRule>, default_reason: &str) {
+    for rule in rules.iter_mut() {
+        rule.id = normalize_optional_string(rule.id.take());
+        rule.agent = normalize_optional_string(rule.agent.take());
+        rule.reason = normalize_optional_string(rule.reason.take())
+            .or_else(|| Some(default_reason.to_string()));
+        if let Some(confidence) = rule.confidence {
+            rule.confidence = Some(confidence.clamp(0.0, 1.0));
+        }
+        if rule.enabled.is_none() {
+            rule.enabled = Some(true);
+        }
+
+        let mut cleaned = std::collections::HashMap::new();
+        for (key, value) in std::mem::take(&mut rule.matchers) {
+            let normalized_key = key.trim().to_ascii_lowercase();
+            if normalized_key.is_empty() {
+                continue;
+            }
+            let normalized_value = normalize_detection_matcher_value(value);
+            if !normalized_value.is_null() {
+                cleaned.insert(normalized_key, normalized_value);
+            }
+        }
+        rule.matchers = cleaned;
+    }
+
+    rules.retain(|rule| {
+        rule.enabled.unwrap_or(true)
+            && !rule.matchers.is_empty()
+            && rule
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+    });
+    rules.sort_by(|left, right| detection_rule_sort_key(right).cmp(&detection_rule_sort_key(left)));
+    rules.dedup_by(|left, right| detection_rule_sort_key(left) == detection_rule_sort_key(right));
+}
+
+fn detection_rule_sort_key(rule: &DetectionRule) -> (i32, i32, String, String, String) {
+    let confidence = (rule.confidence.unwrap_or(0.0).clamp(0.0, 1.0) * 1000.0).round() as i32;
+    (
+        rule.priority.unwrap_or(0),
+        confidence,
+        rule.id.clone().unwrap_or_default(),
+        rule.reason.clone().unwrap_or_default(),
+        rule.agent.clone().unwrap_or_default(),
+    )
+}
+
+fn normalize_detection_matcher_value(value: Value) -> Value {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Value::Null
+            } else {
+                Value::String(trimmed.to_string())
+            }
+        }
+        Value::Array(entries) => {
+            let mut out = Vec::new();
+            for entry in entries {
+                let normalized = normalize_detection_matcher_value(entry);
+                if !normalized.is_null() {
+                    out.push(normalized);
+                }
+            }
+            if out.is_empty() {
+                Value::Null
+            } else {
+                Value::Array(out)
+            }
+        }
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, entry) in map {
+                let normalized_key = key.trim().to_ascii_lowercase();
+                if normalized_key.is_empty() {
+                    continue;
+                }
+                let normalized = normalize_detection_matcher_value(entry);
+                if !normalized.is_null() {
+                    out.insert(normalized_key, normalized);
+                }
+            }
+            if out.is_empty() {
+                Value::Null
+            } else {
+                Value::Object(out)
+            }
+        }
+        other => other,
+    }
 }
 
 fn parse_bundle_type(raw: Option<&str>) -> BundleType {
@@ -1293,6 +1409,16 @@ mod tests {
         assert_eq!(parsed.schema_version, 3);
         let provider = parsed.providers.get("openai").unwrap();
         assert_eq!(provider.entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
+        let detection = provider
+            .detection
+            .as_ref()
+            .expect("detection should be parsed");
+        assert_eq!(detection.ua_rules.len(), 1);
+        assert_eq!(detection.path_rules.len(), 1);
+        assert_eq!(
+            detection.path_rules[0].reason.as_deref(),
+            Some("path_match")
+        );
         let entry = parsed.domain_index.first().unwrap();
         assert_eq!(entry.provider_entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
     }
