@@ -190,7 +190,7 @@ impl OispEngine {
     /// Calculate request cost using bundle pricing for a provider/model pair.
     ///
     /// `provider_hints` are checked in order (for example: provider_id then api_format).
-    /// If no hinted provider contains the model, all providers are scanned as a fallback.
+    /// No global fallback scan is performed; callers must provide explicit provider hints.
     pub fn calculate_cost(
         &self,
         provider_hints: &[&str],
@@ -217,18 +217,6 @@ impl OispEngine {
                 .find(|(provider, _)| provider.eq_ignore_ascii_case(provider_hint))
                 .and_then(|(_, models)| find_model_pricing(models, model))
             {
-                return calculate_cost_from_pricing(
-                    pricing,
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                );
-            }
-        }
-
-        for models in self.bundle.pricing.values() {
-            if let Some((_, pricing)) = find_model_pricing(models, model) {
                 return calculate_cost_from_pricing(
                     pricing,
                     input_tokens,

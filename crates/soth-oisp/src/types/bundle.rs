@@ -83,7 +83,7 @@ pub fn compiled_bundle_schema_version() -> u32 {
 }
 
 fn is_supported_compiled_bundle_schema_version(schema_version: u32) -> bool {
-    matches!(schema_version, 1 | 2 | 3)
+    matches!(schema_version, 1..=3)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

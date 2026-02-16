@@ -1525,7 +1525,7 @@ impl Default for PoolConfig {
 }
 
 /// Host filtering configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HostFilterConfig {
     /// Host filtering mode:
     /// - selective: bundle-driven interception only; tunnel non-matching hosts
@@ -1575,15 +1575,6 @@ impl std::fmt::Display for HostFilterMode {
         match self {
             Self::Selective => write!(f, "selective"),
             Self::Discovery => write!(f, "discovery"),
-        }
-    }
-}
-
-impl Default for HostFilterConfig {
-    fn default() -> Self {
-        Self {
-            mode: HostFilterMode::default(),
-            block: Vec::new(),
         }
     }
 }

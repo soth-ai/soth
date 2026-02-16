@@ -227,10 +227,7 @@ fn match_group_values(
         .any(|subject| patterns.iter().any(|pattern| matcher(subject, pattern)))
 }
 
-fn detection_group_subjects<'a>(
-    group: DetectionRuleGroup,
-    context: &'a DetectionContext,
-) -> Vec<&'a str> {
+fn detection_group_subjects(group: DetectionRuleGroup, context: &DetectionContext) -> Vec<&str> {
     let mut out = Vec::new();
     match group {
         DetectionRuleGroup::Model => {

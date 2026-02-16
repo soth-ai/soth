@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+monitoring = ["dep:metrics-exporter-prometheus"]
+
 [dependencies]
 soth-core = { workspace = true }
 soth-oisp = { workspace = true }
@@ -39,7 +43,7 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 once_cell = { workspace = true }
 metrics = { workspace = true }
-metrics-exporter-prometheus = { workspace = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 hudsucker = { version = "0.24.0", features = ["http2", "rcgen-ca", "rustls-client"] }
 rustls-pemfile = "2"
 flate2 = "1.0"

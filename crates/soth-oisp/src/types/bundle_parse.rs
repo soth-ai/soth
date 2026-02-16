@@ -846,7 +846,7 @@ fn normalize_detection_rules(rules: &mut Vec<DetectionRule>, default_reason: &st
                 .as_deref()
                 .is_some_and(|reason| !reason.trim().is_empty())
     });
-    rules.sort_by(|left, right| detection_rule_sort_key(right).cmp(&detection_rule_sort_key(left)));
+    rules.sort_by_key(|rule| std::cmp::Reverse(detection_rule_sort_key(rule)));
     rules.dedup_by(|left, right| detection_rule_sort_key(left) == detection_rule_sort_key(right));
 }
 

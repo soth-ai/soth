@@ -12,7 +12,13 @@ path = "src/main.rs"
 [features]
 default = ["cloud-sync"]
 cloud-sync = ["dep:soth-sync"]
-local-debug = ["dep:soth-dashboard", "dep:ratatui", "dep:crossterm"]
+monitoring = ["soth-proxy/monitoring"]
+local-debug = [
+    "dep:soth-dashboard",
+    "dep:ratatui",
+    "dep:crossterm",
+    "monitoring",
+]
 
 [dependencies]
 soth-core = { workspace = true }

@@ -52,10 +52,7 @@ impl OispEngine {
             let Some(provider) = self.resolve_provider(provider_id.as_str()) else {
                 continue;
             };
-            if !entry_types
-                .iter()
-                .any(|entry| *entry == provider.entry_type)
-            {
+            if !entry_types.contains(&provider.entry_type) {
                 continue;
             }
             let mut candidates = Vec::<DetectionCandidate>::new();
@@ -97,9 +94,7 @@ impl OispEngine {
                 );
             }
 
-            let Some(candidate) = candidates
-                .into_iter()
-                .max_by(|left, right| compare_detection_candidates(left, right))
+            let Some(candidate) = candidates.into_iter().max_by(compare_detection_candidates)
             else {
                 continue;
             };
@@ -183,14 +178,12 @@ impl OispEngine {
             );
         }
 
-        let outcome = if let Some(best) = candidates
-            .into_iter()
-            .max_by(|left, right| compare_detection_candidates(left, right))
-        {
-            Some(best.outcome)
-        } else {
-            None
-        };
+        let outcome =
+            if let Some(best) = candidates.into_iter().max_by(compare_detection_candidates) {
+                Some(best.outcome)
+            } else {
+                None
+            };
 
         if let Ok(mut cache) = self.detection_cache.lock() {
             cache.insert(cache_key, outcome.clone());

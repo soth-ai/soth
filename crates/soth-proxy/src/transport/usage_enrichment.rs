@@ -64,7 +64,6 @@ pub fn extract_usage_meta_from_stream_usage(
     provider: &str,
     host: &str,
     usage: Option<OispProviderUsage>,
-    fallback_model: Option<&str>,
 ) -> ResponseUsageMeta {
     let Some(engine) = oisp_engine else {
         return ResponseUsageMeta::default();
@@ -72,13 +71,7 @@ pub fn extract_usage_meta_from_stream_usage(
     let Some(provider_id) = resolve_provider_id(engine, provider, host) else {
         return ResponseUsageMeta::default();
     };
-    build_response_usage_meta_with_cost(
-        usage,
-        fallback_model,
-        engine,
-        provider_id.as_str(),
-        provider,
-    )
+    build_response_usage_meta_with_cost(usage, engine, provider_id.as_str(), provider)
 }
 
 pub async fn extract_usage_meta_for_mode(
@@ -89,7 +82,6 @@ pub async fn extract_usage_meta_for_mode(
     _is_sse: bool,
     _content_type: Option<&str>,
     _grpc_message_encoding: Option<&str>,
-    fallback_model: Option<&str>,
 ) -> UsageExtractionOutcome {
     let Some(engine) = oisp_engine else {
         return UsageExtractionOutcome::default();
@@ -99,13 +91,8 @@ pub async fn extract_usage_meta_for_mode(
     };
 
     let usage = engine.extract_usage_from_response(provider_id.as_str(), decoded_body);
-    let primary = build_response_usage_meta_with_cost(
-        usage,
-        fallback_model,
-        engine,
-        provider_id.as_str(),
-        provider,
-    );
+    let primary =
+        build_response_usage_meta_with_cost(usage, engine, provider_id.as_str(), provider);
 
     UsageExtractionOutcome {
         primary,
@@ -115,6 +102,7 @@ pub async fn extract_usage_meta_for_mode(
 }
 
 fn resolve_provider_id(engine: &OispEngine, provider: &str, host: &str) -> Option<String> {
+    let _ = host;
     let provider = provider.trim();
     if !provider.is_empty()
         && !provider.eq_ignore_ascii_case("unknown")
@@ -122,19 +110,17 @@ fn resolve_provider_id(engine: &OispEngine, provider: &str, host: &str) -> Optio
     {
         return Some(provider.to_string());
     }
-    engine
-        .classify(host)
-        .map(|classification| classification.provider_id)
+    let _ = engine;
+    None
 }
 
 fn build_response_usage_meta_with_cost(
     provider_usage: Option<OispProviderUsage>,
-    fallback_model: Option<&str>,
     engine: &OispEngine,
     provider_id: &str,
     provider_hint: &str,
 ) -> ResponseUsageMeta {
-    let mut meta = build_response_usage_meta_without_cost(provider_usage, fallback_model);
+    let mut meta = build_response_usage_meta_without_cost(provider_usage);
 
     if let (Some(model), Some(input_tokens), Some(output_tokens)) =
         (meta.model.as_deref(), meta.input_tokens, meta.output_tokens)
@@ -159,7 +145,6 @@ fn build_response_usage_meta_with_cost(
 
 fn build_response_usage_meta_without_cost(
     provider_usage: Option<OispProviderUsage>,
-    fallback_model: Option<&str>,
 ) -> ResponseUsageMeta {
     let mut meta = ResponseUsageMeta::default();
     let Some(provider_usage) = provider_usage else {
@@ -173,9 +158,7 @@ fn build_response_usage_meta_without_cost(
     meta.cache_read_tokens = provider_usage.cache_read_tokens;
     meta.cache_write_tokens = provider_usage.cache_write_tokens;
     meta.reasoning_tokens = provider_usage.reasoning_tokens;
-    meta.model = provider_usage
-        .model
-        .or_else(|| fallback_model.map(ToString::to_string));
+    meta.model = provider_usage.model;
     meta
 }
 
@@ -269,7 +252,6 @@ mod tests {
             body,
             false,
             Some("application/json"),
-            None,
             None,
         )
         .await;

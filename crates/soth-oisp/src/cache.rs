@@ -28,8 +28,9 @@ where
     }
 
     pub(crate) fn insert(&mut self, key: K, value: V) {
-        if self.map.contains_key(&key) {
-            self.map.insert(key, value);
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.map.entry(key.clone())
+        {
+            entry.insert(value);
             return;
         }
 

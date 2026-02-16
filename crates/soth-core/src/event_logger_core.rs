@@ -1074,20 +1074,14 @@ fn wrap_event_to_exchange_v2(
     payload.status_code = event.status_code;
     payload.client = exchange_client_from_wrap_event(event);
 
-    let request_text = event
-        .request_content
-        .as_deref()
-        .or_else(|| match event.direction {
-            WrapDirection::In => event.content.as_deref(),
-            WrapDirection::Out => None,
-        });
-    let response_text = event
-        .response_content
-        .as_deref()
-        .or_else(|| match event.direction {
-            WrapDirection::Out => event.content.as_deref(),
-            WrapDirection::In => None,
-        });
+    let request_text = event.request_content.as_deref().or(match event.direction {
+        WrapDirection::In => event.content.as_deref(),
+        WrapDirection::Out => None,
+    });
+    let response_text = event.response_content.as_deref().or(match event.direction {
+        WrapDirection::Out => event.content.as_deref(),
+        WrapDirection::In => None,
+    });
 
     let (request_body, request_truncated) = exchange_body_from_text(
         request_text,

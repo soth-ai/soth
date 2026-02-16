@@ -20,6 +20,7 @@
 //!   soth dev api start           - Start local API/WebSocket service (local-debug feature)
 //!   soth dev ui start            - Start local UI dev service (local-debug feature)
 //!   soth dev profile start       - Start runtime profile (sensor/api/ui/dev) (local-debug feature)
+//!   soth test                    - Run development test suite (local-debug feature)
 //!   soth identity generate       - Generate a new keypair
 //!   soth identity list           - List trusted agents
 //!   soth identity trust <did>    - Add DID to trust store
@@ -35,6 +36,7 @@ mod logging;
 pub mod style;
 
 use clap::{Parser, Subcommand};
+use std::env;
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*};
 
@@ -236,6 +238,7 @@ enum Commands {
         action: ConfigCommands,
     },
 
+    #[cfg(feature = "local-debug")]
     /// Run tests with CI-friendly output
     Test(commands::test::TestArgs),
 
@@ -566,8 +569,57 @@ async fn ensure_ca_for_up(config_path: Option<PathBuf>, quiet: bool) -> anyhow::
     commands::proxy::run_setup_ca(false, None, config_path).await
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn parse_env_usize(key: &str) -> Option<usize> {
+    env::var(key).ok()?.parse::<usize>().ok()
+}
+
+fn parse_env_u32(key: &str) -> Option<u32> {
+    env::var(key).ok()?.parse::<u32>().ok()
+}
+
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 32)
+}
+
+fn build_tokio_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    let worker_threads = parse_env_usize("SOTH_TOKIO_WORKER_THREADS")
+        .filter(|v| *v > 0)
+        .unwrap_or_else(default_worker_threads);
+    let max_blocking_threads = parse_env_usize("SOTH_TOKIO_MAX_BLOCKING_THREADS")
+        .filter(|v| *v > 0)
+        .unwrap_or(512);
+    let thread_stack_size = parse_env_usize("SOTH_TOKIO_THREAD_STACK_SIZE")
+        .filter(|v| *v >= 256 * 1024)
+        .unwrap_or(3 * 1024 * 1024);
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .enable_all()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
+        .thread_stack_size(thread_stack_size)
+        .thread_name("soth-rt");
+
+    if let Some(value) = parse_env_u32("SOTH_TOKIO_EVENT_INTERVAL").filter(|v| *v > 0) {
+        builder.event_interval(value);
+    }
+    if let Some(value) = parse_env_u32("SOTH_TOKIO_GLOBAL_QUEUE_INTERVAL").filter(|v| *v > 0) {
+        builder.global_queue_interval(value);
+    }
+
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to initialize Tokio runtime: {e}"))
+}
+
+fn main() -> anyhow::Result<()> {
+    build_tokio_runtime()?.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -757,6 +809,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Config { action } => {
             commands::config::run(cli.config.clone(), action).await?;
         }
+        #[cfg(feature = "local-debug")]
         Commands::Test(args) => {
             commands::test::run(args).await?;
         }

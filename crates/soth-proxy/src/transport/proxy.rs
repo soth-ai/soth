@@ -11,7 +11,6 @@ use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
 };
 use parking_lot::Mutex;
-use serde::Deserialize;
 use soth_crypto::tls::LearnedPassthrough;
 use soth_oisp::OispEngine;
 use soth_oisp::OispStreamParser;
@@ -92,12 +91,6 @@ use soth_core::config::{
 };
 use soth_core::types::TrafficEnvelope;
 use soth_core::EventLogger;
-
-/// AI request body structure for model extraction
-#[derive(Debug, Deserialize)]
-struct AiRequestBody {
-    model: Option<String>,
-}
 
 /// Pending request info for correlating with responses
 #[derive(Debug, Clone)]
@@ -561,22 +554,15 @@ impl HttpHandler for AiProxyHandler {
                                 "Captured request body"
                             );
 
-                            // Extract model from bundle parser first, then fallback to generic JSON.
-                            let model = provider
-                                .as_deref()
-                                .and_then(|provider_name| {
-                                    extract_model_from_request_for_mode(
-                                        Some(oisp_engine.as_ref()),
-                                        provider_name,
-                                        &host,
-                                        &decoded_bytes,
-                                    )
-                                })
-                                .or_else(|| {
-                                    serde_json::from_slice::<AiRequestBody>(&decoded_bytes)
-                                        .ok()
-                                        .and_then(|b| b.model)
-                                });
+                            // Extract model strictly from bundle parser configuration.
+                            let model = provider.as_deref().and_then(|provider_name| {
+                                extract_model_from_request_for_mode(
+                                    Some(oisp_engine.as_ref()),
+                                    provider_name,
+                                    &host,
+                                    &decoded_bytes,
+                                )
+                            });
 
                             // Reconstruct request with body
                             let new_body = Body::from(Full::new(bytes));
@@ -1116,7 +1102,6 @@ impl HttpHandler for AiProxyHandler {
                             false,
                             content_type.as_deref(),
                             grpc_message_encoding.as_deref(),
-                            pending.model.as_deref(),
                         )
                         .await;
                         response_usage = usage_outcome.primary;
@@ -1237,7 +1222,6 @@ impl HttpHandler for AiProxyHandler {
                         log_provider.as_str(),
                         &log_pending.host,
                         stream_usage,
-                        log_pending.model.as_deref(),
                     );
                     if !usage_meta.has_signal() {
                         let usage_outcome = extract_usage_meta_for_mode(
@@ -1248,7 +1232,6 @@ impl HttpHandler for AiProxyHandler {
                             log_is_sse,
                             log_content_type.as_deref(),
                             log_grpc_message_encoding.as_deref(),
-                            log_pending.model.as_deref(),
                         )
                         .await;
                         usage_meta = usage_outcome.primary;
