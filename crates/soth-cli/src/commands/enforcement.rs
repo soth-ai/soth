@@ -5,6 +5,7 @@ use soth_budget::BudgetTracker;
 use soth_core::config::SothConfig;
 use soth_core::types::policy::PolicyInputBuilder;
 use soth_crypto::identity::TrustStore;
+use soth_oisp::OispEngine;
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine, PolicyLoader};
 use soth_proxy::metrics;
 use soth_proxy::pipeline::budget::{BudgetConfig, BudgetLayer};
@@ -359,6 +360,46 @@ fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTrac
     Ok(Some(tracker))
 }
 
+fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
+    if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
+        if let Some(parent) = config_cache_path.parent() {
+            return parent.join("registry_bundle_cache.json");
+        }
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join("registry_bundle_cache.json"))
+        .unwrap_or_else(|| PathBuf::from(".soth/registry_bundle_cache.json"))
+}
+
+fn load_budget_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
+    let cache_path = resolve_registry_bundle_cache_path(config);
+    match OispEngine::load_from_registry_cache(cache_path.as_path()) {
+        Ok(Some(engine)) => {
+            info!(
+                cache = %cache_path.display(),
+                bundle_version = %engine.bundle_version(),
+                "Loaded OISP bundle for wrap budget pricing"
+            );
+            Some(Arc::new(engine))
+        }
+        Ok(None) => {
+            warn!(
+                cache = %cache_path.display(),
+                "Wrap budget pricing bundle unavailable; budget cost metadata disabled"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                cache = %cache_path.display(),
+                error = %error,
+                "Failed loading bundle for wrap budget pricing; budget cost metadata disabled"
+            );
+            None
+        }
+    }
+}
+
 pub fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer> {
     let rollout = CryptoIdentityRollout::from_config(config);
     let identity_mode = rollout.proxy_identity_mode();
@@ -456,7 +497,7 @@ pub fn build_wrap_enforcement_runtime(
 
     if let Some(tracker) = build_budget_tracker(config)? {
         enabled = true;
-        let layer = BudgetLayer::with_tracker(
+        let mut layer = BudgetLayer::with_tracker(
             BudgetConfig {
                 enabled: true,
                 block_on_exceeded: true,
@@ -464,6 +505,9 @@ pub fn build_wrap_enforcement_runtime(
             },
             tracker,
         );
+        if let Some(engine) = load_budget_oisp_engine(config) {
+            layer = layer.with_oisp_engine(engine);
+        }
         pipeline_builder = pipeline_builder.layer(layer);
     }
 

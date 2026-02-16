@@ -354,8 +354,16 @@ pub fn record_budget_spend(
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
+    cost_override: Option<f64>,
 ) {
-    tracker.record_spend(session_id, agent_id, model, input_tokens, output_tokens);
+    tracker.record_spend_with_cost(
+        session_id,
+        agent_id,
+        model,
+        input_tokens,
+        output_tokens,
+        cost_override,
+    );
 }
 
 fn budget_scope_label(scope: BudgetScope) -> &'static str {

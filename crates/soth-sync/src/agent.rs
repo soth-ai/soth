@@ -6,7 +6,7 @@ use crate::metadata_pusher::{estimate_gzip_exchange_batch_size, MetadataPusher};
 use crate::retry_queue::BodyRetryQueue;
 use anyhow::Context;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use soth_core::api::{
     BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
     ExchangeMetadata, HeartbeatRequest, HeartbeatTelemetry,
@@ -25,6 +25,7 @@ const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
 const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
 const MAX_EXCHANGE_RETRY_BACKOFF_SECS: u64 = 15 * 60;
 const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
+const SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1: &str = "migration_exchange_uuid_cleanup_v1";
 
 pub type HeartbeatTelemetryProvider =
     Arc<dyn Fn() -> Option<HeartbeatTelemetry> + Send + Sync + 'static>;
@@ -115,6 +116,12 @@ impl SyncAgent {
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
         let retry_queue =
             BodyRetryQueue::new(&config.retry_queue_dir, config.retry_queue_max_bytes)?;
+        if let Err(error) = run_exchange_uuid_cleanup_migration(config.event_db_path.as_path()) {
+            warn!(
+                error = %error,
+                "Failed one-time exchange UUID cleanup migration; continuing"
+            );
+        }
         Ok(Self {
             config,
             metadata_pusher,
@@ -465,6 +472,76 @@ impl SyncAgent {
     fn set_sync_error(&self, error: &str) -> anyhow::Result<()> {
         self.write_sync_value(SYNC_KEY_SYNC_ERRORS, error)
     }
+}
+
+fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
+    let conn = open_rw_conn(path)?;
+    if !sqlite_table_exists(&conn, "sync_state")? {
+        return Ok(());
+    }
+    let already_done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = ?1 LIMIT 1",
+            [SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_done.is_some() {
+        return Ok(());
+    }
+
+    let mut deleted_total = 0usize;
+    for table in ["exchange_upload_queue", "exchange_events", "exchange_spool"] {
+        if sqlite_table_exists(&conn, table)? {
+            deleted_total += prune_non_uuid_exchange_ids(&conn, table)?;
+        }
+    }
+
+    write_sync_state(
+        &conn,
+        SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1,
+        &format!("deleted={deleted_total}"),
+    )?;
+
+    if deleted_total > 0 {
+        warn!(
+            deleted_rows = deleted_total,
+            "Pruned legacy non-UUID exchange rows from local event database"
+        );
+    }
+    Ok(())
+}
+
+fn sqlite_table_exists(conn: &Connection, table_name: &str) -> anyhow::Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
+            [table_name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn prune_non_uuid_exchange_ids(conn: &Connection, table: &str) -> anyhow::Result<usize> {
+    let select_sql = format!("SELECT exchange_id FROM {table}");
+    let mut stmt = conn.prepare(&select_sql)?;
+    let mut invalid_ids = Vec::new();
+    for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+        let exchange_id = row?;
+        if Uuid::parse_str(exchange_id.trim()).is_err() {
+            invalid_ids.push(exchange_id);
+        }
+    }
+    drop(stmt);
+
+    let delete_sql = format!("DELETE FROM {table} WHERE exchange_id = ?1");
+    let mut deleted = 0usize;
+    for exchange_id in invalid_ids {
+        deleted += conn.execute(&delete_sql, [exchange_id])?;
+    }
+    Ok(deleted)
 }
 
 fn open_read_conn(path: &Path) -> anyhow::Result<Connection> {

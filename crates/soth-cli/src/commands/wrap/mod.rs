@@ -175,7 +175,7 @@ fn explicit_detection_metadata(agent: &AgentInfo) -> WrapDetectionMetadata {
 
 fn bundle_unknown_detection_metadata() -> WrapDetectionMetadata {
     WrapDetectionMetadata {
-        detection_reason: Some("fallback_unknown".to_string()),
+        detection_reason: Some("bundle_unclassified".to_string()),
         parse_confidence: Some(0.0),
         target_entity_id: None,
         detection_source: Some("bundle".to_string()),

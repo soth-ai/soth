@@ -2988,7 +2988,7 @@ impl HttpHandler for AiProxyHandler {
                 .map(|value| {
                     value
                         .detection_reason
-                        .eq_ignore_ascii_case("fallback_unknown")
+                        .eq_ignore_ascii_case("bundle_unclassified")
                         || value
                             .detection_reason
                             .eq_ignore_ascii_case("host_classification")
@@ -3025,7 +3025,7 @@ impl HttpHandler for AiProxyHandler {
                 .map(|value| {
                     value
                         .detection_reason
-                        .eq_ignore_ascii_case("fallback_unknown")
+                        .eq_ignore_ascii_case("bundle_unclassified")
                         || value
                             .detection_reason
                             .eq_ignore_ascii_case("host_classification")
@@ -3066,7 +3066,7 @@ impl HttpHandler for AiProxyHandler {
                     )
                 } else {
                     (
-                        Some("fallback_unknown".to_string()),
+                        Some("bundle_unclassified".to_string()),
                         Some(0.0),
                         Some("bundle".to_string()),
                     )
@@ -3085,7 +3085,7 @@ impl HttpHandler for AiProxyHandler {
                 )
             } else {
                 (
-                    Some("fallback_unknown".to_string()),
+                    Some("bundle_unclassified".to_string()),
                     Some(0.0),
                     Some("bundle".to_string()),
                 )
@@ -3409,7 +3409,6 @@ impl HttpHandler for AiProxyHandler {
         let pii_enricher = self.pii_enricher.clone();
         let session_id = self.session_id.clone();
         let request_id = self.request_correlation_id;
-        let registry_mode = self.registry_mode;
         let oisp_engine = self.oisp_engine.clone();
         let exchange_v2_cfg = self.exchange_v2.clone();
         let exchange_bundle_version = if exchange_v2_cfg.is_some() {
@@ -3589,7 +3588,6 @@ impl HttpHandler for AiProxyHandler {
 
                         let usage_outcome = extract_usage_meta_for_mode(
                             Some(oisp_engine.as_ref()),
-                            registry_mode,
                             provider.as_str(),
                             &pending.host,
                             &decoded_bytes,
@@ -3627,7 +3625,6 @@ impl HttpHandler for AiProxyHandler {
                 let log_content_type = content_type.clone();
                 let log_grpc_message_encoding = grpc_message_encoding.clone();
                 let log_is_sse = is_sse;
-                let log_registry_mode = registry_mode;
                 let log_oisp_engine = oisp_engine.clone();
                 let log_budget_tracker = budget_tracker.clone();
                 let log_event_tags = event_tags.clone();
@@ -3723,7 +3720,6 @@ impl HttpHandler for AiProxyHandler {
                     if !usage_meta.has_signal() {
                         let usage_outcome = extract_usage_meta_for_mode(
                             Some(log_oisp_engine.as_ref()),
-                            log_registry_mode,
                             log_provider.as_str(),
                             &log_pending.host,
                             &decoded_bytes,
@@ -4714,7 +4710,7 @@ mod tests {
     #[test]
     fn test_registry_mode_action_uses_oisp_engine() {
         let mut config = ForwardProxyConfig::default();
-        config.registry_mode = RegistryMode::Registry;
+        config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.ai_inference = vec![];
         config.hosts.mcp = vec![];
         config.hosts.agent_apps = vec![];
@@ -4738,7 +4734,7 @@ mod tests {
     #[test]
     fn test_registry_mode_tunnels_unclassified_hosts() {
         let mut config = ForwardProxyConfig::default();
-        config.registry_mode = RegistryMode::Registry;
+        config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.ai_inference = vec![];
         config.hosts.mcp = vec![];
         config.hosts.agent_apps = vec![];
@@ -4754,7 +4750,7 @@ mod tests {
     #[test]
     fn test_registry_mode_does_not_fall_back_to_configured_hosts() {
         let mut config = ForwardProxyConfig::default();
-        config.registry_mode = RegistryMode::Registry;
+        config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.ai_inference = vec!["fallback-only.example".to_string()];
         config.hosts.mcp = vec!["fallback-mcp.example".to_string()];
         config.hosts.agent_apps = vec!["fallback-agent.example".to_string()];
@@ -4770,7 +4766,7 @@ mod tests {
     #[test]
     fn test_connect_action_uses_host_only_oisp_decision() {
         let mut config = ForwardProxyConfig::default();
-        config.registry_mode = RegistryMode::Registry;
+        config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.ai_inference = vec![];
         config.hosts.mcp = vec![];
         config.hosts.agent_apps = vec![];
@@ -4794,7 +4790,7 @@ mod tests {
     #[test]
     fn test_debug_force_intercept_all_intercepts_unknown_remote_hosts() {
         let mut config = ForwardProxyConfig::default();
-        config.registry_mode = RegistryMode::Registry;
+        config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.mode = HostFilterMode::Selective;
         config.hosts.ai_inference = vec![];
         config.hosts.mcp = vec![];
@@ -4814,7 +4810,7 @@ mod tests {
     #[test]
     fn test_debug_force_intercept_all_respects_expiry() {
         let mut config = ForwardProxyConfig::default();
-        config.registry_mode = RegistryMode::Registry;
+        config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.mode = HostFilterMode::Selective;
         config.hosts.ai_inference = vec![];
         config.hosts.mcp = vec![];
@@ -4836,7 +4832,7 @@ mod tests {
     #[test]
     fn test_discovery_mode_catalog_intercept_is_limited_to_first_daily_capture() {
         let mut config = ForwardProxyConfig::default();
-        config.registry_mode = RegistryMode::Registry;
+        config.registry_mode = RegistryMode::BundleOnly;
         config.hosts.mode = HostFilterMode::Discovery;
         config.hosts.ai_inference = vec![];
         config.hosts.mcp = vec![];

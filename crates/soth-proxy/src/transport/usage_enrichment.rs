@@ -1,6 +1,5 @@
 //! Bundle-driven usage/model extraction helpers.
 
-use soth_core::config::RegistryMode;
 use soth_oisp::{OispEngine, OispStreamParser, ProviderUsage as OispProviderUsage};
 
 /// Extracted usage/cost metadata from provider response payloads.
@@ -84,7 +83,6 @@ pub fn extract_usage_meta_from_stream_usage(
 
 pub async fn extract_usage_meta_for_mode(
     oisp_engine: Option<&OispEngine>,
-    _registry_mode: RegistryMode,
     provider: &str,
     host: &str,
     decoded_body: &[u8],
@@ -266,7 +264,6 @@ mod tests {
 
         let outcome = extract_usage_meta_for_mode(
             Some(&engine),
-            RegistryMode::Registry,
             "openai",
             "api.openai.com",
             body,

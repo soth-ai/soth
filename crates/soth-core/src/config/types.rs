@@ -1578,21 +1578,21 @@ pub enum HostFilterMode {
     Discovery,
 }
 
-/// Registry migration mode for forward proxy classification/routing.
+/// Bundle-only classification mode for forward proxy interception/routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RegistryMode {
-    /// Registry bundle-driven detection/intercept (standard mode).
+    /// Bundle-driven detection/intercept.
+    ///
+    /// Aliases are kept so older cached cloud config values continue to parse.
     #[default]
-    Registry,
-    /// Registry bundle-driven detection only (strict cutover mode).
+    #[serde(alias = "registry", alias = "strict")]
     BundleOnly,
 }
 
 impl std::fmt::Display for RegistryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Registry => write!(f, "registry"),
             Self::BundleOnly => write!(f, "bundle_only"),
         }
     }
@@ -2336,7 +2336,7 @@ crypto_identity:
         assert_eq!(config.port, 8080);
         assert_eq!(config.address, "127.0.0.1");
         assert_eq!(config.socket_addr(), "127.0.0.1:8080");
-        assert_eq!(config.registry_mode, RegistryMode::Registry);
+        assert_eq!(config.registry_mode, RegistryMode::BundleOnly);
         assert!(config.process_attribution.enabled);
         assert_eq!(
             config.process_attribution.lookup_timeout,
@@ -2698,12 +2698,12 @@ forward_proxy:
   registry_mode: registry
 "#;
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
+        assert_eq!(config.forward_proxy.registry_mode, RegistryMode::BundleOnly);
     }
 
     #[test]
     fn test_parse_forward_proxy_registry_mode_bundle_only_yaml() {
-        for mode in ["bundle_only"] {
+        for mode in ["bundle_only", "strict"] {
             let yaml = format!(
                 r#"
 forward_proxy:

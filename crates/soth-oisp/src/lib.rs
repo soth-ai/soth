@@ -411,7 +411,7 @@ impl OispEngine {
                 let fallback_reason = if fallback_agent.is_some() {
                     "host_classification"
                 } else {
-                    "fallback_unknown"
+                    "bundle_unclassified"
                 };
                 let fallback_confidence = if fallback_agent.is_some() { 0.70 } else { 0.0 };
 

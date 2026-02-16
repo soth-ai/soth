@@ -601,8 +601,8 @@ fn apply_registry_mode_from_cache(config: &mut SothConfig, mode: Option<&str>) {
     };
     let normalized = mode.trim().to_ascii_lowercase();
     config.forward_proxy.registry_mode = match normalized.as_str() {
-        "bundle_only" | "strict" => RegistryMode::BundleOnly,
-        _ => RegistryMode::Registry,
+        "bundle_only" | "strict" | "registry" => RegistryMode::BundleOnly,
+        _ => RegistryMode::BundleOnly,
     };
 }
 
