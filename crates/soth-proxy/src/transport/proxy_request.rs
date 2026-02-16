@@ -1,14 +1,12 @@
-//! Request-side planning helpers for hudsucker transport.
+//! Request-side planning helpers for proxy transport.
 
 use hudsucker::{hyper::Request, Body};
 use soth_core::config::{HostAction, HostFilterMode};
 use soth_oisp::OispEngine;
 
-use crate::transport::hudsucker_detection::{
-    should_log_request, should_treat_anthropic_api_as_agent,
-};
-use crate::transport::hudsucker_payload::parse_content_length;
-use crate::transport::hudsucker_support::{CatalogDiscoveryLimiter, DiscoveryKind};
+use crate::transport::proxy_detection::{should_log_request, should_treat_anthropic_api_as_agent};
+use crate::transport::proxy_payload::parse_content_length;
+use crate::transport::proxy_support::{CatalogDiscoveryLimiter, DiscoveryKind};
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostTargetInfo {

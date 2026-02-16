@@ -1,4 +1,4 @@
-//! WebSocket handling for hudsucker-based proxy transport.
+//! WebSocket handling for forward proxy transport.
 
 use hudsucker::{tokio_tungstenite::tungstenite::Message, WebSocketContext, WebSocketHandler};
 use std::collections::BTreeMap;
@@ -6,11 +6,11 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::transport::host_fingerprint;
-use crate::transport::hudsucker_support::{
-    append_catalog_discovery_tags, append_process_attribution_tags,
-};
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
 use crate::transport::pii_enrichment::PiiEventEnricher;
+use crate::transport::proxy_support::{
+    append_catalog_discovery_tags, append_process_attribution_tags,
+};
 use soth_core::config::{HostFilterConfig, HostFilterMode};
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,

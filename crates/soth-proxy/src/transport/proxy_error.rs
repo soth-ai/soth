@@ -1,4 +1,4 @@
-//! Forward-error handling helpers for hudsucker transport.
+//! Forward-error handling helpers for proxy transport.
 
 use hudsucker::{hyper::Response, hyper_util::client::legacy::Error as LegacyClientError, Body};
 use std::collections::BTreeMap;
@@ -8,15 +8,13 @@ use tracing::{debug, error, warn};
 
 use crate::metrics;
 use crate::transport::exchange_assembler::ExchangeAssemblerConfig;
-use crate::transport::hudsucker_exchange::{
-    append_detection_tags, finalize_and_enqueue_exchange_v2,
-};
-use crate::transport::hudsucker_proxy::PendingRequests;
-use crate::transport::hudsucker_support::{
+use crate::transport::pii_enrichment::PiiEventEnricher;
+use crate::transport::proxy::PendingRequests;
+use crate::transport::proxy_exchange::{append_detection_tags, finalize_and_enqueue_exchange_v2};
+use crate::transport::proxy_support::{
     append_catalog_discovery_tags, append_process_attribution_tags, is_benign_proxy_forward_error,
     is_emfile_proxy_forward_error,
 };
-use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
 use soth_core::EventLogger;
 

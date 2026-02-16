@@ -1,4 +1,4 @@
-//! Host routing/interception decision helpers for hudsucker transport.
+//! Host routing/interception decision helpers for proxy transport.
 
 use soth_core::config::{HostAction, HostFilterConfig, HostFilterMode};
 use soth_oisp::{InterceptDecision, OispEngine};
@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use tracing::info;
 
 use crate::metrics;
-use crate::transport::hudsucker_support::{
+use crate::transport::proxy_support::{
     CatalogDiscoveryLimiter, DiscoveryKind, DiscoveryReserveResult,
 };
 

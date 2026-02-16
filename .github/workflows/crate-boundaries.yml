@@ -21,4 +21,4 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Check crate boundaries
-        run: scripts/check_crate_boundaries.sh
+        run: .github/scripts/check_crate_boundaries.sh

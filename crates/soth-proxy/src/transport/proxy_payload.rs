@@ -1,4 +1,4 @@
-//! Header sanitation and payload decode helpers for hudsucker transport.
+//! Header sanitation and payload decode helpers for proxy transport.
 
 use brotli::Decompressor as BrotliDecoder;
 use flate2::read::GzDecoder;

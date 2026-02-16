@@ -1,4 +1,4 @@
-//! Response-side helpers for hudsucker transport.
+//! Response-side helpers for proxy transport.
 
 use http_body_util::{BodyExt, Full};
 use hudsucker::{hyper::Response, Body};
@@ -6,15 +6,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::transport::exchange_assembler::ExchangeAssemblerConfig;
-use crate::transport::hudsucker_exchange::{
-    append_detection_tags, finalize_and_enqueue_exchange_v2,
-};
-use crate::transport::hudsucker_payload::decode_payload_for_logging;
-use crate::transport::hudsucker_proxy::PendingRequest;
-use crate::transport::hudsucker_support::{
+use crate::transport::pii_enrichment::PiiEventEnricher;
+use crate::transport::proxy::PendingRequest;
+use crate::transport::proxy_exchange::{append_detection_tags, finalize_and_enqueue_exchange_v2};
+use crate::transport::proxy_payload::decode_payload_for_logging;
+use crate::transport::proxy_support::{
     append_capture_tags, append_catalog_discovery_tags, append_process_attribution_tags,
 };
-use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::response_event_builder::normalize_response_content;
 use crate::transport::tier_enrichment::extract_subscription_tags;
 use crate::transport::usage_enrichment::ResponseUsageMeta;

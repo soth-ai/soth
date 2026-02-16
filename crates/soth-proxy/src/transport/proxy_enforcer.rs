@@ -26,7 +26,7 @@ pub enum ProxyPolicyMode {
     Enforce,
 }
 
-/// Request enforcement configuration for hudsucker transport.
+/// Request enforcement configuration for proxy transport.
 #[derive(Clone)]
 pub struct ProxyEnforcer {
     identity_mode: ProxyIdentityMode,

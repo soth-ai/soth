@@ -1,4 +1,4 @@
-//! Runtime/bootstrap wiring for hudsucker transport.
+//! Runtime/bootstrap wiring for proxy transport.
 
 use hudsucker::{
     certificate_authority::RcgenAuthority,
@@ -17,10 +17,10 @@ use tracing::{error, info};
 
 use crate::error::ProxyError;
 use crate::metrics;
-use crate::transport::hudsucker_proxy::AiProxyHandler;
-use crate::transport::hudsucker_websocket::AiWebSocketHandler;
 use crate::transport::pii_enrichment::PiiEventEnricher;
+use crate::transport::proxy::AiProxyHandler;
 use crate::transport::proxy_enforcer::ProxyEnforcer;
+use crate::transport::proxy_websocket::AiWebSocketHandler;
 use soth_core::config::{ExchangeV2Config, ForwardProxyConfig, ObserveConfig};
 use soth_core::EventLogger;
 
@@ -65,7 +65,7 @@ pub(crate) fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngi
     }
 }
 
-/// Start the hudsucker-based proxy with graceful shutdown support.
+/// Start the forward proxy with graceful shutdown support.
 pub async fn start_proxy(
     config: ForwardProxyConfig,
     ca_cert_path: &Path,
@@ -98,7 +98,7 @@ pub async fn start_proxy(
     .await
 }
 
-/// Start the hudsucker-based proxy with custom shutdown future.
+/// Start the forward proxy with custom shutdown future.
 pub async fn start_proxy_with_shutdown<F>(
     config: ForwardProxyConfig,
     ca_cert_path: &Path,

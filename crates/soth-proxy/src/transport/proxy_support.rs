@@ -1,7 +1,7 @@
-//! Support helpers for hudsucker proxy transport.
+//! Support helpers for proxy transport.
 //!
 //! This module intentionally contains pure support/runtime helpers so
-//! `hudsucker_proxy.rs` can stay focused on orchestration logic.
+//! `proxy.rs` can stay focused on orchestration logic.
 
 use chrono::{NaiveDate, Utc};
 use hudsucker::hyper_util::client::legacy::Error as LegacyClientError;

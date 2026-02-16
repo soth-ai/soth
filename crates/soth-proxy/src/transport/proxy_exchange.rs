@@ -1,9 +1,9 @@
-//! Exchange-v2 projection and enrichment helpers for hudsucker transport.
+//! Exchange-v2 projection and enrichment helpers for proxy transport.
 
 use crate::process_attribution::ProcessIdentity;
 use crate::transport::exchange_assembler::{ExchangeAssembler, ExchangeAssemblerConfig};
-use crate::transport::hudsucker_support::process_bundle_id_from_executable;
 use crate::transport::pii_enrichment::PiiEventEnricher;
+use crate::transport::proxy_support::process_bundle_id_from_executable;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
 use soth_budget::{BudgetTracker, TokenCounter};
 use soth_core::types::exchange_v2::{
@@ -17,7 +17,7 @@ use soth_core::EventLogger;
 use std::collections::BTreeMap;
 use tracing::warn;
 
-use crate::transport::hudsucker_proxy::PendingRequest;
+use crate::transport::proxy::PendingRequest;
 
 pub(crate) fn append_detection_tags(tags: &mut BTreeMap<String, String>, pending: &PendingRequest) {
     append_detection_tags_from_values(

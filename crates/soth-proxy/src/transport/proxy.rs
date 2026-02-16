@@ -1,6 +1,6 @@
 //! Hudsucker-based Forward Proxy
 //!
-//! Uses the battle-tested hudsucker crate for MITM proxy functionality.
+//! Uses the battle-tested proxy engine crate for MITM proxy functionality.
 //! Provides selective interception: AI domains get MITM'd, others tunnel through.
 
 use async_stream::stream;
@@ -35,49 +35,49 @@ use crate::transport::exchange_assembler::ExchangeAssemblerConfig;
 use crate::transport::graphql_enrichment::extract_graphql_operation;
 #[cfg(test)]
 use crate::transport::host_fingerprint;
+use crate::transport::mcp_detection::extract_mcp_request_method;
 #[cfg(test)]
-use crate::transport::hudsucker_detection::has_anthropic_api_key_header;
-use crate::transport::hudsucker_detection::{
+use crate::transport::mcp_detection::is_jsonrpc_response_for_mcp;
+use crate::transport::pii_enrichment::PiiEventEnricher;
+#[cfg(test)]
+use crate::transport::proxy_detection::has_anthropic_api_key_header;
+use crate::transport::proxy_detection::{
     detect_agent_from_process_name, detect_agent_from_user_agent, extract_host,
     resolve_bundle_detection,
 };
-use crate::transport::hudsucker_error::handle_forward_error;
-use crate::transport::hudsucker_exchange::{
+pub use crate::transport::proxy_enforcer::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
+use crate::transport::proxy_error::handle_forward_error;
+use crate::transport::proxy_exchange::{
     append_detection_tags, apply_process_identity, finalize_and_enqueue_exchange_v2,
     record_proxy_budget_spend, seed_exchange_v2_spool,
 };
-use crate::transport::hudsucker_payload::{
+use crate::transport::proxy_payload::{
     capture_sanitized_headers, decode_payload_for_logging, extract_gemini_bard_stream_text,
     is_chat_ui_host, is_gemini_bard_stream_path, parse_content_length, sanitize_request_headers,
 };
 #[cfg(test)]
-use crate::transport::hudsucker_payload::{
+use crate::transport::proxy_payload::{
     decode_body_for_logging, header_size_bytes, trim_cookie_header_for_chatgpt, try_decompress,
     CHATGPT_MAX_COOKIE_HEADER_BYTES, CHAT_UI_STRICT_TOTAL_HEADER_BYTES,
 };
-use crate::transport::hudsucker_request::{
+use crate::transport::proxy_request::{
     build_request_body_inspection_plan, resolve_host_target_info,
 };
-use crate::transport::hudsucker_response::{
+use crate::transport::proxy_response::{
     emit_non_stream_response_event, handle_mcp_jsonrpc_response,
 };
-use crate::transport::hudsucker_routing::{
+use crate::transport::proxy_routing::{
     get_action as routing_get_action, get_connect_action as routing_get_connect_action,
     is_force_intercept_all_active as routing_is_force_intercept_all_active,
 };
-use crate::transport::hudsucker_support::{
+use crate::transport::proxy_support::{
     acquire_stream_buffer, append_capture_tags, append_catalog_discovery_tags,
     append_process_attribution_tags, append_stream_capture, decision_label_from_intercept_decision,
     is_blacklist_detection_reason, process_bundle_id_from_executable, release_stream_buffer,
     CatalogDiscoveryLimiter, TunnelDebugRuntime, STREAM_CAPTURE_MAX_BYTES,
 };
 #[cfg(test)]
-use crate::transport::hudsucker_websocket::should_emit_non_mcp_ws_event;
-use crate::transport::mcp_detection::extract_mcp_request_method;
-#[cfg(test)]
-use crate::transport::mcp_detection::is_jsonrpc_response_for_mcp;
-use crate::transport::pii_enrichment::PiiEventEnricher;
-pub use crate::transport::proxy_enforcer::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
+use crate::transport::proxy_websocket::should_emit_non_mcp_ws_event;
 use crate::transport::response_event_builder::{
     empty_response_placeholder, normalize_response_content,
 };
@@ -155,7 +155,7 @@ fn next_proxy_request_id() -> u64 {
     NEXT_PROXY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// AI-aware HTTP handler for hudsucker
+/// AI-aware HTTP handler for proxy transport
 pub struct AiProxyHandler {
     /// Host filter config for selective interception
     hosts: Arc<HostFilterConfig>,
@@ -1493,9 +1493,9 @@ impl HttpHandler for AiProxyHandler {
 }
 
 #[cfg(test)]
-pub(crate) use crate::transport::hudsucker_runtime::load_oisp_engine;
-pub use crate::transport::hudsucker_runtime::{start_proxy, start_proxy_with_shutdown};
+pub(crate) use crate::transport::proxy_runtime::load_oisp_engine;
+pub use crate::transport::proxy_runtime::{start_proxy, start_proxy_with_shutdown};
 
 #[cfg(test)]
-#[path = "hudsucker_proxy_tests.rs"]
-mod hudsucker_proxy_tests;
+#[path = "proxy_tests.rs"]
+mod proxy_tests;

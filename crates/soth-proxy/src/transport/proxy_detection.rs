@@ -1,4 +1,4 @@
-//! Request/agent detection helpers for hudsucker transport.
+//! Request/agent detection helpers for proxy transport.
 
 use hudsucker::hyper::Request;
 use soth_oisp::types::provider::EntryType;

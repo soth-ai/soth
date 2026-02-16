@@ -1,8 +1,6 @@
 use super::*;
-use crate::transport::hudsucker_detection::{
-    should_log_request, should_treat_anthropic_api_as_agent,
-};
-use crate::transport::hudsucker_support::{DiscoveryKind, DiscoveryReserveResult};
+use crate::transport::proxy_detection::{should_log_request, should_treat_anthropic_api_as_agent};
+use crate::transport::proxy_support::{DiscoveryKind, DiscoveryReserveResult};
 use flate2::{write::GzEncoder, Compression};
 use hudsucker::hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoServerBuilder};
 use soth_core::types::policy::PolicyData;

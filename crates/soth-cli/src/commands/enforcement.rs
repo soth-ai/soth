@@ -12,7 +12,7 @@ use soth_proxy::pipeline::budget::{BudgetConfig, BudgetLayer};
 use soth_proxy::pipeline::identity::{IdentityConfig, IdentityLayer, IdentityMode};
 use soth_proxy::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
 use soth_proxy::pipeline::{Pipeline, PipelineBuilder};
-use soth_proxy::transport::hudsucker_proxy::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
+use soth_proxy::transport::proxy::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
