@@ -119,11 +119,18 @@ pub async fn run(
         proxy_config.socket_addr()
     );
     let rules_line = "source=cloud bundle (ai/mcp/agent classification)".to_string();
+    #[cfg(feature = "local-debug")]
     let api_line = format!(
         "off (run `soth dev api start --port {}` to enable)",
         config.dashboard.port
     );
+    #[cfg(not(feature = "local-debug"))]
+    let api_line = "unavailable in this build (enable `local-debug`)".to_string();
+
+    #[cfg(feature = "local-debug")]
     let ui_line = "off (run `soth dev ui start` to enable)".to_string();
+    #[cfg(not(feature = "local-debug"))]
+    let ui_line = "unavailable in this build (enable `local-debug`)".to_string();
     let system_proxy_line = format!("enabled @ 127.0.0.1:{}", proxy_config.port);
 
     // Initialize Prometheus metrics

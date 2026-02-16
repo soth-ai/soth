@@ -10,8 +10,9 @@ name = "soth"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["cloud-sync"]
 cloud-sync = ["dep:soth-sync"]
+local-debug = ["dep:soth-dashboard", "dep:ratatui", "dep:crossterm"]
 
 [dependencies]
 soth-core = { workspace = true }
@@ -21,7 +22,7 @@ soth-observe = { workspace = true, features = ["sqlite"] }
 soth-budget = { workspace = true }
 soth-collector = { workspace = true }
 soth-proxy = { workspace = true }
-soth-dashboard = { workspace = true }
+soth-dashboard = { workspace = true, optional = true }
 soth-oisp = { workspace = true }
 soth-sync = { workspace = true, optional = true }
 clap = { workspace = true }
@@ -50,8 +51,8 @@ indicatif = "0.17"
 console = "0.15"
 
 # TUI
-ratatui = "0.28"
-crossterm = "0.28"
+ratatui = { version = "0.28", optional = true }
+crossterm = { version = "0.28", optional = true }
 
 # System utilities
 which = "6.0"

@@ -13,13 +13,13 @@
 //!   soth start                   - Start sensor proxy daemon
 //!   soth stop                    - Stop sensor proxy daemon
 //!   soth logs -f                 - Follow sensor proxy logs
-//!   soth tui                     - Interactive API-backed TUI
-//!   soth attach                  - Attach TUI to a running sensor API
+//!   soth tui                     - Interactive API-backed TUI (local-debug feature)
+//!   soth attach                  - Attach TUI to a running sensor API (local-debug feature)
 //!   soth runtime setup-ca        - Generate/install local CA certificate
 //!   soth runtime env             - Print proxy env exports
-//!   soth dev api start           - Start local API/WebSocket service
-//!   soth dev ui start            - Start local UI dev service
-//!   soth dev profile start       - Start runtime profile (sensor/api/ui/dev)
+//!   soth dev api start           - Start local API/WebSocket service (local-debug feature)
+//!   soth dev ui start            - Start local UI dev service (local-debug feature)
+//!   soth dev profile start       - Start runtime profile (sensor/api/ui/dev) (local-debug feature)
 //!   soth identity generate       - Generate a new keypair
 //!   soth identity list           - List trusted agents
 //!   soth identity trust <did>    - Add DID to trust store
@@ -106,6 +106,7 @@ enum Commands {
         action: RuntimeCommands,
     },
 
+    #[cfg(feature = "local-debug")]
     /// Development/runtime surfaces (API/UI/profiles/diagnostics)
     Dev {
         #[command(subcommand)]
@@ -215,9 +216,11 @@ enum Commands {
         action: BudgetCommands,
     },
 
+    #[cfg(feature = "local-debug")]
     /// Interactive API-backed TUI
     Tui(commands::tui::TuiArgs),
 
+    #[cfg(feature = "local-debug")]
     /// Attach TUI to a running soth sensor API
     Attach(commands::tui::TuiArgs),
 
@@ -286,6 +289,7 @@ enum RuntimeCommands {
     },
 }
 
+#[cfg(feature = "local-debug")]
 #[derive(Subcommand)]
 enum DevCommands {
     /// API service management (HTTP + WebSocket)
@@ -626,6 +630,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::proxy::run_ca_info(config.or(cli.config.clone())).await?;
             }
         },
+        #[cfg(feature = "local-debug")]
         Commands::Dev { action } => match action {
             DevCommands::Api { action } => {
                 commands::proxy::run(
@@ -738,9 +743,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Budget { action } => {
             commands::budget::run(action).await?;
         }
+        #[cfg(feature = "local-debug")]
         Commands::Tui(args) => {
             commands::tui::run(args).await?;
         }
+        #[cfg(feature = "local-debug")]
         Commands::Attach(args) => {
             commands::tui::run(args).await?;
         }

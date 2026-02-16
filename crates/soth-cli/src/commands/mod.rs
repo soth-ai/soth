@@ -15,5 +15,6 @@ pub mod proxy;
 pub mod session;
 pub mod setup;
 pub mod test;
+#[cfg(feature = "local-debug")]
 pub mod tui;
 pub mod wrap;

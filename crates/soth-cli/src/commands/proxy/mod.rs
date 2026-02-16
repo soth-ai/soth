@@ -1,14 +1,20 @@
 //! Shared runtime/dev command handlers used by the SOTH CLI command tree.
 
 use crate::cli_config;
+#[cfg(feature = "local-debug")]
 mod api;
 mod ca_info;
+#[cfg(feature = "local-debug")]
 mod circuit;
+#[cfg(feature = "local-debug")]
 mod connections;
 mod daemon;
 mod env;
+#[cfg(feature = "local-debug")]
 mod metrics;
+#[cfg(feature = "local-debug")]
 mod profile;
+#[cfg(feature = "local-debug")]
 mod ratelimit;
 mod retention;
 mod setup_ca;
@@ -18,6 +24,7 @@ mod start_shutdown;
 mod start_ui;
 mod status;
 mod system;
+#[cfg(feature = "local-debug")]
 mod ui;
 
 use clap::Subcommand;
@@ -37,24 +44,28 @@ pub enum ProxyCommands {
         output: Option<String>,
     },
 
+    #[cfg(feature = "local-debug")]
     /// Advanced diagnostics and controls
     Advanced {
         #[command(subcommand)]
         action: AdvancedAction,
     },
 
+    #[cfg(feature = "local-debug")]
     /// API service management (HTTP + WebSocket)
     Api {
         #[command(subcommand)]
         action: ApiAction,
     },
 
+    #[cfg(feature = "local-debug")]
     /// UI service management
     Ui {
         #[command(subcommand)]
         action: UiAction,
     },
 
+    #[cfg(feature = "local-debug")]
     /// Runtime profile management (sensor/api/ui/dev stack)
     Profile {
         #[command(subcommand)]
@@ -155,6 +166,7 @@ pub async fn run_ca_info(config: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// API service actions
+#[cfg(feature = "local-debug")]
 #[derive(Subcommand)]
 pub enum ApiAction {
     /// Start API service
@@ -174,6 +186,7 @@ pub enum ApiAction {
 }
 
 /// UI service actions
+#[cfg(feature = "local-debug")]
 #[derive(Subcommand)]
 pub enum UiAction {
     /// Start UI dev service
@@ -197,6 +210,7 @@ pub enum UiAction {
 }
 
 /// Runtime profile actions
+#[cfg(feature = "local-debug")]
 #[derive(Subcommand)]
 pub enum ProfileAction {
     /// Start one of the runtime profiles
@@ -232,6 +246,7 @@ pub enum ProfileAction {
 }
 
 /// Advanced diagnostics actions
+#[cfg(feature = "local-debug")]
 #[derive(Subcommand)]
 pub enum AdvancedAction {
     /// Show Prometheus metrics from running proxy
@@ -267,6 +282,7 @@ pub enum AdvancedAction {
 }
 
 /// Circuit breaker actions
+#[cfg(feature = "local-debug")]
 #[derive(Subcommand)]
 pub enum CircuitAction {
     /// Show circuit breaker status
@@ -289,11 +305,13 @@ pub enum CircuitAction {
 }
 
 /// Run proxy command
+#[cfg(feature = "local-debug")]
 pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::Result<()> {
     match cmd {
         ProxyCommands::SetupCa { no_trust, output } => {
             setup_ca::run(output, no_trust, global_config.clone()).await
         }
+        #[cfg(feature = "local-debug")]
         ProxyCommands::Advanced { action } => match action {
             AdvancedAction::Metrics { config, raw } => {
                 metrics::run(config.or(global_config.clone()), raw).await
@@ -313,6 +331,7 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
                 ratelimit::run(config.or(global_config.clone())).await
             }
         },
+        #[cfg(feature = "local-debug")]
         ProxyCommands::Api { action } => match action {
             ApiAction::Start {
                 port,
@@ -320,6 +339,7 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
                 quiet,
             } => api::run_start(port, config.or(global_config.clone()), quiet).await,
         },
+        #[cfg(feature = "local-debug")]
         ProxyCommands::Ui { action } => match action {
             UiAction::Start {
                 config,
@@ -328,6 +348,7 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
                 quiet,
             } => ui::run_start(config.or(global_config.clone()), api_port, dir, quiet).await,
         },
+        #[cfg(feature = "local-debug")]
         ProxyCommands::Profile { action } => match action {
             ProfileAction::Start {
                 profile,
@@ -360,7 +381,7 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "local-debug"))]
 mod tests {
     use super::*;
     use clap::Parser;
