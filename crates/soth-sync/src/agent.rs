@@ -668,6 +668,14 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
             .parse
             .as_ref()
             .and_then(|value| value.detection_reason.clone()),
+        target_entity_id: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.target_entity_id.clone()),
+        detection_source: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.detection_source.clone()),
         tags: event.tags.as_ref().map(tree_to_hash),
         event_envelope: build_exchange_event_envelope_metadata(event),
     }

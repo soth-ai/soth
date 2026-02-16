@@ -1501,11 +1501,26 @@ fn wrap_event_to_exchange_v2(
             .as_ref()
             .and_then(|envelope| envelope.key_id.clone()),
     });
+    let detection_source = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("detection.source").cloned())
+        .or_else(|| {
+            serde_json::to_value(event.agent.detected_from)
+                .ok()
+                .and_then(|value| value.as_str().map(ToString::to_string))
+        });
+    let target_entity_id = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("detection.target_entity_id").cloned());
     payload.parse = Some(ExchangeParse {
         parser_version: Some("exchange_v2_wrap".to_string()),
         bundle_version: None,
         parse_confidence: None,
         detection_reason: Some(format!("{:?}", event.agent.detected_from).to_ascii_lowercase()),
+        target_entity_id,
+        detection_source,
     });
     payload.tags = merge_exchange_tags(event);
 

@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use soth_budget::{BudgetTracker, TokenCounter};
 use soth_crypto::tls::LearnedPassthrough;
-use soth_oisp::{InterceptDecision, OispEngine, OispStreamParser};
+use soth_oisp::{DetectionContext, InterceptDecision, OispEngine, OispStreamParser};
 use soth_policy::PolicyEngine;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
@@ -84,7 +84,7 @@ struct PendingRequest {
     path: String,
     method: String,
     provider: Option<String>,
-    agent: Option<&'static str>,
+    agent: Option<String>,
     model: Option<String>,
     graphql_operation: Option<String>,
     started_at: Instant,
@@ -110,6 +110,18 @@ struct PendingRequest {
     detection_reason: Option<String>,
     /// Confidence score for detection reason.
     parse_confidence: Option<f64>,
+    /// Provider/agent entity id derived from bundle detection.
+    target_entity_id: Option<String>,
+    /// Source of detection metadata (bundle/legacy_fallback).
+    detection_source: Option<String>,
+    /// Shadow legacy agent label used for mismatch diagnostics.
+    shadow_agent: Option<String>,
+    /// Shadow legacy detection reason used for mismatch diagnostics.
+    shadow_detection_reason: Option<String>,
+    /// Shadow legacy parse confidence used for mismatch diagnostics.
+    shadow_parse_confidence: Option<f64>,
+    /// Indicates bundle-primary detection diverged from legacy shadow detection.
+    shadow_mismatch: bool,
     /// Whether interception matched blacklist/noise criteria.
     blacklist_match: bool,
     /// Policy decision metadata captured at request enforcement time.
@@ -531,6 +543,53 @@ fn append_process_attribution_tags(
     }
     if let Some(app_type) = envelope.process_app_type.as_ref() {
         tags.insert("metadata.process_app_type".to_string(), app_type.clone());
+    }
+}
+
+fn append_detection_tags(tags: &mut BTreeMap<String, String>, pending: &PendingRequest) {
+    append_detection_tags_from_values(
+        tags,
+        pending.detection_source.as_deref(),
+        pending.target_entity_id.as_deref(),
+        pending.shadow_mismatch,
+        pending.shadow_agent.as_deref(),
+        pending.shadow_detection_reason.as_deref(),
+        pending.shadow_parse_confidence,
+    );
+}
+
+fn append_detection_tags_from_values(
+    tags: &mut BTreeMap<String, String>,
+    detection_source: Option<&str>,
+    target_entity_id: Option<&str>,
+    shadow_mismatch: bool,
+    shadow_agent: Option<&str>,
+    shadow_detection_reason: Option<&str>,
+    shadow_parse_confidence: Option<f64>,
+) {
+    if let Some(source) = detection_source {
+        tags.insert("detection.source".to_string(), source.to_string());
+    }
+    if let Some(entity_id) = target_entity_id {
+        tags.insert(
+            "detection.target_entity_id".to_string(),
+            entity_id.to_string(),
+        );
+    }
+    if shadow_mismatch {
+        tags.insert("detection.shadow_mismatch".to_string(), "true".to_string());
+    }
+    if let Some(agent) = shadow_agent {
+        tags.insert("detection.shadow_agent".to_string(), agent.to_string());
+    }
+    if let Some(reason) = shadow_detection_reason {
+        tags.insert("detection.shadow_reason".to_string(), reason.to_string());
+    }
+    if let Some(confidence) = shadow_parse_confidence {
+        tags.insert(
+            "detection.shadow_confidence".to_string(),
+            format!("{confidence:.3}"),
+        );
     }
 }
 
@@ -1591,7 +1650,7 @@ fn record_proxy_budget_spend(
         .envelope
         .as_ref()
         .and_then(|envelope| envelope.did.as_deref())
-        .or(pending.agent);
+        .or(pending.agent.as_deref());
 
     tracker.record_spend_with_cost(
         session_id,
@@ -1766,7 +1825,7 @@ fn finalize_and_enqueue_exchange_v2(
     assembler.set_session_id(session_id.to_string());
     assembler.set_route(
         pending.provider.clone(),
-        pending.agent.map(|value| value.to_string()),
+        pending.agent.clone(),
         usage_meta.model.clone().or_else(|| pending.model.clone()),
         Some(pending.path.clone()),
         Some(pending.method.clone()),
@@ -1777,6 +1836,8 @@ fn finalize_and_enqueue_exchange_v2(
         bundle_version: bundle_version.map(ToString::to_string),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
+        target_entity_id: pending.target_entity_id.clone(),
+        detection_source: pending.detection_source.clone(),
     }));
     assembler.set_blacklist_match(pending.blacklist_match);
     assembler.set_request(
@@ -1844,6 +1905,7 @@ fn finalize_and_enqueue_exchange_v2(
             .entry("mcp.method".to_string())
             .or_insert_with(|| method.clone());
     }
+    append_detection_tags(&mut exchange_tags, pending);
     if let Some(envelope) = pending.envelope.as_ref() {
         assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
         if let Some(did) = envelope.did.as_ref() {
@@ -1873,7 +1935,7 @@ fn finalize_and_enqueue_exchange_v2(
         &pending.host,
         WrapDirection::Out,
         AgentInfo::new(
-            pending.agent.unwrap_or("unknown"),
+            pending.agent.as_deref().unwrap_or("unknown"),
             DetectionSource::Environment,
         ),
     )
@@ -1965,7 +2027,7 @@ fn seed_exchange_v2_spool(
     assembler.set_session_id(session_id.to_string());
     assembler.set_route(
         pending.provider.clone(),
-        pending.agent.map(|value| value.to_string()),
+        pending.agent.clone(),
         pending.model.clone(),
         Some(pending.path.clone()),
         Some(pending.method.clone()),
@@ -1986,6 +2048,8 @@ fn seed_exchange_v2_spool(
         bundle_version: bundle_version.map(ToString::to_string),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
+        target_entity_id: pending.target_entity_id.clone(),
+        detection_source: pending.detection_source.clone(),
     }));
     assembler.set_blacklist_match(pending.blacklist_match);
     if let Some(envelope) = pending.envelope.as_ref() {
@@ -2484,6 +2548,11 @@ impl HttpHandler for AiProxyHandler {
             } else {
                 (false, false, false, None)
             };
+        let ua_header = req
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
         let ua_agent = Self::detect_agent_from_user_agent(&req);
         let enforcer = self.enforcer.clone();
         let session_id = self.session_id.clone();
@@ -2676,13 +2745,73 @@ impl HttpHandler for AiProxyHandler {
                     "Skipping observability capture for tunneled/noise request"
                 );
             }
-            let agent = Self::detect_agent_with_context_gated(
+            let legacy_agent = Self::detect_agent_with_context_gated(
                 ua_agent,
                 &host,
                 &path,
                 model.as_deref(),
                 host_is_agent_target || (host_mode == HostFilterMode::Discovery),
-            );
+            )
+            .map(ToString::to_string);
+            let legacy_detection_reason = detection_reason_for_bucket(
+                host_is_ai_target,
+                host_is_mcp_target,
+                host_is_agent_target,
+                is_catalog_discovery_host,
+            )
+            .map(ToString::to_string);
+            let legacy_parse_confidence =
+                parse_confidence_for_reason(legacy_detection_reason.as_deref());
+            let detection_context = DetectionContext {
+                host: Some(host.clone()),
+                path: Some(path.clone()),
+                user_agent: ua_header.clone(),
+                model: model.clone(),
+                process_name: process_identity.as_ref().map(|value| value.name.clone()),
+                bundle_id: None,
+                client_name: legacy_agent.clone(),
+                client_version: None,
+                env_keys: Vec::new(),
+            };
+            let bundle_detection = provider
+                .as_deref()
+                .and_then(|provider_id| {
+                    oisp_engine.evaluate_detection(provider_id, &detection_context)
+                })
+                .or_else(|| oisp_engine.evaluate_detection_for_host(&host, &detection_context));
+            let bundle_agent = bundle_detection
+                .as_ref()
+                .and_then(|value| value.agent.clone());
+            let agent = bundle_agent.clone().or_else(|| legacy_agent.clone());
+            let detection_reason = bundle_detection
+                .as_ref()
+                .map(|value| value.detection_reason.clone())
+                .or(legacy_detection_reason.clone());
+            let parse_confidence = bundle_detection
+                .as_ref()
+                .map(|value| value.parse_confidence)
+                .or(legacy_parse_confidence);
+            let target_entity_id = bundle_detection
+                .as_ref()
+                .and_then(|value| value.target_entity_id.clone());
+            let detection_source = Some(if bundle_detection.is_some() {
+                "bundle".to_string()
+            } else {
+                "legacy_fallback".to_string()
+            });
+            let shadow_mismatch = match (bundle_agent.as_deref(), legacy_agent.as_deref()) {
+                (Some(bundle_value), Some(legacy_value)) => {
+                    !bundle_value.eq_ignore_ascii_case(legacy_value)
+                }
+                _ => false,
+            };
+            let shadow_agent = bundle_detection.as_ref().and_then(|_| legacy_agent.clone());
+            let shadow_detection_reason = bundle_detection
+                .as_ref()
+                .and_then(|_| legacy_detection_reason.clone());
+            let shadow_parse_confidence = bundle_detection
+                .as_ref()
+                .and_then(|_| legacy_parse_confidence);
             let mcp_request_method = if !is_connect
                 && should_capture_observability
                 && (host_is_mcp_target || (host_mode == HostFilterMode::Discovery))
@@ -2734,7 +2863,7 @@ impl HttpHandler for AiProxyHandler {
                             &http_method,
                             &path,
                             model.as_deref(),
-                            agent,
+                            agent.as_deref(),
                             identity_did.as_deref(),
                             identity_signature.as_deref(),
                             body_content.as_deref(),
@@ -2825,13 +2954,8 @@ impl HttpHandler for AiProxyHandler {
 
                 // Store pending request for response correlation (only for logged requests)
                 if should_log {
-                    let detection_reason = detection_reason_for_bucket(
-                        host_is_ai_target,
-                        host_is_mcp_target,
-                        host_is_agent_target,
-                        is_catalog_discovery_host,
-                    );
-                    let blacklist_match = is_blacklist_detection_reason(detection_reason);
+                    let blacklist_match =
+                        is_blacklist_detection_reason(detection_reason.as_deref());
                     let envelope = apply_process_identity(
                         TrafficEnvelope::proxy(
                             &session_id,
@@ -2841,7 +2965,7 @@ impl HttpHandler for AiProxyHandler {
                             &http_method,
                             &display_path,
                             model.as_deref(),
-                            agent,
+                            agent.as_deref(),
                             identity_did.as_deref(),
                             identity_signature.as_deref(),
                             body_content.as_deref(),
@@ -2858,7 +2982,7 @@ impl HttpHandler for AiProxyHandler {
                             path: display_path.clone(),
                             method: http_method.clone(),
                             provider: Some(provider.to_string()),
-                            agent,
+                            agent: agent.clone(),
                             model: model.clone(),
                             graphql_operation: graphql_operation.clone(),
                             started_at: Instant::now(),
@@ -2871,8 +2995,14 @@ impl HttpHandler for AiProxyHandler {
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
                             catalog_discovery: is_catalog_discovery_host,
-                            detection_reason: detection_reason.map(ToString::to_string),
-                            parse_confidence: parse_confidence_for_reason(detection_reason),
+                            detection_reason: detection_reason.clone(),
+                            parse_confidence,
+                            target_entity_id: target_entity_id.clone(),
+                            detection_source: detection_source.clone(),
+                            shadow_agent: shadow_agent.clone(),
+                            shadow_detection_reason: shadow_detection_reason.clone(),
+                            shadow_parse_confidence,
+                            shadow_mismatch,
                             blacklist_match,
                             policy_allowed,
                             policy_reason: None,
@@ -2894,8 +3024,10 @@ impl HttpHandler for AiProxyHandler {
 
                 if legacy_wrap_events_enabled {
                     if let Some(ref logger) = event_logger {
-                        let mcp_agent =
-                            AgentInfo::new(agent.unwrap_or("mcp"), DetectionSource::Environment);
+                        let mcp_agent = AgentInfo::new(
+                            agent.as_deref().unwrap_or("mcp"),
+                            DetectionSource::Environment,
+                        );
                         let mut event =
                             WrapEvent::new(&session_id, &host, WrapDirection::In, mcp_agent)
                                 .with_source(EventSource::Mcp)
@@ -2907,7 +3039,7 @@ impl HttpHandler for AiProxyHandler {
                                 mcp_method.clone(),
                                 &host,
                                 &path,
-                                agent,
+                                agent.as_deref(),
                                 identity_did.as_deref(),
                                 identity_signature.as_deref(),
                                 body_content.as_deref(),
@@ -2924,6 +3056,15 @@ impl HttpHandler for AiProxyHandler {
                             append_catalog_discovery_tags(&mut tags, &host);
                         }
                         append_process_attribution_tags(&mut tags, event.traffic_envelope.as_ref());
+                        append_detection_tags_from_values(
+                            &mut tags,
+                            detection_source.as_deref(),
+                            target_entity_id.as_deref(),
+                            shadow_mismatch,
+                            shadow_agent.as_deref(),
+                            shadow_detection_reason.as_deref(),
+                            shadow_parse_confidence,
+                        );
                         if !tags.is_empty() {
                             event = event.with_tags(tags);
                         }
@@ -2933,13 +3074,7 @@ impl HttpHandler for AiProxyHandler {
                 }
 
                 let mut pending = pending_requests.lock();
-                let detection_reason = detection_reason_for_bucket(
-                    host_is_ai_target,
-                    host_is_mcp_target,
-                    host_is_agent_target,
-                    is_catalog_discovery_host,
-                );
-                let blacklist_match = is_blacklist_detection_reason(detection_reason);
+                let blacklist_match = is_blacklist_detection_reason(detection_reason.as_deref());
                 pending.insert(
                     request_id,
                     PendingRequest {
@@ -2951,7 +3086,7 @@ impl HttpHandler for AiProxyHandler {
                                 mcp_method.clone(),
                                 &host,
                                 &path,
-                                agent,
+                                agent.as_deref(),
                                 identity_did.as_deref(),
                                 identity_signature.as_deref(),
                                 body_content.as_deref(),
@@ -2962,7 +3097,7 @@ impl HttpHandler for AiProxyHandler {
                         path: path.clone(),
                         method: http_method.clone(),
                         provider: None,
-                        agent,
+                        agent: agent.clone(),
                         model: None,
                         graphql_operation: None,
                         started_at: Instant::now(),
@@ -2975,8 +3110,14 @@ impl HttpHandler for AiProxyHandler {
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
                         catalog_discovery: is_catalog_discovery_host,
-                        detection_reason: detection_reason.map(ToString::to_string),
-                        parse_confidence: parse_confidence_for_reason(detection_reason),
+                        detection_reason: detection_reason.clone(),
+                        parse_confidence,
+                        target_entity_id: target_entity_id.clone(),
+                        detection_source: detection_source.clone(),
+                        shadow_agent: shadow_agent.clone(),
+                        shadow_detection_reason: shadow_detection_reason.clone(),
+                        shadow_parse_confidence,
+                        shadow_mismatch,
                         blacklist_match,
                         policy_allowed: None,
                         policy_reason: None,
@@ -3128,7 +3269,7 @@ impl HttpHandler for AiProxyHandler {
 
                 if let Some(ref logger) = event_logger {
                     let mcp_agent = AgentInfo::new(
-                        pending.agent.unwrap_or("mcp"),
+                        pending.agent.as_deref().unwrap_or("mcp"),
                         DetectionSource::Environment,
                     );
                     let method_name = pending
@@ -3168,6 +3309,7 @@ impl HttpHandler for AiProxyHandler {
                         append_catalog_discovery_tags(&mut tags, &pending.host);
                     }
                     append_process_attribution_tags(&mut tags, pending.envelope.as_ref());
+                    append_detection_tags(&mut tags, &pending);
                     append_capture_tags(
                         &mut tags,
                         pending.request_body_truncated,
@@ -3452,6 +3594,7 @@ impl HttpHandler for AiProxyHandler {
                             &mut enriched_tags,
                             log_pending.envelope.as_ref(),
                         );
+                        append_detection_tags(&mut enriched_tags, &log_pending);
                         append_capture_tags(
                             &mut enriched_tags,
                             log_pending.request_body_truncated,
@@ -3482,7 +3625,7 @@ impl HttpHandler for AiProxyHandler {
                                 session_id: &log_session_id,
                                 host: &log_pending.host,
                                 provider: log_provider.as_str(),
-                                agent: log_pending.agent,
+                                agent: log_pending.agent.as_deref(),
                                 method: &log_pending.method,
                                 path: &log_pending.path,
                                 graphql_operation: log_pending.graphql_operation.as_deref(),
@@ -3590,6 +3733,7 @@ impl HttpHandler for AiProxyHandler {
                         append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
                     }
                     append_process_attribution_tags(&mut enriched_tags, pending.envelope.as_ref());
+                    append_detection_tags(&mut enriched_tags, &pending);
                     append_capture_tags(
                         &mut enriched_tags,
                         pending.request_body_truncated,
@@ -3617,7 +3761,7 @@ impl HttpHandler for AiProxyHandler {
                             session_id: &session_id,
                             host: &pending.host,
                             provider: provider.as_str(),
-                            agent: pending.agent,
+                            agent: pending.agent.as_deref(),
                             method: &pending.method,
                             path: &pending.path,
                             graphql_operation: pending.graphql_operation.as_deref(),
@@ -3726,13 +3870,14 @@ impl HttpHandler for AiProxyHandler {
                     append_catalog_discovery_tags(&mut tags, &pending_req.host);
                 }
                 append_process_attribution_tags(&mut tags, pending_req.envelope.as_ref());
+                append_detection_tags(&mut tags, pending_req);
                 let usage_meta = ResponseUsageMeta::default();
                 if legacy_wrap_events_enabled {
                     let mut event = build_paired_response_event(ResponseEventInput {
                         session_id: &session_id,
                         host: &pending_req.host,
                         provider: provider.as_str(),
-                        agent: pending_req.agent,
+                        agent: pending_req.agent.as_deref(),
                         method: &pending_req.method,
                         path: &pending_req.path,
                         graphql_operation: pending_req.graphql_operation.as_deref(),
