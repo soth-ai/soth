@@ -7,13 +7,18 @@ use hudsucker::{
     rustls::crypto::aws_lc_rs,
     Proxy,
 };
+use chrono::Utc;
 use soth_crypto::tls::LearnedPassthrough;
 use soth_oisp::OispEngine;
+use soth_oisp::types::{CompiledBundle, DomainFilters, ResolvedProvider};
+use soth_oisp::types::bundle::{BundleStats, BundleType};
+use soth_oisp::types::EntryType;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::error::ProxyError;
 use crate::metrics;
@@ -25,10 +30,56 @@ use soth_core::config::{ExchangeV2Config, ForwardProxyConfig, ObserveConfig};
 use soth_core::EventLogger;
 
 pub(crate) fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyError> {
+    fn fallback_engine(reason: &str) -> Result<Arc<OispEngine>, ProxyError> {
+        // Fail-open fallback: keep proxy online and tunnel traffic when bundle/cache is unavailable.
+        // This avoids startup outages while preserving operator visibility.
+        let provider_id = "fallback-unknown".to_string();
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            provider_id.clone(),
+            ResolvedProvider {
+                id: provider_id,
+                entity_id: Some("p_fallback_unknown".to_string()),
+                name: "Fallback Unknown".to_string(),
+                entry_type: EntryType::AgentApp,
+                api_format: None,
+                domains: Vec::new(),
+                user_agent_patterns: Vec::new(),
+                detection: None,
+            },
+        );
+
+        let bundle = CompiledBundle {
+            schema_version: 3,
+            version: "fallback-local-1".to_string(),
+            compiled_at: Utc::now().to_rfc3339(),
+            bundle_type: BundleType::Local,
+            domain_index: Vec::new(),
+            providers,
+            filters: DomainFilters::default(),
+            pricing: BTreeMap::new(),
+            stats: BundleStats {
+                providers: 1,
+                domains: 0,
+                formats: 0,
+            },
+            formats: BTreeMap::new(),
+            catalog_domains: Vec::new(),
+            meta: None,
+            signatures: None,
+        };
+
+        let engine = OispEngine::new(bundle).map_err(|error| {
+            ProxyError::transport(format!(
+                "failed to construct fallback OISP engine for fail-open mode: {error}"
+            ))
+        })?;
+        warn!(reason = reason, "Using fail-open fallback OISP engine");
+        Ok(Arc::new(engine))
+    }
+
     let Some(path) = cache_path else {
-        return Err(ProxyError::transport(
-            "compiled registry bundle is required for proxy start; run `soth init` (or cloud sync) to populate registry cache".to_string(),
-        ));
+        return fallback_engine("registry cache path not configured");
     };
 
     match OispEngine::load_from_registry_cache(path) {
@@ -47,20 +98,20 @@ pub(crate) fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngi
             );
             Ok(Arc::new(engine))
         }
-        Ok(None) => Err(ProxyError::transport(format!(
-            "compiled registry bundle is required for proxy start; cache not found at {}",
+        Ok(None) => fallback_engine(&format!(
+            "registry cache not found at {}; running in tunnel-first fail-open mode",
             path.display()
-        ))),
+        )),
         Err(error) => {
             error!(
                 cache = %path.display(),
                 error = %error,
                 "Failed to load OISP registry cache"
             );
-            Err(ProxyError::transport(format!(
-                "compiled registry bundle is required for proxy start; failed loading cache {}: {error}",
+            fallback_engine(&format!(
+                "failed loading registry cache {}: {error}",
                 path.display()
-            )))
+            ))
         }
     }
 }

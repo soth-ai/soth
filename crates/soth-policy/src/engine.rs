@@ -8,6 +8,7 @@ use soth_core::error::Result;
 use soth_core::types::policy::{EvaluationResult, PolicyData, PolicyDecision, PolicyInput};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -45,6 +46,8 @@ pub struct PolicyEngine {
     cache: Arc<DecisionCache>,
     /// Statistics
     stats: RwLock<EngineStats>,
+    /// Guard to avoid spamming runtime-mismatch warnings on every evaluation.
+    rego_runtime_warning_emitted: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +100,7 @@ impl PolicyEngine {
             config,
             artifacts: RwLock::new(PolicyArtifactSet::default()),
             stats: RwLock::new(EngineStats::default()),
+            rego_runtime_warning_emitted: AtomicBool::new(false),
         }
     }
 
@@ -110,6 +114,7 @@ impl PolicyEngine {
             },
             artifacts: RwLock::new(PolicyArtifactSet::default()),
             stats: RwLock::new(EngineStats::default()),
+            rego_runtime_warning_emitted: AtomicBool::new(false),
         }
     }
 
@@ -243,11 +248,14 @@ impl PolicyEngine {
         }
 
         // TODO: Wire up OpaWasmRuntime (crate::wasm) to execute loaded Rego modules.
-        // Currently the wasm runtime is a placeholder that fails closed. Once it can
-        // actually evaluate Rego, this branch should call into it and merge the result
-        // with the built-in data-based rules below. Until then we warn and fall through
-        // to the built-in evaluator so cloud-synced Rego modules don't block startup.
-        if has_modules {
+        // Currently the wasm runtime is a placeholder and runtime evaluation remains
+        // fail-open by falling through to the built-in data-based rules below. Once the
+        // Rego runtime is available, this branch should call into it and merge results.
+        if has_modules
+            && !self
+                .rego_runtime_warning_emitted
+                .swap(true, Ordering::Relaxed)
+        {
             warn!(
                 module_count = has_modules_count,
                 "Policy modules loaded but no Rego execution runtime available — \

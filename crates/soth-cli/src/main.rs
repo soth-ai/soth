@@ -16,7 +16,7 @@
 //!   soth tui                     - Interactive API-backed TUI (local-debug feature)
 //!   soth attach                  - Attach TUI to a running sensor API (local-debug feature)
 //!   soth runtime setup-ca        - Generate/install local CA certificate
-//!   soth runtime env             - Print proxy env exports
+//!   soth runtime env             - Print proxy env exports/unsets
 //!   soth dev api start           - Start local API/WebSocket service (local-debug feature)
 //!   soth dev ui start            - Start local UI dev service (local-debug feature)
 //!   soth dev profile start       - Start runtime profile (sensor/api/ui/dev) (local-debug feature)
@@ -267,6 +267,10 @@ enum RuntimeCommands {
         /// Shell type (bash, zsh, fish, powershell)
         #[arg(long, default_value = "bash")]
         shell: String,
+
+        /// Print unset/remove commands instead of set/export commands
+        #[arg(long)]
+        unset: bool,
 
         /// Only show CA cert path (for --cacert)
         #[arg(long)]
@@ -670,10 +674,12 @@ async fn async_main() -> anyhow::Result<()> {
             }
             RuntimeCommands::Env {
                 shell,
+                unset,
                 ca_only,
                 config,
             } => {
-                commands::proxy::run_env(&shell, ca_only, config.or(cli.config.clone())).await?;
+                commands::proxy::run_env(&shell, ca_only, unset, config.or(cli.config.clone()))
+                    .await?;
             }
             RuntimeCommands::Status { config } => {
                 commands::proxy::run_status(config.or(cli.config.clone())).await?;

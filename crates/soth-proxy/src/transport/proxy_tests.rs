@@ -64,14 +64,10 @@ fn test_oisp_engine() -> Arc<OispEngine> {
 }
 
 #[test]
-fn load_oisp_engine_requires_configured_cache_path() {
-    let error = match load_oisp_engine(None) {
-        Ok(_) => panic!("expected missing cache path to fail"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("compiled registry bundle is required"));
+fn load_oisp_engine_without_cache_path_falls_open() {
+    let engine = load_oisp_engine(None).expect("missing cache path should fail-open");
+    assert!(engine.classify("api.openai.com").is_none());
+    assert!(!engine.should_intercept_host("api.openai.com"));
 }
 
 #[test]
@@ -130,16 +126,12 @@ fn load_oisp_engine_uses_cache_bundle_without_embedded_overlay() {
 }
 
 #[test]
-fn load_oisp_engine_requires_existing_cache_bundle() {
+fn load_oisp_engine_missing_cache_bundle_falls_open() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("missing_registry_bundle_cache.json");
-    let error = match load_oisp_engine(Some(path.as_path())) {
-        Ok(_) => panic!("expected missing cache bundle to fail"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("compiled registry bundle is required"));
+    let engine = load_oisp_engine(Some(path.as_path())).expect("missing cache should fail-open");
+    assert!(engine.classify("chatgpt.com").is_none());
+    assert!(!engine.should_intercept_host("chatgpt.com"));
 }
 
 #[test]

@@ -2,6 +2,7 @@
 
 use crate::style;
 use anyhow::{anyhow, Context};
+use std::env;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpStream};
@@ -12,6 +13,20 @@ use std::time::Duration;
 const PID_FILE: &str = "proxy.pid";
 const LOG_FILE: &str = "proxy.log";
 const DEFAULT_PROXY_PORT: u16 = 8080;
+const PROXY_ENV_KEYS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "AWS_CA_BUNDLE",
+];
 
 fn soth_home_dir() -> PathBuf {
     dirs::home_dir()
@@ -186,6 +201,76 @@ fn compact_path(path: &Path) -> String {
     full
 }
 
+fn shell_unset_hint_command() -> &'static str {
+    let shell = env::var("SHELL")
+        .ok()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if shell.contains("fish") {
+        "eval (soth runtime env --shell fish --unset)"
+    } else {
+        "eval \"$(soth runtime env --unset)\""
+    }
+}
+
+fn shell_set_hint_command() -> &'static str {
+    let shell = env::var("SHELL")
+        .ok()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if shell.contains("fish") {
+        "eval (soth runtime env --shell fish)"
+    } else {
+        "eval \"$(soth runtime env)\""
+    }
+}
+
+fn has_local_proxy_env() -> bool {
+    PROXY_ENV_KEYS.iter().any(|key| {
+        let Ok(value) = env::var(key) else {
+            return false;
+        };
+        let normalized = value.to_ascii_lowercase();
+        match *key {
+            "HTTP_PROXY" | "HTTPS_PROXY" | "http_proxy" | "https_proxy" => {
+                normalized.contains("127.0.0.1") || normalized.contains("localhost")
+            }
+            "NO_PROXY" | "no_proxy" => {
+                normalized.contains("127.0.0.1") || normalized.contains("localhost")
+            }
+            "SSL_CERT_FILE"
+            | "REQUESTS_CA_BUNDLE"
+            | "NODE_EXTRA_CA_CERTS"
+            | "CURL_CA_BUNDLE"
+            | "GIT_SSL_CAINFO"
+            | "AWS_CA_BUNDLE" => normalized.contains(".soth"),
+            _ => false,
+        }
+    })
+}
+
+fn print_env_setup_hint_if_needed() {
+    if !has_local_proxy_env() {
+        style::info(&format!(
+            "Set shell proxy env in this terminal: {}",
+            shell_set_hint_command()
+        ));
+    }
+}
+
+fn should_hint_env_cleanup() -> bool {
+    has_local_proxy_env()
+}
+
+fn print_env_cleanup_hint_if_needed() {
+    if should_hint_env_cleanup() {
+        style::info(&format!(
+            "Clear shell proxy env in this terminal: {}",
+            shell_unset_hint_command()
+        ));
+    }
+}
+
 pub async fn run_start_daemon(
     port: Option<u16>,
     config_path: Option<PathBuf>,
@@ -318,6 +403,7 @@ pub async fn run_start_daemon(
         style::kv("Logs", &compact_path(&log_file_path));
         style::kv("Control", "soth stop");
         style::kv("Tail", "soth logs -f");
+        print_env_setup_hint_if_needed();
     }
     Ok(())
 }
@@ -327,6 +413,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
         let orphaned = running_daemon_pids();
         if orphaned.is_empty() {
             style::warning("Proxy daemon is not running (no pid file).");
+            print_env_cleanup_hint_if_needed();
             return Ok(());
         }
         for orphan_pid in orphaned {
@@ -334,6 +421,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
         }
         let _ = super::system::disable_quiet().await;
         style::success("Stopped orphaned proxy daemon process(es).");
+        print_env_cleanup_hint_if_needed();
         return Ok(());
     };
 
@@ -343,6 +431,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
         if orphaned.is_empty() {
             style::warning("Proxy daemon pid file was stale; cleaned up.");
             let _ = super::system::disable_quiet().await;
+            print_env_cleanup_hint_if_needed();
             return Ok(());
         }
         for orphan_pid in orphaned {
@@ -350,6 +439,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
         }
         let _ = super::system::disable_quiet().await;
         style::success("Stopped proxy daemon process(es) after stale pid cleanup.");
+        print_env_cleanup_hint_if_needed();
         return Ok(());
     }
 
@@ -359,6 +449,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
             remove_pid_file();
             let _ = super::system::disable_quiet().await;
             style::success("Proxy daemon stopped.");
+            print_env_cleanup_hint_if_needed();
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -370,6 +461,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
             remove_pid_file();
             let _ = super::system::disable_quiet().await;
             style::success("Proxy daemon stopped (forced).");
+            print_env_cleanup_hint_if_needed();
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

@@ -1,6 +1,5 @@
 //! Shared enforcement runtime builders used by proxy and wrap commands.
 
-use anyhow::Context;
 use soth_budget::BudgetTracker;
 use soth_core::config::SothConfig;
 use soth_core::types::policy::PolicyInputBuilder;
@@ -143,9 +142,19 @@ fn collect_trusted_dids(config: &SothConfig) -> anyhow::Result<HashSet<String>> 
     if let Some(path) = &config.identity.trust_store_path {
         let trust_store_file = resolve_trust_store_file(path);
         if trust_store_file.exists() {
-            let store = TrustStore::new(&trust_store_file)?;
-            for did in store.list() {
-                trusted_dids.insert(did.to_string());
+            match TrustStore::new(&trust_store_file) {
+                Ok(store) => {
+                    for did in store.list() {
+                        trusted_dids.insert(did.to_string());
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        path = %trust_store_file.display(),
+                        error = %error,
+                        "Failed loading trust store; continuing fail-open with configured allowed_dids only"
+                    );
+                }
             }
         }
     }
@@ -245,12 +254,20 @@ fn build_policy_engine(config: &SothConfig) -> anyhow::Result<Option<PolicyEngin
 
     if let Err(error) = validate_policy_artifacts(config.policy.cache.clone().into(), &artifacts) {
         metrics::record_policy_reload(false);
-        return Err(error);
+        warn!(
+            error = %error,
+            "Policy artifacts invalid at startup; continuing fail-open with policy layer disabled"
+        );
+        return Ok(None);
     }
 
     if let Err(error) = apply_policy_artifacts(&engine, &artifacts) {
         metrics::record_policy_reload(false);
-        return Err(error);
+        warn!(
+            error = %error,
+            "Policy artifacts failed to apply at startup; continuing fail-open with policy layer disabled"
+        );
+        return Ok(None);
     }
 
     metrics::record_policy_reload(true);
@@ -337,22 +354,30 @@ fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTrac
         match limit.scope.as_str() {
             "global" => tracker.set_global_budget(limit.daily, limit.weekly, limit.monthly),
             "per_agent" => {
-                let agent_id = limit.agent_id.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("budget limit scope=per_agent requires agent_id")
-                })?;
+                let Some(agent_id) = limit.agent_id.as_deref() else {
+                    warn!(
+                        "Ignoring invalid budget limit: scope=per_agent requires agent_id (fail-open)"
+                    );
+                    continue;
+                };
                 tracker.set_agent_budget(agent_id, limit.daily, limit.weekly, limit.monthly);
             }
             "per_session" => {
                 tracker.set_session_budget(limit.daily, limit.weekly, limit.monthly);
             }
             "per_model" => {
-                let model = limit.model.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("budget limit scope=per_model requires model")
-                })?;
+                let Some(model) = limit.model.as_deref() else {
+                    warn!("Ignoring invalid budget limit: scope=per_model requires model (fail-open)");
+                    continue;
+                };
                 tracker.set_model_budget(model, limit.daily, limit.weekly, limit.monthly);
             }
             other => {
-                return Err(anyhow::anyhow!("unsupported budget limit scope: {other}"));
+                warn!(
+                    scope = other,
+                    "Ignoring unsupported budget limit scope (fail-open)"
+                );
+                continue;
             }
         }
     }
@@ -470,9 +495,13 @@ pub fn build_wrap_enforcement_runtime(
         enabled = true;
         let mut trust_store = TrustStore::in_memory();
         for did in collect_trusted_dids(config)? {
-            trust_store
-                .trust(&did)
-                .with_context(|| format!("Failed to trust DID from config: {did}"))?;
+            if let Err(error) = trust_store.trust(&did) {
+                warn!(
+                    did = %did,
+                    error = %error,
+                    "Ignoring invalid trusted DID from config (fail-open)"
+                );
+            }
         }
         let layer = IdentityLayer::with_trust_store(identity_config.clone(), trust_store);
         pipeline_builder = pipeline_builder.layer(layer);

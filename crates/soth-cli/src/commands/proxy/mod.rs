@@ -78,6 +78,10 @@ pub enum ProxyCommands {
         #[arg(long, default_value = "bash")]
         shell: String,
 
+        /// Print unset/remove commands instead of set/export commands
+        #[arg(long)]
+        unset: bool,
+
         /// Only show CA cert path (for --cacert)
         #[arg(long)]
         ca_only: bool,
@@ -153,8 +157,13 @@ pub async fn run_setup_ca(
     setup_ca::run(output, no_trust, global_config).await
 }
 
-pub async fn run_env(shell: &str, ca_only: bool, config: Option<PathBuf>) -> anyhow::Result<()> {
-    env::run(shell, ca_only, config).await
+pub async fn run_env(
+    shell: &str,
+    ca_only: bool,
+    unset: bool,
+    config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    env::run(shell, ca_only, unset, config).await
 }
 
 pub async fn run_status(config: Option<PathBuf>) -> anyhow::Result<()> {
@@ -373,9 +382,10 @@ pub async fn run(cmd: ProxyCommands, global_config: Option<PathBuf>) -> anyhow::
         },
         ProxyCommands::Env {
             shell,
+            unset,
             ca_only,
             config,
-        } => env::run(&shell, ca_only, config.or(global_config.clone())).await,
+        } => env::run(&shell, ca_only, unset, config.or(global_config.clone())).await,
         ProxyCommands::Status { config } => status::run(config.or(global_config.clone())).await,
         ProxyCommands::CaInfo { config } => ca_info::run(config.or(global_config.clone())).await,
     }
