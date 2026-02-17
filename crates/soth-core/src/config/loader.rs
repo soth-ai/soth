@@ -4,7 +4,6 @@
 
 use crate::config::types::SothConfig;
 use crate::error::{Result, SothError};
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -18,8 +17,6 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 
     let content = std::fs::read_to_string(path)?;
     let mut config: SothConfig = serde_yaml::from_str(&content)?;
-    config.observe.storage.apply_legacy_retention_days();
-    apply_host_domain_file_overrides(&mut config, path.parent())?;
 
     // Apply environment variable overrides
     apply_env_overrides(&mut config);
@@ -32,8 +29,6 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 /// Load configuration from a string
 pub fn load_config_from_str(content: &str) -> Result<SothConfig> {
     let mut config: SothConfig = serde_yaml::from_str(content)?;
-    config.observe.storage.apply_legacy_retention_days();
-    apply_host_domain_file_overrides(&mut config, None)?;
     apply_env_overrides(&mut config);
     normalize_cloud_config(&mut config);
     normalize_budget_db_path(&mut config);
@@ -53,87 +48,6 @@ fn normalize_cloud_config(config: &mut SothConfig) {
     if config.cloud.api_key.is_none() {
         config.cloud.enabled = false;
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum DomainListFile {
-    List(Vec<String>),
-    Object { domains: Vec<String> },
-}
-
-fn normalize_domains(domains: Vec<String>) -> Vec<String> {
-    let mut out = Vec::with_capacity(domains.len());
-    let mut seen = std::collections::HashSet::with_capacity(domains.len());
-    for entry in domains {
-        let trimmed = entry.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if seen.insert(trimmed.to_string()) {
-            out.push(trimmed.to_string());
-        }
-    }
-    out
-}
-
-fn resolve_domain_file_path(raw_path: &Path, base_dir: Option<&Path>) -> std::path::PathBuf {
-    let expanded = expand_path(raw_path);
-    if expanded.is_absolute() {
-        expanded
-    } else if let Some(base) = base_dir {
-        base.join(expanded)
-    } else {
-        expanded
-    }
-}
-
-fn load_domain_list_file(path: &Path) -> Result<Vec<String>> {
-    if !path.exists() {
-        return Err(SothError::ConfigInvalid(format!(
-            "Domain list file not found: {}",
-            path.display()
-        )));
-    }
-
-    let content = std::fs::read_to_string(path)?;
-    let parsed: DomainListFile = serde_yaml::from_str(&content).map_err(|e| {
-        SothError::ConfigInvalid(format!(
-            "Invalid domain list file {}: {}",
-            path.display(),
-            e
-        ))
-    })?;
-
-    let domains = match parsed {
-        DomainListFile::List(domains) => domains,
-        DomainListFile::Object { domains } => domains,
-    };
-    Ok(normalize_domains(domains))
-}
-
-fn apply_host_domain_file_overrides(
-    config: &mut SothConfig,
-    base_dir: Option<&Path>,
-) -> Result<()> {
-    let domain_files = config.forward_proxy.hosts.domain_files.clone();
-
-    if let Some(path) = domain_files.ai_inference.as_ref() {
-        let resolved = resolve_domain_file_path(path, base_dir);
-        config.forward_proxy.hosts.ai_inference = load_domain_list_file(&resolved)?;
-    }
-
-    if let Some(path) = domain_files.mcp.as_ref() {
-        let resolved = resolve_domain_file_path(path, base_dir);
-        config.forward_proxy.hosts.mcp = load_domain_list_file(&resolved)?;
-    }
-
-    if let Some(path) = domain_files.agent_apps.as_ref() {
-        let resolved = resolve_domain_file_path(path, base_dir);
-        config.forward_proxy.hosts.agent_apps = load_domain_list_file(&resolved)?;
-    }
-
-    Ok(())
 }
 
 /// Apply environment variable overrides to the configuration
@@ -245,6 +159,29 @@ fn apply_env_overrides(config: &mut SothConfig) {
             config.cloud.metadata_max_compressed_batch_bytes = parsed.max(1);
         }
     }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_ENABLED") {
+        config.cloud.frontload_enabled = value.parse().unwrap_or(config.cloud.frontload_enabled);
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_MAX_EVENTS_PER_BATCH") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            config.cloud.frontload_max_events_per_batch = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.cloud.frontload_max_compressed_batch_bytes = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            config.cloud.frontload_hard_events_cap = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.cloud.frontload_hard_compressed_cap_bytes = parsed.max(1);
+        }
+    }
     if let Ok(value) = std::env::var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES") {
         if let Ok(parsed) = value.parse::<u64>() {
             config.cloud.body_upload_max_bytes = parsed.max(1);
@@ -334,7 +271,6 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
-    use tempfile::TempDir;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -358,44 +294,6 @@ server:
 "#;
         let config = load_config_from_str(yaml).unwrap();
         assert_eq!(config.server.listen.port, 8080);
-    }
-
-    #[test]
-    fn test_legacy_retention_days_migrates_to_source_aware_retention() {
-        let yaml = r#"
-observe:
-  storage:
-    retention_days: 5
-"#;
-        let config = load_config_from_str(yaml).unwrap();
-        assert_eq!(config.observe.storage.retention.ai_proxy_days, 5);
-        assert_eq!(config.observe.storage.retention.mcp_days, 5);
-        assert_eq!(config.observe.storage.retention.agent_app_days, 5);
-        assert_eq!(config.observe.storage.retention.clusters_days, 5);
-        assert_eq!(config.observe.storage.retention.rollups_days, 5);
-    }
-
-    #[test]
-    fn test_explicit_retention_config_wins_over_legacy_retention_days() {
-        let yaml = r#"
-observe:
-  storage:
-    retention:
-      ai_proxy_days: 9
-      mcp_days: 8
-      agent_app_days: 2
-      clusters_days: 20
-      rollups_days: 120
-      vacuum_after_cleanup: false
-    retention_days: 3
-"#;
-        let config = load_config_from_str(yaml).unwrap();
-        assert_eq!(config.observe.storage.retention.ai_proxy_days, 9);
-        assert_eq!(config.observe.storage.retention.mcp_days, 8);
-        assert_eq!(config.observe.storage.retention.agent_app_days, 2);
-        assert_eq!(config.observe.storage.retention.clusters_days, 20);
-        assert_eq!(config.observe.storage.retention.rollups_days, 120);
-        assert!(!config.observe.storage.retention.vacuum_after_cleanup);
     }
 
     #[test]
@@ -446,96 +344,6 @@ budget:
     }
 
     #[test]
-    fn test_load_config_with_domain_files_replaces_inline_lists() {
-        let temp = TempDir::new().unwrap();
-        let domains_dir = temp.path().join("domains");
-        std::fs::create_dir_all(&domains_dir).unwrap();
-
-        std::fs::write(
-            domains_dir.join("ai.yaml"),
-            "domains:\n  - api.openai.com\n  - chatgpt.com\n",
-        )
-        .unwrap();
-        std::fs::write(
-            domains_dir.join("mcp.yaml"),
-            "domains:\n  - api.github.com\n  - api.notion.com\n",
-        )
-        .unwrap();
-        std::fs::write(
-            domains_dir.join("agent.yaml"),
-            "domains:\n  - chatgpt.com\n  - claude.ai\n",
-        )
-        .unwrap();
-
-        let config_path = temp.path().join("soth.yaml");
-        std::fs::write(
-            &config_path,
-            r#"
-forward_proxy:
-  hosts:
-    ai_inference: ["legacy.ai.example"]
-    mcp: ["legacy.mcp.example"]
-    agent_apps: ["legacy.agent.example"]
-    domain_files:
-      ai_inference: "./domains/ai.yaml"
-      mcp: "./domains/mcp.yaml"
-      agent_apps: "./domains/agent.yaml"
-"#,
-        )
-        .unwrap();
-
-        let config = load_config(&config_path).unwrap();
-        assert_eq!(
-            config.forward_proxy.hosts.ai_inference,
-            vec!["api.openai.com".to_string(), "chatgpt.com".to_string()]
-        );
-        assert_eq!(
-            config.forward_proxy.hosts.mcp,
-            vec!["api.github.com".to_string(), "api.notion.com".to_string()]
-        );
-        assert_eq!(
-            config.forward_proxy.hosts.agent_apps,
-            vec!["chatgpt.com".to_string(), "claude.ai".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_load_config_with_missing_domain_file_fails() {
-        let temp = TempDir::new().unwrap();
-        let config_path = temp.path().join("soth.yaml");
-        std::fs::write(
-            &config_path,
-            r#"
-forward_proxy:
-  hosts:
-    domain_files:
-      ai_inference: "./domains/missing-ai.yaml"
-"#,
-        )
-        .unwrap();
-
-        let err = load_config(&config_path).unwrap_err();
-        assert!(matches!(err, SothError::ConfigInvalid(_)));
-    }
-
-    #[test]
-    fn test_domain_list_file_supports_root_sequence() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("domains.yaml");
-        std::fs::write(
-            &path,
-            "- api.openai.com\n- api.openai.com\n- \"  \"\n- chatgpt.com\n",
-        )
-        .unwrap();
-
-        let domains = load_domain_list_file(&path).unwrap();
-        assert_eq!(
-            domains,
-            vec!["api.openai.com".to_string(), "chatgpt.com".to_string()]
-        );
-    }
-
-    #[test]
     fn test_parse_key_value_tags() {
         let tags = parse_key_value_tags("project=soth, env = dev,invalid,foo=bar");
         assert_eq!(tags.get("project"), Some(&"soth".to_string()));
@@ -573,6 +381,11 @@ forward_proxy:
         std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED", "true");
         std::env::set_var("SOTH_CLOUD_METADATA_MAX_EVENTS_PER_BATCH", "150");
         std::env::set_var("SOTH_CLOUD_METADATA_MAX_COMPRESSED_BATCH_BYTES", "4194304");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_ENABLED", "true");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_MAX_EVENTS_PER_BATCH", "2400");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES", "8388608");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP", "5000");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES", "16777216");
         std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES", "10485760");
         std::env::set_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES", "7340032");
 
@@ -586,6 +399,17 @@ forward_proxy:
         assert!(config.cloud.body_upload_enabled);
         assert_eq!(config.cloud.metadata_max_events_per_batch, 150);
         assert_eq!(config.cloud.metadata_max_compressed_batch_bytes, 4_194_304);
+        assert!(config.cloud.frontload_enabled);
+        assert_eq!(config.cloud.frontload_max_events_per_batch, 2400);
+        assert_eq!(
+            config.cloud.frontload_max_compressed_batch_bytes,
+            8 * 1024 * 1024
+        );
+        assert_eq!(config.cloud.frontload_hard_events_cap, 5000);
+        assert_eq!(
+            config.cloud.frontload_hard_compressed_cap_bytes,
+            16 * 1024 * 1024
+        );
         assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.forward_proxy.capture_max_body_bytes, 7_340_032);
         assert_eq!(config.cloud.tags.get("project"), Some(&"soth".to_string()));
@@ -600,6 +424,11 @@ forward_proxy:
         std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED");
         std::env::remove_var("SOTH_CLOUD_METADATA_MAX_EVENTS_PER_BATCH");
         std::env::remove_var("SOTH_CLOUD_METADATA_MAX_COMPRESSED_BATCH_BYTES");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_ENABLED");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_MAX_EVENTS_PER_BATCH");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES");
         std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES");
         std::env::remove_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES");
     }

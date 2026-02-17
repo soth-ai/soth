@@ -101,6 +101,11 @@ cloud:
   body_upload_enabled: false
   metadata_max_events_per_batch: 200
   metadata_max_compressed_batch_bytes: 5242880
+  frontload_enabled: true
+  frontload_max_events_per_batch: 1500
+  frontload_max_compressed_batch_bytes: 8388608
+  frontload_hard_events_cap: 5000
+  frontload_hard_compressed_cap_bytes: 16777216
   body_upload_max_bytes: 15728640
   cache_path: "~/.soth/cloud_config_cache.json"
   tags:
@@ -151,15 +156,8 @@ forward_proxy:
   # Host filtering
   hosts:
     mode: "selective"   # selective | discovery
-    # Domain classes are loaded from dedicated files.
-    # If a file is configured, it replaces the corresponding inline list.
-    domain_files:
-      ai_inference: "./domains/ai_inference.yaml"
-      mcp: "./domains/mcp.yaml"
-      agent_apps: "./domains/agent_apps.yaml"
-    ai_inference: []
-    mcp: []
-    agent_apps: []
+    # Classification/interception is bundle-driven from cloud registry cache.
+    # Keep only explicit local block rules here.
     block: []
 
   # Adaptive TLS passthrough for cert-pinned hosts that fail repeated MITM.

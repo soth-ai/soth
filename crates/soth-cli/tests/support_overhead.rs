@@ -73,9 +73,10 @@ impl LatencyStats {
     /// Format stats as a human-readable string
     pub fn format(&self) -> String {
         format!(
-            "min={:.1}us mean={:.1}us p50={:.1}us p95={:.1}us p99={:.1}us max={:.1}us (n={})",
+            "min={:.1}us mean={:.1}us std={:.1}us p50={:.1}us p95={:.1}us p99={:.1}us max={:.1}us (n={})",
             self.min_us,
             self.mean_us,
+            self.std_dev_us,
             self.p50_us,
             self.p95_us,
             self.p99_us,
@@ -248,11 +249,13 @@ where
 }
 
 /// Simple timer for measuring individual operations
+#[allow(dead_code)]
 pub struct Timer {
     start: Instant,
     label: String,
 }
 
+#[allow(dead_code)]
 impl Timer {
     /// Start a new timer with a label
     pub fn start(label: impl Into<String>) -> Self {
@@ -276,11 +279,13 @@ impl Timer {
 }
 
 /// Collect multiple timing samples into stats
+#[allow(dead_code)]
 pub struct TimingCollector {
     samples: Vec<Duration>,
     label: String,
 }
 
+#[allow(dead_code)]
 impl TimingCollector {
     /// Create a new collector
     pub fn new(label: impl Into<String>) -> Self {

@@ -4,8 +4,9 @@ use super::middleware::{error_response, get_request_id, Layer, LayerResult, Requ
 use crate::enforcement::core;
 use crate::metrics;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
-use soth_budget::{BudgetTracker, PricingCatalog, TokenUsage};
+use soth_budget::BudgetTracker;
 use soth_core::types::budget::BudgetScope;
+use soth_oisp::OispEngine;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,8 +39,8 @@ pub struct BudgetLayer {
     config: BudgetConfig,
     /// Budget tracker
     tracker: Arc<BudgetTracker>,
-    /// LiteLLM-compatible pricing catalog
-    pricing_catalog: PricingCatalog,
+    /// Bundle-driven pricing source of truth.
+    oisp_engine: Option<Arc<OispEngine>>,
 }
 
 impl BudgetLayer {
@@ -48,7 +49,7 @@ impl BudgetLayer {
         Self {
             config,
             tracker: Arc::new(BudgetTracker::new()),
-            pricing_catalog: PricingCatalog::new(),
+            oisp_engine: None,
         }
     }
 
@@ -57,8 +58,14 @@ impl BudgetLayer {
         Self {
             config,
             tracker: Arc::new(tracker),
-            pricing_catalog: PricingCatalog::new(),
+            oisp_engine: None,
         }
+    }
+
+    /// Attach an OISP engine for bundle-backed pricing lookups.
+    pub fn with_oisp_engine(mut self, oisp_engine: Arc<OispEngine>) -> Self {
+        self.oisp_engine = Some(oisp_engine);
+        self
     }
 
     /// Set global budget limits
@@ -118,6 +125,12 @@ impl BudgetLayer {
         Arc::clone(&self.tracker)
     }
 
+    fn estimate_cost_usd(&self, model: &str, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+        self.oisp_engine.as_ref().and_then(|engine| {
+            engine.calculate_cost(&[], model, input_tokens, output_tokens, None, None)
+        })
+    }
+
     /// Extract model name from message or context
     fn extract_model(&self, ctx: &RequestContext, req: &JsonRpcRequest) -> String {
         // Try to extract model from sampling request
@@ -145,7 +158,8 @@ impl BudgetLayer {
         model: &str,
         input_tokens: u64,
         output_tokens: u64,
-    ) {
+    ) -> Option<f64> {
+        let estimated_cost = self.estimate_cost_usd(model, input_tokens, output_tokens);
         core::record_budget_spend(
             &self.tracker,
             &ctx.session_id,
@@ -153,14 +167,22 @@ impl BudgetLayer {
             model,
             input_tokens,
             output_tokens,
+            estimated_cost,
         );
-        let usage = TokenUsage::new(input_tokens, output_tokens);
-        let estimated_cost = self.pricing_catalog.calculate_cost(model, &usage);
 
-        debug!(
-            "Recorded spend: session={} agent={:?} model={} cost=${:.4}",
-            ctx.session_id, ctx.agent_id, model, estimated_cost
-        );
+        if let Some(cost) = estimated_cost {
+            debug!(
+                "Recorded spend: session={} agent={:?} model={} cost=${:.4}",
+                ctx.session_id, ctx.agent_id, model, cost
+            );
+        } else {
+            debug!(
+                "Recorded spend: session={} agent={:?} model={} cost=unavailable",
+                ctx.session_id, ctx.agent_id, model
+            );
+        }
+
+        estimated_cost
     }
 
     /// Check if budget is exceeded and return first matched scope.
@@ -245,14 +267,17 @@ impl Layer for BudgetLayer {
                         .unwrap_or_else(|| self.config.default_model.clone());
 
                     // Record the spend
-                    self.record_spend(ctx, &model, input_tokens, output_tokens)
+                    let estimated_cost = self
+                        .record_spend(ctx, &model, input_tokens, output_tokens)
                         .await;
 
-                    // Calculate cost for metadata
-                    let usage = TokenUsage::new(input_tokens, output_tokens);
-                    let cost = self.pricing_catalog.calculate_cost(&model, &usage);
-                    ctx.metadata
-                        .insert("budget_cost".to_string(), serde_json::json!(cost));
+                    // Persist cost metadata only when bundle pricing resolved.
+                    if let Some(cost) = estimated_cost {
+                        ctx.metadata
+                            .insert("budget_cost".to_string(), serde_json::json!(cost));
+                    } else {
+                        ctx.metadata.remove("budget_cost");
+                    }
 
                     LayerResult::Continue(message)
                 }

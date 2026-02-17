@@ -22,6 +22,9 @@ use tracing::{info, warn};
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_READ_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_LINE_BYTES: usize = 64 * 1024;
+const DEFAULT_FRONTLOAD_MAX_CYCLES: usize = 24;
+const DEFAULT_FRONTLOAD_MAX_READ_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_AUTO_DISCOVER_MAX_SOURCES: usize = 48;
 
 #[derive(Debug)]
 pub struct CollectorRuntime {
@@ -35,6 +38,10 @@ pub struct CollectorConfig {
     pub state_path: PathBuf,
     pub max_read_bytes_per_source: usize,
     pub max_line_bytes: usize,
+    pub auto_discover_sources: bool,
+    pub frontload_on_start: bool,
+    pub frontload_max_cycles: usize,
+    pub frontload_max_read_bytes_per_source: usize,
     pub agent_name: String,
     pub event_source: EventSource,
     pub exchange_v2: ExchangeV2Config,
@@ -94,6 +101,23 @@ struct EnvSqliteSource {
 }
 
 #[derive(Debug, Deserialize)]
+struct EnvFileSource {
+    #[serde(default)]
+    name: Option<String>,
+    path: String,
+    #[serde(default)]
+    parser: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct EnvSqliteQuery {
     file_type: String,
     sql: String,
@@ -116,42 +140,23 @@ impl CollectorConfig {
             return None;
         }
 
-        let mut sources = Vec::new();
-        if let Ok(sources_raw) = std::env::var("SOTH_COLLECTOR_SOURCES") {
-            for raw in sources_raw.split(',') {
-                let raw = raw.trim();
-                if raw.is_empty() {
-                    continue;
-                }
-                let path = expand_home_path(Path::new(raw));
-                let name = path
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .unwrap_or("collector-source")
-                    .to_string();
-                let parser = match path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "jsonl" | "ndjson" => CollectorParser::JsonLines,
-                    _ => CollectorParser::TextLines,
-                };
-                sources.push(CollectorSource {
-                    name,
-                    path,
-                    parser,
-                    server_name: None,
-                    provider: None,
-                    model: None,
-                    tags: BTreeMap::new(),
-                });
-            }
-        }
+        let auto_discover_sources = parse_bool_env("SOTH_COLLECTOR_AUTO_DISCOVER").unwrap_or(true);
+        let frontload_on_start =
+            parse_bool_env("SOTH_COLLECTOR_FRONTLOAD_ON_START").unwrap_or(true);
+
+        let mut sources = parse_file_sources_from_env();
 
         let sqlite_sources = parse_sqlite_sources_from_env();
+        if auto_discover_sources && sources.is_empty() && sqlite_sources.is_empty() {
+            let discovered_sources = discover_default_sources(DEFAULT_AUTO_DISCOVER_MAX_SOURCES);
+            if !discovered_sources.is_empty() {
+                info!(
+                    discovered = discovered_sources.len(),
+                    "Collector auto-discovered local history sources"
+                );
+                sources = discovered_sources;
+            }
+        }
 
         if sources.is_empty() && sqlite_sources.is_empty() {
             warn!(
@@ -175,6 +180,17 @@ impl CollectorConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_LINE_BYTES)
             .max(1024);
+        let frontload_max_cycles = std::env::var("SOTH_COLLECTOR_FRONTLOAD_MAX_CYCLES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_FRONTLOAD_MAX_CYCLES)
+            .max(1);
+        let frontload_max_read_bytes_per_source =
+            std::env::var("SOTH_COLLECTOR_FRONTLOAD_MAX_READ_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_FRONTLOAD_MAX_READ_BYTES)
+                .max(max_read_bytes_per_source);
         let state_path = std::env::var("SOTH_COLLECTOR_STATE_PATH")
             .ok()
             .map(PathBuf::from)
@@ -194,6 +210,10 @@ impl CollectorConfig {
             state_path,
             max_read_bytes_per_source,
             max_line_bytes,
+            auto_discover_sources,
+            frontload_on_start,
+            frontload_max_cycles,
+            frontload_max_read_bytes_per_source,
             agent_name,
             event_source,
             exchange_v2: ExchangeV2Config::default(),
@@ -284,6 +304,134 @@ fn parse_sqlite_sources_from_env() -> Vec<CollectorSqliteSource> {
         .collect::<Vec<_>>()
 }
 
+fn parse_file_sources_from_env() -> Vec<CollectorSource> {
+    let mut sources = parse_file_sources_json_from_env();
+    if !sources.is_empty() {
+        return sources;
+    }
+
+    let sources_raw = match std::env::var("SOTH_COLLECTOR_SOURCES") {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    for raw in sources_raw.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let path = expand_home_path(Path::new(raw));
+        let name = default_source_name(&path);
+        let parser = parser_for_path_and_hint(&path, None);
+        sources.push(CollectorSource {
+            name,
+            path,
+            parser,
+            server_name: None,
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        });
+    }
+    sources
+}
+
+fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
+    let raw = match std::env::var("SOTH_COLLECTOR_SOURCES_JSON") {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let parsed = match serde_json::from_str::<Vec<EnvFileSource>>(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Invalid SOTH_COLLECTOR_SOURCES_JSON; falling back to path-based source parsing"
+            );
+            return Vec::new();
+        }
+    };
+
+    parsed
+        .into_iter()
+        .filter_map(|source| {
+            let raw_path = source.path.trim();
+            if raw_path.is_empty() {
+                return None;
+            }
+            let path = expand_home_path(Path::new(raw_path));
+            let name = source
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| default_source_name(&path));
+            let parser = parser_for_path_and_hint(&path, source.parser.as_deref());
+            let server_name = normalize_optional_text(source.server_name.as_deref());
+            let provider = normalize_optional_text(source.provider.as_deref());
+            let model = normalize_optional_text(source.model.as_deref());
+            Some(CollectorSource {
+                name,
+                path,
+                parser,
+                server_name,
+                provider,
+                model,
+                tags: source.tags,
+            })
+        })
+        .collect()
+}
+
+fn parser_for_path_and_hint(path: &Path, parser_hint: Option<&str>) -> CollectorParser {
+    if let Some(hint) = parser_hint {
+        match hint.trim().to_ascii_lowercase().as_str() {
+            "jsonl" | "ndjson" | "json_lines" | "jsonlines" => return CollectorParser::JsonLines,
+            "text" | "txt" | "text_lines" | "lines" => return CollectorParser::TextLines,
+            _ => {}
+        }
+    }
+
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jsonl" | "ndjson" => CollectorParser::JsonLines,
+        _ => CollectorParser::TextLines,
+    }
+}
+
+fn default_source_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|v| v.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("collector-source")
+        .to_string()
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_bool_env(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 pub fn spawn_from_env(
     event_logger: EventLogger,
     global_tags: BTreeMap<String, String>,
@@ -304,6 +452,9 @@ pub fn spawn_runtime(
     info!(
         file_sources = collector.config.sources.len(),
         sqlite_sources = collector.config.sqlite_sources.len(),
+        auto_discover = collector.config.auto_discover_sources,
+        frontload_on_start = collector.config.frontload_on_start,
+        frontload_cycles = collector.config.frontload_max_cycles,
         poll_secs = collector.config.poll_interval.as_secs(),
         state_path = %collector.config.state_path.display(),
         "Local collector enabled"
@@ -312,6 +463,11 @@ pub fn spawn_runtime(
     let task = tokio::spawn(async move {
         if let Err(error) = collector.load_state() {
             warn!("Collector state load failed: {}", error);
+        }
+        if collector.config.frontload_on_start {
+            if let Err(error) = collector.run_frontload(&event_logger) {
+                warn!("Collector frontload failed: {}", error);
+            }
         }
         let mut interval = tokio::time::interval(collector.config.poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -345,6 +501,27 @@ struct CollectorAgent {
     redactor: PiiRedactor,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CollectorIngestMode {
+    Incremental,
+    Frontload,
+}
+
+impl CollectorIngestMode {
+    fn as_tag(self) -> &'static str {
+        match self {
+            Self::Incremental => "incremental",
+            Self::Frontload => "frontload",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PollStats {
+    events_emitted: usize,
+    state_changed: bool,
+}
+
 impl CollectorAgent {
     fn new(config: CollectorConfig, global_tags: BTreeMap<String, String>) -> Self {
         Self {
@@ -365,8 +542,50 @@ impl CollectorAgent {
         self.offsets.save(&self.config.state_path)
     }
 
+    fn run_frontload(&mut self, logger: &EventLogger) -> anyhow::Result<()> {
+        let mut total_events = 0usize;
+        let mut cycles = 0usize;
+        for _ in 0..self.config.frontload_max_cycles {
+            let stats = self.poll_once_with_limits(
+                logger,
+                self.config.frontload_max_read_bytes_per_source,
+                CollectorIngestMode::Frontload,
+            )?;
+            cycles += 1;
+            total_events += stats.events_emitted;
+            if !stats.state_changed {
+                break;
+            }
+        }
+        if cycles > 0 {
+            info!(
+                cycles,
+                events = total_events,
+                max_cycles = self.config.frontload_max_cycles,
+                read_bytes_per_source = self.config.frontload_max_read_bytes_per_source,
+                "Collector frontload completed"
+            );
+        }
+        Ok(())
+    }
+
     fn poll_once(&mut self, logger: &EventLogger) -> anyhow::Result<()> {
+        self.poll_once_with_limits(
+            logger,
+            self.config.max_read_bytes_per_source,
+            CollectorIngestMode::Incremental,
+        )?;
+        Ok(())
+    }
+
+    fn poll_once_with_limits(
+        &mut self,
+        logger: &EventLogger,
+        max_read_bytes_per_source: usize,
+        mode: CollectorIngestMode,
+    ) -> anyhow::Result<PollStats> {
         let mut state_changed = false;
+        let mut events_emitted = 0usize;
 
         for source in &self.config.sources {
             let key = source.path.to_string_lossy().to_string();
@@ -374,7 +593,7 @@ impl CollectorAgent {
             let outcome = collect_source_events(
                 source,
                 &prior_state,
-                self.config.max_read_bytes_per_source,
+                max_read_bytes_per_source,
                 self.config.max_line_bytes,
             )?;
             if outcome.next_state != prior_state {
@@ -383,7 +602,8 @@ impl CollectorAgent {
             }
 
             for source_line in outcome.lines {
-                if let Some(event) = self.build_event(source, source_line) {
+                if let Some(event) = self.build_event(source, source_line, mode) {
+                    events_emitted += 1;
                     logger.log(&event);
                     if self.config.exchange_v2.enabled {
                         if let Err(error) = logger.enqueue_exchange_from_wrap_event(
@@ -412,7 +632,8 @@ impl CollectorAgent {
             }
 
             for source_line in outcome.lines {
-                if let Some(event) = self.build_sqlite_event(source, source_line) {
+                if let Some(event) = self.build_sqlite_event(source, source_line, mode) {
+                    events_emitted += 1;
                     logger.log(&event);
                     if self.config.exchange_v2.enabled {
                         if let Err(error) = logger.enqueue_exchange_from_wrap_event(
@@ -435,10 +656,18 @@ impl CollectorAgent {
             self.save_state()?;
         }
 
-        Ok(())
+        Ok(PollStats {
+            events_emitted,
+            state_changed,
+        })
     }
 
-    fn build_event(&self, source: &CollectorSource, line: SourceLine) -> Option<WrapEvent> {
+    fn build_event(
+        &self,
+        source: &CollectorSource,
+        line: SourceLine,
+        mode: CollectorIngestMode,
+    ) -> Option<WrapEvent> {
         let trimmed = line.content.trim();
         if trimmed.is_empty() {
             return None;
@@ -501,6 +730,13 @@ impl CollectorAgent {
         for (k, v) in &source.tags {
             tags.insert(k.clone(), v.clone());
         }
+        tags.insert(
+            "collector.ingest_mode".to_string(),
+            mode.as_tag().to_string(),
+        );
+        if matches!(mode, CollectorIngestMode::Frontload) {
+            tags.insert("collector.frontload".to_string(), "true".to_string());
+        }
         if !tags.is_empty() {
             event = event.with_tags(tags);
         }
@@ -512,6 +748,7 @@ impl CollectorAgent {
         &self,
         source: &CollectorSqliteSource,
         line: SqliteSourceLine,
+        mode: CollectorIngestMode,
     ) -> Option<WrapEvent> {
         let trimmed = line.content.trim();
         if trimmed.is_empty() {
@@ -580,6 +817,13 @@ impl CollectorAgent {
             tags.insert(k.clone(), v.clone());
         }
         tags.insert("collector.query_type".to_string(), line.file_type);
+        tags.insert(
+            "collector.ingest_mode".to_string(),
+            mode.as_tag().to_string(),
+        );
+        if matches!(mode, CollectorIngestMode::Frontload) {
+            tags.insert("collector.frontload".to_string(), "true".to_string());
+        }
         if !tags.is_empty() {
             event = event.with_tags(tags);
         }
@@ -612,42 +856,14 @@ struct OffsetState {
     sqlite: HashMap<String, SqliteScanState>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct LegacyOffsetState {
-    #[serde(default)]
-    offsets: HashMap<String, u64>,
-}
-
 impl OffsetState {
     fn load(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let data = std::fs::read(path)?;
-        let value = serde_json::from_slice::<serde_json::Value>(&data).with_context(|| {
-            format!("failed parsing collector offset state: {}", path.display())
-        })?;
-        if let Ok(parsed) = serde_json::from_value::<Self>(value.clone()) {
-            let has_legacy_offsets = value.get("offsets").is_some();
-            if !parsed.files.is_empty() || !parsed.sqlite.is_empty() || !has_legacy_offsets {
-                return Ok(parsed);
-            }
-        }
-        let legacy = serde_json::from_value::<LegacyOffsetState>(value).with_context(|| {
-            format!(
-                "failed parsing collector legacy offset state: {}",
-                path.display()
-            )
-        })?;
-        let files = legacy
-            .offsets
-            .into_iter()
-            .map(|(path, offset)| (path, FileScanState { offset, mtime: 0 }))
-            .collect::<HashMap<_, _>>();
-        Ok(Self {
-            files,
-            sqlite: HashMap::new(),
-        })
+        serde_json::from_slice(&data)
+            .with_context(|| format!("failed parsing collector offset state: {}", path.display()))
     }
 
     fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -1205,6 +1421,155 @@ fn build_preview(content: &str, max_chars: usize) -> String {
     out
 }
 
+fn discover_default_sources(limit: usize) -> Vec<CollectorSource> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut discovered = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (root_name, raw_root) in default_source_roots() {
+        if discovered.len() >= limit {
+            break;
+        }
+        let root = expand_home_path(Path::new(raw_root));
+        if !root.exists() {
+            continue;
+        }
+        let remaining = limit.saturating_sub(discovered.len());
+        for path in discover_history_files_under(&root, remaining, 4) {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let parser = match path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "jsonl" | "ndjson" => CollectorParser::JsonLines,
+                _ => CollectorParser::TextLines,
+            };
+            let rel = path
+                .strip_prefix(&root)
+                .ok()
+                .map(|v| v.to_string_lossy().to_string())
+                .unwrap_or_else(|| {
+                    path.file_name()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("history")
+                        .to_string()
+                });
+            let mut tags = BTreeMap::new();
+            tags.insert("collector.discovery".to_string(), "auto".to_string());
+            tags.insert("collector.root".to_string(), root_name.to_string());
+            discovered.push(CollectorSource {
+                name: format!("{}:{}", root_name, rel),
+                path,
+                parser,
+                server_name: None,
+                provider: None,
+                model: None,
+                tags,
+            });
+            if discovered.len() >= limit {
+                break;
+            }
+        }
+    }
+    discovered
+}
+
+fn default_source_roots() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("codex", "~/.codex"),
+        ("claude", "~/.claude"),
+        ("cursor", "~/.cursor"),
+        ("windsurf", "~/.codeium/windsurf"),
+        ("warp", "~/.warp"),
+    ]
+}
+
+fn discover_history_files_under(root: &Path, limit: usize, max_depth: usize) -> Vec<PathBuf> {
+    let mut discovered = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if discovered.len() >= limit {
+            break;
+        }
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        for entry in read_dir.flatten() {
+            if discovered.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                if depth < max_depth && !is_ignored_history_dir(&path) {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if is_candidate_history_file(&path) {
+                discovered.push(path);
+            }
+        }
+    }
+    discovered
+}
+
+fn is_ignored_history_dir(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        ".git"
+            | "node_modules"
+            | "cache"
+            | ".cache"
+            | "tmp"
+            | "temp"
+            | "logs"
+            | "log"
+            | "vendor"
+            | "dist"
+            | "build"
+    )
+}
+
+fn is_candidate_history_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ext != "jsonl" && ext != "ndjson" && ext != "log" && ext != "txt" {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.contains("history")
+        || name.contains("session")
+        || name.contains("conversation")
+        || name.contains("chat")
+        || name.contains("prompt")
+}
+
 fn default_state_path() -> PathBuf {
     if let Some(home) = dirs::home_dir() {
         return home
@@ -1261,18 +1626,6 @@ mod tests {
             parse_event_source("agent_apps"),
             Some(EventSource::AgentApp)
         );
-    }
-
-    #[test]
-    fn offset_state_loads_legacy_offsets() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("collector_state.json");
-        std::fs::write(&path, r#"{"offsets":{"/tmp/demo.jsonl":12345}}"#.as_bytes()).unwrap();
-        let loaded = OffsetState::load(&path).unwrap();
-        let file = loaded.files.get("/tmp/demo.jsonl").unwrap();
-        assert_eq!(file.offset, 12345);
-        assert_eq!(file.mtime, 0);
-        assert!(loaded.sqlite.is_empty());
     }
 
     #[test]
@@ -1361,5 +1714,32 @@ mod tests {
             follow_up.next_state.incremental.get("messages"),
             Some(&serde_json::Value::from(3_i64))
         );
+    }
+
+    #[test]
+    fn candidate_history_file_filters_expected_names() {
+        assert!(is_candidate_history_file(Path::new("history.jsonl")));
+        assert!(is_candidate_history_file(Path::new("chat-session.ndjson")));
+        assert!(!is_candidate_history_file(Path::new("events.jsonl")));
+        assert!(!is_candidate_history_file(Path::new("history.json")));
+    }
+
+    #[test]
+    fn discover_history_files_respects_depth_and_patterns() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(root.join("sessions")).unwrap();
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        std::fs::write(root.join("sessions/history.jsonl"), b"{}\n").unwrap();
+        std::fs::write(root.join("logs/history.jsonl"), b"{}\n").unwrap();
+        std::fs::write(root.join("sessions/events.jsonl"), b"{}\n").unwrap();
+
+        let files = discover_history_files_under(&root, 10, 3);
+        let mut names = files
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|value| value.to_str()))
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["history.jsonl"]);
     }
 }

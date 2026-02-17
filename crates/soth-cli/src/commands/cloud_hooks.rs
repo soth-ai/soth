@@ -3,13 +3,9 @@ use soth_core::config::SothConfig;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-#[cfg(feature = "cloud-sync")]
 use soth_core::config::{BudgetLimit, RegistryMode};
-#[cfg(feature = "cloud-sync")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "cloud-sync")]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(feature = "cloud-sync")]
 use tracing::info;
 
 pub struct CloudPullRuntime {
@@ -17,19 +13,13 @@ pub struct CloudPullRuntime {
     pub task: JoinHandle<()>,
 }
 
-#[cfg(feature = "cloud-sync")]
 const STARTUP_REGISTRY_REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
 
-#[cfg(feature = "cloud-sync")]
 const FINAL_CLOUD_SYNC_TIMEOUT: Duration = Duration::from_secs(4);
-#[cfg(feature = "cloud-sync")]
 const FINAL_CLOUD_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(feature = "cloud-sync")]
 const FINAL_CLOUD_SYNC_MAX_ROUNDS: usize = 3;
-#[cfg(feature = "cloud-sync")]
 const CLOUD_BACKOFF_MAX_CAP: Duration = Duration::from_secs(15 * 60);
 
-#[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistryRuntimeSource {
     HealthyCloud,
@@ -37,7 +27,6 @@ enum RegistryRuntimeSource {
     DegradedEmbedded,
 }
 
-#[cfg(feature = "cloud-sync")]
 impl RegistryRuntimeSource {
     fn as_label(self) -> &'static str {
         match self {
@@ -58,7 +47,6 @@ impl RegistryRuntimeSource {
     }
 }
 
-#[cfg(feature = "cloud-sync")]
 fn resolve_registry_runtime_source(registry_cache_path: &Path) -> RegistryRuntimeSource {
     match soth_sync::cache::load_registry_bundle_cache(registry_cache_path) {
         Ok(Some(_)) => RegistryRuntimeSource::DegradedCached,
@@ -66,7 +54,6 @@ fn resolve_registry_runtime_source(registry_cache_path: &Path) -> RegistryRuntim
     }
 }
 
-#[cfg(feature = "cloud-sync")]
 fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -75,7 +62,6 @@ fn current_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(feature = "cloud-sync")]
 pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
     use soth_sync::cache;
 
@@ -106,15 +92,6 @@ pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "cloud-sync"))]
-pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
-    if config.cloud.enabled {
-        warn!("cloud.enabled=true but soth-cli built without `cloud-sync` feature; skipping cloud hooks");
-    }
-    Ok(())
-}
-
-#[cfg(feature = "cloud-sync")]
 pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
     use soth_sync::registry_puller::RegistryPuller;
 
@@ -179,10 +156,6 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
     }
 }
 
-#[cfg(not(feature = "cloud-sync"))]
-pub async fn refresh_registry_bundle_on_start(_config: &SothConfig) {}
-
-#[cfg(feature = "cloud-sync")]
 pub fn spawn_cloud_pull_runtime(
     config: &SothConfig,
     event_db_path: Option<PathBuf>,
@@ -236,9 +209,19 @@ pub fn spawn_cloud_pull_runtime(
                 .cloud
                 .metadata_max_compressed_batch_bytes
                 .max(1) as usize,
+            frontload_enabled: config.cloud.frontload_enabled,
+            frontload_max_events_per_batch: config.cloud.frontload_max_events_per_batch.max(1),
+            frontload_max_compressed_batch_bytes: config
+                .cloud
+                .frontload_max_compressed_batch_bytes
+                .max(1) as usize,
+            frontload_hard_events_cap: config.cloud.frontload_hard_events_cap.max(1),
+            frontload_hard_compressed_cap_bytes: config
+                .cloud
+                .frontload_hard_compressed_cap_bytes
+                .max(1) as usize,
             body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
             global_tags: config.cloud.tags.clone(),
-            exchange_v2_only: config.exchange_v2.enabled,
             heartbeat_telemetry: Some(std::sync::Arc::new(|| {
                 let snapshot = soth_proxy::metrics::heartbeat_telemetry_snapshot();
                 if snapshot.counters.values().all(|value| *value == 0) {
@@ -339,14 +322,16 @@ pub fn spawn_cloud_pull_runtime(
                             agent.flush_for_shutdown(FINAL_CLOUD_SYNC_MAX_ROUNDS),
                         ).await {
                             Ok(Ok(summary)) => {
-                                if summary.metadata_sent > 0
-                                    || summary.body_uploaded > 0
-                                    || summary.retry_uploaded > 0
+                                if summary.exchange_sent > 0
+                                    || summary.exchange_blob_uploaded > 0
+                                    || summary.exchange_retry_deferred > 0
+                                    || summary.exchange_dropped > 0
                                 {
                                     info!(
-                                        metadata_sent = summary.metadata_sent,
-                                        body_uploaded = summary.body_uploaded,
-                                        retry_uploaded = summary.retry_uploaded,
+                                        exchange_sent = summary.exchange_sent,
+                                        exchange_blob_uploaded = summary.exchange_blob_uploaded,
+                                        exchange_retry_deferred = summary.exchange_retry_deferred,
+                                        exchange_dropped = summary.exchange_dropped,
                                         "Final cloud sync flush on shutdown"
                                     );
                                 }
@@ -420,14 +405,16 @@ pub fn spawn_cloud_pull_runtime(
                         match agent.tick().await {
                             Ok(summary) => {
                                 sync_backoff.record_success();
-                                if summary.metadata_sent > 0
-                                    || summary.body_uploaded > 0
-                                    || summary.retry_uploaded > 0
+                                if summary.exchange_sent > 0
+                                    || summary.exchange_blob_uploaded > 0
+                                    || summary.exchange_retry_deferred > 0
+                                    || summary.exchange_dropped > 0
                                 {
                                     info!(
-                                        metadata_sent = summary.metadata_sent,
-                                        body_uploaded = summary.body_uploaded,
-                                        retry_uploaded = summary.retry_uploaded,
+                                        exchange_sent = summary.exchange_sent,
+                                        exchange_blob_uploaded = summary.exchange_blob_uploaded,
+                                        exchange_retry_deferred = summary.exchange_retry_deferred,
+                                        exchange_dropped = summary.exchange_dropped,
                                         "Cloud sync tick"
                                     );
                                 }
@@ -467,15 +454,6 @@ pub fn spawn_cloud_pull_runtime(
     Some(CloudPullRuntime { shutdown_tx, task })
 }
 
-#[cfg(not(feature = "cloud-sync"))]
-pub fn spawn_cloud_pull_runtime(
-    _config: &SothConfig,
-    _event_db_path: Option<std::path::PathBuf>,
-) -> Option<CloudPullRuntime> {
-    None
-}
-
-#[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone)]
 struct ExponentialBackoff {
     base: Duration,
@@ -484,7 +462,6 @@ struct ExponentialBackoff {
     blocked_until: Option<Instant>,
 }
 
-#[cfg(feature = "cloud-sync")]
 impl ExponentialBackoff {
     fn new(base: Duration, max: Duration) -> Self {
         let safe_base = std::cmp::max(base, Duration::from_secs(1));
@@ -534,7 +511,6 @@ impl ExponentialBackoff {
     }
 }
 
-#[cfg(feature = "cloud-sync")]
 fn bounded_backoff_max(base: Duration) -> Duration {
     std::cmp::max(
         base,
@@ -545,7 +521,6 @@ fn bounded_backoff_max(base: Duration) -> Duration {
     )
 }
 
-#[cfg(feature = "cloud-sync")]
 fn apply_budget_from_cache(config: &mut SothConfig, limits: &[soth_core::api::ConfigBudgetLimit]) {
     let mapped: Vec<BudgetLimit> = limits.iter().filter_map(map_cloud_budget_limit).collect();
     if mapped.is_empty() {
@@ -555,7 +530,6 @@ fn apply_budget_from_cache(config: &mut SothConfig, limits: &[soth_core::api::Co
     config.budget.limits = mapped;
 }
 
-#[cfg(feature = "cloud-sync")]
 fn map_cloud_budget_limit(limit: &soth_core::api::ConfigBudgetLimit) -> Option<BudgetLimit> {
     let effective_daily = effective_daily_limit(limit);
     match limit.scope.as_str() {
@@ -579,7 +553,6 @@ fn map_cloud_budget_limit(limit: &soth_core::api::ConfigBudgetLimit) -> Option<B
     }
 }
 
-#[cfg(feature = "cloud-sync")]
 fn apply_policy_from_cache(
     config: &mut SothConfig,
     version: &str,
@@ -595,19 +568,17 @@ fn apply_policy_from_cache(
     Ok(())
 }
 
-#[cfg(feature = "cloud-sync")]
 fn apply_registry_mode_from_cache(config: &mut SothConfig, mode: Option<&str>) {
     let Some(mode) = mode else {
         return;
     };
     let normalized = mode.trim().to_ascii_lowercase();
     config.forward_proxy.registry_mode = match normalized.as_str() {
-        "bundle_only" | "strict" => RegistryMode::BundleOnly,
-        _ => RegistryMode::Registry,
+        "bundle_only" | "strict" | "registry" => RegistryMode::BundleOnly,
+        _ => RegistryMode::BundleOnly,
     };
 }
 
-#[cfg(feature = "cloud-sync")]
 fn materialize_effective_policy_dir(
     version: &str,
     policies: &[soth_core::api::ConfigPolicy],
@@ -650,7 +621,6 @@ fn materialize_effective_policy_dir(
     Ok(dir)
 }
 
-#[cfg(feature = "cloud-sync")]
 fn copy_local_policy_files(local_dir: &Path, destination_dir: &Path) -> Result<usize> {
     let mut copied = 0usize;
     for entry in std::fs::read_dir(local_dir)? {
@@ -678,7 +648,6 @@ fn copy_local_policy_files(local_dir: &Path, destination_dir: &Path) -> Result<u
     Ok(copied)
 }
 
-#[cfg(feature = "cloud-sync")]
 fn effective_daily_limit(limit: &soth_core::api::ConfigBudgetLimit) -> Option<f64> {
     match (limit.daily_usd, limit.remaining_usd) {
         (Some(daily), Some(remaining)) => Some(daily.min(remaining).max(0.0)),
@@ -688,7 +657,6 @@ fn effective_daily_limit(limit: &soth_core::api::ConfigBudgetLimit) -> Option<f6
     }
 }
 
-#[cfg(feature = "cloud-sync")]
 fn resolve_cache_path(config: &SothConfig) -> PathBuf {
     if let Some(path) = config.cloud.cache_path.as_ref() {
         return path.clone();
@@ -696,7 +664,6 @@ fn resolve_cache_path(config: &SothConfig) -> PathBuf {
     default_cache_path()
 }
 
-#[cfg(feature = "cloud-sync")]
 fn resolve_registry_cache_path(config: &SothConfig, config_cache_path: &Path) -> PathBuf {
     if config.cloud.cache_path.is_some() {
         if let Some(parent) = config_cache_path.parent() {
@@ -706,17 +673,14 @@ fn resolve_registry_cache_path(config: &SothConfig, config_cache_path: &Path) ->
     default_registry_cache_path()
 }
 
-#[cfg(feature = "cloud-sync")]
 fn default_cache_path() -> PathBuf {
     soth_sync::cache::default_cache_path()
 }
 
-#[cfg(feature = "cloud-sync")]
 fn default_registry_cache_path() -> PathBuf {
     soth_sync::cache::default_registry_cache_path()
 }
 
-#[cfg(feature = "cloud-sync")]
 fn slugify(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -732,7 +696,6 @@ fn slugify(value: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-#[cfg(feature = "cloud-sync")]
 fn default_retry_queue_dir() -> PathBuf {
     if let Some(home) = dirs::home_dir() {
         return home.join(".soth").join("sync").join("upload_queue");
@@ -740,7 +703,6 @@ fn default_retry_queue_dir() -> PathBuf {
     PathBuf::from(".soth/sync/upload_queue")
 }
 
-#[cfg(feature = "cloud-sync")]
 fn build_agent_instance_id() -> String {
     let host = std::env::var("HOSTNAME")
         .ok()
@@ -749,7 +711,7 @@ fn build_agent_instance_id() -> String {
     format!("{}-{}-{}", host, std::process::id(), uuid::Uuid::new_v4())
 }
 
-#[cfg(all(test, feature = "cloud-sync"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

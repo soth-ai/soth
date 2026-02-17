@@ -1,17 +1,17 @@
 //! Shared enforcement runtime builders used by proxy and wrap commands.
 
-use anyhow::Context;
 use soth_budget::BudgetTracker;
 use soth_core::config::SothConfig;
 use soth_core::types::policy::PolicyInputBuilder;
 use soth_crypto::identity::TrustStore;
+use soth_oisp::OispEngine;
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine, PolicyLoader};
 use soth_proxy::metrics;
 use soth_proxy::pipeline::budget::{BudgetConfig, BudgetLayer};
 use soth_proxy::pipeline::identity::{IdentityConfig, IdentityLayer, IdentityMode};
 use soth_proxy::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
 use soth_proxy::pipeline::{Pipeline, PipelineBuilder};
-use soth_proxy::transport::hudsucker_proxy::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
+use soth_proxy::transport::proxy::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -142,9 +142,19 @@ fn collect_trusted_dids(config: &SothConfig) -> anyhow::Result<HashSet<String>> 
     if let Some(path) = &config.identity.trust_store_path {
         let trust_store_file = resolve_trust_store_file(path);
         if trust_store_file.exists() {
-            let store = TrustStore::new(&trust_store_file)?;
-            for did in store.list() {
-                trusted_dids.insert(did.to_string());
+            match TrustStore::new(&trust_store_file) {
+                Ok(store) => {
+                    for did in store.list() {
+                        trusted_dids.insert(did.to_string());
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        path = %trust_store_file.display(),
+                        error = %error,
+                        "Failed loading trust store; continuing fail-open with configured allowed_dids only"
+                    );
+                }
             }
         }
     }
@@ -244,12 +254,20 @@ fn build_policy_engine(config: &SothConfig) -> anyhow::Result<Option<PolicyEngin
 
     if let Err(error) = validate_policy_artifacts(config.policy.cache.clone().into(), &artifacts) {
         metrics::record_policy_reload(false);
-        return Err(error);
+        warn!(
+            error = %error,
+            "Policy artifacts invalid at startup; continuing fail-open with policy layer disabled"
+        );
+        return Ok(None);
     }
 
     if let Err(error) = apply_policy_artifacts(&engine, &artifacts) {
         metrics::record_policy_reload(false);
-        return Err(error);
+        warn!(
+            error = %error,
+            "Policy artifacts failed to apply at startup; continuing fail-open with policy layer disabled"
+        );
+        return Ok(None);
     }
 
     metrics::record_policy_reload(true);
@@ -336,27 +354,77 @@ fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTrac
         match limit.scope.as_str() {
             "global" => tracker.set_global_budget(limit.daily, limit.weekly, limit.monthly),
             "per_agent" => {
-                let agent_id = limit.agent_id.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("budget limit scope=per_agent requires agent_id")
-                })?;
+                let Some(agent_id) = limit.agent_id.as_deref() else {
+                    warn!(
+                        "Ignoring invalid budget limit: scope=per_agent requires agent_id (fail-open)"
+                    );
+                    continue;
+                };
                 tracker.set_agent_budget(agent_id, limit.daily, limit.weekly, limit.monthly);
             }
             "per_session" => {
                 tracker.set_session_budget(limit.daily, limit.weekly, limit.monthly);
             }
             "per_model" => {
-                let model = limit.model.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("budget limit scope=per_model requires model")
-                })?;
+                let Some(model) = limit.model.as_deref() else {
+                    warn!(
+                        "Ignoring invalid budget limit: scope=per_model requires model (fail-open)"
+                    );
+                    continue;
+                };
                 tracker.set_model_budget(model, limit.daily, limit.weekly, limit.monthly);
             }
             other => {
-                return Err(anyhow::anyhow!("unsupported budget limit scope: {other}"));
+                warn!(
+                    scope = other,
+                    "Ignoring unsupported budget limit scope (fail-open)"
+                );
+                continue;
             }
         }
     }
 
     Ok(Some(tracker))
+}
+
+fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
+    if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
+        if let Some(parent) = config_cache_path.parent() {
+            return parent.join("registry_bundle_cache.json");
+        }
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join("registry_bundle_cache.json"))
+        .unwrap_or_else(|| PathBuf::from(".soth/registry_bundle_cache.json"))
+}
+
+fn load_budget_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
+    let cache_path = resolve_registry_bundle_cache_path(config);
+    match OispEngine::load_from_registry_cache(cache_path.as_path()) {
+        Ok(Some(engine)) => {
+            info!(
+                cache = %cache_path.display(),
+                bundle_version = %engine.bundle_version(),
+                "Loaded OISP bundle for wrap budget pricing"
+            );
+            Some(Arc::new(engine))
+        }
+        Ok(None) => {
+            warn!(
+                cache = %cache_path.display(),
+                "Wrap budget pricing bundle unavailable; budget cost metadata disabled"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                cache = %cache_path.display(),
+                error = %error,
+                "Failed loading bundle for wrap budget pricing; budget cost metadata disabled"
+            );
+            None
+        }
+    }
 }
 
 pub fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer> {
@@ -429,9 +497,13 @@ pub fn build_wrap_enforcement_runtime(
         enabled = true;
         let mut trust_store = TrustStore::in_memory();
         for did in collect_trusted_dids(config)? {
-            trust_store
-                .trust(&did)
-                .with_context(|| format!("Failed to trust DID from config: {did}"))?;
+            if let Err(error) = trust_store.trust(&did) {
+                warn!(
+                    did = %did,
+                    error = %error,
+                    "Ignoring invalid trusted DID from config (fail-open)"
+                );
+            }
         }
         let layer = IdentityLayer::with_trust_store(identity_config.clone(), trust_store);
         pipeline_builder = pipeline_builder.layer(layer);
@@ -456,7 +528,7 @@ pub fn build_wrap_enforcement_runtime(
 
     if let Some(tracker) = build_budget_tracker(config)? {
         enabled = true;
-        let layer = BudgetLayer::with_tracker(
+        let mut layer = BudgetLayer::with_tracker(
             BudgetConfig {
                 enabled: true,
                 block_on_exceeded: true,
@@ -464,6 +536,9 @@ pub fn build_wrap_enforcement_runtime(
             },
             tracker,
         );
+        if let Some(engine) = load_budget_oisp_engine(config) {
+            layer = layer.with_oisp_engine(engine);
+        }
         pipeline_builder = pipeline_builder.layer(layer);
     }
 

@@ -2,11 +2,13 @@ use crate::body_uploader::BodyUploader;
 use crate::cache;
 use crate::config_puller::ConfigPuller;
 use crate::heartbeat::HeartbeatSender;
-use crate::metadata_pusher::{estimate_gzip_exchange_batch_size, MetadataPusher};
+use crate::metadata_pusher::{
+    estimate_gzip_exchange_batch_size, ExchangePushResult, MetadataPusher,
+};
 use crate::retry_queue::BodyRetryQueue;
 use anyhow::Context;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use soth_core::api::{
     BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
     ExchangeMetadata, HeartbeatRequest, HeartbeatTelemetry,
@@ -16,15 +18,39 @@ use soth_core::types::exchange_v2::{ExchangeBodyMode, ExchangeEventV2};
 use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::warn;
 use uuid::Uuid;
 
 const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
 const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
+const DEFAULT_FRONTLOAD_METADATA_BATCH_EVENTS: usize = 1500;
+const DEFAULT_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FRONTLOAD_METADATA_BATCH_EVENTS_HARD_CAP: usize = 5000;
+const MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 16 * 1024 * 1024;
 const MAX_EXCHANGE_RETRY_BACKOFF_SECS: u64 = 15 * 60;
 const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
+const SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1: &str = "migration_exchange_uuid_cleanup_v1";
+const EXCHANGE_SPOOL_STALE_MAX_AGE_SECS: u64 = 6 * 60 * 60;
+const EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT: usize = 10_000;
+const SYNC_TELEMETRY_EXCHANGE_SENT: &str = "sync.exchange.sent";
+const SYNC_TELEMETRY_EXCHANGE_BLOB_UPLOADED: &str = "sync.exchange.blob_uploaded";
+const SYNC_TELEMETRY_EXCHANGE_RETRY_DEFERRED: &str = "sync.exchange.retry_deferred";
+const SYNC_TELEMETRY_EXCHANGE_DROPPED: &str = "sync.exchange.dropped";
+const SYNC_TELEMETRY_EXCHANGE_QUEUE_DEPTH: &str = "sync.exchange.queue_depth";
+const SYNC_TELEMETRY_EXCHANGE_BATCH_SENT: &str = "sync.exchange.batch.sent";
+const SYNC_TELEMETRY_EXCHANGE_BATCH_EVENTS: &str = "sync.exchange.batch.events";
+const SYNC_TELEMETRY_EXCHANGE_BATCH_COMPRESSED_BYTES: &str = "sync.exchange.batch.compressed_bytes";
+const SYNC_TELEMETRY_EXCHANGE_BATCH_SPLIT_COUNT: &str = "sync.exchange.batch.split_count";
+const SYNC_TELEMETRY_EXCHANGE_FRONTLOAD_SENT: &str = "sync.exchange.frontload.sent";
+const SYNC_TELEMETRY_EXCHANGE_LIVE_SENT: &str = "sync.exchange.live.sent";
+
+const MIN_LIVE_EVENTS: usize = 25;
+const MIN_LIVE_COMPRESSED_BYTES: usize = 1 * 1024 * 1024;
+const MIN_FRONTLOAD_EVENTS: usize = 50;
+const MIN_FRONTLOAD_COMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 
 pub type HeartbeatTelemetryProvider =
     Arc<dyn Fn() -> Option<HeartbeatTelemetry> + Send + Sync + 'static>;
@@ -45,9 +71,13 @@ pub struct SyncAgentConfig {
     pub body_upload_enabled: bool,
     pub metadata_max_events_per_batch: usize,
     pub metadata_max_compressed_batch_bytes: usize,
+    pub frontload_enabled: bool,
+    pub frontload_max_events_per_batch: usize,
+    pub frontload_max_compressed_batch_bytes: usize,
+    pub frontload_hard_events_cap: usize,
+    pub frontload_hard_compressed_cap_bytes: usize,
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
-    pub exchange_v2_only: bool,
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
 }
 
@@ -58,15 +88,25 @@ pub struct SyncAgent {
     pub heartbeat_sender: HeartbeatSender,
     pub retry_queue: BodyRetryQueue,
     pub config_puller: Option<ConfigPuller>,
+    sync_exchange_sent_total: AtomicU64,
+    sync_exchange_blob_uploaded_total: AtomicU64,
+    sync_exchange_retry_deferred_total: AtomicU64,
+    sync_exchange_dropped_total: AtomicU64,
+    sync_exchange_batch_sent_total: AtomicU64,
+    sync_exchange_batch_events_total: AtomicU64,
+    sync_exchange_batch_compressed_bytes_total: AtomicU64,
+    sync_exchange_batch_split_total: AtomicU64,
+    sync_exchange_frontload_sent_total: AtomicU64,
+    sync_exchange_live_sent_total: AtomicU64,
+    adaptive_batch_state: Mutex<AdaptiveBatchState>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncTickSummary {
-    pub metadata_sent: usize,
-    pub body_uploaded: usize,
-    pub retry_uploaded: usize,
     pub exchange_sent: usize,
     pub exchange_blob_uploaded: usize,
+    pub exchange_retry_deferred: usize,
+    pub exchange_dropped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +115,76 @@ struct ExchangeQueueRow {
     payload_json: String,
     blobs_json: Option<String>,
     attempt_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeSyncMode {
+    Live,
+    Frontload,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExchangeBatchLimits {
+    max_events: usize,
+    max_compressed_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedExchangeQueueRow {
+    row: ExchangeQueueRow,
+    metadata: ExchangeMetadata,
+    mode: ExchangeSyncMode,
+    blob_uploaded: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchFit {
+    len: usize,
+    compressed_bytes: usize,
+    split_count: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PressureKind {
+    HardLimit,
+    RetryableStatus,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeRejectionDisposition {
+    Retry,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveModeState {
+    max_events: usize,
+    max_compressed_bytes: usize,
+    success_streak: u32,
+}
+
+#[derive(Debug)]
+struct AdaptiveBatchState {
+    live: AdaptiveModeState,
+    frontload: AdaptiveModeState,
+}
+
+impl AdaptiveBatchState {
+    fn new(config: &SyncAgentConfig) -> Self {
+        Self {
+            live: AdaptiveModeState {
+                max_events: config.metadata_max_events_per_batch.max(1),
+                max_compressed_bytes: config.metadata_max_compressed_batch_bytes.max(1),
+                success_streak: 0,
+            },
+            frontload: AdaptiveModeState {
+                max_events: config.frontload_max_events_per_batch.max(1),
+                max_compressed_bytes: config.frontload_max_compressed_batch_bytes.max(1),
+                success_streak: 0,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -90,10 +200,24 @@ struct ExchangeBlobQueueItem {
 }
 
 #[derive(Debug, Clone)]
-enum ExchangeQueueOutcome {
-    Synced { blob_uploaded: usize },
+enum PreparedRowResult {
+    Prepared(PreparedExchangeQueueRow),
     Retry { reason: String },
     Drop { reason: String },
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExchangeQueueStats {
+    exchange_sent: usize,
+    exchange_blob_uploaded: usize,
+    exchange_retry_deferred: usize,
+    exchange_dropped: usize,
+    exchange_batch_sent: usize,
+    exchange_batch_events: usize,
+    exchange_batch_compressed_bytes: usize,
+    exchange_batch_split_count: u64,
+    exchange_frontload_sent: usize,
+    exchange_live_sent: usize,
 }
 
 impl SyncAgent {
@@ -111,11 +235,56 @@ impl SyncAgent {
             .metadata_max_compressed_batch_bytes
             .max(1)
             .min(MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP);
+        if config.frontload_max_events_per_batch == 0 {
+            config.frontload_max_events_per_batch = DEFAULT_FRONTLOAD_METADATA_BATCH_EVENTS;
+        }
+        if config.frontload_max_compressed_batch_bytes == 0 {
+            config.frontload_max_compressed_batch_bytes =
+                DEFAULT_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES;
+        }
+        if config.frontload_hard_events_cap == 0 {
+            config.frontload_hard_events_cap = MAX_FRONTLOAD_METADATA_BATCH_EVENTS_HARD_CAP;
+        }
+        if config.frontload_hard_compressed_cap_bytes == 0 {
+            config.frontload_hard_compressed_cap_bytes =
+                MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP;
+        }
+        config.frontload_max_events_per_batch = config.frontload_max_events_per_batch.max(1).min(
+            config
+                .frontload_hard_events_cap
+                .max(1)
+                .min(MAX_FRONTLOAD_METADATA_BATCH_EVENTS_HARD_CAP),
+        );
+        config.frontload_max_compressed_batch_bytes =
+            config.frontload_max_compressed_batch_bytes.max(1).min(
+                config
+                    .frontload_hard_compressed_cap_bytes
+                    .max(1)
+                    .min(MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP),
+            );
         let metadata_pusher = MetadataPusher::new(&config.endpoint, &config.api_key);
         let body_uploader = BodyUploader::new(&config.endpoint, &config.api_key);
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
         let retry_queue =
             BodyRetryQueue::new(&config.retry_queue_dir, config.retry_queue_max_bytes)?;
+        if let Err(error) = run_exchange_uuid_cleanup_migration(config.event_db_path.as_path()) {
+            warn!(
+                error = %error,
+                "Failed one-time exchange UUID cleanup migration; continuing"
+            );
+        }
+        if let Err(error) = run_exchange_spool_stale_cleanup(
+            config.event_db_path.as_path(),
+            Duration::from_secs(EXCHANGE_SPOOL_STALE_MAX_AGE_SECS),
+            EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT,
+        ) {
+            warn!(
+                error = %error,
+                "Failed exchange spool stale cleanup; continuing"
+            );
+        }
+        let adaptive_batch_state = Mutex::new(AdaptiveBatchState::new(&config));
+
         Ok(Self {
             config,
             metadata_pusher,
@@ -123,22 +292,50 @@ impl SyncAgent {
             heartbeat_sender,
             retry_queue,
             config_puller,
+            sync_exchange_sent_total: AtomicU64::new(0),
+            sync_exchange_blob_uploaded_total: AtomicU64::new(0),
+            sync_exchange_retry_deferred_total: AtomicU64::new(0),
+            sync_exchange_dropped_total: AtomicU64::new(0),
+            sync_exchange_batch_sent_total: AtomicU64::new(0),
+            sync_exchange_batch_events_total: AtomicU64::new(0),
+            sync_exchange_batch_compressed_bytes_total: AtomicU64::new(0),
+            sync_exchange_batch_split_total: AtomicU64::new(0),
+            sync_exchange_frontload_sent_total: AtomicU64::new(0),
+            sync_exchange_live_sent_total: AtomicU64::new(0),
+            adaptive_batch_state,
         })
     }
 
     pub async fn tick(&self) -> anyhow::Result<SyncTickSummary> {
-        let metadata_sent = 0;
-        let (exchange_sent, exchange_blob_uploaded) = self.sync_exchange_queue_once().await?;
-
-        let retry_uploaded = 0;
-        let body_uploaded = 0;
+        let stats = self.sync_exchange_queue_once().await?;
+        self.sync_exchange_sent_total
+            .fetch_add(stats.exchange_sent as u64, Ordering::Relaxed);
+        self.sync_exchange_blob_uploaded_total
+            .fetch_add(stats.exchange_blob_uploaded as u64, Ordering::Relaxed);
+        self.sync_exchange_retry_deferred_total
+            .fetch_add(stats.exchange_retry_deferred as u64, Ordering::Relaxed);
+        self.sync_exchange_dropped_total
+            .fetch_add(stats.exchange_dropped as u64, Ordering::Relaxed);
+        self.sync_exchange_batch_sent_total
+            .fetch_add(stats.exchange_batch_sent as u64, Ordering::Relaxed);
+        self.sync_exchange_batch_events_total
+            .fetch_add(stats.exchange_batch_events as u64, Ordering::Relaxed);
+        self.sync_exchange_batch_compressed_bytes_total.fetch_add(
+            stats.exchange_batch_compressed_bytes as u64,
+            Ordering::Relaxed,
+        );
+        self.sync_exchange_batch_split_total
+            .fetch_add(stats.exchange_batch_split_count, Ordering::Relaxed);
+        self.sync_exchange_frontload_sent_total
+            .fetch_add(stats.exchange_frontload_sent as u64, Ordering::Relaxed);
+        self.sync_exchange_live_sent_total
+            .fetch_add(stats.exchange_live_sent as u64, Ordering::Relaxed);
 
         Ok(SyncTickSummary {
-            metadata_sent,
-            body_uploaded,
-            retry_uploaded,
-            exchange_sent,
-            exchange_blob_uploaded,
+            exchange_sent: stats.exchange_sent,
+            exchange_blob_uploaded: stats.exchange_blob_uploaded,
+            exchange_retry_deferred: stats.exchange_retry_deferred,
+            exchange_dropped: stats.exchange_dropped,
         })
     }
 
@@ -152,17 +349,15 @@ impl SyncAgent {
 
         for _ in 0..rounds {
             let summary = self.tick().await?;
-            total.metadata_sent += summary.metadata_sent;
-            total.body_uploaded += summary.body_uploaded;
-            total.retry_uploaded += summary.retry_uploaded;
             total.exchange_sent += summary.exchange_sent;
             total.exchange_blob_uploaded += summary.exchange_blob_uploaded;
+            total.exchange_retry_deferred += summary.exchange_retry_deferred;
+            total.exchange_dropped += summary.exchange_dropped;
 
-            if summary.metadata_sent == 0
-                && summary.body_uploaded == 0
-                && summary.retry_uploaded == 0
-                && summary.exchange_sent == 0
+            if summary.exchange_sent == 0
                 && summary.exchange_blob_uploaded == 0
+                && summary.exchange_retry_deferred == 0
+                && summary.exchange_dropped == 0
             {
                 break;
             }
@@ -173,6 +368,7 @@ impl SyncAgent {
 
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
         let config_version = self.cached_config_version();
+        let telemetry = self.compose_heartbeat_telemetry();
         let request = HeartbeatRequest {
             agent_instance_id: self.config.agent_instance_id.clone(),
             proxy_version: self.config.proxy_version.clone(),
@@ -180,11 +376,7 @@ impl SyncAgent {
             os: Some(std::env::consts::OS.to_string()),
             hostname: resolve_hostname(),
             active_connections: None,
-            telemetry: self
-                .config
-                .heartbeat_telemetry
-                .as_ref()
-                .and_then(|provider| provider()),
+            telemetry,
         };
 
         match self.heartbeat_sender.send(&request).await {
@@ -209,47 +401,91 @@ impl SyncAgent {
         }
     }
 
-    async fn sync_exchange_queue_once(&self) -> anyhow::Result<(usize, usize)> {
-        let rows = self.load_exchange_queue_ready(self.config.metadata_max_events_per_batch)?;
+    fn compose_heartbeat_telemetry(&self) -> Option<HeartbeatTelemetry> {
+        let mut telemetry = self
+            .config
+            .heartbeat_telemetry
+            .as_ref()
+            .and_then(|provider| provider())
+            .unwrap_or_default();
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_SENT.to_string(),
+            self.sync_exchange_sent_total.load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_BLOB_UPLOADED.to_string(),
+            self.sync_exchange_blob_uploaded_total
+                .load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_RETRY_DEFERRED.to_string(),
+            self.sync_exchange_retry_deferred_total
+                .load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_DROPPED.to_string(),
+            self.sync_exchange_dropped_total.load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_QUEUE_DEPTH.to_string(),
+            self.load_exchange_queue_depth().unwrap_or(0),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_BATCH_SENT.to_string(),
+            self.sync_exchange_batch_sent_total.load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_BATCH_EVENTS.to_string(),
+            self.sync_exchange_batch_events_total
+                .load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_BATCH_COMPRESSED_BYTES.to_string(),
+            self.sync_exchange_batch_compressed_bytes_total
+                .load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_BATCH_SPLIT_COUNT.to_string(),
+            self.sync_exchange_batch_split_total.load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_FRONTLOAD_SENT.to_string(),
+            self.sync_exchange_frontload_sent_total
+                .load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_LIVE_SENT.to_string(),
+            self.sync_exchange_live_sent_total.load(Ordering::Relaxed),
+        );
+        if telemetry.counters.is_empty() {
+            None
+        } else {
+            Some(telemetry)
+        }
+    }
+
+    async fn sync_exchange_queue_once(&self) -> anyhow::Result<ExchangeQueueStats> {
+        let rows = self.load_exchange_queue_ready(self.ready_queue_load_limit())?;
         if rows.is_empty() {
-            return Ok((0, 0));
+            return Ok(ExchangeQueueStats::default());
         }
 
-        let mut exchange_sent = 0usize;
-        let mut blob_uploaded = 0usize;
+        let mut stats = ExchangeQueueStats::default();
         let config_version = self.cached_config_version();
+        let mut live_rows = Vec::new();
+        let mut frontload_rows = Vec::new();
 
         for row in rows {
-            let cloud_exchange_id = normalize_exchange_id_for_cloud(row.exchange_id.as_str());
-            match self
-                .process_exchange_queue_row(&row, config_version.as_ref())
-                .await
-            {
-                Ok(ExchangeQueueOutcome::Synced {
-                    blob_uploaded: uploaded,
-                }) => {
-                    self.delete_exchange_queue_entry(&row.exchange_id)?;
-                    exchange_sent += 1;
-                    blob_uploaded += uploaded;
+            match self.prepare_exchange_queue_row(row.clone()).await {
+                Ok(PreparedRowResult::Prepared(prepared)) => match prepared.mode {
+                    ExchangeSyncMode::Live => live_rows.push(prepared),
+                    ExchangeSyncMode::Frontload => frontload_rows.push(prepared),
+                },
+                Ok(PreparedRowResult::Retry { reason }) => {
+                    self.defer_exchange_row_with_retry(&row, &reason, &mut stats)?;
                 }
-                Ok(ExchangeQueueOutcome::Retry { reason }) => {
-                    self.mark_exchange_queue_attempt(&row.exchange_id, row.attempt_count)?;
-                    warn!(
-                        exchange_id = %row.exchange_id,
-                        cloud_exchange_id = %cloud_exchange_id,
-                        attempt = row.attempt_count.saturating_add(1),
-                        reason = %reason,
-                        "Exchange upload deferred with retry backoff"
-                    );
-                }
-                Ok(ExchangeQueueOutcome::Drop { reason }) => {
-                    warn!(
-                        exchange_id = %row.exchange_id,
-                        cloud_exchange_id = %cloud_exchange_id,
-                        reason = %reason,
-                        "Dropping malformed exchange upload entry"
-                    );
-                    self.delete_exchange_queue_entry(&row.exchange_id)?;
+                Ok(PreparedRowResult::Drop { reason }) => {
+                    self.drop_exchange_row(&row, &reason, &mut stats)?;
                 }
                 Err(error) => {
                     self.mark_exchange_queue_attempt(&row.exchange_id, row.attempt_count)?;
@@ -262,50 +498,66 @@ impl SyncAgent {
             }
         }
 
-        if exchange_sent > 0 {
+        self.flush_prepared_rows(
+            ExchangeSyncMode::Live,
+            live_rows,
+            config_version.as_ref(),
+            &mut stats,
+        )
+        .await?;
+        self.flush_prepared_rows(
+            ExchangeSyncMode::Frontload,
+            frontload_rows,
+            config_version.as_ref(),
+            &mut stats,
+        )
+        .await?;
+
+        if stats.exchange_sent > 0 {
             self.mark_sync_success()?;
         }
-        Ok((exchange_sent, blob_uploaded))
+        Ok(stats)
     }
 
-    async fn process_exchange_queue_row(
+    fn ready_queue_load_limit(&self) -> usize {
+        let live_limit = self
+            .config
+            .metadata_max_events_per_batch
+            .max(self.config.batch_size)
+            .max(1);
+        if self.config.frontload_enabled {
+            live_limit.max(self.config.frontload_max_events_per_batch.max(1))
+        } else {
+            live_limit
+        }
+    }
+
+    async fn prepare_exchange_queue_row(
         &self,
-        row: &ExchangeQueueRow,
-        config_version: Option<&String>,
-    ) -> anyhow::Result<ExchangeQueueOutcome> {
+        row: ExchangeQueueRow,
+    ) -> anyhow::Result<PreparedRowResult> {
         let mut event = match serde_json::from_str::<ExchangeEventV2>(&row.payload_json) {
             Ok(value) => value,
             Err(error) => {
-                return Ok(ExchangeQueueOutcome::Drop {
+                return Ok(PreparedRowResult::Drop {
                     reason: format!("invalid_exchange_payload:{error}"),
                 });
             }
         };
-        let canonical_exchange_id = normalize_exchange_id_for_cloud(event.exchange_id.as_str());
-        if canonical_exchange_id != event.exchange_id {
-            event.exchange_id = canonical_exchange_id.clone();
-            if let Some(reference) = event.request.body.reference.as_mut() {
-                *reference = replace_legacy_exchange_ref(
-                    reference,
-                    row.exchange_id.as_str(),
-                    canonical_exchange_id.as_str(),
-                );
-            }
-            if let Some(reference) = event.response.body.reference.as_mut() {
-                *reference = replace_legacy_exchange_ref(
-                    reference,
-                    row.exchange_id.as_str(),
-                    canonical_exchange_id.as_str(),
-                );
-            }
+        let exchange_id = event.exchange_id.trim().to_string();
+        if Uuid::parse_str(&exchange_id).is_err() {
+            return Ok(PreparedRowResult::Drop {
+                reason: format!("invalid_exchange_id:{exchange_id}"),
+            });
         }
+        event.exchange_id = exchange_id.clone();
 
         let blobs = match row.blobs_json.as_deref() {
             Some(raw) if !raw.trim().is_empty() => {
                 match serde_json::from_str::<Vec<ExchangeBlobQueueItem>>(raw) {
                     Ok(items) => items,
                     Err(error) => {
-                        return Ok(ExchangeQueueOutcome::Drop {
+                        return Ok(PreparedRowResult::Drop {
                             reason: format!("invalid_blob_payload:{error}"),
                         });
                     }
@@ -317,7 +569,7 @@ impl SyncAgent {
         let mut blob_uploaded = 0usize;
         for blob in blobs {
             let request = BlobUploadRequest {
-                exchange_id: canonical_exchange_id.clone(),
+                exchange_id: exchange_id.clone(),
                 side: blob.side.clone(),
                 reference: Some(blob.reference.clone()),
                 content_encoding: Some(blob.content_encoding.clone()),
@@ -341,12 +593,12 @@ impl SyncAgent {
                     }
                 }
                 Some(_) => {
-                    return Ok(ExchangeQueueOutcome::Retry {
+                    return Ok(PreparedRowResult::Retry {
                         reason: "blob_upload_rejected".to_string(),
                     });
                 }
                 None => {
-                    return Ok(ExchangeQueueOutcome::Retry {
+                    return Ok(PreparedRowResult::Retry {
                         reason: "blob_upload_non_success_status".to_string(),
                     });
                 }
@@ -355,33 +607,333 @@ impl SyncAgent {
 
         let mut metadata = exchange_event_to_metadata(&event);
         metadata.tags = merge_tags_for_exchange(&self.config.global_tags, event.tags.as_ref());
+        let mode = exchange_sync_mode(metadata.tags.as_ref(), self.config.frontload_enabled);
+        Ok(PreparedRowResult::Prepared(PreparedExchangeQueueRow {
+            row,
+            metadata,
+            mode,
+            blob_uploaded,
+        }))
+    }
 
-        let request = ExchangeBatchRequest {
-            agent_instance_id: self.config.agent_instance_id.clone(),
-            config_version: config_version.cloned(),
-            batch: vec![metadata],
-        };
-        let compressed_size = estimate_gzip_exchange_batch_size(&request)?;
-        if compressed_size > self.config.metadata_max_compressed_batch_bytes {
-            return Ok(ExchangeQueueOutcome::Retry {
-                reason: format!(
-                    "compressed_batch_limit:{}>{}",
-                    compressed_size, self.config.metadata_max_compressed_batch_bytes
-                ),
+    fn target_limits_for_mode(&self, mode: ExchangeSyncMode) -> ExchangeBatchLimits {
+        match mode {
+            ExchangeSyncMode::Live => ExchangeBatchLimits {
+                max_events: self.config.metadata_max_events_per_batch.max(1),
+                max_compressed_bytes: self.config.metadata_max_compressed_batch_bytes.max(1),
+            },
+            ExchangeSyncMode::Frontload if self.config.frontload_enabled => ExchangeBatchLimits {
+                max_events: self.config.frontload_max_events_per_batch.max(1),
+                max_compressed_bytes: self.config.frontload_max_compressed_batch_bytes.max(1),
+            },
+            ExchangeSyncMode::Frontload => ExchangeBatchLimits {
+                max_events: self.config.metadata_max_events_per_batch.max(1),
+                max_compressed_bytes: self.config.metadata_max_compressed_batch_bytes.max(1),
+            },
+        }
+    }
+
+    fn minimum_limits_for_mode(&self, mode: ExchangeSyncMode) -> ExchangeBatchLimits {
+        match mode {
+            ExchangeSyncMode::Live => ExchangeBatchLimits {
+                max_events: MIN_LIVE_EVENTS.min(self.config.metadata_max_events_per_batch.max(1)),
+                max_compressed_bytes: MIN_LIVE_COMPRESSED_BYTES
+                    .min(self.config.metadata_max_compressed_batch_bytes.max(1)),
+            },
+            ExchangeSyncMode::Frontload => ExchangeBatchLimits {
+                max_events: MIN_FRONTLOAD_EVENTS
+                    .min(self.config.frontload_max_events_per_batch.max(1)),
+                max_compressed_bytes: MIN_FRONTLOAD_COMPRESSED_BYTES
+                    .min(self.config.frontload_max_compressed_batch_bytes.max(1)),
+            },
+        }
+    }
+
+    fn limits_for_mode(&self, mode: ExchangeSyncMode) -> ExchangeBatchLimits {
+        let target = self.target_limits_for_mode(mode);
+        let minimum = self.minimum_limits_for_mode(mode);
+        match self.adaptive_batch_state.lock() {
+            Ok(state) => {
+                let adaptive = match mode {
+                    ExchangeSyncMode::Live => state.live,
+                    ExchangeSyncMode::Frontload => state.frontload,
+                };
+                ExchangeBatchLimits {
+                    max_events: adaptive
+                        .max_events
+                        .clamp(minimum.max_events, target.max_events),
+                    max_compressed_bytes: adaptive
+                        .max_compressed_bytes
+                        .clamp(minimum.max_compressed_bytes, target.max_compressed_bytes),
+                }
+            }
+            Err(_) => target,
+        }
+    }
+
+    fn adaptive_record_success(&self, mode: ExchangeSyncMode) {
+        let target = self.target_limits_for_mode(mode);
+        if let Ok(mut state) = self.adaptive_batch_state.lock() {
+            let entry = match mode {
+                ExchangeSyncMode::Live => &mut state.live,
+                ExchangeSyncMode::Frontload => &mut state.frontload,
+            };
+            entry.success_streak = entry.success_streak.saturating_add(1);
+            if entry.success_streak < 4 {
+                return;
+            }
+            entry.success_streak = 0;
+            let grow_events = (entry.max_events / 4).max(1);
+            let grow_bytes = (entry.max_compressed_bytes / 5).max(64 * 1024);
+            entry.max_events = entry
+                .max_events
+                .saturating_add(grow_events)
+                .min(target.max_events);
+            entry.max_compressed_bytes = entry
+                .max_compressed_bytes
+                .saturating_add(grow_bytes)
+                .min(target.max_compressed_bytes);
+        }
+    }
+
+    fn adaptive_record_pressure(&self, mode: ExchangeSyncMode, pressure: PressureKind) {
+        let minimum = self.minimum_limits_for_mode(mode);
+        if let Ok(mut state) = self.adaptive_batch_state.lock() {
+            let entry = match mode {
+                ExchangeSyncMode::Live => &mut state.live,
+                ExchangeSyncMode::Frontload => &mut state.frontload,
+            };
+            entry.success_streak = 0;
+            let divisor = match pressure {
+                PressureKind::HardLimit => 3,
+                PressureKind::RetryableStatus | PressureKind::Timeout => 2,
+            };
+            entry.max_events = (entry.max_events / divisor).max(minimum.max_events);
+            entry.max_compressed_bytes =
+                (entry.max_compressed_bytes / divisor).max(minimum.max_compressed_bytes);
+        }
+    }
+
+    async fn flush_prepared_rows(
+        &self,
+        mode: ExchangeSyncMode,
+        mut rows: Vec<PreparedExchangeQueueRow>,
+        config_version: Option<&String>,
+        stats: &mut ExchangeQueueStats,
+    ) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        while !rows.is_empty() {
+            let limits = self.limits_for_mode(mode);
+            let fit = self.batch_len_under_limits(&rows, limits, config_version)?;
+            if fit.split_count > 0 {
+                stats.exchange_batch_split_count = stats
+                    .exchange_batch_split_count
+                    .saturating_add(fit.split_count);
+            }
+            if fit.len == 0 {
+                self.adaptive_record_pressure(mode, PressureKind::HardLimit);
+                let row = rows.remove(0);
+                self.defer_exchange_row_with_retry(&row.row, "compressed_single_too_large", stats)?;
+                continue;
+            }
+            let batch = rows.drain(0..fit.len).collect::<Vec<_>>();
+            let request = ExchangeBatchRequest {
+                agent_instance_id: self.config.agent_instance_id.clone(),
+                config_version: config_version.cloned(),
+                batch: batch.iter().map(|value| value.metadata.clone()).collect(),
+            };
+            match self.metadata_pusher.push_exchange_batch(&request).await {
+                Ok(ExchangePushResult::Success(response)) if response.rejected == 0 => {
+                    for item in batch {
+                        self.delete_exchange_queue_entry(&item.row.exchange_id)?;
+                        stats.exchange_sent += 1;
+                        stats.exchange_blob_uploaded += item.blob_uploaded;
+                        match mode {
+                            ExchangeSyncMode::Live => stats.exchange_live_sent += 1,
+                            ExchangeSyncMode::Frontload => stats.exchange_frontload_sent += 1,
+                        }
+                    }
+                    stats.exchange_batch_sent += 1;
+                    stats.exchange_batch_events += request.batch.len();
+                    stats.exchange_batch_compressed_bytes += fit.compressed_bytes;
+                    self.adaptive_record_success(mode);
+                }
+                Ok(ExchangePushResult::Success(response)) => {
+                    let mut rejected = HashMap::new();
+                    for error in &response.errors {
+                        rejected.insert(
+                            error.event_id.clone(),
+                            (error.reason.clone(), error.code.clone()),
+                        );
+                    }
+                    let mut accepted_in_batch = 0usize;
+                    let mut retryable_rejections = 0usize;
+                    for item in batch {
+                        if let Some((reason, code)) = rejected.get(&item.row.exchange_id) {
+                            let token = code.as_deref().unwrap_or(reason.as_str());
+                            match classify_exchange_rejection(reason.as_str(), code.as_deref()) {
+                                ExchangeRejectionDisposition::Drop => self.drop_exchange_row(
+                                    &item.row,
+                                    &format!("exchange_rejected:{token}"),
+                                    stats,
+                                )?,
+                                ExchangeRejectionDisposition::Retry => {
+                                    retryable_rejections += 1;
+                                    self.defer_exchange_row_with_retry(
+                                        &item.row,
+                                        &format!("exchange_rejected:{token}"),
+                                        stats,
+                                    )?
+                                }
+                            }
+                        } else if response.errors.is_empty() {
+                            retryable_rejections += 1;
+                            self.defer_exchange_row_with_retry(
+                                &item.row,
+                                &format!("exchange_rejected_count={}", response.rejected),
+                                stats,
+                            )?;
+                        } else {
+                            self.delete_exchange_queue_entry(&item.row.exchange_id)?;
+                            stats.exchange_sent += 1;
+                            stats.exchange_blob_uploaded += item.blob_uploaded;
+                            accepted_in_batch += 1;
+                            match mode {
+                                ExchangeSyncMode::Live => stats.exchange_live_sent += 1,
+                                ExchangeSyncMode::Frontload => stats.exchange_frontload_sent += 1,
+                            }
+                        }
+                    }
+                    if accepted_in_batch > 0 {
+                        stats.exchange_batch_sent += 1;
+                        stats.exchange_batch_events += accepted_in_batch;
+                        stats.exchange_batch_compressed_bytes += fit.compressed_bytes;
+                        self.adaptive_record_success(mode);
+                    } else if retryable_rejections > 0 {
+                        self.adaptive_record_pressure(mode, PressureKind::RetryableStatus);
+                    } else {
+                        // All rejections were terminal (e.g. duplicates), so avoid shrinking limits.
+                        self.adaptive_record_success(mode);
+                    }
+                }
+                Ok(ExchangePushResult::NonSuccessStatus(status)) => {
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error()
+                        || status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                    {
+                        let pressure = if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+                            PressureKind::HardLimit
+                        } else {
+                            PressureKind::RetryableStatus
+                        };
+                        self.adaptive_record_pressure(mode, pressure);
+                    }
+                    for item in batch {
+                        self.defer_exchange_row_with_retry(
+                            &item.row,
+                            &format!("exchange_upload_status_{}", status.as_u16()),
+                            stats,
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    if is_timeout_error(&error) {
+                        self.adaptive_record_pressure(mode, PressureKind::Timeout);
+                    }
+                    for item in batch {
+                        self.mark_exchange_queue_attempt(
+                            &item.row.exchange_id,
+                            item.row.attempt_count,
+                        )?;
+                    }
+                    self.set_sync_error(&format!("exchange_upload_error:{}", error))?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn batch_len_under_limits(
+        &self,
+        rows: &[PreparedExchangeQueueRow],
+        limits: ExchangeBatchLimits,
+        config_version: Option<&String>,
+    ) -> anyhow::Result<BatchFit> {
+        if rows.is_empty() {
+            return Ok(BatchFit {
+                len: 0,
+                compressed_bytes: 0,
+                split_count: 0,
             });
         }
+        let max_events = rows.len().min(limits.max_events.max(1));
+        let mut candidate = max_events;
+        let mut split_count = 0u64;
 
-        match self.metadata_pusher.push_exchange_batch(&request).await? {
-            Some(response) if response.rejected == 0 => {
-                Ok(ExchangeQueueOutcome::Synced { blob_uploaded })
+        loop {
+            let request = ExchangeBatchRequest {
+                agent_instance_id: self.config.agent_instance_id.clone(),
+                config_version: config_version.cloned(),
+                batch: rows
+                    .iter()
+                    .take(candidate)
+                    .map(|value| value.metadata.clone())
+                    .collect(),
+            };
+            let compressed_size = estimate_gzip_exchange_batch_size(&request)?;
+            if compressed_size <= limits.max_compressed_bytes {
+                return Ok(BatchFit {
+                    len: candidate,
+                    compressed_bytes: compressed_size,
+                    split_count,
+                });
             }
-            Some(response) => Ok(ExchangeQueueOutcome::Retry {
-                reason: format!("exchange_rejected_count={}", response.rejected),
-            }),
-            None => Ok(ExchangeQueueOutcome::Retry {
-                reason: "exchange_upload_non_success_status".to_string(),
-            }),
+            if candidate <= 1 {
+                return Ok(BatchFit {
+                    len: 0,
+                    compressed_bytes: compressed_size,
+                    split_count,
+                });
+            }
+            candidate = (candidate / 2).max(1);
+            split_count = split_count.saturating_add(1);
         }
+    }
+
+    fn defer_exchange_row_with_retry(
+        &self,
+        row: &ExchangeQueueRow,
+        reason: &str,
+        stats: &mut ExchangeQueueStats,
+    ) -> anyhow::Result<()> {
+        self.mark_exchange_queue_attempt(&row.exchange_id, row.attempt_count)?;
+        stats.exchange_retry_deferred += 1;
+        warn!(
+            exchange_id = %row.exchange_id,
+            attempt = row.attempt_count.saturating_add(1),
+            reason = %reason,
+            "Exchange upload deferred with retry backoff"
+        );
+        Ok(())
+    }
+
+    fn drop_exchange_row(
+        &self,
+        row: &ExchangeQueueRow,
+        reason: &str,
+        stats: &mut ExchangeQueueStats,
+    ) -> anyhow::Result<()> {
+        stats.exchange_dropped += 1;
+        warn!(
+            exchange_id = %row.exchange_id,
+            reason = %reason,
+            "Dropping malformed exchange upload entry"
+        );
+        self.delete_exchange_queue_entry(&row.exchange_id)
     }
 
     fn load_exchange_queue_ready(&self, limit: usize) -> anyhow::Result<Vec<ExchangeQueueRow>> {
@@ -400,30 +952,6 @@ impl SyncAgent {
             Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => {
                 return Ok(Vec::new());
             }
-            Err(error) if is_missing_column_error(&error, "blobs_json") => {
-                let mut fallback_stmt = conn.prepare(
-                    r#"
-                    SELECT exchange_id, payload_json, attempt_count
-                    FROM exchange_upload_queue
-                    WHERE next_attempt_at IS NULL
-                       OR next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    ORDER BY updated_at ASC
-                    LIMIT ?1
-                    "#,
-                )?;
-                let mut rows = fallback_stmt.query([limit.max(1) as i64])?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next()? {
-                    let attempt_count_i64: i64 = row.get(2)?;
-                    out.push(ExchangeQueueRow {
-                        exchange_id: row.get(0)?,
-                        payload_json: row.get(1)?,
-                        blobs_json: None,
-                        attempt_count: attempt_count_i64.max(0) as u32,
-                    });
-                }
-                return Ok(out);
-            }
             Err(error) => return Err(error.into()),
         };
 
@@ -439,6 +967,18 @@ impl SyncAgent {
             });
         }
         Ok(out)
+    }
+
+    fn load_exchange_queue_depth(&self) -> anyhow::Result<u64> {
+        let conn = open_read_conn(&self.config.event_db_path)?;
+        let depth = match conn.query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(count) => count.max(0) as u64,
+            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => 0,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(depth)
     }
 
     fn mark_exchange_queue_attempt(
@@ -506,23 +1046,109 @@ impl SyncAgent {
     }
 }
 
-fn normalize_exchange_id_for_cloud(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if Uuid::parse_str(trimmed).is_ok() {
-        return trimmed.to_string();
+fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
+    let conn = open_rw_conn(path)?;
+    if !sqlite_table_exists(&conn, "sync_state")? {
+        return Ok(());
     }
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("soth-legacy-exchange:{trimmed}").as_bytes(),
-    )
-    .to_string()
+    let already_done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = ?1 LIMIT 1",
+            [SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_done.is_some() {
+        return Ok(());
+    }
+
+    let mut deleted_total = 0usize;
+    for table in ["exchange_upload_queue", "exchange_events", "exchange_spool"] {
+        if sqlite_table_exists(&conn, table)? {
+            deleted_total += prune_non_uuid_exchange_ids(&conn, table)?;
+        }
+    }
+
+    write_sync_state(
+        &conn,
+        SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1,
+        &format!("deleted={deleted_total}"),
+    )?;
+
+    if deleted_total > 0 {
+        warn!(
+            deleted_rows = deleted_total,
+            "Pruned legacy non-UUID exchange rows from local event database"
+        );
+    }
+    Ok(())
 }
 
-fn replace_legacy_exchange_ref(reference: &str, legacy: &str, canonical: &str) -> String {
-    if legacy.is_empty() || legacy == canonical {
-        return reference.to_string();
+fn run_exchange_spool_stale_cleanup(
+    path: &Path,
+    max_age: Duration,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let conn = open_rw_conn(path)?;
+    if !sqlite_table_exists(&conn, "exchange_spool")? {
+        return Ok(());
     }
-    reference.replace(legacy, canonical)
+
+    let age_secs = max_age.as_secs().max(1) as i64;
+    let deleted = conn.execute(
+        r#"
+        DELETE FROM exchange_spool
+        WHERE exchange_id IN (
+            SELECT exchange_id
+            FROM exchange_spool
+            WHERE finalized_at IS NULL
+              AND updated_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('-%d seconds', ?1))
+            ORDER BY updated_at ASC
+            LIMIT ?2
+        )
+        "#,
+        params![age_secs, limit.max(1) as i64],
+    )?;
+    if deleted > 0 {
+        warn!(
+            deleted_rows = deleted,
+            age_secs = age_secs,
+            "Pruned stale in-flight exchange spool rows during sync startup"
+        );
+    }
+    Ok(())
+}
+
+fn sqlite_table_exists(conn: &Connection, table_name: &str) -> anyhow::Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
+            [table_name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn prune_non_uuid_exchange_ids(conn: &Connection, table: &str) -> anyhow::Result<usize> {
+    let select_sql = format!("SELECT exchange_id FROM {table}");
+    let mut stmt = conn.prepare(&select_sql)?;
+    let mut invalid_ids = Vec::new();
+    for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+        let exchange_id = row?;
+        if Uuid::parse_str(exchange_id.trim()).is_err() {
+            invalid_ids.push(exchange_id);
+        }
+    }
+    drop(stmt);
+
+    let delete_sql = format!("DELETE FROM {table} WHERE exchange_id = ?1");
+    let mut deleted = 0usize;
+    for exchange_id in invalid_ids {
+        deleted += conn.execute(&delete_sql, [exchange_id])?;
+    }
+    Ok(deleted)
 }
 
 fn open_read_conn(path: &Path) -> anyhow::Result<Connection> {
@@ -688,6 +1314,31 @@ fn merge_tags_for_exchange(
     merge_tags(global_tags, event_tags)
 }
 
+fn exchange_sync_mode(
+    tags: Option<&HashMap<String, String>>,
+    frontload_enabled: bool,
+) -> ExchangeSyncMode {
+    if !frontload_enabled {
+        return ExchangeSyncMode::Live;
+    }
+    let mode = tags
+        .and_then(|value| value.get("collector.ingest_mode"))
+        .map(|value| value.trim().to_ascii_lowercase());
+    if matches!(mode.as_deref(), Some("frontload")) {
+        ExchangeSyncMode::Frontload
+    } else {
+        ExchangeSyncMode::Live
+    }
+}
+
+fn classify_exchange_rejection(reason: &str, code: Option<&str>) -> ExchangeRejectionDisposition {
+    let candidate = code.unwrap_or(reason).trim().to_ascii_lowercase();
+    match candidate.as_str() {
+        "duplicate" => ExchangeRejectionDisposition::Drop,
+        _ => ExchangeRejectionDisposition::Retry,
+    }
+}
+
 fn build_exchange_event_envelope_metadata(
     event: &ExchangeEventV2,
 ) -> Option<EventEnvelopeMetadata> {
@@ -841,11 +1492,13 @@ fn is_missing_table_error(error: &rusqlite::Error, table: &str) -> bool {
     false
 }
 
-fn is_missing_column_error(error: &rusqlite::Error, column: &str) -> bool {
-    if let rusqlite::Error::SqliteFailure(_, Some(message)) = error {
-        return message
-            .to_ascii_lowercase()
-            .contains(&format!("no such column: {}", column.to_ascii_lowercase()));
+fn is_timeout_error(error: &anyhow::Error) -> bool {
+    for cause in error.chain() {
+        if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
+            if reqwest_error.is_timeout() {
+                return true;
+            }
+        }
     }
     false
 }
@@ -860,4 +1513,182 @@ fn resolve_hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn create_test_agent() -> SyncAgent {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("events.db");
+        let retry_dir = dir.path().join("retry");
+        std::fs::create_dir_all(&retry_dir).expect("retry dir");
+
+        let config = SyncAgentConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            api_key: "test-key".to_string(),
+            event_db_path: db_path,
+            cache_path: dir.path().join("cache.json"),
+            agent_instance_id: "agent-test".to_string(),
+            proxy_version: "test".to_string(),
+            retry_queue_dir: retry_dir,
+            retry_queue_max_bytes: 10 * 1024 * 1024,
+            sync_interval: Duration::from_secs(1),
+            batch_size: 200,
+            body_batch_size: 50,
+            body_upload_enabled: false,
+            metadata_max_events_per_batch: 200,
+            metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+            frontload_enabled: true,
+            frontload_max_events_per_batch: 1500,
+            frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+            frontload_hard_events_cap: 5000,
+            frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+            body_upload_max_bytes: 15 * 1024 * 1024,
+            global_tags: BTreeMap::new(),
+            heartbeat_telemetry: None,
+        };
+        SyncAgent::new(config, None).expect("sync agent")
+    }
+
+    fn noisy_text(len: usize, seed: u64) -> String {
+        let mut value = seed;
+        let mut out = String::with_capacity(len);
+        for _ in 0..len {
+            value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let ch = b'a' + ((value >> 32) % 26) as u8;
+            out.push(ch as char);
+        }
+        out
+    }
+
+    fn build_prepared_row(exchange_id: &str, preview_len: usize) -> PreparedExchangeQueueRow {
+        let mut event = ExchangeEventV2::new(
+            exchange_id,
+            soth_core::types::exchange_v2::ExchangeSourceClass::Collector,
+            soth_core::types::exchange_v2::ExchangeTransport::Https,
+            ExchangeBodyMode::MetadataOnly,
+            ExchangeBodyMode::MetadataOnly,
+        );
+        event.request.body.preview = Some(noisy_text(preview_len, 7));
+        event.response.body.preview = Some(noisy_text(preview_len, 13));
+        let metadata = exchange_event_to_metadata(&event);
+        PreparedExchangeQueueRow {
+            row: ExchangeQueueRow {
+                exchange_id: exchange_id.to_string(),
+                payload_json: "{}".to_string(),
+                blobs_json: None,
+                attempt_count: 0,
+            },
+            metadata,
+            mode: ExchangeSyncMode::Live,
+            blob_uploaded: 0,
+        }
+    }
+
+    #[test]
+    fn exchange_sync_mode_defaults_to_live() {
+        assert!(matches!(
+            exchange_sync_mode(None, true),
+            ExchangeSyncMode::Live
+        ));
+    }
+
+    #[test]
+    fn exchange_sync_mode_frontload_tag_respected_when_enabled() {
+        let tags = HashMap::from([("collector.ingest_mode".to_string(), "frontload".to_string())]);
+        assert!(matches!(
+            exchange_sync_mode(Some(&tags), true),
+            ExchangeSyncMode::Frontload
+        ));
+    }
+
+    #[test]
+    fn exchange_sync_mode_frontload_tag_ignored_when_disabled() {
+        let tags = HashMap::from([("collector.ingest_mode".to_string(), "frontload".to_string())]);
+        assert!(matches!(
+            exchange_sync_mode(Some(&tags), false),
+            ExchangeSyncMode::Live
+        ));
+    }
+
+    #[test]
+    fn classify_exchange_rejection_drops_terminal_reasons() {
+        assert!(matches!(
+            classify_exchange_rejection("duplicate", None),
+            ExchangeRejectionDisposition::Drop
+        ));
+    }
+
+    #[test]
+    fn classify_exchange_rejection_retries_non_terminal_reasons() {
+        assert!(matches!(
+            classify_exchange_rejection("rate_limited", None),
+            ExchangeRejectionDisposition::Retry
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("payload_too_large", None),
+            ExchangeRejectionDisposition::Retry
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("validation_failed", None),
+            ExchangeRejectionDisposition::Retry
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("invalid_exchange_id", None),
+            ExchangeRejectionDisposition::Retry
+        ));
+    }
+
+    #[test]
+    fn batch_fit_splits_when_compressed_limit_is_tight() {
+        let agent = create_test_agent();
+        let rows = vec![
+            build_prepared_row("11111111-1111-4111-8111-111111111111", 4096),
+            build_prepared_row("22222222-2222-4222-8222-222222222222", 4096),
+            build_prepared_row("33333333-3333-4333-8333-333333333333", 4096),
+            build_prepared_row("44444444-4444-4444-8444-444444444444", 4096),
+        ];
+        let generous = ExchangeBatchLimits {
+            max_events: 4,
+            max_compressed_bytes: 64 * 1024,
+        };
+        let full_fit = agent
+            .batch_len_under_limits(&rows, generous, None)
+            .expect("full fit");
+        assert_eq!(full_fit.len, rows.len());
+
+        let limits = ExchangeBatchLimits {
+            max_events: 4,
+            max_compressed_bytes: full_fit.compressed_bytes.saturating_sub(1).max(1),
+        };
+        let fit = agent
+            .batch_len_under_limits(&rows, limits, None)
+            .expect("fit");
+        assert!(fit.len >= 1);
+        assert!(fit.len < rows.len());
+        assert!(fit.split_count >= 1);
+        assert!(fit.compressed_bytes <= limits.max_compressed_bytes);
+    }
+
+    #[test]
+    fn batch_fit_returns_zero_for_oversized_single_exchange() {
+        let agent = create_test_agent();
+        let rows = vec![build_prepared_row(
+            "55555555-5555-4555-8555-555555555555",
+            4096,
+        )];
+        let limits = ExchangeBatchLimits {
+            max_events: 1,
+            max_compressed_bytes: 64,
+        };
+        let fit = agent
+            .batch_len_under_limits(&rows, limits, None)
+            .expect("fit");
+        assert_eq!(fit.len, 0);
+        assert!(fit.compressed_bytes > limits.max_compressed_bytes);
+    }
 }

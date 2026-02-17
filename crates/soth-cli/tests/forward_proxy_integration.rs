@@ -1,8 +1,6 @@
 //! Integration tests for forward proxy functionality
 
-use soth_core::config::{
-    ForwardProxyConfig, HostDomainFilesConfig, HostFilterConfig, HostFilterMode,
-};
+use soth_core::config::{ForwardProxyConfig, HostFilterConfig, HostFilterMode};
 use soth_crypto::tls::CertificateAuthority;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -70,33 +68,21 @@ fn test_cert_cache() {
     assert_eq!(stats.expired, 0);
 }
 
-/// Test host filtering - explicit AI host list
+/// Test host filtering - selective mode tunnels non-blocked hosts
 #[test]
-fn test_host_filter_ai_list() {
+fn test_host_filter_selective_tunnels_non_blocked_hosts() {
     use soth_core::HostAction;
 
     let filter = HostFilterConfig {
         mode: HostFilterMode::Selective,
-        ai_inference: vec![
-            "api.openai.com".to_string(),
-            "api.anthropic.com".to_string(),
-        ],
-        mcp: vec![],
-        agent_apps: vec![],
-        domain_files: HostDomainFilesConfig::default(),
         block: vec![],
     };
 
-    // Configured hosts intercepted, others tunneled
-    assert_eq!(
-        filter.action_for_host("api.openai.com"),
-        HostAction::Intercept
-    );
+    assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Tunnel);
     assert_eq!(
         filter.action_for_host("api.anthropic.com"),
-        HostAction::Intercept
+        HostAction::Tunnel
     );
-    assert_eq!(filter.action_for_host("malicious.com"), HostAction::Tunnel);
     assert_eq!(filter.action_for_host("example.com"), HostAction::Tunnel);
 }
 
@@ -107,24 +93,14 @@ fn test_host_filter_selective() {
 
     let filter = HostFilterConfig {
         mode: HostFilterMode::Selective,
-        ai_inference: vec![
-            "api.openai.com".to_string(),
-            "api.anthropic.com".to_string(),
-        ],
-        mcp: vec![],
-        agent_apps: vec![],
-        domain_files: HostDomainFilesConfig::default(),
         block: vec!["blocked.com".to_string()],
     };
 
-    // AI domains intercepted
-    assert_eq!(
-        filter.action_for_host("api.openai.com"),
-        HostAction::Intercept
-    );
+    // Non-blocked hosts tunnel
+    assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Tunnel);
     assert_eq!(
         filter.action_for_host("api.anthropic.com"),
-        HostAction::Intercept
+        HostAction::Tunnel
     );
 
     // Blocked hosts blocked
@@ -148,16 +124,6 @@ fn test_config_defaults() {
     // Check default host actions
     assert_eq!(
         config.hosts.action_for_host("api.openai.com"),
-        soth_core::HostAction::Intercept
-    );
-    assert_eq!(
-        config.hosts.action_for_host("api.anthropic.com"),
-        soth_core::HostAction::Intercept
-    );
-    assert_eq!(
-        config
-            .hosts
-            .action_for_host("generativelanguage.googleapis.com"),
         soth_core::HostAction::Intercept
     );
 }

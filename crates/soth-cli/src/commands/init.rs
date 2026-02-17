@@ -1,7 +1,6 @@
 //! Initialize command
 
 use anyhow::Result;
-use soth_core::config::HostFilterConfig;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::info;
@@ -25,15 +24,8 @@ forward_proxy:
     min_log_interval: "30s"
   hosts:
     mode: "discovery"  # discovery | selective
-    # Domain classes are loaded from dedicated files (recommended).
-    # If a file is configured, it replaces the corresponding inline list.
-    domain_files:
-      ai_inference: "./domains/ai_inference.yaml"
-      mcp: "./domains/mcp.yaml"
-      agent_apps: "./domains/agent_apps.yaml"
-    ai_inference: []
-    mcp: []
-    agent_apps: []
+    # Classification/interception is bundle-driven.
+    # Keep only explicit local block rules here.
     block: []
 
 # Identity configuration
@@ -79,6 +71,17 @@ observe:
   event_tags:
     project: "local-dev"
     environment: "development"
+  collector:
+    enabled: true
+    auto_discover_sources: true
+    frontload_on_start: true
+    frontload_max_cycles: 24
+    frontload_max_read_bytes_per_source: 8388608
+    poll_interval_secs: 5
+    max_read_bytes_per_source: 524288
+    max_line_bytes: 65536
+    sources: []
+    sqlite_sources: []
   log_requests: true
   log_responses: true
   tamper_proof: true
@@ -122,6 +125,11 @@ cloud:
   body_upload_enabled: true
   metadata_max_events_per_batch: 200
   metadata_max_compressed_batch_bytes: 5242880
+  frontload_enabled: true
+  frontload_max_events_per_batch: 1500
+  frontload_max_compressed_batch_bytes: 8388608
+  frontload_hard_events_cap: 5000
+  frontload_hard_compressed_cap_bytes: 16777216
   body_upload_max_bytes: 15728640
   cache_path: "~/.soth/cloud_config_cache.json"
   tags: {}
@@ -141,72 +149,7 @@ exchange_v2:
   recover_inflight_on_start: true
 "#;
 
-const DEFAULT_POLICY: &str = r#"# Default SOTH Policy
-# This policy provides basic safety controls
-
-name: default
-description: Default safety policy for MCP traffic
-
-rules:
-  # Block dangerous tools by default
-  - name: block_dangerous_tools
-    description: Block tools that could be dangerous
-    conditions:
-      method: "tools/call"
-      tool:
-        in:
-          - "shell_exec"
-          - "system_command"
-          - "eval"
-          - "delete_all"
-    action: deny
-    message: "This tool is blocked by policy"
-
-  # Require identity for sensitive operations
-  - name: require_identity_for_write
-    description: Require verified identity for write operations
-    conditions:
-      method: "tools/call"
-      tool:
-        matches: "write.*|delete.*|update.*"
-      identity_verified: false
-    action: deny
-    message: "Verified identity required for write operations"
-
-  # Rate limit sampling requests
-  - name: rate_limit_sampling
-    description: Rate limit sampling requests
-    conditions:
-      method: "sampling/createMessage"
-    action: rate_limit
-    rate_limit:
-      requests: 10
-      window_seconds: 60
-
-  # Log all tool calls
-  - name: log_tool_calls
-    description: Log all tool calls for audit
-    conditions:
-      method: "tools/call"
-    action: log
-
-  # Allow everything else
-  - name: allow_default
-    description: Allow all other requests
-    conditions: {}
-    action: allow
-"#;
-
-fn render_domain_list(comment: &str, domains: &[String]) -> String {
-    let mut out = String::new();
-    out.push_str(comment);
-    out.push('\n');
-    out.push_str("domains:\n");
-    for domain in domains {
-        out.push_str(&format!("  - \"{}\"\n", domain));
-    }
-    out
-}
+const DEFAULT_POLICY: &str = include_str!("../../assets/policies/default.yaml");
 
 /// Run the init command
 pub async fn run(output: PathBuf) -> Result<()> {
@@ -240,35 +183,6 @@ pub async fn run(output: PathBuf) -> Result<()> {
     fs::create_dir_all(&logs_dir).await?;
     info!("Created logs directory: {:?}", logs_dir);
 
-    // Create domain-list files from canonical defaults.
-    let default_hosts = HostFilterConfig::default();
-    let ai_domain_content =
-        render_domain_list("# AI inference/API domains", &default_hosts.ai_inference);
-    let mcp_domain_content =
-        render_domain_list("# MCP transport/service domains", &default_hosts.mcp);
-    let agent_domain_content = render_domain_list(
-        "# Agent app domains (chat/web/IDE agents)",
-        &default_hosts.agent_apps,
-    );
-
-    let domains_dir = output.join("domains");
-    fs::create_dir_all(&domains_dir).await?;
-    let ai_domains_path = domains_dir.join("ai_inference.yaml");
-    if !ai_domains_path.exists() {
-        fs::write(&ai_domains_path, ai_domain_content).await?;
-        info!("Created AI domain list: {:?}", ai_domains_path);
-    }
-    let mcp_domains_path = domains_dir.join("mcp.yaml");
-    if !mcp_domains_path.exists() {
-        fs::write(&mcp_domains_path, mcp_domain_content).await?;
-        info!("Created MCP domain list: {:?}", mcp_domains_path);
-    }
-    let agent_domains_path = domains_dir.join("agent_apps.yaml");
-    if !agent_domains_path.exists() {
-        fs::write(&agent_domains_path, agent_domain_content).await?;
-        info!("Created agent app domain list: {:?}", agent_domains_path);
-    }
-
     // Create .soth directory in home
     if let Some(home) = dirs::home_dir() {
         let soth_dir = home.join(".soth");
@@ -282,10 +196,9 @@ pub async fn run(output: PathBuf) -> Result<()> {
 
     println!("\n✓ SOTH initialized successfully!");
     println!("\nNext steps:");
-    println!("  1. Edit domains/*.yaml (ai_inference, mcp, agent_apps)");
-    println!("  2. Edit soth.yaml for runtime/proxy settings");
-    println!("  3. Generate an identity: soth identity generate");
-    println!("  4. Start the sensor lifecycle: soth up");
+    println!("  1. Edit soth.yaml for runtime/proxy settings");
+    println!("  2. Generate an identity: soth identity generate");
+    println!("  3. Start the sensor lifecycle: soth up");
     println!();
 
     Ok(())

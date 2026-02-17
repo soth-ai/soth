@@ -58,7 +58,6 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     style::subtitle("Services");
 
     let proxy_addr = config.forward_proxy.socket_addr();
-    let api_addr = format!("127.0.0.1:{}", config.dashboard.port);
     let mut server_table = style::table();
     server_table.set_header(vec!["Property", "Value"]);
 
@@ -70,19 +69,25 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let running = tokio::net::TcpStream::connect(proxy_addr.as_str())
         .await
         .is_ok();
-    let api_running = tokio::net::TcpStream::connect(api_addr.as_str())
-        .await
-        .is_ok();
     let status_display = if running {
         format!("{} Running", style::CHECK.green())
     } else {
         format!("{} Not running", style::CROSS.red())
     };
     server_table.add_row(vec![Cell::new("Sensor Status"), Cell::new(status_display)]);
+
+    #[cfg(feature = "local-debug")]
+    let api_addr = format!("127.0.0.1:{}", config.dashboard.port);
+    #[cfg(feature = "local-debug")]
+    let api_running = tokio::net::TcpStream::connect(api_addr.as_str())
+        .await
+        .is_ok();
+    #[cfg(feature = "local-debug")]
     server_table.add_row(vec![
         Cell::new("API Address"),
         Cell::new(format!("http://{}", api_addr).cyan().to_string()),
     ]);
+    #[cfg(feature = "local-debug")]
     server_table.add_row(vec![
         Cell::new("API Status"),
         Cell::new(if api_running {
@@ -91,6 +96,11 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             format!("{} Not running", style::CROSS.red())
         }),
     ]);
+    #[cfg(not(feature = "local-debug"))]
+    server_table.add_row(vec![
+        Cell::new("Local Debug"),
+        Cell::new("disabled in this build (enable `local-debug`)"),
+    ]);
     println!("{server_table}");
 
     if !running {
@@ -98,6 +108,7 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         style::info("Start sensor runtime with:");
         println!("  {}", "soth start".bold());
     }
+    #[cfg(feature = "local-debug")]
     if !api_running {
         println!();
         style::info("Start API service with:");
@@ -106,18 +117,21 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             format!("soth dev api start --port {}", config.dashboard.port).bold()
         );
     }
-    println!();
-    style::info("Optional UI/TUI surfaces:");
-    println!("  {}", "soth dev ui start".bold());
-    println!("  {}", "soth dev profile start --profile dev-stack".bold());
-    println!(
-        "  {}",
-        format!(
-            "soth attach --api-url http://127.0.0.1:{}",
-            config.dashboard.port
-        )
-        .bold()
-    );
+    #[cfg(feature = "local-debug")]
+    {
+        println!();
+        style::info("Optional UI/TUI surfaces:");
+        println!("  {}", "soth dev ui start".bold());
+        println!("  {}", "soth dev profile start --profile dev-stack".bold());
+        println!(
+            "  {}",
+            format!(
+                "soth attach --api-url http://127.0.0.1:{}",
+                config.dashboard.port
+            )
+            .bold()
+        );
+    }
 
     // Environment variables
     println!();

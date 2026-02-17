@@ -1,101 +1,31 @@
 //! Start sensor runtime command
 
 use super::daemon;
+use super::start_fd::{ensure_fd_budget, spawn_fd_monitor_runtime};
+use super::start_shutdown::{
+    disable_system_proxy_after_run, flush_local_event_buffers,
+    is_expected_shutdown_transport_error, runtime_shutdown_timeout, shutdown_cloud_runtime,
+    shutdown_collector_runtime, shutdown_fd_monitor_runtime, shutdown_retention_runtime,
+};
+use super::start_ui::{compact_path, print_logo_banner, render_startup_panel};
 use crate::cli_config;
 use crate::commands::cloud_hooks;
 use crate::commands::enforcement;
 use crate::commands::proxy::retention;
 use crate::commands::proxy::system;
 use crate::style;
-use console::Term;
 use owo_colors::OwoColorize;
 use soth_collector::CollectorRuntime;
 use soth_core::config::{HostFilterMode, ObserveCollectorConfig, SothConfig};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
 use soth_proxy::metrics;
-use soth_proxy::transport::hudsucker_proxy;
+use soth_proxy::transport::proxy;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
-
-const SOTH_PROXY_ASCII: &[&str] = &[
-    "  █████████     ███████    ███████████ █████   █████",
-    " ███░░░░░███  ███░░░░░███ ░█░░░███░░░█░░███   ░░███ ",
-    "░███    ░░░  ███     ░░███░   ░███  ░  ░███    ░███ ",
-    "░░█████████ ░███      ░███    ░███     ░███████████ ",
-    " ░░░░░░░░███░███      ░███    ░███     ░███░░░░░███ ",
-    " ███    ░███░░███     ███     ░███     ░███    ░███ ",
-    "░░█████████  ░░░███████░      █████    █████   █████",
-    " ░░░░░░░░░     ░░░░░░░       ░░░░░    ░░░░░   ░░░░░ ",
-];
-const SOTH_ACCENT: (u8, u8, u8) = (0xD9, 0x77, 0x57);
-const SOTH_MUTED: (u8, u8, u8) = (0x9F, 0x9F, 0x9F);
-const SOTH_TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
-const MIN_NOFILE_SOFT_LIMIT: u64 = 8192;
-const WARN_NOFILE_SOFT_LIMIT: u64 = 2048;
-const FD_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
-const FD_MONITOR_WARN_INTERVAL: Duration = Duration::from_secs(60);
-
-#[cfg(unix)]
-fn ensure_fd_budget() {
-    unsafe {
-        let mut limits = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
-            warn!("Failed to read RLIMIT_NOFILE");
-            return;
-        }
-
-        let initial_soft = limits.rlim_cur as u64;
-        let hard = limits.rlim_max as u64;
-
-        if initial_soft < MIN_NOFILE_SOFT_LIMIT {
-            let target = std::cmp::min(hard, MIN_NOFILE_SOFT_LIMIT) as libc::rlim_t;
-            if target > limits.rlim_cur {
-                limits.rlim_cur = target;
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == 0 {
-                    info!(
-                        previous_soft = initial_soft,
-                        new_soft = target as u64,
-                        hard_limit = hard,
-                        "Raised RLIMIT_NOFILE soft limit"
-                    );
-                } else {
-                    warn!(
-                        soft_limit = initial_soft,
-                        hard_limit = hard,
-                        "Failed to raise RLIMIT_NOFILE soft limit"
-                    );
-                }
-            }
-        }
-
-        let mut verify = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut verify) == 0 {
-            let effective_soft = verify.rlim_cur as u64;
-            let effective_hard = verify.rlim_max as u64;
-            if effective_soft < WARN_NOFILE_SOFT_LIMIT {
-                warn!(
-                    soft_limit = effective_soft,
-                    hard_limit = effective_hard,
-                    "Low RLIMIT_NOFILE soft limit may cause EMFILE under bursty traffic"
-                );
-            }
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn ensure_fd_budget() {}
 
 /// Run the start command
 pub async fn run(
@@ -134,7 +64,7 @@ pub async fn run(
     // Ensure proxy is enabled
     proxy_config.enabled = true;
 
-    // Hudsucker proxy requires cert and key paths.
+    // Forward proxy requires cert and key paths.
     let ca_cert_path = cli_config::expand_tilde(&proxy_config.ca.cert_path);
     let ca_key_path = cli_config::expand_tilde(&proxy_config.ca.key_path);
 
@@ -164,31 +94,9 @@ pub async fn run(
     // Auto-enable system proxy when soth starts without extra console noise.
     system::enable_quiet(Some(proxy_config.port)).await?;
 
-    let intercept_count = proxy_config.hosts.intercept_domain_count();
-    let mut intercept_hosts: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for host in proxy_config
-        .hosts
-        .ai_inference
-        .iter()
-        .chain(proxy_config.hosts.mcp.iter())
-        .chain(proxy_config.hosts.agent_apps.iter())
-    {
-        if seen.insert(host.clone()) {
-            intercept_hosts.push(host.clone());
-        }
-    }
-
     let intercept_summary = match proxy_config.hosts.mode {
-        HostFilterMode::Discovery => {
-            let seed_preview = summarize_hosts(&intercept_hosts, 2);
-            if intercept_count > 0 {
-                format!("all non-local hosts (discovery), seeds: {seed_preview}")
-            } else {
-                "all non-local hosts (discovery mode)".to_string()
-            }
-        }
-        HostFilterMode::Selective => summarize_hosts(&intercept_hosts, 3),
+        HostFilterMode::Discovery => "all non-local hosts (discovery mode)".to_string(),
+        HostFilterMode::Selective => "bundle-classified hosts (registry cache)".to_string(),
     };
 
     let inline_threshold = config.observe.storage.inline_threshold_bytes;
@@ -210,18 +118,19 @@ pub async fn run(
         proxy_config.hosts.mode,
         proxy_config.socket_addr()
     );
-    let rules_line = format!(
-        "AI:{}  MCP:{}  Agent:{}  Total:{}",
-        proxy_config.hosts.ai_inference.len(),
-        proxy_config.hosts.mcp.len(),
-        proxy_config.hosts.agent_apps.len(),
-        intercept_count
-    );
+    let rules_line = "source=cloud bundle (ai/mcp/agent classification)".to_string();
+    #[cfg(feature = "local-debug")]
     let api_line = format!(
         "off (run `soth dev api start --port {}` to enable)",
         config.dashboard.port
     );
+    #[cfg(not(feature = "local-debug"))]
+    let api_line = "unavailable in this build (enable `local-debug`)".to_string();
+
+    #[cfg(feature = "local-debug")]
     let ui_line = "off (run `soth dev ui start` to enable)".to_string();
+    #[cfg(not(feature = "local-debug"))]
+    let ui_line = "unavailable in this build (enable `local-debug`)".to_string();
     let system_proxy_line = format!("enabled @ 127.0.0.1:{}", proxy_config.port);
 
     // Initialize Prometheus metrics
@@ -271,136 +180,6 @@ pub async fn run(
         debug_intercept_all_for,
     )
     .await
-}
-
-fn render_startup_panel(
-    runtime: &str,
-    rules: &str,
-    intercept: &str,
-    env_line: &str,
-    ca_path: &str,
-    api_line: &str,
-    ui_line: &str,
-    events_line: &str,
-    system_proxy_line: &str,
-) {
-    let term_width = Term::stdout().size().1 as usize;
-    let total_width = term_width.saturating_sub(2).clamp(78, 110);
-    let inner_width = total_width.saturating_sub(2);
-
-    print_panel_top(inner_width, &format!("SOTH Proxy ─ {runtime}"));
-    print_panel_kv_row(inner_width, "Rules", rules);
-    print_panel_kv_row(inner_width, "Intercept", intercept);
-    print_panel_kv_row(inner_width, "Env", env_line);
-    print_panel_kv_row(inner_width, "CA", ca_path);
-    print_panel_kv_row(inner_width, "API", api_line);
-    print_panel_kv_row(inner_width, "UI", ui_line);
-    print_panel_kv_row(inner_width, "Events", events_line);
-    print_panel_kv_row(inner_width, "System", system_proxy_line);
-
-    print_panel_bottom(inner_width);
-    println!();
-}
-
-fn print_logo_banner() {
-    println!();
-    for icon in SOTH_PROXY_ASCII {
-        let icon_colored = icon
-            .truecolor(SOTH_ACCENT.0, SOTH_ACCENT.1, SOTH_ACCENT.2)
-            .bold()
-            .to_string();
-        println!("  {}", icon_colored);
-    }
-}
-
-fn print_panel_top(inner_width: usize, title: &str) {
-    let middle_width = inner_width;
-    let prefix = "─ ";
-    let mut title_text = format!("{prefix}{title} ");
-    if display_width(&title_text) > middle_width {
-        title_text = truncate_display(&title_text, middle_width);
-    }
-    let fill = middle_width.saturating_sub(display_width(&title_text));
-    println!("╭{}{}╮", title_text, "─".repeat(fill));
-}
-
-fn print_panel_bottom(inner_width: usize) {
-    println!("╰{}╯", "─".repeat(inner_width));
-}
-
-fn print_panel_kv_row(inner_width: usize, label: &str, value: &str) {
-    let label_field = format!("{label:<10}");
-    let label_width = display_width(&label_field);
-    let value_width = inner_width.saturating_sub(label_width);
-    let value = truncate_display(value, value_width);
-    let pad = inner_width
-        .saturating_sub(label_width)
-        .saturating_sub(display_width(&value));
-
-    println!(
-        "│{}{}{}│",
-        label_field
-            .truecolor(SOTH_MUTED.0, SOTH_MUTED.1, SOTH_MUTED.2)
-            .bold(),
-        value.truecolor(SOTH_TEXT.0, SOTH_TEXT.1, SOTH_TEXT.2),
-        " ".repeat(pad)
-    );
-}
-
-fn truncate_display(value: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-
-    if display_width(value) <= max_width {
-        return value.to_string();
-    }
-
-    if max_width == 1 {
-        return "…".to_string();
-    }
-
-    let mut out = String::new();
-    for ch in value.chars() {
-        if out.chars().count() + 1 >= max_width {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
-}
-
-fn display_width(value: &str) -> usize {
-    value.chars().count()
-}
-
-fn summarize_hosts(hosts: &[String], take: usize) -> String {
-    if hosts.is_empty() {
-        return "none".to_string();
-    }
-
-    let mut preview = hosts
-        .iter()
-        .take(take)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if hosts.len() > take {
-        preview.push_str(&format!(", +{}", hosts.len() - take));
-    }
-    preview
-}
-
-fn compact_path(path: &std::path::Path) -> String {
-    let full = path.display().to_string();
-    if let Some(home) = dirs::home_dir() {
-        let home = home.display().to_string();
-        if full.starts_with(&home) {
-            return format!("~{}", &full[home.len()..]);
-        }
-    }
-    full
 }
 
 fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
@@ -592,7 +371,7 @@ fn spawn_proxy_runtime(
     let oisp_registry_cache_path = resolve_registry_bundle_cache_path(config);
     let exchange_v2_config = config.exchange_v2.clone();
     let handle = tokio::spawn(async move {
-        hudsucker_proxy::start_proxy_with_shutdown(
+        proxy::start_proxy_with_shutdown(
             proxy_config,
             &ca_cert_path,
             &ca_key_path,
@@ -626,91 +405,6 @@ fn spawn_proxy_runtime(
     })
 }
 
-struct FdMonitorRuntime {
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-    task: JoinHandle<()>,
-}
-
-#[cfg(unix)]
-fn spawn_fd_monitor_runtime() -> Option<FdMonitorRuntime> {
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(FD_MONITOR_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_warn_at: Option<Instant> = None;
-
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break,
-                _ = interval.tick() => {
-                    if let Some((open_fds, soft_limit, hard_limit)) = current_fd_snapshot() {
-                        metrics::set_runtime_fd_snapshot(open_fds, soft_limit, hard_limit);
-                        if soft_limit > 0 {
-                            let utilization = (open_fds as f64) / (soft_limit as f64);
-                            if utilization >= 0.9 {
-                                let should_warn = last_warn_at
-                                    .map(|last| last.elapsed() >= FD_MONITOR_WARN_INTERVAL)
-                                    .unwrap_or(true);
-                                if should_warn {
-                                    last_warn_at = Some(Instant::now());
-                                    warn!(
-                                        open_fds = open_fds,
-                                        soft_limit = soft_limit,
-                                        hard_limit = hard_limit,
-                                        utilization_pct = format!("{:.1}", utilization * 100.0),
-                                        "High file-descriptor utilization detected"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    Some(FdMonitorRuntime { shutdown_tx, task })
-}
-
-#[cfg(not(unix))]
-fn spawn_fd_monitor_runtime() -> Option<FdMonitorRuntime> {
-    None
-}
-
-#[cfg(unix)]
-fn current_fd_snapshot() -> Option<(u64, u64, u64)> {
-    let (soft_limit, hard_limit) = current_nofile_limits()?;
-    let open_fds = current_open_fd_count()?;
-    Some((open_fds, soft_limit, hard_limit))
-}
-
-#[cfg(unix)]
-fn current_nofile_limits() -> Option<(u64, u64)> {
-    unsafe {
-        let mut limits = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
-            return None;
-        }
-        Some((limits.rlim_cur as u64, limits.rlim_max as u64))
-    }
-}
-
-#[cfg(unix)]
-fn current_open_fd_count() -> Option<u64> {
-    for path in ["/proc/self/fd", "/dev/fd"] {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            let count = entries.filter_map(Result::ok).count() as u64;
-            if count > 0 {
-                return Some(count);
-            }
-        }
-    }
-    None
-}
-
 fn set_env_if_present<T: ToString>(key: &str, value: Option<T>) {
     if let Some(value) = value {
         std::env::set_var(key, value.to_string());
@@ -723,6 +417,14 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
     }
 
     std::env::set_var("SOTH_COLLECTOR_ENABLED", "true");
+    std::env::set_var(
+        "SOTH_COLLECTOR_AUTO_DISCOVER",
+        collector.auto_discover_sources.to_string(),
+    );
+    std::env::set_var(
+        "SOTH_COLLECTOR_FRONTLOAD_ON_START",
+        collector.frontload_on_start.to_string(),
+    );
 
     if !collector.sources.is_empty() {
         let sources = collector
@@ -736,6 +438,45 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
             .collect::<Vec<_>>()
             .join(",");
         std::env::set_var("SOTH_COLLECTOR_SOURCES", sources);
+
+        let structured_sources = collector
+            .sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "name": source.name,
+                    "path": cli_config::expand_tilde(&source.path).to_string_lossy().to_string(),
+                    "parser": source.parser,
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Ok(raw) = serde_json::to_string(&structured_sources) {
+            std::env::set_var("SOTH_COLLECTOR_SOURCES_JSON", raw);
+        }
+    }
+    if !collector.sqlite_sources.is_empty() {
+        let sqlite_sources = collector
+            .sqlite_sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "name": source.name,
+                    "db_path": cli_config::expand_tilde(&source.db_path).to_string_lossy().to_string(),
+                    "server_name": source.server_name,
+                    "provider": source.provider,
+                    "model": source.model,
+                    "tags": source.tags,
+                    "queries": source.queries.iter().map(|query| serde_json::json!({
+                        "file_type": query.file_type,
+                        "sql": query.sql,
+                        "incremental_field": query.incremental_field,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Ok(raw) = serde_json::to_string(&sqlite_sources) {
+            std::env::set_var("SOTH_COLLECTOR_SQLITE_SOURCES", raw);
+        }
     }
 
     set_env_if_present(
@@ -747,6 +488,14 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
         collector.max_read_bytes_per_source,
     );
     set_env_if_present("SOTH_COLLECTOR_MAX_LINE_BYTES", collector.max_line_bytes);
+    set_env_if_present(
+        "SOTH_COLLECTOR_FRONTLOAD_MAX_CYCLES",
+        collector.frontload_max_cycles,
+    );
+    set_env_if_present(
+        "SOTH_COLLECTOR_FRONTLOAD_MAX_READ_BYTES",
+        collector.frontload_max_read_bytes_per_source,
+    );
     set_env_if_present(
         "SOTH_COLLECTOR_STATE_PATH",
         collector
@@ -760,178 +509,4 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
         "SOTH_COLLECTOR_EVENT_SOURCE",
         collector.event_source.clone(),
     );
-}
-
-async fn shutdown_retention_runtime(
-    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    task: &mut Option<JoinHandle<()>>,
-    timeout_budget: Duration,
-) {
-    if let Some(tx) = shutdown_tx.take() {
-        let _ = tx.send(());
-    }
-
-    if let Some(mut handle) = task.take() {
-        match tokio::time::timeout(timeout_budget, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!("Retention task join error: {}", error);
-            }
-            Err(_) => {
-                handle.abort();
-                tracing::warn!("Retention task shutdown timed out; aborted task.");
-            }
-        }
-    }
-}
-
-async fn shutdown_fd_monitor_runtime(
-    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    task: &mut Option<JoinHandle<()>>,
-    timeout_budget: Duration,
-) {
-    if let Some(tx) = shutdown_tx.take() {
-        let _ = tx.send(());
-    }
-
-    if let Some(mut handle) = task.take() {
-        match tokio::time::timeout(timeout_budget, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!("FD monitor task join error: {}", error);
-            }
-            Err(_) => {
-                handle.abort();
-                tracing::warn!("FD monitor task shutdown timed out; aborted task.");
-            }
-        }
-    }
-}
-
-async fn shutdown_cloud_runtime(
-    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    task: &mut Option<JoinHandle<()>>,
-    timeout_budget: Duration,
-) {
-    if let Some(tx) = shutdown_tx.take() {
-        let _ = tx.send(());
-    }
-
-    if let Some(mut handle) = task.take() {
-        match tokio::time::timeout(timeout_budget, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!("Cloud pull task join error: {}", error);
-            }
-            Err(_) => {
-                handle.abort();
-                tracing::warn!("Cloud pull task shutdown timed out; aborted task.");
-            }
-        }
-    }
-}
-
-async fn shutdown_collector_runtime(
-    shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    task: &mut Option<JoinHandle<()>>,
-    timeout_budget: Duration,
-) {
-    if let Some(tx) = shutdown_tx.take() {
-        let _ = tx.send(());
-    }
-
-    if let Some(mut handle) = task.take() {
-        match tokio::time::timeout(timeout_budget, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!("Collector task join error: {}", error);
-            }
-            Err(_) => {
-                handle.abort();
-                tracing::warn!("Collector task shutdown timed out; aborted task.");
-            }
-        }
-    }
-}
-
-fn runtime_shutdown_timeout(config: &SothConfig) -> Duration {
-    config
-        .server
-        .graceful_shutdown
-        .max(Duration::from_secs(2))
-        .min(Duration::from_secs(20))
-}
-
-async fn flush_local_event_buffers(
-    event_logger: &mut Option<EventLogger>,
-    timeout_budget: Duration,
-    quiet: bool,
-) {
-    let Some(logger) = event_logger.take() else {
-        return;
-    };
-
-    let flush_logger = logger.clone();
-    match tokio::time::timeout(
-        timeout_budget,
-        tokio::task::spawn_blocking(move || flush_logger.flush()),
-    )
-    .await
-    {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => {
-            if !quiet {
-                style::warning(&format!("Failed to flush local event logger: {}", error));
-            }
-        }
-        Ok(Err(error)) => {
-            if !quiet {
-                style::warning(&format!("Event logger flush task join error: {}", error));
-            }
-        }
-        Err(_) => {
-            if !quiet {
-                style::warning("Timed out flushing local event logger before shutdown.");
-            }
-        }
-    }
-
-    let close_logger = logger.clone();
-    match tokio::time::timeout(
-        timeout_budget,
-        tokio::task::spawn_blocking(move || close_logger.close()),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            if !quiet {
-                style::warning(&format!("Event logger close task join error: {}", error));
-            }
-        }
-        Err(_) => {
-            if !quiet {
-                style::warning("Timed out closing local event logger; continuing shutdown.");
-            }
-        }
-    }
-}
-
-async fn disable_system_proxy_after_run(quiet: bool) {
-    if let Err(error) = system::disable_quiet().await {
-        if !quiet {
-            style::warning(&format!(
-                "Failed to disable system proxy automatically: {}",
-                error
-            ));
-        }
-    }
-}
-
-fn is_expected_shutdown_transport_error(error: &anyhow::Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    (text.contains("transport error") && text.contains("io error"))
-        || text.contains("operation canceled")
-        || text.contains("broken pipe")
-        || text.contains("connection closed")
 }

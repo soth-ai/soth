@@ -1,4 +1,4 @@
-//! Shared cloud API contract types.
+//! Shared edge-cloud wire API contract types.
 //!
 //! This module intentionally contains only serializable data structures and
 //! version helpers used by both edge and cloud implementations.

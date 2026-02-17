@@ -1,6 +1,5 @@
 //! Spend tracking module
 
-use crate::pricing::PricingCatalog;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use soth_core::types::budget::{BudgetScope, BudgetState, SpendRecord, TokenUsage};
@@ -11,22 +10,19 @@ use std::sync::Arc;
 pub struct SpendTracker {
     /// Records by session
     records: RwLock<Vec<SpendRecord>>,
-    /// LiteLLM-compatible pricing catalog
-    pricing_catalog: PricingCatalog,
 }
 
 impl SpendTracker {
     /// Create a new spend tracker
     pub fn new() -> Self {
-        Self::with_pricing_catalog(PricingCatalog::with_defaults())
-    }
-
-    /// Create a spend tracker with an explicit pricing catalog.
-    pub fn with_pricing_catalog(pricing_catalog: PricingCatalog) -> Self {
         Self {
             records: RwLock::new(Vec::new()),
-            pricing_catalog,
         }
+    }
+
+    /// Legacy constructor retained for API compatibility.
+    pub fn with_pricing_catalog(_pricing_catalog: crate::pricing::PricingCatalog) -> Self {
+        Self::new()
     }
 
     /// Record a spend event
@@ -62,14 +58,7 @@ impl SpendTracker {
         cost_override: Option<f64>,
     ) -> SpendRecord {
         let usage = TokenUsage::new(input_tokens, output_tokens);
-        let cost = cost_override.unwrap_or_else(|| {
-            self.pricing_catalog
-                .get_pricing(model)
-                .map(|pricing| {
-                    pricing.calculate_cost(usage.input_tokens, usage.output_tokens, None, None)
-                })
-                .unwrap_or(0.0)
-        });
+        let cost = cost_override.unwrap_or(0.0);
 
         let record = SpendRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -172,6 +161,11 @@ impl BudgetTracker {
             model_budgets: RwLock::new(HashMap::new()),
             global_budget: RwLock::new(None),
         }
+    }
+
+    /// Legacy constructor retained for API compatibility.
+    pub fn with_pricing_catalog(_pricing_catalog: crate::pricing::PricingCatalog) -> Self {
+        Self::new()
     }
 
     /// Set a global budget
@@ -421,15 +415,24 @@ mod tests {
     fn test_spend_tracker() {
         let tracker = SpendTracker::new();
 
-        tracker.record(
+        tracker.record_with_cost(
             "session-1",
             Some("agent-1"),
             "gpt-4o",
             1000,
             500,
             Some("tools/call"),
+            Some(0.001),
         );
-        tracker.record("session-1", Some("agent-1"), "gpt-4o", 2000, 1000, None);
+        tracker.record_with_cost(
+            "session-1",
+            Some("agent-1"),
+            "gpt-4o",
+            2000,
+            1000,
+            None,
+            Some(0.002),
+        );
 
         let total = tracker.total_spend();
         assert!(total > 0.0);
@@ -442,8 +445,8 @@ mod tests {
     fn test_session_spend() {
         let tracker = SpendTracker::new();
 
-        tracker.record("session-1", None, "gpt-4o", 1000, 500, None);
-        tracker.record("session-2", None, "gpt-4o", 2000, 1000, None);
+        tracker.record_with_cost("session-1", None, "gpt-4o", 1000, 500, None, Some(0.001));
+        tracker.record_with_cost("session-2", None, "gpt-4o", 2000, 1000, None, Some(0.003));
 
         let s1_spend = tracker.session_spend("session-1");
         let s2_spend = tracker.session_spend("session-2");
@@ -461,7 +464,14 @@ mod tests {
 
         // Record a lot of spend
         for _ in 0..100 {
-            tracker.record_spend("session-1", None, "gpt-4o", 1_000_000, 500_000);
+            tracker.record_spend_with_cost(
+                "session-1",
+                None,
+                "gpt-4o",
+                1_000_000,
+                500_000,
+                Some(1.0),
+            );
         }
 
         // Should exceed budget now
@@ -474,7 +484,14 @@ mod tests {
 
         tracker.set_agent_budget("agent-1", Some(1.0), None, None);
 
-        tracker.record_spend("session-1", Some("agent-1"), "gpt-4o", 1_000_000, 500_000);
+        tracker.record_spend_with_cost(
+            "session-1",
+            Some("agent-1"),
+            "gpt-4o",
+            1000,
+            500,
+            Some(2.0),
+        );
 
         let status = tracker.get_budget_status("agent-1").unwrap();
         assert!(status.current_spend > 0.0);
@@ -485,7 +502,7 @@ mod tests {
         let tracker = BudgetTracker::new();
         tracker.set_session_budget(Some(0.01), None, None);
 
-        tracker.record_spend("session-a", None, "gpt-4o", 1_000_000, 500_000);
+        tracker.record_spend_with_cost("session-a", None, "gpt-4o", 1000, 500, Some(0.02));
 
         assert!(tracker.is_budget_exceeded_scoped("session-a", None, Some("gpt-4o")));
         assert_eq!(
@@ -499,7 +516,7 @@ mod tests {
         let tracker = BudgetTracker::new();
         tracker.set_model_budget("gpt-4o", Some(0.01), None, None);
 
-        tracker.record_spend("session-a", None, "gpt-4o", 1_000_000, 500_000);
+        tracker.record_spend_with_cost("session-a", None, "gpt-4o", 1000, 500, Some(0.02));
 
         assert!(tracker.is_budget_exceeded_scoped("session-a", None, Some("gpt-4o")));
         assert_eq!(

@@ -1,5 +1,5 @@
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::State;
 use axum::http::{
     header::{CONTENT_TYPE, ETAG},
     HeaderMap, HeaderValue, StatusCode,
@@ -14,9 +14,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use soth_core::api::{
     version::{API_VERSION, API_VERSION_HEADER},
-    BodyUploadResponse, ConfigBudget, ConfigBudgetLimit, ConfigOrg, ConfigPolicy, ConfigResponse,
-    ConfigTeam, ConfigUser, EventBatchRequest, EventBatchResponse, HeartbeatRequest,
-    HeartbeatResponse, RegistryVersionResponse,
+    BlobUploadRequest, BlobUploadResponse, ConfigBudget, ConfigBudgetLimit, ConfigOrg,
+    ConfigPolicy, ConfigResponse, ConfigTeam, ConfigUser, ExchangeBatchRequest,
+    ExchangeBatchResponse, HeartbeatRequest, HeartbeatResponse, RegistryVersionResponse,
 };
 use soth_core::types::{
     exchange_v2::{ExchangeBodyMode, ExchangeEventV2, ExchangeSourceClass, ExchangeTransport},
@@ -56,7 +56,7 @@ fn test_bundle_sha() -> String {
 
 #[derive(Debug, Clone, Default)]
 struct CapturedState {
-    metadata_requests: Vec<EventBatchRequest>,
+    metadata_requests: Vec<ExchangeBatchRequest>,
     body_upload_payloads: Vec<String>,
     heartbeat_requests: Vec<HeartbeatRequest>,
     registry_version_requests: usize,
@@ -105,17 +105,22 @@ async fn contract_sync_endpoints_and_cursors() {
         body_upload_enabled: true,
         metadata_max_events_per_batch: 200,
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
-        exchange_v2_only: true,
         heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
     let summary = agent.tick().await.unwrap();
-    assert_eq!(summary.metadata_sent, 1);
-    assert_eq!(summary.body_uploaded, 1);
-    assert_eq!(summary.retry_uploaded, 0);
+    assert_eq!(summary.exchange_sent, 1);
+    assert_eq!(summary.exchange_blob_uploaded, 1);
+    assert_eq!(summary.exchange_retry_deferred, 0);
+    assert_eq!(summary.exchange_dropped, 0);
 
     let heartbeat_ok = agent.send_heartbeat().await.unwrap();
     assert!(heartbeat_ok);
@@ -147,6 +152,24 @@ async fn contract_sync_endpoints_and_cursors() {
     assert!(
         registry_cache_path.exists(),
         "registry bundle cache should be materialized"
+    );
+    let telemetry = captured.heartbeat_requests[0]
+        .telemetry
+        .as_ref()
+        .expect("heartbeat telemetry should be populated");
+    assert_eq!(telemetry.counters.get("sync.exchange.sent"), Some(&1));
+    assert_eq!(
+        telemetry.counters.get("sync.exchange.blob_uploaded"),
+        Some(&1)
+    );
+    assert_eq!(
+        telemetry.counters.get("sync.exchange.retry_deferred"),
+        Some(&0)
+    );
+    assert_eq!(telemetry.counters.get("sync.exchange.dropped"), Some(&0));
+    assert_eq!(
+        telemetry.counters.get("sync.exchange.queue_depth"),
+        Some(&0)
     );
 
     let metadata = &captured.metadata_requests[0];
@@ -223,17 +246,22 @@ async fn contract_retry_queue_on_body_upload_failure() {
         body_upload_enabled: true,
         metadata_max_events_per_batch: 200,
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
-        exchange_v2_only: true,
         heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
     let first = agent.tick().await.unwrap();
-    assert_eq!(first.metadata_sent, 1);
-    assert_eq!(first.body_uploaded, 0);
-    assert_eq!(first.retry_uploaded, 0);
+    assert_eq!(first.exchange_sent, 0);
+    assert_eq!(first.exchange_blob_uploaded, 0);
+    assert_eq!(first.exchange_retry_deferred, 1);
+    assert_eq!(first.exchange_dropped, 0);
 
     let queued_files = std::fs::read_dir(&retry_queue_dir)
         .unwrap()
@@ -245,8 +273,10 @@ async fn contract_retry_queue_on_body_upload_failure() {
     );
 
     let second = agent.tick().await.unwrap();
-    assert_eq!(second.metadata_sent, 0);
-    assert_eq!(second.retry_uploaded, 1);
+    assert_eq!(second.exchange_sent, 0);
+    assert_eq!(second.exchange_blob_uploaded, 0);
+    assert_eq!(second.exchange_retry_deferred, 1);
+    assert_eq!(second.exchange_dropped, 0);
 }
 
 #[tokio::test]
@@ -287,16 +317,23 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         body_upload_enabled: true,
         metadata_max_events_per_batch: 200,
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
-        exchange_v2_only: true,
         heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
     let summary = agent.flush_for_shutdown(5).await.unwrap();
-    assert_eq!(summary.metadata_sent, 2);
-    assert_eq!(summary.body_uploaded, 1);
+    assert_eq!(summary.exchange_sent, 2);
+    assert_eq!(summary.exchange_blob_uploaded, 1);
+    let captured = state.lock().unwrap().clone();
+    assert_eq!(captured.metadata_requests.len(), 1);
+    assert_eq!(captured.metadata_requests[0].batch.len(), 2);
 
     let conn = Connection::open(&db_path).unwrap();
     let metadata_cursor: String = conn
@@ -314,7 +351,8 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, false);
-    seed_exchange_upload_queue(&db_path, "ex-failure-1");
+    let exchange_id = "11111111-2222-3333-4444-555555555555";
+    seed_exchange_upload_queue(&db_path, exchange_id);
 
     let config = SyncAgentConfig {
         endpoint: "http://127.0.0.1:1".to_string(),
@@ -331,9 +369,13 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         body_upload_enabled: true,
         metadata_max_events_per_batch: 200,
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
-        exchange_v2_only: true,
         heartbeat_telemetry: None,
     };
     let agent = SyncAgent::new(config, None).unwrap();
@@ -350,18 +392,104 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
     let conn = Connection::open(&db_path).unwrap();
     let attempt_count: i64 = conn
         .query_row(
-            "SELECT attempt_count FROM exchange_upload_queue WHERE exchange_id = 'ex-failure-1'",
-            [],
+            "SELECT attempt_count FROM exchange_upload_queue WHERE exchange_id = ?1",
+            [exchange_id],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(attempt_count, 1);
 }
 
+#[tokio::test]
+async fn contract_frontload_and_live_batches_are_separated() {
+    let state = Arc::new(Mutex::new(CapturedState::default()));
+    let Some(server_url) = start_mock_server(state.clone()).await else {
+        eprintln!(
+            "Skipping contract_frontload_and_live_batches_are_separated: cannot bind localhost listener"
+        );
+        return;
+    };
+
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("events.db");
+    create_test_db(&db_path, false);
+    let cache_path = temp.path().join("cloud_cache.json");
+    let registry_cache_path = temp.path().join("registry_cache.json");
+    let retry_queue_dir = temp.path().join("retry");
+
+    let mut frontload_event = make_exchange_event("11111111-2222-3333-4444-555555555551");
+    frontload_event.tags = Some(BTreeMap::from([(
+        "collector.ingest_mode".to_string(),
+        "frontload".to_string(),
+    )]));
+    seed_exchange_upload_queue_event(&db_path, &frontload_event);
+
+    let live_event = make_exchange_event("11111111-2222-3333-4444-555555555552");
+    seed_exchange_upload_queue_event(&db_path, &live_event);
+
+    let registry_puller =
+        RegistryPuller::new(server_url.clone(), "test-key", registry_cache_path.clone());
+    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone())
+        .with_registry_puller(registry_puller);
+    let _ = puller.pull_once().await.unwrap();
+
+    let config = SyncAgentConfig {
+        endpoint: server_url,
+        api_key: "test-key".to_string(),
+        event_db_path: db_path.clone(),
+        cache_path,
+        agent_instance_id: "agent-instance-mode-separation".to_string(),
+        proxy_version: "0.1.0-test".to_string(),
+        retry_queue_dir,
+        retry_queue_max_bytes: 10 * 1024 * 1024,
+        sync_interval: Duration::from_secs(1),
+        batch_size: 200,
+        body_batch_size: 200,
+        body_upload_enabled: true,
+        metadata_max_events_per_batch: 200,
+        metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        body_upload_max_bytes: 15 * 1024 * 1024,
+        global_tags: BTreeMap::new(),
+        heartbeat_telemetry: None,
+    };
+
+    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+    let summary = agent.tick().await.unwrap();
+    assert_eq!(summary.exchange_sent, 2);
+
+    let captured = state.lock().unwrap().clone();
+    assert_eq!(captured.metadata_requests.len(), 2);
+
+    let has_frontload_batch = captured.metadata_requests.iter().any(|request| {
+        request.batch.len() == 1
+            && request.batch[0]
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.get("collector.ingest_mode"))
+                .map(|value| value == "frontload")
+                .unwrap_or(false)
+    });
+    let has_live_batch = captured.metadata_requests.iter().any(|request| {
+        request.batch.len() == 1
+            && request.batch[0]
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.get("collector.ingest_mode"))
+                .is_none()
+    });
+    assert!(has_frontload_batch);
+    assert!(has_live_batch);
+}
+
 async fn start_mock_server(state: SharedState) -> Option<String> {
     let app = Router::new()
-        .route("/api/v1/events/batch", post(events_batch_handler))
-        .route("/api/v1/events/:id/body", post(body_upload_handler))
+        .route("/api/v1/exchanges/batch", post(exchange_batch_handler))
+        .route("/api/v1/blobs", post(blob_upload_handler))
         .route("/api/v1/config", get(config_handler))
         .route("/api/v1/heartbeat", post(heartbeat_handler))
         .route("/api/v1/registry/version", get(registry_version_handler))
@@ -384,24 +512,26 @@ async fn start_mock_server(state: SharedState) -> Option<String> {
     Some(format!("http://{}", addr))
 }
 
-async fn events_batch_handler(
+async fn exchange_batch_handler(
     State(state): State<SharedState>,
     headers: HeaderMap,
     body: Bytes,
-) -> (StatusCode, Json<EventBatchResponse>) {
+) -> (StatusCode, Json<ExchangeBatchResponse>) {
     record_headers(&state, &headers);
-    let request = match decode_event_batch_request(&headers, body.as_ref()) {
+    let request = match decode_exchange_batch_request(&headers, body.as_ref()) {
         Ok(request) => request,
         Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(EventBatchResponse {
+                Json(ExchangeBatchResponse {
                     accepted: 0,
                     rejected: 1,
                     errors: vec![soth_core::api::EventError {
                         event_id: "decode".to_string(),
                         reason: error,
+                        code: Some("validation_failed".to_string()),
                     }],
+                    retry_after_secs: None,
                     config_changed: false,
                     server_time: Utc::now().to_rfc3339(),
                 }),
@@ -415,63 +545,69 @@ async fn events_batch_handler(
         .push(request.clone());
     (
         StatusCode::OK,
-        Json(EventBatchResponse {
+        Json(ExchangeBatchResponse {
             accepted: request.batch.len() as u64,
             rejected: 0,
             errors: Vec::new(),
+            retry_after_secs: None,
             config_changed: false,
             server_time: Utc::now().to_rfc3339(),
         }),
     )
 }
 
-fn decode_event_batch_request(
+fn decode_exchange_batch_request(
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<EventBatchRequest, String> {
+) -> Result<ExchangeBatchRequest, String> {
     let is_gzip = headers
         .get("content-encoding")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.eq_ignore_ascii_case("gzip"))
         .unwrap_or(false);
     if !is_gzip {
-        return serde_json::from_slice::<EventBatchRequest>(body).map_err(|e| e.to_string());
+        return serde_json::from_slice::<ExchangeBatchRequest>(body).map_err(|e| e.to_string());
     }
 
     let mut decoder = GzDecoder::new(body);
     let mut decoded = Vec::new();
     std::io::Read::read_to_end(&mut decoder, &mut decoded).map_err(|error| error.to_string())?;
-    serde_json::from_slice::<EventBatchRequest>(&decoded).map_err(|e| e.to_string())
+    serde_json::from_slice::<ExchangeBatchRequest>(&decoded).map_err(|e| e.to_string())
 }
 
-async fn body_upload_handler(
+async fn blob_upload_handler(
     State(state): State<SharedState>,
-    AxumPath(_event_id): AxumPath<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> (StatusCode, Json<BodyUploadResponse>) {
+) -> (StatusCode, Json<BlobUploadResponse>) {
     record_headers(&state, &headers);
     let mut guard = state.lock().unwrap();
     if guard.body_failures_remaining > 0 {
         guard.body_failures_remaining -= 1;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(BodyUploadResponse {
+            Json(BlobUploadResponse {
                 stored: false,
-                request_key: None,
-                response_key: None,
+                blob_key: None,
+                key: None,
+                sha256: None,
             }),
         );
     }
     guard
         .body_upload_payloads
         .push(String::from_utf8_lossy(&body).to_string());
+    let request = serde_json::from_slice::<BlobUploadRequest>(body.as_ref())
+        .ok()
+        .and_then(|value| value.reference)
+        .unwrap_or_else(|| "blob://stored/mock".to_string());
     (
         StatusCode::OK,
-        Json(BodyUploadResponse {
+        Json(BlobUploadResponse {
             stored: true,
-            request_key: Some("r2/request".to_string()),
-            response_key: Some("r2/response".to_string()),
+            blob_key: Some(request.clone()),
+            key: Some(request),
+            sha256: None,
         }),
     )
 }
@@ -689,6 +825,26 @@ fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
     .unwrap();
 
     let event = make_exchange_event(exchange_id);
+    seed_exchange_upload_queue_event(path, &event);
+}
+
+fn seed_exchange_upload_queue_event(path: &Path, event: &ExchangeEventV2) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS exchange_upload_queue (
+            exchange_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            blobs_json TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+
     let now = Utc::now().to_rfc3339();
     conn.execute(
         r#"
@@ -698,8 +854,8 @@ fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
         VALUES (?1, ?2, NULL, 0, NULL, ?3, ?3)
         "#,
         (
-            exchange_id,
-            serde_json::to_string(&event).unwrap(),
+            event.exchange_id.as_str(),
+            serde_json::to_string(event).unwrap(),
             now,
         ),
     )

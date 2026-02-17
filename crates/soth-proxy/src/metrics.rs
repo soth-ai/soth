@@ -3,14 +3,21 @@
 //! Provides counters, gauges, and histograms for monitoring proxy health and performance.
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+#[cfg(feature = "monitoring")]
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+#[cfg(feature = "monitoring")]
 use once_cell::sync::OnceCell;
 use soth_core::api::HeartbeatTelemetry;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(not(feature = "monitoring"))]
+#[derive(Clone, Debug)]
+pub struct PrometheusHandle;
+
 /// Global Prometheus handle for rendering metrics
+#[cfg(feature = "monitoring")]
 static PROMETHEUS_HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
 static BLACKLIST_KEYWORD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLACKLIST_GRAPHQL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -28,6 +35,7 @@ static EMFILE_FORWARD_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Initialize the Prometheus metrics exporter
 ///
 /// Call this once at startup. Returns the handle for rendering metrics.
+#[cfg(feature = "monitoring")]
 pub fn init_metrics() -> PrometheusHandle {
     PROMETHEUS_HANDLE
         .get_or_init(|| {
@@ -45,17 +53,38 @@ pub fn init_metrics() -> PrometheusHandle {
         .clone()
 }
 
+#[cfg(not(feature = "monitoring"))]
+pub fn init_metrics() -> PrometheusHandle {
+    // Keep shape compatibility when monitoring is disabled.
+    describe_counters();
+    describe_gauges();
+    describe_histograms();
+    PrometheusHandle
+}
+
 /// Get the Prometheus handle (must call init_metrics first)
+#[cfg(feature = "monitoring")]
 pub fn get_prometheus_handle() -> Option<PrometheusHandle> {
     PROMETHEUS_HANDLE.get().cloned()
 }
 
+#[cfg(not(feature = "monitoring"))]
+pub fn get_prometheus_handle() -> Option<PrometheusHandle> {
+    None
+}
+
 /// Render current metrics as Prometheus text format
+#[cfg(feature = "monitoring")]
 pub fn render_metrics() -> String {
     PROMETHEUS_HANDLE
         .get()
         .map(|h| h.render())
         .unwrap_or_default()
+}
+
+#[cfg(not(feature = "monitoring"))]
+pub fn render_metrics() -> String {
+    String::new()
 }
 
 // === Metric Names ===

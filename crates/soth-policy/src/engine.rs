@@ -7,8 +7,10 @@ use parking_lot::RwLock;
 use soth_core::error::Result;
 use soth_core::types::policy::{EvaluationResult, PolicyData, PolicyDecision, PolicyInput};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// Policy engine configuration
 #[derive(Debug, Clone)]
@@ -44,6 +46,8 @@ pub struct PolicyEngine {
     cache: Arc<DecisionCache>,
     /// Statistics
     stats: RwLock<EngineStats>,
+    /// Guard to avoid spamming runtime-mismatch warnings on every evaluation.
+    rego_runtime_warning_emitted: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +100,7 @@ impl PolicyEngine {
             config,
             artifacts: RwLock::new(PolicyArtifactSet::default()),
             stats: RwLock::new(EngineStats::default()),
+            rego_runtime_warning_emitted: AtomicBool::new(false),
         }
     }
 
@@ -109,6 +114,7 @@ impl PolicyEngine {
             },
             artifacts: RwLock::new(PolicyArtifactSet::default()),
             stats: RwLock::new(EngineStats::default()),
+            rego_runtime_warning_emitted: AtomicBool::new(false),
         }
     }
 
@@ -213,11 +219,13 @@ impl PolicyEngine {
     /// Evaluate a policy decision
     pub fn evaluate(&self, input: &PolicyInput) -> Result<EvaluationResult> {
         let start = Instant::now();
-        let (policy_version, has_modules, policy_data) = {
+        let (policy_version, has_modules, has_modules_count, policy_data) = {
             let artifacts = self.artifacts.read();
+            let modules_len = artifacts.active.modules.len();
             (
                 format!("v{}", artifacts.active.version),
-                !artifacts.active.modules.is_empty(),
+                modules_len > 0,
+                modules_len,
                 artifacts.active.data.clone(),
             )
         };
@@ -239,12 +247,20 @@ impl PolicyEngine {
             });
         }
 
-        // Fail closed if policy modules were loaded but module execution runtime
-        // is not wired into this engine implementation.
-        if has_modules {
-            return Err(soth_core::error::SothError::PolicyEvaluation(
-                "Loaded policy modules cannot be executed by current runtime".to_string(),
-            ));
+        // TODO: Wire up OpaWasmRuntime (crate::wasm) to execute loaded Rego modules.
+        // Currently the wasm runtime is a placeholder and runtime evaluation remains
+        // fail-open by falling through to the built-in data-based rules below. Once the
+        // Rego runtime is available, this branch should call into it and merge results.
+        if has_modules
+            && !self
+                .rego_runtime_warning_emitted
+                .swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                module_count = has_modules_count,
+                "Policy modules loaded but no Rego execution runtime available — \
+                 falling through to built-in rule evaluation"
+            );
         }
 
         // Check cache

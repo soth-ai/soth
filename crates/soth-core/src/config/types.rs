@@ -697,14 +697,29 @@ impl Default for ObserveConfig {
 }
 
 /// Local collector settings for ingesting agent session files incrementally.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObserveCollectorConfig {
     /// Enable local collector runtime.
     #[serde(default)]
     pub enabled: bool,
+    /// Auto-discover known local agent transcript files when no sources are configured.
+    #[serde(default = "default_true")]
+    pub auto_discover_sources: bool,
     /// File sources (JSONL/text) for incremental tailing.
     #[serde(default)]
     pub sources: Vec<ObserveCollectorSourceConfig>,
+    /// SQLite sources for incremental cursor-based collection.
+    #[serde(default)]
+    pub sqlite_sources: Vec<ObserveCollectorSqliteSourceConfig>,
+    /// Run a one-time high-throughput frontload pass on startup.
+    #[serde(default = "default_true")]
+    pub frontload_on_start: bool,
+    /// Maximum frontload cycles during startup.
+    #[serde(default)]
+    pub frontload_max_cycles: Option<u32>,
+    /// Maximum bytes read per source during frontload cycles.
+    #[serde(default)]
+    pub frontload_max_read_bytes_per_source: Option<usize>,
     /// Poll interval in seconds.
     #[serde(default)]
     pub poll_interval_secs: Option<u64>,
@@ -725,6 +740,26 @@ pub struct ObserveCollectorConfig {
     pub event_source: Option<String>,
 }
 
+impl Default for ObserveCollectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_discover_sources: true,
+            sources: Vec::new(),
+            sqlite_sources: Vec::new(),
+            frontload_on_start: true,
+            frontload_max_cycles: None,
+            frontload_max_read_bytes_per_source: None,
+            poll_interval_secs: None,
+            max_read_bytes_per_source: None,
+            max_line_bytes: None,
+            state_path: None,
+            agent_name: None,
+            event_source: None,
+        }
+    }
+}
+
 /// Per-file local collector source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObserveCollectorSourceConfig {
@@ -736,6 +771,42 @@ pub struct ObserveCollectorSourceConfig {
     /// Parser type: jsonl/ndjson/text.
     #[serde(default)]
     pub parser: Option<String>,
+}
+
+/// Per-database local collector source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveCollectorSqliteSourceConfig {
+    /// Logical source name.
+    pub name: String,
+    /// SQLite database path.
+    pub db_path: PathBuf,
+    /// Optional logical server name for emitted events.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// Optional provider override.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Optional model override.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional source-level tags.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    /// Query set to run against the database.
+    #[serde(default)]
+    pub queries: Vec<ObserveCollectorSqliteQueryConfig>,
+}
+
+/// Query definition for SQLite collector sources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveCollectorSqliteQueryConfig {
+    /// Logical file type bucket for this query.
+    pub file_type: String,
+    /// SQL query text.
+    pub sql: String,
+    /// Optional incremental field used as cursor.
+    #[serde(default)]
+    pub incremental_field: Option<String>,
 }
 
 /// Source scopes for PII detection.
@@ -780,13 +851,6 @@ pub struct StorageConfig {
     /// Inline payload threshold (bytes) before payload side-table offload.
     #[serde(default = "default_inline_threshold_bytes")]
     pub inline_threshold_bytes: usize,
-
-    /// Deprecated single retention days setting (0 = forever).
-    /// Read for backward compatibility from existing configs.
-    #[serde(default)]
-    #[serde(rename = "retention_days")]
-    #[serde(skip_serializing)]
-    pub legacy_retention_days: Option<u32>,
 }
 
 fn default_storage_backend() -> String {
@@ -808,21 +872,6 @@ impl Default for StorageConfig {
             path: default_storage_path(),
             retention: RetentionConfig::default(),
             inline_threshold_bytes: default_inline_threshold_bytes(),
-            legacy_retention_days: None,
-        }
-    }
-}
-
-impl StorageConfig {
-    /// Applies deprecated `retention_days` when present and no explicit
-    /// source-aware retention values were configured.
-    pub fn apply_legacy_retention_days(&mut self) {
-        let Some(days) = self.legacy_retention_days.take() else {
-            return;
-        };
-
-        if self.retention.is_default() {
-            self.retention = RetentionConfig::uniform(days);
         }
     }
 }
@@ -982,6 +1031,26 @@ pub struct CloudConfig {
     #[serde(default = "default_cloud_metadata_max_compressed_batch_bytes")]
     pub metadata_max_compressed_batch_bytes: u64,
 
+    /// Enable frontload-specific batching overrides for collector backfill.
+    #[serde(default = "default_true")]
+    pub frontload_enabled: bool,
+
+    /// Maximum metadata events per batch during collector frontload.
+    #[serde(default = "default_cloud_frontload_max_events_per_batch")]
+    pub frontload_max_events_per_batch: usize,
+
+    /// Maximum compressed metadata batch size in bytes during frontload.
+    #[serde(default = "default_cloud_frontload_max_compressed_batch_bytes")]
+    pub frontload_max_compressed_batch_bytes: u64,
+
+    /// Absolute hard cap for frontload event batch count.
+    #[serde(default = "default_cloud_frontload_hard_events_cap")]
+    pub frontload_hard_events_cap: usize,
+
+    /// Absolute hard cap for frontload compressed payload size.
+    #[serde(default = "default_cloud_frontload_hard_compressed_cap_bytes")]
+    pub frontload_hard_compressed_cap_bytes: u64,
+
     /// Maximum request/response body size eligible for cloud body upload.
     #[serde(default = "default_cloud_body_upload_max_bytes")]
     pub body_upload_max_bytes: u64,
@@ -1019,6 +1088,22 @@ fn default_cloud_metadata_max_compressed_batch_bytes() -> u64 {
     5 * 1024 * 1024
 }
 
+fn default_cloud_frontload_max_events_per_batch() -> usize {
+    1500
+}
+
+fn default_cloud_frontload_max_compressed_batch_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_cloud_frontload_hard_events_cap() -> usize {
+    5000
+}
+
+fn default_cloud_frontload_hard_compressed_cap_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
 fn default_cloud_body_upload_max_bytes() -> u64 {
     15 * 1024 * 1024
 }
@@ -1036,6 +1121,13 @@ impl Default for CloudConfig {
             body_upload_enabled: true,
             metadata_max_events_per_batch: default_cloud_metadata_max_events_per_batch(),
             metadata_max_compressed_batch_bytes: default_cloud_metadata_max_compressed_batch_bytes(
+            ),
+            frontload_enabled: true,
+            frontload_max_events_per_batch: default_cloud_frontload_max_events_per_batch(),
+            frontload_max_compressed_batch_bytes:
+                default_cloud_frontload_max_compressed_batch_bytes(),
+            frontload_hard_events_cap: default_cloud_frontload_hard_events_cap(),
+            frontload_hard_compressed_cap_bytes: default_cloud_frontload_hard_compressed_cap_bytes(
             ),
             body_upload_max_bytes: default_cloud_body_upload_max_bytes(),
             cache_path: default_cloud_cache_path(),
@@ -1547,81 +1639,46 @@ impl Default for PoolConfig {
 }
 
 /// Host filtering configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HostFilterConfig {
     /// Host filtering mode:
-    /// - selective: intercept configured AI/MCP hosts and tunnel the rest
+    /// - selective: bundle-driven interception only; tunnel non-matching hosts
     /// - discovery: intercept all non-local hosts to discover new MCP/AI domains
     ///   (default)
     #[serde(default)]
     pub mode: HostFilterMode,
-
-    /// Hosts classified as AI inference/app traffic.
-    #[serde(default = "default_ai_inference_hosts")]
-    pub ai_inference: Vec<String>,
-
-    /// Hosts classified as MCP transport/service traffic.
-    #[serde(default = "default_mcp_service_hosts")]
-    pub mcp: Vec<String>,
-
-    /// Hosts classified as agent app traffic (ChatGPT, Claude, Gemini web apps, IDE agents).
-    #[serde(default = "default_agent_app_hosts")]
-    pub agent_apps: Vec<String>,
-
-    /// Optional external domain-list files.
-    /// When set, each file replaces the corresponding inline list at load time.
-    #[serde(default)]
-    pub domain_files: HostDomainFilesConfig,
 
     /// Blocked hosts - these are rejected with 403
     #[serde(default)]
     pub block: Vec<String>,
 }
 
-/// Optional file paths for host domain classes.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct HostDomainFilesConfig {
-    /// YAML file for AI inference domains.
-    pub ai_inference: Option<PathBuf>,
-    /// YAML file for MCP domains.
-    pub mcp: Option<PathBuf>,
-    /// YAML file for agent app domains.
-    pub agent_apps: Option<PathBuf>,
-}
-
 /// Host filtering mode for soth proxy interception
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HostFilterMode {
-    /// Intercept configured hosts only; blind tunnel everything else.
+    /// Bundle-driven interception only; blind tunnel everything else.
     Selective,
     /// Intercept all non-local hosts (useful for discovery).
     #[default]
     Discovery,
 }
 
-/// Registry migration mode for forward proxy classification/routing.
+/// Bundle-only classification mode for forward proxy interception/routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RegistryMode {
-    /// Registry bundle-driven detection/intercept with legacy detector kept
-    /// in shadow mode for mismatch telemetry.
+    /// Bundle-driven detection/intercept.
     ///
-    /// `legacy` and `shadow` are accepted as compatibility aliases and map to this mode.
+    /// Aliases are kept so older cached cloud config values continue to parse.
     #[default]
-    #[serde(alias = "legacy", alias = "shadow")]
-    Registry,
-    /// Registry bundle-driven detection only (cutover mode).
-    ///
-    /// No legacy detector fallback/shadow comparison is executed.
-    #[serde(alias = "strict")]
+    #[serde(alias = "registry", alias = "strict")]
     BundleOnly,
 }
 
 impl std::fmt::Display for RegistryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Registry => write!(f, "registry"),
             Self::BundleOnly => write!(f, "bundle_only"),
         }
     }
@@ -1636,120 +1693,7 @@ impl std::fmt::Display for HostFilterMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct DomainSeedFile {
-    #[serde(default)]
-    domains: Vec<String>,
-}
-
-fn default_ai_inference_hosts() -> Vec<String> {
-    load_seed_domains(include_str!("../../../../domains/ai_inference.yaml"))
-}
-
-fn default_mcp_service_hosts() -> Vec<String> {
-    load_seed_domains(include_str!("../../../../domains/mcp.yaml"))
-}
-
-fn default_agent_app_hosts() -> Vec<String> {
-    load_seed_domains(include_str!("../../../../domains/agent_apps.yaml"))
-}
-
-fn load_seed_domains(contents: &str) -> Vec<String> {
-    match serde_yaml::from_str::<DomainSeedFile>(contents) {
-        Ok(seed) => dedupe_hosts(seed.domains),
-        Err(error) => {
-            tracing::warn!("Failed to parse embedded domain seed list: {error}");
-            Vec::new()
-        }
-    }
-}
-
-fn dedupe_hosts(hosts: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::with_capacity(hosts.len());
-    let mut deduped = Vec::with_capacity(hosts.len());
-    for host in hosts {
-        if seen.insert(host.clone()) {
-            deduped.push(host);
-        }
-    }
-    deduped
-}
-
-impl Default for HostFilterConfig {
-    fn default() -> Self {
-        Self {
-            mode: HostFilterMode::default(),
-            ai_inference: default_ai_inference_hosts(),
-            mcp: default_mcp_service_hosts(),
-            agent_apps: default_agent_app_hosts(),
-            domain_files: HostDomainFilesConfig::default(),
-            block: Vec::new(),
-        }
-    }
-}
-
 impl HostFilterConfig {
-    fn matches_any(host: &str, patterns: &[String]) -> bool {
-        patterns
-            .iter()
-            .any(|pattern| Self::matches_pattern(host, pattern))
-    }
-
-    /// API endpoints that should stay in AI inference class even if they match
-    /// a broad agent-app wildcard.
-    fn is_ai_api_host(host: &str) -> bool {
-        host == "api.openai.com"
-            || host.ends_with(".api.openai.com")
-            || host == "api.anthropic.com"
-            || host.ends_with(".api.anthropic.com")
-            || host == "api.claude.ai"
-            || host.ends_with(".api.claude.ai")
-    }
-
-    /// Check if host is in AI inference/app whitelist.
-    pub fn should_check_ai_inference(&self, host: &str) -> bool {
-        Self::matches_any(host, &self.ai_inference)
-    }
-
-    /// Check if host is in MCP whitelist.
-    pub fn should_check_mcp(&self, host: &str) -> bool {
-        if !self.mcp.is_empty() {
-            Self::matches_any(host, &self.mcp)
-        } else {
-            false
-        }
-    }
-
-    /// Check if host is in agent app whitelist.
-    pub fn should_check_agent_app(&self, host: &str) -> bool {
-        if Self::is_ai_api_host(host) {
-            return false;
-        }
-        Self::matches_any(host, &self.agent_apps)
-    }
-
-    /// Number of unique host patterns that can trigger interception.
-    pub fn intercept_domain_count(&self) -> usize {
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for host in &self.ai_inference {
-            seen.insert(host.as_str());
-        }
-        for host in &self.mcp {
-            seen.insert(host.as_str());
-        }
-        for host in &self.agent_apps {
-            seen.insert(host.as_str());
-        }
-        seen.len()
-    }
-
-    /// Check if a host should be intercepted (full MITM)
-    pub fn should_intercept(&self, host: &str) -> bool {
-        self.should_check_ai_inference(host)
-            || self.should_check_mcp(host)
-            || self.should_check_agent_app(host)
-    }
-
     /// Check if a host is blocked (rejected with 403)
     pub fn is_blocked(&self, host: &str) -> bool {
         self.block
@@ -1827,14 +1771,7 @@ impl HostFilterConfig {
 
         match self.mode {
             HostFilterMode::Discovery => HostAction::Intercept,
-            HostFilterMode::Selective => {
-                // Intercept configured host patterns; tunnel everything else.
-                if self.should_intercept(host) {
-                    HostAction::Intercept
-                } else {
-                    HostAction::Tunnel
-                }
-            }
+            HostFilterMode::Selective => HostAction::Tunnel,
         }
     }
 }
@@ -2290,6 +2227,11 @@ cloud:
   body_upload_enabled: true
   metadata_max_events_per_batch: 120
   metadata_max_compressed_batch_bytes: 3145728
+  frontload_enabled: true
+  frontload_max_events_per_batch: 1800
+  frontload_max_compressed_batch_bytes: 8388608
+  frontload_hard_events_cap: 5000
+  frontload_hard_compressed_cap_bytes: 16777216
   body_upload_max_bytes: 10485760
   tags:
     project: "edge"
@@ -2305,6 +2247,17 @@ cloud:
         assert!(config.cloud.body_upload_enabled);
         assert_eq!(config.cloud.metadata_max_events_per_batch, 120);
         assert_eq!(config.cloud.metadata_max_compressed_batch_bytes, 3_145_728);
+        assert!(config.cloud.frontload_enabled);
+        assert_eq!(config.cloud.frontload_max_events_per_batch, 1800);
+        assert_eq!(
+            config.cloud.frontload_max_compressed_batch_bytes,
+            8 * 1024 * 1024
+        );
+        assert_eq!(config.cloud.frontload_hard_events_cap, 5000);
+        assert_eq!(
+            config.cloud.frontload_hard_compressed_cap_bytes,
+            16 * 1024 * 1024
+        );
         assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
     }
@@ -2404,7 +2357,7 @@ crypto_identity:
         assert_eq!(config.port, 8080);
         assert_eq!(config.address, "127.0.0.1");
         assert_eq!(config.socket_addr(), "127.0.0.1:8080");
-        assert_eq!(config.registry_mode, RegistryMode::Registry);
+        assert_eq!(config.registry_mode, RegistryMode::BundleOnly);
         assert!(config.process_attribution.enabled);
         assert_eq!(
             config.process_attribution.lookup_timeout,
@@ -2427,16 +2380,9 @@ crypto_identity:
         use super::HostAction;
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            ai_inference: vec!["api.openai.com".to_string()],
-            mcp: vec![],
-            agent_apps: vec![],
-            domain_files: HostDomainFilesConfig::default(),
             block: vec![],
         };
-        assert_eq!(
-            filter.action_for_host("api.openai.com"),
-            HostAction::Intercept
-        );
+        assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Tunnel);
         assert_eq!(
             filter.action_for_host("api.example.com"),
             HostAction::Tunnel
@@ -2448,10 +2394,6 @@ crypto_identity:
         use super::HostAction;
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            ai_inference: vec![],
-            mcp: vec![],
-            agent_apps: vec![],
-            domain_files: HostDomainFilesConfig::default(),
             block: vec!["blocked.com".to_string()],
         };
         assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Tunnel);
@@ -2464,21 +2406,7 @@ crypto_identity:
         let filter = HostFilterConfig::default();
         assert_eq!(filter.mode, HostFilterMode::Discovery);
 
-        // AI domains should be intercepted
-        assert_eq!(
-            filter.action_for_host("api.openai.com"),
-            HostAction::Intercept
-        );
-        assert_eq!(
-            filter.action_for_host("api.anthropic.com"),
-            HostAction::Intercept
-        );
-        assert_eq!(
-            filter.action_for_host("generativelanguage.googleapis.com"),
-            HostAction::Intercept
-        );
-
-        // In discovery mode, non-local unknown domains are intercepted.
+        // In discovery mode, non-local hosts are intercepted.
         assert_eq!(
             filter.action_for_host("random.example.com"),
             HostAction::Intercept
@@ -2490,215 +2418,43 @@ crypto_identity:
     fn test_host_filter_intercept() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            ai_inference: vec![
-                "api.openai.com".to_string(),
-                "*.openai.azure.com".to_string(),
-            ],
-            mcp: vec![],
-            agent_apps: vec![],
-            domain_files: HostDomainFilesConfig::default(),
-            block: vec![],
+            block: vec!["*.bad.com".to_string()],
         };
-
-        assert!(filter.should_intercept("api.openai.com"));
-        assert!(filter.should_intercept("myinstance.openai.azure.com"));
-        assert!(!filter.should_intercept("google.com"));
+        assert!(filter.is_blocked("x.bad.com"));
+        assert!(!filter.is_blocked("x.good.com"));
     }
 
     #[test]
     fn test_host_filter_wildcard_patterns() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            ai_inference: vec![
+            block: vec![
                 "api.openai.com".to_string(),          // Exact
                 "*.openai.azure.com".to_string(),      // Prefix wildcard
                 "bedrock.*.amazonaws.com".to_string(), // Middle wildcard
                 "*.huggingface.co".to_string(),        // Prefix wildcard
             ],
-            mcp: vec![],
-            agent_apps: vec![],
-            domain_files: HostDomainFilesConfig::default(),
-            block: vec![],
         };
 
         // Exact match
-        assert!(filter.should_intercept("api.openai.com"));
-        assert!(!filter.should_intercept("api.openai.com.fake.com"));
+        assert!(filter.is_blocked("api.openai.com"));
+        assert!(!filter.is_blocked("api.openai.com.fake.com"));
 
         // Prefix wildcard
-        assert!(filter.should_intercept("myinstance.openai.azure.com"));
-        assert!(filter.should_intercept("corp.openai.azure.com"));
-        assert!(!filter.should_intercept("openai.azure.com")); // Must have prefix
+        assert!(filter.is_blocked("myinstance.openai.azure.com"));
+        assert!(filter.is_blocked("corp.openai.azure.com"));
+        assert!(!filter.is_blocked("openai.azure.com")); // Must have prefix
 
         // Middle wildcard (AWS Bedrock regions)
-        assert!(filter.should_intercept("bedrock.us-east-1.amazonaws.com"));
-        assert!(filter.should_intercept("bedrock.eu-west-1.amazonaws.com"));
-        assert!(filter.should_intercept("bedrock.ap-northeast-1.amazonaws.com"));
-        assert!(!filter.should_intercept("bedrock.amazonaws.com")); // Must have middle part
-        assert!(!filter.should_intercept("s3.us-east-1.amazonaws.com")); // Different prefix
+        assert!(filter.is_blocked("bedrock.us-east-1.amazonaws.com"));
+        assert!(filter.is_blocked("bedrock.eu-west-1.amazonaws.com"));
+        assert!(filter.is_blocked("bedrock.ap-northeast-1.amazonaws.com"));
+        assert!(!filter.is_blocked("bedrock.amazonaws.com")); // Must have middle part
+        assert!(!filter.is_blocked("s3.us-east-1.amazonaws.com")); // Different prefix
 
         // Hugging Face
-        assert!(filter.should_intercept("api-inference.huggingface.co"));
-        assert!(filter.should_intercept("datasets.huggingface.co"));
-    }
-
-    #[test]
-    fn test_default_ai_domains_coverage() {
-        let filter = HostFilterConfig::default();
-
-        // Major AI providers should be intercepted by default
-        let ai_domains = vec![
-            // OpenAI
-            "api.openai.com",
-            "chat.openai.com",
-            "ws.chat.openai.com",
-            "myinstance.openai.azure.com",
-            // Anthropic
-            "api.anthropic.com",
-            // Google
-            "gemini.google.com",
-            "generativelanguage.googleapis.com",
-            "aiplatform.googleapis.com",
-            "us-central1-aiplatform.googleapis.com",
-            // AWS Bedrock
-            "bedrock.us-east-1.amazonaws.com",
-            "bedrock-runtime.us-west-2.amazonaws.com",
-            // Amazon Q / CodeWhisperer
-            "codewhisperer.us-east-1.amazonaws.com",
-            // GitHub Copilot
-            "api.githubcopilot.com",
-            "enterprise.githubcopilot.com",
-            // Cursor / Windsurf / Zed / Junie
-            "api2.cursor.sh",
-            "server.codeium.com",
-            "cloud.zed.dev",
-            "api.jetbrains.ai",
-            // Mistral
-            "api.mistral.ai",
-            // Cohere
-            "api.cohere.ai",
-            // xAI
-            "api.x.ai",
-            // Groq
-            "api.groq.com",
-            // Together
-            "api.together.xyz",
-            // Perplexity
-            "api.perplexity.ai",
-            // Replicate
-            "api.replicate.com",
-            // Hugging Face
-            "api-inference.huggingface.co",
-            // Fireworks
-            "api.fireworks.ai",
-            // OpenRouter
-            "openrouter.ai",
-        ];
-
-        for domain in ai_domains {
-            assert!(
-                filter.should_intercept(domain),
-                "Expected {domain} to be intercepted"
-            );
-        }
-
-        // Non-AI domains should NOT be intercepted (tunneled instead)
-        let non_ai_domains = vec![
-            "google.com",
-            "example.org",
-            "stackoverflow.com",
-            "example.com",
-        ];
-
-        for domain in non_ai_domains {
-            assert!(
-                !filter.should_intercept(domain),
-                "Expected {domain} to NOT be intercepted"
-            );
-        }
-    }
-
-    #[test]
-    fn test_default_mcp_domain_seed_coverage() {
-        let mcp_hosts = default_mcp_service_hosts();
-        assert!(
-            mcp_hosts.len() >= 100,
-            "Expected >=100 MCP service hosts, got {}",
-            mcp_hosts.len()
-        );
-        assert!(
-            mcp_hosts.contains(&"api.github.com".to_string()),
-            "api.github.com should be in MCP seed list"
-        );
-        assert!(
-            mcp_hosts.contains(&"api.slack.com".to_string()),
-            "api.slack.com should be in MCP seed list"
-        );
-        assert!(
-            mcp_hosts.contains(&"api.notion.com".to_string()),
-            "api.notion.com should be in MCP seed list"
-        );
-    }
-
-    #[test]
-    fn test_default_agent_app_domain_seed_coverage() {
-        let agent_hosts = default_agent_app_hosts();
-        assert!(
-            agent_hosts.contains(&"chatgpt.com".to_string()),
-            "chatgpt.com should be in agent app seed list"
-        );
-        assert!(
-            agent_hosts.contains(&"claude.ai".to_string()),
-            "claude.ai should be in agent app seed list"
-        );
-        assert!(
-            agent_hosts.contains(&"gemini.google.com".to_string()),
-            "gemini.google.com should be in agent app seed list"
-        );
-    }
-
-    #[test]
-    fn test_separate_ai_and_mcp_whitelists() {
-        let filter = HostFilterConfig {
-            mode: HostFilterMode::Selective,
-            ai_inference: vec!["api.openai.com".to_string()],
-            mcp: vec!["api.github.com".to_string()],
-            agent_apps: vec!["chatgpt.com".to_string()],
-            domain_files: HostDomainFilesConfig::default(),
-            block: vec![],
-        };
-
-        assert!(filter.should_check_ai_inference("api.openai.com"));
-        assert!(!filter.should_check_mcp("api.openai.com"));
-        assert!(!filter.should_check_agent_app("api.openai.com"));
-
-        assert!(filter.should_check_mcp("api.github.com"));
-        assert!(!filter.should_check_ai_inference("api.github.com"));
-
-        assert!(filter.should_check_agent_app("chatgpt.com"));
-        assert!(!filter.should_check_mcp("chatgpt.com"));
-    }
-
-    #[test]
-    fn test_host_filter_intercepts_agent_app_hosts() {
-        let filter = HostFilterConfig {
-            mode: HostFilterMode::Selective,
-            ai_inference: vec![],
-            mcp: vec![],
-            agent_apps: vec!["chatgpt.com".to_string()],
-            domain_files: HostDomainFilesConfig::default(),
-            block: vec![],
-        };
-
-        assert!(filter.should_intercept("chatgpt.com"));
-        assert!(!filter.should_intercept("api.openai.com"));
-    }
-
-    #[test]
-    fn test_agent_app_class_excludes_claude_api_host() {
-        let filter = HostFilterConfig::default();
-        assert!(!filter.should_check_agent_app("api.claude.ai"));
-        assert!(filter.should_check_agent_app("claude.ai"));
+        assert!(filter.is_blocked("api-inference.huggingface.co"));
+        assert!(filter.is_blocked("datasets.huggingface.co"));
     }
 
     #[test]
@@ -2720,7 +2476,7 @@ crypto_identity:
     fn test_default_host_filter_intercepts_known_claude_mcp_hosts() {
         let filter = HostFilterConfig::default();
 
-        // Claude/Anthropic app transport domains are included in default host lists.
+        // Discovery mode intercepts known non-local domains too.
         assert_eq!(
             filter.action_for_host("a-api.anthropic.com"),
             HostAction::Intercept
@@ -2735,20 +2491,16 @@ crypto_identity:
     fn test_host_filter_catch_all_pattern_intercepts_non_local_hosts() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            ai_inference: vec!["*".to_string()],
-            mcp: vec![],
-            agent_apps: vec![],
-            domain_files: HostDomainFilesConfig::default(),
-            block: vec![],
+            block: vec!["*".to_string()],
         };
 
         assert_eq!(
             filter.action_for_host("custom-mcp.example.com"),
-            HostAction::Intercept
+            HostAction::Block
         );
         assert_eq!(
             filter.action_for_host("unlisted.vendor.tld"),
-            HostAction::Intercept
+            HostAction::Block
         );
 
         // Local addresses still bypass interception.
@@ -2760,10 +2512,6 @@ crypto_identity:
     fn test_host_filter_discovery_mode_intercepts_unknown_non_local_hosts() {
         let filter = HostFilterConfig {
             mode: HostFilterMode::Discovery,
-            ai_inference: vec![],
-            mcp: vec![],
-            agent_apps: vec![],
-            domain_files: HostDomainFilesConfig::default(),
             block: vec!["malware.com".to_string()],
         };
 
@@ -2784,10 +2532,6 @@ crypto_identity:
         use super::HostAction;
         let filter = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            ai_inference: vec!["api.openai.com".to_string()],
-            mcp: vec![],
-            agent_apps: vec![],
-            domain_files: HostDomainFilesConfig::default(),
             block: vec!["malware.com".to_string(), "*.bad.com".to_string()],
         };
 
@@ -2796,10 +2540,7 @@ crypto_identity:
             filter.action_for_host("anything.bad.com"),
             HostAction::Block
         );
-        assert_eq!(
-            filter.action_for_host("api.openai.com"),
-            HostAction::Intercept
-        );
+        assert_eq!(filter.action_for_host("api.openai.com"), HostAction::Tunnel);
         assert_eq!(filter.action_for_host("google.com"), HostAction::Tunnel);
     }
 
@@ -2813,10 +2554,6 @@ forward_proxy:
   address: "0.0.0.0"
   hosts:
     mode: selective
-    ai_inference:
-      - "api.openai.com"
-      - "api.anthropic.com"
-      - "*.openai.azure.com"
     block:
       - "malware.com"
 "#;
@@ -2824,26 +2561,6 @@ forward_proxy:
         assert!(config.forward_proxy.enabled);
         assert_eq!(config.forward_proxy.port, 9090);
         assert_eq!(config.forward_proxy.address, "0.0.0.0");
-
-        // AI domains intercepted
-        assert_eq!(
-            config.forward_proxy.hosts.action_for_host("api.openai.com"),
-            HostAction::Intercept
-        );
-        assert_eq!(
-            config
-                .forward_proxy
-                .hosts
-                .action_for_host("api.anthropic.com"),
-            HostAction::Intercept
-        );
-        assert_eq!(
-            config
-                .forward_proxy
-                .hosts
-                .action_for_host("foo.openai.azure.com"),
-            HostAction::Intercept
-        );
 
         // Blocked domains blocked
         assert_eq!(
@@ -2866,22 +2583,7 @@ forward_proxy:
   registry_mode: registry
 "#;
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
-    }
-
-    #[test]
-    fn test_parse_forward_proxy_registry_mode_legacy_aliases_yaml() {
-        for mode in ["legacy", "shadow"] {
-            let yaml = format!(
-                r#"
-forward_proxy:
-  enabled: true
-  registry_mode: {mode}
-"#
-            );
-            let config: SothConfig = serde_yaml::from_str(&yaml).unwrap();
-            assert_eq!(config.forward_proxy.registry_mode, RegistryMode::Registry);
-        }
+        assert_eq!(config.forward_proxy.registry_mode, RegistryMode::BundleOnly);
     }
 
     #[test]
@@ -2941,7 +2643,7 @@ forward_proxy:
     }
 
     #[test]
-    fn test_parse_forward_proxy_yaml_ai_inference_only() {
+    fn test_parse_forward_proxy_yaml_legacy_host_lists_are_ignored() {
         use super::HostAction;
         let yaml = r#"
 forward_proxy:
@@ -2952,47 +2654,24 @@ forward_proxy:
     ai_inference:
       - "api.openai.com"
       - "custom.api.com"
-"#;
-        let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
-
-        // Allowed hosts intercepted
-        assert_eq!(
-            config.forward_proxy.hosts.action_for_host("api.openai.com"),
-            HostAction::Intercept
-        );
-        assert_eq!(
-            config.forward_proxy.hosts.action_for_host("custom.api.com"),
-            HostAction::Intercept
-        );
-
-        // Other hosts tunneled by default
-        assert_eq!(
-            config.forward_proxy.hosts.action_for_host("other.com"),
-            HostAction::Tunnel
-        );
-    }
-
-    #[test]
-    fn test_parse_forward_proxy_yaml_agent_apps_only() {
-        use super::HostAction;
-        let yaml = r#"
-forward_proxy:
-  enabled: true
-  hosts:
-    mode: selective
-    ai_inference: []
-    mcp: []
+    mcp:
+      - "api.github.com"
     agent_apps:
       - "chatgpt.com"
 "#;
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
 
-        assert_eq!(
-            config.forward_proxy.hosts.action_for_host("chatgpt.com"),
-            HostAction::Intercept
-        );
+        // Legacy host lists are ignored in bundle-only interception.
         assert_eq!(
             config.forward_proxy.hosts.action_for_host("api.openai.com"),
+            HostAction::Tunnel
+        );
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("chatgpt.com"),
+            HostAction::Tunnel
+        );
+        assert_eq!(
+            config.forward_proxy.hosts.action_for_host("api.github.com"),
             HostAction::Tunnel
         );
     }
@@ -3247,10 +2926,6 @@ forward_proxy:
         // Even if localhost is in the block list, it should still tunnel
         let filter_with_block = HostFilterConfig {
             mode: HostFilterMode::Selective,
-            ai_inference: vec![],
-            mcp: vec![],
-            agent_apps: vec![],
-            domain_files: HostDomainFilesConfig::default(),
             block: vec!["localhost".to_string(), "127.0.0.1".to_string()],
         };
 
