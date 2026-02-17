@@ -1,5 +1,7 @@
 use super::*;
-use crate::transport::proxy_detection::{should_log_request, should_treat_anthropic_api_as_agent};
+use crate::transport::proxy_detection::{
+    detect_agent_from_user_agent, should_log_request, should_treat_anthropic_api_as_agent,
+};
 use crate::transport::proxy_support::{DiscoveryKind, DiscoveryReserveResult};
 use flate2::{write::GzEncoder, Compression};
 use hudsucker::hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoServerBuilder};

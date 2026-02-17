@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
 use crate::transport::pii_enrichment::PiiEventEnricher;
+use crate::transport::proxy_detection::resolve_bundle_detection;
 use crate::transport::proxy_support::{
     append_catalog_discovery_tags, append_process_attribution_tags,
 };
@@ -105,13 +105,22 @@ impl WebSocketHandler for AiWebSocketHandler {
             };
 
         let is_agent_app = host_is_agent_target;
-        let detected_ws_agent = host_fingerprint::detect_agent_with_context_gated(
-            None,
+        let bundle_detection = resolve_bundle_detection(
+            oisp_engine.as_ref(),
+            if provider == "unknown" {
+                None
+            } else {
+                Some(provider.as_str())
+            },
             &host,
             &ws_path,
             None,
-            host_is_agent_target || is_discovery,
+            None,
+            None,
+            None,
+            None,
         );
+        let detected_ws_agent = bundle_detection.agent.clone();
 
         async move {
             match &msg {
@@ -164,7 +173,9 @@ impl WebSocketHandler for AiWebSocketHandler {
                             host = %host,
                             path = %ws_path,
                             provider = %provider_for_event,
-                            agent = detected_ws_agent.unwrap_or(provider_for_event.as_str()),
+                            agent = %detected_ws_agent
+                                .as_deref()
+                                .unwrap_or(provider_for_event.as_str()),
                             len = text.len(),
                             "WebSocket text message"
                         );
@@ -172,16 +183,18 @@ impl WebSocketHandler for AiWebSocketHandler {
                         // Log WebSocket message for observability.
                         if let Some(ref logger) = event_logger {
                             let resolved_agent =
-                                detected_ws_agent.unwrap_or_else(|| match source {
-                                    EventSource::Mcp => "mcp",
-                                    EventSource::AiProxy | EventSource::AgentApp => {
-                                        if provider_for_event == "unknown" {
-                                            "websocket"
-                                        } else {
-                                            provider_for_event.as_str()
+                                detected_ws_agent
+                                    .as_deref()
+                                    .unwrap_or_else(|| match source {
+                                        EventSource::Mcp => "mcp",
+                                        EventSource::AiProxy | EventSource::AgentApp => {
+                                            if provider_for_event == "unknown" {
+                                                "websocket"
+                                            } else {
+                                                provider_for_event.as_str()
+                                            }
                                         }
-                                    }
-                                });
+                                    });
                             let agent_info =
                                 AgentInfo::new(resolved_agent, DetectionSource::Environment);
 

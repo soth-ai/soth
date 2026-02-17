@@ -7,10 +7,8 @@ use crate::cli_config;
 use crate::ConfigCommands;
 use crate::ConfigRegistryCommands;
 use anyhow::{Context, Result};
-#[cfg(feature = "cloud-sync")]
 use serde_json::Value;
 use soth_core::config::{HostFilterMode, SothConfig};
-#[cfg(feature = "cloud-sync")]
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
@@ -398,7 +396,6 @@ async fn generate_example(output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cloud-sync")]
 async fn show_registry_status(global_config: Option<PathBuf>) -> Result<()> {
     use soth_sync::cache;
 
@@ -475,13 +472,6 @@ async fn show_registry_status(global_config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "cloud-sync"))]
-async fn show_registry_status(_global_config: Option<PathBuf>) -> Result<()> {
-    println!("Registry status is unavailable: soth-cli built without cloud-sync feature.");
-    Ok(())
-}
-
-#[cfg(feature = "cloud-sync")]
 fn bundle_array_len(root: &Value, path: &[&str]) -> usize {
     let mut cursor = root;
     for key in path {
@@ -493,7 +483,6 @@ fn bundle_array_len(root: &Value, path: &[&str]) -> usize {
     cursor.as_array().map(|arr| arr.len()).unwrap_or(0)
 }
 
-#[cfg(feature = "cloud-sync")]
 fn resolve_config_cache_path(config: &SothConfig) -> PathBuf {
     if let Some(path) = config.cloud.cache_path.as_ref() {
         return path.clone();
@@ -501,7 +490,6 @@ fn resolve_config_cache_path(config: &SothConfig) -> PathBuf {
     soth_sync::cache::default_cache_path()
 }
 
-#[cfg(feature = "cloud-sync")]
 fn resolve_registry_cache_path(config: &SothConfig, config_cache_path: &Path) -> PathBuf {
     if config.cloud.cache_path.is_some() {
         if let Some(parent) = config_cache_path.parent() {

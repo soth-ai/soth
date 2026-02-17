@@ -10,8 +10,6 @@ name = "soth"
 path = "src/main.rs"
 
 [features]
-default = ["cloud-sync"]
-cloud-sync = ["dep:soth-sync"]
 monitoring = ["soth-proxy/monitoring"]
 local-debug = [
     "dep:soth-dashboard",
@@ -30,7 +28,7 @@ soth-collector = { workspace = true }
 soth-proxy = { workspace = true }
 soth-dashboard = { workspace = true, optional = true }
 soth-oisp = { workspace = true }
-soth-sync = { workspace = true, optional = true }
+soth-sync = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

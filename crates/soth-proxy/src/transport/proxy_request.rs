@@ -4,7 +4,7 @@ use hudsucker::{hyper::Request, Body};
 use soth_core::config::{HostAction, HostFilterMode};
 use soth_oisp::OispEngine;
 
-use crate::transport::proxy_detection::{should_log_request, should_treat_anthropic_api_as_agent};
+use crate::transport::proxy_detection::is_noise_intercept_decision;
 use crate::transport::proxy_payload::parse_content_length;
 use crate::transport::proxy_support::{CatalogDiscoveryLimiter, DiscoveryKind};
 
@@ -19,11 +19,9 @@ pub(crate) struct HostTargetInfo {
 }
 
 pub(crate) fn resolve_host_target_info(
-    req: &Request<Body>,
     host_action: HostAction,
     host_mode: HostFilterMode,
     host: &str,
-    is_connect: bool,
     oisp_engine: &OispEngine,
     catalog_discovery_limiter: &CatalogDiscoveryLimiter,
 ) -> HostTargetInfo {
@@ -38,7 +36,7 @@ pub(crate) fn resolve_host_target_info(
         && oisp_classification.is_none()
         && oisp_engine.is_catalog_domain(host)
         && catalog_discovery_limiter.was_reserved_today(DiscoveryKind::Catalog, host);
-    let (mut host_is_ai_target, host_is_mcp_target, mut host_is_agent_target, provider) =
+    let (host_is_ai_target, host_is_mcp_target, host_is_agent_target, provider) =
         if let Some(classification) = oisp_classification.as_ref() {
             let (ai, mcp, agent) = match classification.entry_type_label() {
                 "ai_inference" => (true, false, false),
@@ -52,13 +50,6 @@ pub(crate) fn resolve_host_target_info(
         } else {
             (false, false, false, None)
         };
-    let anthropic_agent_override = should_capture_observability
-        && !is_connect
-        && should_treat_anthropic_api_as_agent(host, req);
-    if anthropic_agent_override {
-        host_is_ai_target = false;
-        host_is_agent_target = true;
-    }
 
     HostTargetInfo {
         should_capture_observability,
@@ -85,14 +76,17 @@ pub(crate) struct RequestBodyInspectionPlan {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_request_body_inspection_plan(
     req: &Request<Body>,
-    path: &str,
-    http_method: &str,
+    _path: &str,
+    _http_method: &str,
     host_mode: HostFilterMode,
     should_capture_observability: bool,
     host_is_ai_target: bool,
     host_is_mcp_target: bool,
     host_is_agent_target: bool,
     is_catalog_discovery_host: bool,
+    host: &str,
+    path_for_filter: &str,
+    oisp_engine: &OispEngine,
     capture_max_body_bytes: u64,
 ) -> RequestBodyInspectionPlan {
     let is_post = req.method() == hyper::Method::POST;
@@ -114,7 +108,8 @@ pub(crate) fn build_request_body_inspection_plan(
     let request_capture_oversized = declared_request_size_bytes
         .map(|size| size > capture_max_body_bytes)
         .unwrap_or(false);
-    let should_log_inference_request = should_log_request(path, http_method);
+    let should_log_inference_request =
+        !is_noise_intercept_decision(oisp_engine.should_intercept(host, path_for_filter));
     let should_inspect_body = is_post
         && should_capture_observability
         && (host_is_mcp_target

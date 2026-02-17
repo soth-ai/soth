@@ -173,6 +173,17 @@ fn explicit_detection_metadata(agent: &AgentInfo) -> WrapDetectionMetadata {
     }
 }
 
+fn initialize_detection_metadata() -> WrapDetectionMetadata {
+    WrapDetectionMetadata {
+        detection_reason: Some("mcp_initialize".to_string()),
+        parse_confidence: Some(detection_confidence_from_source(
+            DetectionSource::McpInitialize,
+        )),
+        target_entity_id: None,
+        detection_source: Some("mcp_initialize".to_string()),
+    }
+}
+
 fn bundle_unknown_detection_metadata() -> WrapDetectionMetadata {
     WrapDetectionMetadata {
         detection_reason: Some("bundle_unclassified".to_string()),
@@ -285,6 +296,30 @@ fn evaluate_bundle_detection(
             target_entity_id: scoped.outcome.target_entity_id,
             detection_source: Some("bundle".to_string()),
         },
+    })
+}
+
+fn evaluate_initialize_detection(params: &serde_json::Value) -> Option<WrapDetectionResolution> {
+    let client_info = params.get("clientInfo")?;
+    let raw_name = client_info.get("name")?.as_str()?.trim();
+    if raw_name.is_empty() {
+        return None;
+    }
+
+    let normalized = agent_detect::canonicalize_agent_name(raw_name);
+    let mut agent = AgentInfo::new(normalized, DetectionSource::McpInitialize);
+    if let Some(version) = client_info
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        agent = agent.with_version(version);
+    }
+
+    Some(WrapDetectionResolution {
+        agent,
+        metadata: initialize_detection_metadata(),
     })
 }
 
@@ -939,19 +974,15 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
             // Handle initialize message - extract agent info
             if method == "initialize" {
                 if let Some(params) = msg.get("params") {
-                    if let Some(engine) = session.oisp_engine.as_ref() {
-                        if let Some(resolution) = evaluate_bundle_detection(
-                            engine,
-                            Some(params),
-                            session.env_keys.as_ref(),
-                        ) {
-                            session.update_agent(resolution.agent).await;
-                            session.update_detection_metadata(resolution.metadata).await;
-                        } else {
-                            session
-                                .update_detection_metadata(bundle_unknown_detection_metadata())
-                                .await;
-                        }
+                    let bundle_resolution = session.oisp_engine.as_ref().and_then(|engine| {
+                        evaluate_bundle_detection(engine, Some(params), session.env_keys.as_ref())
+                    });
+                    let resolution =
+                        bundle_resolution.or_else(|| evaluate_initialize_detection(params));
+
+                    if let Some(resolution) = resolution {
+                        session.update_agent(resolution.agent).await;
+                        session.update_detection_metadata(resolution.metadata).await;
                     } else {
                         session
                             .update_detection_metadata(bundle_unknown_detection_metadata())
@@ -1414,5 +1445,32 @@ mod tests {
         let candidate =
             AgentInfo::new("Claude Code", DetectionSource::McpInitialize).with_version("1.2.3");
         assert!(should_promote_agent(&current, &candidate));
+    }
+
+    #[test]
+    fn test_evaluate_initialize_detection_extracts_client_info() {
+        let params = json!({
+            "clientInfo": {
+                "name": "openai-codex",
+                "version": "0.40.0"
+            }
+        });
+        let resolution = evaluate_initialize_detection(&params).expect("expected init detection");
+        assert_eq!(resolution.agent.name, "Codex");
+        assert_eq!(resolution.agent.version.as_deref(), Some("0.40.0"));
+        assert_eq!(
+            resolution.metadata.detection_reason.as_deref(),
+            Some("mcp_initialize")
+        );
+    }
+
+    #[test]
+    fn test_evaluate_initialize_detection_requires_client_name() {
+        let params = json!({
+            "clientInfo": {
+                "version": "1.0.0"
+            }
+        });
+        assert!(evaluate_initialize_detection(&params).is_none());
     }
 }

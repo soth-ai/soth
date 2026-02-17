@@ -40,10 +40,7 @@ use crate::transport::mcp_detection::is_jsonrpc_response_for_mcp;
 use crate::transport::pii_enrichment::PiiEventEnricher;
 #[cfg(test)]
 use crate::transport::proxy_detection::has_anthropic_api_key_header;
-use crate::transport::proxy_detection::{
-    detect_agent_from_process_name, detect_agent_from_user_agent, extract_host,
-    resolve_bundle_detection,
-};
+use crate::transport::proxy_detection::{extract_host, resolve_bundle_detection};
 pub use crate::transport::proxy_enforcer::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
 use crate::transport::proxy_error::handle_forward_error;
 use crate::transport::proxy_exchange::{
@@ -380,11 +377,9 @@ impl HttpHandler for AiProxyHandler {
         let host_mode = self.hosts.mode;
         let catalog_discovery_limiter = self.catalog_discovery_limiter.clone();
         let host_target_info = resolve_host_target_info(
-            &req,
             host_action,
             host_mode,
             &host,
-            is_connect,
             self.oisp_engine.as_ref(),
             &catalog_discovery_limiter,
         );
@@ -399,7 +394,6 @@ impl HttpHandler for AiProxyHandler {
             .get("user-agent")
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
-        let ua_agent = detect_agent_from_user_agent(&req);
         let enforcer = self.enforcer.clone();
         let session_id = self.session_id.clone();
         let did_header = enforcer.as_ref().map(|e| e.did_header().to_string());
@@ -425,6 +419,9 @@ impl HttpHandler for AiProxyHandler {
             host_is_mcp_target,
             host_is_agent_target,
             is_catalog_discovery_host,
+            &host,
+            &path_for_filter,
+            self.oisp_engine.as_ref(),
             self.capture_max_body_bytes,
         );
         let is_post = request_plan.is_post;
@@ -611,7 +608,6 @@ impl HttpHandler for AiProxyHandler {
                         decision = %decision_label,
                         client_addr = %client_addr,
                         provider_hint = ?provider,
-                        agent_hint = ?ua_agent,
                         process_pid = ?process_pid,
                         process_name = %process_name.unwrap_or("-"),
                         process_app_type = %process_identity
@@ -634,10 +630,6 @@ impl HttpHandler for AiProxyHandler {
             let process_bundle_id = process_identity
                 .as_ref()
                 .and_then(|value| process_bundle_id_from_executable(value.executable.as_deref()));
-            let process_agent = process_identity
-                .as_ref()
-                .and_then(|value| detect_agent_from_process_name(&value.name))
-                .map(ToString::to_string);
             let bundle_detection = resolve_bundle_detection(
                 oisp_engine.as_ref(),
                 provider.as_deref(),
@@ -647,7 +639,7 @@ impl HttpHandler for AiProxyHandler {
                 model.as_deref(),
                 process_identity.as_ref().map(|value| value.name.as_str()),
                 process_bundle_id.as_deref(),
-                process_agent.as_deref(),
+                None,
             );
             let agent = bundle_detection.agent.clone();
             let detection_reason = bundle_detection.detection_reason.clone();

@@ -2,7 +2,7 @@
 
 use hudsucker::hyper::Request;
 use soth_oisp::types::provider::EntryType;
-use soth_oisp::{DetectionContext, OispEngine};
+use soth_oisp::{DetectionContext, InterceptDecision, OispEngine};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BundleDetectionResult {
@@ -32,7 +32,12 @@ pub(crate) fn extract_host<T>(req: &Request<T>) -> String {
         .unwrap_or_default()
 }
 
+pub(crate) fn is_noise_intercept_decision(decision: InterceptDecision) -> bool {
+    matches!(decision, InterceptDecision::Noise)
+}
+
 /// Detect agent/client from User-Agent header.
+#[cfg(test)]
 pub(crate) fn detect_agent_from_user_agent<T>(req: &Request<T>) -> Option<&'static str> {
     let ua = req
         .headers()
@@ -79,6 +84,7 @@ pub(crate) fn detect_agent_from_user_agent<T>(req: &Request<T>) -> Option<&'stat
     }
 }
 
+#[cfg(test)]
 pub(crate) fn is_anthropic_api_host(host: &str) -> bool {
     let normalized = host.trim().to_ascii_lowercase();
     normalized == "api.anthropic.com"
@@ -87,6 +93,7 @@ pub(crate) fn is_anthropic_api_host(host: &str) -> bool {
         || normalized.ends_with(".api.claude.ai")
 }
 
+#[cfg(test)]
 pub(crate) fn has_anthropic_api_key_header<T>(req: &Request<T>) -> bool {
     if req.headers().contains_key("x-api-key") {
         return true;
@@ -101,39 +108,14 @@ pub(crate) fn has_anthropic_api_key_header<T>(req: &Request<T>) -> bool {
 
 /// Anthropic API hosts can represent either direct inference traffic
 /// (API key present) or agent-orchestrated traffic (no API key).
+#[cfg(test)]
 pub(crate) fn should_treat_anthropic_api_as_agent<T>(host: &str, req: &Request<T>) -> bool {
     is_anthropic_api_host(host) && !has_anthropic_api_key_header(req)
 }
 
-/// Best-effort local process-name heuristic for discovery-mode agent labeling.
-pub(crate) fn detect_agent_from_process_name(process_name: &str) -> Option<&'static str> {
-    let lower = process_name.to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-    if lower.contains("warp") {
-        Some("warp")
-    } else if lower.contains("openai-codex") || lower.contains("codex") {
-        Some("codex")
-    } else if lower.contains("claude-code") || lower.contains("claude code") {
-        Some("claude-code")
-    } else if lower.contains("claude") {
-        Some("claude")
-    } else if lower.contains("cursor") {
-        Some("cursor")
-    } else if lower.contains("windsurf") || lower.contains("codeium") {
-        Some("windsurf")
-    } else if lower.contains("copilot") {
-        Some("github-copilot")
-    } else if lower.contains("chatgpt") || lower.contains("openai") {
-        Some("chatgpt")
-    } else {
-        None
-    }
-}
-
 /// Check if a request should be logged for observability.
 /// Uses blacklist approach: include everything EXCEPT obvious non-inference content.
+#[cfg(test)]
 pub(crate) fn should_log_request(path: &str, method: &str) -> bool {
     // CONNECT is transport setup, not an application request.
     if method.eq_ignore_ascii_case("CONNECT") {

@@ -2,6 +2,7 @@
 
 pub mod exchange_assembler;
 pub mod graphql_enrichment;
+#[cfg(test)]
 pub mod host_fingerprint;
 pub mod mcp_detection;
 pub mod pii_enrichment;
