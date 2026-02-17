@@ -209,6 +209,17 @@ pub fn spawn_cloud_pull_runtime(
                 .cloud
                 .metadata_max_compressed_batch_bytes
                 .max(1) as usize,
+            frontload_enabled: config.cloud.frontload_enabled,
+            frontload_max_events_per_batch: config.cloud.frontload_max_events_per_batch.max(1),
+            frontload_max_compressed_batch_bytes: config
+                .cloud
+                .frontload_max_compressed_batch_bytes
+                .max(1) as usize,
+            frontload_hard_events_cap: config.cloud.frontload_hard_events_cap.max(1),
+            frontload_hard_compressed_cap_bytes: config
+                .cloud
+                .frontload_hard_compressed_cap_bytes
+                .max(1) as usize,
             body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
             global_tags: config.cloud.tags.clone(),
             heartbeat_telemetry: Some(std::sync::Arc::new(|| {

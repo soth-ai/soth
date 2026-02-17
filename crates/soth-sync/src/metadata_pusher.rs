@@ -6,6 +6,12 @@ use soth_core::api::{
 };
 use std::io::Write;
 
+#[derive(Debug, Clone)]
+pub enum ExchangePushResult {
+    Success(ExchangeBatchResponse),
+    NonSuccessStatus(reqwest::StatusCode),
+}
+
 #[derive(Clone)]
 pub struct MetadataPusher {
     endpoint: String,
@@ -26,7 +32,7 @@ impl MetadataPusher {
     pub async fn push_exchange_batch(
         &self,
         request: &ExchangeBatchRequest,
-    ) -> anyhow::Result<Option<ExchangeBatchResponse>> {
+    ) -> anyhow::Result<ExchangePushResult> {
         let url = format!("{}/api/v1/exchanges/batch", self.endpoint);
         let request_json =
             serde_json::to_vec(request).context("failed encoding exchange push request")?;
@@ -50,9 +56,9 @@ impl MetadataPusher {
                 .json::<ExchangeBatchResponse>()
                 .await
                 .context("failed decoding exchange batch response")?;
-            return Ok(Some(decoded));
+            return Ok(ExchangePushResult::Success(decoded));
         }
-        Ok(None)
+        Ok(ExchangePushResult::NonSuccessStatus(gzip_response.status()))
     }
 }
 

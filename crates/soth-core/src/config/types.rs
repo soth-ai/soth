@@ -697,14 +697,29 @@ impl Default for ObserveConfig {
 }
 
 /// Local collector settings for ingesting agent session files incrementally.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObserveCollectorConfig {
     /// Enable local collector runtime.
     #[serde(default)]
     pub enabled: bool,
+    /// Auto-discover known local agent transcript files when no sources are configured.
+    #[serde(default = "default_true")]
+    pub auto_discover_sources: bool,
     /// File sources (JSONL/text) for incremental tailing.
     #[serde(default)]
     pub sources: Vec<ObserveCollectorSourceConfig>,
+    /// SQLite sources for incremental cursor-based collection.
+    #[serde(default)]
+    pub sqlite_sources: Vec<ObserveCollectorSqliteSourceConfig>,
+    /// Run a one-time high-throughput frontload pass on startup.
+    #[serde(default = "default_true")]
+    pub frontload_on_start: bool,
+    /// Maximum frontload cycles during startup.
+    #[serde(default)]
+    pub frontload_max_cycles: Option<u32>,
+    /// Maximum bytes read per source during frontload cycles.
+    #[serde(default)]
+    pub frontload_max_read_bytes_per_source: Option<usize>,
     /// Poll interval in seconds.
     #[serde(default)]
     pub poll_interval_secs: Option<u64>,
@@ -725,6 +740,26 @@ pub struct ObserveCollectorConfig {
     pub event_source: Option<String>,
 }
 
+impl Default for ObserveCollectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_discover_sources: true,
+            sources: Vec::new(),
+            sqlite_sources: Vec::new(),
+            frontload_on_start: true,
+            frontload_max_cycles: None,
+            frontload_max_read_bytes_per_source: None,
+            poll_interval_secs: None,
+            max_read_bytes_per_source: None,
+            max_line_bytes: None,
+            state_path: None,
+            agent_name: None,
+            event_source: None,
+        }
+    }
+}
+
 /// Per-file local collector source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObserveCollectorSourceConfig {
@@ -736,6 +771,42 @@ pub struct ObserveCollectorSourceConfig {
     /// Parser type: jsonl/ndjson/text.
     #[serde(default)]
     pub parser: Option<String>,
+}
+
+/// Per-database local collector source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveCollectorSqliteSourceConfig {
+    /// Logical source name.
+    pub name: String,
+    /// SQLite database path.
+    pub db_path: PathBuf,
+    /// Optional logical server name for emitted events.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// Optional provider override.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Optional model override.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional source-level tags.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    /// Query set to run against the database.
+    #[serde(default)]
+    pub queries: Vec<ObserveCollectorSqliteQueryConfig>,
+}
+
+/// Query definition for SQLite collector sources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveCollectorSqliteQueryConfig {
+    /// Logical file type bucket for this query.
+    pub file_type: String,
+    /// SQL query text.
+    pub sql: String,
+    /// Optional incremental field used as cursor.
+    #[serde(default)]
+    pub incremental_field: Option<String>,
 }
 
 /// Source scopes for PII detection.
@@ -960,6 +1031,26 @@ pub struct CloudConfig {
     #[serde(default = "default_cloud_metadata_max_compressed_batch_bytes")]
     pub metadata_max_compressed_batch_bytes: u64,
 
+    /// Enable frontload-specific batching overrides for collector backfill.
+    #[serde(default = "default_true")]
+    pub frontload_enabled: bool,
+
+    /// Maximum metadata events per batch during collector frontload.
+    #[serde(default = "default_cloud_frontload_max_events_per_batch")]
+    pub frontload_max_events_per_batch: usize,
+
+    /// Maximum compressed metadata batch size in bytes during frontload.
+    #[serde(default = "default_cloud_frontload_max_compressed_batch_bytes")]
+    pub frontload_max_compressed_batch_bytes: u64,
+
+    /// Absolute hard cap for frontload event batch count.
+    #[serde(default = "default_cloud_frontload_hard_events_cap")]
+    pub frontload_hard_events_cap: usize,
+
+    /// Absolute hard cap for frontload compressed payload size.
+    #[serde(default = "default_cloud_frontload_hard_compressed_cap_bytes")]
+    pub frontload_hard_compressed_cap_bytes: u64,
+
     /// Maximum request/response body size eligible for cloud body upload.
     #[serde(default = "default_cloud_body_upload_max_bytes")]
     pub body_upload_max_bytes: u64,
@@ -997,6 +1088,22 @@ fn default_cloud_metadata_max_compressed_batch_bytes() -> u64 {
     5 * 1024 * 1024
 }
 
+fn default_cloud_frontload_max_events_per_batch() -> usize {
+    1500
+}
+
+fn default_cloud_frontload_max_compressed_batch_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_cloud_frontload_hard_events_cap() -> usize {
+    5000
+}
+
+fn default_cloud_frontload_hard_compressed_cap_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
 fn default_cloud_body_upload_max_bytes() -> u64 {
     15 * 1024 * 1024
 }
@@ -1014,6 +1121,13 @@ impl Default for CloudConfig {
             body_upload_enabled: true,
             metadata_max_events_per_batch: default_cloud_metadata_max_events_per_batch(),
             metadata_max_compressed_batch_bytes: default_cloud_metadata_max_compressed_batch_bytes(
+            ),
+            frontload_enabled: true,
+            frontload_max_events_per_batch: default_cloud_frontload_max_events_per_batch(),
+            frontload_max_compressed_batch_bytes:
+                default_cloud_frontload_max_compressed_batch_bytes(),
+            frontload_hard_events_cap: default_cloud_frontload_hard_events_cap(),
+            frontload_hard_compressed_cap_bytes: default_cloud_frontload_hard_compressed_cap_bytes(
             ),
             body_upload_max_bytes: default_cloud_body_upload_max_bytes(),
             cache_path: default_cloud_cache_path(),
@@ -2113,6 +2227,11 @@ cloud:
   body_upload_enabled: true
   metadata_max_events_per_batch: 120
   metadata_max_compressed_batch_bytes: 3145728
+  frontload_enabled: true
+  frontload_max_events_per_batch: 1800
+  frontload_max_compressed_batch_bytes: 8388608
+  frontload_hard_events_cap: 5000
+  frontload_hard_compressed_cap_bytes: 16777216
   body_upload_max_bytes: 10485760
   tags:
     project: "edge"
@@ -2128,6 +2247,17 @@ cloud:
         assert!(config.cloud.body_upload_enabled);
         assert_eq!(config.cloud.metadata_max_events_per_batch, 120);
         assert_eq!(config.cloud.metadata_max_compressed_batch_bytes, 3_145_728);
+        assert!(config.cloud.frontload_enabled);
+        assert_eq!(config.cloud.frontload_max_events_per_batch, 1800);
+        assert_eq!(
+            config.cloud.frontload_max_compressed_batch_bytes,
+            8 * 1024 * 1024
+        );
+        assert_eq!(config.cloud.frontload_hard_events_cap, 5000);
+        assert_eq!(
+            config.cloud.frontload_hard_compressed_cap_bytes,
+            16 * 1024 * 1024
+        );
         assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));
     }

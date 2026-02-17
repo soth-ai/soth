@@ -71,6 +71,17 @@ observe:
   event_tags:
     project: "local-dev"
     environment: "development"
+  collector:
+    enabled: true
+    auto_discover_sources: true
+    frontload_on_start: true
+    frontload_max_cycles: 24
+    frontload_max_read_bytes_per_source: 8388608
+    poll_interval_secs: 5
+    max_read_bytes_per_source: 524288
+    max_line_bytes: 65536
+    sources: []
+    sqlite_sources: []
   log_requests: true
   log_responses: true
   tamper_proof: true
@@ -114,6 +125,11 @@ cloud:
   body_upload_enabled: true
   metadata_max_events_per_batch: 200
   metadata_max_compressed_batch_bytes: 5242880
+  frontload_enabled: true
+  frontload_max_events_per_batch: 1500
+  frontload_max_compressed_batch_bytes: 8388608
+  frontload_hard_events_cap: 5000
+  frontload_hard_compressed_cap_bytes: 16777216
   body_upload_max_bytes: 15728640
   cache_path: "~/.soth/cloud_config_cache.json"
   tags: {}

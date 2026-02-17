@@ -159,6 +159,29 @@ fn apply_env_overrides(config: &mut SothConfig) {
             config.cloud.metadata_max_compressed_batch_bytes = parsed.max(1);
         }
     }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_ENABLED") {
+        config.cloud.frontload_enabled = value.parse().unwrap_or(config.cloud.frontload_enabled);
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_MAX_EVENTS_PER_BATCH") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            config.cloud.frontload_max_events_per_batch = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.cloud.frontload_max_compressed_batch_bytes = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            config.cloud.frontload_hard_events_cap = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.cloud.frontload_hard_compressed_cap_bytes = parsed.max(1);
+        }
+    }
     if let Ok(value) = std::env::var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES") {
         if let Ok(parsed) = value.parse::<u64>() {
             config.cloud.body_upload_max_bytes = parsed.max(1);
@@ -358,6 +381,11 @@ budget:
         std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED", "true");
         std::env::set_var("SOTH_CLOUD_METADATA_MAX_EVENTS_PER_BATCH", "150");
         std::env::set_var("SOTH_CLOUD_METADATA_MAX_COMPRESSED_BATCH_BYTES", "4194304");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_ENABLED", "true");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_MAX_EVENTS_PER_BATCH", "2400");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES", "8388608");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP", "5000");
+        std::env::set_var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES", "16777216");
         std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES", "10485760");
         std::env::set_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES", "7340032");
 
@@ -371,6 +399,17 @@ budget:
         assert!(config.cloud.body_upload_enabled);
         assert_eq!(config.cloud.metadata_max_events_per_batch, 150);
         assert_eq!(config.cloud.metadata_max_compressed_batch_bytes, 4_194_304);
+        assert!(config.cloud.frontload_enabled);
+        assert_eq!(config.cloud.frontload_max_events_per_batch, 2400);
+        assert_eq!(
+            config.cloud.frontload_max_compressed_batch_bytes,
+            8 * 1024 * 1024
+        );
+        assert_eq!(config.cloud.frontload_hard_events_cap, 5000);
+        assert_eq!(
+            config.cloud.frontload_hard_compressed_cap_bytes,
+            16 * 1024 * 1024
+        );
         assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.forward_proxy.capture_max_body_bytes, 7_340_032);
         assert_eq!(config.cloud.tags.get("project"), Some(&"soth".to_string()));
@@ -385,6 +424,11 @@ budget:
         std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_ENABLED");
         std::env::remove_var("SOTH_CLOUD_METADATA_MAX_EVENTS_PER_BATCH");
         std::env::remove_var("SOTH_CLOUD_METADATA_MAX_COMPRESSED_BATCH_BYTES");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_ENABLED");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_MAX_EVENTS_PER_BATCH");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES");
         std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES");
         std::env::remove_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES");
     }

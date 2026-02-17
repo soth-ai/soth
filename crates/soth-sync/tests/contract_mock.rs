@@ -105,6 +105,11 @@ async fn contract_sync_endpoints_and_cursors() {
         body_upload_enabled: true,
         metadata_max_events_per_batch: 200,
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
         heartbeat_telemetry: None,
@@ -162,7 +167,10 @@ async fn contract_sync_endpoints_and_cursors() {
         Some(&0)
     );
     assert_eq!(telemetry.counters.get("sync.exchange.dropped"), Some(&0));
-    assert_eq!(telemetry.counters.get("sync.exchange.queue_depth"), Some(&0));
+    assert_eq!(
+        telemetry.counters.get("sync.exchange.queue_depth"),
+        Some(&0)
+    );
 
     let metadata = &captured.metadata_requests[0];
     assert_eq!(metadata.batch.len(), 1);
@@ -238,6 +246,11 @@ async fn contract_retry_queue_on_body_upload_failure() {
         body_upload_enabled: true,
         metadata_max_events_per_batch: 200,
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -304,6 +317,11 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         body_upload_enabled: true,
         metadata_max_events_per_batch: 200,
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -313,6 +331,9 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
     let summary = agent.flush_for_shutdown(5).await.unwrap();
     assert_eq!(summary.exchange_sent, 2);
     assert_eq!(summary.exchange_blob_uploaded, 1);
+    let captured = state.lock().unwrap().clone();
+    assert_eq!(captured.metadata_requests.len(), 1);
+    assert_eq!(captured.metadata_requests[0].batch.len(), 2);
 
     let conn = Connection::open(&db_path).unwrap();
     let metadata_cursor: String = conn
@@ -348,6 +369,11 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         body_upload_enabled: true,
         metadata_max_events_per_batch: 200,
         metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -372,6 +398,92 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         )
         .unwrap();
     assert_eq!(attempt_count, 1);
+}
+
+#[tokio::test]
+async fn contract_frontload_and_live_batches_are_separated() {
+    let state = Arc::new(Mutex::new(CapturedState::default()));
+    let Some(server_url) = start_mock_server(state.clone()).await else {
+        eprintln!(
+            "Skipping contract_frontload_and_live_batches_are_separated: cannot bind localhost listener"
+        );
+        return;
+    };
+
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("events.db");
+    create_test_db(&db_path, false);
+    let cache_path = temp.path().join("cloud_cache.json");
+    let registry_cache_path = temp.path().join("registry_cache.json");
+    let retry_queue_dir = temp.path().join("retry");
+
+    let mut frontload_event = make_exchange_event("11111111-2222-3333-4444-555555555551");
+    frontload_event.tags = Some(BTreeMap::from([(
+        "collector.ingest_mode".to_string(),
+        "frontload".to_string(),
+    )]));
+    seed_exchange_upload_queue_event(&db_path, &frontload_event);
+
+    let live_event = make_exchange_event("11111111-2222-3333-4444-555555555552");
+    seed_exchange_upload_queue_event(&db_path, &live_event);
+
+    let registry_puller =
+        RegistryPuller::new(server_url.clone(), "test-key", registry_cache_path.clone());
+    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone())
+        .with_registry_puller(registry_puller);
+    let _ = puller.pull_once().await.unwrap();
+
+    let config = SyncAgentConfig {
+        endpoint: server_url,
+        api_key: "test-key".to_string(),
+        event_db_path: db_path.clone(),
+        cache_path,
+        agent_instance_id: "agent-instance-mode-separation".to_string(),
+        proxy_version: "0.1.0-test".to_string(),
+        retry_queue_dir,
+        retry_queue_max_bytes: 10 * 1024 * 1024,
+        sync_interval: Duration::from_secs(1),
+        batch_size: 200,
+        body_batch_size: 200,
+        body_upload_enabled: true,
+        metadata_max_events_per_batch: 200,
+        metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        body_upload_max_bytes: 15 * 1024 * 1024,
+        global_tags: BTreeMap::new(),
+        heartbeat_telemetry: None,
+    };
+
+    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+    let summary = agent.tick().await.unwrap();
+    assert_eq!(summary.exchange_sent, 2);
+
+    let captured = state.lock().unwrap().clone();
+    assert_eq!(captured.metadata_requests.len(), 2);
+
+    let has_frontload_batch = captured.metadata_requests.iter().any(|request| {
+        request.batch.len() == 1
+            && request.batch[0]
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.get("collector.ingest_mode"))
+                .map(|value| value == "frontload")
+                .unwrap_or(false)
+    });
+    let has_live_batch = captured.metadata_requests.iter().any(|request| {
+        request.batch.len() == 1
+            && request.batch[0]
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.get("collector.ingest_mode"))
+                .is_none()
+    });
+    assert!(has_frontload_batch);
+    assert!(has_live_batch);
 }
 
 async fn start_mock_server(state: SharedState) -> Option<String> {
@@ -710,6 +822,26 @@ fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
     .unwrap();
 
     let event = make_exchange_event(exchange_id);
+    seed_exchange_upload_queue_event(path, &event);
+}
+
+fn seed_exchange_upload_queue_event(path: &Path, event: &ExchangeEventV2) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS exchange_upload_queue (
+            exchange_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            blobs_json TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+
     let now = Utc::now().to_rfc3339();
     conn.execute(
         r#"
@@ -719,8 +851,8 @@ fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
         VALUES (?1, ?2, NULL, 0, NULL, ?3, ?3)
         "#,
         (
-            exchange_id,
-            serde_json::to_string(&event).unwrap(),
+            event.exchange_id.as_str(),
+            serde_json::to_string(event).unwrap(),
             now,
         ),
     )
