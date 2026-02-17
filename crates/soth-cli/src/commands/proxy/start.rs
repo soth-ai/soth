@@ -417,6 +417,14 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
     }
 
     std::env::set_var("SOTH_COLLECTOR_ENABLED", "true");
+    std::env::set_var(
+        "SOTH_COLLECTOR_AUTO_DISCOVER",
+        collector.auto_discover_sources.to_string(),
+    );
+    std::env::set_var(
+        "SOTH_COLLECTOR_FRONTLOAD_ON_START",
+        collector.frontload_on_start.to_string(),
+    );
 
     if !collector.sources.is_empty() {
         let sources = collector
@@ -431,6 +439,30 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
             .join(",");
         std::env::set_var("SOTH_COLLECTOR_SOURCES", sources);
     }
+    if !collector.sqlite_sources.is_empty() {
+        let sqlite_sources = collector
+            .sqlite_sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "name": source.name,
+                    "db_path": cli_config::expand_tilde(&source.db_path).to_string_lossy().to_string(),
+                    "server_name": source.server_name,
+                    "provider": source.provider,
+                    "model": source.model,
+                    "tags": source.tags,
+                    "queries": source.queries.iter().map(|query| serde_json::json!({
+                        "file_type": query.file_type,
+                        "sql": query.sql,
+                        "incremental_field": query.incremental_field,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Ok(raw) = serde_json::to_string(&sqlite_sources) {
+            std::env::set_var("SOTH_COLLECTOR_SQLITE_SOURCES", raw);
+        }
+    }
 
     set_env_if_present(
         "SOTH_COLLECTOR_POLL_INTERVAL_SECS",
@@ -441,6 +473,14 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
         collector.max_read_bytes_per_source,
     );
     set_env_if_present("SOTH_COLLECTOR_MAX_LINE_BYTES", collector.max_line_bytes);
+    set_env_if_present(
+        "SOTH_COLLECTOR_FRONTLOAD_MAX_CYCLES",
+        collector.frontload_max_cycles,
+    );
+    set_env_if_present(
+        "SOTH_COLLECTOR_FRONTLOAD_MAX_READ_BYTES",
+        collector.frontload_max_read_bytes_per_source,
+    );
     set_env_if_present(
         "SOTH_COLLECTOR_STATE_PATH",
         collector

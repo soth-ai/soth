@@ -1485,6 +1485,76 @@ fn resolve_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn create_test_agent() -> SyncAgent {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("events.db");
+        let retry_dir = dir.path().join("retry");
+        std::fs::create_dir_all(&retry_dir).expect("retry dir");
+
+        let config = SyncAgentConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            api_key: "test-key".to_string(),
+            event_db_path: db_path,
+            cache_path: dir.path().join("cache.json"),
+            agent_instance_id: "agent-test".to_string(),
+            proxy_version: "test".to_string(),
+            retry_queue_dir: retry_dir,
+            retry_queue_max_bytes: 10 * 1024 * 1024,
+            sync_interval: Duration::from_secs(1),
+            batch_size: 200,
+            body_batch_size: 50,
+            body_upload_enabled: false,
+            metadata_max_events_per_batch: 200,
+            metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+            frontload_enabled: true,
+            frontload_max_events_per_batch: 1500,
+            frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+            frontload_hard_events_cap: 5000,
+            frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+            body_upload_max_bytes: 15 * 1024 * 1024,
+            global_tags: BTreeMap::new(),
+            heartbeat_telemetry: None,
+        };
+        SyncAgent::new(config, None).expect("sync agent")
+    }
+
+    fn noisy_text(len: usize, seed: u64) -> String {
+        let mut value = seed;
+        let mut out = String::with_capacity(len);
+        for _ in 0..len {
+            value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let ch = b'a' + ((value >> 32) % 26) as u8;
+            out.push(ch as char);
+        }
+        out
+    }
+
+    fn build_prepared_row(exchange_id: &str, preview_len: usize) -> PreparedExchangeQueueRow {
+        let mut event = ExchangeEventV2::new(
+            exchange_id,
+            soth_core::types::exchange_v2::ExchangeSourceClass::Collector,
+            soth_core::types::exchange_v2::ExchangeTransport::Https,
+            ExchangeBodyMode::MetadataOnly,
+            ExchangeBodyMode::MetadataOnly,
+        );
+        event.request.body.preview = Some(noisy_text(preview_len, 7));
+        event.response.body.preview = Some(noisy_text(preview_len, 13));
+        let metadata = exchange_event_to_metadata(&event);
+        PreparedExchangeQueueRow {
+            row: ExchangeQueueRow {
+                exchange_id: exchange_id.to_string(),
+                payload_json: "{}".to_string(),
+                blobs_json: None,
+                attempt_count: 0,
+            },
+            metadata,
+            mode: ExchangeSyncMode::Live,
+            blob_uploaded: 0,
+        }
+    }
 
     #[test]
     fn exchange_sync_mode_defaults_to_live() {
@@ -1510,5 +1580,54 @@ mod tests {
             exchange_sync_mode(Some(&tags), false),
             ExchangeSyncMode::Live
         ));
+    }
+
+    #[test]
+    fn batch_fit_splits_when_compressed_limit_is_tight() {
+        let agent = create_test_agent();
+        let rows = vec![
+            build_prepared_row("11111111-1111-4111-8111-111111111111", 4096),
+            build_prepared_row("22222222-2222-4222-8222-222222222222", 4096),
+            build_prepared_row("33333333-3333-4333-8333-333333333333", 4096),
+            build_prepared_row("44444444-4444-4444-8444-444444444444", 4096),
+        ];
+        let generous = ExchangeBatchLimits {
+            max_events: 4,
+            max_compressed_bytes: 64 * 1024,
+        };
+        let full_fit = agent
+            .batch_len_under_limits(&rows, generous, None)
+            .expect("full fit");
+        assert_eq!(full_fit.len, rows.len());
+
+        let limits = ExchangeBatchLimits {
+            max_events: 4,
+            max_compressed_bytes: full_fit.compressed_bytes.saturating_sub(1).max(1),
+        };
+        let fit = agent
+            .batch_len_under_limits(&rows, limits, None)
+            .expect("fit");
+        assert!(fit.len >= 1);
+        assert!(fit.len < rows.len());
+        assert!(fit.split_count >= 1);
+        assert!(fit.compressed_bytes <= limits.max_compressed_bytes);
+    }
+
+    #[test]
+    fn batch_fit_returns_zero_for_oversized_single_exchange() {
+        let agent = create_test_agent();
+        let rows = vec![build_prepared_row(
+            "55555555-5555-4555-8555-555555555555",
+            4096,
+        )];
+        let limits = ExchangeBatchLimits {
+            max_events: 1,
+            max_compressed_bytes: 64,
+        };
+        let fit = agent
+            .batch_len_under_limits(&rows, limits, None)
+            .expect("fit");
+        assert_eq!(fit.len, 0);
+        assert!(fit.compressed_bytes > limits.max_compressed_bytes);
     }
 }
