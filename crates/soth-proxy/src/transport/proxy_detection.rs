@@ -235,11 +235,7 @@ pub(crate) fn resolve_bundle_detection(
         .or_else(|| oisp_engine.evaluate_detection_for_host(host, &detection_context));
     let provider_scoped_is_generic = provider_scoped_detection
         .as_ref()
-        .map(|value| {
-            value
-                .detection_reason
-                .eq_ignore_ascii_case("bundle_unclassified")
-        })
+        .map(|value| is_generic_detection_reason(value.detection_reason.as_str()))
         .unwrap_or(true);
     let cross_entry_detection = if provider_scoped_detection.is_none() || provider_scoped_is_generic
     {
@@ -268,11 +264,13 @@ pub(crate) fn resolve_bundle_detection(
 
     let (detection_reason, parse_confidence, detection_source) =
         if let Some(value) = bundle_detection.as_ref() {
-            (
-                Some(value.detection_reason.clone()),
-                Some(value.parse_confidence),
-                Some("bundle".to_string()),
-            )
+            let reason = normalize_detection_reason(value.detection_reason.as_str());
+            let confidence = if is_generic_detection_reason(reason.as_str()) {
+                0.0
+            } else {
+                value.parse_confidence
+            };
+            (Some(reason), Some(confidence), Some("bundle".to_string()))
         } else {
             (
                 Some("bundle_unclassified".to_string()),
@@ -289,5 +287,44 @@ pub(crate) fn resolve_bundle_detection(
         target_entity_id: bundle_detection
             .as_ref()
             .and_then(|value| value.target_entity_id.clone()),
+    }
+}
+
+fn is_generic_detection_reason(reason: &str) -> bool {
+    matches!(
+        reason.trim().to_ascii_lowercase().as_str(),
+        "bundle_unclassified" | "fallback_unknown" | "unknown" | "unclassified"
+    )
+}
+
+fn normalize_detection_reason(reason: &str) -> String {
+    if is_generic_detection_reason(reason) {
+        "bundle_unclassified".to_string()
+    } else {
+        reason.trim().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_generic_detection_reason, normalize_detection_reason};
+
+    #[test]
+    fn generic_reasons_are_normalized() {
+        assert_eq!(
+            normalize_detection_reason("fallback_unknown"),
+            "bundle_unclassified"
+        );
+        assert_eq!(normalize_detection_reason("unknown"), "bundle_unclassified");
+        assert_eq!(
+            normalize_detection_reason("bundle_unclassified"),
+            "bundle_unclassified"
+        );
+    }
+
+    #[test]
+    fn non_generic_reason_is_preserved() {
+        assert_eq!(normalize_detection_reason("ua_match"), "ua_match");
+        assert!(!is_generic_detection_reason("host_classification"));
     }
 }

@@ -214,6 +214,36 @@ impl EventLogger {
         Ok(out)
     }
 
+    /// Delete stale non-finalized spool rows older than `max_age`.
+    ///
+    /// Returns number of deleted rows.
+    pub fn prune_stale_exchange_spool(
+        &self,
+        max_age: Duration,
+        limit: usize,
+    ) -> std::io::Result<usize> {
+        let conn = self.open_sqlite_metadata_conn()?;
+        let age_secs = max_age.as_secs().max(1) as i64;
+        let capped_limit = limit.max(1) as i64;
+        let deleted = conn
+            .execute(
+                r#"
+                DELETE FROM exchange_spool
+                WHERE exchange_id IN (
+                    SELECT exchange_id
+                    FROM exchange_spool
+                    WHERE finalized_at IS NULL
+                      AND updated_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('-%d seconds', ?1))
+                    ORDER BY updated_at ASC
+                    LIMIT ?2
+                )
+                "#,
+                params![age_secs, capped_limit],
+            )
+            .map_err(to_io_err)?;
+        Ok(deleted)
+    }
+
     /// Enqueue or refresh a finalized exchange upload payload.
     pub fn enqueue_exchange_upload(
         &self,
@@ -1217,21 +1247,37 @@ fn transport_from_wrap_event(event: &WrapEvent) -> ExchangeTransport {
 }
 
 fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> {
-    let envelope = event.traffic_envelope.as_ref()?;
-    let bundle_id = bundle_id_from_executable_path(envelope.process_executable.as_deref());
+    let envelope = event.traffic_envelope.as_ref();
+    let process_name = envelope
+        .and_then(|value| value.process_name.clone())
+        .or_else(|| Some(event.agent.name.clone()).filter(|name| !name.trim().is_empty()))
+        .or_else(|| envelope.and_then(|value| value.agent.clone()))
+        .or_else(|| envelope.and_then(|value| value.provider.clone()));
+    let bundle_id = bundle_id_from_executable_path(
+        envelope.and_then(|value| value.process_executable.as_deref()),
+    )
+    .or_else(|| bundle_id_from_agent_hint(process_name.as_deref()));
+    let app_type = event
+        .collector_source
+        .as_ref()
+        .map(|_| "collector".to_string())
+        .or_else(|| envelope.and_then(|value| value.process_app_type.clone()))
+        .or_else(|| infer_app_type_from_name(process_name.as_deref(), bundle_id.as_deref()))
+        .or_else(|| Some("unknown".to_string()));
+
+    if envelope.and_then(|value| value.process_pid).is_none()
+        && process_name.is_none()
+        && bundle_id.is_none()
+        && app_type.is_none()
+    {
+        return None;
+    }
+
     Some(ExchangeClient {
-        pid: envelope.process_pid,
-        bundle_id: bundle_id.clone(),
-        process_name: envelope.process_name.clone(),
-        app_type: event
-            .collector_source
-            .as_ref()
-            .map(|_| "collector".to_string())
-            .or(envelope.process_app_type.clone())
-            .or(bundle_id
-                .as_ref()
-                .map(|_| "desktop_app".to_string())
-                .or(Some("unknown".to_string()))),
+        pid: envelope.and_then(|value| value.process_pid),
+        bundle_id,
+        process_name,
+        app_type,
         referrer_origin: None,
     })
 }
@@ -1263,6 +1309,63 @@ fn bundle_id_from_executable_path(path: Option<&str>) -> Option<String> {
             .collect::<String>()
             .trim_matches('_')
     ))
+}
+
+fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
+    let value = agent
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())?;
+    let normalized = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format!("agent.{normalized}"))
+    }
+}
+
+fn infer_app_type_from_name(process_name: Option<&str>, bundle_id: Option<&str>) -> Option<String> {
+    let lower = process_name?.to_ascii_lowercase();
+    let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+    if has_any(&[
+        "chrome", "firefox", "safari", "edge", "brave", "arc", "opera", "chromium",
+    ]) {
+        return Some("browser".to_string());
+    }
+    if has_any(&[
+        "codex",
+        "claude-code",
+        "terminal",
+        "shell",
+        "bash",
+        "zsh",
+        "fish",
+        "python",
+        "node",
+        "npm",
+        "cargo",
+    ]) {
+        return Some("cli".to_string());
+    }
+    if has_any(&[
+        "cursor",
+        "windsurf",
+        "vscode",
+        "jetbrains",
+        "zed",
+        "copilot",
+    ]) {
+        return Some("editor".to_string());
+    }
+    if has_any(&["chatgpt", "claude", "warp"]) || bundle_id.is_some() {
+        return Some("desktop_app".to_string());
+    }
+    Some("unknown".to_string())
 }
 
 fn exchange_body_from_text(
@@ -1845,6 +1948,45 @@ mod tests {
     }
 
     #[test]
+    fn test_prune_stale_exchange_spool() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let logger = EventLogger::new(path.clone()).unwrap();
+
+        logger
+            .upsert_exchange_spool("ex-old", r#"{"state":"inflight"}"#, "2026-02-01T00:00:00Z")
+            .unwrap();
+        logger
+            .upsert_exchange_spool(
+                "ex-fresh",
+                r#"{"state":"inflight"}"#,
+                "2026-02-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE exchange_spool SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 hours') WHERE exchange_id = 'ex-old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE exchange_spool SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE exchange_id = 'ex-fresh'",
+            [],
+        )
+        .unwrap();
+
+        let deleted = logger
+            .prune_stale_exchange_spool(Duration::from_secs(2 * 60 * 60), 100)
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        let pending = logger.load_exchange_spool_pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].exchange_id, "ex-fresh");
+    }
+
+    #[test]
     fn test_exchange_upload_queue_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.db");
@@ -1932,5 +2074,9 @@ mod tests {
         assert!(ready[0]
             .payload_json
             .contains("\"target_entity_id\":\"agt_bundle01\""));
+        assert!(ready[0]
+            .payload_json
+            .contains("\"process_name\":\"claude-code\""));
+        assert!(ready[0].payload_json.contains("\"app_type\":\"cli\""));
     }
 }

@@ -137,23 +137,32 @@ fn event_source_for_pending(pending: &PendingRequest) -> EventSource {
 
 fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<ExchangeClient> {
     let envelope = envelope?;
+    let process_name = envelope
+        .process_name
+        .clone()
+        .or_else(|| envelope.agent.clone())
+        .or_else(|| envelope.provider.clone());
+    let bundle_id = process_bundle_id_from_executable(envelope.process_executable.as_deref())
+        .or_else(|| bundle_id_from_agent_hint(envelope.agent.as_deref()));
+    let app_type = envelope
+        .process_app_type
+        .clone()
+        .or_else(|| classify_process_app_type(process_name.as_deref(), bundle_id.as_deref()))
+        .or_else(|| infer_agent_fallback_app_type(envelope.agent.as_deref()))
+        .or_else(|| Some("unknown".to_string()));
+
     if envelope.process_pid.is_none()
-        && envelope.process_name.is_none()
-        && envelope.process_executable.is_none()
+        && process_name.is_none()
+        && bundle_id.is_none()
+        && app_type.is_none()
     {
         return None;
     }
 
-    let bundle_id = process_bundle_id_from_executable(envelope.process_executable.as_deref());
-
-    let app_type = envelope.process_app_type.clone().or_else(|| {
-        classify_process_app_type(envelope.process_name.as_deref(), bundle_id.as_deref())
-    });
-
     Some(ExchangeClient {
         pid: envelope.process_pid,
         bundle_id,
-        process_name: envelope.process_name.clone(),
+        process_name,
         app_type,
         referrer_origin: None,
     })
@@ -172,17 +181,6 @@ fn classify_process_app_type(
             return Some("browser".to_string());
         }
         if has_any(&[
-            "cursor",
-            "code",
-            "windsurf",
-            "jetbrains",
-            "zed",
-            "xcode",
-            "vim",
-        ]) {
-            return Some("editor".to_string());
-        }
-        if has_any(&[
             "claude-code",
             "codex",
             "terminal",
@@ -196,15 +194,65 @@ fn classify_process_app_type(
         ]) {
             return Some("cli".to_string());
         }
+        if has_any(&[
+            "cursor",
+            "code",
+            "windsurf",
+            "jetbrains",
+            "zed",
+            "xcode",
+            "vim",
+        ]) {
+            return Some("editor".to_string());
+        }
         if has_any(&["service", "daemon", "launchd", "systemd"]) {
             return Some("service".to_string());
         }
     }
     if bundle_id.is_some() {
-        Some("desktop_app".to_string())
-    } else {
-        Some("unknown".to_string())
+        return Some("desktop_app".to_string());
     }
+    None
+}
+
+fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
+    let agent = agent
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())?;
+    let normalized = agent
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format!("agent.{normalized}"))
+    }
+}
+
+fn infer_agent_fallback_app_type(agent: Option<&str>) -> Option<String> {
+    let lower = agent?.to_ascii_lowercase();
+    let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+    if has_any(&["codex", "claude-code", "terminal", "shell", "cli"]) {
+        return Some("cli".to_string());
+    }
+    if has_any(&[
+        "cursor",
+        "windsurf",
+        "vscode",
+        "copilot",
+        "jetbrains",
+        "zed",
+    ]) {
+        return Some("editor".to_string());
+    }
+    if has_any(&["chatgpt", "claude", "warp"]) {
+        return Some("desktop_app".to_string());
+    }
+    Some("unknown".to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -499,6 +547,83 @@ pub(crate) fn apply_process_identity(
         envelope.process_app_type = Some(process.app_type.clone());
         envelope.process_attribution_source = Some(process.attribution_source.clone());
         envelope.process_attribution_confidence = Some(process.attribution_confidence);
+    } else {
+        if envelope.process_name.is_none() {
+            envelope.process_name = envelope
+                .agent
+                .clone()
+                .or_else(|| envelope.provider.clone())
+                .or_else(|| envelope.host.clone());
+        }
+        if envelope.process_app_type.is_none() {
+            envelope.process_app_type = classify_process_app_type(
+                envelope.process_name.as_deref(),
+                process_bundle_id_from_executable(envelope.process_executable.as_deref())
+                    .as_deref(),
+            )
+            .or_else(|| infer_agent_fallback_app_type(envelope.agent.as_deref()));
+            if envelope.process_app_type.is_none() {
+                envelope.process_app_type = Some("unknown".to_string());
+            }
+        }
+        if envelope.process_attribution_source.is_none() && envelope.process_name.is_some() {
+            envelope.process_attribution_source = Some("heuristic_agent_fallback".to_string());
+        }
+        if envelope.process_attribution_confidence.is_none() && envelope.process_name.is_some() {
+            envelope.process_attribution_confidence = Some(0.35);
+        }
     }
     envelope
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_process_identity, exchange_client_from_envelope};
+    use soth_core::types::TrafficEnvelope;
+
+    #[test]
+    fn apply_process_identity_uses_heuristic_fallback_when_lookup_missing() {
+        let envelope = TrafficEnvelope::proxy(
+            "s1",
+            "r1",
+            "anthropic",
+            "api.anthropic.com",
+            "POST",
+            "/v1/messages",
+            Some("claude-opus-4-6"),
+            Some("claude"),
+            None,
+            None,
+            Some("{}"),
+        );
+        let enriched = apply_process_identity(envelope, None);
+        assert_eq!(enriched.process_name.as_deref(), Some("claude"));
+        assert_eq!(enriched.process_app_type.as_deref(), Some("desktop_app"));
+        assert_eq!(
+            enriched.process_attribution_source.as_deref(),
+            Some("heuristic_agent_fallback")
+        );
+        assert_eq!(enriched.process_attribution_confidence, Some(0.35));
+    }
+
+    #[test]
+    fn exchange_client_falls_back_to_agent_when_process_fields_missing() {
+        let envelope = TrafficEnvelope::proxy(
+            "s1",
+            "r1",
+            "chatgpt",
+            "chatgpt.com",
+            "POST",
+            "/backend-api/codex/responses",
+            Some("gpt-5.3-codex"),
+            Some("codex"),
+            None,
+            None,
+            Some("{}"),
+        );
+        let client = exchange_client_from_envelope(Some(&envelope)).expect("client expected");
+        assert_eq!(client.process_name.as_deref(), Some("codex"));
+        assert_eq!(client.app_type.as_deref(), Some("cli"));
+        assert_eq!(client.bundle_id.as_deref(), Some("agent.codex"));
+    }
 }
