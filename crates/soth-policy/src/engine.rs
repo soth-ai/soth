@@ -9,6 +9,7 @@ use soth_core::types::policy::{EvaluationResult, PolicyData, PolicyDecision, Pol
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// Policy engine configuration
 #[derive(Debug, Clone)]
@@ -213,11 +214,13 @@ impl PolicyEngine {
     /// Evaluate a policy decision
     pub fn evaluate(&self, input: &PolicyInput) -> Result<EvaluationResult> {
         let start = Instant::now();
-        let (policy_version, has_modules, policy_data) = {
+        let (policy_version, has_modules, has_modules_count, policy_data) = {
             let artifacts = self.artifacts.read();
+            let modules_len = artifacts.active.modules.len();
             (
                 format!("v{}", artifacts.active.version),
-                !artifacts.active.modules.is_empty(),
+                modules_len > 0,
+                modules_len,
                 artifacts.active.data.clone(),
             )
         };
@@ -239,12 +242,17 @@ impl PolicyEngine {
             });
         }
 
-        // Fail closed if policy modules were loaded but module execution runtime
-        // is not wired into this engine implementation.
+        // TODO: Wire up OpaWasmRuntime (crate::wasm) to execute loaded Rego modules.
+        // Currently the wasm runtime is a placeholder that fails closed. Once it can
+        // actually evaluate Rego, this branch should call into it and merge the result
+        // with the built-in data-based rules below. Until then we warn and fall through
+        // to the built-in evaluator so cloud-synced Rego modules don't block startup.
         if has_modules {
-            return Err(soth_core::error::SothError::PolicyEvaluation(
-                "Loaded policy modules cannot be executed by current runtime".to_string(),
-            ));
+            warn!(
+                module_count = has_modules_count,
+                "Policy modules loaded but no Rego execution runtime available — \
+                 falling through to built-in rule evaluation"
+            );
         }
 
         // Check cache
