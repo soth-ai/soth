@@ -367,7 +367,9 @@ fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTrac
             }
             "per_model" => {
                 let Some(model) = limit.model.as_deref() else {
-                    warn!("Ignoring invalid budget limit: scope=per_model requires model (fail-open)");
+                    warn!(
+                        "Ignoring invalid budget limit: scope=per_model requires model (fail-open)"
+                    );
                     continue;
                 };
                 tracker.set_model_budget(model, limit.daily, limit.weekly, limit.monthly);

@@ -529,7 +529,9 @@ async fn exchange_batch_handler(
                     errors: vec![soth_core::api::EventError {
                         event_id: "decode".to_string(),
                         reason: error,
+                        code: Some("validation_failed".to_string()),
                     }],
+                    retry_after_secs: None,
                     config_changed: false,
                     server_time: Utc::now().to_rfc3339(),
                 }),
@@ -547,6 +549,7 @@ async fn exchange_batch_handler(
             accepted: request.batch.len() as u64,
             rejected: 0,
             errors: Vec::new(),
+            retry_after_secs: None,
             config_changed: false,
             server_time: Utc::now().to_rfc3339(),
         }),

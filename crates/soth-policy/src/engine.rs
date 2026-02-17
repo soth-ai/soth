@@ -7,8 +7,8 @@ use parking_lot::RwLock;
 use soth_core::error::Result;
 use soth_core::types::policy::{EvaluationResult, PolicyData, PolicyDecision, PolicyInput};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 

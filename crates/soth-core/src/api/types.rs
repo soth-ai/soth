@@ -116,6 +116,8 @@ pub struct ExchangeBatchResponse {
     pub accepted: u64,
     pub rejected: u64,
     pub errors: Vec<EventError>,
+    #[serde(default)]
+    pub retry_after_secs: Option<u64>,
     pub config_changed: bool,
     pub server_time: String,
 }
@@ -124,6 +126,8 @@ pub struct ExchangeBatchResponse {
 pub struct EventError {
     pub event_id: String,
     pub reason: String,
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

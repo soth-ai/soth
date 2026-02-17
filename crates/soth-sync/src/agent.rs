@@ -151,6 +151,12 @@ enum PressureKind {
     Timeout,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeRejectionDisposition {
+    Retry,
+    Drop,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AdaptiveModeState {
     max_events: usize,
@@ -758,17 +764,33 @@ impl SyncAgent {
                 Ok(ExchangePushResult::Success(response)) => {
                     let mut rejected = HashMap::new();
                     for error in &response.errors {
-                        rejected.insert(error.event_id.clone(), error.reason.clone());
+                        rejected.insert(
+                            error.event_id.clone(),
+                            (error.reason.clone(), error.code.clone()),
+                        );
                     }
                     let mut accepted_in_batch = 0usize;
+                    let mut retryable_rejections = 0usize;
                     for item in batch {
-                        if let Some(reason) = rejected.get(&item.row.exchange_id) {
-                            self.defer_exchange_row_with_retry(
-                                &item.row,
-                                &format!("exchange_rejected:{reason}"),
-                                stats,
-                            )?;
+                        if let Some((reason, code)) = rejected.get(&item.row.exchange_id) {
+                            let token = code.as_deref().unwrap_or(reason.as_str());
+                            match classify_exchange_rejection(reason.as_str(), code.as_deref()) {
+                                ExchangeRejectionDisposition::Drop => self.drop_exchange_row(
+                                    &item.row,
+                                    &format!("exchange_rejected:{token}"),
+                                    stats,
+                                )?,
+                                ExchangeRejectionDisposition::Retry => {
+                                    retryable_rejections += 1;
+                                    self.defer_exchange_row_with_retry(
+                                        &item.row,
+                                        &format!("exchange_rejected:{token}"),
+                                        stats,
+                                    )?
+                                }
+                            }
                         } else if response.errors.is_empty() {
+                            retryable_rejections += 1;
                             self.defer_exchange_row_with_retry(
                                 &item.row,
                                 &format!("exchange_rejected_count={}", response.rejected),
@@ -790,8 +812,11 @@ impl SyncAgent {
                         stats.exchange_batch_events += accepted_in_batch;
                         stats.exchange_batch_compressed_bytes += fit.compressed_bytes;
                         self.adaptive_record_success(mode);
-                    } else {
+                    } else if retryable_rejections > 0 {
                         self.adaptive_record_pressure(mode, PressureKind::RetryableStatus);
+                    } else {
+                        // All rejections were terminal (e.g. duplicates), so avoid shrinking limits.
+                        self.adaptive_record_success(mode);
                     }
                 }
                 Ok(ExchangePushResult::NonSuccessStatus(status)) => {
@@ -1306,6 +1331,14 @@ fn exchange_sync_mode(
     }
 }
 
+fn classify_exchange_rejection(reason: &str, code: Option<&str>) -> ExchangeRejectionDisposition {
+    let candidate = code.unwrap_or(reason).trim().to_ascii_lowercase();
+    match candidate.as_str() {
+        "duplicate" => ExchangeRejectionDisposition::Drop,
+        _ => ExchangeRejectionDisposition::Retry,
+    }
+}
+
 fn build_exchange_event_envelope_metadata(
     event: &ExchangeEventV2,
 ) -> Option<EventEnvelopeMetadata> {
@@ -1579,6 +1612,34 @@ mod tests {
         assert!(matches!(
             exchange_sync_mode(Some(&tags), false),
             ExchangeSyncMode::Live
+        ));
+    }
+
+    #[test]
+    fn classify_exchange_rejection_drops_terminal_reasons() {
+        assert!(matches!(
+            classify_exchange_rejection("duplicate", None),
+            ExchangeRejectionDisposition::Drop
+        ));
+    }
+
+    #[test]
+    fn classify_exchange_rejection_retries_non_terminal_reasons() {
+        assert!(matches!(
+            classify_exchange_rejection("rate_limited", None),
+            ExchangeRejectionDisposition::Retry
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("payload_too_large", None),
+            ExchangeRejectionDisposition::Retry
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("validation_failed", None),
+            ExchangeRejectionDisposition::Retry
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("invalid_exchange_id", None),
+            ExchangeRejectionDisposition::Retry
         ));
     }
 

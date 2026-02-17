@@ -438,6 +438,21 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
             .collect::<Vec<_>>()
             .join(",");
         std::env::set_var("SOTH_COLLECTOR_SOURCES", sources);
+
+        let structured_sources = collector
+            .sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "name": source.name,
+                    "path": cli_config::expand_tilde(&source.path).to_string_lossy().to_string(),
+                    "parser": source.parser,
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Ok(raw) = serde_json::to_string(&structured_sources) {
+            std::env::set_var("SOTH_COLLECTOR_SOURCES_JSON", raw);
+        }
     }
     if !collector.sqlite_sources.is_empty() {
         let sqlite_sources = collector

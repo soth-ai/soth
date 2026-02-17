@@ -1,5 +1,6 @@
 //! Runtime/bootstrap wiring for proxy transport.
 
+use chrono::Utc;
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoServerBuilder},
@@ -7,12 +8,11 @@ use hudsucker::{
     rustls::crypto::aws_lc_rs,
     Proxy,
 };
-use chrono::Utc;
 use soth_crypto::tls::LearnedPassthrough;
-use soth_oisp::OispEngine;
-use soth_oisp::types::{CompiledBundle, DomainFilters, ResolvedProvider};
 use soth_oisp::types::bundle::{BundleStats, BundleType};
 use soth_oisp::types::EntryType;
+use soth_oisp::types::{CompiledBundle, DomainFilters, ResolvedProvider};
+use soth_oisp::OispEngine;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

@@ -101,6 +101,23 @@ struct EnvSqliteSource {
 }
 
 #[derive(Debug, Deserialize)]
+struct EnvFileSource {
+    #[serde(default)]
+    name: Option<String>,
+    path: String,
+    #[serde(default)]
+    parser: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct EnvSqliteQuery {
     file_type: String,
     sql: String,
@@ -127,40 +144,7 @@ impl CollectorConfig {
         let frontload_on_start =
             parse_bool_env("SOTH_COLLECTOR_FRONTLOAD_ON_START").unwrap_or(true);
 
-        let mut sources = Vec::new();
-        if let Ok(sources_raw) = std::env::var("SOTH_COLLECTOR_SOURCES") {
-            for raw in sources_raw.split(',') {
-                let raw = raw.trim();
-                if raw.is_empty() {
-                    continue;
-                }
-                let path = expand_home_path(Path::new(raw));
-                let name = path
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .unwrap_or("collector-source")
-                    .to_string();
-                let parser = match path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "jsonl" | "ndjson" => CollectorParser::JsonLines,
-                    _ => CollectorParser::TextLines,
-                };
-                sources.push(CollectorSource {
-                    name,
-                    path,
-                    parser,
-                    server_name: None,
-                    provider: None,
-                    model: None,
-                    tags: BTreeMap::new(),
-                });
-            }
-        }
+        let mut sources = parse_file_sources_from_env();
 
         let sqlite_sources = parse_sqlite_sources_from_env();
         if auto_discover_sources && sources.is_empty() && sqlite_sources.is_empty() {
@@ -318,6 +302,125 @@ fn parse_sqlite_sources_from_env() -> Vec<CollectorSqliteSource> {
             })
         })
         .collect::<Vec<_>>()
+}
+
+fn parse_file_sources_from_env() -> Vec<CollectorSource> {
+    let mut sources = parse_file_sources_json_from_env();
+    if !sources.is_empty() {
+        return sources;
+    }
+
+    let sources_raw = match std::env::var("SOTH_COLLECTOR_SOURCES") {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    for raw in sources_raw.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let path = expand_home_path(Path::new(raw));
+        let name = default_source_name(&path);
+        let parser = parser_for_path_and_hint(&path, None);
+        sources.push(CollectorSource {
+            name,
+            path,
+            parser,
+            server_name: None,
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        });
+    }
+    sources
+}
+
+fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
+    let raw = match std::env::var("SOTH_COLLECTOR_SOURCES_JSON") {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let parsed = match serde_json::from_str::<Vec<EnvFileSource>>(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Invalid SOTH_COLLECTOR_SOURCES_JSON; falling back to path-based source parsing"
+            );
+            return Vec::new();
+        }
+    };
+
+    parsed
+        .into_iter()
+        .filter_map(|source| {
+            let raw_path = source.path.trim();
+            if raw_path.is_empty() {
+                return None;
+            }
+            let path = expand_home_path(Path::new(raw_path));
+            let name = source
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| default_source_name(&path));
+            let parser = parser_for_path_and_hint(&path, source.parser.as_deref());
+            let server_name = normalize_optional_text(source.server_name.as_deref());
+            let provider = normalize_optional_text(source.provider.as_deref());
+            let model = normalize_optional_text(source.model.as_deref());
+            Some(CollectorSource {
+                name,
+                path,
+                parser,
+                server_name,
+                provider,
+                model,
+                tags: source.tags,
+            })
+        })
+        .collect()
+}
+
+fn parser_for_path_and_hint(path: &Path, parser_hint: Option<&str>) -> CollectorParser {
+    if let Some(hint) = parser_hint {
+        match hint.trim().to_ascii_lowercase().as_str() {
+            "jsonl" | "ndjson" | "json_lines" | "jsonlines" => return CollectorParser::JsonLines,
+            "text" | "txt" | "text_lines" | "lines" => return CollectorParser::TextLines,
+            _ => {}
+        }
+    }
+
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jsonl" | "ndjson" => CollectorParser::JsonLines,
+        _ => CollectorParser::TextLines,
+    }
+}
+
+fn default_source_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|v| v.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("collector-source")
+        .to_string()
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn parse_bool_env(key: &str) -> Option<bool> {
