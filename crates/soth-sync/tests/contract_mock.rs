@@ -112,9 +112,10 @@ async fn contract_sync_endpoints_and_cursors() {
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
     let summary = agent.tick().await.unwrap();
-    assert_eq!(summary.metadata_sent, 1);
-    assert_eq!(summary.body_uploaded, 1);
-    assert_eq!(summary.retry_uploaded, 0);
+    assert_eq!(summary.exchange_sent, 1);
+    assert_eq!(summary.exchange_blob_uploaded, 1);
+    assert_eq!(summary.exchange_retry_deferred, 0);
+    assert_eq!(summary.exchange_dropped, 0);
 
     let heartbeat_ok = agent.send_heartbeat().await.unwrap();
     assert!(heartbeat_ok);
@@ -147,6 +148,21 @@ async fn contract_sync_endpoints_and_cursors() {
         registry_cache_path.exists(),
         "registry bundle cache should be materialized"
     );
+    let telemetry = captured.heartbeat_requests[0]
+        .telemetry
+        .as_ref()
+        .expect("heartbeat telemetry should be populated");
+    assert_eq!(telemetry.counters.get("sync.exchange.sent"), Some(&1));
+    assert_eq!(
+        telemetry.counters.get("sync.exchange.blob_uploaded"),
+        Some(&1)
+    );
+    assert_eq!(
+        telemetry.counters.get("sync.exchange.retry_deferred"),
+        Some(&0)
+    );
+    assert_eq!(telemetry.counters.get("sync.exchange.dropped"), Some(&0));
+    assert_eq!(telemetry.counters.get("sync.exchange.queue_depth"), Some(&0));
 
     let metadata = &captured.metadata_requests[0];
     assert_eq!(metadata.batch.len(), 1);
@@ -229,9 +245,10 @@ async fn contract_retry_queue_on_body_upload_failure() {
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
     let first = agent.tick().await.unwrap();
-    assert_eq!(first.metadata_sent, 1);
-    assert_eq!(first.body_uploaded, 0);
-    assert_eq!(first.retry_uploaded, 0);
+    assert_eq!(first.exchange_sent, 0);
+    assert_eq!(first.exchange_blob_uploaded, 0);
+    assert_eq!(first.exchange_retry_deferred, 1);
+    assert_eq!(first.exchange_dropped, 0);
 
     let queued_files = std::fs::read_dir(&retry_queue_dir)
         .unwrap()
@@ -243,8 +260,10 @@ async fn contract_retry_queue_on_body_upload_failure() {
     );
 
     let second = agent.tick().await.unwrap();
-    assert_eq!(second.metadata_sent, 0);
-    assert_eq!(second.retry_uploaded, 1);
+    assert_eq!(second.exchange_sent, 0);
+    assert_eq!(second.exchange_blob_uploaded, 0);
+    assert_eq!(second.exchange_retry_deferred, 1);
+    assert_eq!(second.exchange_dropped, 0);
 }
 
 #[tokio::test]
@@ -292,8 +311,8 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
     let agent = SyncAgent::new(config, Some(puller)).unwrap();
 
     let summary = agent.flush_for_shutdown(5).await.unwrap();
-    assert_eq!(summary.metadata_sent, 2);
-    assert_eq!(summary.body_uploaded, 1);
+    assert_eq!(summary.exchange_sent, 2);
+    assert_eq!(summary.exchange_blob_uploaded, 1);
 
     let conn = Connection::open(&db_path).unwrap();
     let metadata_cursor: String = conn

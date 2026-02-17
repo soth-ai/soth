@@ -16,6 +16,7 @@ use soth_core::types::exchange_v2::{ExchangeBodyMode, ExchangeEventV2};
 use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -26,6 +27,13 @@ const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
 const MAX_EXCHANGE_RETRY_BACKOFF_SECS: u64 = 15 * 60;
 const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
 const SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1: &str = "migration_exchange_uuid_cleanup_v1";
+const EXCHANGE_SPOOL_STALE_MAX_AGE_SECS: u64 = 6 * 60 * 60;
+const EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT: usize = 10_000;
+const SYNC_TELEMETRY_EXCHANGE_SENT: &str = "sync.exchange.sent";
+const SYNC_TELEMETRY_EXCHANGE_BLOB_UPLOADED: &str = "sync.exchange.blob_uploaded";
+const SYNC_TELEMETRY_EXCHANGE_RETRY_DEFERRED: &str = "sync.exchange.retry_deferred";
+const SYNC_TELEMETRY_EXCHANGE_DROPPED: &str = "sync.exchange.dropped";
+const SYNC_TELEMETRY_EXCHANGE_QUEUE_DEPTH: &str = "sync.exchange.queue_depth";
 
 pub type HeartbeatTelemetryProvider =
     Arc<dyn Fn() -> Option<HeartbeatTelemetry> + Send + Sync + 'static>;
@@ -58,15 +66,18 @@ pub struct SyncAgent {
     pub heartbeat_sender: HeartbeatSender,
     pub retry_queue: BodyRetryQueue,
     pub config_puller: Option<ConfigPuller>,
+    sync_exchange_sent_total: AtomicU64,
+    sync_exchange_blob_uploaded_total: AtomicU64,
+    sync_exchange_retry_deferred_total: AtomicU64,
+    sync_exchange_dropped_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncTickSummary {
-    pub metadata_sent: usize,
-    pub body_uploaded: usize,
-    pub retry_uploaded: usize,
     pub exchange_sent: usize,
     pub exchange_blob_uploaded: usize,
+    pub exchange_retry_deferred: usize,
+    pub exchange_dropped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +107,14 @@ enum ExchangeQueueOutcome {
     Drop { reason: String },
 }
 
+#[derive(Debug, Clone, Default)]
+struct ExchangeQueueStats {
+    exchange_sent: usize,
+    exchange_blob_uploaded: usize,
+    exchange_retry_deferred: usize,
+    exchange_dropped: usize,
+}
+
 impl SyncAgent {
     pub fn new(
         mut config: SyncAgentConfig,
@@ -122,6 +141,16 @@ impl SyncAgent {
                 "Failed one-time exchange UUID cleanup migration; continuing"
             );
         }
+        if let Err(error) = run_exchange_spool_stale_cleanup(
+            config.event_db_path.as_path(),
+            Duration::from_secs(EXCHANGE_SPOOL_STALE_MAX_AGE_SECS),
+            EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT,
+        ) {
+            warn!(
+                error = %error,
+                "Failed exchange spool stale cleanup; continuing"
+            );
+        }
         Ok(Self {
             config,
             metadata_pusher,
@@ -129,22 +158,29 @@ impl SyncAgent {
             heartbeat_sender,
             retry_queue,
             config_puller,
+            sync_exchange_sent_total: AtomicU64::new(0),
+            sync_exchange_blob_uploaded_total: AtomicU64::new(0),
+            sync_exchange_retry_deferred_total: AtomicU64::new(0),
+            sync_exchange_dropped_total: AtomicU64::new(0),
         })
     }
 
     pub async fn tick(&self) -> anyhow::Result<SyncTickSummary> {
-        let metadata_sent = 0;
-        let (exchange_sent, exchange_blob_uploaded) = self.sync_exchange_queue_once().await?;
-
-        let retry_uploaded = 0;
-        let body_uploaded = 0;
+        let stats = self.sync_exchange_queue_once().await?;
+        self.sync_exchange_sent_total
+            .fetch_add(stats.exchange_sent as u64, Ordering::Relaxed);
+        self.sync_exchange_blob_uploaded_total
+            .fetch_add(stats.exchange_blob_uploaded as u64, Ordering::Relaxed);
+        self.sync_exchange_retry_deferred_total
+            .fetch_add(stats.exchange_retry_deferred as u64, Ordering::Relaxed);
+        self.sync_exchange_dropped_total
+            .fetch_add(stats.exchange_dropped as u64, Ordering::Relaxed);
 
         Ok(SyncTickSummary {
-            metadata_sent,
-            body_uploaded,
-            retry_uploaded,
-            exchange_sent,
-            exchange_blob_uploaded,
+            exchange_sent: stats.exchange_sent,
+            exchange_blob_uploaded: stats.exchange_blob_uploaded,
+            exchange_retry_deferred: stats.exchange_retry_deferred,
+            exchange_dropped: stats.exchange_dropped,
         })
     }
 
@@ -158,17 +194,15 @@ impl SyncAgent {
 
         for _ in 0..rounds {
             let summary = self.tick().await?;
-            total.metadata_sent += summary.metadata_sent;
-            total.body_uploaded += summary.body_uploaded;
-            total.retry_uploaded += summary.retry_uploaded;
             total.exchange_sent += summary.exchange_sent;
             total.exchange_blob_uploaded += summary.exchange_blob_uploaded;
+            total.exchange_retry_deferred += summary.exchange_retry_deferred;
+            total.exchange_dropped += summary.exchange_dropped;
 
-            if summary.metadata_sent == 0
-                && summary.body_uploaded == 0
-                && summary.retry_uploaded == 0
-                && summary.exchange_sent == 0
+            if summary.exchange_sent == 0
                 && summary.exchange_blob_uploaded == 0
+                && summary.exchange_retry_deferred == 0
+                && summary.exchange_dropped == 0
             {
                 break;
             }
@@ -179,6 +213,7 @@ impl SyncAgent {
 
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
         let config_version = self.cached_config_version();
+        let telemetry = self.compose_heartbeat_telemetry();
         let request = HeartbeatRequest {
             agent_instance_id: self.config.agent_instance_id.clone(),
             proxy_version: self.config.proxy_version.clone(),
@@ -186,11 +221,7 @@ impl SyncAgent {
             os: Some(std::env::consts::OS.to_string()),
             hostname: resolve_hostname(),
             active_connections: None,
-            telemetry: self
-                .config
-                .heartbeat_telemetry
-                .as_ref()
-                .and_then(|provider| provider()),
+            telemetry,
         };
 
         match self.heartbeat_sender.send(&request).await {
@@ -215,14 +246,49 @@ impl SyncAgent {
         }
     }
 
-    async fn sync_exchange_queue_once(&self) -> anyhow::Result<(usize, usize)> {
+    fn compose_heartbeat_telemetry(&self) -> Option<HeartbeatTelemetry> {
+        let mut telemetry = self
+            .config
+            .heartbeat_telemetry
+            .as_ref()
+            .and_then(|provider| provider())
+            .unwrap_or_default();
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_SENT.to_string(),
+            self.sync_exchange_sent_total.load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_BLOB_UPLOADED.to_string(),
+            self.sync_exchange_blob_uploaded_total
+                .load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_RETRY_DEFERRED.to_string(),
+            self.sync_exchange_retry_deferred_total
+                .load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_DROPPED.to_string(),
+            self.sync_exchange_dropped_total.load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_QUEUE_DEPTH.to_string(),
+            self.load_exchange_queue_depth().unwrap_or(0),
+        );
+        if telemetry.counters.is_empty() {
+            None
+        } else {
+            Some(telemetry)
+        }
+    }
+
+    async fn sync_exchange_queue_once(&self) -> anyhow::Result<ExchangeQueueStats> {
         let rows = self.load_exchange_queue_ready(self.config.metadata_max_events_per_batch)?;
         if rows.is_empty() {
-            return Ok((0, 0));
+            return Ok(ExchangeQueueStats::default());
         }
 
-        let mut exchange_sent = 0usize;
-        let mut blob_uploaded = 0usize;
+        let mut stats = ExchangeQueueStats::default();
         let config_version = self.cached_config_version();
 
         for row in rows {
@@ -234,11 +300,12 @@ impl SyncAgent {
                     blob_uploaded: uploaded,
                 }) => {
                     self.delete_exchange_queue_entry(&row.exchange_id)?;
-                    exchange_sent += 1;
-                    blob_uploaded += uploaded;
+                    stats.exchange_sent += 1;
+                    stats.exchange_blob_uploaded += uploaded;
                 }
                 Ok(ExchangeQueueOutcome::Retry { reason }) => {
                     self.mark_exchange_queue_attempt(&row.exchange_id, row.attempt_count)?;
+                    stats.exchange_retry_deferred += 1;
                     warn!(
                         exchange_id = %row.exchange_id,
                         attempt = row.attempt_count.saturating_add(1),
@@ -247,6 +314,7 @@ impl SyncAgent {
                     );
                 }
                 Ok(ExchangeQueueOutcome::Drop { reason }) => {
+                    stats.exchange_dropped += 1;
                     warn!(
                         exchange_id = %row.exchange_id,
                         reason = %reason,
@@ -265,10 +333,10 @@ impl SyncAgent {
             }
         }
 
-        if exchange_sent > 0 {
+        if stats.exchange_sent > 0 {
             self.mark_sync_success()?;
         }
-        Ok((exchange_sent, blob_uploaded))
+        Ok(stats)
     }
 
     async fn process_exchange_queue_row(
@@ -409,6 +477,18 @@ impl SyncAgent {
         Ok(out)
     }
 
+    fn load_exchange_queue_depth(&self) -> anyhow::Result<u64> {
+        let conn = open_read_conn(&self.config.event_db_path)?;
+        let depth = match conn.query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(count) => count.max(0) as u64,
+            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => 0,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(depth)
+    }
+
     fn mark_exchange_queue_attempt(
         &self,
         exchange_id: &str,
@@ -507,6 +587,41 @@ fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
         warn!(
             deleted_rows = deleted_total,
             "Pruned legacy non-UUID exchange rows from local event database"
+        );
+    }
+    Ok(())
+}
+
+fn run_exchange_spool_stale_cleanup(
+    path: &Path,
+    max_age: Duration,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let conn = open_rw_conn(path)?;
+    if !sqlite_table_exists(&conn, "exchange_spool")? {
+        return Ok(());
+    }
+
+    let age_secs = max_age.as_secs().max(1) as i64;
+    let deleted = conn.execute(
+        r#"
+        DELETE FROM exchange_spool
+        WHERE exchange_id IN (
+            SELECT exchange_id
+            FROM exchange_spool
+            WHERE finalized_at IS NULL
+              AND updated_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('-%d seconds', ?1))
+            ORDER BY updated_at ASC
+            LIMIT ?2
+        )
+        "#,
+        params![age_secs, limit.max(1) as i64],
+    )?;
+    if deleted > 0 {
+        warn!(
+            deleted_rows = deleted,
+            age_secs = age_secs,
+            "Pruned stale in-flight exchange spool rows during sync startup"
         );
     }
     Ok(())

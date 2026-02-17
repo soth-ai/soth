@@ -338,14 +338,16 @@ pub fn spawn_cloud_pull_runtime(
                             agent.flush_for_shutdown(FINAL_CLOUD_SYNC_MAX_ROUNDS),
                         ).await {
                             Ok(Ok(summary)) => {
-                                if summary.metadata_sent > 0
-                                    || summary.body_uploaded > 0
-                                    || summary.retry_uploaded > 0
+                                if summary.exchange_sent > 0
+                                    || summary.exchange_blob_uploaded > 0
+                                    || summary.exchange_retry_deferred > 0
+                                    || summary.exchange_dropped > 0
                                 {
                                     info!(
-                                        metadata_sent = summary.metadata_sent,
-                                        body_uploaded = summary.body_uploaded,
-                                        retry_uploaded = summary.retry_uploaded,
+                                        exchange_sent = summary.exchange_sent,
+                                        exchange_blob_uploaded = summary.exchange_blob_uploaded,
+                                        exchange_retry_deferred = summary.exchange_retry_deferred,
+                                        exchange_dropped = summary.exchange_dropped,
                                         "Final cloud sync flush on shutdown"
                                     );
                                 }
@@ -419,14 +421,16 @@ pub fn spawn_cloud_pull_runtime(
                         match agent.tick().await {
                             Ok(summary) => {
                                 sync_backoff.record_success();
-                                if summary.metadata_sent > 0
-                                    || summary.body_uploaded > 0
-                                    || summary.retry_uploaded > 0
+                                if summary.exchange_sent > 0
+                                    || summary.exchange_blob_uploaded > 0
+                                    || summary.exchange_retry_deferred > 0
+                                    || summary.exchange_dropped > 0
                                 {
                                     info!(
-                                        metadata_sent = summary.metadata_sent,
-                                        body_uploaded = summary.body_uploaded,
-                                        retry_uploaded = summary.retry_uploaded,
+                                        exchange_sent = summary.exchange_sent,
+                                        exchange_blob_uploaded = summary.exchange_blob_uploaded,
+                                        exchange_retry_deferred = summary.exchange_retry_deferred,
+                                        exchange_dropped = summary.exchange_dropped,
                                         "Cloud sync tick"
                                     );
                                 }
