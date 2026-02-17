@@ -1,18 +1,28 @@
 //! CLI command implementations
 
+#[cfg(feature = "ops")]
 pub mod audit;
+#[cfg(feature = "ops")]
 pub mod budget;
 pub mod cloud_hooks;
+#[cfg(feature = "ops")]
 pub mod config;
 pub mod enforcement;
+#[cfg(feature = "ops")]
 pub mod enroll;
+#[cfg(feature = "ops")]
 pub mod identity;
 pub mod init;
+#[cfg(feature = "ops")]
 pub mod install;
+#[cfg(feature = "ops")]
 pub mod login;
+#[cfg(feature = "ops")]
 pub mod policy;
 pub mod proxy;
+#[cfg(feature = "ops")]
 pub mod session;
+#[cfg(feature = "ops")]
 pub mod setup;
 #[cfg(feature = "local-debug")]
 pub mod test;

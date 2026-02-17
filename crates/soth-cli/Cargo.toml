@@ -4,14 +4,25 @@ description = "CLI entry point for SOTH edge proxy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "soth"
 
 [[bin]]
 name = "soth"
+path = "src/main_sensor.rs"
+required-features = ["sensor"]
+
+[[bin]]
+name = "soth-ops"
 path = "src/main.rs"
+required-features = ["ops"]
 
 [features]
+default = ["sensor"]
+sensor = []
+ops = ["dep:reqwest"]
 monitoring = ["soth-proxy/monitoring"]
 local-debug = [
+    "ops",
     "dep:soth-dashboard",
     "dep:ratatui",
     "dep:crossterm",
@@ -31,7 +42,6 @@ soth-oisp = { workspace = true }
 soth-sync = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -45,7 +55,7 @@ x509-parser = { workspace = true }
 sha2 = { workspace = true }
 hex = "0.4"
 dirs = "5.0"
-reqwest = { workspace = true }
+reqwest = { workspace = true, optional = true }
 rusqlite = { workspace = true }
 
 # CLI styling
@@ -61,9 +71,6 @@ crossterm = { version = "0.28", optional = true }
 # System utilities
 which = "6.0"
 libc = "0.2"
-
-# File watching
-notify = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

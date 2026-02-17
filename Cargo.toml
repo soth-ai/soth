@@ -54,7 +54,18 @@ soth-dashboard = { path = "crates/soth-dashboard" }
 soth-sync = { path = "crates/soth-sync" }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "net",
+    "sync",
+    "fs",
+    "time",
+    "process",
+    "io-util",
+    "io-std",
+] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 async-trait = "0.1"
 async-stream = "0.3"
@@ -79,7 +90,16 @@ wasmtime = "17"
 axum = { version = "0.7", features = ["ws"] }
 tower = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "rustls-tls",
+    "http2",
+    "charset",
+    "gzip",
+    "brotli",
+    "zstd",
+] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"

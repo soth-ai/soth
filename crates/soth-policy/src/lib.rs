@@ -10,6 +10,7 @@ pub mod cache;
 pub mod compiler;
 pub mod engine;
 pub mod loader;
+#[cfg(feature = "opa-wasm")]
 pub mod wasm;
 
 pub use cache::{CacheConfig, CacheMetrics, DecisionCache};
