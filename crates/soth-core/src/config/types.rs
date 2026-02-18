@@ -1367,6 +1367,10 @@ pub struct ForwardProxyConfig {
     /// Tunnel-only debug logging controls (metadata only; no body capture).
     #[serde(default)]
     pub tunnel_debug: TunnelDebugConfig,
+
+    /// Register runtime autostart (launchd/systemd/Run key) when starting daemon mode.
+    #[serde(default = "default_true")]
+    pub autostart_on_boot: bool,
 }
 
 fn default_forward_proxy_port() -> u16 {
@@ -1412,6 +1416,7 @@ impl Default for ForwardProxyConfig {
             capture_max_body_bytes: default_forward_proxy_capture_max_body_bytes(),
             process_attribution: ProcessAttributionConfig::default(),
             tunnel_debug: TunnelDebugConfig::default(),
+            autostart_on_boot: default_true(),
         }
     }
 }

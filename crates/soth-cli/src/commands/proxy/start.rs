@@ -37,6 +37,7 @@ pub async fn run(
     intercept_all: bool,
     intercept_all_for: Option<u64>,
     daemon_child: bool,
+    no_autostart: bool,
 ) -> anyhow::Result<()> {
     if !foreground && !daemon_child {
         return daemon::run_start_daemon(
@@ -45,6 +46,7 @@ pub async fn run(
             quiet,
             intercept_all,
             intercept_all_for,
+            no_autostart,
         )
         .await;
     }

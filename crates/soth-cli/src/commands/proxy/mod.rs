@@ -1,6 +1,7 @@
 //! Shared runtime/dev command handlers used by the SOTH CLI command tree.
 
 use crate::cli_config;
+use crate::style;
 #[cfg(feature = "local-debug")]
 mod api;
 mod autostart;
@@ -129,6 +130,7 @@ pub async fn run_start_internal(
     intercept_all: bool,
     intercept_all_for: Option<u64>,
     daemon_child: bool,
+    no_autostart: bool,
 ) -> anyhow::Result<()> {
     start::run(
         port,
@@ -138,6 +140,7 @@ pub async fn run_start_internal(
         intercept_all,
         intercept_all_for,
         daemon_child,
+        no_autostart,
     )
     .await
 }
@@ -173,6 +176,56 @@ pub async fn run_status(config: Option<PathBuf>) -> anyhow::Result<()> {
 
 pub async fn run_ca_info(config: Option<PathBuf>) -> anyhow::Result<()> {
     ca_info::run(config).await
+}
+
+/// Runtime autostart actions
+#[derive(Subcommand)]
+pub enum AutostartAction {
+    /// Enable startup autostart (launchd/systemd/Run key)
+    Enable {
+        /// Sensor port override (uses configured port when omitted)
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Disable startup autostart registration
+    Disable,
+
+    /// Show startup autostart registration status
+    Status,
+}
+
+pub async fn run_autostart(
+    action: AutostartAction,
+    global_config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    match action {
+        AutostartAction::Enable { port, config } => {
+            let effective_config = config.or(global_config);
+            let selected_port = if let Some(value) = port {
+                value
+            } else {
+                cli_config::load_effective_config(effective_config.as_ref(), None)?
+                    .forward_proxy
+                    .port
+            };
+            let details = autostart::ensure_enabled(selected_port, effective_config.as_ref())?;
+            style::success(&format!("Startup autostart enabled: {details}"));
+        }
+        AutostartAction::Disable => match autostart::disable_managed_autostart()? {
+            Some(details) => style::success(&format!("Startup autostart disabled: {details}")),
+            None => style::info("Startup autostart unsupported on this OS."),
+        },
+        AutostartAction::Status => {
+            let details = autostart::managed_status()?;
+            style::info(&format!("Startup autostart status: {details}"));
+        }
+    }
+    Ok(())
 }
 
 /// API service actions

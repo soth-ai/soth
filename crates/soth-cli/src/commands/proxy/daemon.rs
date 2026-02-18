@@ -167,6 +167,15 @@ fn resolve_expected_port(port: Option<u16>, config_path: Option<&PathBuf>) -> u1
         .unwrap_or(DEFAULT_PROXY_PORT)
 }
 
+fn resolve_autostart_enabled(no_autostart: bool, config_path: Option<&PathBuf>) -> bool {
+    if no_autostart {
+        return false;
+    }
+    cli_config::load_effective_config(config_path, None)
+        .map(|cfg| cfg.forward_proxy.autostart_on_boot)
+        .unwrap_or(true)
+}
+
 fn proxy_log_rotation_limits() -> (u64, usize) {
     let max_bytes = parse_env_u64("SOTH_PROXY_LOG_MAX_BYTES")
         .unwrap_or(DEFAULT_PROXY_LOG_MAX_BYTES)
@@ -374,7 +383,7 @@ fn is_expected_daemon_process(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn is_listener_owned_by_pid(port: u16, pid: u32) -> Option<bool> {
+fn listener_owner_pids(port: u16) -> Option<Vec<u32>> {
     let output = Command::new("lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
         .output()
@@ -382,12 +391,29 @@ fn is_listener_owned_by_pid(port: u16, pid: u32) -> Option<bool> {
     if !output.status.success() {
         return None;
     }
-    let owned = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix('p'))
-        .filter_map(|value| value.parse::<u32>().ok())
-        .any(|owner_pid| owner_pid == pid);
-    Some(owned)
+    let mut owners = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(pid) = line
+            .strip_prefix('p')
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            owners.push(pid);
+        }
+    }
+    owners.sort_unstable();
+    owners.dedup();
+    Some(owners)
+}
+
+#[cfg(not(unix))]
+fn listener_owner_pids(_port: u16) -> Option<Vec<u32>> {
+    None
+}
+
+#[cfg(unix)]
+fn is_listener_owned_by_pid(port: u16, pid: u32) -> Option<bool> {
+    let owners = listener_owner_pids(port)?;
+    Some(owners.into_iter().any(|owner_pid| owner_pid == pid))
 }
 
 #[cfg(not(unix))]
@@ -545,34 +571,65 @@ fn print_env_cleanup_hint_if_needed() {
     }
 }
 
+fn adopt_running_daemon_state(expected_port: u16, quiet: bool) -> anyhow::Result<Option<u32>> {
+    let owners = listener_owner_pids(expected_port).unwrap_or_default();
+    if owners.len() != 1 {
+        return Ok(None);
+    }
+    let pid = owners[0];
+    if !is_expected_daemon_process(pid) {
+        return Ok(None);
+    }
+    let owner_token = uuid::Uuid::new_v4().to_string();
+    write_pid(pid)?;
+    write_pid_owner_token(&owner_token)?;
+    let _ = write_pid_metadata(pid, expected_port, &owner_token);
+    if !quiet {
+        style::warning(&format!(
+            "Recovered missing daemon pid state from running listener (pid {}, port {}).",
+            pid, expected_port
+        ));
+    }
+    Ok(Some(pid))
+}
+
 pub async fn run_start_daemon(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     quiet: bool,
     intercept_all: bool,
     intercept_all_for: Option<u64>,
+    no_autostart: bool,
 ) -> anyhow::Result<()> {
     ensure_runtime_dirs()?;
     let _lifecycle_lock = acquire_lifecycle_lock()?;
 
     let expected_port = resolve_expected_port(port, config_path.as_ref());
+    let autostart_enabled = resolve_autostart_enabled(no_autostart, config_path.as_ref());
+    if read_pid()?.is_none() && trusted_pid_from_metadata().is_none() {
+        let _ = adopt_running_daemon_state(expected_port, quiet);
+    }
 
     if let Some(pid) = read_pid()? {
         if is_expected_daemon_process(pid) {
-            let autostart_result =
-                super::autostart::ensure_enabled(expected_port, config_path.as_ref());
             if !quiet {
                 style::success(&format!("Proxy daemon already running (pid {pid})."));
                 style::info(&format!(
                     "Logs: {} (use `soth logs -f`)",
                     compact_path(&log_path())
                 ));
-                match autostart_result {
-                    Ok(details) => style::info(&format!("Startup autostart ensured: {details}")),
-                    Err(error) => style::warning(&format!(
-                        "Could not register startup autostart (continuing): {}",
-                        error
-                    )),
+                if autostart_enabled {
+                    match super::autostart::ensure_enabled(expected_port, config_path.as_ref()) {
+                        Ok(details) => {
+                            style::info(&format!("Startup autostart ensured: {details}"))
+                        }
+                        Err(error) => style::warning(&format!(
+                            "Could not register startup autostart (continuing): {}",
+                            error
+                        )),
+                    }
+                } else {
+                    style::info("Startup autostart skipped (disabled via flag/config).");
                 }
             }
             return Ok(());
@@ -606,6 +663,48 @@ pub async fn run_start_daemon(
                 } else {
                     style::warning(&format!(
                         "Could not stop orphan daemon pid {pid}; startup may fail."
+                    ));
+                }
+            }
+        }
+    }
+
+    if autostart_enabled && super::autostart::supports_managed_mode() {
+        match super::autostart::start_managed(expected_port, config_path.as_ref()) {
+            Ok(details) => {
+                let startup_timeout = daemon_startup_timeout();
+                let startup_deadline = std::time::Instant::now() + startup_timeout;
+                while !is_local_listener_ready(expected_port) {
+                    if std::time::Instant::now() >= startup_deadline {
+                        return Err(anyhow!(
+                            "managed proxy startup did not open 127.0.0.1:{} within {}s timeout; check {}",
+                            expected_port,
+                            startup_timeout.as_secs(),
+                            compact_path(&log_path())
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(120));
+                }
+
+                let _ = adopt_running_daemon_state(expected_port, true);
+                if !quiet {
+                    let pid_text = read_pid()?
+                        .map(|pid| format!(" (pid {pid})"))
+                        .unwrap_or_default();
+                    style::success(&format!("Proxy managed service started{pid_text}."));
+                    style::kv("Logs", &compact_path(&log_path()));
+                    style::kv("Control", "soth stop");
+                    style::kv("Tail", "soth logs -f");
+                    style::info(&format!("Startup autostart ensured: {details}"));
+                    print_env_setup_hint_if_needed();
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                if !quiet {
+                    style::warning(&format!(
+                        "Managed startup unavailable (falling back to daemon-child): {}",
+                        error
                     ));
                 }
             }
@@ -729,20 +828,24 @@ pub async fn run_start_daemon(
         print_env_setup_hint_if_needed();
     }
 
-    match super::autostart::ensure_enabled(expected_port, config_path.as_ref()) {
-        Ok(details) => {
-            if !quiet {
-                style::info(&format!("Startup autostart ensured: {details}"));
+    if autostart_enabled {
+        match super::autostart::ensure_enabled(expected_port, config_path.as_ref()) {
+            Ok(details) => {
+                if !quiet {
+                    style::info(&format!("Startup autostart ensured: {details}"));
+                }
+            }
+            Err(error) => {
+                if !quiet {
+                    style::warning(&format!(
+                        "Could not register startup autostart (continuing): {}",
+                        error
+                    ));
+                }
             }
         }
-        Err(error) => {
-            if !quiet {
-                style::warning(&format!(
-                    "Could not register startup autostart (continuing): {}",
-                    error
-                ));
-            }
-        }
+    } else if !quiet {
+        style::info("Startup autostart skipped (disabled via flag/config).");
     }
 
     Ok(())
@@ -752,6 +855,20 @@ pub async fn run_stop() -> anyhow::Result<()> {
     ensure_runtime_dirs()?;
     let _lifecycle_lock = acquire_lifecycle_lock()?;
     let mut stopped_any = false;
+
+    match super::autostart::stop_managed_runtime_only() {
+        Ok(Some(details)) => style::info(&format!("Managed runtime stop: {details}")),
+        Ok(None) => {}
+        Err(error) => style::warning(&format!(
+            "Could not stop managed runtime cleanly (continuing): {}",
+            error
+        )),
+    }
+
+    if read_pid()?.is_none() && trusted_pid_from_metadata().is_none() {
+        let expected_port = resolve_expected_port(None, None);
+        let _ = adopt_running_daemon_state(expected_port, true);
+    }
 
     let Some(pid) = read_pid()? else {
         let owned_orphan = trusted_pid_from_metadata();
@@ -991,7 +1108,7 @@ mod tests {
                 .build()
                 .expect("runtime");
             let err = runtime
-                .block_on(run_start_daemon(Some(18888), None, true, false, None))
+                .block_on(run_start_daemon(Some(18888), None, true, false, None, true))
                 .expect_err("daemon start should fail in unit test binary");
             let text = format!("{err:#}");
             assert!(

@@ -86,6 +86,10 @@ enum Commands {
         /// Internal daemon child execution mode (hidden)
         #[arg(long, hide = true)]
         daemon_child: bool,
+
+        /// Do not register startup autostart (launchd/systemd/Run key)
+        #[arg(long)]
+        no_autostart: bool,
     },
 
     /// Bootstrap prerequisites and start the sensor lifecycle
@@ -129,6 +133,10 @@ enum Commands {
         /// Optional machine name override sent during enrollment
         #[arg(long)]
         machine_name: Option<String>,
+
+        /// Do not register startup autostart (launchd/systemd/Run key)
+        #[arg(long)]
+        no_autostart: bool,
     },
 
     /// Stop the sensor lifecycle and restore direct network path
@@ -203,6 +211,12 @@ enum RuntimeCommands {
         /// Config file path
         #[arg(short, long)]
         config: Option<PathBuf>,
+    },
+
+    /// Manage startup autostart registration
+    Autostart {
+        #[command(subcommand)]
+        action: commands::proxy::AutostartAction,
     },
 }
 
@@ -484,6 +498,9 @@ async fn async_main() -> anyhow::Result<()> {
             RuntimeCommands::CaInfo { config } => {
                 commands::proxy::run_ca_info(config.or(cli.config.clone())).await?;
             }
+            RuntimeCommands::Autostart { action } => {
+                commands::proxy::run_autostart(action, cli.config.clone()).await?;
+            }
         },
         Commands::Start {
             port,
@@ -493,6 +510,7 @@ async fn async_main() -> anyhow::Result<()> {
             intercept_all,
             intercept_all_for,
             daemon_child,
+            no_autostart,
         } => {
             commands::proxy::run_start_internal(
                 port,
@@ -502,6 +520,7 @@ async fn async_main() -> anyhow::Result<()> {
                 intercept_all,
                 intercept_all_for,
                 daemon_child,
+                no_autostart,
             )
             .await?;
         }
@@ -516,6 +535,7 @@ async fn async_main() -> anyhow::Result<()> {
             enroll_token_stdin,
             enroll_endpoint,
             machine_name,
+            no_autostart,
         } => {
             let effective_config = ensure_config_for_up(config, cli.config.clone(), quiet).await?;
 
@@ -549,6 +569,7 @@ async fn async_main() -> anyhow::Result<()> {
                     intercept_all,
                     intercept_all_for,
                     false,
+                    no_autostart,
                 )
                 .await?;
             } else {
@@ -560,6 +581,7 @@ async fn async_main() -> anyhow::Result<()> {
                     intercept_all,
                     intercept_all_for,
                     false,
+                    no_autostart,
                 )
                 .await?;
                 commands::proxy::run_on(port, effective_config).await?;

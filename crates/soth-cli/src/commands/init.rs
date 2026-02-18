@@ -13,6 +13,7 @@ forward_proxy:
   enabled: true
   address: "127.0.0.1"
   port: 8080
+  autostart_on_boot: true
   capture_max_body_bytes: 15728640
   process_attribution:
     enabled: true

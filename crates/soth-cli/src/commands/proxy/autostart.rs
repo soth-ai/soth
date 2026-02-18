@@ -21,7 +21,7 @@ fn resolve_abs_path(path: &Path) -> Result<PathBuf> {
 fn build_args(port: u16, config_path: Option<&PathBuf>) -> Result<Vec<String>> {
     let mut args = vec![
         "start".to_string(),
-        "--foreground".to_string(),
+        "--daemon-child".to_string(),
         "--quiet".to_string(),
         "--port".to_string(),
         port.to_string(),
@@ -59,6 +59,251 @@ pub fn ensure_enabled(port: u16, config_path: Option<&PathBuf>) -> Result<String
         let _ = args;
         Ok("autostart unsupported on this OS".to_string())
     }
+}
+
+pub fn supports_managed_mode() -> bool {
+    cfg!(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    ))
+}
+
+pub fn start_managed(port: u16, config_path: Option<&PathBuf>) -> Result<String> {
+    ensure_enabled(port, config_path)
+}
+
+pub fn stop_managed_runtime_only() -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        return stop_macos_launch_agent_runtime_only().map(Some);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return stop_linux_runtime_only().map(Some);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(Some(
+            "windows runtime stop is handled by pid lifecycle; autostart registration preserved"
+                .to_string(),
+        ));
+    }
+    #[allow(unreachable_code)]
+    Ok(None)
+}
+
+pub fn disable_managed_autostart() -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        return stop_macos_launch_agent().map(Some);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return stop_linux_autostart().map(Some);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return stop_windows_autostart().map(Some);
+    }
+    #[allow(unreachable_code)]
+    Ok(None)
+}
+
+pub fn managed_status() -> Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
+        let label = "ai.soth.proxy";
+        let plist_path = home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{label}.plist"));
+        let state = if plist_path.exists() {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        return Ok(format!("launchd {state} ({label})"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            let unit_path = home
+                .join(".config")
+                .join("systemd")
+                .join("user")
+                .join(format!("{SERVICE_NAME}.service"));
+            if unit_path.exists() {
+                return Ok(format!(
+                    "systemd --user enabled ({SERVICE_NAME}) at {}",
+                    unit_path.display()
+                ));
+            }
+            let desktop_path = home
+                .join(".config")
+                .join("autostart")
+                .join("soth-proxy.desktop");
+            if desktop_path.exists() {
+                return Ok(format!(
+                    "XDG autostart enabled at {}",
+                    desktop_path.display()
+                ));
+            }
+        }
+        return Ok("linux autostart disabled".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let output = Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "SothProxy",
+            ])
+            .creation_flags(0x08000000)
+            .output()
+            .context("failed querying Windows startup Run key")?;
+        if output.status.success() {
+            return Ok("windows Run key enabled (HKCU\\...\\Run\\SothProxy)".to_string());
+        }
+        return Ok("windows Run key disabled (HKCU\\...\\Run\\SothProxy)".to_string());
+    }
+    #[allow(unreachable_code)]
+    Ok("autostart unsupported on this OS".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_macos_launch_agent() -> Result<String> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
+    let label = "ai.soth.proxy";
+    let plist_path = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{label}.plist"));
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let gui_target = format!("gui/{uid}/{label}");
+    let user_target = format!("user/{uid}/{label}");
+
+    let _ = launchctl_silent(["bootout", &gui_target]);
+    let _ = launchctl_silent(["bootout", &user_target]);
+    let _ = launchctl_silent(["disable", &gui_target]);
+    let _ = launchctl_silent(["disable", &user_target]);
+
+    if plist_path.exists() {
+        let _ = std::fs::remove_file(&plist_path);
+    }
+
+    Ok(format!("launchd disabled ({label})"))
+}
+
+#[cfg(target_os = "macos")]
+fn stop_macos_launch_agent_runtime_only() -> Result<String> {
+    let label = "ai.soth.proxy";
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let gui_target = format!("gui/{uid}/{label}");
+    let user_target = format!("user/{uid}/{label}");
+    let _ = launchctl_silent(["bootout", &gui_target]);
+    let _ = launchctl_silent(["bootout", &user_target]);
+    Ok(format!(
+        "launchd stopped ({label}); startup registration preserved"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_silent<const N: usize>(args: [&str; N]) -> Result<()> {
+    let output = Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("failed running launchctl")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("no such process")
+        || stderr.contains("could not find service")
+        || stderr.contains("service is disabled")
+        || stderr.contains("not loaded")
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "launchctl failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_autostart() -> Result<String> {
+    if which::which("systemctl").is_ok() {
+        let _ = run_linux_cmd(&["systemctl", "--user", "disable", "--now", SERVICE_NAME]);
+        if let Some(home) = dirs::home_dir() {
+            let unit_path = home
+                .join(".config")
+                .join("systemd")
+                .join("user")
+                .join(format!("{SERVICE_NAME}.service"));
+            if unit_path.exists() {
+                let _ = std::fs::remove_file(&unit_path);
+            }
+            let _ = run_linux_cmd(&["systemctl", "--user", "daemon-reload"]);
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let desktop_path = home
+            .join(".config")
+            .join("autostart")
+            .join("soth-proxy.desktop");
+        if desktop_path.exists() {
+            let _ = std::fs::remove_file(&desktop_path);
+        }
+    }
+
+    Ok("linux autostart disabled".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_runtime_only() -> Result<String> {
+    if which::which("systemctl").is_ok() {
+        let _ = run_linux_cmd(&["systemctl", "--user", "stop", SERVICE_NAME]);
+        return Ok(format!(
+            "systemd --user stopped ({SERVICE_NAME}); startup registration preserved"
+        ));
+    }
+    Ok("linux runtime stop handled by pid lifecycle; autostart registration preserved".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_autostart() -> Result<String> {
+    use std::os::windows::process::CommandExt;
+
+    let output = Command::new("reg")
+        .args([
+            "delete",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "SothProxy",
+            "/f",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .context("failed removing Windows startup Run key")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if !stderr.contains("unable to find the specified registry key")
+            && !stderr.contains("unable to find the specified value")
+        {
+            anyhow::bail!(
+                "failed deleting Windows startup Run key: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    Ok("windows Run key removed (HKCU\\...\\Run\\SothProxy)".to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -117,9 +362,8 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
     let gui_target = format!("gui/{uid}/{label}");
     let user_target = format!("user/{uid}/{label}");
 
-    let _ = Command::new("launchctl")
-        .args(["bootout", &gui_target])
-        .status();
+    let _ = launchctl_silent(["bootout", &gui_target]);
+    let _ = launchctl_silent(["bootout", &user_target]);
 
     let bootstrap_gui = Command::new("launchctl")
         .args([
@@ -328,9 +572,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_args_includes_foreground_and_port() {
+    fn build_args_includes_daemon_child_and_port() {
         let args = build_args(8080, None).expect("args");
-        assert!(args.iter().any(|v| v == "--foreground"));
+        assert!(args.iter().any(|v| v == "--daemon-child"));
         assert!(args.iter().any(|v| v == "--quiet"));
         assert!(args.iter().any(|v| v == "8080"));
     }
