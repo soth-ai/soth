@@ -566,7 +566,6 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
         Commands::Down => {
-            commands::proxy::run_off().await?;
             commands::proxy::run_stop().await?;
         }
         Commands::Stop => {

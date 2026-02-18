@@ -19,6 +19,7 @@ const MACOS_NETWORK_SERVICES: &[&str] = &["Wi-Fi", "Ethernet", "USB 10/100/1000 
 /// Default proxy port
 const DEFAULT_PROXY_PORT: u16 = 8080;
 const SYSTEM_PROXY_STATE_FILE: &str = "system_proxy_state.json";
+const SYSTEM_PROXY_OWNER_FILE: &str = "system_proxy_owner.id";
 
 /// Domains to bypass proxy (localhost and local network).
 const PROXY_BYPASS_DOMAINS: &[&str] = &[
@@ -46,7 +47,7 @@ const PROXY_BYPASS_DOMAINS: &[&str] = &[
     "172.31.*",
 ];
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SystemProxyState {
     schema_version: u32,
@@ -54,10 +55,15 @@ struct SystemProxyState {
     owner_id: String,
     created_at_unix_secs: u64,
     port: u16,
+    #[cfg(target_os = "macos")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     macos: Option<MacosProxySnapshot>,
+    #[cfg(target_os = "linux")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     linux: Option<LinuxProxySnapshot>,
+    #[cfg(target_os = "windows")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows: Option<WindowsProxySnapshot>,
 }
 
 #[cfg(target_os = "macos")]
@@ -75,7 +81,7 @@ struct MacosServiceSnapshot {
     bypass_domains: Vec<String>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProxyEndpointSnapshot {
     enabled: bool,
@@ -92,6 +98,14 @@ struct LinuxProxySnapshot {
     http: ProxyEndpointSnapshot,
     https: ProxyEndpointSnapshot,
     ignore_hosts: Vec<String>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WindowsProxySnapshot {
+    enabled: bool,
+    proxy_server: Option<String>,
+    proxy_override: Option<String>,
 }
 
 /// Enable system proxy settings
@@ -232,7 +246,7 @@ fn get_ca_path() -> PathBuf {
         .join("ca.crt")
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn system_proxy_state_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -241,7 +255,7 @@ fn system_proxy_state_path() -> PathBuf {
         .join(SYSTEM_PROXY_STATE_FILE)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn load_system_proxy_state() -> Result<Option<SystemProxyState>> {
     let path = system_proxy_state_path();
     if !path.exists() {
@@ -254,7 +268,7 @@ fn load_system_proxy_state() -> Result<Option<SystemProxyState>> {
     Ok(Some(state))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn save_system_proxy_state(state: &SystemProxyState) -> Result<()> {
     let path = system_proxy_state_path();
     if let Some(parent) = path.parent() {
@@ -268,18 +282,87 @@ fn save_system_proxy_state(state: &SystemProxyState) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn remove_system_proxy_state() {
     let _ = std::fs::remove_file(system_proxy_state_path());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|v| v.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn system_proxy_owner_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".soth")
+        .join("run")
+        .join(SYSTEM_PROXY_OWNER_FILE)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn load_system_proxy_owner_id() -> Result<Option<String>> {
+    let path = system_proxy_owner_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed reading system proxy owner id {}", path.display()))?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value.to_string()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn save_system_proxy_owner_id(owner_id: &str) -> Result<()> {
+    let path = system_proxy_owner_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed creating proxy owner directory {}", parent.display())
+        })?;
+    }
+    std::fs::write(&path, format!("{owner_id}\n"))
+        .with_context(|| format!("failed writing system proxy owner id {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn local_system_proxy_owner_id() -> Result<String> {
+    if let Some(owner_id) = load_system_proxy_owner_id()? {
+        return Ok(owner_id);
+    }
+    let owner_id = uuid::Uuid::new_v4().to_string();
+    save_system_proxy_owner_id(&owner_id)?;
+    Ok(owner_id)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn assert_state_owner_matches_local(state: &SystemProxyState) -> Result<()> {
+    match load_system_proxy_owner_id()? {
+        Some(local_owner_id) => {
+            if local_owner_id == state.owner_id {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "system proxy state owner mismatch (state={}, local={}): refusing restore",
+                    state.owner_id,
+                    local_owner_id
+                )
+            }
+        }
+        None => {
+            // One-time migration for older installs without explicit owner marker.
+            save_system_proxy_owner_id(&state.owner_id)?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -314,16 +397,24 @@ async fn configure_macos_proxy(enable: bool, port: u16, print_user_output: bool)
     let services = get_macos_network_services()?;
 
     if enable {
-        if load_system_proxy_state()?.is_none() {
+        if let Some(existing_state) = load_system_proxy_state()? {
+            if existing_state.platform != "macos" {
+                anyhow::bail!(
+                    "system proxy state exists for platform {} and cannot be modified by macOS flow",
+                    existing_state.platform
+                );
+            }
+            assert_state_owner_matches_local(&existing_state)?;
+        } else {
             let snapshot = capture_macos_proxy_snapshot(&services)?;
+            let owner_id = local_system_proxy_owner_id()?;
             let state = SystemProxyState {
                 schema_version: 1,
                 platform: "macos".to_string(),
-                owner_id: uuid::Uuid::new_v4().to_string(),
+                owner_id,
                 created_at_unix_secs: now_unix_secs(),
                 port,
                 macos: Some(snapshot),
-                linux: None,
             };
             save_system_proxy_state(&state)?;
         }
@@ -346,17 +437,23 @@ async fn configure_macos_proxy(enable: bool, port: u16, print_user_output: bool)
         }
     } else if let Some(state) = load_system_proxy_state()? {
         if state.platform == "macos" {
+            assert_state_owner_matches_local(&state)?;
             if let Some(snapshot) = state.macos.as_ref() {
                 restore_macos_proxy_snapshot(snapshot)?;
             } else {
-                disable_macos_proxy_without_snapshot(&services)?;
+                anyhow::bail!(
+                    "system proxy state found for macOS but snapshot payload is missing; refusing blind proxy disable"
+                );
             }
             remove_system_proxy_state();
         } else {
-            disable_macos_proxy_without_snapshot(&services)?;
+            anyhow::bail!(
+                "system proxy state exists for platform {} and cannot be safely restored on macOS",
+                state.platform
+            );
         }
     } else {
-        disable_macos_proxy_without_snapshot(&services)?;
+        anyhow::bail!("system proxy state missing; refusing blind macOS proxy disable");
     }
 
     if print_user_output {
@@ -372,19 +469,6 @@ async fn configure_macos_proxy(enable: bool, port: u16, print_user_output: bool)
         }
     }
 
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn disable_macos_proxy_without_snapshot(services: &[String]) -> Result<()> {
-    for service in services {
-        run_networksetup(&["-setwebproxystate", service, "off"])?;
-        run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
-        info!(
-            "Disabled proxy for network service without state restore: {}",
-            service
-        );
-    }
     Ok(())
 }
 
@@ -667,15 +751,23 @@ async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool)
 #[cfg(target_os = "linux")]
 fn configure_gnome_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<()> {
     if enable {
-        if load_system_proxy_state()?.is_none() {
+        if let Some(existing_state) = load_system_proxy_state()? {
+            if existing_state.platform != "linux" {
+                anyhow::bail!(
+                    "system proxy state exists for platform {} and cannot be modified by Linux flow",
+                    existing_state.platform
+                );
+            }
+            assert_state_owner_matches_local(&existing_state)?;
+        } else {
             let snapshot = capture_linux_proxy_snapshot()?;
+            let owner_id = local_system_proxy_owner_id()?;
             let state = SystemProxyState {
                 schema_version: 1,
                 platform: "linux".to_string(),
-                owner_id: uuid::Uuid::new_v4().to_string(),
+                owner_id,
                 created_at_unix_secs: now_unix_secs(),
                 port,
-                macos: None,
                 linux: Some(snapshot),
             };
             save_system_proxy_state(&state)?;
@@ -719,17 +811,23 @@ fn configure_gnome_proxy(enable: bool, port: u16, print_user_output: bool) -> Re
     } else {
         if let Some(state) = load_system_proxy_state()? {
             if state.platform == "linux" {
+                assert_state_owner_matches_local(&state)?;
                 if let Some(snapshot) = state.linux.as_ref() {
                     restore_linux_proxy_snapshot(snapshot)?;
                 } else {
-                    run_gsettings(&["set", "org.gnome.system.proxy", "mode", "'none'"])?;
+                    anyhow::bail!(
+                        "system proxy state found for linux but snapshot payload is missing; refusing blind proxy disable"
+                    );
                 }
                 remove_system_proxy_state();
             } else {
-                run_gsettings(&["set", "org.gnome.system.proxy", "mode", "'none'"])?;
+                anyhow::bail!(
+                    "system proxy state exists for platform {} and cannot be safely restored on Linux",
+                    state.platform
+                );
             }
         } else {
-            run_gsettings(&["set", "org.gnome.system.proxy", "mode", "'none'"])?;
+            anyhow::bail!("system proxy state missing; refusing blind Linux proxy disable");
         }
         if print_user_output {
             println!("   {} Restored GNOME proxy settings", style::CHECK);
@@ -826,7 +924,13 @@ fn run_gsettings(args: &[&str]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!("gsettings warning: {}", stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!(
+            "gsettings {:?} failed: {} {}",
+            args,
+            stdout.trim(),
+            stderr.trim()
+        );
     }
     Ok(())
 }
@@ -921,43 +1025,55 @@ async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: boo
     use std::os::windows::process::CommandExt;
 
     let proxy_server = format!("127.0.0.1:{}", port);
-    // Windows proxy bypass list
     let proxy_bypass = "localhost;127.0.0.1;::1;*.local;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>";
 
     if enable {
-        // Enable proxy
-        run_reg_add(
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "ProxyEnable",
-            "REG_DWORD",
-            "1",
-        )?;
-        run_reg_add(
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "ProxyServer",
-            "REG_SZ",
-            &proxy_server,
-        )?;
-        // Set proxy bypass (ProxyOverride)
-        run_reg_add(
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "ProxyOverride",
-            "REG_SZ",
-            proxy_bypass,
-        )?;
+        if let Some(existing_state) = load_system_proxy_state()? {
+            if existing_state.platform != "windows" {
+                anyhow::bail!(
+                    "system proxy state exists for platform {} and cannot be modified by Windows flow",
+                    existing_state.platform
+                );
+            }
+            assert_state_owner_matches_local(&existing_state)?;
+        } else {
+            let owner_id = local_system_proxy_owner_id()?;
+            let state = SystemProxyState {
+                schema_version: 1,
+                platform: "windows".to_string(),
+                owner_id,
+                created_at_unix_secs: now_unix_secs(),
+                port,
+                windows: Some(capture_windows_proxy_snapshot()?),
+            };
+            save_system_proxy_state(&state)?;
+        }
+        apply_windows_proxy_manual(&proxy_server, proxy_bypass)?;
         if print_user_output {
             println!("   {} Configured Windows proxy settings", style::CHECK);
         }
     } else {
-        // Disable proxy
-        run_reg_add(
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "ProxyEnable",
-            "REG_DWORD",
-            "0",
-        )?;
+        if let Some(state) = load_system_proxy_state()? {
+            if state.platform != "windows" {
+                anyhow::bail!(
+                    "system proxy state exists for platform {} and cannot be safely restored on Windows",
+                    state.platform
+                );
+            }
+            assert_state_owner_matches_local(&state)?;
+            if let Some(snapshot) = state.windows.as_ref() {
+                restore_windows_proxy_snapshot(snapshot)?;
+            } else {
+                anyhow::bail!(
+                    "system proxy state found for windows but snapshot payload is missing; refusing blind proxy disable"
+                );
+            }
+            remove_system_proxy_state();
+        } else {
+            anyhow::bail!("system proxy state missing; refusing blind Windows proxy disable");
+        }
         if print_user_output {
-            println!("   {} Disabled Windows proxy settings", style::CHECK);
+            println!("   {} Restored Windows proxy settings", style::CHECK);
         }
     }
 
@@ -967,6 +1083,189 @@ async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: boo
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output();
 
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_proxy_manual(proxy_server: &str, proxy_bypass: &str) -> Result<()> {
+    run_reg_add(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        "ProxyEnable",
+        "REG_DWORD",
+        "1",
+    )?;
+    run_reg_add(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        "ProxyServer",
+        "REG_SZ",
+        proxy_server,
+    )?;
+    run_reg_add(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        "ProxyOverride",
+        "REG_SZ",
+        proxy_bypass,
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn capture_windows_proxy_snapshot() -> Result<WindowsProxySnapshot> {
+    Ok(WindowsProxySnapshot {
+        enabled: read_windows_proxy_enabled()?,
+        proxy_server: read_windows_string_value("ProxyServer")?,
+        proxy_override: read_windows_string_value("ProxyOverride")?,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn restore_windows_proxy_snapshot(snapshot: &WindowsProxySnapshot) -> Result<()> {
+    run_reg_add(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        "ProxyEnable",
+        "REG_DWORD",
+        if snapshot.enabled { "1" } else { "0" },
+    )?;
+
+    match snapshot.proxy_server.as_deref() {
+        Some(value) if !value.trim().is_empty() => run_reg_add(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyServer",
+            "REG_SZ",
+            value,
+        )?,
+        _ => run_reg_delete(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyServer",
+        )?,
+    }
+
+    match snapshot.proxy_override.as_deref() {
+        Some(value) if !value.trim().is_empty() => run_reg_add(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyOverride",
+            "REG_SZ",
+            value,
+        )?,
+        _ => run_reg_delete(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyOverride",
+        )?,
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_reg_value(stdout: &str, value_name: &str) -> Option<(String, String)> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case(value_name) {
+            continue;
+        }
+        let Some(value_type) = parts.next() else {
+            continue;
+        };
+        let data = parts.collect::<Vec<_>>().join(" ");
+        return Some((value_type.to_string(), data.trim().to_string()));
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_reg_value(value_name: &str) -> Result<Option<(String, String)>> {
+    use std::os::windows::process::CommandExt;
+
+    let output = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "/v",
+            value_name,
+        ])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .with_context(|| format!("Failed to query registry value {value_name}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if stderr.contains("unable to find") || stderr.contains("cannot find") {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "Failed querying registry value {}: {}",
+            value_name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_windows_reg_value(&stdout, value_name))
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_proxy_enabled() -> Result<bool> {
+    let Some((value_type, value)) = query_windows_reg_value("ProxyEnable")? else {
+        return Ok(false);
+    };
+    if !value_type.eq_ignore_ascii_case("REG_DWORD") {
+        return Ok(false);
+    }
+    let normalized = value.trim();
+    if let Some(hex) = normalized
+        .strip_prefix("0x")
+        .or_else(|| normalized.strip_prefix("0X"))
+    {
+        return Ok(u32::from_str_radix(hex, 16).unwrap_or(0) != 0);
+    }
+    Ok(normalized.parse::<u32>().unwrap_or(0) != 0)
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_string_value(value_name: &str) -> Result<Option<String>> {
+    let Some((value_type, value)) = query_windows_reg_value(value_name)? else {
+        return Ok(None);
+    };
+    if !value_type.eq_ignore_ascii_case("REG_SZ")
+        && !value_type.eq_ignore_ascii_case("REG_EXPAND_SZ")
+    {
+        return Ok(None);
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+#[cfg(target_os = "windows")]
+fn run_reg_delete(key: &str, value: &str) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    let output = Command::new("reg")
+        .args(["delete", key, "/v", value, "/f"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .context("Failed to run reg delete command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if stderr.contains("unable to find") || stderr.contains("cannot find") {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Failed to delete registry value {}: {}",
+            value,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
 }
 
@@ -989,25 +1288,39 @@ fn run_reg_add(key: &str, value: &str, value_type: &str, data: &str) -> Result<(
 
 #[cfg(target_os = "windows")]
 async fn check_windows_proxy_status() -> Result<bool> {
-    use std::os::windows::process::CommandExt;
-
-    let output = Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "/v",
-            "ProxyEnable",
-        ])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .output()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.contains("0x1"))
+    read_windows_proxy_enabled()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
+        let guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env mutex poisoned");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", temp.path());
+        }
+        let result = f();
+        match old_home {
+            Some(value) => unsafe {
+                env::set_var("HOME", value);
+            },
+            None => unsafe {
+                env::remove_var("HOME");
+            },
+        }
+        drop(guard);
+        result
+    }
 
     #[test]
     fn test_get_ca_path() {
@@ -1024,5 +1337,70 @@ mod tests {
         assert!(merged.contains(&"example.com".to_string()));
         assert!(merged.contains(&"localhost".to_string()));
         assert!(merged.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn test_local_owner_id_persists() {
+        with_temp_home(|| {
+            let first = local_system_proxy_owner_id().expect("owner id");
+            let second = local_system_proxy_owner_id().expect("owner id");
+            assert_eq!(first, second);
+        });
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn test_owner_mismatch_is_rejected() {
+        with_temp_home(|| {
+            save_system_proxy_owner_id("owner-a").expect("save owner");
+            let state = SystemProxyState {
+                schema_version: 1,
+                platform: {
+                    #[cfg(target_os = "macos")]
+                    {
+                        "macos".to_string()
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        "linux".to_string()
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        "windows".to_string()
+                    }
+                },
+                owner_id: "owner-b".to_string(),
+                created_at_unix_secs: 0,
+                port: 8080,
+                #[cfg(target_os = "macos")]
+                macos: Some(MacosProxySnapshot {
+                    services: Vec::new(),
+                }),
+                #[cfg(target_os = "linux")]
+                linux: Some(LinuxProxySnapshot {
+                    mode: "none".to_string(),
+                    http: ProxyEndpointSnapshot {
+                        enabled: false,
+                        host: None,
+                        port: None,
+                    },
+                    https: ProxyEndpointSnapshot {
+                        enabled: false,
+                        host: None,
+                        port: None,
+                    },
+                    ignore_hosts: Vec::new(),
+                }),
+                #[cfg(target_os = "windows")]
+                windows: Some(WindowsProxySnapshot {
+                    enabled: false,
+                    proxy_server: None,
+                    proxy_override: None,
+                }),
+            };
+            let result = assert_state_owner_matches_local(&state);
+            assert!(result.is_err());
+        });
     }
 }

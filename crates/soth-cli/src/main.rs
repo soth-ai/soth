@@ -777,22 +777,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
         Commands::Down => {
-            let off_err = commands::proxy::run_off().await.err();
-            let stop_err = commands::proxy::run_stop().await.err();
-            match (off_err, stop_err) {
-                (None, None) => {}
-                (Some(off), None) => {
-                    return Err(off);
-                }
-                (None, Some(stop)) => {
-                    return Err(stop);
-                }
-                (Some(off), Some(stop)) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to disable system proxy: {off}; failed to stop daemon: {stop}"
-                    ));
-                }
-            }
+            commands::proxy::run_stop().await?;
         }
         Commands::Stop => {
             commands::proxy::run_stop().await?;
