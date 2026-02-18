@@ -543,7 +543,7 @@ async fn async_main() -> anyhow::Result<()> {
                 if !quiet {
                     style::info("Enrollment requested via `up`; exchanging token before startup.");
                 }
-                commands::enroll::run(
+                if let Err(error) = commands::enroll::run(
                     commands::enroll::EnrollArgs {
                         token: enroll_token,
                         endpoint: enroll_endpoint,
@@ -554,7 +554,18 @@ async fn async_main() -> anyhow::Result<()> {
                     },
                     effective_config.clone(),
                 )
-                .await?;
+                .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "Enrollment exchange failed during `up`; continuing fail-open with local runtime"
+                    );
+                    if !quiet {
+                        style::warning(&format!(
+                            "Enrollment failed during `up` (continuing fail-open): {error}"
+                        ));
+                    }
+                }
             }
 
             ensure_ca_for_up(effective_config.clone(), quiet).await?;

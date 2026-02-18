@@ -18,6 +18,7 @@ import {
   useProxyMetrics,
 } from "@/hooks/useDashboardData";
 import { useEventStream } from "@/hooks/useEventStream";
+import { normalizeEventSource } from "@/lib/event-normalize";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn, formatLatency, formatNumber, formatTimestamp } from "@/lib/utils";
 import type { WrapEvent } from "@/types";
@@ -32,11 +33,8 @@ interface SourceSummary {
   lastSeen: string;
 }
 
-function normalizeSource(value: WrapEvent["source"]): SourceKey | null {
-  if (value === "ai_proxy" || value === "mcp" || value === "agent_app") {
-    return value;
-  }
-  return null;
+function normalizeSource(event: WrapEvent): SourceKey {
+  return normalizeEventSource(event);
 }
 
 function statusTone(ok: boolean): string {
@@ -124,8 +122,7 @@ export default function DebugPage() {
     }
 
     for (const event of liveEvents) {
-      const source = normalizeSource(event.source);
-      if (!source) continue;
+      const source = normalizeSource(event);
       const row = rows.get(source)!;
       row.total += 1;
       if ((event.status_code ?? 0) >= 500) row.errors += 1;
@@ -152,6 +149,45 @@ export default function DebugPage() {
     }
 
     return [...rows.values()];
+  }, [liveEvents]);
+
+  const mcpDiagnostics = useMemo(() => {
+    const methodCounts = new Map<string, number>();
+    const toolCounts = new Map<string, number>();
+    const serverCounts = new Map<string, number>();
+    let total = 0;
+
+    for (const event of liveEvents) {
+      if (normalizeSource(event) !== "mcp") continue;
+      total += 1;
+
+      const method = (event.method || "").trim();
+      if (method) {
+        methodCounts.set(method, (methodCounts.get(method) ?? 0) + 1);
+      }
+
+      const tool = (event.tool_name || "").trim();
+      if (tool) {
+        toolCounts.set(tool, (toolCounts.get(tool) ?? 0) + 1);
+      }
+
+      const server = (event.server_name || "").trim();
+      if (server) {
+        serverCounts.set(server, (serverCounts.get(server) ?? 0) + 1);
+      }
+    }
+
+    const topMethods = [...methodCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4);
+    const topTools = [...toolCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4);
+    const topServers = [...serverCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4);
+
+    return { total, topMethods, topTools, topServers };
   }, [liveEvents]);
 
   const recentFailures = useMemo(() => {
@@ -376,6 +412,49 @@ export default function DebugPage() {
                       <span className="font-medium">{formatNumber(count)}</span>
                     </p>
                   ))}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <p className="text-xs uppercase tracking-wide text-muted-foreground mb-1">MCP Activity</p>
+              {mcpDiagnostics.total === 0 ? (
+                <p className="text-xs text-muted-foreground">No MCP traffic in current window.</p>
+              ) : (
+                <div className="space-y-2">
+                  {mcpDiagnostics.topMethods.length > 0 ? (
+                    <div className="space-y-1">
+                      <p className="text-[11px] text-muted-foreground">Top methods</p>
+                      {mcpDiagnostics.topMethods.map(([method, count]) => (
+                        <p key={`method-${method}`} className="flex items-center justify-between">
+                          <span className="truncate pr-3">{method}</span>
+                          <span className="font-medium">{formatNumber(count)}</span>
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
+                  {mcpDiagnostics.topTools.length > 0 ? (
+                    <div className="space-y-1">
+                      <p className="text-[11px] text-muted-foreground">Top tools</p>
+                      {mcpDiagnostics.topTools.map(([tool, count]) => (
+                        <p key={`tool-${tool}`} className="flex items-center justify-between">
+                          <span className="truncate pr-3">{tool}</span>
+                          <span className="font-medium">{formatNumber(count)}</span>
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
+                  {mcpDiagnostics.topServers.length > 0 ? (
+                    <div className="space-y-1">
+                      <p className="text-[11px] text-muted-foreground">Top servers</p>
+                      {mcpDiagnostics.topServers.map(([server, count]) => (
+                        <p key={`server-${server}`} className="flex items-center justify-between">
+                          <span className="truncate pr-3">{server}</span>
+                          <span className="font-medium">{formatNumber(count)}</span>
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               )}
             </div>

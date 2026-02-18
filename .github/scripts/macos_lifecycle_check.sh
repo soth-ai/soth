@@ -67,6 +67,18 @@ require_cmd() {
   fi
 }
 
+count_log_matches() {
+  local pattern="$1"
+  local file="$2"
+  local out
+  out="$(rg -c --no-messages "${pattern}" "${file}" 2>/dev/null || true)"
+  if [[ -z "${out}" ]]; then
+    echo "0"
+    return 0
+  fi
+  printf '%s' "${out}" | tr -d '[:space:]'
+}
+
 require_macos() {
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "error: this script is macOS-only" >&2
@@ -99,11 +111,26 @@ assert_listener_stopped() {
 }
 
 list_macos_services() {
-  networksetup -listallnetworkservices 2>/dev/null \
+  local all
+  all="$(networksetup -listallnetworkservices 2>/dev/null \
     | tail -n +2 \
     | sed '/^An asterisk (\*) denotes/d' \
     | sed 's/^\*//' \
-    | sed '/^[[:space:]]*$/d'
+    | sed '/^[[:space:]]*$/d' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+  local filtered
+  filtered="$(printf '%s\n' "${all}" \
+    | awk 'length($0) > 0' \
+    | grep -E 'Wi-Fi|Ethernet|USB 10/100/1000 LAN' || true)"
+
+  if [[ -n "${filtered}" ]]; then
+    printf '%s\n' "${filtered}" | awk '!seen[$0]++'
+    return 0
+  fi
+
+  # Mirror runtime fallback behavior when no known services are found.
+  printf '%s\n' "${all}" | awk 'length($0) > 0 && !seen[$0]++'
 }
 
 sanitize_service_name() {
@@ -268,11 +295,11 @@ phase_anomaly() {
   step "Anomaly signal summary (local evidence)"
   if [[ -f "${SOTH_LOG_FILE}" ]]; then
     local deferred dropped fdpressure syncfail schemarej
-    deferred="$(rg -n "Exchange upload deferred with retry backoff" "${SOTH_LOG_FILE}" | wc -l | tr -d ' ')"
-    dropped="$(rg -n "Dropping malformed exchange upload entry" "${SOTH_LOG_FILE}" | wc -l | tr -d ' ')"
-    fdpressure="$(rg -n "FD pressure fail-open|Too many open files|EMFILE" "${SOTH_LOG_FILE}" | wc -l | tr -d ' ')"
-    syncfail="$(rg -n "Cloud sync tick failed|Cloud heartbeat failed|exchange_upload_status_" "${SOTH_LOG_FILE}" | wc -l | tr -d ' ')"
-    schemarej="$(rg -n "exchange_rejected" "${SOTH_LOG_FILE}" | wc -l | tr -d ' ')"
+    deferred="$(count_log_matches "Exchange upload deferred with retry backoff" "${SOTH_LOG_FILE}")"
+    dropped="$(count_log_matches "Dropping malformed exchange upload entry" "${SOTH_LOG_FILE}")"
+    fdpressure="$(count_log_matches "FD pressure fail-open|Too many open files|EMFILE" "${SOTH_LOG_FILE}")"
+    syncfail="$(count_log_matches "Cloud sync tick failed|Cloud heartbeat failed|exchange_upload_status_" "${SOTH_LOG_FILE}")"
+    schemarej="$(count_log_matches "exchange_rejected" "${SOTH_LOG_FILE}")"
     info "log counters:"
     info "  deferred_uploads=${deferred}"
     info "  dropped_malformed=${dropped}"

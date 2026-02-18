@@ -1,7 +1,7 @@
 //! Dashboard tab (v2): signal-dense operational overview.
 
 use crate::commands::tui::api::ClusterRow;
-use crate::commands::tui::app::{App, PanelFocus};
+use crate::commands::tui::app::{App, ConnectionState, PanelFocus};
 use crate::commands::tui::theme::{
     format_currency, format_number, format_percent, truncate, Theme, CIRCLE_FILLED, WARNING,
 };
@@ -38,147 +38,113 @@ fn render_signal_strip(frame: &mut Frame, area: Rect, app: &App) {
 
     let focused = app.focused_panel == PanelFocus::Signals;
 
-    let policy = app.metrics.policy.as_ref();
     let proxy = app.metrics.proxy.as_ref();
-    let observe = app.metrics.observe.as_ref();
-    let budget = app.metrics.budget_primitives.as_ref();
-    let clusters = &app.metrics.clusters;
+    let stream = app.metrics.stream_stats.as_ref();
 
-    let (policy_value, policy_sub, policy_style) = if let Some(p) = policy {
-        let allow_pct = if p.evaluations > 0 {
-            (p.allowed as f64 / p.evaluations as f64) * 100.0
+    let proxy_enabled = proxy.map(|p| p.status.enabled).unwrap_or(false);
+    let ca_ok = proxy.map(|p| p.status.ca_installed).unwrap_or(false);
+    let (connectivity_value, connectivity_sub, connectivity_style) = match app.connection {
+        ConnectionState::Connected => (
+            "Connected".to_string(),
+            format!(
+                "proxy {} | ca {}",
+                if proxy_enabled { "on" } else { "off" },
+                if ca_ok { "ok" } else { "missing" }
+            ),
+            if proxy_enabled {
+                Theme::get().success_style()
+            } else {
+                Theme::get().warning_style()
+            },
+        ),
+        ConnectionState::Connecting => (
+            "Connecting".to_string(),
+            "waiting for dashboard api".to_string(),
+            Theme::get().warning_style(),
+        ),
+        ConnectionState::Disconnected => (
+            "Disconnected".to_string(),
+            "dashboard api unavailable".to_string(),
+            Theme::get().error_style(),
+        ),
+    };
+
+    let lagged_events = stream.map(|s| s.lagged_events).unwrap_or(0);
+    let send_failures = stream.map(|s| s.broadcast_send_failures).unwrap_or(0);
+    let (sync_value, sync_sub, sync_style) = if stream.is_some() {
+        let state = if lagged_events == 0 && send_failures == 0 {
+            "Healthy"
         } else {
-            100.0
+            "Backpressure"
         };
-        let style = if p.denied > 0 {
+        let style = if send_failures > 0 {
+            Theme::get().error_style()
+        } else if lagged_events > 0 {
             Theme::get().warning_style()
         } else {
             Theme::get().success_style()
         };
         (
-            format!("{} allow", format_percent(allow_pct)),
-            format!("{} denied / {} eval", p.denied, p.evaluations),
+            state.to_string(),
+            format!("lagged {} | send_fail {}", lagged_events, send_failures),
             style,
         )
     } else {
         (
-            "Loading...".to_string(),
-            "policy data pending".to_string(),
+            "Pending".to_string(),
+            "stream stats unavailable".to_string(),
             Theme::get().muted_style(),
         )
     };
 
-    let recent_req = proxy.map(|p| p.recent_requests.len() as u64).unwrap_or(0);
-    let recent_res = proxy
-        .map(|p| {
-            p.recent_requests
-                .iter()
-                .filter(|row| row.status_code.is_some())
-                .count() as u64
-        })
-        .unwrap_or(0);
-    let p95_recent = proxy.and_then(p95_recent_latency_ms);
-    let p95 = p95_recent
-        .or_else(|| p95_latency_ms(clusters))
-        .map(|v| format!("{v}ms"))
-        .unwrap_or_else(|| "-".to_string());
-
-    let (traffic_value, traffic_sub, traffic_style) = if let Some(p) = proxy {
-        let recent_hint = if recent_req > 0 {
+    let lagged_receivers = stream.map(|s| s.lagged_receivers).unwrap_or(0);
+    let backfill_batches = stream.map(|s| s.backfill_batches).unwrap_or(0);
+    let (queue_value, queue_sub, queue_style) = if stream.is_some() {
+        (
+            format!("{} lagged", lagged_events),
             format!(
-                "recent {}/{}",
-                format_number(recent_req),
-                format_number(recent_res)
-            )
-        } else {
-            "recent -/-".to_string()
-        };
-        let filter_hint = filter_decision_hint(p)
-            .map(|hint| format!(" | {hint}"))
-            .unwrap_or_default();
+                "receivers {} | backfill {}",
+                lagged_receivers, backfill_batches
+            ),
+            if lagged_events > 0 || lagged_receivers > 0 {
+                Theme::get().warning_style()
+            } else {
+                Theme::get().success_style()
+            },
+        )
+    } else {
+        (
+            "Pending".to_string(),
+            "queue telemetry unavailable".to_string(),
+            Theme::get().muted_style(),
+        )
+    };
+
+    let (detection_value, detection_sub, detection_style) = if let Some(p) = proxy {
+        let decisions = &p.filter_decisions.by_decision;
+        let intercepts = decisions.get("intercept").copied().unwrap_or(0)
+            + decisions
+                .get("catalog_discovery_intercept")
+                .copied()
+                .unwrap_or(0);
+        let noise = decisions.get("noise").copied().unwrap_or(0);
+        let tunnels = decisions.get("tunnel").copied().unwrap_or(0);
         (
             format!("{} req", format_number(p.total_requests)),
             format!(
-                "{} res | {} | p95 {}{}",
-                format_number(p.total_responses),
-                recent_hint,
-                p95,
-                filter_hint,
+                "int {} | noise {} | tunnel {}",
+                intercepts, noise, tunnels
             ),
-            Theme::get().info_style(),
+            if noise > 0 {
+                Theme::get().warning_style()
+            } else {
+                Theme::get().info_style()
+            },
         )
     } else {
         (
-            "Loading...".to_string(),
-            "traffic data pending".to_string(),
-            Theme::get().muted_style(),
-        )
-    };
-
-    let (error_value, error_sub, error_style) = if let Some(p) = proxy {
-        let (errors_5xx, responses) = if recent_req > 0 {
-            let errors = p
-                .recent_requests
-                .iter()
-                .filter(|row| row.status_code.is_some_and(|code| code >= 500))
-                .count() as u64;
-            (errors, recent_res.max(1))
-        } else {
-            let errors = clusters
-                .iter()
-                .filter(|row| row.status_code.unwrap_or(0) >= 500)
-                .count() as u64;
-            (errors, p.total_responses.max(1))
-        };
-        let rate = (errors_5xx as f64 / responses as f64) * 100.0;
-        let style = if rate >= 2.0 {
-            Theme::get().error_style()
-        } else if rate >= 0.5 {
-            Theme::get().warning_style()
-        } else {
-            Theme::get().success_style()
-        };
-        (
-            format!("{} 5xx", errors_5xx),
-            format!("rate {}", format_percent(rate)),
-            style,
-        )
-    } else {
-        (
-            "Loading...".to_string(),
-            "error data pending".to_string(),
-            Theme::get().muted_style(),
-        )
-    };
-
-    let (spend_value, spend_sub, spend_style) = if let Some(b) = budget {
-        let util = b.utilization_pct.unwrap_or(0.0);
-        let style = if util >= 95.0 {
-            Theme::get().error_style()
-        } else if util >= 85.0 {
-            Theme::get().warning_style()
-        } else {
-            Theme::get().success_style()
-        };
-        (
-            format_currency(b.total_cost_usd),
-            format!(
-                "in {} out {} | {}",
-                short_number(b.total_input_tokens),
-                short_number(b.total_output_tokens),
-                if b.daily_limit_usd.is_some() {
-                    format!("{} util", format_percent(util))
-                } else {
-                    "no limit".to_string()
-                }
-            ),
-            style,
-        )
-    } else {
-        let fallback_cost = proxy.map(|p| p.total_cost_usd).unwrap_or(0.0);
-        (
-            format_currency(fallback_cost),
-            "budget primitives pending".to_string(),
+            "Pending".to_string(),
+            "detection counters unavailable".to_string(),
             Theme::get().muted_style(),
         )
     };
@@ -186,41 +152,39 @@ fn render_signal_strip(frame: &mut Frame, area: Rect, app: &App) {
     render_signal_card(
         frame,
         cols[0],
-        "Policy",
-        &policy_value,
-        &policy_sub,
-        policy_style,
+        "Connectivity",
+        &connectivity_value,
+        &connectivity_sub,
+        connectivity_style,
         focused,
     );
     render_signal_card(
         frame,
         cols[1],
-        "Traffic",
-        &traffic_value,
-        &traffic_sub,
-        traffic_style,
+        "Sync",
+        &sync_value,
+        &sync_sub,
+        sync_style,
         focused,
     );
     render_signal_card(
         frame,
         cols[2],
-        "Errors",
-        &error_value,
-        &error_sub,
-        error_style,
+        "Queue",
+        &queue_value,
+        &queue_sub,
+        queue_style,
         focused,
     );
     render_signal_card(
         frame,
         cols[3],
-        "Spend",
-        &spend_value,
-        &spend_sub,
-        spend_style,
+        "Detection",
+        &detection_value,
+        &detection_sub,
+        detection_style,
         focused,
     );
-
-    let _ = observe;
 }
 
 fn render_signal_card(

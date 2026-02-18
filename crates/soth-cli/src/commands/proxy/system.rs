@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Network services to configure on macOS
 const MACOS_NETWORK_SERVICES: &[&str] = &["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN"];
@@ -453,7 +453,41 @@ async fn configure_macos_proxy(enable: bool, port: u16, print_user_output: bool)
             );
         }
     } else {
-        anyhow::bail!("system proxy state missing; refusing blind macOS proxy disable");
+        // Fail-open + safety: never attempt a blind disable without a known snapshot.
+        // If the proxy appears inactive, treat this as idempotent success.
+        // If loopback proxies are active, preserve them and warn (manual intervention).
+        let active_loopback_services = list_macos_services_using_loopback_proxy(&services);
+        if active_loopback_services.is_empty() {
+            warn!(
+                "System proxy state missing during macOS disable; no loopback proxy active, treating as no-op"
+            );
+            if print_user_output {
+                println!(
+                    "   {} System proxy state missing; no loopback proxy active (no-op).",
+                    style::INFO
+                );
+            }
+            return Ok(());
+        }
+
+        let service_list = active_loopback_services.join(", ");
+        warn!(
+            services = %service_list,
+            "System proxy state missing during macOS disable; preserving active loopback proxies (no blind changes)"
+        );
+        if print_user_output {
+            println!(
+                "   {} System proxy state missing; preserving active loopback proxy settings for: {}",
+                style::WARNING,
+                service_list
+            );
+            println!(
+                "   {} If this is stale SOTH state, run: soth on --port {}  then  soth off",
+                style::INFO,
+                port
+            );
+        }
+        return Ok(());
     }
 
     if print_user_output {
@@ -470,6 +504,52 @@ async fn configure_macos_proxy(enable: bool, port: u16, print_user_output: bool)
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host.trim().to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn list_macos_services_using_loopback_proxy(services: &[String]) -> Vec<String> {
+    let mut active = Vec::new();
+    for service in services {
+        let web = get_macos_proxy_endpoint(service, false).ok();
+        let secure = get_macos_proxy_endpoint(service, true).ok();
+
+        let web_enabled = web
+            .as_ref()
+            .map(|snapshot| {
+                snapshot.enabled
+                    && snapshot
+                        .host
+                        .as_deref()
+                        .map(is_loopback_host)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        let secure_enabled = secure
+            .as_ref()
+            .map(|snapshot| {
+                snapshot.enabled
+                    && snapshot
+                        .host
+                        .as_deref()
+                        .map(is_loopback_host)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        if web_enabled || secure_enabled {
+            active.push(service.clone());
+        }
+    }
+    active
 }
 
 #[cfg(target_os = "macos")]

@@ -13,6 +13,7 @@ import { useObservabilityStore, type LogEntry } from "@/store/observability";
 import { useIsMobile } from "@/hooks/useMobile";
 import { useEventStream } from "@/hooks/useEventStream";
 import { buildApiUrl } from "@/lib/endpoints";
+import { normalizeEventSource } from "@/lib/event-normalize";
 import type { ApiResponse, EventsSummary, WrapEvent } from "@/types";
 import { cn } from "@/lib/utils";
 
@@ -62,10 +63,7 @@ function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
     normalizePreview(wrapEvent.content_preview) ||
     JSON.stringify(wrapEvent, null, 2);
 
-  const normalizedSource =
-    wrapEvent.source === "ai_proxy" && wrapEvent.provider === "mcp"
-      ? "mcp"
-      : (wrapEvent.source || "mcp");
+  const normalizedSource = normalizeEventSource(wrapEvent);
   const normalizedAgent =
     wrapEvent.agent?.name === "websocket" && wrapEvent.provider
       ? { ...wrapEvent.agent, name: wrapEvent.provider }
@@ -110,9 +108,7 @@ function mapWrapEventToLog(wrapEvent: WrapEvent): LogEntry {
     cost_usd: wrapEvent.cost_usd,
     latency_ms: wrapEvent.latency_ms,
     message_type:
-      wrapEvent.source === "ai_proxy" || wrapEvent.source === "agent_app"
-        ? "raw"
-        : "json-rpc",
+      normalizedSource === "mcp" ? "json-rpc" : "raw",
   };
 }
 
