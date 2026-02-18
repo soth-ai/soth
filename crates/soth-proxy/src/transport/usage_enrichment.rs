@@ -59,6 +59,17 @@ pub fn extract_model_from_request_for_mode(
     engine.extract_model_from_request(provider_id.as_str(), decoded_body)
 }
 
+pub fn extract_request_pii_probe_for_mode(
+    oisp_engine: Option<&OispEngine>,
+    provider: &str,
+    host: &str,
+    decoded_body: &[u8],
+) -> Option<String> {
+    let engine = oisp_engine?;
+    let provider_id = resolve_provider_id(engine, provider, host)?;
+    engine.extract_pii_probe_from_request(provider_id.as_str(), decoded_body)
+}
+
 pub fn extract_usage_meta_from_stream_usage(
     oisp_engine: Option<&OispEngine>,
     provider: &str,
@@ -219,7 +230,11 @@ mod tests {
                     "openai": {
                         "name": "openai",
                         "request": {
-                            "model": "$.model"
+                            "model": "$.model",
+                            "prompt": [
+                                "$.messages[-1].content",
+                                "$.input"
+                            ]
                         },
                         "response": {
                             "json": {
@@ -271,5 +286,14 @@ mod tests {
         let model =
             extract_model_from_request_for_mode(Some(&engine), "openai", "api.openai.com", body);
         assert_eq!(model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn request_pii_probe_is_extracted_via_bundle_format_prompt() {
+        let engine = test_oisp_engine();
+        let body = br#"{"messages":[{"role":"user","content":"email me at pii@example.com"}],"model":"gpt-4o"}"#;
+        let probe =
+            extract_request_pii_probe_for_mode(Some(&engine), "openai", "api.openai.com", body);
+        assert_eq!(probe.as_deref(), Some("email me at pii@example.com"));
     }
 }

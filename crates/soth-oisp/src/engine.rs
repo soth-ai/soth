@@ -5,9 +5,9 @@ use crate::matchers::{
 };
 use crate::parse_helpers::{
     decode_grpc_frame_payloads, extract_string_from_field_path_value,
-    extract_usage_from_response_value, format_uses_grpc_frames, format_uses_strip_xssi,
-    parse_json_with_xssi_fallback, parse_stream_parser_config, parse_stream_payload_with_config,
-    strip_json_security_prefix_bytes,
+    extract_text_from_field_path_value, extract_usage_from_response_value, format_uses_grpc_frames,
+    format_uses_strip_xssi, parse_json_with_xssi_fallback, parse_stream_parser_config,
+    parse_stream_payload_with_config, strip_json_security_prefix_bytes,
 };
 use crate::pricing::{calculate_cost_from_pricing, find_model_pricing};
 use crate::registry_cache::{load_from_registry_cache_path, registry_cache_last_good_path};
@@ -258,6 +258,44 @@ impl OispEngine {
         let model_path = request.get("model")?;
         let root = parse_json_with_xssi_fallback(&transformed)?;
         extract_string_from_field_path_value(&root, model_path)
+    }
+
+    /// Extract request prompt/query text from payload according to provider format request parser.
+    ///
+    /// This is used by downstream PII enrichment so detection runs on parsed user input
+    /// fields (for example `prompt`, `messages`, `query`) rather than raw request JSON.
+    pub fn extract_pii_probe_from_request(&self, provider_id: &str, body: &[u8]) -> Option<String> {
+        let transformed = self.apply_body_transform(provider_id, body);
+        let format_value = self.resolve_provider_format(provider_id)?;
+        let request = format_value.get("request")?;
+        let root = parse_json_with_xssi_fallback(&transformed)?;
+
+        const REQUEST_TEXT_KEYS: &[&str] = &[
+            "prompt",
+            "query",
+            "input",
+            "message",
+            "messages",
+            "contents",
+            "chat_history",
+            "text",
+            "content",
+            "system",
+            "system_instruction",
+        ];
+
+        for key in REQUEST_TEXT_KEYS {
+            let Some(path_spec) = request.get(*key) else {
+                continue;
+            };
+            if let Some(text) = extract_text_from_field_path_value(&root, path_spec) {
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+
+        None
     }
 
     /// Extract model from response payload according to provider format response parser.

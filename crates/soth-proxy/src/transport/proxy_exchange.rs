@@ -410,7 +410,11 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
             .clone()
             .unwrap_or_else(|| format!("{} {}", pending.method, pending.path)),
     );
-    if let Some(request_body) = pending.request_content.as_ref() {
+    if let Some(request_body) = pending
+        .request_content_for_pii
+        .as_ref()
+        .or(pending.request_content.as_ref())
+    {
         pii_probe = pii_probe.with_request(request_body.clone(), "");
     }
     if let Some(response_body) = response_body {

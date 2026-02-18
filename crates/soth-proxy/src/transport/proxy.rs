@@ -80,7 +80,8 @@ use crate::transport::response_event_builder::{
 };
 use crate::transport::tier_enrichment::extract_subscription_tags;
 use crate::transport::usage_enrichment::{
-    create_stream_usage_parser, extract_model_from_request_for_mode, extract_usage_meta_for_mode,
+    create_stream_usage_parser, extract_model_from_request_for_mode,
+    extract_request_pii_probe_for_mode, extract_usage_meta_for_mode,
     extract_usage_meta_from_stream_usage, ResponseUsageMeta,
 };
 use soth_core::config::{
@@ -105,6 +106,8 @@ pub(crate) struct PendingRequest {
     pub(crate) started_at: Instant,
     /// Request body content for paired logging
     pub(crate) request_content: Option<String>,
+    /// Parser-derived request payload used for PII detection (prompt/query-first).
+    pub(crate) request_content_for_pii: Option<String>,
     /// Whether request body capture was truncated/skipped.
     pub(crate) request_body_truncated: bool,
     /// Request payload size in bytes (wire payload)
@@ -534,27 +537,41 @@ impl HttpHandler for AiProxyHandler {
             }
 
             // Capture body for AI/MCP requests and record payload-size metadata.
-            let (body_content, request_size_bytes, model, req, request_body_truncated) =
-                if should_inspect_body {
-                    let (parts, body) = req.into_parts();
-                    match body.collect().await {
-                        Ok(collected) => {
-                            let bytes = collected.to_bytes();
-                            let body_len = bytes.len();
-                            let (decoded_bytes, body_str) = decode_payload_for_logging(
-                                &bytes,
-                                request_content_encoding.as_deref(),
-                            );
+            let (
+                body_content,
+                request_content_for_pii,
+                request_size_bytes,
+                model,
+                req,
+                request_body_truncated,
+            ) = if should_inspect_body {
+                let (parts, body) = req.into_parts();
+                match body.collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.to_bytes();
+                        let body_len = bytes.len();
+                        let (decoded_bytes, body_str) =
+                            decode_payload_for_logging(&bytes, request_content_encoding.as_deref());
 
-                            debug!(
-                                body_len = body_len,
-                                body_preview = %body_str.chars().take(100).collect::<String>(),
-                                "Captured request body"
-                            );
+                        debug!(
+                            body_len = body_len,
+                            body_preview = %body_str.chars().take(100).collect::<String>(),
+                            "Captured request body"
+                        );
 
-                            // Extract model strictly from bundle parser configuration.
-                            let model = provider.as_deref().and_then(|provider_name| {
-                                extract_model_from_request_for_mode(
+                        // Extract model strictly from bundle parser configuration.
+                        let model = provider.as_deref().and_then(|provider_name| {
+                            extract_model_from_request_for_mode(
+                                Some(oisp_engine.as_ref()),
+                                provider_name,
+                                &host,
+                                &decoded_bytes,
+                            )
+                        });
+                        // Extract parsed prompt/query text for PII detection.
+                        let request_content_for_pii =
+                            provider.as_deref().and_then(|provider_name| {
+                                extract_request_pii_probe_for_mode(
                                     Some(oisp_engine.as_ref()),
                                     provider_name,
                                     &host,
@@ -562,36 +579,44 @@ impl HttpHandler for AiProxyHandler {
                                 )
                             });
 
-                            // Reconstruct request with body
-                            let new_body = Body::from(Full::new(bytes));
-                            let req = Request::from_parts(parts, new_body);
-                            (Some(body_str), Some(body_len as u64), model, req, false)
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to collect request body");
-                            let req = Request::from_parts(parts, Body::empty());
-                            (None, declared_request_size_bytes, None, req, false)
-                        }
+                        // Reconstruct request with body
+                        let new_body = Body::from(Full::new(bytes));
+                        let req = Request::from_parts(parts, new_body);
+                        (
+                            Some(body_str),
+                            request_content_for_pii,
+                            Some(body_len as u64),
+                            model,
+                            req,
+                            false,
+                        )
                     }
-                } else {
-                    debug!("Skipping body inspection");
-                    let preview = if request_capture_oversized {
-                        Some(format!(
+                    Err(e) => {
+                        warn!(error = %e, "Failed to collect request body");
+                        let req = Request::from_parts(parts, Body::empty());
+                        (None, None, declared_request_size_bytes, None, req, false)
+                    }
+                }
+            } else {
+                debug!("Skipping body inspection");
+                let preview = if request_capture_oversized {
+                    Some(format!(
                         "[request body truncated; declared size {} bytes exceeds capture limit {} bytes]",
                         declared_request_size_bytes.unwrap_or_default(),
                         capture_max_body_bytes
                     ))
-                    } else {
-                        None
-                    };
-                    (
-                        preview,
-                        declared_request_size_bytes,
-                        None,
-                        req,
-                        request_capture_oversized,
-                    )
+                } else {
+                    None
                 };
+                (
+                    preview,
+                    None,
+                    declared_request_size_bytes,
+                    None,
+                    req,
+                    request_capture_oversized,
+                )
+            };
             if !is_connect && !should_capture_observability {
                 let decision_label = decision_label_from_intercept_decision(
                     oisp_engine.should_intercept(&host, &path_for_filter),
@@ -822,6 +847,7 @@ impl HttpHandler for AiProxyHandler {
                             graphql_operation: graphql_operation.clone(),
                             started_at: Instant::now(),
                             request_content: body_content,
+                            request_content_for_pii,
                             request_body_truncated,
                             request_size_bytes,
                             headers: None,
@@ -882,6 +908,7 @@ impl HttpHandler for AiProxyHandler {
                         graphql_operation: None,
                         started_at: Instant::now(),
                         request_content: None,
+                        request_content_for_pii: None,
                         request_body_truncated,
                         request_size_bytes,
                         headers: None,

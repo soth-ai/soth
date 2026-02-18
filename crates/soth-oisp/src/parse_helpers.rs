@@ -682,6 +682,15 @@ pub(crate) fn extract_string_from_field_path_value(
         .find_map(|path| extract_string_from_path(root, path.as_str()))
 }
 
+pub(crate) fn extract_text_from_field_path_value(
+    root: &Value,
+    field_path: &Value,
+) -> Option<String> {
+    field_path_candidates(field_path)
+        .into_iter()
+        .find_map(|path| extract_text_from_path(root, path.as_str()))
+}
+
 fn field_path_candidates(field_path: &Value) -> Vec<String> {
     match field_path {
         Value::String(path) => vec![path.clone()],
@@ -705,6 +714,17 @@ fn extract_string_from_path(root: &Value, path: &str) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         Value::Bool(value) => Some(value.to_string()),
         _ => None,
+    }
+}
+
+fn extract_text_from_path(root: &Value, path: &str) -> Option<String> {
+    let value = extract_field_path_value(root, path)?;
+    match value {
+        Value::String(raw) => normalize_string(Some(raw.clone())),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Array(_) | Value::Object(_) => normalize_string(serde_json::to_string(value).ok()),
+        Value::Null => None,
     }
 }
 
