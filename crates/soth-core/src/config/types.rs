@@ -714,6 +714,12 @@ pub struct ObserveCollectorConfig {
     /// Run a one-time high-throughput frontload pass on startup.
     #[serde(default = "default_true")]
     pub frontload_on_start: bool,
+    /// Force a one-time first-run replay frontload even if collector offsets already exist.
+    #[serde(default = "default_true")]
+    pub frontload_force_first_run: bool,
+    /// Reset collector offsets before startup frontload so history is replayed.
+    #[serde(default)]
+    pub frontload_reset_offsets_on_start: bool,
     /// Maximum frontload cycles during startup.
     #[serde(default)]
     pub frontload_max_cycles: Option<u32>,
@@ -748,6 +754,8 @@ impl Default for ObserveCollectorConfig {
             sources: Vec::new(),
             sqlite_sources: Vec::new(),
             frontload_on_start: true,
+            frontload_force_first_run: true,
+            frontload_reset_offsets_on_start: false,
             frontload_max_cycles: None,
             frontload_max_read_bytes_per_source: None,
             poll_interval_secs: None,

@@ -425,6 +425,14 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
         "SOTH_COLLECTOR_FRONTLOAD_ON_START",
         collector.frontload_on_start.to_string(),
     );
+    std::env::set_var(
+        "SOTH_COLLECTOR_FRONTLOAD_FORCE_FIRST_RUN",
+        collector.frontload_force_first_run.to_string(),
+    );
+    std::env::set_var(
+        "SOTH_COLLECTOR_FRONTLOAD_RESET_OFFSETS_ON_START",
+        collector.frontload_reset_offsets_on_start.to_string(),
+    );
 
     if !collector.sources.is_empty() {
         let sources = collector

@@ -18,7 +18,7 @@ required-features = ["ops"]
 
 [features]
 default = ["sensor"]
-sensor = []
+sensor = ["dep:reqwest"]
 ops = ["dep:reqwest"]
 monitoring = ["soth-proxy/monitoring"]
 local-debug = [

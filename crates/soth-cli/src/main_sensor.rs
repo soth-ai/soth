@@ -2,6 +2,7 @@
 //!
 //! Focused runtime surface:
 //! - wrap/init/bootstrap/start/stop lifecycle
+//! - login/enroll onboarding
 //! - runtime CA/env/status helpers
 //! - system proxy on/off controls
 
@@ -36,6 +37,12 @@ struct Cli {
 enum Commands {
     /// Wrap an MCP server to intercept all traffic
     Wrap(commands::wrap::WrapArgs),
+
+    /// Store cloud API credentials locally (interactive prompt or flag/stdin)
+    Login(commands::login::LoginArgs),
+
+    /// Enroll this machine with a centralized SOTH workspace
+    Enroll(commands::enroll::EnrollArgs),
 
     /// Initialize configuration and keys
     Init {
@@ -432,6 +439,12 @@ async fn async_main() -> anyhow::Result<()> {
                 args.config = cli.config.clone();
             }
             commands::wrap::run(args).await?;
+        }
+        Commands::Login(args) => {
+            commands::login::run(args, cli.config.clone()).await?;
+        }
+        Commands::Enroll(args) => {
+            commands::enroll::run(args, cli.config.clone()).await?;
         }
         Commands::Init { output } => {
             commands::init::run(output).await?;

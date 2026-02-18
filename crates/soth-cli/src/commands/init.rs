@@ -75,6 +75,8 @@ observe:
     enabled: true
     auto_discover_sources: true
     frontload_on_start: true
+    frontload_force_first_run: true
+    frontload_reset_offsets_on_start: false
     frontload_max_cycles: 24
     frontload_max_read_bytes_per_source: 8388608
     poll_interval_secs: 5

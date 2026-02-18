@@ -40,6 +40,8 @@ pub struct CollectorConfig {
     pub max_line_bytes: usize,
     pub auto_discover_sources: bool,
     pub frontload_on_start: bool,
+    pub frontload_force_first_run: bool,
+    pub frontload_reset_offsets_on_start: bool,
     pub frontload_max_cycles: usize,
     pub frontload_max_read_bytes_per_source: usize,
     pub agent_name: String,
@@ -143,6 +145,10 @@ impl CollectorConfig {
         let auto_discover_sources = parse_bool_env("SOTH_COLLECTOR_AUTO_DISCOVER").unwrap_or(true);
         let frontload_on_start =
             parse_bool_env("SOTH_COLLECTOR_FRONTLOAD_ON_START").unwrap_or(true);
+        let frontload_force_first_run =
+            parse_bool_env("SOTH_COLLECTOR_FRONTLOAD_FORCE_FIRST_RUN").unwrap_or(true);
+        let frontload_reset_offsets_on_start =
+            parse_bool_env("SOTH_COLLECTOR_FRONTLOAD_RESET_OFFSETS_ON_START").unwrap_or(false);
 
         let mut sources = parse_file_sources_from_env();
 
@@ -212,6 +218,8 @@ impl CollectorConfig {
             max_line_bytes,
             auto_discover_sources,
             frontload_on_start,
+            frontload_force_first_run,
+            frontload_reset_offsets_on_start,
             frontload_max_cycles,
             frontload_max_read_bytes_per_source,
             agent_name,
@@ -454,6 +462,8 @@ pub fn spawn_runtime(
         sqlite_sources = collector.config.sqlite_sources.len(),
         auto_discover = collector.config.auto_discover_sources,
         frontload_on_start = collector.config.frontload_on_start,
+        frontload_force_first_run = collector.config.frontload_force_first_run,
+        frontload_reset_offsets_on_start = collector.config.frontload_reset_offsets_on_start,
         frontload_cycles = collector.config.frontload_max_cycles,
         poll_secs = collector.config.poll_interval.as_secs(),
         state_path = %collector.config.state_path.display(),
@@ -464,9 +474,34 @@ pub fn spawn_runtime(
         if let Err(error) = collector.load_state() {
             warn!("Collector state load failed: {}", error);
         }
+
+        let should_force_first_run_frontload = collector.config.frontload_on_start
+            && collector.config.frontload_force_first_run
+            && !collector.frontload_bootstrap_completed();
+        if should_force_first_run_frontload {
+            info!(
+                bootstrap_path = %collector.frontload_bootstrap_path().display(),
+                "Collector first-run frontload bootstrap active; resetting offsets"
+            );
+            collector.offsets = OffsetState::default();
+            if let Err(error) = collector.save_state() {
+                warn!("Collector state reset failed: {}", error);
+            }
+        } else if collector.config.frontload_on_start
+            && collector.config.frontload_reset_offsets_on_start
+        {
+            collector.offsets = OffsetState::default();
+            if let Err(error) = collector.save_state() {
+                warn!("Collector state reset failed: {}", error);
+            }
+        }
         if collector.config.frontload_on_start {
             if let Err(error) = collector.run_frontload(&event_logger) {
                 warn!("Collector frontload failed: {}", error);
+            } else if should_force_first_run_frontload {
+                if let Err(error) = collector.mark_frontload_bootstrap_complete() {
+                    warn!("Collector frontload bootstrap mark failed: {}", error);
+                }
             }
         }
         let mut interval = tokio::time::interval(collector.config.poll_interval);
@@ -540,6 +575,35 @@ impl CollectorAgent {
 
     fn save_state(&self) -> anyhow::Result<()> {
         self.offsets.save(&self.config.state_path)
+    }
+
+    fn frontload_bootstrap_path(&self) -> PathBuf {
+        if let Some(parent) = self.config.state_path.parent() {
+            return parent.join("collector_frontload_bootstrap.json");
+        }
+        PathBuf::from(".soth/runtime/collector_frontload_bootstrap.json")
+    }
+
+    fn frontload_bootstrap_completed(&self) -> bool {
+        let path = self.frontload_bootstrap_path();
+        FrontloadBootstrapState::load(&path)
+            .map(|state| state.completed)
+            .unwrap_or(false)
+    }
+
+    fn mark_frontload_bootstrap_complete(&self) -> anyhow::Result<()> {
+        let path = self.frontload_bootstrap_path();
+        let state = FrontloadBootstrapState {
+            completed: true,
+            completed_at_unix_secs: Some(
+                std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ),
+        };
+        state.save(&path)
     }
 
     fn run_frontload(&mut self, logger: &EventLogger) -> anyhow::Result<()> {
@@ -856,6 +920,14 @@ struct OffsetState {
     sqlite: HashMap<String, SqliteScanState>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct FrontloadBootstrapState {
+    #[serde(default)]
+    completed: bool,
+    #[serde(default)]
+    completed_at_unix_secs: Option<u64>,
+}
+
 impl OffsetState {
     fn load(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
@@ -864,6 +936,28 @@ impl OffsetState {
         let data = std::fs::read(path)?;
         serde_json::from_slice(&data)
             .with_context(|| format!("failed parsing collector offset state: {}", path.display()))
+    }
+
+    fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = File::create(path)?;
+        let payload = serde_json::to_vec_pretty(self)?;
+        file.write_all(&payload)?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
+impl FrontloadBootstrapState {
+    fn load(path: &Path) -> anyhow::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let data = std::fs::read(path)?;
+        serde_json::from_slice(&data)
+            .with_context(|| format!("failed parsing frontload bootstrap state: {}", path.display()))
     }
 
     fn save(&self, path: &Path) -> anyhow::Result<()> {

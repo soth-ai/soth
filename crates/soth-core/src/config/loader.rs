@@ -48,6 +48,12 @@ fn normalize_cloud_config(config: &mut SothConfig) {
     if config.cloud.api_key.is_none() {
         config.cloud.enabled = false;
     }
+    // Unified exchange pipeline is required for cloud sync.
+    // Keep this fail-open and deterministic: if cloud is enabled with credentials,
+    // runtime ingestion/upload should always use exchange.v2.
+    if config.cloud.enabled {
+        config.exchange_v2.enabled = true;
+    }
 }
 
 /// Apply environment variable overrides to the configuration

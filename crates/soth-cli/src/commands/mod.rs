@@ -8,14 +8,12 @@ pub mod cloud_hooks;
 #[cfg(feature = "ops")]
 pub mod config;
 pub mod enforcement;
-#[cfg(feature = "ops")]
 pub mod enroll;
 #[cfg(feature = "ops")]
 pub mod identity;
 pub mod init;
 #[cfg(feature = "ops")]
 pub mod install;
-#[cfg(feature = "ops")]
 pub mod login;
 #[cfg(feature = "ops")]
 pub mod policy;

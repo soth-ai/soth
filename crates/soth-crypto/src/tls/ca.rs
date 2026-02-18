@@ -177,6 +177,7 @@ impl CertificateAuthority {
         ];
 
         // Set validity to match original or extend
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
         params.not_after = time::OffsetDateTime::now_utc() + DEFAULT_CA_VALIDITY;
 
         // Create self-signed cert with the existing key
