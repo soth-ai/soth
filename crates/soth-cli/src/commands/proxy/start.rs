@@ -21,6 +21,7 @@ use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
 use soth_proxy::metrics;
 use soth_proxy::transport::proxy;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -369,7 +370,7 @@ fn spawn_proxy_runtime(
 
     let mut collector_shutdown_tx = None;
     let mut collector_task = None;
-    apply_collector_env_overrides(&config.observe.collector);
+    apply_collector_env_overrides(config, &config.observe.collector);
     if let Some(ref logger) = event_logger {
         if let Some(CollectorRuntime { shutdown_tx, task }) = soth_collector::spawn_from_env(
             logger.clone(),
@@ -420,14 +421,97 @@ fn spawn_proxy_runtime(
     })
 }
 
+#[derive(Debug, Clone)]
+struct RegistryCollectorSource {
+    agent: String,
+    path: String,
+    parser: Option<String>,
+}
+
 fn set_env_if_present<T: ToString>(key: &str, value: Option<T>) {
     if let Some(value) = value {
         std::env::set_var(key, value.to_string());
     }
 }
 
-fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
+fn parse_registry_collector_sources(bundle: &serde_json::Value) -> Vec<RegistryCollectorSource> {
+    let sources = bundle
+        .get("collector")
+        .and_then(|value| value.get("sources"))
+        .or_else(|| bundle.get("collector_sources"))
+        .and_then(serde_json::Value::as_array);
+    let Some(sources) = sources else {
+        return Vec::new();
+    };
+
+    let mut parsed = Vec::new();
+    let mut seen = BTreeSet::new();
+    for source in sources {
+        let Some(source_obj) = source.as_object() else {
+            continue;
+        };
+        let Some(agent) = source_obj
+            .get("agent")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(path) = source_obj
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let parser = source_obj
+            .get("parser")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let key = format!("{agent}|{path}");
+        if !seen.insert(key) {
+            continue;
+        }
+        parsed.push(RegistryCollectorSource {
+            agent: agent.to_string(),
+            path: path.to_string(),
+            parser,
+        });
+    }
+
+    parsed
+}
+
+fn load_registry_collector_sources(config: &SothConfig) -> Vec<RegistryCollectorSource> {
+    let cache_path = resolve_registry_bundle_cache_path(config);
+    let cached = match soth_sync::cache::load_registry_bundle_cache(cache_path.as_path()) {
+        Ok(Some(cached)) => cached,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            warn!(
+                cache = %cache_path.display(),
+                error = %error,
+                "Failed to read registry cache for collector source hints"
+            );
+            return Vec::new();
+        }
+    };
+    parse_registry_collector_sources(&cached.bundle)
+}
+
+fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollectorConfig) {
+    let registry_sources = load_registry_collector_sources(config);
     if !collector.enabled {
+        if !registry_sources.is_empty() {
+            warn!(
+                sources = registry_sources.len(),
+                "Registry collector sources available but observe.collector.enabled=false; collector remains disabled"
+            );
+        }
         return;
     }
 
@@ -449,30 +533,43 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
         collector.frontload_reset_offsets_on_start.to_string(),
     );
 
-    if !collector.sources.is_empty() {
-        let sources = collector
-            .sources
-            .iter()
-            .map(|source| {
-                cli_config::expand_tilde(&source.path)
-                    .to_string_lossy()
-                    .to_string()
+    let mut source_paths = BTreeSet::new();
+    let mut structured_sources = collector
+        .sources
+        .iter()
+        .map(|source| {
+            let path = cli_config::expand_tilde(&source.path)
+                .to_string_lossy()
+                .to_string();
+            source_paths.insert(path.clone());
+            serde_json::json!({
+                "name": source.name,
+                "path": path,
+                "parser": source.parser,
             })
-            .collect::<Vec<_>>()
-            .join(",");
-        std::env::set_var("SOTH_COLLECTOR_SOURCES", sources);
+        })
+        .collect::<Vec<_>>();
 
-        let structured_sources = collector
-            .sources
-            .iter()
-            .map(|source| {
-                serde_json::json!({
-                    "name": source.name,
-                    "path": cli_config::expand_tilde(&source.path).to_string_lossy().to_string(),
-                    "parser": source.parser,
-                })
-            })
-            .collect::<Vec<_>>();
+    for source in &registry_sources {
+        source_paths.insert(source.path.clone());
+        structured_sources.push(serde_json::json!({
+            "name": format!("registry:{}", source.agent),
+            "path": source.path,
+            "parser": source.parser.clone().unwrap_or_else(|| "jsonl".to_string()),
+            "agent": source.agent,
+            "server_name": source.agent,
+            "tags": {
+                "collector.discovery": "registry_bundle",
+                "collector.agent": source.agent,
+            },
+        }));
+    }
+
+    if !structured_sources.is_empty() {
+        std::env::set_var(
+            "SOTH_COLLECTOR_SOURCES",
+            source_paths.into_iter().collect::<Vec<_>>().join(","),
+        );
         if let Ok(raw) = serde_json::to_string(&structured_sources) {
             std::env::set_var("SOTH_COLLECTOR_SOURCES_JSON", raw);
         }

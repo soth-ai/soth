@@ -56,6 +56,7 @@ pub struct CollectorSource {
     pub name: String,
     pub path: PathBuf,
     pub parser: CollectorParser,
+    pub agent: Option<String>,
     pub server_name: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -109,6 +110,8 @@ struct EnvFileSource {
     path: String,
     #[serde(default)]
     parser: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
     #[serde(default)]
     server_name: Option<String>,
     #[serde(default)]
@@ -334,6 +337,7 @@ fn parse_file_sources_from_env() -> Vec<CollectorSource> {
             name,
             path,
             parser,
+            agent: None,
             server_name: None,
             provider: None,
             model: None,
@@ -375,6 +379,7 @@ fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
                 .map(str::to_string)
                 .unwrap_or_else(|| default_source_name(&path));
             let parser = parser_for_path_and_hint(&path, source.parser.as_deref());
+            let agent = normalize_optional_text(source.agent.as_deref());
             let server_name = normalize_optional_text(source.server_name.as_deref());
             let provider = normalize_optional_text(source.provider.as_deref());
             let model = normalize_optional_text(source.model.as_deref());
@@ -382,6 +387,7 @@ fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
                 name,
                 path,
                 parser,
+                agent,
                 server_name,
                 provider,
                 model,
@@ -738,16 +744,21 @@ impl CollectorAgent {
         }
 
         let parsed = parse_line(source.parser, trimmed);
-        let agent_name = parsed
+        let agent_name = source
             .agent
             .clone()
+            .or(parsed.agent.clone())
             .unwrap_or_else(|| self.config.agent_name.clone());
         let server_name = source
             .server_name
             .clone()
             .unwrap_or_else(|| source.name.clone());
         let direction = parsed.direction.unwrap_or(WrapDirection::In);
-        let source_kind = parsed.source.unwrap_or(self.config.event_source);
+        let source_kind = if source.agent.is_some() {
+            EventSource::AgentApp
+        } else {
+            parsed.source.unwrap_or(self.config.event_source)
+        };
 
         let mut event = WrapEvent::new(
             self.session_id.clone(),
@@ -1565,6 +1576,7 @@ fn discover_default_sources(limit: usize) -> Vec<CollectorSource> {
                 name: format!("{}:{}", root_name, rel),
                 path,
                 parser,
+                agent: None,
                 server_name: None,
                 provider: None,
                 model: None,
@@ -1738,6 +1750,7 @@ mod tests {
             name: "events".to_string(),
             path,
             parser: CollectorParser::JsonLines,
+            agent: None,
             server_name: None,
             provider: None,
             model: None,
