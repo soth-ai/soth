@@ -70,7 +70,8 @@ use crate::transport::proxy_support::{
     acquire_stream_buffer, append_capture_tags, append_catalog_discovery_tags,
     append_process_attribution_tags, append_stream_capture, decision_label_from_intercept_decision,
     is_blacklist_detection_reason, process_bundle_id_from_executable, release_stream_buffer,
-    CatalogDiscoveryLimiter, TunnelDebugRuntime, STREAM_CAPTURE_MAX_BYTES,
+    should_shed_intercept_due_to_fd_pressure, CatalogDiscoveryLimiter, TunnelDebugRuntime,
+    STREAM_CAPTURE_MAX_BYTES,
 };
 #[cfg(test)]
 use crate::transport::proxy_websocket::should_emit_non_mcp_ws_event;
@@ -1434,6 +1435,18 @@ impl HttpHandler for AiProxyHandler {
             match action {
                 HostAction::Intercept => {
                     if !debug_force_intercept {
+                        if let Some(fd_snapshot) = should_shed_intercept_due_to_fd_pressure() {
+                            metrics::record_filter_decision("connect", "fd_pressure_tunnel");
+                            debug!(
+                                host = %host,
+                                open_fds = fd_snapshot.open_fds,
+                                soft_limit = fd_snapshot.soft_limit,
+                                hard_limit = fd_snapshot.hard_limit,
+                                utilization_pct = format!("{:.1}", fd_snapshot.utilization * 100.0),
+                                "FD pressure fail-open: tunneling CONNECT instead of MITM"
+                            );
+                            return false;
+                        }
                         if let Some(learned) = learned_passthrough.as_ref() {
                             if learned.should_passthrough(&host) {
                                 metrics::record_tls_learned_passthrough("bypass");

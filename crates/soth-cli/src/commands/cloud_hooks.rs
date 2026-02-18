@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::Serialize;
 use soth_core::config::SothConfig;
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -62,6 +63,72 @@ fn current_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Debug, Serialize)]
+struct RegistryRuntimeStateSnapshot<'a> {
+    schema_version: u32,
+    source: &'a str,
+    consecutive_failures: u64,
+    updated_at_unix_secs: u64,
+    last_success_unix_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+}
+
+fn registry_runtime_state_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| {
+            home.join(".soth")
+                .join("runtime")
+                .join("registry_runtime_state.json")
+        })
+        .unwrap_or_else(|| PathBuf::from(".soth/runtime/registry_runtime_state.json"))
+}
+
+fn persist_registry_runtime_state(
+    source: RegistryRuntimeSource,
+    consecutive_failures: u64,
+    last_success_unix_secs: u64,
+    detail: Option<&str>,
+) {
+    let snapshot = RegistryRuntimeStateSnapshot {
+        schema_version: 1,
+        source: source.as_label(),
+        consecutive_failures,
+        updated_at_unix_secs: current_unix_secs(),
+        last_success_unix_secs,
+        detail,
+    };
+    let path = registry_runtime_state_path();
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "Failed creating registry runtime state directory"
+            );
+            return;
+        }
+    }
+    match serde_json::to_vec_pretty(&snapshot) {
+        Ok(body) => {
+            if let Err(error) = std::fs::write(&path, body) {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "Failed writing registry runtime state snapshot"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "Failed serializing registry runtime state snapshot"
+            );
+        }
+    }
+}
+
 pub fn apply_cached_controls(config: &mut SothConfig) -> Result<()> {
     use soth_sync::cache;
 
@@ -108,19 +175,36 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
     let registry_cache_path = resolve_registry_cache_path(config, &cache_path);
     let mut runtime_source = resolve_registry_runtime_source(&registry_cache_path);
     let mut consecutive_failures = 0_u64;
+    let mut last_success_unix_secs = 0_u64;
 
     soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
     soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+    persist_registry_runtime_state(
+        runtime_source,
+        consecutive_failures,
+        last_success_unix_secs,
+        Some("startup_init"),
+    );
 
-    let puller = RegistryPuller::new(config.cloud.endpoint.clone(), api_key, registry_cache_path);
+    let puller = RegistryPuller::new(config.cloud.endpoint.clone(), api_key, registry_cache_path)
+        .with_fallback_endpoints(config.cloud.registry_bundle_fallback_endpoints.clone());
 
     match tokio::time::timeout(STARTUP_REGISTRY_REFRESH_TIMEOUT, puller.refresh_now()).await {
         Ok(Ok(outcome)) => {
             runtime_source = RegistryRuntimeSource::HealthyCloud;
             consecutive_failures = 0;
+            last_success_unix_secs = current_unix_secs();
             soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
             soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
-            soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(current_unix_secs());
+            soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(
+                last_success_unix_secs,
+            );
+            persist_registry_runtime_state(
+                runtime_source,
+                consecutive_failures,
+                last_success_unix_secs,
+                Some("startup_refresh_success"),
+            );
             info!(
                 source = runtime_source.as_label(),
                 checked = outcome.checked,
@@ -134,6 +218,12 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
             runtime_source = resolve_registry_runtime_source(puller.cache_path());
             soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
             soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+            persist_registry_runtime_state(
+                runtime_source,
+                consecutive_failures,
+                last_success_unix_secs,
+                Some("startup_refresh_failed"),
+            );
             warn!(
                 source = runtime_source.as_label(),
                 consecutive_failures = consecutive_failures,
@@ -146,6 +236,12 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
             runtime_source = resolve_registry_runtime_source(puller.cache_path());
             soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
             soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+            persist_registry_runtime_state(
+                runtime_source,
+                consecutive_failures,
+                last_success_unix_secs,
+                Some("startup_refresh_timeout"),
+            );
             warn!(
                 source = runtime_source.as_label(),
                 consecutive_failures = consecutive_failures,
@@ -179,7 +275,8 @@ pub fn spawn_cloud_pull_runtime(
         endpoint.clone(),
         api_key.clone(),
         registry_cache_path.clone(),
-    );
+    )
+    .with_fallback_endpoints(config.cloud.registry_bundle_fallback_endpoints.clone());
     let puller = ConfigPuller::new(endpoint, api_key, cache_path)
         .with_registry_puller(registry_puller)
         .with_debounce(std::time::Duration::from_secs(debounce_secs));
@@ -253,9 +350,16 @@ pub fn spawn_cloud_pull_runtime(
 
         let mut registry_source = resolve_registry_runtime_source(&registry_cache_path);
         let mut registry_consecutive_failures = 0_u64;
+        let mut registry_last_success_unix_secs = 0_u64;
         soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
         soth_proxy::metrics::set_registry_refresh_consecutive_failures(
             registry_consecutive_failures,
+        );
+        persist_registry_runtime_state(
+            registry_source,
+            registry_consecutive_failures,
+            registry_last_success_unix_secs,
+            Some("runtime_init"),
         );
         info!(
             source = registry_source.as_label(),
@@ -278,6 +382,12 @@ pub fn spawn_cloud_pull_runtime(
             }
             registry_source = degraded;
             soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
+            persist_registry_runtime_state(
+                registry_source,
+                registry_consecutive_failures,
+                registry_last_success_unix_secs,
+                Some("initial_pull_failed"),
+            );
             warn!(
                 source = registry_source.as_label(),
                 consecutive_failures = registry_consecutive_failures,
@@ -300,7 +410,16 @@ pub fn spawn_cloud_pull_runtime(
             soth_proxy::metrics::set_registry_refresh_consecutive_failures(
                 registry_consecutive_failures,
             );
-            soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(current_unix_secs());
+            registry_last_success_unix_secs = current_unix_secs();
+            soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(
+                registry_last_success_unix_secs,
+            );
+            persist_registry_runtime_state(
+                registry_source,
+                registry_consecutive_failures,
+                registry_last_success_unix_secs,
+                Some("initial_pull_success"),
+            );
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -370,6 +489,12 @@ pub fn spawn_cloud_pull_runtime(
                         }
                         registry_source = degraded;
                         soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
+                        persist_registry_runtime_state(
+                            registry_source,
+                            registry_consecutive_failures,
+                            registry_last_success_unix_secs,
+                            Some("periodic_pull_failed"),
+                        );
                         warn!(
                             source = registry_source.as_label(),
                             consecutive_failures = registry_consecutive_failures,
@@ -392,8 +517,15 @@ pub fn spawn_cloud_pull_runtime(
                         soth_proxy::metrics::set_registry_refresh_consecutive_failures(
                             registry_consecutive_failures,
                         );
+                        registry_last_success_unix_secs = current_unix_secs();
                         soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(
-                            current_unix_secs(),
+                            registry_last_success_unix_secs,
+                        );
+                        persist_registry_runtime_state(
+                            registry_source,
+                            registry_consecutive_failures,
+                            registry_last_success_unix_secs,
+                            Some("periodic_pull_success"),
                         );
                     }
                 }

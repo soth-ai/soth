@@ -13,6 +13,14 @@ use std::time::Duration;
 const PID_FILE: &str = "proxy.pid";
 const LOG_FILE: &str = "proxy.log";
 const DEFAULT_PROXY_PORT: u16 = 8080;
+const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 12;
+const MIN_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 3;
+const MAX_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_PROXY_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+const MIN_PROXY_LOG_MAX_BYTES: u64 = 1 * 1024 * 1024;
+const MAX_PROXY_LOG_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_PROXY_LOG_MAX_BACKUPS: usize = 5;
+const MAX_PROXY_LOG_MAX_BACKUPS: usize = 20;
 const PROXY_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -54,6 +62,78 @@ fn ensure_runtime_dirs() -> anyhow::Result<()> {
     std::fs::create_dir_all(run_dir()).context("failed creating ~/.soth/run")?;
     std::fs::create_dir_all(logs_dir()).context("failed creating ~/.soth/logs")?;
     Ok(())
+}
+
+fn parse_env_u64(key: &str) -> Option<u64> {
+    env::var(key).ok()?.trim().parse::<u64>().ok()
+}
+
+fn parse_env_usize(key: &str) -> Option<usize> {
+    env::var(key).ok()?.trim().parse::<usize>().ok()
+}
+
+fn daemon_startup_timeout() -> Duration {
+    let secs = parse_env_u64("SOTH_DAEMON_STARTUP_TIMEOUT_SECS")
+        .unwrap_or(DEFAULT_DAEMON_STARTUP_TIMEOUT_SECS)
+        .clamp(
+            MIN_DAEMON_STARTUP_TIMEOUT_SECS,
+            MAX_DAEMON_STARTUP_TIMEOUT_SECS,
+        );
+    Duration::from_secs(secs)
+}
+
+fn proxy_log_rotation_limits() -> (u64, usize) {
+    let max_bytes = parse_env_u64("SOTH_PROXY_LOG_MAX_BYTES")
+        .unwrap_or(DEFAULT_PROXY_LOG_MAX_BYTES)
+        .clamp(MIN_PROXY_LOG_MAX_BYTES, MAX_PROXY_LOG_MAX_BYTES);
+    let max_backups = parse_env_usize("SOTH_PROXY_LOG_MAX_BACKUPS")
+        .unwrap_or(DEFAULT_PROXY_LOG_MAX_BACKUPS)
+        .clamp(1, MAX_PROXY_LOG_MAX_BACKUPS);
+    (max_bytes, max_backups)
+}
+
+fn rotated_log_path(base: &Path, generation: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{}", base.display(), generation))
+}
+
+fn rotate_proxy_log_if_needed(
+    log_path: &Path,
+    max_bytes: u64,
+    max_backups: usize,
+) -> anyhow::Result<bool> {
+    let metadata = match std::fs::metadata(log_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() < max_bytes {
+        return Ok(false);
+    }
+
+    let last_backup = rotated_log_path(log_path, max_backups);
+    if last_backup.exists() {
+        let _ = std::fs::remove_file(&last_backup);
+    }
+    for generation in (1..=max_backups).rev() {
+        let src = if generation == 1 {
+            log_path.to_path_buf()
+        } else {
+            rotated_log_path(log_path, generation - 1)
+        };
+        if !src.exists() {
+            continue;
+        }
+        let dst = rotated_log_path(log_path, generation);
+        std::fs::rename(&src, &dst).with_context(|| {
+            format!(
+                "failed rotating log from {} to {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+    }
+
+    Ok(true)
 }
 
 fn read_pid() -> anyhow::Result<Option<u32>> {
@@ -320,6 +400,16 @@ pub async fn run_start_daemon(
     }
 
     let log_file_path = log_path();
+    let (log_max_bytes, log_max_backups) = proxy_log_rotation_limits();
+    if let Err(error) = rotate_proxy_log_if_needed(&log_file_path, log_max_bytes, log_max_backups) {
+        if !quiet {
+            style::warning(&format!(
+                "Failed to rotate proxy log (continuing): {}",
+                error
+            ));
+        }
+    }
+
     let stdout_file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -366,7 +456,8 @@ pub async fn run_start_daemon(
     }
 
     let mut child = cmd.spawn().context("failed spawning proxy daemon")?;
-    let startup_deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let startup_timeout = daemon_startup_timeout();
+    let startup_deadline = std::time::Instant::now() + startup_timeout;
     loop {
         if let Some(status) = child
             .try_wait()
@@ -386,8 +477,9 @@ pub async fn run_start_daemon(
             let pid = child.id();
             let _ = stop_pid_and_wait(pid, Duration::from_secs(2));
             return Err(anyhow!(
-                "proxy daemon did not open 127.0.0.1:{} within startup timeout; check {}",
+                "proxy daemon did not open 127.0.0.1:{} within {}s startup timeout; check {}",
                 expected_port,
+                startup_timeout.as_secs(),
                 compact_path(&log_file_path)
             ));
         }

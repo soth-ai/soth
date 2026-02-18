@@ -7,8 +7,8 @@ use tracing::{info, warn};
 
 const MIN_NOFILE_SOFT_LIMIT: u64 = 8192;
 const WARN_NOFILE_SOFT_LIMIT: u64 = 2048;
-const FD_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
-const FD_MONITOR_WARN_INTERVAL: Duration = Duration::from_secs(60);
+const FD_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
+const FD_MONITOR_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[cfg(unix)]
 pub(crate) fn ensure_fd_budget() {

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TunnelDebugRuntime {
@@ -75,6 +75,86 @@ impl TunnelDebugRuntime {
         map.insert(key, now);
         true
     }
+}
+
+const FD_PRESSURE_SHED_ENTER_RATIO: f64 = 0.95;
+const FD_PRESSURE_SHED_EXIT_RATIO: f64 = 0.85;
+const FD_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FdPressureSnapshot {
+    pub(crate) open_fds: u64,
+    pub(crate) soft_limit: u64,
+    pub(crate) hard_limit: u64,
+    pub(crate) utilization: f64,
+}
+
+#[derive(Debug)]
+struct FdPressureState {
+    active: bool,
+    last_log_at: Option<Instant>,
+}
+
+static FD_PRESSURE_STATE: Lazy<Mutex<FdPressureState>> = Lazy::new(|| {
+    Mutex::new(FdPressureState {
+        active: false,
+        last_log_at: None,
+    })
+});
+
+pub(crate) fn should_shed_intercept_due_to_fd_pressure() -> Option<FdPressureSnapshot> {
+    let (open_fds, soft_limit, hard_limit) = crate::metrics::runtime_fd_snapshot();
+    if soft_limit == 0 {
+        return None;
+    }
+    let utilization = (open_fds as f64) / (soft_limit as f64);
+    let snapshot = FdPressureSnapshot {
+        open_fds,
+        soft_limit,
+        hard_limit,
+        utilization,
+    };
+
+    let now = Instant::now();
+    let mut state = FD_PRESSURE_STATE.lock();
+    if state.active {
+        if utilization <= FD_PRESSURE_SHED_EXIT_RATIO {
+            state.active = false;
+            state.last_log_at = None;
+            info!(
+                open_fds = open_fds,
+                soft_limit = soft_limit,
+                hard_limit = hard_limit,
+                utilization_pct = format!("{:.1}", utilization * 100.0),
+                "FD pressure recovered; resuming MITM interception decisions"
+            );
+            return None;
+        }
+    } else if utilization >= FD_PRESSURE_SHED_ENTER_RATIO {
+        state.active = true;
+        state.last_log_at = None;
+    }
+
+    if !state.active {
+        return None;
+    }
+
+    let should_log = state
+        .last_log_at
+        .map(|last| now.saturating_duration_since(last) >= FD_PRESSURE_LOG_INTERVAL)
+        .unwrap_or(true);
+    if should_log {
+        state.last_log_at = Some(now);
+        warn!(
+            open_fds = open_fds,
+            soft_limit = soft_limit,
+            hard_limit = hard_limit,
+            utilization_pct = format!("{:.1}", utilization * 100.0),
+            "FD pressure fail-open active: tunneling CONNECT instead of MITM to prevent EMFILE"
+        );
+    }
+
+    Some(snapshot)
 }
 
 pub(crate) fn is_benign_proxy_forward_error(err: &LegacyClientError) -> bool {

@@ -4,6 +4,7 @@ use crate::cli_config;
 use crate::style;
 use comfy_table::Cell;
 use owo_colors::OwoColorize;
+use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Run the status command
@@ -201,7 +202,24 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .get("device_id")
         .map(String::as_str)
         .unwrap_or("-");
-    cloud_table.add_row(vec![Cell::new("Device ID"), Cell::new(device_id.to_string())]);
+    cloud_table.add_row(vec![
+        Cell::new("Device ID"),
+        Cell::new(device_id.to_string()),
+    ]);
+    if let Some(runtime_state) = load_registry_runtime_state() {
+        cloud_table.add_row(vec![
+            Cell::new("Registry Source"),
+            Cell::new(runtime_state.source),
+        ]);
+        cloud_table.add_row(vec![
+            Cell::new("Registry Failures"),
+            Cell::new(runtime_state.consecutive_failures.to_string()),
+        ]);
+        cloud_table.add_row(vec![
+            Cell::new("Registry Last Success"),
+            Cell::new(runtime_state.last_success_unix_secs.to_string()),
+        ]);
+    }
     println!("{cloud_table}");
 
     // Environment variables
@@ -298,4 +316,23 @@ fn mask_secret(raw: &str) -> String {
     let head = &raw[..6];
     let tail = &raw[raw.len() - 4..];
     format!("{head}…{tail}")
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryRuntimeState {
+    source: String,
+    consecutive_failures: u64,
+    last_success_unix_secs: u64,
+}
+
+fn load_registry_runtime_state() -> Option<RegistryRuntimeState> {
+    let path = dirs::home_dir()
+        .map(|home| {
+            home.join(".soth")
+                .join("runtime")
+                .join("registry_runtime_state.json")
+        })
+        .unwrap_or_else(|| PathBuf::from(".soth/runtime/registry_runtime_state.json"));
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RegistryRuntimeState>(&body).ok()
 }
