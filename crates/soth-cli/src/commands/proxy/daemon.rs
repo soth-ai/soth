@@ -559,12 +559,21 @@ pub async fn run_start_daemon(
 
     if let Some(pid) = read_pid()? {
         if is_expected_daemon_process(pid) {
+            let autostart_result =
+                super::autostart::ensure_enabled(expected_port, config_path.as_ref());
             if !quiet {
                 style::success(&format!("Proxy daemon already running (pid {pid})."));
                 style::info(&format!(
                     "Logs: {} (use `soth logs -f`)",
                     compact_path(&log_path())
                 ));
+                match autostart_result {
+                    Ok(details) => style::info(&format!("Startup autostart ensured: {details}")),
+                    Err(error) => style::warning(&format!(
+                        "Could not register startup autostart (continuing): {}",
+                        error
+                    )),
+                }
             }
             return Ok(());
         }
@@ -719,6 +728,23 @@ pub async fn run_start_daemon(
         style::kv("Tail", "soth logs -f");
         print_env_setup_hint_if_needed();
     }
+
+    match super::autostart::ensure_enabled(expected_port, config_path.as_ref()) {
+        Ok(details) => {
+            if !quiet {
+                style::info(&format!("Startup autostart ensured: {details}"));
+            }
+        }
+        Err(error) => {
+            if !quiet {
+                style::warning(&format!(
+                    "Could not register startup autostart (continuing): {}",
+                    error
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 

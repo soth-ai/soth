@@ -3,6 +3,7 @@
 use crate::cli_config;
 #[cfg(feature = "local-debug")]
 mod api;
+mod autostart;
 mod ca_info;
 #[cfg(feature = "local-debug")]
 mod circuit;
