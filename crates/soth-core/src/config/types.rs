@@ -714,6 +714,12 @@ pub struct ObserveCollectorConfig {
     /// Run a one-time high-throughput frontload pass on startup.
     #[serde(default = "default_true")]
     pub frontload_on_start: bool,
+    /// Force a one-time first-run replay frontload even if collector offsets already exist.
+    #[serde(default = "default_true")]
+    pub frontload_force_first_run: bool,
+    /// Reset collector offsets before startup frontload so history is replayed.
+    #[serde(default)]
+    pub frontload_reset_offsets_on_start: bool,
     /// Maximum frontload cycles during startup.
     #[serde(default)]
     pub frontload_max_cycles: Option<u32>,
@@ -748,6 +754,8 @@ impl Default for ObserveCollectorConfig {
             sources: Vec::new(),
             sqlite_sources: Vec::new(),
             frontload_on_start: true,
+            frontload_force_first_run: true,
+            frontload_reset_offsets_on_start: false,
             frontload_max_cycles: None,
             frontload_max_read_bytes_per_source: None,
             poll_interval_secs: None,
@@ -1003,6 +1011,11 @@ pub struct CloudConfig {
     #[serde(default = "default_cloud_endpoint")]
     pub endpoint: String,
 
+    /// Optional fallback endpoints for registry bundle/version pulls.
+    /// Tried in order after `endpoint` failures.
+    #[serde(default)]
+    pub registry_bundle_fallback_endpoints: Vec<String>,
+
     /// User-defined cloud tags for attribution
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
@@ -1114,6 +1127,7 @@ impl Default for CloudConfig {
             enabled: false,
             api_key: None,
             endpoint: default_cloud_endpoint(),
+            registry_bundle_fallback_endpoints: Vec::new(),
             tags: BTreeMap::new(),
             sync_interval_secs: default_cloud_sync_interval_secs(),
             config_pull_interval_secs: default_cloud_config_pull_interval_secs(),
@@ -1353,6 +1367,10 @@ pub struct ForwardProxyConfig {
     /// Tunnel-only debug logging controls (metadata only; no body capture).
     #[serde(default)]
     pub tunnel_debug: TunnelDebugConfig,
+
+    /// Register runtime autostart (launchd/systemd/Run key) when starting daemon mode.
+    #[serde(default = "default_true")]
+    pub autostart_on_boot: bool,
 }
 
 fn default_forward_proxy_port() -> u16 {
@@ -1398,6 +1416,7 @@ impl Default for ForwardProxyConfig {
             capture_max_body_bytes: default_forward_proxy_capture_max_body_bytes(),
             process_attribution: ProcessAttributionConfig::default(),
             tunnel_debug: TunnelDebugConfig::default(),
+            autostart_on_boot: default_true(),
         }
     }
 }
@@ -1513,15 +1532,15 @@ fn default_learned_passthrough_state_path() -> PathBuf {
 }
 
 fn default_learned_passthrough_max_age() -> Duration {
-    Duration::from_secs(7 * 24 * 60 * 60)
+    Duration::from_secs(24 * 60 * 60)
 }
 
 fn default_learned_passthrough_failure_threshold() -> u32 {
-    3
+    8
 }
 
 fn default_learned_passthrough_failure_window() -> Duration {
-    Duration::from_secs(90)
+    Duration::from_secs(120)
 }
 
 impl Default for LearnedPassthroughConfig {
@@ -2753,9 +2772,9 @@ forward_proxy:
     fn test_learned_passthrough_config_default() {
         let config = LearnedPassthroughConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.max_age, Duration::from_secs(7 * 24 * 60 * 60));
-        assert_eq!(config.failure_threshold, 3);
-        assert_eq!(config.failure_window, Duration::from_secs(90));
+        assert_eq!(config.max_age, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(config.failure_threshold, 8);
+        assert_eq!(config.failure_window, Duration::from_secs(120));
     }
 
     #[test]

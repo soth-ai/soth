@@ -4,6 +4,7 @@ use crate::cli_config;
 use crate::style;
 use comfy_table::Cell;
 use owo_colors::OwoColorize;
+use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Run the status command
@@ -133,6 +134,94 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         );
     }
 
+    // Cloud enrollment state
+    println!();
+    style::subtitle("Cloud Enrollment");
+
+    let cloud_enabled = config.cloud.enabled;
+    let api_key = config
+        .cloud
+        .api_key
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty());
+    let exchange_v2_enabled = config.exchange_v2.enabled;
+
+    let mut cloud_table = style::table();
+    cloud_table.set_header(vec!["Property", "Value"]);
+    let enrollment_display = if cloud_enabled && api_key.is_some() {
+        format!("{} Enrolled", style::CHECK.green())
+    } else if cloud_enabled {
+        format!("{} Cloud enabled (missing API key)", style::CROSS.red())
+    } else {
+        format!("{} Local only", style::CIRCLE_FILLED.yellow())
+    };
+    cloud_table.add_row(vec![Cell::new("Enrollment"), Cell::new(enrollment_display)]);
+    cloud_table.add_row(vec![
+        Cell::new("Cloud Enabled"),
+        Cell::new(if cloud_enabled {
+            "true".green().to_string()
+        } else {
+            "false".yellow().to_string()
+        }),
+    ]);
+    cloud_table.add_row(vec![
+        Cell::new("Endpoint"),
+        Cell::new(config.cloud.endpoint.as_str().cyan().to_string()),
+    ]);
+    cloud_table.add_row(vec![
+        Cell::new("API Key"),
+        Cell::new(
+            api_key
+                .map(mask_secret)
+                .unwrap_or_else(|| "(not configured)".dimmed().to_string()),
+        ),
+    ]);
+    cloud_table.add_row(vec![
+        Cell::new("Exchange V2"),
+        Cell::new(if exchange_v2_enabled {
+            "enabled".green().to_string()
+        } else {
+            "disabled".yellow().to_string()
+        }),
+    ]);
+    let workspace_id = config
+        .cloud
+        .tags
+        .get("workspace_id")
+        .or_else(|| config.cloud.tags.get("team_id"))
+        .map(String::as_str)
+        .unwrap_or("-");
+    cloud_table.add_row(vec![
+        Cell::new("Workspace"),
+        Cell::new(workspace_id.to_string()),
+    ]);
+    let device_id = config
+        .cloud
+        .tags
+        .get("device_id")
+        .map(String::as_str)
+        .unwrap_or("-");
+    cloud_table.add_row(vec![
+        Cell::new("Device ID"),
+        Cell::new(device_id.to_string()),
+    ]);
+    if let Some(runtime_state) = load_registry_runtime_state() {
+        cloud_table.add_row(vec![
+            Cell::new("Registry Source"),
+            Cell::new(runtime_state.source),
+        ]);
+        cloud_table.add_row(vec![
+            Cell::new("Registry Failures"),
+            Cell::new(runtime_state.consecutive_failures.to_string()),
+        ]);
+        cloud_table.add_row(vec![
+            Cell::new("Registry Last Success"),
+            Cell::new(runtime_state.last_success_unix_secs.to_string()),
+        ]);
+    }
+    println!("{cloud_table}");
+
     // Environment variables
     println!();
     style::subtitle("Environment");
@@ -218,4 +307,32 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     style::footer();
     Ok(())
+}
+
+fn mask_secret(raw: &str) -> String {
+    if raw.len() <= 10 {
+        return "***".to_string();
+    }
+    let head = &raw[..6];
+    let tail = &raw[raw.len() - 4..];
+    format!("{head}…{tail}")
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryRuntimeState {
+    source: String,
+    consecutive_failures: u64,
+    last_success_unix_secs: u64,
+}
+
+fn load_registry_runtime_state() -> Option<RegistryRuntimeState> {
+    let path = dirs::home_dir()
+        .map(|home| {
+            home.join(".soth")
+                .join("runtime")
+                .join("registry_runtime_state.json")
+        })
+        .unwrap_or_else(|| PathBuf::from(".soth/runtime/registry_runtime_state.json"));
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RegistryRuntimeState>(&body).ok()
 }

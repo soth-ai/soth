@@ -48,6 +48,12 @@ fn normalize_cloud_config(config: &mut SothConfig) {
     if config.cloud.api_key.is_none() {
         config.cloud.enabled = false;
     }
+    // Unified exchange pipeline is required for cloud sync.
+    // Keep this fail-open and deterministic: if cloud is enabled with credentials,
+    // runtime ingestion/upload should always use exchange.v2.
+    if config.cloud.enabled {
+        config.exchange_v2.enabled = true;
+    }
 }
 
 /// Apply environment variable overrides to the configuration
@@ -126,6 +132,15 @@ fn apply_env_overrides(config: &mut SothConfig) {
         if !endpoint.trim().is_empty() {
             config.cloud.endpoint = endpoint;
         }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_REGISTRY_FALLBACK_ENDPOINTS") {
+        let endpoints = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        config.cloud.registry_bundle_fallback_endpoints = endpoints;
     }
     if let Ok(value) = std::env::var("SOTH_CLOUD_TAGS") {
         config.cloud.tags = parse_key_value_tags(&value);

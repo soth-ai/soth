@@ -19,7 +19,7 @@ pub struct EnrollArgs {
     #[arg(long)]
     pub endpoint: Option<String>,
 
-    /// Config file path to update (defaults to ~/.soth/config.yaml)
+    /// Config file path to update (defaults to ~/.soth/soth.yaml)
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -69,6 +69,8 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     config.cloud.enabled = true;
     config.cloud.api_key = Some(exchanged.api_key);
     config.cloud.endpoint = exchanged.endpoint.unwrap_or(endpoint);
+    // Cloud sync uses unified exchange.v2 pipeline.
+    config.exchange_v2.enabled = true;
 
     if let Some(workspace_id) = exchanged.workspace_id {
         config
@@ -81,6 +83,9 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
             config.cloud.tags.insert(key, value);
         }
     }
+    if let Some(device_id) = exchanged.device_id {
+        config.cloud.tags.insert("device_id".to_string(), device_id);
+    }
 
     let serialized = serde_yaml::to_string(&config).context("failed serializing config")?;
     std::fs::write(&config_path, serialized)
@@ -90,6 +95,7 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     println!("Saved cloud credentials to {}", config_path.display());
     println!("Cloud sync enabled: {}", config.cloud.enabled);
     println!("Cloud endpoint: {}", config.cloud.endpoint);
+    println!("Exchange v2 enabled: {}", config.exchange_v2.enabled);
     if let Some(workspace_id) = config.cloud.tags.get("workspace_id") {
         println!("Workspace: {workspace_id}");
     }
@@ -103,6 +109,7 @@ struct EnrollmentExchange {
     endpoint: Option<String>,
     workspace_id: Option<String>,
     tags: Option<BTreeMap<String, String>>,
+    device_id: Option<String>,
 }
 
 fn parse_enrollment_exchange(value: &Value) -> Result<EnrollmentExchange> {
@@ -148,12 +155,14 @@ fn parse_enrollment_exchange(value: &Value) -> Result<EnrollmentExchange> {
     );
 
     let tags = first_object_map(value, &["/tags", "/data/tags"]);
+    let device_id = first_string(value, &["/device_id", "/data/device_id"]);
 
     Ok(EnrollmentExchange {
         api_key,
         endpoint,
         workspace_id,
         tags,
+        device_id,
     })
 }
 
@@ -320,13 +329,15 @@ mod tests {
                 "api_key": "soth_live_x",
                 "endpoint": "https://api.example.com",
                 "workspace_id": "ws_123",
-                "tags": { "env": "prod" }
+                "tags": { "env": "prod" },
+                "device_id": "device_123"
             }
         });
         let parsed = parse_enrollment_exchange(&payload).expect("parse enrollment payload");
         assert_eq!(parsed.api_key, "soth_live_x");
         assert_eq!(parsed.endpoint.as_deref(), Some("https://api.example.com"));
         assert_eq!(parsed.workspace_id.as_deref(), Some("ws_123"));
+        assert_eq!(parsed.device_id.as_deref(), Some("device_123"));
         assert_eq!(
             parsed
                 .tags

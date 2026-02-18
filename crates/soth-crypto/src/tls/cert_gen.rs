@@ -14,6 +14,11 @@ pub const DEFAULT_CERT_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default CA validity period (10 years)
 pub const DEFAULT_CA_VALIDITY: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
+fn cert_not_before() -> time::OffsetDateTime {
+    // Keep a small skew buffer for clock drift while avoiding rcgen's very old default.
+    time::OffsetDateTime::now_utc() - time::Duration::hours(1)
+}
+
 /// Certificate generator for creating domain certificates
 pub struct CertGenerator {
     /// Certificate validity duration
@@ -52,6 +57,7 @@ impl CertGenerator {
         // Set validity
         let validity = validity.unwrap_or(DEFAULT_CA_VALIDITY);
         let not_after = time::OffsetDateTime::now_utc() + validity;
+        params.not_before = cert_not_before();
         params.not_after = not_after;
 
         // CA-specific settings
@@ -89,6 +95,7 @@ impl CertGenerator {
 
         // Set validity
         let not_after = time::OffsetDateTime::now_utc() + self.validity;
+        params.not_before = cert_not_before();
         params.not_after = not_after;
 
         // Server certificate settings
@@ -141,6 +148,7 @@ impl CertGenerator {
 
         // Set validity
         let not_after = time::OffsetDateTime::now_utc() + self.validity;
+        params.not_before = cert_not_before();
         params.not_after = not_after;
 
         // Server certificate settings

@@ -17,10 +17,10 @@ pub struct RegistryPullOutcome {
 #[derive(Clone)]
 pub struct RegistryPuller {
     endpoint: String,
+    fallback_endpoints: Vec<String>,
     api_key: String,
     cache_path: PathBuf,
     bundle_type: String,
-    client: reqwest::Client,
 }
 
 impl RegistryPuller {
@@ -31,8 +31,8 @@ impl RegistryPuller {
     ) -> Self {
         let endpoint = endpoint.into().trim_end_matches('/').to_string();
         Self {
-            client: build_cloud_client(&endpoint),
             endpoint,
+            fallback_endpoints: Vec::new(),
             api_key: api_key.into(),
             cache_path,
             bundle_type: "local".to_string(),
@@ -44,8 +44,33 @@ impl RegistryPuller {
         self
     }
 
+    pub fn with_fallback_endpoints<I, S>(mut self, endpoints: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.fallback_endpoints = endpoints
+            .into_iter()
+            .map(|value| value.into().trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty() && value != &self.endpoint)
+            .collect();
+        self
+    }
+
     pub fn cache_path(&self) -> &PathBuf {
         &self.cache_path
+    }
+
+    fn endpoint_candidates(&self) -> Vec<&str> {
+        let mut endpoints = Vec::with_capacity(1 + self.fallback_endpoints.len());
+        endpoints.push(self.endpoint.as_str());
+        for endpoint in &self.fallback_endpoints {
+            let candidate = endpoint.as_str();
+            if !endpoints.contains(&candidate) {
+                endpoints.push(candidate);
+            }
+        }
+        endpoints
     }
 
     pub async fn sync_from_hint(
@@ -75,37 +100,20 @@ impl RegistryPuller {
             });
         }
 
-        let Some(version) = self.fetch_version().await? else {
-            return Ok(RegistryPullOutcome {
-                checked: false,
-                downloaded: false,
-                version: expected_bundle_version,
-            });
-        };
         let if_none_match = cached.as_ref().map(|value| value.etag.as_str());
-        let bundle_result = self.fetch_bundle(if_none_match).await?;
-
-        match bundle_result {
-            BundleFetchResult::NotModified => Ok(RegistryPullOutcome {
-                checked: true,
-                downloaded: false,
-                version: Some(version.version),
-            }),
-            BundleFetchResult::Downloaded { bytes, etag } => {
-                let verified_metadata = verify_bundle_integrity(&version, &bytes, Some(&etag))?;
-                cache::save_registry_bundle_cache(
-                    &self.cache_path,
-                    &verified_metadata,
-                    &etag,
-                    &bytes,
-                )?;
-                Ok(RegistryPullOutcome {
-                    checked: true,
-                    downloaded: true,
-                    version: Some(verified_metadata.version),
-                })
-            }
-        }
+        self.pull_with_fallbacks(if_none_match)
+            .await
+            .or_else(|error| {
+                if expected_bundle_version.is_some() {
+                    Ok(RegistryPullOutcome {
+                        checked: false,
+                        downloaded: false,
+                        version: expected_bundle_version,
+                    })
+                } else {
+                    Err(error)
+                }
+            })
     }
 
     /// Force a registry refresh attempt against cloud.
@@ -125,21 +133,58 @@ impl RegistryPuller {
             }
         };
 
-        let Some(version) = self.fetch_version().await? else {
-            return Ok(RegistryPullOutcome {
+        let if_none_match = cached.as_ref().map(|value| value.etag.as_str());
+        self.pull_with_fallbacks(if_none_match).await
+    }
+
+    async fn pull_with_fallbacks(
+        &self,
+        if_none_match: Option<&str>,
+    ) -> anyhow::Result<RegistryPullOutcome> {
+        let mut last_error: Option<anyhow::Error> = None;
+        for endpoint in self.endpoint_candidates() {
+            match self.pull_once(endpoint, if_none_match).await {
+                Ok(Some(outcome)) => return Ok(outcome),
+                Ok(None) => continue,
+                Err(error) => {
+                    last_error = Some(
+                        error.context(format!("registry pull failed via endpoint {}", endpoint)),
+                    );
+                    if endpoint != self.endpoint {
+                        tracing::warn!(
+                            endpoint = endpoint,
+                            "Registry pull fallback endpoint failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = last_error {
+            Err(error)
+        } else {
+            Ok(RegistryPullOutcome {
                 checked: false,
                 downloaded: false,
                 version: None,
-            });
-        };
+            })
+        }
+    }
 
-        let if_none_match = cached.as_ref().map(|value| value.etag.as_str());
-        match self.fetch_bundle(if_none_match).await? {
-            BundleFetchResult::NotModified => Ok(RegistryPullOutcome {
+    async fn pull_once(
+        &self,
+        endpoint: &str,
+        if_none_match: Option<&str>,
+    ) -> anyhow::Result<Option<RegistryPullOutcome>> {
+        let Some(version) = self.fetch_version(endpoint).await? else {
+            return Ok(None);
+        };
+        match self.fetch_bundle(endpoint, if_none_match).await? {
+            BundleFetchResult::NotModified => Ok(Some(RegistryPullOutcome {
                 checked: true,
                 downloaded: false,
                 version: Some(version.version),
-            }),
+            })),
             BundleFetchResult::Downloaded { bytes, etag } => {
                 let verified_metadata = verify_bundle_integrity(&version, &bytes, Some(&etag))?;
                 cache::save_registry_bundle_cache(
@@ -148,19 +193,28 @@ impl RegistryPuller {
                     &etag,
                     &bytes,
                 )?;
-                Ok(RegistryPullOutcome {
+                if endpoint != self.endpoint {
+                    tracing::warn!(
+                        endpoint = endpoint,
+                        bundle_version = verified_metadata.version.as_str(),
+                        "Registry bundle refresh succeeded via fallback endpoint"
+                    );
+                }
+                Ok(Some(RegistryPullOutcome {
                     checked: true,
                     downloaded: true,
                     version: Some(verified_metadata.version),
-                })
+                }))
             }
         }
     }
 
-    async fn fetch_version(&self) -> anyhow::Result<Option<RegistryVersionResponse>> {
-        let url = format!("{}/api/v1/registry/version", self.endpoint);
-        let response = self
-            .client
+    async fn fetch_version(
+        &self,
+        endpoint: &str,
+    ) -> anyhow::Result<Option<RegistryVersionResponse>> {
+        let url = format!("{endpoint}/api/v1/registry/version");
+        let response = build_cloud_client(endpoint)
             .get(&url)
             .query(&[("type", self.bundle_type.as_str())])
             .header(API_VERSION_HEADER, API_VERSION)
@@ -189,10 +243,13 @@ impl RegistryPuller {
         Ok(Some(parsed))
     }
 
-    async fn fetch_bundle(&self, if_none_match: Option<&str>) -> anyhow::Result<BundleFetchResult> {
-        let url = format!("{}/api/v1/registry/bundle", self.endpoint);
-        let mut request = self
-            .client
+    async fn fetch_bundle(
+        &self,
+        endpoint: &str,
+        if_none_match: Option<&str>,
+    ) -> anyhow::Result<BundleFetchResult> {
+        let url = format!("{endpoint}/api/v1/registry/bundle");
+        let mut request = build_cloud_client(endpoint)
             .get(&url)
             .query(&[("type", self.bundle_type.as_str())])
             .header(API_VERSION_HEADER, API_VERSION)
@@ -289,7 +346,7 @@ fn verify_bundle_integrity(
     if !expected_hash.is_empty() {
         if actual_hash != expected_hash {
             if etag_hash.as_deref() == Some(actual_hash.as_str()) {
-                tracing::debug!(
+                tracing::warn!(
                     metadata_hash = expected_hash,
                     actual_hash = actual_hash,
                     etag_hash = etag_hash.as_deref().unwrap_or_default(),
@@ -306,7 +363,7 @@ fn verify_bundle_integrity(
             );
         }
         if size_mismatch {
-            tracing::debug!(
+            tracing::warn!(
                 metadata_size = metadata.size_bytes,
                 actual_size = bundle_bytes.len(),
                 "registry bundle metadata size drift detected; accepting bundle because sha256 matched"
@@ -318,7 +375,7 @@ fn verify_bundle_integrity(
 
     if size_mismatch {
         if etag_hash.as_deref() == Some(actual_hash.as_str()) {
-            tracing::debug!(
+            tracing::warn!(
                 metadata_size = metadata.size_bytes,
                 actual_size = bundle_bytes.len(),
                 actual_hash = actual_hash,

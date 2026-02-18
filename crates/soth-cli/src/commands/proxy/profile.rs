@@ -27,7 +27,17 @@ pub async fn run_start(
 ) -> anyhow::Result<()> {
     match profile {
         RuntimeProfile::SensorOnly => {
-            start::run(sensor_port, config_path, quiet, true, false, None, false).await
+            start::run(
+                sensor_port,
+                config_path,
+                quiet,
+                true,
+                false,
+                None,
+                false,
+                false,
+            )
+            .await
         }
         RuntimeProfile::ApiOnly => api::run_start(api_port, config_path, quiet).await,
         RuntimeProfile::UiOnly => ui::run_start(config_path, api_port, ui_dir, quiet).await,
@@ -48,10 +58,10 @@ async fn run_dev_stack(
     let mut children: Vec<ManagedChild> = Vec::new();
 
     let mut sensor_args = vec![
-        "proxy".to_string(),
         "start".to_string(),
         "--foreground".to_string(),
         "--quiet".to_string(),
+        "--no-autostart".to_string(),
     ];
     if let Some(port) = sensor_port {
         sensor_args.push("--port".to_string());
@@ -64,7 +74,7 @@ async fn run_dev_stack(
     children.push(spawn_child("sensor", &sensor_args)?);
 
     let mut api_args = vec![
-        "proxy".to_string(),
+        "dev".to_string(),
         "api".to_string(),
         "start".to_string(),
         "--quiet".to_string(),
@@ -81,7 +91,7 @@ async fn run_dev_stack(
 
     if !no_ui {
         let mut ui_args = vec![
-            "proxy".to_string(),
+            "dev".to_string(),
             "ui".to_string(),
             "start".to_string(),
             "--quiet".to_string(),

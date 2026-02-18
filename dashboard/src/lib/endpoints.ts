@@ -72,8 +72,8 @@ export function getWsBaseUrl(): string {
   }
 
   if (typeof window !== "undefined") {
-    // Local dev default: Next UI runs on :3002 and Rust backend on :3001.
-    if (window.location.port === "3002") {
+    // Local dev default: Next UI runs on :3002 (or legacy :3005) and Rust backend on :3001.
+    if (window.location.port === "3002" || window.location.port === "3005") {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       return `${protocol}//${window.location.hostname}:3001`;
     }

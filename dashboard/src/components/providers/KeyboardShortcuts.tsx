@@ -16,9 +16,7 @@ interface ShortcutMap {
 
 const navigationShortcuts: ShortcutMap = {
   o: { path: "/", label: "Overview" },
-  t: { path: "/observability", label: "Observability" },
-  p: { path: "/policies", label: "Policy" },
-  b: { path: "/budget", label: "Budget" },
+  d: { path: "/debug", label: "Debug" },
   s: { path: "/settings", label: "Settings" },
 };
 
@@ -88,9 +86,7 @@ export function KeyboardShortcuts({ children }: { children: React.ReactNode }) {
             <p className="font-semibold">Keyboard Shortcuts</p>
             <p className="text-xs">⌘K - Command Palette</p>
             <p className="text-xs">G O - Go to Overview</p>
-            <p className="text-xs">G T - Go to Observability</p>
-            <p className="text-xs">G P - Go to Policies</p>
-            <p className="text-xs">G B - Go to Budget</p>
+            <p className="text-xs">G D - Go to Debug</p>
             <p className="text-xs">G S - Go to Settings</p>
           </div>,
           { duration: 5000 }

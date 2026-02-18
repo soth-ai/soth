@@ -225,7 +225,7 @@ fn parse_lsof_output(stdout: &[u8], client_addr: SocketAddr) -> Option<(u32, Str
                         return Some((pid, cmd, true));
                     }
                     if generic_match.is_none() {
-                        generic_match = Some((pid, cmd, true));
+                        generic_match = Some((pid, cmd, false));
                     }
                 }
             }
@@ -334,6 +334,17 @@ mod tests {
         assert_eq!(parsed.0, 9876);
         assert_eq!(parsed.1, "Warp");
         assert!(parsed.2);
+    }
+
+    #[test]
+    fn parse_lsof_fallback_match_marks_non_exact_confidence() {
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        // Selector appears in the line but not as client-owner prefix.
+        let sample = b"p9876\ncWarp\nn127.0.0.1:3001->127.0.0.1:8081\n";
+        let parsed = parse_lsof_output(sample, addr).unwrap();
+        assert_eq!(parsed.0, 9876);
+        assert_eq!(parsed.1, "Warp");
+        assert!(!parsed.2);
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub struct LoginArgs {
     #[arg(long)]
     pub endpoint: Option<String>,
 
-    /// Config file path to update (defaults to ~/.soth/config.yaml)
+    /// Config file path to update (defaults to ~/.soth/soth.yaml)
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -43,6 +43,8 @@ pub async fn run(args: LoginArgs, global_config: Option<PathBuf>) -> anyhow::Res
     let api_key = resolve_api_key(&args)?;
     config.cloud.api_key = Some(api_key);
     config.cloud.enabled = true;
+    // Cloud sync uses unified exchange.v2 pipeline.
+    config.exchange_v2.enabled = true;
     if let Some(endpoint) = args.endpoint {
         config.cloud.endpoint = endpoint;
     }
@@ -54,6 +56,7 @@ pub async fn run(args: LoginArgs, global_config: Option<PathBuf>) -> anyhow::Res
     println!("Saved cloud credentials to {}", config_path.display());
     println!("Cloud sync enabled: {}", config.cloud.enabled);
     println!("Cloud endpoint: {}", config.cloud.endpoint);
+    println!("Exchange v2 enabled: {}", config.exchange_v2.enabled);
     println!("For enterprise invites, use: soth enroll <token>");
     Ok(())
 }
@@ -65,7 +68,7 @@ fn resolve_login_config_path(explicit: Option<&PathBuf>, global: Option<&PathBuf
     if let Some(path) = global {
         return cli_config::expand_tilde(path);
     }
-    cli_config::expand_tilde(Path::new("~/.soth/config.yaml"))
+    cli_config::expand_tilde(Path::new("~/.soth/soth.yaml"))
 }
 
 fn resolve_api_key(args: &LoginArgs) -> anyhow::Result<String> {

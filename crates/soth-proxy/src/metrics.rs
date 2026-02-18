@@ -431,6 +431,15 @@ pub fn set_runtime_fd_snapshot(open_fds: u64, soft_limit: u64, hard_limit: u64) 
     gauge!(RUNTIME_FD_UTILIZATION_GAUGE).set(utilization);
 }
 
+/// Return the latest runtime FD snapshot captured by the monitor loop.
+pub fn runtime_fd_snapshot() -> (u64, u64, u64) {
+    (
+        RUNTIME_OPEN_FDS.load(Ordering::Relaxed),
+        RUNTIME_FD_SOFT_LIMIT.load(Ordering::Relaxed),
+        RUNTIME_FD_HARD_LIMIT.load(Ordering::Relaxed),
+    )
+}
+
 pub fn record_emfile_forward_error() {
     EMFILE_FORWARD_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
     counter!("soth_runtime_emfile_forward_errors_total").increment(1);

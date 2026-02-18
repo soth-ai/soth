@@ -241,6 +241,15 @@ export interface HealthResponse {
   filter_decisions?: FilterDecisionMetrics;
 }
 
+export interface StreamStats {
+  lagged_receivers: number;
+  lagged_events: number;
+  backfill_batches: number;
+  backfilled_events: number;
+  broadcast_send_failures: number;
+  latest_seq: number;
+}
+
 // Wrap Events (from soth wrap)
 export interface WrapEvent {
   seq?: number;

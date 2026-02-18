@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Gear } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
-import { CostLogo, IdentityLogo, MetricLogo, ObserverLogo } from "./dock-icons";
+import { MetricLogo, ObserverLogo } from "./dock-icons";
 
 interface NavItem {
   label: string;
@@ -14,9 +14,7 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { label: "Overview", href: "/", icon: MetricLogo },
-  { label: "Observe", href: "/observability", icon: ObserverLogo },
-  { label: "Policy", href: "/policies", icon: IdentityLogo },
-  { label: "Budget", href: "/budget", icon: CostLogo },
+  { label: "Debug", href: "/debug", icon: ObserverLogo },
   { label: "Settings", href: "/settings", icon: Gear },
 ];
 
@@ -25,7 +23,7 @@ export function DockNav() {
 
   return (
     <nav className="pointer-events-none fixed bottom-2 left-1/2 z-50 w-[min(700px,calc(100%-1rem))] -translate-x-1/2 safe-area-bottom">
-      <div className="pointer-events-auto grid grid-cols-5 items-center gap-0.5 rounded-xl border border-dashed border-border/80 bg-card/88 p-1 backdrop-blur-xl shadow-[0_14px_40px_-30px_rgba(0,0,0,0.92)]">
+      <div className="pointer-events-auto grid grid-cols-3 items-center gap-0.5 rounded-xl border border-dashed border-border/80 bg-card/88 p-1 backdrop-blur-xl shadow-[0_14px_40px_-30px_rgba(0,0,0,0.92)]">
         {navItems.map((item) => {
           const isActive =
             pathname === item.href ||

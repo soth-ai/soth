@@ -2,6 +2,7 @@
 //!
 //! Focused runtime surface:
 //! - wrap/init/bootstrap/start/stop lifecycle
+//! - login/enroll onboarding
 //! - runtime CA/env/status helpers
 //! - system proxy on/off controls
 
@@ -36,6 +37,12 @@ struct Cli {
 enum Commands {
     /// Wrap an MCP server to intercept all traffic
     Wrap(commands::wrap::WrapArgs),
+
+    /// Store cloud API credentials locally (interactive prompt or flag/stdin)
+    Login(commands::login::LoginArgs),
+
+    /// Enroll this machine with a centralized SOTH workspace
+    Enroll(commands::enroll::EnrollArgs),
 
     /// Initialize configuration and keys
     Init {
@@ -79,6 +86,10 @@ enum Commands {
         /// Internal daemon child execution mode (hidden)
         #[arg(long, hide = true)]
         daemon_child: bool,
+
+        /// Do not register startup autostart (launchd/systemd/Run key)
+        #[arg(long)]
+        no_autostart: bool,
     },
 
     /// Bootstrap prerequisites and start the sensor lifecycle
@@ -106,6 +117,26 @@ enum Commands {
         /// Debug: limit intercept-all window to N seconds (implies --intercept-all).
         #[arg(long, value_name = "SECONDS")]
         intercept_all_for: Option<u64>,
+
+        /// Enrollment invite token to exchange before startup
+        #[arg(long, conflicts_with = "enroll_token_stdin")]
+        enroll_token: Option<String>,
+
+        /// Read enrollment token from stdin before startup
+        #[arg(long, conflicts_with = "enroll_token")]
+        enroll_token_stdin: bool,
+
+        /// Enrollment endpoint override
+        #[arg(long)]
+        enroll_endpoint: Option<String>,
+
+        /// Optional machine name override sent during enrollment
+        #[arg(long)]
+        machine_name: Option<String>,
+
+        /// Do not register startup autostart (launchd/systemd/Run key)
+        #[arg(long)]
+        no_autostart: bool,
     },
 
     /// Stop the sensor lifecycle and restore direct network path
@@ -180,6 +211,12 @@ enum RuntimeCommands {
         /// Config file path
         #[arg(short, long)]
         config: Option<PathBuf>,
+    },
+
+    /// Manage startup autostart registration
+    Autostart {
+        #[command(subcommand)]
+        action: commands::proxy::AutostartAction,
     },
 }
 
@@ -433,6 +470,12 @@ async fn async_main() -> anyhow::Result<()> {
             }
             commands::wrap::run(args).await?;
         }
+        Commands::Login(args) => {
+            commands::login::run(args, cli.config.clone()).await?;
+        }
+        Commands::Enroll(args) => {
+            commands::enroll::run(args, cli.config.clone()).await?;
+        }
         Commands::Init { output } => {
             commands::init::run(output).await?;
         }
@@ -455,6 +498,9 @@ async fn async_main() -> anyhow::Result<()> {
             RuntimeCommands::CaInfo { config } => {
                 commands::proxy::run_ca_info(config.or(cli.config.clone())).await?;
             }
+            RuntimeCommands::Autostart { action } => {
+                commands::proxy::run_autostart(action, cli.config.clone()).await?;
+            }
         },
         Commands::Start {
             port,
@@ -464,6 +510,7 @@ async fn async_main() -> anyhow::Result<()> {
             intercept_all,
             intercept_all_for,
             daemon_child,
+            no_autostart,
         } => {
             commands::proxy::run_start_internal(
                 port,
@@ -473,6 +520,7 @@ async fn async_main() -> anyhow::Result<()> {
                 intercept_all,
                 intercept_all_for,
                 daemon_child,
+                no_autostart,
             )
             .await?;
         }
@@ -483,8 +531,43 @@ async fn async_main() -> anyhow::Result<()> {
             foreground,
             intercept_all,
             intercept_all_for,
+            enroll_token,
+            enroll_token_stdin,
+            enroll_endpoint,
+            machine_name,
+            no_autostart,
         } => {
             let effective_config = ensure_config_for_up(config, cli.config.clone(), quiet).await?;
+
+            if enroll_token.is_some() || enroll_token_stdin {
+                if !quiet {
+                    style::info("Enrollment requested via `up`; exchanging token before startup.");
+                }
+                if let Err(error) = commands::enroll::run(
+                    commands::enroll::EnrollArgs {
+                        token: enroll_token,
+                        endpoint: enroll_endpoint,
+                        config: effective_config.clone(),
+                        from_stdin: enroll_token_stdin,
+                        non_interactive: true,
+                        machine_name,
+                    },
+                    effective_config.clone(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "Enrollment exchange failed during `up`; continuing fail-open with local runtime"
+                    );
+                    if !quiet {
+                        style::warning(&format!(
+                            "Enrollment failed during `up` (continuing fail-open): {error}"
+                        ));
+                    }
+                }
+            }
+
             ensure_ca_for_up(effective_config.clone(), quiet).await?;
 
             if foreground {
@@ -497,6 +580,7 @@ async fn async_main() -> anyhow::Result<()> {
                     intercept_all,
                     intercept_all_for,
                     false,
+                    no_autostart,
                 )
                 .await?;
             } else {
@@ -508,13 +592,13 @@ async fn async_main() -> anyhow::Result<()> {
                     intercept_all,
                     intercept_all_for,
                     false,
+                    no_autostart,
                 )
                 .await?;
                 commands::proxy::run_on(port, effective_config).await?;
             }
         }
         Commands::Down => {
-            commands::proxy::run_off().await?;
             commands::proxy::run_stop().await?;
         }
         Commands::Stop => {

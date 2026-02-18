@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 /// Run the start command
 pub async fn run(
@@ -36,6 +37,7 @@ pub async fn run(
     intercept_all: bool,
     intercept_all_for: Option<u64>,
     daemon_child: bool,
+    no_autostart: bool,
 ) -> anyhow::Result<()> {
     if !foreground && !daemon_child {
         return daemon::run_start_daemon(
@@ -44,6 +46,7 @@ pub async fn run(
             quiet,
             intercept_all,
             intercept_all_for,
+            no_autostart,
         )
         .await;
     }
@@ -81,7 +84,7 @@ pub async fn run(
             pb.finish_and_clear();
         }
         style::error("CA certificate not found. Run: soth runtime setup-ca");
-        return Ok(());
+        anyhow::bail!("CA certificate not found");
     }
 
     if let Some(pb) = spinner {
@@ -91,8 +94,20 @@ pub async fn run(
     // Best-effort startup refresh: try cloud registry fetch first, then fall back to cache.
     cloud_hooks::refresh_registry_bundle_on_start(&config).await;
 
-    // Auto-enable system proxy when soth starts without extra console noise.
-    system::enable_quiet(Some(proxy_config.port)).await?;
+    // Fail-open: proxy runtime should still start even if system proxy toggling fails.
+    if let Err(error) = system::enable_quiet(Some(proxy_config.port)).await {
+        warn!(
+            error = %error,
+            port = proxy_config.port,
+            "Failed to auto-enable system proxy; continuing with sensor runtime only"
+        );
+        if !quiet {
+            style::warning(&format!(
+                "Could not auto-enable system proxy (continuing fail-open): {error}"
+            ));
+            style::info("Use `soth on` after resolving network/permission issues.");
+        }
+    }
 
     let intercept_summary = match proxy_config.hosts.mode {
         HostFilterMode::Discovery => "all non-local hosts (discovery mode)".to_string(),
@@ -424,6 +439,14 @@ fn apply_collector_env_overrides(collector: &ObserveCollectorConfig) {
     std::env::set_var(
         "SOTH_COLLECTOR_FRONTLOAD_ON_START",
         collector.frontload_on_start.to_string(),
+    );
+    std::env::set_var(
+        "SOTH_COLLECTOR_FRONTLOAD_FORCE_FIRST_RUN",
+        collector.frontload_force_first_run.to_string(),
+    );
+    std::env::set_var(
+        "SOTH_COLLECTOR_FRONTLOAD_RESET_OFFSETS_ON_START",
+        collector.frontload_reset_offsets_on_start.to_string(),
     );
 
     if !collector.sources.is_empty() {

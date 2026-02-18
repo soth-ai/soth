@@ -13,6 +13,7 @@ forward_proxy:
   enabled: true
   address: "127.0.0.1"
   port: 8080
+  autostart_on_boot: true
   capture_max_body_bytes: 15728640
   process_attribution:
     enabled: true
@@ -75,6 +76,8 @@ observe:
     enabled: true
     auto_discover_sources: true
     frontload_on_start: true
+    frontload_force_first_run: true
+    frontload_reset_offsets_on_start: false
     frontload_max_cycles: 24
     frontload_max_read_bytes_per_source: 8388608
     poll_interval_secs: 5
