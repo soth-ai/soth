@@ -676,10 +676,15 @@ impl CollectorAgent {
                     events_emitted += 1;
                     logger.log(&event);
                     if self.config.exchange_v2.enabled {
+                        let source_class = if source.agent.is_some() {
+                            ExchangeSourceClass::AgentApp
+                        } else {
+                            ExchangeSourceClass::Collector
+                        };
                         if let Err(error) = logger.enqueue_exchange_from_wrap_event(
                             &event,
                             &self.config.exchange_v2,
-                            Some(ExchangeSourceClass::Collector),
+                            Some(source_class),
                         ) {
                             warn!(
                                 event_id = %event.id,
