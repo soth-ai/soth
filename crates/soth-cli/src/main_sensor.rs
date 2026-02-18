@@ -113,6 +113,22 @@ enum Commands {
         /// Debug: limit intercept-all window to N seconds (implies --intercept-all).
         #[arg(long, value_name = "SECONDS")]
         intercept_all_for: Option<u64>,
+
+        /// Enrollment invite token to exchange before startup
+        #[arg(long, conflicts_with = "enroll_token_stdin")]
+        enroll_token: Option<String>,
+
+        /// Read enrollment token from stdin before startup
+        #[arg(long, conflicts_with = "enroll_token")]
+        enroll_token_stdin: bool,
+
+        /// Enrollment endpoint override
+        #[arg(long)]
+        enroll_endpoint: Option<String>,
+
+        /// Optional machine name override sent during enrollment
+        #[arg(long)]
+        machine_name: Option<String>,
     },
 
     /// Stop the sensor lifecycle and restore direct network path
@@ -496,8 +512,31 @@ async fn async_main() -> anyhow::Result<()> {
             foreground,
             intercept_all,
             intercept_all_for,
+            enroll_token,
+            enroll_token_stdin,
+            enroll_endpoint,
+            machine_name,
         } => {
             let effective_config = ensure_config_for_up(config, cli.config.clone(), quiet).await?;
+
+            if enroll_token.is_some() || enroll_token_stdin {
+                if !quiet {
+                    style::info("Enrollment requested via `up`; exchanging token before startup.");
+                }
+                commands::enroll::run(
+                    commands::enroll::EnrollArgs {
+                        token: enroll_token,
+                        endpoint: enroll_endpoint,
+                        config: effective_config.clone(),
+                        from_stdin: enroll_token_stdin,
+                        non_interactive: true,
+                        machine_name,
+                    },
+                    effective_config.clone(),
+                )
+                .await?;
+            }
+
             ensure_ca_for_up(effective_config.clone(), quiet).await?;
 
             if foreground {
