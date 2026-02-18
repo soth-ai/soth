@@ -956,8 +956,12 @@ impl FrontloadBootstrapState {
             return Ok(Self::default());
         }
         let data = std::fs::read(path)?;
-        serde_json::from_slice(&data)
-            .with_context(|| format!("failed parsing frontload bootstrap state: {}", path.display()))
+        serde_json::from_slice(&data).with_context(|| {
+            format!(
+                "failed parsing frontload bootstrap state: {}",
+                path.display()
+            )
+        })
     }
 
     fn save(&self, path: &Path) -> anyhow::Result<()> {

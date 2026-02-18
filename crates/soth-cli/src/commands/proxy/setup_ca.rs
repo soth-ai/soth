@@ -47,7 +47,9 @@ fn ensure_macos_login_keychain_trust(cert_path: &Path) -> anyhow::Result<MacOsTr
         .arg(&keychain_path)
         .arg(cert_path)
         .output()
-        .map_err(|error| anyhow::anyhow!("failed to execute security add-trusted-cert: {}", error))?;
+        .map_err(|error| {
+            anyhow::anyhow!("failed to execute security add-trusted-cert: {}", error)
+        })?;
 
     if output.status.success() {
         return Ok(MacOsTrustResult::Installed);
@@ -109,13 +111,19 @@ fn ensure_linux_trust(cert_path: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("invalid certificate path"))?;
 
     if which("update-ca-certificates").is_ok() {
-        run_linux_trust_command("cp", &[cert, "/usr/local/share/ca-certificates/soth-ca.crt"])?;
+        run_linux_trust_command(
+            "cp",
+            &[cert, "/usr/local/share/ca-certificates/soth-ca.crt"],
+        )?;
         run_linux_trust_command("update-ca-certificates", &[])?;
         return Ok(());
     }
 
     if which("update-ca-trust").is_ok() {
-        run_linux_trust_command("cp", &[cert, "/etc/pki/ca-trust/source/anchors/soth-ca.crt"])?;
+        run_linux_trust_command(
+            "cp",
+            &[cert, "/etc/pki/ca-trust/source/anchors/soth-ca.crt"],
+        )?;
         run_linux_trust_command("update-ca-trust", &[])?;
         return Ok(());
     }
@@ -234,7 +242,10 @@ pub async fn run(
             }
 
             println!();
-            println!("  {} (optional system-wide trust, requires admin):", "macOS".bold());
+            println!(
+                "  {} (optional system-wide trust, requires admin):",
+                "macOS".bold()
+            );
             println!(
                 "    {}",
                 format!(
