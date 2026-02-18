@@ -1,5 +1,6 @@
 use anyhow::Context;
 use base64::Engine as _;
+use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{
     params, params_from_iter,
     types::{Value as SqlValue, ValueRef},
@@ -657,11 +658,11 @@ impl CollectorAgent {
         let mut state_changed = false;
         let mut events_emitted = 0usize;
 
-        for source in &self.config.sources {
+        for source in resolve_collector_sources_for_scan(&self.config.sources) {
             let key = source.path.to_string_lossy().to_string();
             let prior_state = self.offsets.files.get(&key).cloned().unwrap_or_default();
             let outcome = collect_source_events(
-                source,
+                &source,
                 &prior_state,
                 max_read_bytes_per_source,
                 self.config.max_line_bytes,
@@ -672,7 +673,7 @@ impl CollectorAgent {
             }
 
             for source_line in outcome.lines {
-                if let Some(event) = self.build_event(source, source_line, mode) {
+                if let Some(event) = self.build_event(&source, source_line, mode) {
                     events_emitted += 1;
                     logger.log(&event);
                     if self.config.exchange_v2.enabled {
@@ -749,6 +750,9 @@ impl CollectorAgent {
         }
 
         let parsed = parse_line(source.parser, trimmed);
+        let observed_at = parsed.occurred_at.clone();
+        let source_session_id = parsed.session_id.clone();
+        let source_project = parsed.project.clone();
         let agent_name = source
             .agent
             .clone()
@@ -766,13 +770,16 @@ impl CollectorAgent {
         };
 
         let mut event = WrapEvent::new(
-            self.session_id.clone(),
+            source_session_id.unwrap_or_else(|| self.session_id.clone()),
             server_name,
             direction,
             AgentInfo::new(agent_name, DetectionSource::Environment),
         )
         .with_source(source_kind)
         .with_collector_metadata(source.name.clone(), line.end_offset);
+        if let Some(timestamp) = observed_at {
+            event.timestamp = timestamp;
+        }
 
         if let Some(provider) = parsed.provider.as_ref().or(source.provider.as_ref()) {
             event = event.with_provider(provider.clone());
@@ -814,6 +821,9 @@ impl CollectorAgent {
             "collector.ingest_mode".to_string(),
             mode.as_tag().to_string(),
         );
+        if let Some(project) = source_project {
+            tags.insert("collector.project".to_string(), project);
+        }
         if matches!(mode, CollectorIngestMode::Frontload) {
             tags.insert("collector.frontload".to_string(), "true".to_string());
         }
@@ -836,6 +846,9 @@ impl CollectorAgent {
         }
 
         let parsed = parse_line(CollectorParser::JsonLines, trimmed);
+        let observed_at = parsed.occurred_at.clone();
+        let source_session_id = parsed.session_id.clone();
+        let source_project = parsed.project.clone();
         let agent_name = parsed
             .agent
             .clone()
@@ -847,7 +860,7 @@ impl CollectorAgent {
         let direction = parsed.direction.unwrap_or(WrapDirection::In);
         let source_kind = parsed.source.unwrap_or(self.config.event_source);
         let mut event = WrapEvent::new(
-            self.session_id.clone(),
+            source_session_id.unwrap_or_else(|| self.session_id.clone()),
             server_name,
             direction,
             AgentInfo::new(agent_name, DetectionSource::Environment),
@@ -857,6 +870,9 @@ impl CollectorAgent {
             format!("{}:{}", source.name, line.file_type),
             line.end_offset,
         );
+        if let Some(timestamp) = observed_at {
+            event.timestamp = timestamp;
+        }
 
         if let Some(provider) = parsed.provider.as_ref().or(source.provider.as_ref()) {
             event = event.with_provider(provider.clone());
@@ -901,6 +917,9 @@ impl CollectorAgent {
             "collector.ingest_mode".to_string(),
             mode.as_tag().to_string(),
         );
+        if let Some(project) = source_project {
+            tags.insert("collector.project".to_string(), project);
+        }
         if matches!(mode, CollectorIngestMode::Frontload) {
             tags.insert("collector.frontload".to_string(), "true".to_string());
         }
@@ -1122,6 +1141,196 @@ fn collect_source_events(
         },
         lines,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobToken {
+    Literal(char),
+    Star,
+    DoubleStar,
+    Qmark,
+}
+
+fn resolve_collector_sources_for_scan(sources: &[CollectorSource]) -> Vec<CollectorSource> {
+    let mut resolved = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for source in sources {
+        for path in expand_source_paths_for_scan(&source.path) {
+            let key = format!(
+                "{}|{}|{}",
+                source.name,
+                source.agent.clone().unwrap_or_default(),
+                path.to_string_lossy()
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut resolved_source = source.clone();
+            resolved_source.path = path;
+            resolved.push(resolved_source);
+        }
+    }
+
+    resolved
+}
+
+fn expand_source_paths_for_scan(path: &Path) -> Vec<PathBuf> {
+    if !source_path_contains_glob(path) {
+        return vec![path.to_path_buf()];
+    }
+
+    let pattern = normalize_glob_path(path);
+    let root = glob_search_root(&pattern);
+    if !root.exists() {
+        return Vec::new();
+    }
+
+    let mut matches = if root.is_file() {
+        if glob_pattern_matches(&pattern, &normalize_glob_path(&root)) {
+            vec![root]
+        } else {
+            Vec::new()
+        }
+    } else {
+        discover_files_recursive(&root)
+            .into_iter()
+            .filter(|candidate| glob_pattern_matches(&pattern, &normalize_glob_path(candidate)))
+            .collect::<Vec<_>>()
+    };
+    matches.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    matches.dedup();
+    matches
+}
+
+fn source_path_contains_glob(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    raw.contains('*') || raw.contains('?')
+}
+
+fn normalize_glob_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn glob_search_root(pattern: &str) -> PathBuf {
+    let first_meta = pattern.find(|ch| matches!(ch, '*' | '?'));
+    let Some(meta_index) = first_meta else {
+        return PathBuf::from(pattern);
+    };
+    let prefix = &pattern[..meta_index];
+    let last_sep = prefix.rfind(|ch| matches!(ch, '/' | '\\'));
+    match last_sep {
+        Some(0) if pattern.starts_with('/') => PathBuf::from("/"),
+        Some(index) if index > 0 => PathBuf::from(&pattern[..index]),
+        _ if pattern.starts_with('/') => PathBuf::from("/"),
+        _ => PathBuf::from("."),
+    }
+}
+
+fn discover_files_recursive(root: &Path) -> Vec<PathBuf> {
+    let mut discovered = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        for entry in read_dir.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !file_type.is_symlink() {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if file_type.is_file() {
+                discovered.push(path);
+            }
+        }
+    }
+    discovered
+}
+
+fn glob_pattern_matches(pattern: &str, candidate: &str) -> bool {
+    let tokens = tokenize_glob_pattern(pattern);
+    let chars = candidate.chars().collect::<Vec<_>>();
+    let token_count = tokens.len();
+    let char_count = chars.len();
+    let mut dp = vec![vec![false; char_count + 1]; token_count + 1];
+    dp[0][0] = true;
+
+    for i in 1..=token_count {
+        match tokens[i - 1] {
+            GlobToken::Literal(ch) => {
+                for j in 1..=char_count {
+                    if dp[i - 1][j - 1] && chars[j - 1] == ch {
+                        dp[i][j] = true;
+                    }
+                }
+            }
+            GlobToken::Qmark => {
+                for j in 1..=char_count {
+                    if dp[i - 1][j - 1] && chars[j - 1] != '/' {
+                        dp[i][j] = true;
+                    }
+                }
+            }
+            GlobToken::Star => {
+                for j in 0..=char_count {
+                    if dp[i - 1][j] {
+                        dp[i][j] = true;
+                    }
+                    if j > 0 && chars[j - 1] != '/' && dp[i][j - 1] {
+                        dp[i][j] = true;
+                    }
+                }
+            }
+            GlobToken::DoubleStar => {
+                for j in 0..=char_count {
+                    if dp[i - 1][j] {
+                        dp[i][j] = true;
+                    }
+                    if j > 0 && dp[i][j - 1] {
+                        dp[i][j] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    dp[token_count][char_count]
+}
+
+fn tokenize_glob_pattern(pattern: &str) -> Vec<GlobToken> {
+    let chars = pattern.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '*' => {
+                if index + 1 < chars.len() && chars[index + 1] == '*' {
+                    tokens.push(GlobToken::DoubleStar);
+                    index += 2;
+                } else {
+                    tokens.push(GlobToken::Star);
+                    index += 1;
+                }
+            }
+            '?' => {
+                tokens.push(GlobToken::Qmark);
+                index += 1;
+            }
+            ch => {
+                tokens.push(GlobToken::Literal(ch));
+                index += 1;
+            }
+        }
+    }
+    tokens
 }
 
 fn metadata_mtime_seconds(metadata: &std::fs::Metadata) -> u64 {
@@ -1387,6 +1596,7 @@ fn extract_complete_lines(bytes: &[u8], at_eof: bool) -> (usize, Vec<&[u8]>) {
 #[derive(Debug)]
 struct ParsedLine {
     content: String,
+    occurred_at: Option<DateTime<Utc>>,
     source: Option<EventSource>,
     direction: Option<WrapDirection>,
     provider: Option<String>,
@@ -1394,6 +1604,8 @@ struct ParsedLine {
     method: Option<String>,
     tool_name: Option<String>,
     agent: Option<String>,
+    session_id: Option<String>,
+    project: Option<String>,
     request: Option<String>,
     response: Option<String>,
 }
@@ -1402,6 +1614,7 @@ fn parse_line(parser: CollectorParser, line: &str) -> ParsedLine {
     match parser {
         CollectorParser::TextLines => ParsedLine {
             content: line.to_string(),
+            occurred_at: None,
             source: None,
             direction: None,
             provider: None,
@@ -1409,11 +1622,14 @@ fn parse_line(parser: CollectorParser, line: &str) -> ParsedLine {
             method: None,
             tool_name: None,
             agent: None,
+            session_id: None,
+            project: None,
             request: None,
             response: None,
         },
         CollectorParser::JsonLines => parse_json_line(line).unwrap_or(ParsedLine {
             content: line.to_string(),
+            occurred_at: None,
             source: None,
             direction: None,
             provider: None,
@@ -1421,6 +1637,8 @@ fn parse_line(parser: CollectorParser, line: &str) -> ParsedLine {
             method: None,
             tool_name: None,
             agent: None,
+            session_id: None,
+            project: None,
             request: None,
             response: None,
         }),
@@ -1430,6 +1648,7 @@ fn parse_line(parser: CollectorParser, line: &str) -> ParsedLine {
 fn parse_json_line(line: &str) -> Option<ParsedLine> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let content = serde_json::to_string(&value).ok()?;
+    let occurred_at = extract_json_timestamp(&value);
     let source = value
         .get("source")
         .and_then(|v| v.as_str())
@@ -1449,6 +1668,8 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
     });
     let tool_name = extract_string(&value, &["tool_name", "tool"]);
     let agent = extract_string(&value, &["agent", "agent_name", "client"]);
+    let session_id = extract_string(&value, &["session_id", "sessionId"]);
+    let project = extract_string(&value, &["project", "cwd"]);
     let request = value
         .get("request")
         .and_then(|v| serde_json::to_string(v).ok());
@@ -1458,6 +1679,7 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
 
     Some(ParsedLine {
         content,
+        occurred_at,
         source,
         direction,
         provider,
@@ -1465,6 +1687,8 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
         method,
         tool_name,
         agent,
+        session_id,
+        project,
         request,
         response,
     })
@@ -1480,6 +1704,74 @@ fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_json_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    const KEYS: &[&str] = &[
+        "ts",
+        "timestamp",
+        "time",
+        "created_at",
+        "createdAt",
+        "updated_at",
+        "updatedAt",
+        "observed_at",
+    ];
+    for key in KEYS {
+        if let Some(raw) = value.get(*key).and_then(parse_json_timestamp_value) {
+            return Some(raw);
+        }
+    }
+    value
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|payload| {
+            KEYS.iter()
+                .find_map(|key| payload.get(*key).and_then(parse_json_timestamp_value))
+        })
+}
+
+fn parse_json_timestamp_value(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let epoch = match value {
+        serde_json::Value::Number(num) => {
+            if let Some(raw) = num.as_i64() {
+                Some(raw)
+            } else {
+                num.as_f64().map(|raw| raw.trunc() as i64)
+            }
+        }
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Ok(parsed) = trimmed.parse::<i64>() {
+                Some(parsed)
+            } else if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
+                return Some(parsed.with_timezone(&Utc));
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }?;
+    datetime_from_unix_epoch(epoch)
+}
+
+fn datetime_from_unix_epoch(raw: i64) -> Option<DateTime<Utc>> {
+    if raw <= 0 {
+        return None;
+    }
+    let (secs, nanos) = if raw >= 1_000_000_000_000_000_000 {
+        (raw / 1_000_000_000, (raw % 1_000_000_000) as u32)
+    } else if raw >= 1_000_000_000_000_000 {
+        (raw / 1_000_000, ((raw % 1_000_000) * 1_000) as u32)
+    } else if raw >= 1_000_000_000_000 {
+        (raw / 1_000, ((raw % 1_000) * 1_000_000) as u32)
+    } else {
+        (raw, 0)
+    };
+    Utc.timestamp_opt(secs, nanos).single()
 }
 
 fn parse_event_source(raw: &str) -> Option<EventSource> {
@@ -1708,7 +2000,28 @@ fn expand_home_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
+
+    fn test_collector_config() -> CollectorConfig {
+        CollectorConfig {
+            poll_interval: Duration::from_secs(5),
+            state_path: PathBuf::from("/tmp/collector-test-state.json"),
+            max_read_bytes_per_source: 64 * 1024,
+            max_line_bytes: 64 * 1024,
+            auto_discover_sources: false,
+            frontload_on_start: false,
+            frontload_force_first_run: false,
+            frontload_reset_offsets_on_start: false,
+            frontload_max_cycles: 1,
+            frontload_max_read_bytes_per_source: 64 * 1024,
+            agent_name: "collector".to_string(),
+            event_source: EventSource::AgentApp,
+            exchange_v2: ExchangeV2Config::default(),
+            sources: Vec::new(),
+            sqlite_sources: Vec::new(),
+        }
+    }
 
     #[test]
     fn extract_complete_lines_skips_partial_non_eof() {
@@ -1744,6 +2057,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_timestamp_supports_seconds_millis_and_rfc3339() {
+        let secs = parse_json_timestamp_value(&json!(1757962470)).unwrap();
+        assert_eq!(secs, Utc.timestamp_opt(1757962470, 0).single().unwrap());
+
+        let millis = parse_json_timestamp_value(&json!(1767383435897_i64)).unwrap();
+        assert_eq!(
+            millis,
+            Utc.timestamp_millis_opt(1767383435897).single().unwrap()
+        );
+
+        let rfc3339 = parse_json_timestamp_value(&json!("2026-02-18T19:21:32.980Z")).unwrap();
+        assert_eq!(
+            rfc3339,
+            Utc.timestamp_millis_opt(1771442492980).single().unwrap()
+        );
+    }
+
+    #[test]
+    fn collector_event_uses_source_timestamp_and_session_id() {
+        let agent = CollectorAgent::new(test_collector_config(), BTreeMap::new());
+        let source = CollectorSource {
+            name: "registry:codex".to_string(),
+            path: PathBuf::from("/tmp/codex-history.jsonl"),
+            parser: CollectorParser::JsonLines,
+            agent: Some("codex".to_string()),
+            server_name: Some("codex".to_string()),
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        };
+        let line = SourceLine {
+            content: "{\"session_id\":\"source-session-1\",\"ts\":1757962470,\"project\":\"/tmp/example\",\"text\":\"hello\"}".to_string(),
+            end_offset: 10,
+        };
+
+        let event = agent
+            .build_event(&source, line, CollectorIngestMode::Incremental)
+            .expect("event");
+
+        assert_eq!(event.session_id, "source-session-1");
+        assert_eq!(
+            event.timestamp,
+            Utc.timestamp_opt(1757962470, 0).single().unwrap()
+        );
+        assert_eq!(event.source, EventSource::AgentApp);
+        assert_eq!(
+            event
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.get("collector.project")),
+            Some(&"/tmp/example".to_string())
+        );
+    }
+
+    #[test]
     fn collect_source_events_skips_when_file_unchanged() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
@@ -1768,6 +2136,69 @@ mod tests {
         let outcome = collect_source_events(&source, &prior, 64 * 1024, 64 * 1024).unwrap();
         assert_eq!(outcome.next_state, prior);
         assert!(outcome.lines.is_empty());
+    }
+
+    #[test]
+    fn glob_pattern_matches_supports_recursive_paths() {
+        let pattern = "/tmp/.codex/sessions/**/*.jsonl";
+        assert!(glob_pattern_matches(
+            pattern,
+            "/tmp/.codex/sessions/2026/02/rollout.jsonl"
+        ));
+        assert!(!glob_pattern_matches(
+            pattern,
+            "/tmp/.codex/sessions/rollout.jsonl"
+        ));
+        assert!(!glob_pattern_matches(
+            pattern,
+            "/tmp/.codex/sessions/2026/02/rollout.log"
+        ));
+    }
+
+    #[test]
+    fn resolve_collector_sources_for_scan_expands_glob_paths() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let jan_dir = sessions.join("2026").join("01");
+        let feb_dir = sessions.join("2026").join("02");
+        std::fs::create_dir_all(&jan_dir).unwrap();
+        std::fs::create_dir_all(&feb_dir).unwrap();
+        std::fs::write(jan_dir.join("rollout-a.jsonl"), b"{}\n").unwrap();
+        std::fs::write(feb_dir.join("rollout-b.jsonl"), b"{}\n").unwrap();
+        std::fs::write(feb_dir.join("notes.txt"), b"hello\n").unwrap();
+
+        let source = CollectorSource {
+            name: "registry:codex".to_string(),
+            path: sessions.join("**").join("rollout-*.jsonl"),
+            parser: CollectorParser::JsonLines,
+            agent: Some("codex".to_string()),
+            server_name: Some("codex".to_string()),
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        };
+
+        let resolved = resolve_collector_sources_for_scan(&[source]);
+        let mut relative = resolved
+            .iter()
+            .map(|source| {
+                source
+                    .path
+                    .strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        relative.sort();
+
+        assert_eq!(
+            relative,
+            vec![
+                "sessions/2026/01/rollout-a.jsonl".to_string(),
+                "sessions/2026/02/rollout-b.jsonl".to_string()
+            ]
+        );
     }
 
     #[test]
