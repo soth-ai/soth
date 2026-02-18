@@ -13,6 +13,7 @@ import type {
   HealthResponse,
   DashboardSnapshot,
   AgentsSummary,
+  StreamStats,
 } from "@/types";
 import { buildApiUrl } from "@/lib/endpoints";
 import { useSettingsStore } from "@/store/settings";
@@ -124,6 +125,15 @@ export function useDashboardSnapshot() {
   return useQuery({
     queryKey: ["snapshot"],
     queryFn: () => fetchJson<ApiResponse<DashboardSnapshot>>("/snapshot"),
+    refetchInterval: Math.max(1000, refreshInterval),
+  });
+}
+
+export function useEventStreamStats() {
+  const refreshInterval = useSettingsStore((state) => state.refreshInterval);
+  return useQuery({
+    queryKey: ["event-stream-stats"],
+    queryFn: () => fetchJson<ApiResponse<StreamStats>>("/events/stream/stats"),
     refetchInterval: Math.max(1000, refreshInterval),
   });
 }

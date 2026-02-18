@@ -62,7 +62,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         "paused"
     };
     let context = match app.active_tab {
-        Tab::Dashboard => format!("{} {}", mode, app.rollup_window_label()),
+        Tab::Dashboard => {
+            let mut base = format!("{} {}", mode, app.rollup_window_label());
+            if let Some(stats) = app.metrics.stream_stats.as_ref() {
+                base.push_str(&format!(
+                    " | lag:{} send_fail:{}",
+                    stats.lagged_events, stats.broadcast_send_failures
+                ));
+            }
+            base
+        }
         Tab::Events => format!("{} {}", mode, app.event_filter_label()),
         _ => mode.to_string(),
     };

@@ -332,7 +332,7 @@ export default function OverviewPage() {
     [observe?.pii_by_type]
   );
   const topPiiTypes = piiByType.slice(0, 5);
-  const piiAlertsHref = "/observability?preset=builtin-pii-alerts";
+  const piiAlertsHref = "/debug";
   const cryptoCoveragePct = cryptoStatus?.signature_coverage_pct ?? 0;
   const cryptoFailures = cryptoStatus?.verification_failures ?? 0;
 
@@ -378,14 +378,14 @@ export default function OverviewPage() {
         severity: "warning",
         title: "Cost spike detected",
         description: costSpikeAnomaly.description,
-        href: "/budget",
+        href: "/debug",
       });
     } else if (spendDeltaPct >= 15) {
       items.push({
         severity: "warning",
         title: "Spend velocity increased",
         description: `Spend is ${signedPercent(spendDeltaPct)} vs 7d baseline in current range.`,
-        href: "/budget",
+        href: "/debug",
       });
     }
 
@@ -394,7 +394,7 @@ export default function OverviewPage() {
         severity: "critical",
         title: "Proxy runtime disabled with traffic present",
         description: "Traffic is active while proxy status reports not running.",
-        href: "/observability",
+        href: "/debug",
       });
     }
 
@@ -403,7 +403,7 @@ export default function OverviewPage() {
         severity: "warning",
         title: "Budget threshold approaching",
         description: `${utilization.toFixed(1)}% used against configured daily limit.`,
-        href: "/budget",
+        href: "/debug",
       });
     }
 
@@ -425,7 +425,7 @@ export default function OverviewPage() {
         description:
           newModelFromAnomaly?.description ??
           `Recent production model: ${latestModelObserved ?? "unknown"}`,
-        href: "/observability",
+        href: "/debug",
       });
     }
 
@@ -434,7 +434,7 @@ export default function OverviewPage() {
         severity: "ok",
         title: "No enforcement or PII incidents",
         description: "Policy denies and PII detections are both zero in current state.",
-        href: "/policies",
+        href: "/settings",
       });
     }
 
@@ -796,13 +796,13 @@ export default function OverviewPage() {
 
                 <div className="flex items-center gap-2 pt-2">
                   <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-4 border-white/[0.04] bg-white/[0.02]">
-                    <a href="/observability">Observability</a>
+                    <a href="/debug">Debug</a>
                   </Button>
                   <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-4 border-white/[0.04] bg-white/[0.02]">
-                    <a href="/budget">Budget Control</a>
+                    <a href="/debug">Traffic Drilldown</a>
                   </Button>
                   <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-4 border-white/[0.04] bg-white/[0.02]">
-                    <a href="/policies">Policy Engine</a>
+                    <a href="/settings">Settings</a>
                   </Button>
                 </div>
               </div>
@@ -941,13 +941,13 @@ export default function OverviewPage() {
 
               <div className="grid grid-cols-3 gap-2">
                 <Button asChild variant="outline" size="sm" className="h-7 text-[11px]">
-                  <a href="/observability">Observe</a>
+                  <a href="/debug">Debug</a>
                 </Button>
                 <Button asChild variant="outline" size="sm" className="h-7 text-[11px]">
-                  <a href="/budget">Budget</a>
+                  <a href="/debug">Traffic</a>
                 </Button>
                 <Button asChild variant="outline" size="sm" className="h-7 text-[11px]">
-                  <a href="/policies">Policy</a>
+                  <a href="/settings">Settings</a>
                 </Button>
               </div>
             </div>

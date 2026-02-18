@@ -4,10 +4,9 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Pulse,
-  Shield,
-  CurrencyDollar,
   Binoculars,
   List,
+  Gear,
 } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 
@@ -19,9 +18,8 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { label: "Overview", href: "/", icon: Pulse },
-  { label: "Traffic", href: "/observability", icon: Binoculars },
-  { label: "Policy", href: "/policies", icon: Shield },
-  { label: "Budget", href: "/budget", icon: CurrencyDollar },
+  { label: "Debug", href: "/debug", icon: Binoculars },
+  { label: "Settings", href: "/settings", icon: Gear },
 ];
 
 interface MobileNavProps {

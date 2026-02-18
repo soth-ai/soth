@@ -5,12 +5,9 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Pulse,
-  Shield,
-  CurrencyDollar,
   Binoculars,
   Gear,
   Key,
-  ShieldCheck,
   CaretLeft,
   CaretRight,
 } from "@phosphor-icons/react";
@@ -28,25 +25,13 @@ const navItems: NavItem[] = [
     label: "Overview",
     href: "/",
     icon: Pulse,
-    description: "System health & metrics",
+    description: "High-level runtime state",
   },
   {
-    label: "Observability",
-    href: "/observability",
+    label: "Debug",
+    href: "/debug",
     icon: Binoculars,
-    description: "Traffic inspection",
-  },
-  {
-    label: "Identity & Policy",
-    href: "/policies",
-    icon: ShieldCheck,
-    description: "Access control & rules",
-  },
-  {
-    label: "Cost & Risk",
-    href: "/budget",
-    icon: CurrencyDollar,
-    description: "Budget & compliance",
+    description: "MCP/Agent/AI diagnostics",
   },
 ];
 

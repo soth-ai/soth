@@ -88,6 +88,14 @@ pub struct RollupsSummary {
 pub struct StreamStats {
     pub lagged_receivers: u64,
     pub lagged_events: u64,
+    #[serde(default)]
+    pub backfill_batches: u64,
+    #[serde(default)]
+    pub backfilled_events: u64,
+    #[serde(default)]
+    pub broadcast_send_failures: u64,
+    #[serde(default)]
+    pub latest_seq: i64,
 }
 
 /// Hot lane data for frequent refreshes.
@@ -169,6 +177,10 @@ pub async fn fetch_hot(
         Err(_) => StreamStats {
             lagged_receivers: 0,
             lagged_events: 0,
+            backfill_batches: 0,
+            backfilled_events: 0,
+            broadcast_send_failures: 0,
+            latest_seq: 0,
         },
     };
 
