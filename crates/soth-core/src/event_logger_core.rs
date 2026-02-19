@@ -1213,7 +1213,9 @@ fn wrap_event_to_exchange_v2(
     };
     payload.pii_types = event.pii_types.clone();
     payload.integrity = Some(ExchangeIntegrity {
+        status: None,
         event_hash: event.event_hash.clone(),
+        canonical_form: None,
         signature: event
             .traffic_envelope
             .as_ref()
@@ -1222,6 +1224,19 @@ fn wrap_event_to_exchange_v2(
             .traffic_envelope
             .as_ref()
             .and_then(|envelope| envelope.key_id.clone()),
+        proof_log_id: None,
+        batch_id: None,
+        leaf_index: None,
+        leaf_hash: None,
+        root_hash: None,
+        siblings: Vec::new(),
+        path: Vec::new(),
+        anchor_status: None,
+        anchor_chain: None,
+        anchor_tx_hash: None,
+        anchor_block_number: None,
+        anchor_block_hash: None,
+        anchor_confirmed_at: None,
     });
     let detection_source = event
         .tags
@@ -1246,6 +1261,14 @@ fn wrap_event_to_exchange_v2(
             .and_then(|raw| raw.parse::<f64>().ok())
     });
     payload.parse = Some(ExchangeParse {
+        detection_id: event
+            .tags
+            .as_ref()
+            .and_then(|tags| tags.get("detection.id").cloned()),
+        detection_bundle_version: event
+            .tags
+            .as_ref()
+            .and_then(|tags| tags.get("detection.bundle_version").cloned()),
         parser_version: Some("exchange_v2_wrap".to_string()),
         bundle_version: None,
         parse_confidence,
@@ -1319,6 +1342,7 @@ fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> 
 
     Some(ExchangeClient {
         pid: envelope.and_then(|value| value.process_pid),
+        device_id: None,
         bundle_id,
         process_name,
         app_type,
@@ -2105,7 +2129,7 @@ mod tests {
         let ready = logger.load_exchange_upload_queue_ready(10).unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].exchange_id, event.id);
-        assert!(ready[0].payload_json.contains("\"schema_version\":\"2.0\""));
+        assert!(ready[0].payload_json.contains("\"schema_version\":\"1\""));
         assert!(ready[0].payload_json.contains("\"source_class\":\"mcp\""));
         assert!(ready[0].payload_json.contains("\"method\":\"tools/call\""));
         assert!(ready[0].payload_json.contains("\"input_tokens\":12"));

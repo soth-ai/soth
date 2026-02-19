@@ -15,6 +15,12 @@ pub struct ExchangeMetadata {
     pub exchange_id: String,
     pub schema_version: String,
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_is_synthetic: Option<bool>,
     pub observed_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
@@ -30,7 +36,15 @@ pub struct ExchangeMetadata {
     pub model: Option<String>,
     pub endpoint: Option<String>,
     pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_bundle_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_identity_key: Option<String>,
     pub status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_device_id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -62,6 +76,8 @@ pub struct ExchangeMetadata {
     pub mcp_tool_name: Option<String>,
     pub graphql_operation: Option<String>,
     pub event_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_status: Option<String>,
     pub signature: Option<String>,
     pub signature_key_id: Option<String>,
     pub parser_version: Option<String>,
@@ -94,6 +110,7 @@ pub struct ExchangeMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventClientMetadata {
     pub pid: Option<u32>,
+    pub device_id: Option<String>,
     pub bundle_id: Option<String>,
     pub process_name: Option<String>,
     pub process_executable: Option<String>,
@@ -384,8 +401,11 @@ mod tests {
             config_version: Some("v2".to_string()),
             batch: vec![ExchangeMetadata {
                 exchange_id: "ex-1".to_string(),
-                schema_version: "2.0".to_string(),
+                schema_version: "1".to_string(),
                 session_id: Some("sess-1".to_string()),
+                edge_session_id: Some("edge-1".to_string()),
+                provider_session_id: Some("provider-1".to_string()),
+                session_is_synthetic: Some(false),
                 observed_at: "2026-02-01T00:00:00Z".to_string(),
                 started_at: Some("2026-02-01T00:00:00Z".to_string()),
                 completed_at: Some("2026-02-01T00:00:01Z".to_string()),
@@ -401,7 +421,11 @@ mod tests {
                 model: Some("gpt-5.3-codex".to_string()),
                 endpoint: Some("/v1/responses".to_string()),
                 method: Some("POST".to_string()),
+                detection_id: Some("openai.codex".to_string()),
+                detection_bundle_version: Some("2026.02.19".to_string()),
+                tool_identity_key: Some("entity:openai.codex".to_string()),
                 status_code: Some(200),
+                client_device_id: Some("device_1".to_string()),
                 input_tokens: Some(12),
                 output_tokens: Some(34),
                 cache_read_tokens: Some(0),
@@ -433,6 +457,7 @@ mod tests {
                 mcp_tool_name: None,
                 graphql_operation: None,
                 event_hash: Some("hash".to_string()),
+                integrity_status: Some("signed".to_string()),
                 signature: None,
                 signature_key_id: None,
                 parser_version: Some("v1".to_string()),
@@ -441,6 +466,13 @@ mod tests {
                 detection_reason: Some("model_marker".to_string()),
                 target_entity_id: Some("agt_abc123".to_string()),
                 detection_source: Some("bundle".to_string()),
+                decision_step: None,
+                decision_outcome: None,
+                skip_reason: None,
+                discovery_kind: None,
+                client_app_type: None,
+                client_host_origin: None,
+                client_referrer_origin: None,
                 tags: None,
                 event_envelope: None,
             }],

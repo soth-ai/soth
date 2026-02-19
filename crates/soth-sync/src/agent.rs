@@ -1277,6 +1277,9 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         exchange_id: event.exchange_id.clone(),
         schema_version: event.schema_version.clone(),
         session_id: event.session_id.clone(),
+        edge_session_id: event.edge_session_id.clone(),
+        provider_session_id: event.provider_session_id.clone(),
+        session_is_synthetic: event.session_is_synthetic,
         observed_at: event.observed_at.to_rfc3339(),
         started_at: event.started_at.map(|value| value.to_rfc3339()),
         completed_at: event.completed_at.map(|value| value.to_rfc3339()),
@@ -1292,7 +1295,18 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         model: event.model.clone(),
         endpoint: event.endpoint.clone(),
         method: event.method.clone(),
+        detection_id: event.effective_detection_id().map(ToString::to_string),
+        detection_bundle_version: event
+            .effective_detection_bundle_version()
+            .map(ToString::to_string),
+        tool_identity_key: event.tool_identity_key.clone(),
         status_code: event.status_code,
+        client_device_id: event.client_device_id.clone().or_else(|| {
+            event
+                .client
+                .as_ref()
+                .and_then(|value| value.device_id.clone())
+        }),
         input_tokens: event.usage.input_tokens,
         output_tokens: event.usage.output_tokens,
         cache_read_tokens: event.usage.cache_read_tokens,
@@ -1330,6 +1344,10 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
             .integrity
             .as_ref()
             .and_then(|value| value.event_hash.clone()),
+        integrity_status: event
+            .integrity
+            .as_ref()
+            .and_then(|value| value.status.clone()),
         signature: event
             .integrity
             .as_ref()
@@ -1439,6 +1457,7 @@ fn build_exchange_event_envelope_metadata(
         .cloned();
     let client = event.client.as_ref().map(|value| EventClientMetadata {
         pid: value.pid,
+        device_id: value.device_id.clone(),
         bundle_id: value.bundle_id.clone(),
         process_name: value.process_name.clone(),
         process_executable,
@@ -1958,6 +1977,7 @@ mod tests {
         );
         event.client = Some(soth_core::types::exchange_v2::ExchangeClient {
             pid: None,
+            device_id: Some("device_local_01".to_string()),
             bundle_id: Some("agent.codex".to_string()),
             process_name: Some("codex".to_string()),
             app_type: Some("collector".to_string()),

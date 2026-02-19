@@ -7,9 +7,9 @@ use crate::transport::proxy_support::process_bundle_id_from_executable;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
 use soth_budget::{BudgetTracker, TokenCounter};
 use soth_core::types::exchange_v2::{
-    ExchangeClient, ExchangeCost, ExchangeParse, ExchangeSourceClass, ExchangeTransport,
-    ExchangeUsage, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY, EXCHANGE_DECISION_OUTCOME_SKIPPED,
-    EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_DOMAIN,
+    ExchangeClient, ExchangeCost, ExchangeEventV2, ExchangeParse, ExchangeSourceClass,
+    ExchangeTransport, ExchangeUsage, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
+    EXCHANGE_DECISION_OUTCOME_SKIPPED, EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_DOMAIN,
 };
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
@@ -173,6 +173,7 @@ fn exchange_client_from_pending(pending: &PendingRequest) -> Option<ExchangeClie
 
     Some(ExchangeClient {
         pid,
+        device_id: None,
         bundle_id,
         process_name,
         app_type,
@@ -207,6 +208,7 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
 
     Some(ExchangeClient {
         pid: envelope.process_pid,
+        device_id: None,
         bundle_id,
         process_name,
         app_type,
@@ -304,6 +306,85 @@ fn infer_agent_fallback_app_type(agent: Option<&str>) -> Option<String> {
     Some("unknown".to_string())
 }
 
+fn detection_id_for_pending(pending: &PendingRequest) -> Option<String> {
+    pending
+        .target_entity_id
+        .clone()
+        .or_else(|| {
+            pending.envelope.as_ref().and_then(|envelope| {
+                process_bundle_id_from_executable(envelope.process_executable.as_deref())
+            })
+        })
+        .or_else(|| bundle_id_from_agent_hint(pending.agent.as_deref()))
+        .or_else(|| {
+            pending.provider.as_ref().map(|provider| {
+                let normalized = provider
+                    .chars()
+                    .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+                    .collect::<String>()
+                    .trim_matches('_')
+                    .to_ascii_lowercase();
+                format!("provider.{normalized}")
+            })
+        })
+}
+
+fn non_empty_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn detection_bundle_version_for_exchange(bundle_version: Option<&str>) -> String {
+    bundle_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unversioned".to_string())
+}
+
+fn enforce_required_detection_fields(
+    event: &mut ExchangeEventV2,
+    pending: &PendingRequest,
+    bundle_version: Option<&str>,
+) -> bool {
+    let detection_id = event
+        .effective_detection_id()
+        .map(ToString::to_string)
+        .or_else(|| detection_id_for_pending(pending))
+        .and_then(|value| non_empty_string(Some(value)))
+        .unwrap_or_else(|| "unknown.unclassified".to_string());
+    let detection_bundle_version = event
+        .effective_detection_bundle_version()
+        .map(ToString::to_string)
+        .or_else(|| bundle_version.map(ToString::to_string))
+        .and_then(|value| non_empty_string(Some(value)))
+        .unwrap_or_else(|| "unversioned".to_string());
+
+    event.detection_id = Some(detection_id.clone());
+    event.detection_bundle_version = Some(detection_bundle_version.clone());
+    if let Some(parse) = event.parse.as_mut() {
+        parse.detection_id = Some(detection_id.clone());
+        parse.detection_bundle_version = Some(detection_bundle_version.clone());
+        parse.bundle_version = Some(detection_bundle_version);
+    }
+
+    if let Err(missing) = event.validate_proxy_detection_contract() {
+        warn!(
+            exchange_id = %event.exchange_id,
+            missing = ?missing,
+            "Dropping proxy exchange: required detection contract fields unresolved"
+        );
+        return false;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_and_enqueue_exchange_v2(
     logger: &EventLogger,
@@ -323,6 +404,10 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
     response_truncated_reason: Option<&str>,
     bundle_version: Option<&str>,
 ) {
+    let detection_id = non_empty_string(detection_id_for_pending(pending))
+        .unwrap_or_else(|| "unknown.unclassified".to_string());
+    let detection_bundle_version = detection_bundle_version_for_exchange(bundle_version);
+
     let mut assembler = ExchangeAssembler::new(
         exchange_cfg.clone(),
         pending.exchange_id.clone(),
@@ -339,8 +424,10 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
     );
     assembler.set_client(exchange_client_from_pending(pending));
     assembler.set_parse(Some(ExchangeParse {
+        detection_id: Some(detection_id.clone()),
+        detection_bundle_version: Some(detection_bundle_version.clone()),
         parser_version: Some("exchange_v2_edge".to_string()),
-        bundle_version: bundle_version.map(ToString::to_string),
+        bundle_version: Some(detection_bundle_version.clone()),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
         target_entity_id: pending.target_entity_id.clone(),
@@ -378,7 +465,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
     assembler.set_cost(usage_meta.cost_usd.map(|estimated_usd| ExchangeCost {
         estimated_usd,
         currency: "USD".to_string(),
-        pricing_version: bundle_version.map(ToString::to_string),
+        pricing_version: Some(detection_bundle_version.clone()),
     }));
     let is_discovery_capture = pending.catalog_discovery || pending.discovery_kind.is_some();
     assembler.set_discovery_capture(is_discovery_capture);
@@ -498,6 +585,9 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
         assembler.finalize_complete_with_blobs()
     };
     result.event.pii_types = pii_probe.pii_types;
+    if !enforce_required_detection_fields(&mut result.event, pending, bundle_version) {
+        return;
+    }
 
     let payload_json = match serde_json::to_string(&result.event) {
         Ok(value) => value,
@@ -549,6 +639,10 @@ pub(crate) fn seed_exchange_v2_spool(
     session_id: &str,
     bundle_version: Option<&str>,
 ) {
+    let detection_id = non_empty_string(detection_id_for_pending(pending))
+        .unwrap_or_else(|| "unknown.unclassified".to_string());
+    let detection_bundle_version = detection_bundle_version_for_exchange(bundle_version);
+
     let mut assembler = ExchangeAssembler::new(
         exchange_cfg.clone(),
         pending.exchange_id.clone(),
@@ -575,8 +669,10 @@ pub(crate) fn seed_exchange_v2_spool(
     );
     assembler.set_discovery_capture(pending.catalog_discovery || pending.discovery_kind.is_some());
     assembler.set_parse(Some(ExchangeParse {
+        detection_id: Some(detection_id),
+        detection_bundle_version: Some(detection_bundle_version.clone()),
         parser_version: Some("exchange_v2_edge".to_string()),
-        bundle_version: bundle_version.map(ToString::to_string),
+        bundle_version: Some(detection_bundle_version),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
         target_entity_id: pending.target_entity_id.clone(),

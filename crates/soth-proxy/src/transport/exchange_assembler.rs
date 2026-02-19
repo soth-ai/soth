@@ -383,10 +383,29 @@ impl ExchangeAssembler {
         event.method = state.method;
         event.status_code = state.status_code;
         event.client = state.client;
+        event.client_device_id = event
+            .client
+            .as_ref()
+            .and_then(|client| client.device_id.clone());
+        event.edge_session_id = event.session_id.clone();
         event.usage = state.usage;
         event.cost = state.cost;
         event.flags = state.flags.clone();
         event.parse = state.parse;
+        event.detection_id = event
+            .parse
+            .as_ref()
+            .and_then(|parse| parse.detection_id.clone());
+        event.detection_bundle_version = event
+            .parse
+            .as_ref()
+            .and_then(|parse| parse.detection_bundle_version.clone())
+            .or_else(|| {
+                event
+                    .parse
+                    .as_ref()
+                    .and_then(|parse| parse.bundle_version.clone())
+            });
         event.tags = state.tags;
 
         event.request.headers = state.request_headers;
@@ -410,9 +429,24 @@ impl ExchangeAssembler {
         event.request.body = request;
         event.response.body = response;
         event.integrity = Some(ExchangeIntegrity {
+            status: None,
             event_hash: None,
+            canonical_form: None,
             signature: state.integrity_signature,
             signature_key_id: state.integrity_signature_key_id,
+            proof_log_id: None,
+            batch_id: None,
+            leaf_index: None,
+            leaf_hash: None,
+            root_hash: None,
+            siblings: Vec::new(),
+            path: Vec::new(),
+            anchor_status: None,
+            anchor_chain: None,
+            anchor_tx_hash: None,
+            anchor_block_number: None,
+            anchor_block_hash: None,
+            anchor_confirmed_at: None,
         });
 
         let mut blobs = Vec::new();
@@ -599,7 +633,7 @@ mod tests {
         let event = a.finalize_complete();
         assert_eq!(event.request.body.mode, ExchangeBodyMode::Inline);
         assert_eq!(event.response.body.mode, ExchangeBodyMode::Inline);
-        assert_eq!(event.schema_version, "2.0");
+        assert_eq!(event.schema_version, "1");
     }
 
     #[test]
