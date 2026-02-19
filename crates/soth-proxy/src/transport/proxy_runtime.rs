@@ -9,7 +9,7 @@ use hudsucker::{
     Proxy,
 };
 use soth_crypto::tls::LearnedPassthrough;
-use soth_oisp::types::bundle::{BundleStats, BundleType};
+use soth_oisp::types::bundle::{BundleGating, BundleStats, BundleType};
 use soth_oisp::types::EntryType;
 use soth_oisp::types::{CompiledBundle, DomainFilters, ResolvedProvider};
 use soth_oisp::OispEngine;
@@ -65,6 +65,7 @@ pub(crate) fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngi
             },
             formats: BTreeMap::new(),
             catalog_domains: Vec::new(),
+            gating: BundleGating::default(),
             meta: None,
             signatures: None,
         };

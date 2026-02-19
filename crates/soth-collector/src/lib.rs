@@ -1123,8 +1123,7 @@ fn collect_source_events(
             content.pop();
         }
         if content.len() > max_line_bytes {
-            content.truncate(max_line_bytes);
-            content.push_str("… [truncated]");
+            content = truncate_utf8(content.as_str(), max_line_bytes);
         }
         if !content.trim().is_empty() {
             lines.push(SourceLine {
@@ -2181,10 +2180,7 @@ mod tests {
         .to_string();
 
         let parsed = parse_json_line(&line).expect("parsed JSON line");
-        assert_eq!(
-            parsed.session_id.as_deref(),
-            Some("conversation-123")
-        );
+        assert_eq!(parsed.session_id.as_deref(), Some("conversation-123"));
         assert_eq!(parsed.model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(parsed.provider.as_deref(), Some("openai"));
         assert_eq!(parsed.method.as_deref(), Some("POST"));
@@ -2215,6 +2211,29 @@ mod tests {
         let outcome = collect_source_events(&source, &prior, 64 * 1024, 64 * 1024).unwrap();
         assert_eq!(outcome.next_state, prior);
         assert!(outcome.lines.is_empty());
+    }
+
+    #[test]
+    fn collect_source_events_truncates_utf8_without_panicking() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, "éxample line\n").unwrap();
+
+        let source = CollectorSource {
+            name: "events".to_string(),
+            path,
+            parser: CollectorParser::JsonLines,
+            agent: None,
+            server_name: None,
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        };
+
+        let prior = FileScanState::default();
+        let outcome = collect_source_events(&source, &prior, 64 * 1024, 1).unwrap();
+        assert_eq!(outcome.lines.len(), 1);
+        assert!(outcome.lines[0].content.contains("[truncated]"));
     }
 
     #[test]

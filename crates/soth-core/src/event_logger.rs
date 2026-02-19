@@ -21,7 +21,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
-use soth_storage::{open_sqlite_read_write, read_sync_state, write_sync_state};
+use soth_storage::{open_sqlite_read_write_with_timeout, read_sync_state, write_sync_state};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};

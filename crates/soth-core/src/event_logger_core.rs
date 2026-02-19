@@ -1,5 +1,9 @@
 use super::*;
 
+const SQLITE_METADATA_BUSY_TIMEOUT_MS: u64 = 10_000;
+const SQLITE_METADATA_LOCK_RETRY_MAX: u32 = 5;
+const SQLITE_METADATA_LOCK_RETRY_BASE_MS: u64 = 25;
+
 impl EventLogger {
     /// Create a new event logger that writes to the given path.
     pub fn new(path: PathBuf) -> std::io::Result<Self> {
@@ -260,38 +264,57 @@ impl EventLogger {
         payload_json: &str,
         blobs_json: Option<&str>,
     ) -> std::io::Result<()> {
-        let conn = self.open_sqlite_metadata_conn()?;
         let observed_at =
             extract_exchange_observed_at(payload_json).unwrap_or_else(|| Utc::now().to_rfc3339());
-        conn.execute(
-            r#"
-            INSERT INTO exchange_events (
-                exchange_id, observed_at, event_json, created_at, updated_at
-            )
-            VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            ON CONFLICT(exchange_id) DO UPDATE SET
-                observed_at = excluded.observed_at,
-                event_json = excluded.event_json,
-                updated_at = excluded.updated_at
-            "#,
-            params![exchange_id, observed_at, payload_json],
-        )
-        .map_err(to_io_err)?;
-        conn.execute(
-            r#"
-            INSERT INTO exchange_upload_queue (
-                exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
-            )
-            VALUES (?1, ?2, ?3, 0, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            ON CONFLICT(exchange_id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                blobs_json = excluded.blobs_json,
-                updated_at = excluded.updated_at
-            "#,
-            params![exchange_id, payload_json, blobs_json],
-        )
-        .map_err(to_io_err)?;
-        Ok(())
+        for retry in 0..=SQLITE_METADATA_LOCK_RETRY_MAX {
+            let mut conn = self.open_sqlite_metadata_conn()?;
+            let write_result = (|| -> std::io::Result<()> {
+                let tx = conn.transaction().map_err(to_io_err)?;
+                tx.execute(
+                    r#"
+                    INSERT INTO exchange_events (
+                        exchange_id, observed_at, event_json, created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(exchange_id) DO UPDATE SET
+                        observed_at = excluded.observed_at,
+                        event_json = excluded.event_json,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![exchange_id, observed_at, payload_json],
+                )
+                .map_err(to_io_err)?;
+                tx.execute(
+                    r#"
+                    INSERT INTO exchange_upload_queue (
+                        exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, 0, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(exchange_id) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        blobs_json = excluded.blobs_json,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![exchange_id, payload_json, blobs_json],
+                )
+                .map_err(to_io_err)?;
+                tx.commit().map_err(to_io_err)?;
+                Ok(())
+            })();
+            match write_result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if retry < SQLITE_METADATA_LOCK_RETRY_MAX
+                        && is_sqlite_lock_io_error(&error) =>
+                {
+                    std::thread::sleep(sqlite_lock_retry_backoff(retry));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(
+            "sqlite metadata retry loop exited unexpectedly",
+        ))
     }
 
     /// Convert a [`WrapEvent`] into an `exchange.v2` payload and enqueue it for cloud upload.
@@ -467,9 +490,10 @@ impl EventLogger {
     }
 
     fn open_sqlite_metadata_conn(&self) -> std::io::Result<Connection> {
-        let conn = open_sqlite_read_write(&self.path)?;
-        init_sqlite_schema(&conn)?;
-        Ok(conn)
+        open_sqlite_read_write_with_timeout(
+            &self.path,
+            Duration::from_millis(SQLITE_METADATA_BUSY_TIMEOUT_MS),
+        )
     }
 }
 
@@ -1048,6 +1072,22 @@ fn extract_exchange_observed_at(payload_json: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn is_sqlite_lock_io_error(error: &std::io::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database busy")
+}
+
+fn sqlite_lock_retry_backoff(retry: u32) -> Duration {
+    let multiplier = 1u64.checked_shl(retry.min(10)).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        SQLITE_METADATA_LOCK_RETRY_BASE_MS
+            .saturating_mul(multiplier)
+            .min(1_000),
+    )
+}
+
 fn wrap_event_to_exchange_v2(
     event: &WrapEvent,
     exchange_cfg: &ExchangeV2Config,
@@ -1212,6 +1252,10 @@ fn wrap_event_to_exchange_v2(
         detection_reason,
         target_entity_id,
         detection_source,
+        decision_step: None,
+        decision_outcome: None,
+        skip_reason: None,
+        discovery_kind: None,
     });
     payload.tags = merge_exchange_tags(event);
 
@@ -1278,6 +1322,7 @@ fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> 
         bundle_id,
         process_name,
         app_type,
+        host_origin: None,
         referrer_origin: None,
     })
 }

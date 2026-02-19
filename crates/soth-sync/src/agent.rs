@@ -11,17 +11,20 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use soth_core::api::{
     BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
-    ExchangeMetadata, HeartbeatRequest, HeartbeatTelemetry,
+    ExchangeMetadata, HeartbeatHostDetails, HeartbeatRequest, HeartbeatTelemetry,
 };
 use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
-use soth_core::types::exchange_v2::{ExchangeBodyMode, ExchangeEventV2};
+use soth_core::types::exchange_v2::{
+    ExchangeBodyMode, ExchangeEventV2, EXCHANGE_CLIENT_APP_TYPE_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+};
 use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
@@ -35,6 +38,8 @@ const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
 const SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1: &str = "migration_exchange_uuid_cleanup_v1";
 const EXCHANGE_SPOOL_STALE_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 const EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT: usize = 10_000;
+const EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX: u32 = 4;
+const EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_BASE_MS: u64 = 50;
 const SYNC_TELEMETRY_EXCHANGE_SENT: &str = "sync.exchange.sent";
 const SYNC_TELEMETRY_EXCHANGE_BLOB_UPLOADED: &str = "sync.exchange.blob_uploaded";
 const SYNC_TELEMETRY_EXCHANGE_RETRY_DEFERRED: &str = "sync.exchange.retry_deferred";
@@ -278,10 +283,17 @@ impl SyncAgent {
             Duration::from_secs(EXCHANGE_SPOOL_STALE_MAX_AGE_SECS),
             EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT,
         ) {
-            warn!(
-                error = %error,
-                "Failed exchange spool stale cleanup; continuing"
-            );
+            if is_sqlite_lock_anyhow(&error) {
+                debug!(
+                    error = %error,
+                    "Exchange spool stale cleanup skipped due to sqlite lock; continuing"
+                );
+            } else {
+                warn!(
+                    error = %error,
+                    "Failed exchange spool stale cleanup; continuing"
+                );
+            }
         }
         let adaptive_batch_state = Mutex::new(AdaptiveBatchState::new(&config));
 
@@ -369,13 +381,20 @@ impl SyncAgent {
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
         let config_version = self.cached_config_version();
         let telemetry = self.compose_heartbeat_telemetry();
+        let host_details = collect_heartbeat_host_details();
+        let heartbeat_os = host_details
+            .platform
+            .clone()
+            .or_else(|| Some(std::env::consts::OS.to_string()));
+        let heartbeat_hostname = host_details.hostname.clone();
         let request = HeartbeatRequest {
             agent_instance_id: self.config.agent_instance_id.clone(),
             proxy_version: self.config.proxy_version.clone(),
             config_version,
-            os: Some(std::env::consts::OS.to_string()),
-            hostname: resolve_hostname(),
+            os: heartbeat_os,
+            hostname: heartbeat_hostname,
             active_connections: None,
+            host_details: Some(host_details),
             telemetry,
         };
 
@@ -1089,6 +1108,28 @@ fn run_exchange_spool_stale_cleanup(
     max_age: Duration,
     limit: usize,
 ) -> anyhow::Result<()> {
+    for retry in 0..=EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX {
+        match run_exchange_spool_stale_cleanup_once(path, max_age, limit) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if retry < EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX
+                    && is_sqlite_lock_anyhow(&error) =>
+            {
+                std::thread::sleep(exchange_spool_cleanup_retry_backoff(retry));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "exchange spool stale cleanup retry loop exited unexpectedly"
+    ))
+}
+
+fn run_exchange_spool_stale_cleanup_once(
+    path: &Path,
+    max_age: Duration,
+    limit: usize,
+) -> anyhow::Result<()> {
     let conn = open_rw_conn(path)?;
     if !sqlite_table_exists(&conn, "exchange_spool")? {
         return Ok(());
@@ -1117,6 +1158,25 @@ fn run_exchange_spool_stale_cleanup(
         );
     }
     Ok(())
+}
+
+fn exchange_spool_cleanup_retry_backoff(retry: u32) -> Duration {
+    let shift = retry.min(10);
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_BASE_MS
+            .saturating_mul(multiplier)
+            .min(1_000),
+    )
+}
+
+fn is_sqlite_lock_anyhow(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("database is locked")
+            || message.contains("database table is locked")
+            || message.contains("database busy")
+    })
 }
 
 fn sqlite_table_exists(conn: &Connection, table_name: &str) -> anyhow::Result<bool> {
@@ -1302,6 +1362,36 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
             .parse
             .as_ref()
             .and_then(|value| value.detection_source.clone()),
+        decision_step: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.decision_step.clone()),
+        decision_outcome: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.decision_outcome.clone()),
+        skip_reason: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.skip_reason.clone()),
+        discovery_kind: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.discovery_kind.clone()),
+        client_app_type: normalize_client_app_type_for_contract(
+            event
+                .client
+                .as_ref()
+                .and_then(|value| value.app_type.as_deref()),
+        ),
+        client_host_origin: event
+            .client
+            .as_ref()
+            .and_then(|value| value.host_origin.clone()),
+        client_referrer_origin: event
+            .client
+            .as_ref()
+            .and_then(|value| value.referrer_origin.clone()),
         tags: event.tags.as_ref().map(tree_to_hash),
         event_envelope: build_exchange_event_envelope_metadata(event),
     }
@@ -1352,7 +1442,9 @@ fn build_exchange_event_envelope_metadata(
         bundle_id: value.bundle_id.clone(),
         process_name: value.process_name.clone(),
         process_executable,
-        app_type: value.app_type.clone(),
+        app_type: normalize_client_app_type_for_contract(value.app_type.as_deref()),
+        host_origin: value.host_origin.clone(),
+        referrer_origin: value.referrer_origin.clone(),
     });
     let headers = event
         .request
@@ -1478,9 +1570,31 @@ fn exchange_body_mode_to_str(mode: ExchangeBodyMode) -> &'static str {
     match mode {
         ExchangeBodyMode::Inline => "inline",
         ExchangeBodyMode::Offloaded => "offloaded",
-        ExchangeBodyMode::PreviewOnly => "preview_only",
+        // Cloud contract freeze only accepts inline|offloaded|metadata_only.
+        // Legacy local events may still carry PreviewOnly; normalize on upload.
+        ExchangeBodyMode::PreviewOnly => "metadata_only",
         ExchangeBodyMode::MetadataOnly => "metadata_only",
     }
+}
+
+fn normalize_client_app_type_for_contract(raw: Option<&str>) -> Option<String> {
+    let normalized = raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())?;
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
+    }
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_NON_HOST {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
+    }
+
+    // Legacy/local process categories (collector/desktop_app/browser/editor/cli/service/unknown)
+    // collapse to frozen two-bucket contract for cloud ingest.
+    let mapped = match normalized.as_str() {
+        "browser" | "desktop_app" | "editor" | "ide" | "host_app" => EXCHANGE_CLIENT_APP_TYPE_HOST,
+        _ => EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+    };
+    Some(mapped.to_string())
 }
 
 fn is_missing_table_error(error: &rusqlite::Error, table: &str) -> bool {
@@ -1513,6 +1627,166 @@ fn resolve_hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| run_trimmed_command_output(hostname_resolution_command()))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone)]
+struct HostOsIdentity {
+    platform: String,
+    family: String,
+    version: Option<String>,
+}
+
+fn collect_heartbeat_host_details() -> HeartbeatHostDetails {
+    let identity = detect_host_os_identity();
+    HeartbeatHostDetails {
+        platform: Some(identity.platform),
+        os_family: Some(identity.family),
+        os_version: identity.version,
+        hostname: resolve_hostname(),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        cpu_logical_cores: std::thread::available_parallelism()
+            .ok()
+            .map(|value| value.get() as u64),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_host_os_identity() -> HostOsIdentity {
+    HostOsIdentity {
+        platform: "macos".to_string(),
+        family: "unix".to_string(),
+        // Mirrors os_info macOS strategy: parse ProductVersion from sw_vers output.
+        version: detect_macos_version(),
+    }
+}
+
+#[cfg(windows)]
+fn detect_host_os_identity() -> HostOsIdentity {
+    HostOsIdentity {
+        platform: "windows".to_string(),
+        family: "windows".to_string(),
+        // Keep a lightweight subset of os_info behavior by extracting the semantic version
+        // from `cmd /C ver` output.
+        version: detect_windows_version(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_host_os_identity() -> HostOsIdentity {
+    detect_linux_identity()
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn detect_host_os_identity() -> HostOsIdentity {
+    HostOsIdentity {
+        platform: std::env::consts::OS.to_string(),
+        family: std::env::consts::FAMILY.to_string(),
+        version: None,
+    }
+}
+
+fn normalize_os_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_version() -> Option<String> {
+    let output = run_trimmed_command_output(("sw_vers", &[]))?;
+    parse_prefixed_word(&output, "ProductVersion:")
+}
+
+#[cfg(windows)]
+fn detect_windows_version() -> Option<String> {
+    let output = run_trimmed_command_output(("cmd", &["/C", "ver"]))?;
+    parse_windows_ver_output(&output)
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_identity() -> HostOsIdentity {
+    let release = std::fs::read_to_string("/etc/os-release").ok();
+    let distro_id = release
+        .as_deref()
+        .and_then(|contents| parse_os_release_key(contents, "ID"));
+    let distro_version = release
+        .as_deref()
+        .and_then(|contents| parse_os_release_key(contents, "VERSION_ID"));
+    if distro_id
+        .as_deref()
+        .map(|id| id.eq_ignore_ascii_case("ubuntu"))
+        .unwrap_or(false)
+    {
+        HostOsIdentity {
+            platform: "ubuntu".to_string(),
+            family: "unix".to_string(),
+            version: distro_version,
+        }
+    } else {
+        HostOsIdentity {
+            platform: std::env::consts::OS.to_string(),
+            family: std::env::consts::FAMILY.to_string(),
+            version: distro_version,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_prefixed_word(text: &str, prefix: &str) -> Option<String> {
+    let prefix_start = text.find(prefix)?;
+    let suffix = text[prefix_start + prefix.len()..].trim_start();
+    let word_end = suffix
+        .find(|ch: char| ch.is_whitespace())
+        .unwrap_or(suffix.len());
+    normalize_os_text(&suffix[..word_end])
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_ver_output(text: &str) -> Option<String> {
+    let marker = "Version ";
+    let start = text.find(marker)?;
+    let suffix = &text[start + marker.len()..];
+    let end = suffix
+        .find(']')
+        .or_else(|| suffix.find(|ch: char| ch.is_whitespace()))
+        .unwrap_or(suffix.len());
+    normalize_os_text(&suffix[..end])
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_os_release_key(contents: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    contents.lines().find_map(|line| {
+        let raw = line.strip_prefix(&prefix)?;
+        normalize_os_text(raw.trim_matches(|ch: char| ch == '"' || ch.is_whitespace()))
+    })
+}
+
+fn run_trimmed_command_output(command: (&'static str, &'static [&'static str])) -> Option<String> {
+    let output = std::process::Command::new(command.0)
+        .args(command.1.iter().copied())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn hostname_resolution_command() -> (&'static str, &'static [&'static str]) {
+    ("hostname", &[])
 }
 
 #[cfg(test)]
@@ -1590,6 +1864,46 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_host_details_include_platform_arch_and_cores() {
+        let details = collect_heartbeat_host_details();
+        assert!(!details.platform.unwrap_or_default().is_empty());
+        assert!(!details.os_family.unwrap_or_default().is_empty());
+        assert!(!details.arch.unwrap_or_default().is_empty());
+        assert!(details.cpu_logical_cores.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn parse_prefixed_word_extracts_macos_product_version() {
+        let sw_vers = "ProductName:\tmacOS\nProductVersion:\t14.6.1\nBuildVersion:\t23G93";
+        assert_eq!(
+            parse_prefixed_word(sw_vers, "ProductVersion:").as_deref(),
+            Some("14.6.1")
+        );
+    }
+
+    #[test]
+    fn parse_windows_ver_output_extracts_version() {
+        let ver = "Microsoft Windows [Version 10.0.22631.3296]";
+        assert_eq!(
+            parse_windows_ver_output(ver).as_deref(),
+            Some("10.0.22631.3296")
+        );
+    }
+
+    #[test]
+    fn parse_os_release_key_extracts_quoted_values() {
+        let os_release = "NAME=\"Ubuntu\"\nID=ubuntu\nVERSION_ID=\"24.04\"\n";
+        assert_eq!(
+            parse_os_release_key(os_release, "ID").as_deref(),
+            Some("ubuntu")
+        );
+        assert_eq!(
+            parse_os_release_key(os_release, "VERSION_ID").as_deref(),
+            Some("24.04")
+        );
+    }
+
+    #[test]
     fn exchange_sync_mode_defaults_to_live() {
         assert!(matches!(
             exchange_sync_mode(None, true),
@@ -1613,6 +1927,49 @@ mod tests {
             exchange_sync_mode(Some(&tags), false),
             ExchangeSyncMode::Live
         ));
+    }
+
+    #[test]
+    fn exchange_event_to_metadata_normalizes_preview_only_body_mode() {
+        let event = ExchangeEventV2::new(
+            "123e4567-e89b-42d3-a456-426614174000",
+            soth_core::types::exchange_v2::ExchangeSourceClass::AgentApp,
+            soth_core::types::exchange_v2::ExchangeTransport::Https,
+            ExchangeBodyMode::PreviewOnly,
+            ExchangeBodyMode::PreviewOnly,
+        );
+
+        let metadata = exchange_event_to_metadata(&event);
+        assert_eq!(metadata.request_body_mode.as_deref(), Some("metadata_only"));
+        assert_eq!(
+            metadata.response_body_mode.as_deref(),
+            Some("metadata_only")
+        );
+    }
+
+    #[test]
+    fn exchange_event_to_metadata_normalizes_legacy_client_app_type() {
+        let mut event = ExchangeEventV2::new(
+            "123e4567-e89b-42d3-a456-426614174001",
+            soth_core::types::exchange_v2::ExchangeSourceClass::AgentApp,
+            soth_core::types::exchange_v2::ExchangeTransport::Https,
+            ExchangeBodyMode::Inline,
+            ExchangeBodyMode::MetadataOnly,
+        );
+        event.client = Some(soth_core::types::exchange_v2::ExchangeClient {
+            pid: None,
+            bundle_id: Some("agent.codex".to_string()),
+            process_name: Some("codex".to_string()),
+            app_type: Some("collector".to_string()),
+            host_origin: None,
+            referrer_origin: None,
+        });
+
+        let metadata = exchange_event_to_metadata(&event);
+        assert_eq!(metadata.client_app_type.as_deref(), Some("non_host"));
+        let envelope = metadata.event_envelope.expect("event_envelope");
+        let client = envelope.client.expect("event_envelope.client");
+        assert_eq!(client.app_type.as_deref(), Some("non_host"));
     }
 
     #[test]
@@ -1641,6 +1998,16 @@ mod tests {
             classify_exchange_rejection("invalid_exchange_id", None),
             ExchangeRejectionDisposition::Retry
         ));
+    }
+
+    #[test]
+    fn is_sqlite_lock_anyhow_detects_lock_errors() {
+        let locked = anyhow::anyhow!("database is locked");
+        assert!(is_sqlite_lock_anyhow(&locked));
+        let busy = anyhow::anyhow!("database busy");
+        assert!(is_sqlite_lock_anyhow(&busy));
+        let other = anyhow::anyhow!("connection refused");
+        assert!(!is_sqlite_lock_anyhow(&other));
     }
 
     #[test]

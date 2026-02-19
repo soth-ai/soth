@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::Serialize;
 use soth_core::config::SothConfig;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use soth_core::config::{BudgetLimit, RegistryMode};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
@@ -12,6 +13,7 @@ use tracing::info;
 pub struct CloudPullRuntime {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
     pub task: JoinHandle<()>,
+    _singleton_lock: CloudRuntimeSingletonLock,
 }
 
 const STARTUP_REGISTRY_REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -20,6 +22,7 @@ const FINAL_CLOUD_SYNC_TIMEOUT: Duration = Duration::from_secs(4);
 const FINAL_CLOUD_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 const FINAL_CLOUD_SYNC_MAX_ROUNDS: usize = 3;
 const CLOUD_BACKOFF_MAX_CAP: Duration = Duration::from_secs(15 * 60);
+const CLOUD_RUNTIME_LOCK_FILE: &str = "cloud.pull.runtime.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistryRuntimeSource {
@@ -263,6 +266,23 @@ pub fn spawn_cloud_pull_runtime(
     if !config.cloud.enabled {
         return None;
     }
+
+    let singleton_lock = match try_acquire_cloud_runtime_singleton_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            info!(
+                "Cloud runtime already active in another process; skipping duplicate runtime startup"
+            );
+            return None;
+        }
+        Err(error) => {
+            warn!(
+                "Failed to acquire cloud runtime singleton lock; skipping cloud runtime: {:#}",
+                error
+            );
+            return None;
+        }
+    };
 
     let api_key = config.cloud.api_key.clone()?;
     let endpoint = config.cloud.endpoint.clone();
@@ -583,7 +603,61 @@ pub fn spawn_cloud_pull_runtime(
         }
     });
 
-    Some(CloudPullRuntime { shutdown_tx, task })
+    Some(CloudPullRuntime {
+        shutdown_tx,
+        task,
+        _singleton_lock: singleton_lock,
+    })
+}
+
+struct CloudRuntimeSingletonLock {
+    #[allow(dead_code)]
+    file: File,
+}
+
+impl Drop for CloudRuntimeSingletonLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn try_acquire_cloud_runtime_singleton_lock() -> Result<Option<CloudRuntimeSingletonLock>> {
+    let path = cloud_runtime_lock_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(anyhow!(
+                "failed acquiring cloud runtime singleton lock {}: {}",
+                path.display(),
+                error
+            ));
+        }
+    }
+    Ok(Some(CloudRuntimeSingletonLock { file }))
+}
+
+fn cloud_runtime_lock_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join("run").join(CLOUD_RUNTIME_LOCK_FILE))
+        .unwrap_or_else(|| PathBuf::from(".soth/run").join(CLOUD_RUNTIME_LOCK_FILE))
 }
 
 #[derive(Debug, Clone)]

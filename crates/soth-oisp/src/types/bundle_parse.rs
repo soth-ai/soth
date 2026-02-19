@@ -1,4 +1,5 @@
 use super::*;
+use crate::matchers::normalize_host_for_matching;
 use crate::types::provider::{DetectionRule, ProviderDefinition};
 use anyhow::Context;
 use serde_json::{Map, Value};
@@ -125,6 +126,7 @@ fn parse_catalog_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let catalog_domains = parse_catalog_domains(object, None);
+    let gating = parse_bundle_gating(object, None);
 
     Ok(CompiledBundle {
         schema_version: compiled_bundle_schema_version(),
@@ -138,6 +140,7 @@ fn parse_catalog_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         stats,
         formats,
         catalog_domains,
+        gating,
         meta: object.get("meta").cloned(),
         signatures: object.get("signatures").cloned(),
     })
@@ -203,6 +206,7 @@ fn parse_sectioned_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let catalog_domains = parse_catalog_domains(root, Some(core));
+    let gating = parse_bundle_gating(root, Some(core));
 
     let stats = root
         .get("stats")
@@ -226,6 +230,7 @@ fn parse_sectioned_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         stats,
         formats,
         catalog_domains,
+        gating,
         meta: root.get("meta").cloned(),
         signatures: root.get("signatures").cloned(),
     })
@@ -649,6 +654,104 @@ fn parse_catalog_domains(
     domains
 }
 
+fn parse_bundle_gating(
+    root: &Map<String, Value>,
+    core: Option<&Map<String, Value>>,
+) -> BundleGating {
+    let mut allowed_app_origins = AllowedAppOrigins::default();
+    let mut allowed_host_origins = Vec::new();
+
+    collect_allowed_app_origins(root.get("allowed_app_origins"), &mut allowed_app_origins);
+    allowed_host_origins.extend(extract_allowed_host_origins(
+        root.get("allowed_host_origins"),
+    ));
+
+    if let Some(gating) = root.get("gating").and_then(Value::as_object) {
+        collect_allowed_app_origins(gating.get("allowed_app_origins"), &mut allowed_app_origins);
+        allowed_host_origins.extend(extract_allowed_host_origins(
+            gating.get("allowed_host_origins"),
+        ));
+    }
+
+    if let Some(core) = core {
+        collect_allowed_app_origins(core.get("allowed_app_origins"), &mut allowed_app_origins);
+        allowed_host_origins.extend(extract_allowed_host_origins(
+            core.get("allowed_host_origins"),
+        ));
+        if let Some(gating) = core.get("gating").and_then(Value::as_object) {
+            collect_allowed_app_origins(
+                gating.get("allowed_app_origins"),
+                &mut allowed_app_origins,
+            );
+            allowed_host_origins.extend(extract_allowed_host_origins(
+                gating.get("allowed_host_origins"),
+            ));
+        }
+    }
+
+    normalize_identifier_patterns(&mut allowed_app_origins.hosts);
+    normalize_identifier_patterns(&mut allowed_app_origins.non_hosts);
+    normalize_identifier_patterns(&mut allowed_app_origins.apps_with_parsers);
+    normalize_host_origin_patterns(&mut allowed_host_origins);
+
+    BundleGating {
+        allowed_app_origins,
+        allowed_host_origins,
+    }
+}
+
+fn collect_allowed_app_origins(value: Option<&Value>, out: &mut AllowedAppOrigins) {
+    let Some(value) = value else {
+        return;
+    };
+    let Some(object) = value.as_object() else {
+        return;
+    };
+
+    out.hosts.extend(extract_string_array(
+        object.get("hosts").or_else(|| object.get("host")),
+    ));
+    out.non_hosts.extend(extract_string_array(
+        object
+            .get("non_hosts")
+            .or_else(|| object.get("nonHosts"))
+            .or_else(|| object.get("non_hosts_apps")),
+    ));
+    out.apps_with_parsers.extend(extract_string_array(
+        object
+            .get("apps_with_parsers")
+            .or_else(|| object.get("appsWithParsers"))
+            .or_else(|| object.get("with_parsers")),
+    ));
+}
+
+fn extract_allowed_host_origins(value: Option<&Value>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+
+    if let Some(object) = value.as_object() {
+        let mut out = Vec::new();
+        out.extend(extract_string_array(object.get("domains")));
+        out.extend(extract_string_array(object.get("hosts")));
+        out.extend(extract_string_array(object.get("origins")));
+        out.extend(extract_string_array(object.get("allowed")));
+        return out;
+    }
+
+    Vec::new()
+}
+
 fn extract_catalog_domains_from_value(value: Option<&Value>) -> Vec<String> {
     let Some(value) = value else {
         return Vec::new();
@@ -785,6 +888,7 @@ fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
     }
     normalize_domain_filters(&mut bundle.filters);
     dedup_sort_strings(&mut bundle.catalog_domains);
+    normalize_bundle_gating(&mut bundle.gating);
     if bundle.stats.providers == 0 {
         bundle.stats.providers = bundle.providers.len();
     }
@@ -798,6 +902,13 @@ fn normalize_domain_filters(filters: &mut DomainFilters) {
     dedup_sort_strings(&mut filters.blacklist);
     dedup_sort_strings(&mut filters.passthrough);
     dedup_sort_strings(&mut filters.noise_keywords);
+}
+
+fn normalize_bundle_gating(gating: &mut BundleGating) {
+    normalize_identifier_patterns(&mut gating.allowed_app_origins.hosts);
+    normalize_identifier_patterns(&mut gating.allowed_app_origins.non_hosts);
+    normalize_identifier_patterns(&mut gating.allowed_app_origins.apps_with_parsers);
+    normalize_host_origin_patterns(&mut gating.allowed_host_origins);
 }
 
 fn normalize_detection_spec(detection: &mut DetectionSpec) {
@@ -1001,6 +1112,32 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 fn dedup_sort_strings(values: &mut Vec<String>) {
     values.sort();
     values.dedup();
+}
+
+fn normalize_identifier_patterns(values: &mut Vec<String>) {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        let text = value.trim();
+        if text.is_empty() {
+            continue;
+        }
+        normalized.push(text.to_ascii_lowercase());
+    }
+    *values = normalized;
+    dedup_sort_strings(values);
+}
+
+fn normalize_host_origin_patterns(values: &mut Vec<String>) {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        let origin = normalize_host_for_matching(value.as_str());
+        if origin.is_empty() {
+            continue;
+        }
+        normalized.push(origin);
+    }
+    *values = normalized;
+    dedup_sort_strings(values);
 }
 
 fn prune_catch_all_path_rules(paths: &mut Vec<String>, entry_type: &EntryType) {

@@ -8,6 +8,67 @@ use std::collections::BTreeMap;
 
 pub const EXCHANGE_SCHEMA_VERSION_V2: &str = "2.0";
 
+pub const EXCHANGE_CLIENT_APP_TYPE_HOST: &str = "host";
+pub const EXCHANGE_CLIENT_APP_TYPE_NON_HOST: &str = "non_host";
+pub const EXCHANGE_CLIENT_APP_TYPES: &[&str] = &[
+    EXCHANGE_CLIENT_APP_TYPE_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+];
+
+pub const EXCHANGE_DECISION_STEP_APP_GATE: &str = "step0_app_gate";
+pub const EXCHANGE_DECISION_STEP_WHITELIST: &str = "step1_whitelist";
+pub const EXCHANGE_DECISION_STEP_URL_BLACKLIST: &str = "step2_url_blacklist";
+pub const EXCHANGE_DECISION_STEP_GRAPHQL_BLACKLIST: &str = "step3_graphql_blacklist";
+pub const EXCHANGE_DECISION_STEP_APP_ORIGIN: &str = "step4_app_origin";
+pub const EXCHANGE_DECISION_STEP_HOST_ORIGIN: &str = "step5_host_origin";
+pub const EXCHANGE_DECISION_STEPS: &[&str] = &[
+    EXCHANGE_DECISION_STEP_APP_GATE,
+    EXCHANGE_DECISION_STEP_WHITELIST,
+    EXCHANGE_DECISION_STEP_URL_BLACKLIST,
+    EXCHANGE_DECISION_STEP_GRAPHQL_BLACKLIST,
+    EXCHANGE_DECISION_STEP_APP_ORIGIN,
+    EXCHANGE_DECISION_STEP_HOST_ORIGIN,
+];
+
+pub const EXCHANGE_DECISION_OUTCOME_CAPTURED: &str = "captured";
+pub const EXCHANGE_DECISION_OUTCOME_SKIPPED: &str = "skipped";
+pub const EXCHANGE_DECISION_OUTCOME_DISCOVERY_CAPTURE: &str = "discovery_capture";
+pub const EXCHANGE_DECISION_OUTCOME_METADATA_ONLY: &str = "metadata_only";
+pub const EXCHANGE_DECISION_OUTCOMES: &[&str] = &[
+    EXCHANGE_DECISION_OUTCOME_CAPTURED,
+    EXCHANGE_DECISION_OUTCOME_SKIPPED,
+    EXCHANGE_DECISION_OUTCOME_DISCOVERY_CAPTURE,
+    EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
+];
+
+pub const EXCHANGE_SKIP_REASON_NO_BUNDLE_ID: &str = "no_bundle_id";
+pub const EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED: &str = "app_not_allowed";
+pub const EXCHANGE_SKIP_REASON_APP_RATE_LIMITED: &str = "app_rate_limited";
+pub const EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED: &str = "domain_rate_limited";
+pub const EXCHANGE_SKIP_REASON_NOT_WHITELISTED: &str = "not_whitelisted";
+pub const EXCHANGE_SKIP_REASON_BLACKLISTED: &str = "blacklisted";
+pub const EXCHANGE_SKIP_REASON_BLACKLISTED_GRAPHQL: &str = "blacklisted_graphql";
+pub const EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED: &str = "host_origin_not_allowed";
+pub const EXCHANGE_SKIP_REASONS: &[&str] = &[
+    EXCHANGE_SKIP_REASON_NO_BUNDLE_ID,
+    EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED,
+    EXCHANGE_SKIP_REASON_APP_RATE_LIMITED,
+    EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED,
+    EXCHANGE_SKIP_REASON_NOT_WHITELISTED,
+    EXCHANGE_SKIP_REASON_BLACKLISTED,
+    EXCHANGE_SKIP_REASON_BLACKLISTED_GRAPHQL,
+    EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED,
+];
+
+pub const EXCHANGE_DISCOVERY_KIND_CATALOG: &str = "catalog";
+pub const EXCHANGE_DISCOVERY_KIND_APP: &str = "app";
+pub const EXCHANGE_DISCOVERY_KIND_DOMAIN: &str = "domain";
+pub const EXCHANGE_DISCOVERY_KINDS: &[&str] = &[
+    EXCHANGE_DISCOVERY_KIND_CATALOG,
+    EXCHANGE_DISCOVERY_KIND_APP,
+    EXCHANGE_DISCOVERY_KIND_DOMAIN,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExchangeSourceClass {
@@ -48,6 +109,8 @@ pub struct ExchangeClient {
     pub process_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub referrer_origin: Option<String>,
 }
@@ -140,6 +203,14 @@ pub struct ExchangeParse {
     pub target_entity_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detection_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

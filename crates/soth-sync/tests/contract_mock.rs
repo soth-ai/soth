@@ -171,6 +171,22 @@ async fn contract_sync_endpoints_and_cursors() {
         telemetry.counters.get("sync.exchange.queue_depth"),
         Some(&0)
     );
+    let host_details = captured.heartbeat_requests[0]
+        .host_details
+        .as_ref()
+        .expect("heartbeat host_details should be populated");
+    assert!(
+        host_details.platform.is_some(),
+        "heartbeat host_details.platform should be populated"
+    );
+    assert!(
+        host_details.arch.is_some(),
+        "heartbeat host_details.arch should be populated"
+    );
+    assert!(
+        host_details.cpu_logical_cores.is_some(),
+        "heartbeat host_details.cpu_logical_cores should be populated"
+    );
 
     let metadata = &captured.metadata_requests[0];
     assert_eq!(metadata.batch.len(), 1);

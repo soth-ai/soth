@@ -51,6 +51,24 @@ pub struct DomainFilters {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AllowedAppOrigins {
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub non_hosts: Vec<String>,
+    #[serde(default)]
+    pub apps_with_parsers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BundleGating {
+    #[serde(default)]
+    pub allowed_app_origins: AllowedAppOrigins,
+    #[serde(default)]
+    pub allowed_host_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct BundleStats {
     #[serde(default)]
     pub providers: usize,
@@ -107,6 +125,8 @@ pub struct CompiledBundle {
     pub formats: BTreeMap<String, Value>,
     #[serde(default)]
     pub catalog_domains: Vec<String>,
+    #[serde(default)]
+    pub gating: BundleGating,
     #[serde(default)]
     pub meta: Option<Value>,
     #[serde(default)]

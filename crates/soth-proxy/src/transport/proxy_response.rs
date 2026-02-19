@@ -16,6 +16,7 @@ use crate::transport::proxy_support::{
 use crate::transport::response_event_builder::normalize_response_content;
 use crate::transport::tier_enrichment::extract_subscription_tags;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
+use soth_core::types::exchange_v2::EXCHANGE_DECISION_OUTCOME_METADATA_ONLY;
 use soth_core::EventLogger;
 
 #[allow(clippy::too_many_arguments)]
@@ -65,6 +66,18 @@ pub(crate) async fn handle_mcp_jsonrpc_response(
         let mut tags = event_tags.clone();
         if pending.catalog_discovery {
             append_catalog_discovery_tags(&mut tags, &pending.host);
+        }
+        if let Some(kind) = pending.discovery_kind.as_deref() {
+            tags.insert("discovery_mode".to_string(), kind.to_string());
+            tags.insert("discovery_capture".to_string(), "daily_first".to_string());
+            if pending.decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY)
+            {
+                tags.insert("discovery_payload".to_string(), "metadata_only".to_string());
+            }
+            tags.insert("discovery_host".to_string(), pending.host.clone());
+        }
+        if let Some(skip_reason) = pending.skip_reason.as_deref() {
+            tags.insert("decision.skip_reason".to_string(), skip_reason.to_string());
         }
         append_process_attribution_tags(&mut tags, pending.envelope.as_ref());
         append_detection_tags(&mut tags, pending);
@@ -139,6 +152,17 @@ pub(crate) fn emit_non_stream_response_event(
     let mut enriched_tags = event_tags.clone();
     if pending.catalog_discovery {
         append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
+    }
+    if let Some(kind) = pending.discovery_kind.as_deref() {
+        enriched_tags.insert("discovery_mode".to_string(), kind.to_string());
+        enriched_tags.insert("discovery_capture".to_string(), "daily_first".to_string());
+        if pending.decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY) {
+            enriched_tags.insert("discovery_payload".to_string(), "metadata_only".to_string());
+        }
+        enriched_tags.insert("discovery_host".to_string(), pending.host.clone());
+    }
+    if let Some(skip_reason) = pending.skip_reason.as_deref() {
+        enriched_tags.insert("decision.skip_reason".to_string(), skip_reason.to_string());
     }
     append_process_attribution_tags(&mut enriched_tags, pending.envelope.as_ref());
     append_detection_tags(&mut enriched_tags, pending);

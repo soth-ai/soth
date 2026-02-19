@@ -131,10 +131,7 @@ fn render_signal_strip(frame: &mut Frame, area: Rect, app: &App) {
         let tunnels = decisions.get("tunnel").copied().unwrap_or(0);
         (
             format!("{} req", format_number(p.total_requests)),
-            format!(
-                "int {} | noise {} | tunnel {}",
-                intercepts, noise, tunnels
-            ),
+            format!("int {} | noise {} | tunnel {}", intercepts, noise, tunnels),
             if noise > 0 {
                 Theme::get().warning_style()
             } else {

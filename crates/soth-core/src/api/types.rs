@@ -72,6 +72,20 @@ pub struct ExchangeMetadata {
     pub target_entity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_app_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_host_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_referrer_origin: Option<String>,
     pub tags: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_envelope: Option<EventEnvelopeMetadata>,
@@ -84,6 +98,10 @@ pub struct EventClientMetadata {
     pub process_name: Option<String>,
     pub process_executable: Option<String>,
     pub app_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referrer_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +262,8 @@ pub struct HeartbeatRequest {
     pub hostname: Option<String>,
     pub active_connections: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_details: Option<HeartbeatHostDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<HeartbeatTelemetry>,
 }
 
@@ -258,6 +278,22 @@ pub struct HeartbeatResponse {
 pub struct HeartbeatTelemetry {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counters: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeartbeatHostDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_logical_cores: Option<u64>,
 }
 
 // ============================================================================

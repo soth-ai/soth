@@ -243,12 +243,16 @@ pub(crate) fn append_stream_capture(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DiscoveryKind {
     Catalog,
+    App,
+    Domain,
 }
 
 impl DiscoveryKind {
     fn as_key_segment(self) -> &'static str {
         match self {
             Self::Catalog => "catalog",
+            Self::App => "app",
+            Self::Domain => "domain",
         }
     }
 }
@@ -288,6 +292,8 @@ pub(crate) struct CatalogDiscoveryLimiter {
     state_by_kind: Mutex<HashMap<DiscoveryKind, DiscoveryState>>,
     event_logger: Mutex<Option<Arc<EventLogger>>>,
     catalog_daily_cap: u32,
+    app_daily_cap: u32,
+    domain_daily_cap: u32,
 }
 
 impl Default for CatalogDiscoveryLimiter {
@@ -296,6 +302,8 @@ impl Default for CatalogDiscoveryLimiter {
             state_by_kind: Mutex::new(HashMap::new()),
             event_logger: Mutex::new(None),
             catalog_daily_cap: 250,
+            app_daily_cap: 250,
+            domain_daily_cap: 250,
         }
     }
 }
@@ -307,6 +315,8 @@ impl CatalogDiscoveryLimiter {
             state_by_kind: Mutex::new(HashMap::new()),
             event_logger: Mutex::new(None),
             catalog_daily_cap,
+            app_daily_cap: 250,
+            domain_daily_cap: 250,
         }
     }
 
@@ -329,6 +339,8 @@ impl CatalogDiscoveryLimiter {
     fn cap_for_kind(&self, kind: DiscoveryKind) -> u32 {
         match kind {
             DiscoveryKind::Catalog => self.catalog_daily_cap,
+            DiscoveryKind::App => self.app_daily_cap,
+            DiscoveryKind::Domain => self.domain_daily_cap,
         }
     }
 

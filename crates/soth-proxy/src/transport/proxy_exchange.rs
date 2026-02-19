@@ -8,7 +8,8 @@ use crate::transport::usage_enrichment::ResponseUsageMeta;
 use soth_budget::{BudgetTracker, TokenCounter};
 use soth_core::types::exchange_v2::{
     ExchangeClient, ExchangeCost, ExchangeParse, ExchangeSourceClass, ExchangeTransport,
-    ExchangeUsage,
+    ExchangeUsage, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY, EXCHANGE_DECISION_OUTCOME_SKIPPED,
+    EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_DOMAIN,
 };
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
@@ -135,6 +136,51 @@ fn event_source_for_pending(pending: &PendingRequest) -> EventSource {
     }
 }
 
+fn exchange_client_from_pending(pending: &PendingRequest) -> Option<ExchangeClient> {
+    let base = exchange_client_from_envelope(pending.envelope.as_ref());
+    let (pid, mut process_name, mut bundle_id, mut app_type) = if let Some(client) = base {
+        (
+            client.pid,
+            client.process_name,
+            client.bundle_id,
+            client.app_type,
+        )
+    } else {
+        (None, None, None, None)
+    };
+
+    if app_type.is_none() {
+        app_type = pending.client_app_type.clone();
+    }
+    if process_name.is_none() {
+        process_name = pending.agent.clone().or_else(|| pending.provider.clone());
+    }
+    if bundle_id.is_none() {
+        bundle_id = bundle_id_from_agent_hint(pending.agent.as_deref());
+    }
+
+    let host_origin = pending.client_host_origin.clone();
+    let referrer_origin = pending.client_referrer_origin.clone();
+    if pid.is_none()
+        && process_name.is_none()
+        && bundle_id.is_none()
+        && app_type.is_none()
+        && host_origin.is_none()
+        && referrer_origin.is_none()
+    {
+        return None;
+    }
+
+    Some(ExchangeClient {
+        pid,
+        bundle_id,
+        process_name,
+        app_type,
+        host_origin,
+        referrer_origin,
+    })
+}
+
 fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<ExchangeClient> {
     let envelope = envelope?;
     let process_name = envelope
@@ -164,6 +210,7 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
         bundle_id,
         process_name,
         app_type,
+        host_origin: None,
         referrer_origin: None,
     })
 }
@@ -288,7 +335,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
         Some(pending.path.clone()),
         Some(pending.method.clone()),
     );
-    assembler.set_client(exchange_client_from_envelope(pending.envelope.as_ref()));
+    assembler.set_client(exchange_client_from_pending(pending));
     assembler.set_parse(Some(ExchangeParse {
         parser_version: Some("exchange_v2_edge".to_string()),
         bundle_version: bundle_version.map(ToString::to_string),
@@ -296,6 +343,10 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
         detection_reason: pending.detection_reason.clone(),
         target_entity_id: pending.target_entity_id.clone(),
         detection_source: pending.detection_source.clone(),
+        decision_step: pending.decision_step.clone(),
+        decision_outcome: pending.decision_outcome.clone(),
+        skip_reason: pending.skip_reason.clone(),
+        discovery_kind: pending.discovery_kind.clone(),
     }));
     assembler.set_blacklist_match(pending.blacklist_match);
     assembler.set_request(
@@ -327,9 +378,25 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
         currency: "USD".to_string(),
         pricing_version: bundle_version.map(ToString::to_string),
     }));
-    assembler.set_discovery_capture(pending.catalog_discovery);
-    if pending.catalog_discovery {
-        assembler.mark_metadata_only("catalog_discovery_metadata_only");
+    let is_discovery_capture = pending.catalog_discovery || pending.discovery_kind.is_some();
+    assembler.set_discovery_capture(is_discovery_capture);
+    if pending.catalog_discovery
+        || pending.discovery_kind.is_some()
+        || pending.decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY)
+        || pending.decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_SKIPPED)
+    {
+        let reason = if pending.catalog_discovery {
+            "catalog_discovery_metadata_only"
+        } else if pending.discovery_kind.as_deref() == Some(EXCHANGE_DISCOVERY_KIND_APP) {
+            "app_discovery_metadata_only"
+        } else if pending.discovery_kind.as_deref() == Some(EXCHANGE_DISCOVERY_KIND_DOMAIN) {
+            "domain_discovery_metadata_only"
+        } else if pending.decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_SKIPPED) {
+            "decision_skipped_metadata_only"
+        } else {
+            "metadata_only"
+        };
+        assembler.mark_metadata_only(reason);
     }
     if pending.request_body_truncated {
         assembler.mark_truncated("request_body_truncated");
@@ -494,7 +561,7 @@ pub(crate) fn seed_exchange_v2_spool(
         Some(pending.path.clone()),
         Some(pending.method.clone()),
     );
-    assembler.set_client(exchange_client_from_envelope(pending.envelope.as_ref()));
+    assembler.set_client(exchange_client_from_pending(pending));
     assembler.set_request(
         pending.headers.clone(),
         pending.request_content_type.clone(),
@@ -504,7 +571,7 @@ pub(crate) fn seed_exchange_v2_spool(
             .unwrap_or_default()
             .as_bytes(),
     );
-    assembler.set_discovery_capture(pending.catalog_discovery);
+    assembler.set_discovery_capture(pending.catalog_discovery || pending.discovery_kind.is_some());
     assembler.set_parse(Some(ExchangeParse {
         parser_version: Some("exchange_v2_edge".to_string()),
         bundle_version: bundle_version.map(ToString::to_string),
@@ -512,6 +579,10 @@ pub(crate) fn seed_exchange_v2_spool(
         detection_reason: pending.detection_reason.clone(),
         target_entity_id: pending.target_entity_id.clone(),
         detection_source: pending.detection_source.clone(),
+        decision_step: pending.decision_step.clone(),
+        decision_outcome: pending.decision_outcome.clone(),
+        skip_reason: pending.skip_reason.clone(),
+        discovery_kind: pending.discovery_kind.clone(),
     }));
     assembler.set_blacklist_match(pending.blacklist_match);
     if let Some(envelope) = pending.envelope.as_ref() {
