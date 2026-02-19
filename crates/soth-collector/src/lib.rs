@@ -1657,9 +1657,22 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
         .get("direction")
         .and_then(|v| v.as_str())
         .and_then(parse_direction);
-    let provider = extract_string(&value, &["provider", "vendor"]);
-    let model = extract_string(&value, &["model"]);
-    let method = extract_string(&value, &["method", "operation", "rpc_method"]).or_else(|| {
+    let provider = extract_string_with_sections(
+        &value,
+        &["provider", "vendor", "model_provider", "modelProvider"],
+        &["payload", "request", "response", "metadata", "meta"],
+    );
+    let model = extract_string_with_sections(
+        &value,
+        &["model", "model_name", "modelName"],
+        &["payload", "request", "response", "metadata", "meta"],
+    );
+    let method = extract_string_with_sections(
+        &value,
+        &["method", "operation", "rpc_method"],
+        &["payload", "request", "response", "metadata", "meta"],
+    )
+    .or_else(|| {
         value
             .get("request")
             .and_then(|v| v.get("method"))
@@ -1667,9 +1680,30 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
             .map(|v| v.to_string())
     });
     let tool_name = extract_string(&value, &["tool_name", "tool"]);
-    let agent = extract_string(&value, &["agent", "agent_name", "client"]);
-    let session_id = extract_string(&value, &["session_id", "sessionId"]);
-    let project = extract_string(&value, &["project", "cwd"]);
+    let agent = extract_string_with_sections(
+        &value,
+        &["agent", "agent_name", "client", "client_name"],
+        &["payload", "request", "response", "metadata", "meta"],
+    );
+    let session_id = extract_string_with_sections(
+        &value,
+        &[
+            "session_id",
+            "sessionId",
+            "conversation_id",
+            "conversationId",
+            "thread_id",
+            "threadId",
+            "chat_id",
+            "chatId",
+        ],
+        &["payload", "request", "response", "metadata", "meta"],
+    );
+    let project = extract_string_with_sections(
+        &value,
+        &["project", "cwd"],
+        &["payload", "metadata", "meta"],
+    );
     let request = value
         .get("request")
         .and_then(|v| serde_json::to_string(v).ok());
@@ -1703,6 +1737,27 @@ fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
             }
         }
     }
+    None
+}
+
+fn extract_string_with_sections(
+    value: &serde_json::Value,
+    keys: &[&str],
+    sections: &[&str],
+) -> Option<String> {
+    if let Some(found) = extract_string(value, keys) {
+        return Some(found);
+    }
+
+    for section in sections {
+        let Some(candidate) = value.get(*section) else {
+            continue;
+        };
+        if let Some(found) = extract_string(candidate, keys) {
+            return Some(found);
+        }
+    }
+
     None
 }
 
@@ -2109,6 +2164,30 @@ mod tests {
                 .and_then(|tags| tags.get("collector.project")),
             Some(&"/tmp/example".to_string())
         );
+    }
+
+    #[test]
+    fn parse_json_line_extracts_nested_session_aliases() {
+        let line = json!({
+            "payload": {
+                "conversationId": "conversation-123",
+                "model": "gpt-4o-mini",
+                "provider": "openai"
+            },
+            "request": {
+                "method": "POST"
+            }
+        })
+        .to_string();
+
+        let parsed = parse_json_line(&line).expect("parsed JSON line");
+        assert_eq!(
+            parsed.session_id.as_deref(),
+            Some("conversation-123")
+        );
+        assert_eq!(parsed.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(parsed.provider.as_deref(), Some("openai"));
+        assert_eq!(parsed.method.as_deref(), Some("POST"));
     }
 
     #[test]
