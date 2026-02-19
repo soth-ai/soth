@@ -90,6 +90,57 @@ impl OispEngine {
         host_matches_any(host.as_str(), &self.bundle.catalog_domains)
     }
 
+    pub fn classify_app_origin(&self, app_identifier: &str) -> Option<&'static str> {
+        let app_identifier = normalize_host_for_matching(app_identifier);
+        if app_identifier.is_empty() {
+            return None;
+        }
+        if host_matches_any(
+            app_identifier.as_str(),
+            &self.bundle.gating.allowed_app_origins.hosts,
+        ) {
+            return Some("host");
+        }
+        if host_matches_any(
+            app_identifier.as_str(),
+            &self.bundle.gating.allowed_app_origins.non_hosts,
+        ) {
+            return Some("non_host");
+        }
+        None
+    }
+
+    pub fn app_has_parser(&self, app_identifier: &str) -> bool {
+        let app_identifier = normalize_host_for_matching(app_identifier);
+        if app_identifier.is_empty() {
+            return false;
+        }
+        host_matches_any(
+            app_identifier.as_str(),
+            &self.bundle.gating.allowed_app_origins.apps_with_parsers,
+        )
+    }
+
+    pub fn has_app_origin_rules(&self) -> bool {
+        !self.bundle.gating.allowed_app_origins.hosts.is_empty()
+            || !self.bundle.gating.allowed_app_origins.non_hosts.is_empty()
+    }
+
+    pub fn has_host_origin_rules(&self) -> bool {
+        !self.bundle.gating.allowed_host_origins.is_empty()
+    }
+
+    pub fn is_allowed_host_origin(&self, origin: &str) -> bool {
+        let origin = normalize_host_for_matching(origin);
+        if origin.is_empty() {
+            return false;
+        }
+        if self.bundle.gating.allowed_host_origins.is_empty() {
+            return true;
+        }
+        host_matches_any(origin.as_str(), &self.bundle.gating.allowed_host_origins)
+    }
+
     pub fn classify(&self, host: &str) -> Option<Classification> {
         let host = normalize_host_for_matching(host);
         if host.is_empty() {

@@ -176,6 +176,54 @@ fn catalog_domains_are_available_for_discovery_checks() {
 }
 
 #[test]
+fn gating_rules_parse_and_match_app_and_host_origins() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "v3",
+            "compiled_at": "2026-02-19T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" }
+                },
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference"
+                    }
+                ]
+            },
+            "filters": {},
+            "gating": {
+                "allowed_app_origins": {
+                    "hosts": ["com.google.chrome", "org.mozilla.firefox"],
+                    "non_hosts": ["com.anthropic.claudefordesktop"],
+                    "apps_with_parsers": ["com.anthropic.claudefordesktop"]
+                },
+                "allowed_host_origins": ["https://chatgpt.com", "claude.ai"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.classify_app_origin("com.google.chrome"),
+        Some("host")
+    );
+    assert_eq!(
+        engine.classify_app_origin("com.anthropic.claudefordesktop"),
+        Some("non_host")
+    );
+    assert!(engine.app_has_parser("com.anthropic.claudefordesktop"));
+    assert!(engine.has_host_origin_rules());
+    assert!(engine.is_allowed_host_origin("https://chatgpt.com/backend-api"));
+    assert!(!engine.is_allowed_host_origin("https://example.com"));
+}
+
+#[test]
 fn bundle_classification_depends_on_loaded_bundle_content() {
     let engine = OispEngine::new(
             parse_compiled_bundle(&json!({
@@ -318,6 +366,184 @@ fn detection_rules_work_for_codex_and_warp_when_declared_in_bundle() {
         )
         .expect("warp detection should exist");
     assert_eq!(warp.agent.as_deref(), Some("warp"));
+}
+
+#[test]
+fn launch_subset_supports_openai_and_anthropic_app_and_path_detection() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "v1",
+            "compiled_at": "2026-02-19T00:00:00Z",
+            "bundle_type": "cloud",
+            "domain_index": [
+                {
+                    "host": "api.openai.com",
+                    "provider_id": "openai",
+                    "entry_type": "ai-inference",
+                    "paths": ["/v1/chat/completions", "/v1/responses"]
+                },
+                {
+                    "host": "chatgpt.com",
+                    "provider_id": "chatgpt",
+                    "entry_type": "agent-app",
+                    "paths": ["/backend-api/**"]
+                },
+                {
+                    "host": "api.anthropic.com",
+                    "provider_id": "anthropic",
+                    "entry_type": "ai-inference",
+                    "paths": ["/v1/messages"]
+                },
+                {
+                    "host": "claude.ai",
+                    "provider_id": "claude-web",
+                    "entry_type": "agent-app",
+                    "paths": ["/api/**"]
+                }
+            ],
+            "providers": {
+                "openai": {
+                    "id": "openai",
+                    "entity_id": "prv_openai",
+                    "name": "OpenAI",
+                    "type": "ai-inference",
+                    "api_format": "openai"
+                },
+                "chatgpt": {
+                    "id": "chatgpt",
+                    "entity_id": "agt_chatgpt",
+                    "name": "ChatGPT",
+                    "type": "agent-app",
+                    "detection": {
+                        "path_rules": [
+                            {
+                                "id": "chatgpt_codex_path",
+                                "agent": "codex",
+                                "reason": "path_contains_codex",
+                                "confidence": 0.96,
+                                "path": "/backend-api/codex/*"
+                            }
+                        ]
+                    }
+                },
+                "anthropic": {
+                    "id": "anthropic",
+                    "entity_id": "prv_anthropic",
+                    "name": "Anthropic",
+                    "type": "ai-inference",
+                    "api_format": "anthropic",
+                    "detection": {
+                        "ua_rules": [
+                            {
+                                "id": "anthropic_ua_claude_code",
+                                "agent": "claude-code",
+                                "contains": ["claude-code", "claude code"]
+                            }
+                        ],
+                        "process_rules": [
+                            {
+                                "id": "anthropic_process_claude_code",
+                                "agent": "claude-code",
+                                "contains": ["claude-code", "claude code"]
+                            },
+                            {
+                                "id": "anthropic_process_claude",
+                                "agent": "claude",
+                                "contains": "claude"
+                            }
+                        ]
+                    }
+                },
+                "claude-web": {
+                    "id": "claude-web",
+                    "entity_id": "agt_claude_web",
+                    "name": "Claude Web",
+                    "type": "agent-app"
+                }
+            },
+            "filters": {},
+            "pricing": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.should_intercept("api.openai.com", "/v1/chat/completions"),
+        InterceptDecision::Intercept {
+            provider_id: "openai".to_string(),
+            entry_type: EntryType::AiInference
+        }
+    );
+    assert_eq!(
+        engine.should_intercept("chatgpt.com", "/backend-api/conversation"),
+        InterceptDecision::Intercept {
+            provider_id: "chatgpt".to_string(),
+            entry_type: EntryType::AgentApp
+        }
+    );
+    assert_eq!(
+        engine.should_intercept("api.anthropic.com", "/v1/messages"),
+        InterceptDecision::Intercept {
+            provider_id: "anthropic".to_string(),
+            entry_type: EntryType::AiInference
+        }
+    );
+    assert_eq!(
+        engine.should_intercept("claude.ai", "/api/organizations"),
+        InterceptDecision::Intercept {
+            provider_id: "claude-web".to_string(),
+            entry_type: EntryType::AgentApp
+        }
+    );
+    assert_eq!(
+        engine.should_intercept("api.openai.com", "/v1/models"),
+        InterceptDecision::Tunnel
+    );
+    assert_eq!(
+        engine.should_intercept("api.anthropic.com", "/v1/complete"),
+        InterceptDecision::Tunnel
+    );
+
+    let codex = engine
+        .evaluate_detection_for_host(
+            "chatgpt.com",
+            &DetectionContext {
+                host: Some("chatgpt.com".to_string()),
+                path: Some("/backend-api/codex/responses".to_string()),
+                ..DetectionContext::default()
+            },
+        )
+        .expect("codex detection should exist");
+    assert_eq!(codex.agent.as_deref(), Some("codex"));
+
+    let claude_code = engine
+        .evaluate_detection_for_host(
+            "api.anthropic.com",
+            &DetectionContext {
+                host: Some("api.anthropic.com".to_string()),
+                path: Some("/v1/messages".to_string()),
+                user_agent: Some("claude-code/1.0".to_string()),
+                process_name: Some("claude-code".to_string()),
+                ..DetectionContext::default()
+            },
+        )
+        .expect("claude-code detection should exist");
+    assert_eq!(claude_code.agent.as_deref(), Some("claude-code"));
+
+    let claude = engine
+        .evaluate_detection_for_host(
+            "api.anthropic.com",
+            &DetectionContext {
+                host: Some("api.anthropic.com".to_string()),
+                path: Some("/v1/messages".to_string()),
+                process_name: Some("claude".to_string()),
+                ..DetectionContext::default()
+            },
+        )
+        .expect("claude detection should exist");
+    assert_eq!(claude.agent.as_deref(), Some("claude"));
 }
 
 #[test]
