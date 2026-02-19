@@ -92,8 +92,15 @@ pub async fn run(
         pb.finish_and_clear();
     }
 
-    // Best-effort startup refresh: try cloud registry fetch first, then fall back to cache.
-    cloud_hooks::refresh_registry_bundle_on_start(&config).await;
+    // Best-effort startup refresh: in daemon-child mode, do not block proxy bind/readiness.
+    if daemon_child {
+        let startup_refresh_config = config.clone();
+        tokio::spawn(async move {
+            cloud_hooks::refresh_registry_bundle_on_start(&startup_refresh_config).await;
+        });
+    } else {
+        cloud_hooks::refresh_registry_bundle_on_start(&config).await;
+    }
 
     // Fail-open: proxy runtime should still start even if system proxy toggling fails.
     if let Err(error) = system::enable_quiet(Some(proxy_config.port)).await {

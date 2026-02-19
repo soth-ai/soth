@@ -111,8 +111,9 @@ async fn resolve_with_lsof(client_addr: SocketAddr, timeout: Duration) -> Option
         return None;
     }
 
-    let (pid, name, exact_socket_match) = parse_lsof_output(&output.stdout, client_addr)?;
+    let (pid, raw_name, exact_socket_match) = parse_lsof_output(&output.stdout, client_addr)?;
     let executable = lookup_executable(pid, timeout).await;
+    let name = normalize_process_name(raw_name, executable.as_deref());
     let app_type = classify_app_type(name.as_str(), executable.as_deref());
     let confidence = if exact_socket_match { 0.95 } else { 0.75 };
     let attribution_source = if exact_socket_match {
@@ -129,6 +130,77 @@ async fn resolve_with_lsof(client_addr: SocketAddr, timeout: Duration) -> Option
         attribution_source: attribution_source.to_string(),
         attribution_confidence: confidence,
     })
+}
+
+fn normalize_process_name(raw_name: String, executable: Option<&str>) -> String {
+    let trimmed = raw_name.trim();
+    if !trimmed.is_empty() && !looks_like_version_token(trimmed) {
+        return trimmed.to_string();
+    }
+
+    if let Some(candidate) = process_name_from_executable(executable) {
+        if !looks_like_version_token(candidate.as_str()) {
+            return candidate;
+        }
+    }
+
+    "unknown".to_string()
+}
+
+fn process_name_from_executable(executable: Option<&str>) -> Option<String> {
+    let executable = executable?.trim();
+    if executable.is_empty() {
+        return None;
+    }
+
+    let mut candidate = if executable.contains('/') {
+        executable.rsplit('/').next().unwrap_or(executable).trim()
+    } else {
+        executable
+            .split_whitespace()
+            .next()
+            .unwrap_or(executable)
+            .trim()
+    }
+    .trim_matches('"')
+    .trim();
+
+    if candidate.is_empty() {
+        return None;
+    }
+
+    if candidate.ends_with(".app") {
+        candidate = candidate.trim_end_matches(".app").trim();
+    }
+    if candidate.ends_with(".exe") {
+        candidate = candidate.trim_end_matches(".exe").trim();
+    }
+
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
+}
+
+fn looks_like_version_token(value: &str) -> bool {
+    let value = value.trim().trim_start_matches(['v', 'V']);
+    if value.is_empty() || !value.contains('.') {
+        return false;
+    }
+
+    let mut saw_digit = false;
+    for ch in value.chars() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+        if matches!(ch, '.' | '-' | '_' | '+') {
+            continue;
+        }
+        return false;
+    }
+    saw_digit
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -251,6 +323,8 @@ fn classify_app_type(name: &str, executable: Option<&str>) -> String {
     }
     if contains_any(&[
         "claude-code",
+        "claude-cli",
+        "claude --",
         "codex",
         "terminal",
         "bash",
@@ -353,11 +427,27 @@ mod tests {
         assert_eq!(classify_app_type("Cursor", None), "editor");
         assert_eq!(classify_app_type("claude-code", None), "cli");
         assert_eq!(
+            classify_app_type("2.1.47", Some("claude --resume 1234")),
+            "cli"
+        );
+        assert_eq!(
             classify_app_type(
                 "Unknown",
                 Some("/Applications/Figma.app/Contents/MacOS/Figma")
             ),
             "desktop_app"
         );
+    }
+
+    #[test]
+    fn normalize_process_name_replaces_version_only_name_with_executable_name() {
+        let normalized = normalize_process_name("2.1.45".to_string(), Some("claude"));
+        assert_eq!(normalized, "claude");
+    }
+
+    #[test]
+    fn normalize_process_name_uses_unknown_when_only_version_is_available() {
+        let normalized = normalize_process_name("2.1.45".to_string(), None);
+        assert_eq!(normalized, "unknown");
     }
 }

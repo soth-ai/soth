@@ -229,6 +229,8 @@ fn classify_process_app_type(
         }
         if has_any(&[
             "claude-code",
+            "claude-cli",
+            "claude --",
             "codex",
             "terminal",
             "bash",
