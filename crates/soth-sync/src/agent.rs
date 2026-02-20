@@ -11,7 +11,8 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use soth_core::api::{
     BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
-    ExchangeMetadata, HeartbeatHostDetails, HeartbeatRequest, HeartbeatTelemetry,
+    ExchangeMetadata, HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest,
+    HeartbeatTelemetry,
 };
 use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
 use soth_core::types::exchange_v2::{
@@ -51,6 +52,11 @@ const SYNC_TELEMETRY_EXCHANGE_BATCH_COMPRESSED_BYTES: &str = "sync.exchange.batc
 const SYNC_TELEMETRY_EXCHANGE_BATCH_SPLIT_COUNT: &str = "sync.exchange.batch.split_count";
 const SYNC_TELEMETRY_EXCHANGE_FRONTLOAD_SENT: &str = "sync.exchange.frontload.sent";
 const SYNC_TELEMETRY_EXCHANGE_LIVE_SENT: &str = "sync.exchange.live.sent";
+const SYNC_TELEMETRY_REGISTRY_CACHE_PRESENT: &str = "sync.registry.cache_present";
+const SYNC_TELEMETRY_REGISTRY_BUNDLE_AGE_SECS: &str = "sync.registry.bundle_age_seconds";
+const SYNC_TELEMETRY_REGISTRY_DEGRADED_STALE: &str = "sync.registry.degraded_stale";
+const SYNC_TELEMETRY_REGISTRY_VALIDATION_FAILED: &str = "sync.registry.validation_failed";
+const REGISTRY_BUNDLE_DEGRADED_AGE_SECS: u64 = 24 * 60 * 60;
 
 const MIN_LIVE_EVENTS: usize = 25;
 const MIN_LIVE_COMPRESSED_BYTES: usize = 1 * 1024 * 1024;
@@ -380,7 +386,8 @@ impl SyncAgent {
 
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
         let config_version = self.cached_config_version();
-        let telemetry = self.compose_heartbeat_telemetry();
+        let registry = self.collect_registry_heartbeat_details();
+        let telemetry = self.compose_heartbeat_telemetry(registry.as_ref());
         let host_details = collect_heartbeat_host_details();
         let heartbeat_os = host_details
             .platform
@@ -395,6 +402,7 @@ impl SyncAgent {
             hostname: heartbeat_hostname,
             active_connections: None,
             host_details: Some(host_details),
+            registry,
             telemetry,
         };
 
@@ -420,7 +428,10 @@ impl SyncAgent {
         }
     }
 
-    fn compose_heartbeat_telemetry(&self) -> Option<HeartbeatTelemetry> {
+    fn compose_heartbeat_telemetry(
+        &self,
+        registry: Option<&HeartbeatRegistryDetails>,
+    ) -> Option<HeartbeatTelemetry> {
         let mut telemetry = self
             .config
             .heartbeat_telemetry
@@ -476,11 +487,71 @@ impl SyncAgent {
             SYNC_TELEMETRY_EXCHANGE_LIVE_SENT.to_string(),
             self.sync_exchange_live_sent_total.load(Ordering::Relaxed),
         );
+        if let Some(registry) = registry {
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_CACHE_PRESENT.to_string(), 1);
+            telemetry.counters.insert(
+                SYNC_TELEMETRY_REGISTRY_BUNDLE_AGE_SECS.to_string(),
+                registry.bundle_age_seconds.unwrap_or(0),
+            );
+            telemetry.counters.insert(
+                SYNC_TELEMETRY_REGISTRY_DEGRADED_STALE.to_string(),
+                if registry.degraded_stale.unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            );
+            telemetry.counters.insert(
+                SYNC_TELEMETRY_REGISTRY_VALIDATION_FAILED.to_string(),
+                if registry.validation_status.as_deref() == Some("failed")
+                    || registry.validation_failed_reason.is_some()
+                {
+                    1
+                } else {
+                    0
+                },
+            );
+        } else {
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_CACHE_PRESENT.to_string(), 0);
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_BUNDLE_AGE_SECS.to_string(), 0);
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_DEGRADED_STALE.to_string(), 1);
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_VALIDATION_FAILED.to_string(), 0);
+        }
         if telemetry.counters.is_empty() {
             None
         } else {
             Some(telemetry)
         }
+    }
+
+    fn collect_registry_heartbeat_details(&self) -> Option<HeartbeatRegistryDetails> {
+        let registry_cache_path = resolve_registry_cache_path(&self.config.cache_path);
+        let status = cache::registry_bundle_runtime_status(
+            &registry_cache_path,
+            Duration::from_secs(REGISTRY_BUNDLE_DEGRADED_AGE_SECS),
+        );
+        if !status.cache_present {
+            return None;
+        }
+        Some(HeartbeatRegistryDetails {
+            bundle_hash: status.bundle_hash,
+            bundle_version: status.bundle_version,
+            fetched_at: status.fetched_at,
+            bundle_age_seconds: status.bundle_age_seconds,
+            validation_status: status.validation_status,
+            validation_failed_reason: status.validation_failed_reason,
+            degraded_stale: Some(status.stale),
+        })
     }
 
     async fn sync_exchange_queue_once(&self) -> anyhow::Result<ExchangeQueueStats> {
@@ -1640,6 +1711,13 @@ fn tree_to_hash(map: &BTreeMap<String, String>) -> HashMap<String, String> {
     map.iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn resolve_registry_cache_path(config_cache_path: &Path) -> PathBuf {
+    if let Some(parent) = config_cache_path.parent() {
+        return parent.join("registry_bundle_cache.json");
+    }
+    cache::default_registry_cache_path()
 }
 
 fn resolve_hostname() -> Option<String> {

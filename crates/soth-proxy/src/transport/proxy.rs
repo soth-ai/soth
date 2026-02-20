@@ -40,7 +40,9 @@ use crate::transport::mcp_detection::is_jsonrpc_response_for_mcp;
 use crate::transport::pii_enrichment::PiiEventEnricher;
 #[cfg(test)]
 use crate::transport::proxy_detection::has_anthropic_api_key_header;
-use crate::transport::proxy_detection::{extract_host, resolve_bundle_detection};
+use crate::transport::proxy_detection::{
+    classify_capture_policy, extract_host, resolve_bundle_detection, CapturePolicy,
+};
 pub use crate::transport::proxy_enforcer::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
 use crate::transport::proxy_error::handle_forward_error;
 use crate::transport::proxy_exchange::{
@@ -151,6 +153,8 @@ pub(crate) struct PendingRequest {
     pub(crate) decision_outcome: Option<String>,
     /// Canonical skip reason when decision outcome is skipped.
     pub(crate) skip_reason: Option<String>,
+    /// Confidence-based capture policy (`full|selective_body|metadata_only`).
+    pub(crate) capture_policy: CapturePolicy,
     /// Discovery subtype (`catalog|app|domain`) when discovery mode is active.
     pub(crate) discovery_kind: Option<String>,
     /// Client app type used by gating (`host|non_host|...`).
@@ -174,6 +178,54 @@ static NEXT_PROXY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_proxy_request_id() -> u64 {
     NEXT_PROXY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+const SELECTIVE_CAPTURE_MAX_BODY_BYTES: usize = 64 * 1024;
+
+fn should_downgrade_skip_reason_for_metadata_policy(reason: &str) -> bool {
+    matches!(
+        reason,
+        EXCHANGE_SKIP_REASON_NO_BUNDLE_ID
+            | EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED
+            | EXCHANGE_SKIP_REASON_APP_RATE_LIMITED
+            | EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED
+            | EXCHANGE_SKIP_REASON_NOT_WHITELISTED
+            | EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED
+    )
+}
+
+fn apply_request_capture_policy(
+    body_content: Option<String>,
+    request_body_truncated: bool,
+    capture_policy: CapturePolicy,
+) -> (Option<String>, bool) {
+    match capture_policy {
+        CapturePolicy::Full => (body_content, request_body_truncated),
+        CapturePolicy::SelectiveBody => {
+            let Some(content) = body_content else {
+                return (None, request_body_truncated);
+            };
+            if content.len() <= SELECTIVE_CAPTURE_MAX_BODY_BYTES {
+                (Some(content), request_body_truncated)
+            } else {
+                let mut selective_content = String::new();
+                for ch in content.chars() {
+                    if selective_content.len() + ch.len_utf8() > SELECTIVE_CAPTURE_MAX_BODY_BYTES {
+                        break;
+                    }
+                    selective_content.push(ch);
+                }
+                (Some(selective_content), true)
+            }
+        }
+        CapturePolicy::MetadataOnly => {
+            let had_body = body_content
+                .as_ref()
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            (None, request_body_truncated || had_body)
+        }
+    }
 }
 
 fn normalize_origin_host(value: &str) -> Option<String> {
@@ -757,6 +809,8 @@ impl HttpHandler for AiProxyHandler {
             let parse_confidence = bundle_detection.parse_confidence;
             let detection_source = bundle_detection.detection_source.clone();
             let target_entity_id = bundle_detection.target_entity_id.clone();
+            let capture_policy =
+                classify_capture_policy(parse_confidence, detection_reason.as_deref());
             let mcp_request_method = if !is_connect
                 && should_capture_observability
                 && (host_is_mcp_target || (host_mode == HostFilterMode::Discovery))
@@ -901,9 +955,19 @@ impl HttpHandler for AiProxyHandler {
                 }
             }
 
+            if let Some(reason) = skip_reason.as_deref() {
+                if matches!(capture_policy, CapturePolicy::MetadataOnly)
+                    && should_downgrade_skip_reason_for_metadata_policy(reason)
+                {
+                    skip_reason = None;
+                }
+            }
+
             if skip_reason.is_some() {
                 decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_SKIPPED.to_string());
             } else if discovery_kind.is_some() {
+                decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY.to_string());
+            } else if matches!(capture_policy, CapturePolicy::MetadataOnly) {
                 decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY.to_string());
             }
 
@@ -976,6 +1040,13 @@ impl HttpHandler for AiProxyHandler {
                     }
                 }
             }
+
+            let (request_content_for_exchange, request_body_truncated_for_exchange) =
+                apply_request_capture_policy(
+                    body_content.clone(),
+                    request_body_truncated,
+                    capture_policy,
+                );
 
             // Log AI traffic (only inference endpoints, not images/tracking/etc)
             if is_connect {
@@ -1064,9 +1135,9 @@ impl HttpHandler for AiProxyHandler {
                             model: model.clone(),
                             graphql_operation: graphql_operation.clone(),
                             started_at: Instant::now(),
-                            request_content: body_content,
+                            request_content: request_content_for_exchange.clone(),
                             request_content_for_pii,
-                            request_body_truncated,
+                            request_body_truncated: request_body_truncated_for_exchange,
                             request_size_bytes,
                             headers: None,
                             request_content_type: content_type.clone(),
@@ -1081,6 +1152,7 @@ impl HttpHandler for AiProxyHandler {
                             decision_step: decision_step.clone(),
                             decision_outcome: decision_outcome.clone(),
                             skip_reason: skip_reason.clone(),
+                            capture_policy,
                             discovery_kind: discovery_kind.clone(),
                             client_app_type: client_app_type.clone(),
                             client_host_origin: client_host_origin.clone(),
@@ -1132,9 +1204,9 @@ impl HttpHandler for AiProxyHandler {
                         model: None,
                         graphql_operation: None,
                         started_at: Instant::now(),
-                        request_content: None,
+                        request_content: request_content_for_exchange.clone(),
                         request_content_for_pii: None,
-                        request_body_truncated,
+                        request_body_truncated: request_body_truncated_for_exchange,
                         request_size_bytes,
                         headers: None,
                         request_content_type: content_type.clone(),
@@ -1149,6 +1221,7 @@ impl HttpHandler for AiProxyHandler {
                         decision_step: decision_step.clone(),
                         decision_outcome: decision_outcome.clone(),
                         skip_reason: skip_reason.clone(),
+                        capture_policy,
                         discovery_kind: discovery_kind.clone(),
                         client_app_type: client_app_type.clone(),
                         client_host_origin: client_host_origin.clone(),
@@ -1199,9 +1272,9 @@ impl HttpHandler for AiProxyHandler {
                             model: model.clone(),
                             graphql_operation: graphql_operation.clone(),
                             started_at: Instant::now(),
-                            request_content: body_content,
+                            request_content: request_content_for_exchange.clone(),
                             request_content_for_pii,
-                            request_body_truncated,
+                            request_body_truncated: request_body_truncated_for_exchange,
                             request_size_bytes,
                             headers: None,
                             request_content_type: content_type.clone(),
@@ -1216,6 +1289,7 @@ impl HttpHandler for AiProxyHandler {
                             decision_step: decision_step.clone(),
                             decision_outcome: decision_outcome.clone(),
                             skip_reason: skip_reason.clone(),
+                            capture_policy,
                             discovery_kind: discovery_kind.clone(),
                             client_app_type: client_app_type.clone(),
                             client_host_origin: client_host_origin.clone(),
@@ -1343,6 +1417,12 @@ impl HttpHandler for AiProxyHandler {
                 debug!(status = status, "Response for non-tracked request");
                 return res;
             };
+            let selective_capture = matches!(pending.capture_policy, CapturePolicy::SelectiveBody);
+            let response_capture_limit_bytes = if selective_capture {
+                capture_max_body_bytes.min(SELECTIVE_CAPTURE_MAX_BODY_BYTES as u64)
+            } else {
+                capture_max_body_bytes
+            };
 
             let latency_ms = pending.started_at.elapsed().as_millis() as u64;
             if pending.is_mcp_jsonrpc {
@@ -1360,7 +1440,7 @@ impl HttpHandler for AiProxyHandler {
                     exchange_v2_cfg.as_ref(),
                     exchange_bundle_version.as_deref(),
                     &session_id,
-                    capture_max_body_bytes,
+                    response_capture_limit_bytes,
                 )
                 .await;
             }
@@ -1378,7 +1458,7 @@ impl HttpHandler for AiProxyHandler {
                 is_sse || is_codex_response_path || is_gemini_bard_response_path;
             let mut response_usage = ResponseUsageMeta::default();
             let response_declared_oversized = declared_response_size_bytes
-                .map(|size| size > capture_max_body_bytes)
+                .map(|size| size > response_capture_limit_bytes)
                 .unwrap_or(false);
             let mut response_body_truncated = false;
             let mut response_capture_reason: Option<&'static str> = None;
@@ -1393,6 +1473,10 @@ impl HttpHandler for AiProxyHandler {
             } else if decision_metadata_only {
                 response_body_truncated = true;
                 response_capture_reason = Some("decision_metadata_only");
+                true
+            } else if selective_capture && is_stream_response {
+                response_body_truncated = true;
+                response_capture_reason = Some("confidence_selective_stream_skip");
                 true
             } else if response_declared_oversized {
                 response_body_truncated = true;
@@ -1729,7 +1813,7 @@ impl HttpHandler for AiProxyHandler {
                         &event_tags,
                         response_body_truncated,
                         response_capture_reason,
-                        capture_max_body_bytes,
+                        response_capture_limit_bytes,
                         exchange_bundle_version.as_deref(),
                     );
                 }

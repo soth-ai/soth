@@ -23,6 +23,7 @@ const FINAL_CLOUD_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 const FINAL_CLOUD_SYNC_MAX_ROUNDS: usize = 3;
 const CLOUD_BACKOFF_MAX_CAP: Duration = Duration::from_secs(15 * 60);
 const CLOUD_RUNTIME_LOCK_FILE: &str = "cloud.pull.runtime.lock";
+const REGISTRY_BUNDLE_DEGRADED_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistryRuntimeSource {
@@ -58,6 +59,23 @@ fn resolve_registry_runtime_source(registry_cache_path: &Path) -> RegistryRuntim
     }
 }
 
+fn resolve_registry_runtime_source_after_success(
+    registry_cache_path: &Path,
+) -> RegistryRuntimeSource {
+    let status = soth_sync::cache::registry_bundle_runtime_status(
+        registry_cache_path,
+        Duration::from_secs(REGISTRY_BUNDLE_DEGRADED_MAX_AGE_SECS),
+    );
+    if !status.cache_present {
+        return RegistryRuntimeSource::DegradedEmbedded;
+    }
+    if status.stale {
+        RegistryRuntimeSource::DegradedCached
+    } else {
+        RegistryRuntimeSource::HealthyCloud
+    }
+}
+
 fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -67,14 +85,27 @@ fn current_unix_secs() -> u64 {
 }
 
 #[derive(Debug, Serialize)]
-struct RegistryRuntimeStateSnapshot<'a> {
+struct RegistryRuntimeStateSnapshot {
     schema_version: u32,
-    source: &'a str,
+    source: String,
     consecutive_failures: u64,
     updated_at_unix_secs: u64,
     last_success_unix_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<&'a str>,
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_age_seconds: Option<u64>,
+    degraded_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_failed_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_error: Option<String>,
 }
 
 fn registry_runtime_state_path() -> PathBuf {
@@ -88,18 +119,30 @@ fn registry_runtime_state_path() -> PathBuf {
 }
 
 fn persist_registry_runtime_state(
+    registry_cache_path: &Path,
     source: RegistryRuntimeSource,
     consecutive_failures: u64,
     last_success_unix_secs: u64,
     detail: Option<&str>,
 ) {
+    let runtime_status = soth_sync::cache::registry_bundle_runtime_status(
+        registry_cache_path,
+        Duration::from_secs(REGISTRY_BUNDLE_DEGRADED_MAX_AGE_SECS),
+    );
     let snapshot = RegistryRuntimeStateSnapshot {
-        schema_version: 1,
-        source: source.as_label(),
+        schema_version: 2,
+        source: source.as_label().to_string(),
         consecutive_failures,
         updated_at_unix_secs: current_unix_secs(),
         last_success_unix_secs,
-        detail,
+        detail: detail.map(|value| value.to_string()),
+        bundle_hash: runtime_status.bundle_hash,
+        bundle_version: runtime_status.bundle_version,
+        bundle_age_seconds: runtime_status.bundle_age_seconds,
+        degraded_stale: runtime_status.stale,
+        validation_status: runtime_status.validation_status,
+        validation_failed_reason: runtime_status.validation_failed_reason,
+        cache_error: runtime_status.cache_error,
     };
     let path = registry_runtime_state_path();
     if let Some(parent) = path.parent() {
@@ -183,6 +226,7 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
     soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
     soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
     persist_registry_runtime_state(
+        &registry_cache_path,
         runtime_source,
         consecutive_failures,
         last_success_unix_secs,
@@ -194,7 +238,7 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
 
     match tokio::time::timeout(STARTUP_REGISTRY_REFRESH_TIMEOUT, puller.refresh_now()).await {
         Ok(Ok(outcome)) => {
-            runtime_source = RegistryRuntimeSource::HealthyCloud;
+            runtime_source = resolve_registry_runtime_source_after_success(puller.cache_path());
             consecutive_failures = 0;
             last_success_unix_secs = current_unix_secs();
             soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
@@ -203,6 +247,7 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
                 last_success_unix_secs,
             );
             persist_registry_runtime_state(
+                puller.cache_path(),
                 runtime_source,
                 consecutive_failures,
                 last_success_unix_secs,
@@ -222,6 +267,7 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
             soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
             soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
             persist_registry_runtime_state(
+                puller.cache_path(),
                 runtime_source,
                 consecutive_failures,
                 last_success_unix_secs,
@@ -240,6 +286,7 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
             soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
             soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
             persist_registry_runtime_state(
+                puller.cache_path(),
                 runtime_source,
                 consecutive_failures,
                 last_success_unix_secs,
@@ -376,6 +423,7 @@ pub fn spawn_cloud_pull_runtime(
             registry_consecutive_failures,
         );
         persist_registry_runtime_state(
+            &registry_cache_path,
             registry_source,
             registry_consecutive_failures,
             registry_last_success_unix_secs,
@@ -403,6 +451,7 @@ pub fn spawn_cloud_pull_runtime(
             registry_source = degraded;
             soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
             persist_registry_runtime_state(
+                &registry_cache_path,
                 registry_source,
                 registry_consecutive_failures,
                 registry_last_success_unix_secs,
@@ -417,14 +466,15 @@ pub fn spawn_cloud_pull_runtime(
             );
         } else {
             config_pull_backoff.record_success();
-            if registry_source != RegistryRuntimeSource::HealthyCloud {
+            let next_source = resolve_registry_runtime_source_after_success(&registry_cache_path);
+            if registry_source != next_source {
                 info!(
                     previous_source = registry_source.as_label(),
-                    source = RegistryRuntimeSource::HealthyCloud.as_label(),
-                    "Registry runtime source transitioned to healthy cloud"
+                    source = next_source.as_label(),
+                    "Registry runtime source transitioned after pull success"
                 );
             }
-            registry_source = RegistryRuntimeSource::HealthyCloud;
+            registry_source = next_source;
             registry_consecutive_failures = 0;
             soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
             soth_proxy::metrics::set_registry_refresh_consecutive_failures(
@@ -435,6 +485,7 @@ pub fn spawn_cloud_pull_runtime(
                 registry_last_success_unix_secs,
             );
             persist_registry_runtime_state(
+                &registry_cache_path,
                 registry_source,
                 registry_consecutive_failures,
                 registry_last_success_unix_secs,
@@ -510,6 +561,7 @@ pub fn spawn_cloud_pull_runtime(
                         registry_source = degraded;
                         soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
                         persist_registry_runtime_state(
+                            &registry_cache_path,
                             registry_source,
                             registry_consecutive_failures,
                             registry_last_success_unix_secs,
@@ -524,14 +576,16 @@ pub fn spawn_cloud_pull_runtime(
                         );
                     } else {
                         config_pull_backoff.record_success();
-                        if registry_source != RegistryRuntimeSource::HealthyCloud {
+                        let next_source =
+                            resolve_registry_runtime_source_after_success(&registry_cache_path);
+                        if registry_source != next_source {
                             info!(
                                 previous_source = registry_source.as_label(),
-                                source = RegistryRuntimeSource::HealthyCloud.as_label(),
-                                "Registry runtime source transitioned to healthy cloud"
+                                source = next_source.as_label(),
+                                "Registry runtime source transitioned after pull success"
                             );
                         }
-                        registry_source = RegistryRuntimeSource::HealthyCloud;
+                        registry_source = next_source;
                         registry_consecutive_failures = 0;
                         soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
                         soth_proxy::metrics::set_registry_refresh_consecutive_failures(
@@ -542,6 +596,7 @@ pub fn spawn_cloud_pull_runtime(
                             registry_last_success_unix_secs,
                         );
                         persist_registry_runtime_state(
+                            &registry_cache_path,
                             registry_source,
                             registry_consecutive_failures,
                             registry_last_success_unix_secs,

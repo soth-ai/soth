@@ -218,11 +218,71 @@ pub struct RegistryVersionResponse {
     pub bundle_type: String,
     pub version: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_hash: Option<String>,
     pub compiled_at: String,
     pub provider_count: u64,
     pub domain_count: u64,
     pub format_count: u64,
     pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<RegistryBundleManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryBundleManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<RegistryBundleComponentHash>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub changed_sections: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<RegistryBundleIntegrity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryBundleComponentHash {
+    pub name: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryBundleIntegrity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_alg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RegistryBundleFetchQuery {
+    Full,
+    Section {
+        section: String,
+    },
+    Diff {
+        from_hash: String,
+        section: Option<String>,
+    },
+}
+
+impl Default for RegistryBundleFetchQuery {
+    fn default() -> Self {
+        Self::Full
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +341,8 @@ pub struct HeartbeatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_details: Option<HeartbeatHostDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<HeartbeatRegistryDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<HeartbeatTelemetry>,
 }
 
@@ -311,6 +373,24 @@ pub struct HeartbeatHostDetails {
     pub arch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_logical_cores: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeartbeatRegistryDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_age_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_failed_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_stale: Option<bool>,
 }
 
 // ============================================================================

@@ -171,6 +171,31 @@ async fn contract_sync_endpoints_and_cursors() {
         telemetry.counters.get("sync.exchange.queue_depth"),
         Some(&0)
     );
+    assert_eq!(
+        telemetry.counters.get("sync.registry.cache_present"),
+        Some(&1)
+    );
+    assert_eq!(
+        telemetry.counters.get("sync.registry.degraded_stale"),
+        Some(&0)
+    );
+    assert!(
+        telemetry
+            .counters
+            .get("sync.registry.bundle_age_seconds")
+            .is_some(),
+        "heartbeat should include registry bundle age telemetry"
+    );
+    let registry = captured.heartbeat_requests[0]
+        .registry
+        .as_ref()
+        .expect("heartbeat registry details should be populated");
+    assert!(registry.bundle_hash.is_some());
+    assert_eq!(
+        registry.bundle_version.as_deref(),
+        Some(TEST_BUNDLE_VERSION)
+    );
+    assert_eq!(registry.degraded_stale, Some(false));
     let host_details = captured.heartbeat_requests[0]
         .host_details
         .as_ref()
@@ -705,11 +730,14 @@ async fn registry_version_handler(
             bundle_type: "local".to_string(),
             version: TEST_BUNDLE_VERSION.to_string(),
             sha256: test_bundle_sha(),
+            bundle_hash: Some(test_bundle_sha()),
             compiled_at: Utc::now().to_rfc3339(),
             provider_count: 3,
             domain_count: 10,
             format_count: 5,
             size_bytes: TEST_BUNDLE_JSON.as_bytes().len() as u64,
+            manifest: None,
+            channel: Some("stable".to_string()),
         }),
     )
 }

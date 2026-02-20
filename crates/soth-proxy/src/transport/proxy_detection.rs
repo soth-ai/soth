@@ -13,6 +13,16 @@ pub(crate) struct BundleDetectionResult {
     pub(crate) target_entity_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapturePolicy {
+    Full,
+    SelectiveBody,
+    MetadataOnly,
+}
+
+const CAPTURE_CONFIDENCE_FULL_MIN: f64 = 0.85;
+const CAPTURE_CONFIDENCE_SELECTIVE_MIN: f64 = 0.45;
+
 /// Extract host from URI or headers.
 /// Handles both regular requests and CONNECT requests (authority form).
 pub(crate) fn extract_host<T>(req: &Request<T>) -> String {
@@ -287,9 +297,32 @@ fn normalize_detection_reason(reason: &str) -> String {
     }
 }
 
+pub(crate) fn classify_capture_policy(
+    parse_confidence: Option<f64>,
+    detection_reason: Option<&str>,
+) -> CapturePolicy {
+    if detection_reason
+        .map(is_generic_detection_reason)
+        .unwrap_or(true)
+    {
+        return CapturePolicy::MetadataOnly;
+    }
+    let confidence = parse_confidence.unwrap_or(0.0);
+    if confidence >= CAPTURE_CONFIDENCE_FULL_MIN {
+        CapturePolicy::Full
+    } else if confidence >= CAPTURE_CONFIDENCE_SELECTIVE_MIN {
+        CapturePolicy::SelectiveBody
+    } else {
+        CapturePolicy::MetadataOnly
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_generic_detection_reason, normalize_detection_reason};
+    use super::{
+        classify_capture_policy, is_generic_detection_reason, normalize_detection_reason,
+        CapturePolicy,
+    };
 
     #[test]
     fn generic_reasons_are_normalized() {
@@ -308,5 +341,29 @@ mod tests {
     fn non_generic_reason_is_preserved() {
         assert_eq!(normalize_detection_reason("ua_match"), "ua_match");
         assert!(!is_generic_detection_reason("host_classification"));
+    }
+
+    #[test]
+    fn capture_policy_uses_reason_and_confidence() {
+        assert_eq!(
+            classify_capture_policy(Some(0.99), Some("ua_match")),
+            CapturePolicy::Full
+        );
+        assert_eq!(
+            classify_capture_policy(Some(0.60), Some("path_match")),
+            CapturePolicy::SelectiveBody
+        );
+        assert_eq!(
+            classify_capture_policy(Some(0.20), Some("model_match")),
+            CapturePolicy::MetadataOnly
+        );
+        assert_eq!(
+            classify_capture_policy(Some(0.99), Some("bundle_unclassified")),
+            CapturePolicy::MetadataOnly
+        );
+        assert_eq!(
+            classify_capture_policy(None, None),
+            CapturePolicy::MetadataOnly
+        );
     }
 }
