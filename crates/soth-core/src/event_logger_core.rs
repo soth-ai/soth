@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::exchange::{EXCHANGE_CLIENT_APP_TYPE_HOST, EXCHANGE_CLIENT_APP_TYPE_NON_HOST};
 
 const SQLITE_METADATA_BUSY_TIMEOUT_MS: u64 = 10_000;
 const SQLITE_METADATA_LOCK_RETRY_MAX: u32 = 5;
@@ -1337,7 +1338,8 @@ fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> 
         .map(|_| "collector".to_string())
         .or_else(|| envelope.and_then(|value| value.process_app_type.clone()))
         .or_else(|| infer_app_type_from_name(process_name.as_deref(), bundle_id.as_deref()))
-        .or_else(|| Some("unknown".to_string()));
+        .or_else(|| Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string()));
+    let app_type = normalize_exchange_client_app_type(app_type.as_deref());
 
     if envelope.and_then(|value| value.process_pid).is_none()
         && process_name.is_none()
@@ -1406,42 +1408,56 @@ fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
 }
 
 fn infer_app_type_from_name(process_name: Option<&str>, bundle_id: Option<&str>) -> Option<String> {
-    let lower = process_name?.to_ascii_lowercase();
-    let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-    if has_any(&[
-        "chrome", "firefox", "safari", "edge", "brave", "arc", "opera", "chromium",
-    ]) {
-        return Some("browser".to_string());
+    if let Some(name) = process_name {
+        let lower = name.to_ascii_lowercase();
+        let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+        if has_any(&[
+            "chrome", "firefox", "safari", "edge", "brave", "arc", "opera", "chromium",
+        ]) {
+            return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
+        }
+        if has_any(&[
+            "codex",
+            "claude-code",
+            "terminal",
+            "shell",
+            "bash",
+            "zsh",
+            "fish",
+            "python",
+            "node",
+            "npm",
+            "cargo",
+            "cursor",
+            "windsurf",
+            "vscode",
+            "jetbrains",
+            "zed",
+            "copilot",
+            "chatgpt",
+            "claude",
+            "warp",
+        ]) {
+            return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
+        }
     }
-    if has_any(&[
-        "codex",
-        "claude-code",
-        "terminal",
-        "shell",
-        "bash",
-        "zsh",
-        "fish",
-        "python",
-        "node",
-        "npm",
-        "cargo",
-    ]) {
-        return Some("cli".to_string());
+    if bundle_id.is_some() {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
     }
-    if has_any(&[
-        "cursor",
-        "windsurf",
-        "vscode",
-        "jetbrains",
-        "zed",
-        "copilot",
-    ]) {
-        return Some("editor".to_string());
+    Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string())
+}
+
+fn normalize_exchange_client_app_type(raw: Option<&str>) -> Option<String> {
+    let normalized = raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())?;
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST || normalized == "browser" {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
     }
-    if has_any(&["chatgpt", "claude", "warp"]) || bundle_id.is_some() {
-        return Some("desktop_app".to_string());
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_NON_HOST {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
     }
-    Some("unknown".to_string())
+    Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string())
 }
 
 fn exchange_body_from_text(
@@ -2158,7 +2174,7 @@ mod tests {
         assert!(ready[0]
             .payload_json
             .contains("\"process_name\":\"claude-code\""));
-        assert!(ready[0].payload_json.contains("\"app_type\":\"cli\""));
+        assert!(ready[0].payload_json.contains("\"app_type\":\"non_host\""));
     }
 
     #[test]

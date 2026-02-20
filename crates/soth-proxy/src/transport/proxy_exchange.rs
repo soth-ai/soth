@@ -1,4 +1,4 @@
-//! Exchange-v2 projection and enrichment helpers for proxy transport.
+//! Exchange projection and enrichment helpers for proxy transport.
 
 use crate::process_attribution::ProcessIdentity;
 use crate::transport::exchange_assembler::{ExchangeAssembler, ExchangeAssemblerConfig};
@@ -6,9 +6,10 @@ use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::proxy_support::process_bundle_id_from_executable;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
 use soth_budget::{BudgetTracker, TokenCounter};
-use soth_core::types::exchange_v2::{
-    ExchangeClient, ExchangeCost, ExchangeEventV2, ExchangeParse, ExchangeSourceClass,
-    ExchangeTransport, ExchangeUsage, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
+use soth_core::types::exchange::{
+    ExchangeClient, ExchangeCost, ExchangeEvent, ExchangeParse, ExchangeSourceClass,
+    ExchangeTransport, ExchangeUsage, EXCHANGE_CLIENT_APP_TYPE_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
     EXCHANGE_DECISION_OUTCOME_SKIPPED, EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_DOMAIN,
 };
 use soth_core::types::{
@@ -118,7 +119,10 @@ fn transport_for_pending(
         if is_sse {
             return ExchangeTransport::Sse;
         }
-        return ExchangeTransport::Ws;
+        return ExchangeTransport::Ndjson;
+    }
+    if pending.is_http2 {
+        return ExchangeTransport::Http2;
     }
     ExchangeTransport::Https
 }
@@ -145,9 +149,10 @@ fn exchange_client_from_pending(pending: &PendingRequest) -> Option<ExchangeClie
     } else {
         (None, None, None, None)
     };
+    app_type = normalize_exchange_client_app_type(app_type.as_deref());
 
     if app_type.is_none() {
-        app_type = pending.client_app_type.clone();
+        app_type = normalize_exchange_client_app_type(pending.client_app_type.as_deref());
     }
     if process_name.is_none() {
         process_name = pending.agent.clone().or_else(|| pending.provider.clone());
@@ -188,12 +193,10 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
         .or_else(|| envelope.provider.clone());
     let bundle_id = process_bundle_id_from_executable(envelope.process_executable.as_deref())
         .or_else(|| bundle_id_from_agent_hint(envelope.agent.as_deref()));
-    let app_type = envelope
-        .process_app_type
-        .clone()
+    let app_type = normalize_exchange_client_app_type(envelope.process_app_type.as_deref())
         .or_else(|| classify_process_app_type(process_name.as_deref(), bundle_id.as_deref()))
         .or_else(|| infer_agent_fallback_app_type(envelope.agent.as_deref()))
-        .or_else(|| Some("unknown".to_string()));
+        .or_else(|| Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string()));
 
     if envelope.process_pid.is_none()
         && process_name.is_none()
@@ -224,14 +227,17 @@ fn classify_process_app_type(
         if has_any(&[
             "chrome", "firefox", "safari", "edge", "brave", "arc", "opera",
         ]) {
-            return Some("browser".to_string());
+            return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
         }
         if has_any(&[
-            "terminal", "bash", "zsh", "fish", "python", "node", "npm", "cargo",
-        ]) {
-            return Some("cli".to_string());
-        }
-        if has_any(&[
+            "terminal",
+            "bash",
+            "zsh",
+            "fish",
+            "python",
+            "node",
+            "npm",
+            "cargo",
             "cursor",
             "code",
             "windsurf",
@@ -239,15 +245,16 @@ fn classify_process_app_type(
             "zed",
             "xcode",
             "vim",
+            "service",
+            "daemon",
+            "launchd",
+            "systemd",
         ]) {
-            return Some("editor".to_string());
-        }
-        if has_any(&["service", "daemon", "launchd", "systemd"]) {
-            return Some("service".to_string());
+            return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
         }
     }
     if bundle_id.is_some() {
-        return Some("desktop_app".to_string());
+        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
     }
     None
 }
@@ -273,20 +280,25 @@ fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
 fn infer_agent_fallback_app_type(agent: Option<&str>) -> Option<String> {
     let lower = agent?.to_ascii_lowercase();
     let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-    if has_any(&["terminal", "shell", "cli"]) {
-        return Some("cli".to_string());
-    }
     if has_any(&[
-        "cursor",
-        "windsurf",
-        "vscode",
-        "copilot",
-        "jetbrains",
-        "zed",
+        "chrome", "firefox", "safari", "edge", "brave", "arc", "opera",
     ]) {
-        return Some("editor".to_string());
+        return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
     }
-    Some("unknown".to_string())
+    Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string())
+}
+
+fn normalize_exchange_client_app_type(raw: Option<&str>) -> Option<String> {
+    let normalized = raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())?;
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST || normalized == "browser" {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
+    }
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_NON_HOST {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
+    }
+    Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string())
 }
 
 fn detection_id_for_pending(pending: &PendingRequest) -> Option<String> {
@@ -347,7 +359,7 @@ fn detection_bundle_version_for_exchange(bundle_version: Option<&str>) -> Option
 }
 
 fn enforce_required_detection_fields(
-    event: &mut ExchangeEventV2,
+    event: &mut ExchangeEvent,
     pending: &PendingRequest,
     bundle_version: Option<&str>,
 ) -> bool {
@@ -417,7 +429,7 @@ fn enforce_required_detection_fields(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn finalize_and_enqueue_exchange_v2(
+pub(crate) fn finalize_and_enqueue_exchange(
     logger: &EventLogger,
     exchange_cfg: &ExchangeAssemblerConfig,
     pii_enricher: &PiiEventEnricher,
@@ -456,7 +468,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
     assembler.set_parse(Some(ExchangeParse {
         detection_id: detection_id.clone(),
         detection_bundle_version: detection_bundle_version.clone(),
-        parser_version: Some("exchange_v2_edge".to_string()),
+        parser_version: Some("exchange_edge".to_string()),
         bundle_version: detection_bundle_version.clone(),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
@@ -624,7 +636,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
             warn!(
                 exchange_id = %pending.exchange_id,
                 error = %error,
-                "Failed encoding exchange.v2 payload"
+                "Failed encoding exchange payload"
             );
             return;
         }
@@ -638,7 +650,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
                 warn!(
                     exchange_id = %pending.exchange_id,
                     error = %error,
-                    "Failed encoding exchange.v2 blob payloads"
+                    "Failed encoding exchange blob payloads"
                 );
                 None
             }
@@ -653,7 +665,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
         warn!(
             exchange_id = %pending.exchange_id,
             error = %error,
-            "Failed enqueuing exchange.v2 payload"
+            "Failed enqueuing exchange payload"
         );
         return;
     }
@@ -661,7 +673,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
     let _ = logger.delete_exchange_spool(&pending.exchange_id);
 }
 
-pub(crate) fn seed_exchange_v2_spool(
+pub(crate) fn seed_exchange_spool(
     logger: &EventLogger,
     exchange_cfg: &ExchangeAssemblerConfig,
     pending: &PendingRequest,
@@ -716,7 +728,7 @@ pub(crate) fn seed_exchange_v2_spool(
     assembler.set_parse(Some(ExchangeParse {
         detection_id,
         detection_bundle_version: detection_bundle_version.clone(),
-        parser_version: Some("exchange_v2_edge".to_string()),
+        parser_version: Some("exchange_edge".to_string()),
         bundle_version: detection_bundle_version,
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
@@ -797,9 +809,54 @@ pub(crate) fn apply_process_identity(
 mod tests {
     use super::{
         apply_process_identity, detection_bundle_version_for_exchange,
-        exchange_client_from_envelope, is_strict_bundle_detection_id,
+        exchange_client_from_envelope, is_strict_bundle_detection_id, transport_for_pending,
     };
+    use crate::transport::proxy::PendingRequest;
+    use crate::transport::proxy_detection::CapturePolicy;
     use soth_core::types::TrafficEnvelope;
+    use std::time::Instant;
+
+    fn sample_pending() -> PendingRequest {
+        PendingRequest {
+            exchange_id: "ex-1".to_string(),
+            envelope: None,
+            host: "api.example.com".to_string(),
+            path: "/v1/messages".to_string(),
+            method: "POST".to_string(),
+            provider: Some("example".to_string()),
+            agent: None,
+            model: None,
+            graphql_operation: None,
+            started_at: Instant::now(),
+            request_content: None,
+            request_content_for_pii: None,
+            request_body_truncated: false,
+            request_size_bytes: None,
+            headers: None,
+            request_content_type: Some("application/json".to_string()),
+            is_http2: false,
+            is_agent_app: false,
+            mcp_method: None,
+            is_mcp_jsonrpc: false,
+            catalog_discovery: false,
+            detection_reason: None,
+            parse_confidence: None,
+            detection_id: Some("agent.example.app".to_string()),
+            detection_source: Some("bundle".to_string()),
+            decision_step: None,
+            decision_outcome: None,
+            skip_reason: None,
+            capture_policy: CapturePolicy::Full,
+            discovery_kind: None,
+            client_app_type: None,
+            client_host_origin: None,
+            client_referrer_origin: None,
+            blacklist_match: false,
+            policy_allowed: None,
+            policy_reason: None,
+            policy_version: None,
+        }
+    }
 
     #[test]
     fn apply_process_identity_uses_heuristic_fallback_when_lookup_missing() {
@@ -818,7 +875,7 @@ mod tests {
         );
         let enriched = apply_process_identity(envelope, None);
         assert_eq!(enriched.process_name.as_deref(), Some("claude"));
-        assert_eq!(enriched.process_app_type.as_deref(), Some("desktop_app"));
+        assert_eq!(enriched.process_app_type.as_deref(), Some("non_host"));
         assert_eq!(
             enriched.process_attribution_source.as_deref(),
             Some("heuristic_agent_fallback")
@@ -843,7 +900,7 @@ mod tests {
         );
         let client = exchange_client_from_envelope(Some(&envelope)).expect("client expected");
         assert_eq!(client.process_name.as_deref(), Some("codex"));
-        assert_eq!(client.app_type.as_deref(), Some("cli"));
+        assert_eq!(client.app_type.as_deref(), Some("non_host"));
         assert_eq!(client.bundle_id.as_deref(), Some("agent.codex"));
     }
 
@@ -871,5 +928,36 @@ mod tests {
         );
         assert_eq!(detection_bundle_version_for_exchange(Some("  ")), None);
         assert_eq!(detection_bundle_version_for_exchange(None), None);
+    }
+
+    #[test]
+    fn transport_for_pending_handles_stream_sse_http2_and_mcp() {
+        let mut pending = sample_pending();
+        assert_eq!(
+            transport_for_pending(&pending, false, false),
+            soth_core::types::exchange::ExchangeTransport::Https
+        );
+
+        pending.is_http2 = true;
+        assert_eq!(
+            transport_for_pending(&pending, false, false),
+            soth_core::types::exchange::ExchangeTransport::Http2
+        );
+
+        pending.is_http2 = false;
+        assert_eq!(
+            transport_for_pending(&pending, true, true),
+            soth_core::types::exchange::ExchangeTransport::Sse
+        );
+        assert_eq!(
+            transport_for_pending(&pending, true, false),
+            soth_core::types::exchange::ExchangeTransport::Ndjson
+        );
+
+        pending.is_mcp_jsonrpc = true;
+        assert_eq!(
+            transport_for_pending(&pending, false, false),
+            soth_core::types::exchange::ExchangeTransport::Jsonrpc
+        );
     }
 }

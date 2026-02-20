@@ -15,8 +15,8 @@ use soth_core::api::{
     HeartbeatTelemetry,
 };
 use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
-use soth_core::types::exchange_v2::{
-    ExchangeBodyMode, ExchangeEventV2, EXCHANGE_CLIENT_APP_TYPE_HOST,
+use soth_core::types::exchange::{
+    ExchangeBodyMode, ExchangeEvent, EXCHANGE_CLIENT_APP_TYPE_HOST,
     EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
 };
 use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
@@ -633,7 +633,7 @@ impl SyncAgent {
         &self,
         row: ExchangeQueueRow,
     ) -> anyhow::Result<PreparedRowResult> {
-        let mut event = match serde_json::from_str::<ExchangeEventV2>(&row.payload_json) {
+        let mut event = match serde_json::from_str::<ExchangeEvent>(&row.payload_json) {
             Ok(value) => value,
             Err(error) => {
                 return Ok(PreparedRowResult::Drop {
@@ -1327,7 +1327,7 @@ fn merge_tags(
 }
 
 fn exchange_event_to_metadata(
-    event: &ExchangeEventV2,
+    event: &ExchangeEvent,
     global_device_id: Option<&str>,
 ) -> ExchangeMetadata {
     let policy_allowed = event
@@ -1572,9 +1572,7 @@ fn is_terminal_contract_rejection_code(code: &str) -> bool {
         || code.contains("validation")
 }
 
-fn build_exchange_event_envelope_metadata(
-    event: &ExchangeEventV2,
-) -> Option<EventEnvelopeMetadata> {
+fn build_exchange_event_envelope_metadata(event: &ExchangeEvent) -> Option<EventEnvelopeMetadata> {
     let (host, path) = split_endpoint_host_path(event.endpoint.as_deref());
     let tags = event.tags.as_ref();
     let process_executable = tags
@@ -1605,7 +1603,7 @@ fn build_exchange_event_envelope_metadata(
         envelope_id: None,
         request_id: event.trace_id.clone(),
         capture_source: Some(match event.source_class {
-            soth_core::types::exchange_v2::ExchangeSourceClass::Mcp => "wrap".to_string(),
+            soth_core::types::exchange::ExchangeSourceClass::Mcp => "wrap".to_string(),
             _ => "proxy".to_string(),
         }),
         source: Some(exchange_transport_to_str(event.transport).to_string()),
@@ -1686,27 +1684,28 @@ fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<S
 }
 
 fn exchange_source_class_to_str(
-    source: soth_core::types::exchange_v2::ExchangeSourceClass,
+    source: soth_core::types::exchange::ExchangeSourceClass,
 ) -> &'static str {
     match source {
-        soth_core::types::exchange_v2::ExchangeSourceClass::AiInference => "ai_inference",
-        soth_core::types::exchange_v2::ExchangeSourceClass::AgentApp => "agent_app",
-        soth_core::types::exchange_v2::ExchangeSourceClass::Mcp => "mcp",
-        soth_core::types::exchange_v2::ExchangeSourceClass::Collector => "collector",
+        soth_core::types::exchange::ExchangeSourceClass::AiInference => "ai_inference",
+        soth_core::types::exchange::ExchangeSourceClass::AgentApp => "agent_app",
+        soth_core::types::exchange::ExchangeSourceClass::Mcp => "mcp",
+        soth_core::types::exchange::ExchangeSourceClass::Collector => "collector",
     }
 }
 
 fn exchange_transport_to_str(
-    transport: soth_core::types::exchange_v2::ExchangeTransport,
+    transport: soth_core::types::exchange::ExchangeTransport,
 ) -> &'static str {
     match transport {
-        soth_core::types::exchange_v2::ExchangeTransport::Http => "http",
-        soth_core::types::exchange_v2::ExchangeTransport::Https => "https",
-        soth_core::types::exchange_v2::ExchangeTransport::Ws => "ws",
-        soth_core::types::exchange_v2::ExchangeTransport::Sse => "sse",
-        soth_core::types::exchange_v2::ExchangeTransport::Ndjson => "ndjson",
-        soth_core::types::exchange_v2::ExchangeTransport::Stdio => "stdio",
-        soth_core::types::exchange_v2::ExchangeTransport::Jsonrpc => "jsonrpc",
+        soth_core::types::exchange::ExchangeTransport::Http => "http",
+        soth_core::types::exchange::ExchangeTransport::Https => "https",
+        soth_core::types::exchange::ExchangeTransport::Http2 => "http2",
+        soth_core::types::exchange::ExchangeTransport::Ws => "ws",
+        soth_core::types::exchange::ExchangeTransport::Sse => "sse",
+        soth_core::types::exchange::ExchangeTransport::Ndjson => "ndjson",
+        soth_core::types::exchange::ExchangeTransport::Stdio => "stdio",
+        soth_core::types::exchange::ExchangeTransport::Jsonrpc => "jsonrpc",
     }
 }
 
@@ -1732,11 +1731,12 @@ fn normalize_client_app_type_for_contract(raw: Option<&str>) -> Option<String> {
         return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
     }
 
-    // Legacy/local process categories (collector/desktop_app/browser/editor/cli/service/unknown)
-    // collapse to frozen two-bucket contract for cloud ingest.
-    let mapped = match normalized.as_str() {
-        "browser" | "desktop_app" | "editor" | "ide" | "host_app" => EXCHANGE_CLIENT_APP_TYPE_HOST,
-        _ => EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+    // Legacy/local process categories collapse to frozen two-bucket contract:
+    // only browser-like identifiers map to host; everything else is non_host.
+    let mapped = if matches!(normalized.as_str(), "browser" | "host_app") {
+        EXCHANGE_CLIENT_APP_TYPE_HOST
+    } else {
+        EXCHANGE_CLIENT_APP_TYPE_NON_HOST
     };
     Some(mapped.to_string())
 }
@@ -1998,10 +1998,10 @@ mod tests {
     }
 
     fn build_prepared_row(exchange_id: &str, preview_len: usize) -> PreparedExchangeQueueRow {
-        let mut event = ExchangeEventV2::new(
+        let mut event = ExchangeEvent::new(
             exchange_id,
-            soth_core::types::exchange_v2::ExchangeSourceClass::Collector,
-            soth_core::types::exchange_v2::ExchangeTransport::Https,
+            soth_core::types::exchange::ExchangeSourceClass::Collector,
+            soth_core::types::exchange::ExchangeTransport::Https,
             ExchangeBodyMode::MetadataOnly,
             ExchangeBodyMode::MetadataOnly,
         );
@@ -2112,10 +2112,10 @@ mod tests {
 
     #[test]
     fn exchange_event_to_metadata_normalizes_preview_only_body_mode() {
-        let event = ExchangeEventV2::new(
+        let event = ExchangeEvent::new(
             "123e4567-e89b-42d3-a456-426614174000",
-            soth_core::types::exchange_v2::ExchangeSourceClass::AgentApp,
-            soth_core::types::exchange_v2::ExchangeTransport::Https,
+            soth_core::types::exchange::ExchangeSourceClass::AgentApp,
+            soth_core::types::exchange::ExchangeTransport::Https,
             ExchangeBodyMode::PreviewOnly,
             ExchangeBodyMode::PreviewOnly,
         );
@@ -2130,14 +2130,14 @@ mod tests {
 
     #[test]
     fn exchange_event_to_metadata_normalizes_legacy_client_app_type() {
-        let mut event = ExchangeEventV2::new(
+        let mut event = ExchangeEvent::new(
             "123e4567-e89b-42d3-a456-426614174001",
-            soth_core::types::exchange_v2::ExchangeSourceClass::AgentApp,
-            soth_core::types::exchange_v2::ExchangeTransport::Https,
+            soth_core::types::exchange::ExchangeSourceClass::AgentApp,
+            soth_core::types::exchange::ExchangeTransport::Https,
             ExchangeBodyMode::Inline,
             ExchangeBodyMode::MetadataOnly,
         );
-        event.client = Some(soth_core::types::exchange_v2::ExchangeClient {
+        event.client = Some(soth_core::types::exchange::ExchangeClient {
             pid: None,
             device_id: Some("device_local_01".to_string()),
             bundle_id: Some("agent.codex".to_string()),
@@ -2152,6 +2152,22 @@ mod tests {
         let envelope = metadata.event_envelope.expect("event_envelope");
         let client = envelope.client.expect("event_envelope.client");
         assert_eq!(client.app_type.as_deref(), Some("non_host"));
+    }
+
+    #[test]
+    fn normalize_client_app_type_maps_browser_to_host() {
+        assert_eq!(
+            normalize_client_app_type_for_contract(Some("browser")).as_deref(),
+            Some("host")
+        );
+    }
+
+    #[test]
+    fn normalize_client_app_type_maps_editor_to_non_host() {
+        assert_eq!(
+            normalize_client_app_type_for_contract(Some("editor")).as_deref(),
+            Some("non_host")
+        );
     }
 
     #[test]
