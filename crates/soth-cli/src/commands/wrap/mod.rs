@@ -77,7 +77,7 @@ struct WrapSession {
     oisp_engine: Option<Arc<OispEngine>>,
     env_keys: Arc<Vec<String>>,
     event_logger: Option<EventLogger>,
-    exchange_v2: soth_core::config::types::ExchangeV2Config,
+    exchange: soth_core::config::types::ExchangeConfig,
     request_contexts: RwLock<std::collections::HashMap<String, WrapRequestContext>>,
     enforcement: Option<Arc<WrapEnforcement>>,
     fail_open: bool,
@@ -131,6 +131,30 @@ fn detection_source_rank(source: DetectionSource) -> u8 {
     }
 }
 
+fn agent_name_tokens(name: &str) -> Vec<String> {
+    name.trim()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_more_specific_agent_name(current: &str, candidate: &str) -> bool {
+    let current_tokens = agent_name_tokens(current);
+    let candidate_tokens = agent_name_tokens(candidate);
+
+    if current_tokens.is_empty() || candidate_tokens.len() <= current_tokens.len() {
+        return false;
+    }
+    if current.eq_ignore_ascii_case(candidate) {
+        return false;
+    }
+
+    current_tokens
+        .iter()
+        .all(|token| candidate_tokens.iter().any(|value| value == token))
+}
+
 fn should_promote_agent(current: &AgentInfo, candidate: &AgentInfo) -> bool {
     // Never override explicit operator input.
     if matches!(current.detected_from, DetectionSource::CommandLine) {
@@ -143,9 +167,19 @@ fn should_promote_agent(current: &AgentInfo, candidate: &AgentInfo) -> bool {
         return true;
     }
 
-    // If we already trust initialize info, allow enrichments like version fill.
-    candidate_rank == current_rank
-        && matches!(candidate.detected_from, DetectionSource::McpInitialize)
+    if candidate_rank != current_rank
+        || !matches!(candidate.detected_from, DetectionSource::McpInitialize)
+    {
+        return false;
+    }
+
+    // Same-rank initialize detections can still improve agent fidelity.
+    if is_more_specific_agent_name(&current.name, &candidate.name) {
+        return true;
+    }
+
+    // Only fill version from same name to avoid identity downgrade.
+    current.name.eq_ignore_ascii_case(&candidate.name)
         && current.version.is_none()
         && candidate.version.is_some()
 }
@@ -331,7 +365,7 @@ impl WrapSession {
         oisp_engine: Option<Arc<OispEngine>>,
         env_keys: Arc<Vec<String>>,
         event_logger: Option<EventLogger>,
-        exchange_v2: soth_core::config::types::ExchangeV2Config,
+        exchange: soth_core::config::types::ExchangeConfig,
         enforcement: Option<Arc<WrapEnforcement>>,
         fail_open: bool,
         pii_enricher: PiiEventEnricher,
@@ -362,7 +396,7 @@ impl WrapSession {
             oisp_engine,
             env_keys,
             event_logger,
-            exchange_v2,
+            exchange,
             enforcement,
             fail_open,
             pii_enricher,
@@ -376,16 +410,16 @@ impl WrapSession {
             let mut event = event.clone();
             self.pii_enricher.enrich(&mut event);
             logger.log(&event);
-            if self.exchange_v2.enabled {
+            if self.exchange.enabled {
                 if let Err(error) = logger.enqueue_exchange_from_wrap_event(
                     &event,
-                    &self.exchange_v2,
+                    &self.exchange,
                     Some(ExchangeSourceClass::Mcp),
                 ) {
                     warn!(
                         event_id = %event.id,
                         error = %error,
-                        "Failed to enqueue wrap exchange.v2 payload"
+                        "Failed to enqueue wrap exchange payload"
                     );
                 }
             }
@@ -698,7 +732,7 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         oisp_engine,
         env_keys,
         event_logger,
-        config.exchange_v2.clone(),
+        config.exchange.clone(),
         enforcement,
         fail_open,
         pii_enricher,
@@ -1450,6 +1484,21 @@ mod tests {
         let candidate =
             AgentInfo::new("Claude Code", DetectionSource::McpInitialize).with_version("1.2.3");
         assert!(should_promote_agent(&current, &candidate));
+    }
+
+    #[test]
+    fn test_should_promote_initialize_when_candidate_name_is_more_specific() {
+        let current = AgentInfo::new("Claude", DetectionSource::McpInitialize);
+        let candidate = AgentInfo::new("Claude Code", DetectionSource::McpInitialize);
+        assert!(should_promote_agent(&current, &candidate));
+    }
+
+    #[test]
+    fn test_should_not_promote_initialize_when_candidate_name_is_less_specific() {
+        let current = AgentInfo::new("Claude Code", DetectionSource::McpInitialize);
+        let candidate =
+            AgentInfo::new("Claude", DetectionSource::McpInitialize).with_version("1.2.3");
+        assert!(!should_promote_agent(&current, &candidate));
     }
 
     #[test]

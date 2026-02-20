@@ -378,7 +378,20 @@ async fn resolve_with_ps_fallback(
 }
 
 fn should_attempt_parent_walk(name: &str, app_type: &str) -> bool {
-    matches!(app_type, "service") || is_system_helper_process_name(name)
+    if matches!(app_type, "service") || is_system_helper_process_name(name) {
+        return true;
+    }
+    if is_generic_shell_process(name) {
+        return true;
+    }
+    app_type == "unknown" && is_low_signal_process_name(name)
+}
+
+fn is_low_signal_process_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("unknown")
+        || looks_like_version_token(trimmed)
 }
 
 fn is_system_helper_process_name(name: &str) -> bool {
@@ -1128,5 +1141,14 @@ mod tests {
             Some("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
         ));
         assert!(is_responsible_parent_candidate("Cursor", None));
+    }
+
+    #[test]
+    fn parent_walk_triggers_for_low_signal_processes() {
+        assert!(should_attempt_parent_walk("node", "cli"));
+        assert!(should_attempt_parent_walk("unknown", "unknown"));
+        assert!(should_attempt_parent_walk("2.1.45", "unknown"));
+        assert!(!should_attempt_parent_walk("Codex", "cli"));
+        assert!(!should_attempt_parent_walk("Cursor", "editor"));
     }
 }

@@ -317,14 +317,14 @@ impl EventLogger {
         ))
     }
 
-    /// Convert a [`WrapEvent`] into an `exchange.v2` payload and enqueue it for cloud upload.
+    /// Convert a [`WrapEvent`] into an Exchange payload and enqueue it for cloud upload.
     ///
     /// This is used by wrap/collector paths so they share the same cloud upload mechanism
     /// as proxy traffic (`exchange_upload_queue` -> `/api/v1/exchanges/batch`).
     pub fn enqueue_exchange_from_wrap_event(
         &self,
         event: &WrapEvent,
-        exchange_cfg: &ExchangeV2Config,
+        exchange_cfg: &ExchangeConfig,
         source_class_override: Option<ExchangeSourceClass>,
     ) -> std::io::Result<()> {
         if !exchange_cfg.enabled {
@@ -332,9 +332,9 @@ impl EventLogger {
         }
 
         let exchange_id = event.id.clone();
-        let payload = wrap_event_to_exchange_v2(event, exchange_cfg, source_class_override);
+        let payload = wrap_event_to_exchange(event, exchange_cfg, source_class_override);
         let payload_json = serde_json::to_string(&payload)
-            .map_err(|error| std::io::Error::other(format!("serialize exchange.v2: {error}")))?;
+            .map_err(|error| std::io::Error::other(format!("serialize exchange: {error}")))?;
         self.enqueue_exchange_upload(exchange_id.as_str(), payload_json.as_str())
     }
 
@@ -1088,14 +1088,14 @@ fn sqlite_lock_retry_backoff(retry: u32) -> Duration {
     )
 }
 
-fn wrap_event_to_exchange_v2(
+fn wrap_event_to_exchange(
     event: &WrapEvent,
-    exchange_cfg: &ExchangeV2Config,
+    exchange_cfg: &ExchangeConfig,
     source_class_override: Option<ExchangeSourceClass>,
-) -> ExchangeEventV2 {
+) -> ExchangeEvent {
     let source_class = source_class_override.unwrap_or_else(|| source_class_from_wrap_event(event));
     let transport = transport_from_wrap_event(event);
-    let mut payload = ExchangeEventV2::new(
+    let mut payload = ExchangeEvent::new(
         event.id.clone(),
         source_class,
         transport,
@@ -1238,42 +1238,37 @@ fn wrap_event_to_exchange_v2(
         anchor_block_hash: None,
         anchor_confirmed_at: None,
     });
-    let detection_source = event
-        .tags
-        .as_ref()
-        .and_then(|tags| tags.get("detection.source").cloned())
-        .or_else(|| {
-            serde_json::to_value(event.agent.detected_from)
-                .ok()
-                .and_then(|value| value.as_str().map(ToString::to_string))
-        });
-    let detection_reason = event
-        .tags
-        .as_ref()
-        .and_then(|tags| tags.get("detection.reason").cloned())
-        .or_else(|| Some(format!("{:?}", event.agent.detected_from).to_ascii_lowercase()));
-    let parse_confidence = event.tags.as_ref().and_then(|tags| {
-        tags.get("detection.parse_confidence")
-            .and_then(|raw| raw.parse::<f64>().ok())
+    let tags = event.tags.as_ref();
+    let tag = |key: &str| tags.and_then(|values| values.get(key).cloned());
+    let detection_source = tag("detection.source").or_else(|| {
+        serde_json::to_value(event.agent.detected_from)
+            .ok()
+            .and_then(|value| value.as_str().map(ToString::to_string))
     });
+    let detection_reason = tag("detection.reason")
+        .or_else(|| Some(format!("{:?}", event.agent.detected_from).to_ascii_lowercase()));
+    let parse_confidence =
+        tag("detection.parse_confidence").and_then(|raw| raw.parse::<f64>().ok());
+    let decision_step = tag("decision.step").or_else(|| tag("decision_step"));
+    let decision_outcome = tag("decision.outcome").or_else(|| tag("decision_outcome"));
+    let skip_reason = tag("decision.skip_reason")
+        .or_else(|| tag("skip_reason"))
+        .or_else(|| tag("decision.skipReason"));
+    let discovery_kind = tag("discovery.kind")
+        .or_else(|| tag("discovery_kind"))
+        .or_else(|| tag("discovery_mode"));
     payload.parse = Some(ExchangeParse {
-        detection_id: event
-            .tags
-            .as_ref()
-            .and_then(|tags| tags.get("detection.id").cloned()),
-        detection_bundle_version: event
-            .tags
-            .as_ref()
-            .and_then(|tags| tags.get("detection.bundle_version").cloned()),
-        parser_version: Some("exchange_v2_wrap".to_string()),
+        detection_id: tag("detection.id"),
+        detection_bundle_version: tag("detection.bundle_version"),
+        parser_version: Some("exchange_wrap".to_string()),
         bundle_version: None,
         parse_confidence,
         detection_reason,
         detection_source,
-        decision_step: None,
-        decision_outcome: None,
-        skip_reason: None,
-        discovery_kind: None,
+        decision_step,
+        decision_outcome,
+        skip_reason,
+        discovery_kind,
     });
     payload.tags = merge_exchange_tags(event);
 
@@ -1293,6 +1288,23 @@ fn source_class_from_wrap_event(event: &WrapEvent) -> ExchangeSourceClass {
 
 fn transport_from_wrap_event(event: &WrapEvent) -> ExchangeTransport {
     use crate::types::TrafficSource;
+
+    if let Some(transport_hint) = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("exchange.transport"))
+        .map(|value| value.trim().to_ascii_lowercase())
+    {
+        match transport_hint.as_str() {
+            "http" => return ExchangeTransport::Http,
+            "https" => return ExchangeTransport::Https,
+            "http2" | "h2" => return ExchangeTransport::Http2,
+            "ws" | "websocket" => return ExchangeTransport::Ws,
+            "sse" => return ExchangeTransport::Sse,
+            "ndjson" | "streamable_http" | "stream" => return ExchangeTransport::Ndjson,
+            _ => {}
+        }
+    }
 
     if let Some(envelope) = event.traffic_envelope.as_ref() {
         return match envelope.source {
@@ -1437,7 +1449,7 @@ fn exchange_body_from_text(
     preview: Option<&str>,
     size_hint: Option<u64>,
     content_type: Option<String>,
-    exchange_cfg: &ExchangeV2Config,
+    exchange_cfg: &ExchangeConfig,
 ) -> (ExchangeBody, bool) {
     if let Some(value) = text {
         let bytes = value.as_bytes();
@@ -2090,7 +2102,7 @@ mod tests {
         let path = dir.path().join("events.db");
         let logger = EventLogger::new(path).unwrap();
 
-        let mut cfg = ExchangeV2Config::default();
+        let mut cfg = ExchangeConfig::default();
         cfg.enabled = true;
 
         let event = WrapEvent::new(
@@ -2112,6 +2124,8 @@ mod tests {
                 "0.9300".to_string(),
             ),
             ("detection.id".to_string(), "agent.bundle01.app".to_string()),
+            ("decision.step".to_string(), "step5_host_origin".to_string()),
+            ("decision.outcome".to_string(), "captured".to_string()),
         ]));
 
         logger
@@ -2137,7 +2151,85 @@ mod tests {
             .contains("\"detection_id\":\"agent.bundle01.app\""));
         assert!(ready[0]
             .payload_json
+            .contains("\"decision_step\":\"step5_host_origin\""));
+        assert!(ready[0]
+            .payload_json
+            .contains("\"decision_outcome\":\"captured\""));
+        assert!(ready[0]
+            .payload_json
             .contains("\"process_name\":\"claude-code\""));
         assert!(ready[0].payload_json.contains("\"app_type\":\"cli\""));
+    }
+
+    #[test]
+    fn transport_hint_tag_sets_ws_transport_for_exchange_upload() {
+        let mut cfg = ExchangeConfig::default();
+        cfg.enabled = true;
+        let event = WrapEvent::new(
+            "session-ws",
+            "chatgpt.com",
+            WrapDirection::Out,
+            AgentInfo::new("chatgpt", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_method("WebSocket /backend-api/realtime")
+        .with_tags(std::collections::BTreeMap::from([(
+            "exchange.transport".to_string(),
+            "ws".to_string(),
+        )]));
+
+        let payload = wrap_event_to_exchange(&event, &cfg, None);
+        assert_eq!(payload.transport, ExchangeTransport::Ws);
+    }
+
+    #[test]
+    fn transport_hint_tag_sets_http2_transport_for_exchange_upload() {
+        let mut cfg = ExchangeConfig::default();
+        cfg.enabled = true;
+        let event = WrapEvent::new(
+            "session-h2",
+            "api.openai.com",
+            WrapDirection::Out,
+            AgentInfo::new("openai", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_method("POST /v1/responses")
+        .with_tags(std::collections::BTreeMap::from([(
+            "exchange.transport".to_string(),
+            "http2".to_string(),
+        )]));
+
+        let payload = wrap_event_to_exchange(&event, &cfg, None);
+        assert_eq!(payload.transport, ExchangeTransport::Http2);
+    }
+
+    #[test]
+    fn wrap_exchange_parse_extracts_decision_and_discovery_fields_from_tags() {
+        let mut cfg = ExchangeConfig::default();
+        cfg.enabled = true;
+        let event = WrapEvent::new(
+            "session-decision",
+            "chatgpt.com",
+            WrapDirection::Out,
+            AgentInfo::new("chatgpt", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_method("WebSocket /backend-api/realtime")
+        .with_tags(std::collections::BTreeMap::from([
+            ("decision.step".to_string(), "step5_host_origin".to_string()),
+            ("decision.outcome".to_string(), "metadata_only".to_string()),
+            (
+                "decision.skip_reason".to_string(),
+                "not_whitelisted".to_string(),
+            ),
+            ("discovery_mode".to_string(), "catalog".to_string()),
+        ]));
+
+        let payload = wrap_event_to_exchange(&event, &cfg, None);
+        let parse = payload.parse.expect("parse should exist");
+        assert_eq!(parse.decision_step.as_deref(), Some("step5_host_origin"));
+        assert_eq!(parse.decision_outcome.as_deref(), Some("metadata_only"));
+        assert_eq!(parse.skip_reason.as_deref(), Some("not_whitelisted"));
+        assert_eq!(parse.discovery_kind.as_deref(), Some("catalog"));
     }
 }

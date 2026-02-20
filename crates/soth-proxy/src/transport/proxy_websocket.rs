@@ -3,7 +3,7 @@
 use hudsucker::{tokio_tungstenite::tungstenite::Message, WebSocketContext, WebSocketHandler};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::transport::mcp_detection::{extract_mcp_request_method, is_jsonrpc_response_for_mcp};
 use crate::transport::pii_enrichment::PiiEventEnricher;
@@ -11,7 +11,11 @@ use crate::transport::proxy_detection::resolve_bundle_detection;
 use crate::transport::proxy_support::{
     append_catalog_discovery_tags, append_process_attribution_tags,
 };
-use soth_core::config::{HostFilterConfig, HostFilterMode};
+use soth_core::config::{ExchangeConfig, HostFilterConfig, HostFilterMode};
+use soth_core::types::exchange::{
+    EXCHANGE_DECISION_OUTCOME_CAPTURED, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
+    EXCHANGE_DECISION_STEP_HOST_ORIGIN, EXCHANGE_DISCOVERY_KIND_CATALOG,
+};
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
 };
@@ -33,6 +37,8 @@ pub struct AiWebSocketHandler {
     event_tags: Arc<BTreeMap<String, String>>,
     /// Optional PII enrichment before events are written.
     pii_enricher: Arc<PiiEventEnricher>,
+    /// Optional exchange upload config for strict exchange pipeline.
+    exchange: Option<ExchangeConfig>,
 }
 
 impl AiWebSocketHandler {
@@ -43,6 +49,7 @@ impl AiWebSocketHandler {
         oisp_engine: Arc<OispEngine>,
         event_tags: Arc<BTreeMap<String, String>>,
         pii_enricher: Arc<PiiEventEnricher>,
+        exchange: Option<ExchangeConfig>,
     ) -> Self {
         Self {
             event_logger,
@@ -51,6 +58,7 @@ impl AiWebSocketHandler {
             oisp_engine,
             event_tags,
             pii_enricher,
+            exchange,
         }
     }
 }
@@ -71,6 +79,7 @@ impl WebSocketHandler for AiWebSocketHandler {
         let oisp_engine = self.oisp_engine.clone();
         let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
+        let exchange = self.exchange.clone();
 
         // Extract host/path and direction from context.
         let (host, ws_path, direction) = match ctx {
@@ -207,7 +216,44 @@ impl WebSocketHandler for AiWebSocketHandler {
                             let mut tags = (*event_tags).clone();
                             if is_catalog_discovery_ws {
                                 append_catalog_discovery_tags(&mut tags, &host);
+                                tags.insert(
+                                    "discovery.kind".to_string(),
+                                    EXCHANGE_DISCOVERY_KIND_CATALOG.to_string(),
+                                );
                             }
+                            if let Some(source) = bundle_detection.detection_source.as_ref() {
+                                tags.insert("detection.source".to_string(), source.clone());
+                            }
+                            if let Some(reason) = bundle_detection.detection_reason.as_ref() {
+                                tags.insert("detection.reason".to_string(), reason.clone());
+                            }
+                            if let Some(confidence) = bundle_detection.parse_confidence {
+                                tags.insert(
+                                    "detection.parse_confidence".to_string(),
+                                    format!("{confidence:.3}"),
+                                );
+                            }
+                            if let Some(detection_id) = bundle_detection.detection_id.as_ref() {
+                                tags.insert("detection.id".to_string(), detection_id.clone());
+                            }
+                            tags.insert(
+                                "detection.bundle_version".to_string(),
+                                oisp_engine.bundle_version().to_string(),
+                            );
+                            tags.insert("exchange.transport".to_string(), "ws".to_string());
+                            tags.insert(
+                                "decision.step".to_string(),
+                                EXCHANGE_DECISION_STEP_HOST_ORIGIN.to_string(),
+                            );
+                            let ws_decision_outcome = if is_catalog_discovery_ws {
+                                EXCHANGE_DECISION_OUTCOME_METADATA_ONLY
+                            } else {
+                                EXCHANGE_DECISION_OUTCOME_CAPTURED
+                            };
+                            tags.insert(
+                                "decision.outcome".to_string(),
+                                ws_decision_outcome.to_string(),
+                            );
                             if matches!(source, EventSource::Mcp) {
                                 let envelope = TrafficEnvelope::mcp_http(
                                     &session_id,
@@ -228,6 +274,20 @@ impl WebSocketHandler for AiWebSocketHandler {
                             }
                             pii_enricher.enrich(&mut event);
                             logger.log(&event);
+                            if let Some(exchange_cfg) = exchange.as_ref().filter(|cfg| cfg.enabled)
+                            {
+                                if let Err(error) = logger.enqueue_exchange_from_wrap_event(
+                                    &event,
+                                    exchange_cfg,
+                                    None,
+                                ) {
+                                    warn!(
+                                        event_id = %event.id,
+                                        error = %error,
+                                        "Failed to enqueue websocket exchange payload"
+                                    );
+                                }
+                            }
                         }
                     } else {
                         debug!(
