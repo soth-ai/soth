@@ -111,7 +111,7 @@ struct OutboundProcessResult {
 struct WrapDetectionMetadata {
     detection_reason: Option<String>,
     parse_confidence: Option<f64>,
-    target_entity_id: Option<String>,
+    detection_id: Option<String>,
     detection_source: Option<String>,
 }
 
@@ -168,7 +168,7 @@ fn explicit_detection_metadata(agent: &AgentInfo) -> WrapDetectionMetadata {
     WrapDetectionMetadata {
         detection_reason: Some(detection_reason_from_source(agent.detected_from)),
         parse_confidence: Some(detection_confidence_from_source(agent.detected_from)),
-        target_entity_id: None,
+        detection_id: None,
         detection_source: Some("explicit".to_string()),
     }
 }
@@ -179,7 +179,7 @@ fn initialize_detection_metadata() -> WrapDetectionMetadata {
         parse_confidence: Some(detection_confidence_from_source(
             DetectionSource::McpInitialize,
         )),
-        target_entity_id: None,
+        detection_id: None,
         detection_source: Some("mcp_initialize".to_string()),
     }
 }
@@ -188,7 +188,7 @@ fn bundle_unknown_detection_metadata() -> WrapDetectionMetadata {
     WrapDetectionMetadata {
         detection_reason: Some("bundle_unclassified".to_string()),
         parse_confidence: Some(0.0),
-        target_entity_id: None,
+        detection_id: None,
         detection_source: Some("bundle".to_string()),
     }
 }
@@ -293,7 +293,7 @@ fn evaluate_bundle_detection(
         metadata: WrapDetectionMetadata {
             detection_reason: Some(scoped.outcome.detection_reason),
             parse_confidence: Some(scoped.outcome.parse_confidence),
-            target_entity_id: scoped.outcome.target_entity_id,
+            detection_id: scoped.outcome.detection_id,
             detection_source: Some("bundle".to_string()),
         },
     })
@@ -440,8 +440,8 @@ impl WrapSession {
                 format!("{confidence:.4}"),
             );
         }
-        if let Some(entity_id) = metadata.target_entity_id {
-            tags.insert("detection.target_entity_id".to_string(), entity_id);
+        if let Some(detection_id) = metadata.detection_id {
+            tags.insert("detection.id".to_string(), detection_id);
         }
         if !tags.is_empty() {
             event.tags = Some(tags);
@@ -498,7 +498,12 @@ impl WrapSession {
 }
 
 fn load_wrap_config(path: Option<&PathBuf>) -> Result<SothConfig> {
-    cli_config::load_effective_config(path, None).context("Failed to load wrap config")
+    let mut config =
+        cli_config::load_effective_config(path, None).context("Failed to load wrap config")?;
+    if config.cloud.enabled {
+        let _ = cli_config::sync_client_device_id(&mut config, None)?;
+    }
+    Ok(config)
 }
 
 fn extract_request_id_for_error(msg: &serde_json::Value) -> Option<RequestId> {

@@ -93,7 +93,7 @@ pub struct DetectionOutcome {
     pub agent: Option<String>,
     pub detection_reason: String,
     pub parse_confidence: f64,
-    pub target_entity_id: Option<String>,
+    pub detection_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -51,7 +51,7 @@ use crate::transport::proxy_exchange::{
 };
 use crate::transport::proxy_payload::{
     capture_sanitized_headers, decode_payload_for_logging, extract_gemini_bard_stream_text,
-    is_chat_ui_host, is_gemini_bard_stream_path, parse_content_length, sanitize_request_headers,
+    is_gemini_bard_stream_path, parse_content_length, sanitize_request_headers,
 };
 #[cfg(test)]
 use crate::transport::proxy_payload::{
@@ -80,7 +80,6 @@ use crate::transport::proxy_websocket::should_emit_non_mcp_ws_event;
 use crate::transport::response_event_builder::{
     empty_response_placeholder, normalize_response_content,
 };
-use crate::transport::tier_enrichment::extract_subscription_tags;
 use crate::transport::usage_enrichment::{
     create_stream_usage_parser, extract_model_from_request_for_mode,
     extract_request_pii_probe_for_mode, extract_usage_meta_for_mode,
@@ -143,8 +142,8 @@ pub(crate) struct PendingRequest {
     pub(crate) detection_reason: Option<String>,
     /// Confidence score for detection reason.
     pub(crate) parse_confidence: Option<f64>,
-    /// Provider/agent entity id derived from bundle detection.
-    pub(crate) target_entity_id: Option<String>,
+    /// Stable detection id derived from bundle detection.
+    pub(crate) detection_id: Option<String>,
     /// Source of detection metadata (bundle).
     pub(crate) detection_source: Option<String>,
     /// Final lifecycle decision step reached for this request.
@@ -808,7 +807,22 @@ impl HttpHandler for AiProxyHandler {
             let detection_reason = bundle_detection.detection_reason.clone();
             let parse_confidence = bundle_detection.parse_confidence;
             let detection_source = bundle_detection.detection_source.clone();
-            let target_entity_id = bundle_detection.target_entity_id.clone();
+            let detection_id = bundle_detection.detection_id.clone();
+            if let Some(detection_id) = detection_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                info!(
+                    detection_id = %detection_id,
+                    provider = %provider.as_deref().unwrap_or(""),
+                    model = %model.as_deref().unwrap_or(""),
+                    detection_source = %detection_source.as_deref().unwrap_or(""),
+                    detection_reason = %detection_reason.as_deref().unwrap_or(""),
+                    host = %host,
+                    path = %path,
+                    "Bundle detection resolved"
+                );
+            }
             let capture_policy =
                 classify_capture_policy(parse_confidence, detection_reason.as_deref());
             let mcp_request_method = if !is_connect
@@ -1089,18 +1103,6 @@ impl HttpHandler for AiProxyHandler {
                     );
                 }
 
-                // Dedicated visibility for Chat UI backend calls (used to debug 431 issues).
-                if is_chat_ui_host(&host) && display_path.contains("/backend-api/") {
-                    info!(
-                        provider = provider,
-                        host = %host,
-                        path = %display_path,
-                        method = %http_method,
-                        should_log = should_log,
-                        "Chat UI backend API request"
-                    );
-                }
-
                 // Store pending request for response correlation.
                 if should_track_request {
                     let blacklist_match =
@@ -1147,7 +1149,7 @@ impl HttpHandler for AiProxyHandler {
                             catalog_discovery: is_catalog_discovery_host,
                             detection_reason: detection_reason.clone(),
                             parse_confidence,
-                            target_entity_id: target_entity_id.clone(),
+                            detection_id: detection_id.clone(),
                             detection_source: detection_source.clone(),
                             decision_step: decision_step.clone(),
                             decision_outcome: decision_outcome.clone(),
@@ -1216,7 +1218,7 @@ impl HttpHandler for AiProxyHandler {
                         catalog_discovery: is_catalog_discovery_host,
                         detection_reason: detection_reason.clone(),
                         parse_confidence,
-                        target_entity_id: target_entity_id.clone(),
+                        detection_id: detection_id.clone(),
                         detection_source: detection_source.clone(),
                         decision_step: decision_step.clone(),
                         decision_outcome: decision_outcome.clone(),
@@ -1284,7 +1286,7 @@ impl HttpHandler for AiProxyHandler {
                             catalog_discovery: is_catalog_discovery_host,
                             detection_reason: detection_reason.clone(),
                             parse_confidence,
-                            target_entity_id: target_entity_id.clone(),
+                            detection_id: detection_id.clone(),
                             detection_source: detection_source.clone(),
                             decision_step: decision_step.clone(),
                             decision_outcome: decision_outcome.clone(),
@@ -1723,15 +1725,6 @@ impl HttpHandler for AiProxyHandler {
                                 None
                             },
                         );
-                        let subscription_tags = extract_subscription_tags(
-                            log_provider.as_str(),
-                            &log_pending.host,
-                            &log_pending.path,
-                            content.as_str(),
-                        );
-                        if !subscription_tags.is_empty() {
-                            enriched_tags.extend(subscription_tags);
-                        }
                         let content_for_exchange = content.clone();
                         if let Some(exchange_cfg) = log_exchange_v2_cfg.as_ref() {
                             finalize_and_enqueue_exchange_v2(

@@ -106,7 +106,7 @@ pub(crate) fn collect_detection_candidates(
                 agent,
                 detection_reason,
                 parse_confidence,
-                target_entity_id: provider.entity_id.clone(),
+                detection_id: provider.detection_id.clone(),
             },
             precedence: detection_group_precedence(group) + rule.priority.unwrap_or(0),
             stable_key,

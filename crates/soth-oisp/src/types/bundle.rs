@@ -31,8 +31,6 @@ pub enum FilterAction {
 pub struct DomainIndexEntry {
     pub host: String,
     pub provider_id: String,
-    #[serde(default)]
-    pub provider_entity_id: Option<String>,
     pub entry_type: EntryType,
     #[serde(default)]
     pub paths: Vec<String>,
@@ -82,7 +80,7 @@ pub struct BundleStats {
 pub struct ResolvedProvider {
     pub id: String,
     #[serde(default)]
-    pub entity_id: Option<String>,
+    pub detection_id: Option<String>,
     pub name: String,
     #[serde(rename = "type")]
     pub entry_type: EntryType,
@@ -164,11 +162,11 @@ impl CompiledBundle {
                 );
             }
             if provider
-                .entity_id
+                .detection_id
                 .as_ref()
-                .is_some_and(|entity_id| entity_id.trim().is_empty())
+                .is_some_and(|detection_id| detection_id.trim().is_empty())
             {
-                anyhow::bail!("provider `{provider_id}` has empty entity_id");
+                anyhow::bail!("provider `{provider_id}` has empty detection_id");
             }
         }
         for entry in &self.domain_index {

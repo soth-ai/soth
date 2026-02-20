@@ -83,9 +83,7 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
             config.cloud.tags.insert(key, value);
         }
     }
-    if let Some(device_id) = exchanged.device_id {
-        config.cloud.tags.insert("device_id".to_string(), device_id);
-    }
+    let device_id = cli_config::sync_client_device_id(&mut config, exchanged.device_id.as_deref())?;
 
     let serialized = serde_yaml::to_string(&config).context("failed serializing config")?;
     std::fs::write(&config_path, serialized)
@@ -96,6 +94,7 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     println!("Cloud sync enabled: {}", config.cloud.enabled);
     println!("Cloud endpoint: {}", config.cloud.endpoint);
     println!("Exchange v2 enabled: {}", config.exchange_v2.enabled);
+    println!("Client device ID: {device_id}");
     if let Some(workspace_id) = config.cloud.tags.get("workspace_id") {
         println!("Workspace: {workspace_id}");
     }

@@ -22,7 +22,7 @@ pub enum DomainType {
 pub struct ProviderDefinition {
     pub id: String,
     #[serde(default)]
-    pub entity_id: Option<String>,
+    pub detection_id: Option<String>,
     pub name: String,
     pub vendor: String,
     #[serde(default)]

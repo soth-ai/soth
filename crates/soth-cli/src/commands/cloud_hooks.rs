@@ -4,6 +4,7 @@ use soth_core::config::SothConfig;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::cli_config;
 use soth_core::config::{BudgetLimit, RegistryMode};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -338,6 +339,12 @@ pub fn spawn_cloud_pull_runtime(
     let sync_interval_secs = config.cloud.sync_interval_secs.max(5);
     let interval_secs = config.cloud.config_pull_interval_secs.max(15);
     let debounce_secs = config.cloud.config_debounce_secs.max(1);
+    let mut global_tags = config.cloud.tags.clone();
+    if !global_tags.contains_key("device_id") {
+        if let Some(device_id) = cli_config::read_client_device_id() {
+            global_tags.insert("device_id".to_string(), device_id);
+        }
+    }
     let frontload_exchange_upload_path = std::env::var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH")
         .ok()
         .map(|value| value.trim().to_string())
@@ -391,7 +398,7 @@ pub fn spawn_cloud_pull_runtime(
                 .max(1) as usize,
             frontload_exchange_upload_path: frontload_exchange_upload_path.clone(),
             body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
-            global_tags: config.cloud.tags.clone(),
+            global_tags: global_tags.clone(),
             heartbeat_telemetry: Some(std::sync::Arc::new(|| {
                 let snapshot = soth_proxy::metrics::heartbeat_telemetry_snapshot();
                 if snapshot.counters.values().all(|value| *value == 0) {

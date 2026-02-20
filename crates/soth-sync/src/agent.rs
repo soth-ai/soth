@@ -702,7 +702,8 @@ impl SyncAgent {
             }
         }
 
-        let mut metadata = exchange_event_to_metadata(&event);
+        let global_device_id = normalized_global_device_id(&self.config.global_tags);
+        let mut metadata = exchange_event_to_metadata(&event, global_device_id.as_deref());
         metadata.tags = merge_tags_for_exchange(&self.config.global_tags, event.tags.as_ref());
         let mode = exchange_sync_mode(metadata.tags.as_ref(), self.config.frontload_enabled);
         Ok(PreparedRowResult::Prepared(PreparedExchangeQueueRow {
@@ -1325,7 +1326,10 @@ fn merge_tags(
     Some(merged)
 }
 
-fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
+fn exchange_event_to_metadata(
+    event: &ExchangeEventV2,
+    global_device_id: Option<&str>,
+) -> ExchangeMetadata {
     let policy_allowed = event
         .tags
         .as_ref()
@@ -1383,12 +1387,16 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
             .map(ToString::to_string),
         tool_identity_key: event.tool_identity_key.clone(),
         status_code: event.status_code,
-        client_device_id: event.client_device_id.clone().or_else(|| {
-            event
-                .client
-                .as_ref()
-                .and_then(|value| value.device_id.clone())
-        }),
+        client_device_id: event
+            .client_device_id
+            .clone()
+            .or_else(|| {
+                event
+                    .client
+                    .as_ref()
+                    .and_then(|value| value.device_id.clone())
+            })
+            .or_else(|| global_device_id.map(str::to_string)),
         input_tokens: event.usage.input_tokens,
         output_tokens: event.usage.output_tokens,
         cache_read_tokens: event.usage.cache_read_tokens,
@@ -1454,10 +1462,6 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
             .parse
             .as_ref()
             .and_then(|value| value.detection_reason.clone()),
-        target_entity_id: event
-            .parse
-            .as_ref()
-            .and_then(|value| value.target_entity_id.clone()),
         detection_source: event
             .parse
             .as_ref()
@@ -1495,6 +1499,17 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         tags: event.tags.as_ref().map(tree_to_hash),
         event_envelope: build_exchange_event_envelope_metadata(event),
     }
+}
+
+fn normalized_global_device_id(tags: &BTreeMap<String, String>) -> Option<String> {
+    tags.get("device_id").and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn merge_tags_for_exchange(
@@ -1992,7 +2007,7 @@ mod tests {
         );
         event.request.body.preview = Some(noisy_text(preview_len, 7));
         event.response.body.preview = Some(noisy_text(preview_len, 13));
-        let metadata = exchange_event_to_metadata(&event);
+        let metadata = exchange_event_to_metadata(&event, None);
         PreparedExchangeQueueRow {
             row: ExchangeQueueRow {
                 exchange_id: exchange_id.to_string(),
@@ -2105,7 +2120,7 @@ mod tests {
             ExchangeBodyMode::PreviewOnly,
         );
 
-        let metadata = exchange_event_to_metadata(&event);
+        let metadata = exchange_event_to_metadata(&event, None);
         assert_eq!(metadata.request_body_mode.as_deref(), Some("metadata_only"));
         assert_eq!(
             metadata.response_body_mode.as_deref(),
@@ -2132,7 +2147,7 @@ mod tests {
             referrer_origin: None,
         });
 
-        let metadata = exchange_event_to_metadata(&event);
+        let metadata = exchange_event_to_metadata(&event, None);
         assert_eq!(metadata.client_app_type.as_deref(), Some("non_host"));
         let envelope = metadata.event_envelope.expect("event_envelope");
         let client = envelope.client.expect("event_envelope.client");

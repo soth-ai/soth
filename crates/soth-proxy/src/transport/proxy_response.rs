@@ -14,7 +14,6 @@ use crate::transport::proxy_support::{
     append_capture_tags, append_catalog_discovery_tags, append_process_attribution_tags,
 };
 use crate::transport::response_event_builder::normalize_response_content;
-use crate::transport::tier_enrichment::extract_subscription_tags;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
 use soth_core::types::exchange_v2::EXCHANGE_DECISION_OUTCOME_METADATA_ONLY;
 use soth_core::EventLogger;
@@ -139,7 +138,7 @@ pub(crate) fn emit_non_stream_response_event(
     capture_max_body_bytes: u64,
     exchange_bundle_version: Option<&str>,
 ) {
-    let normalized_response = normalize_response_content(
+    let normalized_response_for_exchange = normalize_response_content(
         body_content,
         pending.request_content.as_deref(),
         &pending.method,
@@ -148,7 +147,6 @@ pub(crate) fn emit_non_stream_response_event(
         is_sse,
         false,
     );
-    let normalized_response_for_exchange = normalized_response.clone();
     let mut enriched_tags = event_tags.clone();
     if pending.catalog_discovery {
         append_catalog_discovery_tags(&mut enriched_tags, &pending.host);
@@ -177,17 +175,6 @@ pub(crate) fn emit_non_stream_response_event(
             None
         },
     );
-    if let Some(response_body) = normalized_response.as_deref() {
-        let subscription_tags = extract_subscription_tags(
-            pending.provider.as_deref().unwrap_or("unknown"),
-            &pending.host,
-            &pending.path,
-            response_body,
-        );
-        if !subscription_tags.is_empty() {
-            enriched_tags.extend(subscription_tags);
-        }
-    }
     if let Some(exchange_cfg) = exchange_v2_cfg {
         finalize_and_enqueue_exchange_v2(
             logger,

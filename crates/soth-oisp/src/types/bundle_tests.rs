@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_compiled_bundle_accepts_sectioned_v3_shape_with_entity_ids() {
+    fn parse_compiled_bundle_accepts_sectioned_v3_shape_with_detection_ids() {
         let value = json!({
             "schema_version": 3,
             "version": "2026.02.13-r3",
@@ -248,7 +248,7 @@ mod tests {
                 "providers": {
                     "openai": {
                         "id": "openai",
-                        "entity_id": "prv_4n7k2q9m1x",
+                        "detection_id": "prv_4n7k2q9m1x",
                         "name": "OpenAI",
                         "type": "ai-inference",
                         "api_format": "openai",
@@ -278,7 +278,7 @@ mod tests {
         let parsed = parse_compiled_bundle(&value).unwrap();
         assert_eq!(parsed.schema_version, 3);
         let provider = parsed.providers.get("openai").unwrap();
-        assert_eq!(provider.entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
+        assert_eq!(provider.detection_id.as_deref(), Some("prv_4n7k2q9m1x"));
         let detection = provider
             .detection
             .as_ref()
@@ -290,6 +290,6 @@ mod tests {
             Some("path_match")
         );
         let entry = parsed.domain_index.first().unwrap();
-        assert_eq!(entry.provider_entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
+        assert_eq!(entry.provider_id, "openai");
     }
 }

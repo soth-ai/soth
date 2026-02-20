@@ -39,7 +39,7 @@ pub(crate) fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngi
             provider_id.clone(),
             ResolvedProvider {
                 id: provider_id,
-                entity_id: Some("p_fallback_unknown".to_string()),
+                detection_id: Some("p_fallback_unknown".to_string()),
                 name: "Fallback Unknown".to_string(),
                 entry_type: EntryType::AgentApp,
                 api_format: None,

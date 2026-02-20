@@ -481,14 +481,14 @@ fn launch_subset_supports_openai_and_anthropic_app_and_path_detection() {
             "providers": {
                 "openai": {
                     "id": "openai",
-                    "entity_id": "prv_openai",
+                    "detection_id": "prv_openai",
                     "name": "OpenAI",
                     "type": "ai-inference",
                     "api_format": "openai"
                 },
                 "chatgpt": {
                     "id": "chatgpt",
-                    "entity_id": "agt_chatgpt",
+                    "detection_id": "agt_chatgpt",
                     "name": "ChatGPT",
                     "type": "agent-app",
                     "detection": {
@@ -505,7 +505,7 @@ fn launch_subset_supports_openai_and_anthropic_app_and_path_detection() {
                 },
                 "anthropic": {
                     "id": "anthropic",
-                    "entity_id": "prv_anthropic",
+                    "detection_id": "prv_anthropic",
                     "name": "Anthropic",
                     "type": "ai-inference",
                     "api_format": "anthropic",
@@ -533,7 +533,7 @@ fn launch_subset_supports_openai_and_anthropic_app_and_path_detection() {
                 },
                 "claude-web": {
                     "id": "claude-web",
-                    "entity_id": "agt_claude_web",
+                    "detection_id": "agt_claude_web",
                     "name": "Claude Web",
                     "type": "agent-app"
                 }
@@ -754,14 +754,12 @@ fn select_best_domain_match_prefers_longer_wildcard() {
         DomainIndexEntry {
             host: "*.openai.com".to_string(),
             provider_id: "broad".to_string(),
-            provider_entity_id: None,
             entry_type: EntryType::AiInference,
             paths: Vec::new(),
         },
         DomainIndexEntry {
             host: "api.*.openai.com".to_string(),
             provider_id: "specific".to_string(),
-            provider_entity_id: None,
             entry_type: EntryType::AiInference,
             paths: Vec::new(),
         },
@@ -778,7 +776,7 @@ fn classify_uses_provider_type_from_provider_map() {
         "openai".to_string(),
         types::bundle::ResolvedProvider {
             id: "openai".to_string(),
-            entity_id: None,
+            detection_id: None,
             name: "OpenAI".to_string(),
             entry_type: EntryType::Mcp,
             api_format: None,
@@ -791,7 +789,6 @@ fn classify_uses_provider_type_from_provider_map() {
     bundle.domain_index = vec![DomainIndexEntry {
         host: "api.openai.com".to_string(),
         provider_id: "openai".to_string(),
-        provider_entity_id: None,
         entry_type: EntryType::AiInference,
         paths: Vec::new(),
     }];
@@ -836,52 +833,52 @@ fn calculate_cost_uses_provider_hint_and_prefix_model_match() {
 }
 
 #[test]
-fn evaluate_detection_prefers_model_rule_with_entity_id() {
+fn evaluate_detection_prefers_model_rule_with_detection_id() {
     let engine = OispEngine::new(
-            parse_compiled_bundle(&json!({
-                "schema_version": 3,
-                "version": "v1",
-                "compiled_at": "2026-02-16T00:00:00Z",
-                "bundle_type": "local",
-                "domain_index": [
-                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_abc123" }
-                ],
-                "providers": {
-                    "chatgpt": {
-                        "id": "chatgpt",
-                        "entity_id": "agt_abc123",
-                        "name": "ChatGPT",
-                        "type": "agent-app",
-                        "api_format": "openai",
-                        "detection": {
-                            "ua_rules": [
-                                {
-                                    "id": "ua-1",
-                                    "reason": "ua_match",
-                                    "confidence": 0.80,
-                                    "agent": "chatgpt",
-                                    "contains": "chatgpt"
-                                }
-                            ],
-                            "model_rules": [
-                                {
-                                    "id": "model-1",
-                                    "reason": "model_match",
-                                    "confidence": 0.99,
-                                    "priority": 10,
-                                    "agent": "codex",
-                                    "model": "*codex*"
-                                }
-                            ]
-                        }
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "v1",
+            "compiled_at": "2026-02-16T00:00:00Z",
+            "bundle_type": "local",
+            "domain_index": [
+                { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" }
+            ],
+            "providers": {
+                "chatgpt": {
+                    "id": "chatgpt",
+                    "detection_id": "agt_abc123",
+                    "name": "ChatGPT",
+                    "type": "agent-app",
+                    "api_format": "openai",
+                    "detection": {
+                        "ua_rules": [
+                            {
+                                "id": "ua-1",
+                                "reason": "ua_match",
+                                "confidence": 0.80,
+                                "agent": "chatgpt",
+                                "contains": "chatgpt"
+                            }
+                        ],
+                        "model_rules": [
+                            {
+                                "id": "model-1",
+                                "reason": "model_match",
+                                "confidence": 0.99,
+                                "priority": 10,
+                                "agent": "codex",
+                                "model": "*codex*"
+                            }
+                        ]
                     }
-                },
-                "filters": {},
-                "pricing": {}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+                }
+            },
+            "filters": {},
+            "pricing": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let outcome = engine
         .evaluate_detection(
@@ -898,53 +895,53 @@ fn evaluate_detection_prefers_model_rule_with_entity_id() {
     assert_eq!(outcome.agent.as_deref(), Some("codex"));
     assert_eq!(outcome.detection_reason, "model_match");
     assert!((outcome.parse_confidence - 0.99).abs() < 1e-9);
-    assert_eq!(outcome.target_entity_id.as_deref(), Some("agt_abc123"));
+    assert_eq!(outcome.detection_id.as_deref(), Some("agt_abc123"));
 }
 
 #[test]
 fn evaluate_detection_is_deterministic_for_same_context() {
     let engine = OispEngine::new(
-            parse_compiled_bundle(&json!({
-                "schema_version": 3,
-                "version": "v1",
-                "compiled_at": "2026-02-16T00:00:00Z",
-                "bundle_type": "local",
-                "domain_index": [
-                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_abc123" }
-                ],
-                "providers": {
-                    "chatgpt": {
-                        "id": "chatgpt",
-                        "entity_id": "agt_abc123",
-                        "name": "ChatGPT",
-                        "type": "agent-app",
-                        "api_format": "openai",
-                        "detection": {
-                            "ua_rules": [
-                                {
-                                    "id": "z-rule",
-                                    "reason": "ua_match",
-                                    "confidence": 0.90,
-                                    "agent": "chatgpt",
-                                    "contains": "desktop"
-                                },
-                                {
-                                    "id": "a-rule",
-                                    "reason": "ua_match",
-                                    "confidence": 0.90,
-                                    "agent": "codex",
-                                    "contains": "desktop"
-                                }
-                            ]
-                        }
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "v1",
+            "compiled_at": "2026-02-16T00:00:00Z",
+            "bundle_type": "local",
+            "domain_index": [
+                { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" }
+            ],
+            "providers": {
+                "chatgpt": {
+                    "id": "chatgpt",
+                    "detection_id": "agt_abc123",
+                    "name": "ChatGPT",
+                    "type": "agent-app",
+                    "api_format": "openai",
+                    "detection": {
+                        "ua_rules": [
+                            {
+                                "id": "z-rule",
+                                "reason": "ua_match",
+                                "confidence": 0.90,
+                                "agent": "chatgpt",
+                                "contains": "desktop"
+                            },
+                            {
+                                "id": "a-rule",
+                                "reason": "ua_match",
+                                "confidence": 0.90,
+                                "agent": "codex",
+                                "contains": "desktop"
+                            }
+                        ]
                     }
-                },
-                "filters": {},
-                "pricing": {}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+                }
+            },
+            "filters": {},
+            "pricing": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let context = DetectionContext {
         host: Some("chatgpt.com".to_string()),
@@ -962,46 +959,46 @@ fn evaluate_detection_is_deterministic_for_same_context() {
     assert_eq!(first, second);
     assert_eq!(first.agent.as_deref(), Some("codex"));
     assert_eq!(first.detection_reason, "ua_match");
-    assert_eq!(first.target_entity_id.as_deref(), Some("agt_abc123"));
+    assert_eq!(first.detection_id.as_deref(), Some("agt_abc123"));
 }
 
 #[test]
 fn evaluate_detection_rules_only_returns_none_without_match() {
     let engine = OispEngine::new(
-            parse_compiled_bundle(&json!({
-                "schema_version": 3,
-                "version": "v1",
-                "compiled_at": "2026-02-16T00:00:00Z",
-                "bundle_type": "local",
-                "domain_index": [
-                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_abc123" }
-                ],
-                "providers": {
-                    "chatgpt": {
-                        "id": "chatgpt",
-                        "entity_id": "agt_abc123",
-                        "name": "ChatGPT",
-                        "type": "agent-app",
-                        "api_format": "openai",
-                        "detection": {
-                            "ua_rules": [
-                                {
-                                    "id": "ua-chatgpt",
-                                    "reason": "ua_match",
-                                    "confidence": 0.90,
-                                    "agent": "chatgpt",
-                                    "contains": "chatgpt"
-                                }
-                            ]
-                        }
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "v1",
+            "compiled_at": "2026-02-16T00:00:00Z",
+            "bundle_type": "local",
+            "domain_index": [
+                { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" }
+            ],
+            "providers": {
+                "chatgpt": {
+                    "id": "chatgpt",
+                    "detection_id": "agt_abc123",
+                    "name": "ChatGPT",
+                    "type": "agent-app",
+                    "api_format": "openai",
+                    "detection": {
+                        "ua_rules": [
+                            {
+                                "id": "ua-chatgpt",
+                                "reason": "ua_match",
+                                "confidence": 0.90,
+                                "agent": "chatgpt",
+                                "contains": "chatgpt"
+                            }
+                        ]
                     }
-                },
-                "filters": {},
-                "pricing": {}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+                }
+            },
+            "filters": {},
+            "pricing": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let context = DetectionContext {
         user_agent: Some("unknown-client".to_string()),
@@ -1016,59 +1013,59 @@ fn evaluate_detection_rules_only_returns_none_without_match() {
 #[test]
 fn evaluate_detection_across_entry_types_prefers_highest_confidence_rule() {
     let engine = OispEngine::new(
-            parse_compiled_bundle(&json!({
-                "schema_version": 3,
-                "version": "v1",
-                "compiled_at": "2026-02-16T00:00:00Z",
-                "bundle_type": "local",
-                "domain_index": [
-                    { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app", "provider_entity_id": "agt_chatgpt" },
-                    { "host": "claude.ai", "provider_id": "claude", "entry_type": "agent-app", "provider_entity_id": "agt_claude" }
-                ],
-                "providers": {
-                    "chatgpt": {
-                        "id": "chatgpt",
-                        "entity_id": "agt_chatgpt",
-                        "name": "ChatGPT",
-                        "type": "agent-app",
-                        "api_format": "openai",
-                        "detection": {
-                            "ua_rules": [
-                                {
-                                    "id": "ua-chatgpt",
-                                    "reason": "ua_match",
-                                    "confidence": 0.91,
-                                    "agent": "chatgpt",
-                                    "contains": "assistant-client"
-                                }
-                            ]
-                        }
-                    },
-                    "claude": {
-                        "id": "claude",
-                        "entity_id": "agt_claude",
-                        "name": "Claude",
-                        "type": "agent-app",
-                        "api_format": "anthropic",
-                        "detection": {
-                            "ua_rules": [
-                                {
-                                    "id": "ua-claude",
-                                    "reason": "ua_match",
-                                    "confidence": 0.97,
-                                    "agent": "claude",
-                                    "contains": "assistant-client"
-                                }
-                            ]
-                        }
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "v1",
+            "compiled_at": "2026-02-16T00:00:00Z",
+            "bundle_type": "local",
+            "domain_index": [
+                { "host": "chatgpt.com", "provider_id": "chatgpt", "entry_type": "agent-app" },
+                { "host": "claude.ai", "provider_id": "claude", "entry_type": "agent-app" }
+            ],
+            "providers": {
+                "chatgpt": {
+                    "id": "chatgpt",
+                    "detection_id": "agt_chatgpt",
+                    "name": "ChatGPT",
+                    "type": "agent-app",
+                    "api_format": "openai",
+                    "detection": {
+                        "ua_rules": [
+                            {
+                                "id": "ua-chatgpt",
+                                "reason": "ua_match",
+                                "confidence": 0.91,
+                                "agent": "chatgpt",
+                                "contains": "assistant-client"
+                            }
+                        ]
                     }
                 },
-                "filters": {},
-                "pricing": {}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+                "claude": {
+                    "id": "claude",
+                    "detection_id": "agt_claude",
+                    "name": "Claude",
+                    "type": "agent-app",
+                    "api_format": "anthropic",
+                    "detection": {
+                        "ua_rules": [
+                            {
+                                "id": "ua-claude",
+                                "reason": "ua_match",
+                                "confidence": 0.97,
+                                "agent": "claude",
+                                "contains": "assistant-client"
+                            }
+                        ]
+                    }
+                }
+            },
+            "filters": {},
+            "pricing": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let context = DetectionContext {
         user_agent: Some("assistant-client/1.0".to_string()),
@@ -1082,10 +1079,7 @@ fn evaluate_detection_across_entry_types_prefers_highest_confidence_rule() {
     assert_eq!(outcome.entry_type, EntryType::AgentApp);
     assert_eq!(outcome.outcome.agent.as_deref(), Some("claude"));
     assert!((outcome.outcome.parse_confidence - 0.97).abs() < 1e-9);
-    assert_eq!(
-        outcome.outcome.target_entity_id.as_deref(),
-        Some("agt_claude")
-    );
+    assert_eq!(outcome.outcome.detection_id.as_deref(), Some("agt_claude"));
 }
 
 #[test]

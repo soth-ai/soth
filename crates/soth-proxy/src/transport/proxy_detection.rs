@@ -10,7 +10,7 @@ pub(crate) struct BundleDetectionResult {
     pub(crate) detection_reason: Option<String>,
     pub(crate) parse_confidence: Option<f64>,
     pub(crate) detection_source: Option<String>,
-    pub(crate) target_entity_id: Option<String>,
+    pub(crate) detection_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,9 +276,9 @@ pub(crate) fn resolve_bundle_detection(
         detection_reason,
         parse_confidence,
         detection_source,
-        target_entity_id: bundle_detection
+        detection_id: bundle_detection
             .as_ref()
-            .and_then(|value| value.target_entity_id.clone()),
+            .and_then(|value| value.detection_id.clone()),
     }
 }
 

@@ -7,17 +7,22 @@ use rusqlite::{
     Connection,
 };
 use serde::{Deserialize, Serialize};
+use soth_core::api::{
+    version::{API_VERSION, API_VERSION_HEADER},
+    LocalSessionArtifact, LocalSessionsBatchRequest, LocalSessionsBatchResponse,
+};
 use soth_core::config::types::ExchangeV2Config;
 use soth_core::types::exchange_v2::ExchangeSourceClass;
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
 use soth_observe::PiiRedactor;
 use soth_storage::open_sqlite_read_only;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tracing::{info, warn};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -26,6 +31,10 @@ const DEFAULT_MAX_LINE_BYTES: usize = 64 * 1024;
 const DEFAULT_FRONTLOAD_MAX_CYCLES: usize = 24;
 const DEFAULT_FRONTLOAD_MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_AUTO_DISCOVER_MAX_SOURCES: usize = 48;
+const DEFAULT_LOCAL_SESSIONS_UPLOAD_PATH: &str = "/api/v1/ingest/local-sessions";
+const DEFAULT_LOCAL_SESSIONS_UPLOAD_BATCH_SIZE: usize = 200;
+const DEFAULT_LOCAL_SESSIONS_UPLOAD_TIMEOUT_SECS: u64 = 20;
+const DEFAULT_LOCAL_SESSIONS_RATE_LIMIT_BACKOFF_SECS: u64 = 15;
 
 #[derive(Debug)]
 pub struct CollectorRuntime {
@@ -48,9 +57,43 @@ pub struct CollectorConfig {
     pub agent_name: String,
     pub event_source: EventSource,
     pub exchange_v2: ExchangeV2Config,
+    pub direct_upload: Option<CollectorDirectUploadConfig>,
     pub sources: Vec<CollectorSource>,
     pub sqlite_sources: Vec<CollectorSqliteSource>,
 }
+
+#[derive(Debug, Clone)]
+pub struct CollectorDirectUploadConfig {
+    pub endpoint: String,
+    pub api_key: String,
+    pub upload_path: String,
+    pub batch_size: usize,
+    pub request_timeout: Duration,
+    pub agent_instance_id: String,
+    pub config_version: Option<String>,
+    pub client_device_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct CollectorDirectUploader {
+    cfg: CollectorDirectUploadConfig,
+    client: reqwest::Client,
+}
+
+#[derive(Debug)]
+struct CollectorUploadError {
+    message: String,
+    rate_limited: bool,
+    retry_after_secs: Option<u64>,
+}
+
+impl std::fmt::Display for CollectorUploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CollectorUploadError {}
 
 #[derive(Debug, Clone)]
 pub struct CollectorSource {
@@ -223,6 +266,7 @@ impl CollectorConfig {
             .ok()
             .and_then(|v| parse_event_source(&v))
             .unwrap_or(EventSource::AgentApp);
+        let direct_upload = CollectorDirectUploadConfig::from_env();
 
         Some(Self {
             poll_interval,
@@ -238,10 +282,241 @@ impl CollectorConfig {
             agent_name,
             event_source,
             exchange_v2: ExchangeV2Config::default(),
+            direct_upload,
             sources,
             sqlite_sources,
         })
     }
+}
+
+impl CollectorDirectUploadConfig {
+    fn from_env() -> Option<Self> {
+        let enabled = parse_bool_env("SOTH_COLLECTOR_DIRECT_UPLOAD_ENABLED").unwrap_or(true);
+        if !enabled {
+            return None;
+        }
+
+        let endpoint = std::env::var("SOTH_COLLECTOR_CLOUD_ENDPOINT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())?;
+        let api_key = std::env::var("SOTH_COLLECTOR_CLOUD_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())?;
+        let upload_path = std::env::var("SOTH_COLLECTOR_UPLOAD_PATH")
+            .ok()
+            .and_then(|value| normalize_upload_path_or_url(value.as_str()))
+            .unwrap_or_else(|| DEFAULT_LOCAL_SESSIONS_UPLOAD_PATH.to_string());
+        let batch_size = std::env::var("SOTH_COLLECTOR_UPLOAD_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_LOCAL_SESSIONS_UPLOAD_BATCH_SIZE)
+            .max(1);
+        let timeout_secs = std::env::var("SOTH_COLLECTOR_UPLOAD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LOCAL_SESSIONS_UPLOAD_TIMEOUT_SECS)
+            .max(1);
+        let agent_instance_id = std::env::var("SOTH_COLLECTOR_AGENT_INSTANCE_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(build_default_agent_instance_id);
+        let config_version = std::env::var("SOTH_COLLECTOR_CONFIG_VERSION")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let client_device_id = std::env::var("SOTH_COLLECTOR_CLIENT_DEVICE_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        Some(Self {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            api_key,
+            upload_path,
+            batch_size,
+            request_timeout: Duration::from_secs(timeout_secs),
+            agent_instance_id,
+            config_version,
+            client_device_id,
+        })
+    }
+}
+
+impl CollectorDirectUploader {
+    fn new(cfg: CollectorDirectUploadConfig) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(cfg.request_timeout)
+            .build()
+            .context("failed building collector local-sessions HTTP client")?;
+        Ok(Self { cfg, client })
+    }
+
+    async fn push_artifacts(
+        &self,
+        artifacts: Vec<LocalSessionArtifact>,
+        mode: CollectorIngestMode,
+    ) -> Result<(), CollectorUploadError> {
+        if artifacts.is_empty() {
+            return Ok(());
+        }
+
+        let url = compose_upload_url(self.cfg.endpoint.as_str(), self.cfg.upload_path.as_str());
+        for chunk in artifacts.chunks(self.cfg.batch_size) {
+            let request = LocalSessionsBatchRequest {
+                agent_instance_id: self.cfg.agent_instance_id.clone(),
+                config_version: self.cfg.config_version.clone(),
+                client_device_id: self.cfg.client_device_id.clone(),
+                ingest_mode: Some(mode.as_tag().to_string()),
+                batch: chunk.to_vec(),
+            };
+            let response = self
+                .client
+                .post(url.as_str())
+                .header(API_VERSION_HEADER, API_VERSION)
+                .header("content-type", "application/json")
+                .bearer_auth(self.cfg.api_key.as_str())
+                .json(&request)
+                .send()
+                .await
+                .map_err(|error| CollectorUploadError {
+                    message: format!("collector local sessions upload failed for {url}: {error}"),
+                    rate_limited: false,
+                    retry_after_secs: None,
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                let retry_after_secs = parse_retry_after_secs(response.headers())
+                    .or_else(|| status.as_u16().eq(&429).then_some(1));
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unavailable>".to_string());
+                let retry_after_secs =
+                    retry_after_secs.or_else(|| parse_retry_after_secs_body(&body));
+                let body = truncate_utf8(body.as_str(), 256);
+                return Err(CollectorUploadError {
+                    message: format!(
+                        "collector local sessions upload returned status {} body={}",
+                        status.as_u16(),
+                        body
+                    ),
+                    rate_limited: status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    retry_after_secs,
+                });
+            }
+            let decoded = response
+                .json::<LocalSessionsBatchResponse>()
+                .await
+                .map_err(|error| CollectorUploadError {
+                    message: format!("failed decoding local sessions upload response: {error}"),
+                    rate_limited: false,
+                    retry_after_secs: None,
+                })?;
+            if decoded.rejected > 0 {
+                let mut duplicate_rejections = 0u64;
+                let mut top_reason: Option<String> = None;
+                let mut top_reason_count = 0u64;
+                let mut reason_counts: HashMap<String, u64> = HashMap::new();
+                for error in &decoded.errors {
+                    let reason = error
+                        .code
+                        .as_deref()
+                        .or(Some(error.reason.as_str()))
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("unknown")
+                        .to_ascii_lowercase();
+                    let next = reason_counts
+                        .get(reason.as_str())
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    reason_counts.insert(reason.clone(), next);
+                    if next > top_reason_count {
+                        top_reason_count = next;
+                        top_reason = Some(reason.clone());
+                    }
+                    if reason == "duplicate" {
+                        duplicate_rejections = duplicate_rejections.saturating_add(1);
+                    }
+                }
+
+                if duplicate_rejections == decoded.rejected {
+                    info!(
+                        accepted = decoded.accepted,
+                        rejected = decoded.rejected,
+                        "Collector local-sessions upload returned duplicate rows only"
+                    );
+                } else {
+                    warn!(
+                        accepted = decoded.accepted,
+                        rejected = decoded.rejected,
+                        duplicate_rejected = duplicate_rejections,
+                        top_reason = top_reason.unwrap_or_else(|| "unknown".to_string()),
+                        "Collector local-sessions upload returned rejected rows"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn normalize_upload_path_or_url(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.trim_end_matches('/').to_string());
+    }
+    let normalized = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    let normalized = normalized.trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(normalized)
+    }
+}
+
+fn compose_upload_url(endpoint: &str, path_or_url: &str) -> String {
+    if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+        return path_or_url.to_string();
+    }
+    format!("{endpoint}{path_or_url}")
+}
+
+fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    raw.trim().parse::<u64>().ok()
+}
+
+fn parse_retry_after_secs_body(body: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    value
+        .get("retry_after_secs")
+        .and_then(|value| value.as_u64())
+}
+
+fn build_default_agent_instance_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "edge".to_string());
+    format!(
+        "collector-{}-{}-{}",
+        host,
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    )
 }
 
 fn parse_sqlite_sources_from_env() -> Vec<CollectorSqliteSource> {
@@ -481,6 +756,7 @@ pub fn spawn_runtime(
         frontload_force_first_run = collector.config.frontload_force_first_run,
         frontload_reset_offsets_on_start = collector.config.frontload_reset_offsets_on_start,
         frontload_cycles = collector.config.frontload_max_cycles,
+        direct_upload_enabled = collector.uploader.is_some(),
         poll_secs = collector.config.poll_interval.as_secs(),
         state_path = %collector.config.state_path.display(),
         "Local collector enabled"
@@ -512,7 +788,7 @@ pub fn spawn_runtime(
             }
         }
         if collector.config.frontload_on_start {
-            if let Err(error) = collector.run_frontload(&event_logger) {
+            if let Err(error) = collector.run_frontload(&event_logger).await {
                 warn!("Collector frontload failed: {}", error);
             } else if should_force_first_run_frontload {
                 if let Err(error) = collector.mark_frontload_bootstrap_complete() {
@@ -533,7 +809,7 @@ pub fn spawn_runtime(
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Err(error) = collector.poll_once(&event_logger) {
+                    if let Err(error) = collector.poll_once(&event_logger).await {
                         warn!("Collector poll failed: {}", error);
                     }
                 }
@@ -550,6 +826,8 @@ struct CollectorAgent {
     offsets: OffsetState,
     session_id: String,
     redactor: PiiRedactor,
+    uploader: Option<CollectorDirectUploader>,
+    upload_backoff_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -575,12 +853,28 @@ struct PollStats {
 
 impl CollectorAgent {
     fn new(config: CollectorConfig, global_tags: BTreeMap<String, String>) -> Self {
+        let uploader =
+            config
+                .direct_upload
+                .clone()
+                .and_then(|cfg| match CollectorDirectUploader::new(cfg) {
+                    Ok(uploader) => Some(uploader),
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "Collector direct upload disabled: failed initializing uploader"
+                        );
+                        None
+                    }
+                });
         Self {
             config,
             global_tags,
             offsets: OffsetState::default(),
             session_id: uuid::Uuid::new_v4().to_string(),
             redactor: PiiRedactor::new().with_preserve_length(false),
+            uploader,
+            upload_backoff_until: None,
         }
     }
 
@@ -622,15 +916,17 @@ impl CollectorAgent {
         state.save(&path)
     }
 
-    fn run_frontload(&mut self, logger: &EventLogger) -> anyhow::Result<()> {
+    async fn run_frontload(&mut self, logger: &EventLogger) -> anyhow::Result<()> {
         let mut total_events = 0usize;
         let mut cycles = 0usize;
         for _ in 0..self.config.frontload_max_cycles {
-            let stats = self.poll_once_with_limits(
-                logger,
-                self.config.frontload_max_read_bytes_per_source,
-                CollectorIngestMode::Frontload,
-            )?;
+            let stats = self
+                .poll_once_with_limits(
+                    logger,
+                    self.config.frontload_max_read_bytes_per_source,
+                    CollectorIngestMode::Frontload,
+                )
+                .await?;
             cycles += 1;
             total_events += stats.events_emitted;
             if !stats.state_changed {
@@ -649,25 +945,45 @@ impl CollectorAgent {
         Ok(())
     }
 
-    fn poll_once(&mut self, logger: &EventLogger) -> anyhow::Result<()> {
+    async fn poll_once(&mut self, logger: &EventLogger) -> anyhow::Result<()> {
         self.poll_once_with_limits(
             logger,
             self.config.max_read_bytes_per_source,
             CollectorIngestMode::Incremental,
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    fn poll_once_with_limits(
+    async fn poll_once_with_limits(
         &mut self,
         logger: &EventLogger,
         max_read_bytes_per_source: usize,
         mode: CollectorIngestMode,
     ) -> anyhow::Result<PollStats> {
+        if let Some(until) = self.upload_backoff_until {
+            let now = Instant::now();
+            if now < until {
+                let remaining = until.saturating_duration_since(now).as_secs().max(1);
+                if matches!(mode, CollectorIngestMode::Frontload) {
+                    return Err(anyhow::anyhow!(
+                        "collector local sessions upload paused by rate limit ({}s remaining)",
+                        remaining
+                    ));
+                }
+                return Ok(PollStats {
+                    events_emitted: 0,
+                    state_changed: false,
+                });
+            }
+            self.upload_backoff_until = None;
+        }
+
         let mut state_changed = false;
         let mut events_emitted = 0usize;
+        let mut rate_limited_backoff: Option<u64> = None;
 
-        for source in resolve_collector_sources_for_scan(&self.config.sources) {
+        'file_sources: for source in resolve_collector_sources_for_scan(&self.config.sources) {
             let key = source.path.to_string_lossy().to_string();
             let prior_state = self.offsets.files.get(&key).cloned().unwrap_or_default();
             let outcome = collect_source_events(
@@ -676,63 +992,146 @@ impl CollectorAgent {
                 max_read_bytes_per_source,
                 self.config.max_line_bytes,
             )?;
-            if outcome.next_state != prior_state {
-                self.offsets.files.insert(key, outcome.next_state);
-                state_changed = true;
-            }
-
-            for source_line in outcome.lines {
-                if let Some(event) = self.build_event(&source, source_line, mode) {
-                    events_emitted += 1;
-                    logger.log(&event);
-                    if self.config.exchange_v2.enabled {
-                        let source_class = if source.agent.is_some() {
-                            ExchangeSourceClass::AgentApp
-                        } else {
-                            ExchangeSourceClass::Collector
-                        };
-                        if let Err(error) = logger.enqueue_exchange_from_wrap_event(
-                            &event,
-                            &self.config.exchange_v2,
-                            Some(source_class),
-                        ) {
+            let mut source_upload_failed = false;
+            if let Some(uploader) = self.uploader.as_ref() {
+                let mut artifacts = Vec::new();
+                for source_line in outcome.lines {
+                    if let Some(artifact) =
+                        self.build_local_session_artifact(&source, source_line, mode)
+                    {
+                        events_emitted += 1;
+                        artifacts.push(artifact);
+                    }
+                }
+                if !artifacts.is_empty() {
+                    if let Err(error) = uploader.push_artifacts(artifacts, mode).await {
+                        if error.rate_limited {
+                            let backoff_secs = error
+                                .retry_after_secs
+                                .unwrap_or(DEFAULT_LOCAL_SESSIONS_RATE_LIMIT_BACKOFF_SECS)
+                                .max(1)
+                                .min(300);
+                            self.upload_backoff_until =
+                                Some(Instant::now() + Duration::from_secs(backoff_secs));
+                            rate_limited_backoff = Some(backoff_secs);
                             warn!(
-                                event_id = %event.id,
-                                error = %error,
-                                "Collector failed to enqueue exchange.v2 payload"
+                                mode = mode.as_tag(),
+                                backoff_secs,
+                                "Collector local sessions upload rate-limited; pausing uploads"
                             );
+                            break 'file_sources;
+                        }
+                        source_upload_failed = true;
+                        warn!(
+                            source = %source.name,
+                            path = %source.path.display(),
+                            mode = mode.as_tag(),
+                            error = %error.message,
+                            "Collector local artifact upload failed; offsets unchanged for retry"
+                        );
+                    }
+                }
+            } else {
+                for source_line in outcome.lines {
+                    if let Some(event) = self.build_event(&source, source_line, mode) {
+                        events_emitted += 1;
+                        logger.log(&event);
+                        if self.config.exchange_v2.enabled {
+                            let source_class = if source.agent.is_some() {
+                                ExchangeSourceClass::AgentApp
+                            } else {
+                                ExchangeSourceClass::Collector
+                            };
+                            if let Err(error) = logger.enqueue_exchange_from_wrap_event(
+                                &event,
+                                &self.config.exchange_v2,
+                                Some(source_class),
+                            ) {
+                                warn!(
+                                    event_id = %event.id,
+                                    error = %error,
+                                    "Collector failed to enqueue exchange.v2 payload"
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
-
-        for source in &self.config.sqlite_sources {
-            let key = source.db_path.to_string_lossy().to_string();
-            let prior_state = self.offsets.sqlite.get(&key).cloned().unwrap_or_default();
-            let outcome = collect_sqlite_events(source, &prior_state, self.config.max_line_bytes)?;
-            if outcome.next_state != prior_state {
-                self.offsets.sqlite.insert(key, outcome.next_state);
+            if !source_upload_failed && outcome.next_state != prior_state {
+                self.offsets.files.insert(key, outcome.next_state);
                 state_changed = true;
             }
+        }
 
-            for source_line in outcome.lines {
-                if let Some(event) = self.build_sqlite_event(source, source_line, mode) {
-                    events_emitted += 1;
-                    logger.log(&event);
-                    if self.config.exchange_v2.enabled {
-                        if let Err(error) = logger.enqueue_exchange_from_wrap_event(
-                            &event,
-                            &self.config.exchange_v2,
-                            Some(ExchangeSourceClass::Collector),
-                        ) {
+        if rate_limited_backoff.is_none() {
+            'sqlite_sources: for source in &self.config.sqlite_sources {
+                let key = source.db_path.to_string_lossy().to_string();
+                let prior_state = self.offsets.sqlite.get(&key).cloned().unwrap_or_default();
+                let outcome =
+                    collect_sqlite_events(source, &prior_state, self.config.max_line_bytes)?;
+                let mut source_upload_failed = false;
+                if let Some(uploader) = self.uploader.as_ref() {
+                    let mut artifacts = Vec::new();
+                    for source_line in outcome.lines {
+                        if let Some(artifact) =
+                            self.build_local_sqlite_artifact(source, source_line, mode)
+                        {
+                            events_emitted += 1;
+                            artifacts.push(artifact);
+                        }
+                    }
+                    if !artifacts.is_empty() {
+                        if let Err(error) = uploader.push_artifacts(artifacts, mode).await {
+                            if error.rate_limited {
+                                let backoff_secs = error
+                                    .retry_after_secs
+                                    .unwrap_or(DEFAULT_LOCAL_SESSIONS_RATE_LIMIT_BACKOFF_SECS)
+                                    .max(1)
+                                    .min(300);
+                                self.upload_backoff_until =
+                                    Some(Instant::now() + Duration::from_secs(backoff_secs));
+                                rate_limited_backoff = Some(backoff_secs);
+                                warn!(
+                                    mode = mode.as_tag(),
+                                    backoff_secs,
+                                    "Collector local sessions upload rate-limited; pausing uploads"
+                                );
+                                break 'sqlite_sources;
+                            }
+                            source_upload_failed = true;
                             warn!(
-                                event_id = %event.id,
-                                error = %error,
-                                "Collector failed to enqueue exchange.v2 payload"
+                                source = %source.name,
+                                db_path = %source.db_path.display(),
+                                mode = mode.as_tag(),
+                                error = %error.message,
+                                "Collector sqlite artifact upload failed; offsets unchanged for retry"
                             );
                         }
                     }
+                } else {
+                    for source_line in outcome.lines {
+                        if let Some(event) = self.build_sqlite_event(source, source_line, mode) {
+                            events_emitted += 1;
+                            logger.log(&event);
+                            if self.config.exchange_v2.enabled {
+                                if let Err(error) = logger.enqueue_exchange_from_wrap_event(
+                                    &event,
+                                    &self.config.exchange_v2,
+                                    Some(ExchangeSourceClass::Collector),
+                                ) {
+                                    warn!(
+                                        event_id = %event.id,
+                                        error = %error,
+                                        "Collector failed to enqueue exchange.v2 payload"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if !source_upload_failed && outcome.next_state != prior_state {
+                    self.offsets.sqlite.insert(key, outcome.next_state);
+                    state_changed = true;
                 }
             }
         }
@@ -741,9 +1140,236 @@ impl CollectorAgent {
             self.save_state()?;
         }
 
+        if let Some(backoff_secs) = rate_limited_backoff {
+            if matches!(mode, CollectorIngestMode::Frontload) {
+                return Err(anyhow::anyhow!(
+                    "collector local sessions upload rate-limited; backoff={}s",
+                    backoff_secs
+                ));
+            }
+        }
+
         Ok(PollStats {
             events_emitted,
             state_changed,
+        })
+    }
+
+    fn build_local_session_artifact(
+        &self,
+        source: &CollectorSource,
+        line: SourceLine,
+        mode: CollectorIngestMode,
+    ) -> Option<LocalSessionArtifact> {
+        let trimmed = line.content.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let parsed = parse_line(source.parser, trimmed);
+        let observed_at = parsed.occurred_at.unwrap_or_else(Utc::now);
+        let local_type = normalize_local_type(
+            source
+                .agent
+                .as_deref()
+                .or(parsed.agent.as_deref())
+                .unwrap_or(source.name.as_str()),
+        );
+        let content_type = if matches!(source.parser, CollectorParser::JsonLines) {
+            Some("application/json".to_string())
+        } else {
+            Some("text/plain".to_string())
+        };
+        let body_inline = parsed.content;
+        let body_bytes = Some(body_inline.len() as u64);
+        let mut tags = HashMap::new();
+        for (key, value) in &self.global_tags {
+            tags.insert(key.clone(), value.clone());
+        }
+        for (key, value) in &source.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+        if let Some(agent) = parsed.agent.as_ref().or(source.agent.as_ref()) {
+            tags.entry("collector.agent".to_string())
+                .or_insert_with(|| agent.clone());
+        }
+        tags.entry("collector.source".to_string())
+            .or_insert_with(|| source.name.clone());
+        tags.entry("collector.parser".to_string())
+            .or_insert_with(|| source.parser.as_tag().to_string());
+        tags.insert(
+            "collector.ingest_mode".to_string(),
+            mode.as_tag().to_string(),
+        );
+        tags.insert("collector.offset".to_string(), line.end_offset.to_string());
+        if matches!(mode, CollectorIngestMode::Frontload) {
+            tags.insert("collector.frontload".to_string(), "true".to_string());
+        }
+        if let Some(project) = parsed.project.as_ref() {
+            tags.insert("collector.project".to_string(), project.clone());
+        }
+        if let Some(method) = parsed.method.as_ref() {
+            tags.insert("collector.method".to_string(), method.clone());
+        }
+        if let Some(tool_name) = parsed.tool_name.as_ref() {
+            tags.insert("collector.tool".to_string(), tool_name.clone());
+        }
+
+        let metadata = serde_json::json!({
+            "collector": {
+                "source": source.name,
+                "offset": line.end_offset,
+                "parser": source.parser.as_tag(),
+                "ingest_mode": mode.as_tag(),
+                "source_path": source.path.to_string_lossy().to_string(),
+            },
+            "parsed": {
+                "direction": parsed.direction.map(direction_tag),
+                "method": parsed.method,
+                "tool_name": parsed.tool_name,
+                "request": parsed.request,
+                "response": parsed.response,
+            },
+        });
+
+        Some(LocalSessionArtifact {
+            artifact_id: build_local_artifact_id(
+                source.path.to_string_lossy().as_ref(),
+                local_type.as_str(),
+                line.end_offset,
+            ),
+            observed_at: observed_at.to_rfc3339(),
+            local_type,
+            file_type: Some(source.parser.as_tag().to_string()),
+            parser_hint: Some(source.parser.as_tag().to_string()),
+            source_path: Some(source.path.to_string_lossy().to_string()),
+            source_db_path: None,
+            source_query: None,
+            read_mode: Some(mode.as_tag().to_string()),
+            content_type,
+            body_inline: Some(body_inline),
+            body_blob_key: None,
+            body_sha256: None,
+            body_bytes,
+            session_id: parsed
+                .session_id
+                .or_else(|| Some(self.session_id.clone()))
+                .filter(|value| !value.trim().is_empty()),
+            provider: parsed.provider.or(source.provider.clone()),
+            model: parsed.model.or(source.model.clone()),
+            agent: parsed
+                .agent
+                .or(source.agent.clone())
+                .or_else(|| Some(self.config.agent_name.clone())),
+            tags: if tags.is_empty() { None } else { Some(tags) },
+            metadata: Some(metadata),
+        })
+    }
+
+    fn build_local_sqlite_artifact(
+        &self,
+        source: &CollectorSqliteSource,
+        line: SqliteSourceLine,
+        mode: CollectorIngestMode,
+    ) -> Option<LocalSessionArtifact> {
+        let trimmed = line.content.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let parsed = parse_line(CollectorParser::JsonLines, trimmed);
+        let observed_at = parsed.occurred_at.unwrap_or_else(Utc::now);
+        let local_type = normalize_local_type(
+            parsed
+                .agent
+                .as_deref()
+                .or(source.server_name.as_deref())
+                .unwrap_or(source.name.as_str()),
+        );
+        let body_inline = parsed.content;
+        let body_bytes = Some(body_inline.len() as u64);
+        let mut tags = HashMap::new();
+        for (key, value) in &self.global_tags {
+            tags.insert(key.clone(), value.clone());
+        }
+        for (key, value) in &source.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+        tags.entry("collector.source".to_string())
+            .or_insert_with(|| source.name.clone());
+        tags.entry("collector.parser".to_string())
+            .or_insert_with(|| CollectorParser::JsonLines.as_tag().to_string());
+        tags.insert(
+            "collector.ingest_mode".to_string(),
+            mode.as_tag().to_string(),
+        );
+        tags.insert("collector.query_type".to_string(), line.file_type.clone());
+        tags.insert("collector.offset".to_string(), line.end_offset.to_string());
+        if matches!(mode, CollectorIngestMode::Frontload) {
+            tags.insert("collector.frontload".to_string(), "true".to_string());
+        }
+        if let Some(project) = parsed.project.as_ref() {
+            tags.insert("collector.project".to_string(), project.clone());
+        }
+        if let Some(method) = parsed.method.as_ref() {
+            tags.insert("collector.method".to_string(), method.clone());
+        }
+        if let Some(tool_name) = parsed.tool_name.as_ref() {
+            tags.insert("collector.tool".to_string(), tool_name.clone());
+        }
+        if let Some(agent) = parsed.agent.as_ref() {
+            tags.entry("collector.agent".to_string())
+                .or_insert_with(|| agent.clone());
+        }
+
+        let metadata = serde_json::json!({
+            "collector": {
+                "source": source.name,
+                "offset": line.end_offset,
+                "query_type": line.file_type,
+                "ingest_mode": mode.as_tag(),
+                "source_db_path": source.db_path.to_string_lossy().to_string(),
+            },
+            "parsed": {
+                "direction": parsed.direction.map(direction_tag),
+                "method": parsed.method,
+                "tool_name": parsed.tool_name,
+                "request": parsed.request,
+                "response": parsed.response,
+            },
+        });
+
+        Some(LocalSessionArtifact {
+            artifact_id: build_local_artifact_id(
+                source.db_path.to_string_lossy().as_ref(),
+                local_type.as_str(),
+                line.end_offset,
+            ),
+            observed_at: observed_at.to_rfc3339(),
+            local_type,
+            file_type: Some(line.file_type.clone()),
+            parser_hint: Some("jsonl".to_string()),
+            source_path: None,
+            source_db_path: Some(source.db_path.to_string_lossy().to_string()),
+            source_query: Some(line.file_type),
+            read_mode: Some(mode.as_tag().to_string()),
+            content_type: Some("application/json".to_string()),
+            body_inline: Some(body_inline),
+            body_blob_key: None,
+            body_sha256: None,
+            body_bytes,
+            session_id: parsed
+                .session_id
+                .or_else(|| Some(self.session_id.clone()))
+                .filter(|value| !value.trim().is_empty()),
+            provider: parsed.provider.or(source.provider.clone()),
+            model: parsed.model.or(source.model.clone()),
+            agent: parsed
+                .agent
+                .or_else(|| source.server_name.clone())
+                .or_else(|| Some(self.config.agent_name.clone())),
+            tags: if tags.is_empty() { None } else { Some(tags) },
+            metadata: Some(metadata),
         })
     }
 
@@ -1869,6 +2495,48 @@ fn parse_direction(raw: &str) -> Option<WrapDirection> {
     }
 }
 
+fn direction_tag(direction: WrapDirection) -> &'static str {
+    match direction {
+        WrapDirection::In => "in",
+        WrapDirection::Out => "out",
+    }
+}
+
+fn normalize_local_type(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("registry:")
+        .trim_start_matches("local:")
+        .trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    let normalized = trimmed
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('-').replace("--", "-");
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn build_local_artifact_id(source_key: &str, local_type: &str, offset: u64) -> String {
+    let mut hasher = DefaultHasher::new();
+    source_key.hash(&mut hasher);
+    local_type.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("{}-{:016x}-{}", local_type, hash, offset)
+}
+
 fn redact_content(redactor: &PiiRedactor, content: String) -> (String, Vec<String>) {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
         let (redacted, redactions) = redactor.redact_json(&json);
@@ -2096,6 +2764,7 @@ mod tests {
             agent_name: "collector".to_string(),
             event_source: EventSource::AgentApp,
             exchange_v2: ExchangeV2Config::default(),
+            direct_upload: None,
             sources: Vec::new(),
             sqlite_sources: Vec::new(),
         }

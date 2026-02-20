@@ -55,6 +55,9 @@ pub async fn run(
     ensure_fd_budget();
 
     let mut config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    if config.cloud.enabled {
+        let _ = cli_config::sync_client_device_id(&mut config, None)?;
+    }
     cloud_hooks::apply_cached_controls(&mut config)?;
 
     // Override port if specified
@@ -475,6 +478,13 @@ fn parse_registry_collector_hints(bundle: &serde_json::Value) -> RegistryCollect
     let mut upload_endpoint = None;
 
     for section in sections {
+        parse_registry_collector_sources_from_local_sources_v2(
+            section.get("collector"),
+            &mut file_sources,
+            &mut file_seen,
+            &mut sqlite_sources,
+            &mut upload_endpoint,
+        );
         if upload_endpoint.is_none() {
             upload_endpoint = section
                 .get("localDataSources")
@@ -561,6 +571,201 @@ fn parse_registry_collector_sources_from_array(
             .map(str::to_string);
         push_registry_collector_source(parsed, seen, agent, path, parser);
     }
+}
+
+fn parse_registry_collector_sources_from_local_sources_v2(
+    collector: Option<&serde_json::Value>,
+    file_sources: &mut Vec<RegistryCollectorSource>,
+    file_seen: &mut BTreeSet<String>,
+    sqlite_sources: &mut Vec<RegistryCollectorSqliteSource>,
+    upload_endpoint: &mut Option<String>,
+) {
+    let Some(collector_obj) = collector.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    if collector_obj
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        return;
+    }
+
+    if upload_endpoint.is_none() {
+        *upload_endpoint = collector_obj
+            .get("local_ingestion")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|ingestion| ingestion.get("upload_endpoint"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+
+    let source_bindings = collector_obj
+        .get("local_ingestion")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|ingestion| ingestion.get("source_bindings"))
+        .and_then(serde_json::Value::as_object);
+
+    let Some(sources_obj) = collector_obj
+        .get("artifact_catalog")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|catalog| catalog.get("sources"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+
+    for (source_name, source_value) in sources_obj {
+        let Some(source_obj) = source_value.as_object() else {
+            continue;
+        };
+        if !local_source_binding_enabled(source_bindings, source_name.as_str()) {
+            continue;
+        }
+        let agent = source_obj
+            .get("detection_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(source_name.as_str());
+
+        let parser = source_obj
+            .get("parser")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|parser| {
+                let enabled = parser
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                if enabled {
+                    parser
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            });
+
+        let Some(collectors) = source_obj
+            .get("collectors")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+
+        for collector_entry in collectors {
+            let Some(entry_obj) = collector_entry.as_object() else {
+                continue;
+            };
+            let kind = entry_obj
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            match kind {
+                "glob" => {
+                    let Some(pattern) = entry_obj
+                        .get("pattern")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    let content_type = entry_obj
+                        .get("content_type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim);
+                    if !is_supported_registry_collector_glob(pattern, content_type) {
+                        continue;
+                    }
+                    let parser_name = parser.clone().or_else(|| {
+                        Some(
+                            default_registry_collector_parser_for_glob(pattern, content_type)
+                                .to_string(),
+                        )
+                    });
+                    push_registry_collector_source(
+                        file_sources,
+                        file_seen,
+                        agent,
+                        pattern,
+                        parser_name,
+                    );
+                }
+                "sqlite_query" => {
+                    let Some(db_path) = entry_obj
+                        .get("db_path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    let Some(file_type) = entry_obj
+                        .get("file_type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    let Some(sql) = entry_obj
+                        .get("sql")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    let incremental_field = entry_obj
+                        .get("incremental_field")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
+                    let mut tags = std::collections::BTreeMap::new();
+                    tags.insert(
+                        "collector.discovery".to_string(),
+                        "registry_bundle".to_string(),
+                    );
+                    tags.insert("collector.agent".to_string(), agent.to_string());
+
+                    push_registry_sqlite_source(
+                        sqlite_sources,
+                        RegistryCollectorSqliteSource {
+                            agent: agent.to_string(),
+                            db_path: db_path.to_string(),
+                            queries: vec![RegistryCollectorSqliteQuery {
+                                file_type: file_type.to_string(),
+                                sql: sql.to_string(),
+                                incremental_field,
+                            }],
+                            tags,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn local_source_binding_enabled(
+    source_bindings: Option<&serde_json::Map<String, serde_json::Value>>,
+    source_name: &str,
+) -> bool {
+    source_bindings
+        .and_then(|bindings| bindings.get(source_name))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|binding| binding.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
 }
 
 fn parse_registry_collector_sources_from_local_artifacts(
@@ -884,6 +1089,46 @@ fn load_registry_collector_hints(config: &SothConfig) -> RegistryCollectorHints 
 fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollectorConfig) {
     let registry_hints = load_registry_collector_hints(config);
     let registry_sources = &registry_hints.file_sources;
+    if config.cloud.enabled {
+        if let Some(api_key) = config
+            .cloud
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            std::env::set_var("SOTH_COLLECTOR_DIRECT_UPLOAD_ENABLED", "true");
+            std::env::set_var(
+                "SOTH_COLLECTOR_CLOUD_ENDPOINT",
+                config.cloud.endpoint.trim_end_matches('/'),
+            );
+            std::env::set_var("SOTH_COLLECTOR_CLOUD_API_KEY", api_key);
+            let upload_path = registry_hints
+                .upload_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("/api/v1/ingest/local-sessions");
+            std::env::set_var("SOTH_COLLECTOR_UPLOAD_PATH", upload_path);
+            if let Some(device_id) = config
+                .cloud
+                .tags
+                .get("device_id")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                std::env::set_var("SOTH_COLLECTOR_CLIENT_DEVICE_ID", device_id);
+            } else {
+                std::env::remove_var("SOTH_COLLECTOR_CLIENT_DEVICE_ID");
+            }
+        } else {
+            std::env::set_var("SOTH_COLLECTOR_DIRECT_UPLOAD_ENABLED", "false");
+            warn!("Collector direct upload disabled because cloud.api_key is missing");
+        }
+    } else {
+        std::env::set_var("SOTH_COLLECTOR_DIRECT_UPLOAD_ENABLED", "false");
+    }
     if config.cloud.frontload_exchange_upload_path.is_none() {
         if let Some(upload_endpoint) = registry_hints.upload_endpoint.as_deref() {
             let trimmed = upload_endpoint.trim();
@@ -1171,5 +1416,70 @@ mod tests {
         );
         assert_eq!(sqlite.queries.len(), 1);
         assert_eq!(sqlite.queries[0].file_type, "sqlite_composer");
+    }
+
+    #[test]
+    fn parse_registry_collector_hints_supports_local_sources_v2_shape() {
+        let bundle = serde_json::json!({
+            "collector": {
+                "schema_version": 2,
+                "artifact_catalog": {
+                    "sources": {
+                        "codex": {
+                            "detection_id": "agent.codex.app",
+                            "parser": { "name": "codex", "enabled": true },
+                            "collectors": [
+                                {
+                                    "id": "glob_session_transcript_1",
+                                    "kind": "glob",
+                                    "pattern": "~/.codex/sessions/**/*.jsonl",
+                                    "file_type": "session_transcript",
+                                    "read_mode": "incremental",
+                                    "content_type": "json"
+                                }
+                            ]
+                        },
+                        "cursor": {
+                            "detection_id": "agent.cursor.app",
+                            "collectors": [
+                                {
+                                    "id": "sqlite_sqlite_composer",
+                                    "kind": "sqlite_query",
+                                    "db_path": "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+                                    "file_type": "sqlite_composer",
+                                    "sql": "SELECT rowid, value FROM cursorDiskKV WHERE rowid > ?",
+                                    "incremental_field": "rowid"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "local_ingestion": {
+                    "upload_endpoint": "/api/v1/ingest/local-sessions",
+                    "source_bindings": {
+                        "codex": { "enabled": true },
+                        "cursor": { "enabled": true }
+                    }
+                }
+            }
+        });
+
+        let hints = parse_registry_collector_hints(&bundle);
+        assert_eq!(
+            hints.upload_endpoint.as_deref(),
+            Some("/api/v1/ingest/local-sessions")
+        );
+        assert!(hints
+            .file_sources
+            .iter()
+            .any(|source| source.agent == "agent.codex.app"
+                && source.path == "~/.codex/sessions/**/*.jsonl"));
+        assert_eq!(hints.sqlite_sources.len(), 1);
+        assert_eq!(hints.sqlite_sources[0].agent, "agent.cursor.app");
+        assert_eq!(hints.sqlite_sources[0].queries.len(), 1);
+        assert_eq!(
+            hints.sqlite_sources[0].queries[0].file_type,
+            "sqlite_composer"
+        );
     }
 }

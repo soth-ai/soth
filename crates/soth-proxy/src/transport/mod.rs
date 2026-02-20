@@ -19,5 +19,6 @@ pub mod proxy_runtime;
 pub mod proxy_support;
 pub mod proxy_websocket;
 pub mod response_event_builder;
+#[cfg(test)]
 pub mod tier_enrichment;
 pub mod usage_enrichment;

@@ -26,7 +26,7 @@ pub(crate) fn append_detection_tags(tags: &mut BTreeMap<String, String>, pending
         pending.detection_source.as_deref(),
         pending.detection_reason.as_deref(),
         pending.parse_confidence,
-        pending.target_entity_id.as_deref(),
+        pending.detection_id.as_deref(),
     );
 }
 
@@ -35,7 +35,7 @@ fn append_detection_tags_from_values(
     detection_source: Option<&str>,
     detection_reason: Option<&str>,
     parse_confidence: Option<f64>,
-    target_entity_id: Option<&str>,
+    detection_id: Option<&str>,
 ) {
     if let Some(source) = detection_source {
         tags.insert("detection.source".to_string(), source.to_string());
@@ -49,11 +49,8 @@ fn append_detection_tags_from_values(
             format!("{confidence:.3}"),
         );
     }
-    if let Some(entity_id) = target_entity_id {
-        tags.insert(
-            "detection.target_entity_id".to_string(),
-            entity_id.to_string(),
-        );
+    if let Some(value) = detection_id {
+        tags.insert("detection.id".to_string(), value.to_string());
     }
 }
 
@@ -230,18 +227,7 @@ fn classify_process_app_type(
             return Some("browser".to_string());
         }
         if has_any(&[
-            "claude-code",
-            "claude-cli",
-            "claude --",
-            "codex",
-            "terminal",
-            "bash",
-            "zsh",
-            "fish",
-            "python",
-            "node",
-            "npm",
-            "cargo",
+            "terminal", "bash", "zsh", "fish", "python", "node", "npm", "cargo",
         ]) {
             return Some("cli".to_string());
         }
@@ -287,7 +273,7 @@ fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
 fn infer_agent_fallback_app_type(agent: Option<&str>) -> Option<String> {
     let lower = agent?.to_ascii_lowercase();
     let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-    if has_any(&["codex", "claude-code", "terminal", "shell", "cli"]) {
+    if has_any(&["terminal", "shell", "cli"]) {
         return Some("cli".to_string());
     }
     if has_any(&[
@@ -299,9 +285,6 @@ fn infer_agent_fallback_app_type(agent: Option<&str>) -> Option<String> {
         "zed",
     ]) {
         return Some("editor".to_string());
-    }
-    if has_any(&["chatgpt", "claude", "warp"]) {
-        return Some("desktop_app".to_string());
     }
     Some("unknown".to_string())
 }
@@ -315,46 +298,36 @@ fn detection_id_for_pending(pending: &PendingRequest) -> Option<String> {
     if !detection_source_is_bundle {
         return None;
     }
-    non_empty_string(pending.target_entity_id.clone())
+    non_empty_string(pending.detection_id.clone())
 }
 
 fn is_strict_bundle_detection_id(value: &str) -> bool {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
+    if trimmed.is_empty() || trimmed.len() > 160 {
         return false;
     }
 
     let normalized = trimmed.to_ascii_lowercase();
     if normalized.starts_with("provider.")
-        || normalized.starts_with("agent.")
         || normalized.starts_with("bundle.")
         || normalized.starts_with("unknown")
     {
         return false;
     }
 
-    if let Some((prefix, suffix)) = normalized.split_once('_') {
-        if matches!(prefix, "prv" | "agt" | "mcp")
-            && suffix.len() >= 4
-            && suffix.len() <= 64
-            && suffix
-                .chars()
-                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-        {
-            return true;
-        }
-    }
-
     let segments = normalized.split('.').collect::<Vec<_>>();
-    if segments.len() < 2 {
+    if segments.len() < 3 || segments.len() > 8 {
+        return false;
+    }
+    if !matches!(segments.first().copied(), Some("ai" | "agent" | "mcp")) {
         return false;
     }
     segments.iter().all(|segment| {
         !segment.is_empty()
-            && segment.len() <= 64
+            && segment.len() <= 48
             && segment
                 .chars()
-                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
     })
 }
 
@@ -408,21 +381,6 @@ fn enforce_required_detection_fields(
             exchange_id = %event.exchange_id,
             detection_source = pending.detection_source.as_deref().unwrap_or_default(),
             "Dropping proxy exchange: detection_source must be bundle"
-        );
-        return false;
-    }
-    if pending
-        .target_entity_id
-        .as_deref()
-        .and_then(|value| non_empty_string(Some(value.to_string())))
-        .as_deref()
-        != Some(detection_id.as_str())
-    {
-        warn!(
-            exchange_id = %event.exchange_id,
-            pending_target_entity_id = pending.target_entity_id.as_deref().unwrap_or_default(),
-            resolved_detection_id = detection_id,
-            "Dropping proxy exchange: detection_id must match target_entity_id"
         );
         return false;
     }
@@ -502,7 +460,6 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
         bundle_version: detection_bundle_version.clone(),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
-        target_entity_id: pending.target_entity_id.clone(),
         detection_source: pending.detection_source.clone(),
         decision_step: pending.decision_step.clone(),
         decision_outcome: pending.decision_outcome.clone(),
@@ -763,7 +720,6 @@ pub(crate) fn seed_exchange_v2_spool(
         bundle_version: detection_bundle_version,
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
-        target_entity_id: pending.target_entity_id.clone(),
         detection_source: pending.detection_source.clone(),
         decision_step: pending.decision_step.clone(),
         decision_outcome: pending.decision_outcome.clone(),
@@ -892,11 +848,11 @@ mod tests {
     }
 
     #[test]
-    fn strict_bundle_detection_id_accepts_registry_entity_or_namespace_values() {
-        assert!(is_strict_bundle_detection_id("agt_chatgpt1"));
-        assert!(is_strict_bundle_detection_id("prv_openai1"));
-        assert!(is_strict_bundle_detection_id("mcp_github1"));
-        assert!(is_strict_bundle_detection_id("agent.openai.codex"));
+    fn strict_bundle_detection_id_accepts_namespace_values() {
+        assert!(is_strict_bundle_detection_id("agent.chatgpt.app"));
+        assert!(is_strict_bundle_detection_id("ai.openai.service"));
+        assert!(is_strict_bundle_detection_id("mcp.github.tool"));
+        assert!(is_strict_bundle_detection_id("agent.openai.codex.cli"));
     }
 
     #[test]

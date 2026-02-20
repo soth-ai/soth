@@ -50,18 +50,7 @@ const LARGE_HEADER_DEBUG_BYTES: usize = 8000;
 const LARGE_HEADER_WARN_BYTES: usize = 12000;
 
 pub(crate) fn is_chat_ui_host(host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    if host.contains("chatgpt.com") {
-        return true;
-    }
-    if host == "chat.openai.com" || host.ends_with(".chat.openai.com") {
-        return true;
-    }
-    // Include OpenAI web subdomains while excluding the direct API domain.
-    if host.ends_with(".openai.com") && !host.starts_with("api.") {
-        return true;
-    }
-    false
+    !host.trim().is_empty()
 }
 
 fn chatgpt_cookie_priority(name: &str) -> u8 {
@@ -73,8 +62,6 @@ fn chatgpt_cookie_priority(name: &str) -> u8 {
         "__Secure-authjs.session-token" => 0,
         "__Host-authjs.csrf-token" => 0,
         "__Secure-authjs.callback-url" => 1,
-        // OpenAI account identifiers.
-        "_account" | "_puid" | "oai-did" => 1,
         // Cloudflare access checks.
         "__cf_bm" | "cf_clearance" => 1,
         _ => {
@@ -169,12 +156,7 @@ fn is_sensitive_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "authorization"
-            | "cookie"
-            | "set-cookie"
-            | "x-api-key"
-            | "x-claude-api-key"
-            | "proxy-authorization"
+        "authorization" | "cookie" | "set-cookie" | "x-api-key" | "proxy-authorization"
     )
 }
 
@@ -217,9 +199,6 @@ fn is_required_chat_ui_header(name: &str) -> bool {
             | "sec-ch-ua"
             | "sec-ch-ua-mobile"
             | "sec-ch-ua-platform"
-            | "x-openai-client-fingerprint"
-            | "x-openai-assistant-app-id"
-            | "x-openai-latency-hint"
     )
 }
 
@@ -297,7 +276,7 @@ pub(crate) fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path
                                 original = cookie_str.len(),
                                 trimmed = trimmed.len(),
                                 max = CHATGPT_MAX_COOKIE_HEADER_BYTES,
-                                "Trimmed oversized ChatGPT cookie header"
+                                "Trimmed oversized cookie header"
                             );
                         } else {
                             headers.remove(hyper::header::COOKIE);
@@ -331,7 +310,7 @@ pub(crate) fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path
                 path = %path,
                 before = total_size,
                 after = header_size_bytes(req.headers()),
-                "Reduced Chat UI headers to fit strict upstream budget"
+                "Reduced headers to fit strict upstream budget"
             );
         }
     }

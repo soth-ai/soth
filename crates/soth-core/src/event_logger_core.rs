@@ -1247,10 +1247,6 @@ fn wrap_event_to_exchange_v2(
                 .ok()
                 .and_then(|value| value.as_str().map(ToString::to_string))
         });
-    let target_entity_id = event
-        .tags
-        .as_ref()
-        .and_then(|tags| tags.get("detection.target_entity_id").cloned());
     let detection_reason = event
         .tags
         .as_ref()
@@ -1273,7 +1269,6 @@ fn wrap_event_to_exchange_v2(
         bundle_version: None,
         parse_confidence,
         detection_reason,
-        target_entity_id,
         detection_source,
         decision_step: None,
         decision_outcome: None,
@@ -2116,10 +2111,7 @@ mod tests {
                 "detection.parse_confidence".to_string(),
                 "0.9300".to_string(),
             ),
-            (
-                "detection.target_entity_id".to_string(),
-                "agt_bundle01".to_string(),
-            ),
+            ("detection.id".to_string(), "agent.bundle01.app".to_string()),
         ]));
 
         logger
@@ -2142,7 +2134,7 @@ mod tests {
             .contains("\"detection_reason\":\"mcp_initialize\""));
         assert!(ready[0]
             .payload_json
-            .contains("\"target_entity_id\":\"agt_bundle01\""));
+            .contains("\"detection_id\":\"agent.bundle01.app\""));
         assert!(ready[0]
             .payload_json
             .contains("\"process_name\":\"claude-code\""));

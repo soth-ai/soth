@@ -86,8 +86,6 @@ pub struct ExchangeMetadata {
     pub parse_confidence: Option<f64>,
     pub detection_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_entity_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_step: Option<String>,
@@ -162,6 +160,8 @@ pub struct ExchangeBatchResponse {
 pub struct LocalSessionsBatchRequest {
     pub agent_instance_id: String,
     pub config_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingest_mode: Option<String>,
     pub batch: Vec<LocalSessionArtifact>,
@@ -606,7 +606,6 @@ mod tests {
                 bundle_version: Some("bundle-1".to_string()),
                 parse_confidence: Some(0.98),
                 detection_reason: Some("model_marker".to_string()),
-                target_entity_id: Some("agt_abc123".to_string()),
                 detection_source: Some("bundle".to_string()),
                 decision_step: None,
                 decision_outcome: None,
@@ -634,6 +633,7 @@ mod tests {
         let req = LocalSessionsBatchRequest {
             agent_instance_id: "agent-local-1".to_string(),
             config_version: Some("cv-local-1".to_string()),
+            client_device_id: Some("device-local-1".to_string()),
             ingest_mode: Some("frontload".to_string()),
             batch: vec![LocalSessionArtifact {
                 artifact_id: "artifact-codex-1".to_string(),
@@ -669,6 +669,7 @@ mod tests {
         let parsed: LocalSessionsBatchRequest =
             serde_json::from_str(&json).expect("deserialize local sessions batch");
         assert_eq!(parsed.agent_instance_id, "agent-local-1");
+        assert_eq!(parsed.client_device_id.as_deref(), Some("device-local-1"));
         assert_eq!(parsed.ingest_mode.as_deref(), Some("frontload"));
         assert_eq!(parsed.batch.len(), 1);
         assert_eq!(parsed.batch[0].local_type, "codex");

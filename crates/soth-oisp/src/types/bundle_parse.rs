@@ -270,8 +270,8 @@ fn parse_catalog_providers(
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToString::to_string);
-        let entity_id = provider_obj
-            .get("entity_id")
+        let detection_id = provider_obj
+            .get("detection_id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
@@ -303,7 +303,7 @@ fn parse_catalog_providers(
             provider_id.clone(),
             ResolvedProvider {
                 id: provider_id.clone(),
-                entity_id,
+                detection_id,
                 name,
                 entry_type,
                 api_format,
@@ -408,11 +408,6 @@ fn parse_catalog_domain_index(
             if let Some(extra) = provider_path_hints.get(&entry.provider_id) {
                 entry.paths.extend(extra.iter().cloned());
             }
-            if entry.provider_entity_id.is_none() {
-                entry.provider_entity_id = providers
-                    .get(&entry.provider_id)
-                    .and_then(|provider| provider.entity_id.clone());
-            }
             if let Some(host_rules) = interception_patterns
                 .and_then(|patterns| patterns.get(&entry.host))
                 .and_then(Value::as_array)
@@ -479,14 +474,9 @@ fn parse_catalog_domain_index(
         }
         prune_catch_all_path_rules(&mut paths, &entry_type);
         dedup_sort_strings(&mut paths);
-        let provider_entity_id = providers
-            .get(&provider_id)
-            .and_then(|provider| provider.entity_id.clone());
-
         out.push(DomainIndexEntry {
             host: host.clone(),
             provider_id,
-            provider_entity_id,
             entry_type,
             paths,
         });
@@ -558,14 +548,9 @@ fn parse_catalog_domain_index_array_entry(
     }
     prune_catch_all_path_rules(&mut paths, &entry_type);
     dedup_sort_strings(&mut paths);
-    let provider_entity_id = providers
-        .get(&provider_id)
-        .and_then(|provider| provider.entity_id.clone());
-
     Ok(DomainIndexEntry {
         host,
         provider_id,
-        provider_entity_id,
         entry_type,
         paths,
     })
@@ -949,7 +934,7 @@ fn has_any_pricing_field(pricing: &ModelPricing) -> bool {
 
 fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
     for provider in bundle.providers.values_mut() {
-        provider.entity_id = normalize_optional_string(provider.entity_id.take());
+        provider.detection_id = normalize_optional_string(provider.detection_id.take());
         dedup_sort_strings(&mut provider.domains);
         dedup_sort_strings(&mut provider.user_agent_patterns);
         if let Some(detection) = provider.detection.as_mut() {
@@ -957,7 +942,6 @@ fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
         }
     }
     for entry in &mut bundle.domain_index {
-        entry.provider_entity_id = normalize_optional_string(entry.provider_entity_id.take());
         dedup_sort_strings(&mut entry.paths);
     }
     normalize_domain_filters(&mut bundle.filters);
