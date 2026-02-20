@@ -1,7 +1,8 @@
 use crate::cache::BoundedCache;
 use crate::matchers::{
     contains_noise_keyword_for_host, contains_noise_keyword_text, host_matches_any,
-    identifier_matches_any, normalize_host_for_matching, normalize_identifier_for_matching,
+    host_matches_pattern, identifier_matches_any, normalize_host_for_matching,
+    normalize_identifier_for_matching,
     path_matches_any, select_best_domain_match,
 };
 use crate::parse_helpers::{
@@ -98,15 +99,15 @@ impl OispEngine {
         }
         if identifier_matches_any(
             app_identifier.as_str(),
-            &self.bundle.gating.allowed_app_origins.hosts,
-        ) {
-            return Some("host");
-        }
-        if identifier_matches_any(
-            app_identifier.as_str(),
             &self.bundle.gating.allowed_app_origins.non_hosts,
         ) {
             return Some("non_host");
+        }
+        if identifier_matches_any(
+            app_identifier.as_str(),
+            &self.bundle.gating.allowed_app_origins.hosts,
+        ) {
+            return Some("host");
         }
         None
     }
@@ -139,7 +140,11 @@ impl OispEngine {
         if self.bundle.gating.allowed_host_origins.is_empty() {
             return true;
         }
-        host_matches_any(origin.as_str(), &self.bundle.gating.allowed_host_origins)
+        self.bundle
+            .gating
+            .allowed_host_origins
+            .iter()
+            .any(|allowed| host_origin_matches_allowed(origin.as_str(), allowed.as_str()))
     }
 
     pub fn classify(&self, host: &str) -> Option<Classification> {
@@ -437,5 +442,58 @@ impl OispEngine {
                 .find(|(candidate, _)| candidate.eq_ignore_ascii_case(provider_id))
                 .map(|(_, provider)| provider)
         })
+    }
+}
+
+fn host_origin_matches_allowed(origin: &str, allowed: &str) -> bool {
+    let allowed = normalize_host_for_matching(allowed);
+    if allowed.is_empty() {
+        return false;
+    }
+    if host_matches_pattern(origin, allowed.as_str()) {
+        return true;
+    }
+    if allowed.contains('*') {
+        return false;
+    }
+    if origin.len() <= allowed.len() || !origin.ends_with(allowed.as_str()) {
+        return false;
+    }
+    origin
+        .as_bytes()
+        .get(origin.len().saturating_sub(allowed.len() + 1))
+        .copied()
+        == Some(b'.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_origin_matches_allowed;
+
+    #[test]
+    fn host_origin_allowlist_accepts_exact_and_subdomain_matches() {
+        assert!(host_origin_matches_allowed("chatgpt.com", "chatgpt.com"));
+        assert!(host_origin_matches_allowed(
+            "labs.chatgpt.com",
+            "chatgpt.com"
+        ));
+    }
+
+    #[test]
+    fn host_origin_allowlist_rejects_partial_suffix_match() {
+        assert!(!host_origin_matches_allowed(
+            "evilchatgpt.com",
+            "chatgpt.com"
+        ));
+        assert!(!host_origin_matches_allowed(
+            "chatgpt.com.evil.com",
+            "chatgpt.com"
+        ));
+    }
+
+    #[test]
+    fn host_origin_allowlist_keeps_wildcard_behavior() {
+        assert!(host_origin_matches_allowed("foo.claude.ai", "*.claude.ai"));
+        assert!(!host_origin_matches_allowed("claude.ai", "*.claude.ai"));
     }
 }
