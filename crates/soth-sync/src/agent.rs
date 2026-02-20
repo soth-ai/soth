@@ -540,7 +540,9 @@ impl SyncAgent {
             &registry_cache_path,
             Duration::from_secs(REGISTRY_BUNDLE_DEGRADED_AGE_SECS),
         );
-        if !status.cache_present {
+        let has_validation_signal =
+            status.validation_status.is_some() || status.validation_failed_reason.is_some();
+        if !status.cache_present && !has_validation_signal {
             return None;
         }
         Some(HeartbeatRegistryDetails {
@@ -550,7 +552,7 @@ impl SyncAgent {
             bundle_age_seconds: status.bundle_age_seconds,
             validation_status: status.validation_status,
             validation_failed_reason: status.validation_failed_reason,
-            degraded_stale: Some(status.stale),
+            degraded_stale: Some(status.stale || !status.cache_present),
         })
     }
 
@@ -1890,9 +1892,9 @@ fn hostname_resolution_command() -> (&'static str, &'static [&'static str]) {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
-    fn create_test_agent() -> SyncAgent {
+    fn create_test_agent_with_tempdir() -> (TempDir, SyncAgent) {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("events.db");
         let retry_dir = dir.path().join("retry");
@@ -1922,7 +1924,13 @@ mod tests {
             global_tags: BTreeMap::new(),
             heartbeat_telemetry: None,
         };
-        SyncAgent::new(config, None).expect("sync agent")
+        let agent = SyncAgent::new(config, None).expect("sync agent");
+        (dir, agent)
+    }
+
+    fn create_test_agent() -> SyncAgent {
+        let (_dir, agent) = create_test_agent_with_tempdir();
+        agent
     }
 
     fn noisy_text(len: usize, seed: u64) -> String {
@@ -1998,6 +2006,29 @@ mod tests {
             parse_os_release_key(os_release, "VERSION_ID").as_deref(),
             Some("24.04")
         );
+    }
+
+    #[test]
+    fn collect_registry_heartbeat_details_reports_validation_failure_without_cache() {
+        let (_dir, agent) = create_test_agent_with_tempdir();
+        let registry_cache_path = resolve_registry_cache_path(&agent.config.cache_path);
+        cache::mark_registry_validation_failed(
+            &registry_cache_path,
+            "integrity_verification_failed:sha_mismatch",
+        )
+        .unwrap();
+
+        let details = agent
+            .collect_registry_heartbeat_details()
+            .expect("registry details");
+        assert_eq!(details.validation_status.as_deref(), Some("failed"));
+        assert_eq!(
+            details.validation_failed_reason.as_deref(),
+            Some("integrity_verification_failed:sha_mismatch")
+        );
+        assert!(details.bundle_hash.is_none());
+        assert!(details.bundle_version.is_none());
+        assert_eq!(details.degraded_stale, Some(true));
     }
 
     #[test]
