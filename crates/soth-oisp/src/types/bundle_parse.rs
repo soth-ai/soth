@@ -1231,6 +1231,12 @@ fn is_catch_all_path_pattern(pattern: &str) -> bool {
 
 fn normalize_pattern_for_host_matching(pattern: &str) -> String {
     let mut out = pattern.trim().to_string();
+    if out.is_empty() {
+        return out;
+    }
+    if is_regex_like_host_pattern(out.as_str()) {
+        return out;
+    }
     if out.starts_with('^') {
         out.remove(0);
     }
@@ -1248,6 +1254,12 @@ fn normalize_pattern_for_host_matching(pattern: &str) -> String {
 
 fn normalize_host_pattern_for_matching(pattern: &str) -> String {
     let normalized = normalize_pattern_for_host_matching(pattern);
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if is_regex_like_host_pattern(normalized.as_str()) {
+        return normalized;
+    }
     let host_only = normalized
         .split_once('/')
         .map(|(host, _)| host)
@@ -1255,4 +1267,13 @@ fn normalize_host_pattern_for_matching(pattern: &str) -> String {
         .trim_end_matches(':')
         .trim();
     host_only.to_string()
+}
+
+fn is_regex_like_host_pattern(pattern: &str) -> bool {
+    pattern.chars().any(|ch| {
+        matches!(
+            ch,
+            '^' | '$' | '\\' | '[' | ']' | '(' | ')' | '|' | '+' | '?' | '{' | '}'
+        )
+    })
 }

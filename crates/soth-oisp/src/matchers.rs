@@ -1,4 +1,5 @@
 use crate::types::bundle::DomainIndexEntry;
+use regex::RegexBuilder;
 
 pub(crate) fn select_best_domain_match<'a>(
     entries: &'a [DomainIndexEntry],
@@ -31,6 +32,7 @@ pub(crate) fn contains_noise_keyword_for_host(host: &str, path: &str, keywords: 
 
     let lower_host = normalize_host_for_matching(host);
     let lower_path = path.to_ascii_lowercase();
+    let full_target = format!("{lower_host}{lower_path}");
     keywords.iter().any(|keyword| {
         let candidate = keyword.trim().to_ascii_lowercase();
         if candidate.is_empty() {
@@ -48,7 +50,7 @@ pub(crate) fn contains_noise_keyword_for_host(host: &str, path: &str, keywords: 
             }
         }
 
-        lower_path.contains(&candidate)
+        full_target.contains(&candidate)
     })
 }
 
@@ -98,22 +100,43 @@ pub(crate) fn identifier_matches_pattern(identifier: &str, pattern: &str) -> boo
 
 pub(crate) fn host_matches_pattern(host: &str, pattern: &str) -> bool {
     let host = normalize_host_for_matching(host);
-    let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
 
+    if is_regex_like_host_pattern(pattern) {
+        return regex_host_matches(host.as_str(), pattern);
+    }
+
+    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
     if !pattern.contains('*') {
         return host == pattern;
     }
 
-    if let Some(star_pos) = pattern.find('*') {
-        let prefix = &pattern[..star_pos];
-        let suffix = &pattern[star_pos + 1..];
-        if host.starts_with(prefix) && host.ends_with(suffix) {
-            let middle_len = host.len().saturating_sub(prefix.len() + suffix.len());
-            return middle_len > 0;
-        }
-    }
+    wildcard_match(host.as_str(), pattern.as_str())
+}
 
-    false
+fn is_regex_like_host_pattern(pattern: &str) -> bool {
+    pattern.chars().any(|ch| {
+        matches!(
+            ch,
+            '^' | '$' | '\\' | '[' | ']' | '(' | ')' | '|' | '+' | '?' | '{' | '}'
+        )
+    })
+}
+
+fn regex_host_matches(host: &str, pattern: &str) -> bool {
+    let expression = if pattern.starts_with('^') || pattern.ends_with('$') {
+        pattern.to_string()
+    } else {
+        format!("^(?:{pattern})$")
+    };
+    RegexBuilder::new(expression.as_str())
+        .case_insensitive(true)
+        .build()
+        .map(|regex| regex.is_match(host))
+        .unwrap_or(false)
 }
 
 pub(crate) fn normalize_host_for_matching(host: &str) -> String {

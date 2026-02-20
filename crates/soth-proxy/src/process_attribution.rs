@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+const MAX_PARENT_WALK_DEPTH: usize = 10;
+
 #[derive(Debug, Clone)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -26,6 +28,13 @@ pub struct ProcessAttribution {
 struct CacheEntry {
     value: Option<ProcessIdentity>,
     expires_at: Instant,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone)]
+struct ProcessTableRow {
+    ppid: u32,
+    name: String,
 }
 
 impl ProcessAttribution {
@@ -106,6 +115,21 @@ async fn build_process_identity(
     let executable = lookup_executable(pid, timeout).await;
     let name = normalize_process_name(raw_name, executable.as_deref());
     let app_type = classify_app_type(name.as_str(), executable.as_deref());
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if should_attempt_parent_walk(name.as_str(), app_type.as_str()) {
+        if let Some(parent_identity) = resolve_parent_process_identity(
+            pid,
+            attribution_source,
+            attribution_confidence,
+            timeout,
+        )
+        .await
+        {
+            return parent_identity;
+        }
+    }
+
     ProcessIdentity {
         pid,
         name,
@@ -351,6 +375,143 @@ async fn resolve_with_ps_fallback(
         let _ = timeout;
         None
     }
+}
+
+fn should_attempt_parent_walk(name: &str, app_type: &str) -> bool {
+    matches!(app_type, "service") || is_system_helper_process_name(name)
+}
+
+fn is_system_helper_process_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "webkit.networking",
+        "webkit.webcontent",
+        "webkit.gpu",
+        "nsurlsessiond",
+        "cfnetwork",
+        "networkserviceproxy",
+        "xpcproxy",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_generic_shell_process(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "sh" | "bash" | "zsh" | "fish" | "node" | "python" | "npm" | "pnpm" | "yarn" | "cargo"
+    )
+}
+
+fn is_responsible_parent_candidate(name: &str, executable: Option<&str>) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("soth") {
+        return false;
+    }
+    if is_system_helper_process_name(trimmed) {
+        return false;
+    }
+
+    let app_type = classify_app_type(trimmed, executable);
+    if matches!(app_type.as_str(), "browser" | "editor" | "desktop_app") {
+        return true;
+    }
+    if app_type == "cli" {
+        return !is_generic_shell_process(trimmed);
+    }
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn resolve_parent_process_identity(
+    pid: u32,
+    attribution_source: &str,
+    attribution_confidence: f64,
+    timeout: Duration,
+) -> Option<ProcessIdentity> {
+    let table = load_unix_process_table(timeout).await?;
+    let per_hop_timeout = timeout
+        .checked_div(8)
+        .unwrap_or_else(|| Duration::from_millis(25))
+        .max(Duration::from_millis(15))
+        .min(Duration::from_millis(100));
+
+    let mut current_pid = pid;
+    for _ in 0..MAX_PARENT_WALK_DEPTH {
+        let parent_pid = table.get(&current_pid)?.ppid;
+        if parent_pid == 0 || parent_pid == current_pid {
+            break;
+        }
+        let parent_row = table.get(&parent_pid)?;
+        let parent_executable = lookup_executable(parent_pid, per_hop_timeout).await;
+        let parent_name =
+            normalize_process_name(parent_row.name.clone(), parent_executable.as_deref());
+        let parent_app_type = classify_app_type(parent_name.as_str(), parent_executable.as_deref());
+        if is_responsible_parent_candidate(parent_name.as_str(), parent_executable.as_deref()) {
+            return Some(ProcessIdentity {
+                pid: parent_pid,
+                name: parent_name,
+                executable: parent_executable,
+                app_type: parent_app_type,
+                attribution_source: format!("{attribution_source}_parent_walk"),
+                attribution_confidence: attribution_confidence.min(0.90).max(0.55),
+            });
+        }
+        current_pid = parent_pid;
+    }
+
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn load_unix_process_table(timeout: Duration) -> Option<HashMap<u32, ProcessTableRow>> {
+    use tokio::process::Command;
+
+    let output = tokio::time::timeout(
+        timeout,
+        Command::new("ps")
+            .args(["-axo", "pid=,ppid=,comm="])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_unix_process_table(&output.stdout))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parse_unix_process_table(stdout: &[u8]) -> HashMap<u32, ProcessTableRow> {
+    let mut table = HashMap::new();
+    let text = String::from_utf8_lossy(stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(pid_raw) = parts.next() else {
+            continue;
+        };
+        let Some(ppid_raw) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_raw.parse::<u32>() else {
+            continue;
+        };
+        let Ok(ppid) = ppid_raw.parse::<u32>() else {
+            continue;
+        };
+        let name = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        table.insert(pid, ProcessTableRow { ppid, name });
+    }
+    table
 }
 
 fn is_ps_fallback_candidate(name: &str) -> bool {
@@ -950,5 +1111,22 @@ mod tests {
         let parsed = parse_tasklist_row(row).unwrap();
         assert_eq!(parsed.0, 4108);
         assert_eq!(parsed.1, "Code");
+    }
+
+    #[test]
+    fn system_helper_detection_matches_known_macos_service_names() {
+        assert!(is_system_helper_process_name("com.apple.nsurlsessiond"));
+        assert!(is_system_helper_process_name("com.apple.WebKit.Networking"));
+        assert!(!is_system_helper_process_name("Cursor"));
+    }
+
+    #[test]
+    fn responsible_parent_candidate_rejects_shells_and_accepts_apps() {
+        assert!(!is_responsible_parent_candidate("zsh", Some("/bin/zsh")));
+        assert!(is_responsible_parent_candidate(
+            "Terminal",
+            Some("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
+        ));
+        assert!(is_responsible_parent_candidate("Cursor", None));
     }
 }
