@@ -205,7 +205,7 @@ impl RegistryPuller {
         if_none_match: Option<&str>,
         fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<Option<RegistryPullOutcome>> {
-        let Some(version) = self.fetch_version(endpoint).await? else {
+        let Some(version) = self.fetch_version(endpoint, fetch_query).await? else {
             return Ok(None);
         };
         match self
@@ -244,11 +244,14 @@ impl RegistryPuller {
     async fn fetch_version(
         &self,
         endpoint: &str,
+        fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<Option<RegistryVersionResponse>> {
         let url = format!("{endpoint}/api/v1/registry/version");
+        let mut query_params = vec![("type", self.bundle_type.clone())];
+        query_params.extend(build_bundle_query_pairs(fetch_query));
         let response = build_cloud_client(endpoint)
             .get(&url)
-            .query(&[("type", self.bundle_type.as_str())])
+            .query(&query_params)
             .header(API_VERSION_HEADER, API_VERSION)
             .bearer_auth(&self.api_key)
             .send()
