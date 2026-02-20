@@ -88,6 +88,15 @@ pub enum CollectorParser {
     TextLines,
 }
 
+impl CollectorParser {
+    fn as_tag(self) -> &'static str {
+        match self {
+            Self::JsonLines => "jsonl",
+            Self::TextLines => "text",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct EnvSqliteSource {
     name: String,
@@ -817,6 +826,12 @@ impl CollectorAgent {
         for (k, v) in &source.tags {
             tags.insert(k.clone(), v.clone());
         }
+        if let Some(agent) = parsed.agent.as_ref().or(source.agent.as_ref()) {
+            tags.entry("collector.agent".to_string())
+                .or_insert_with(|| agent.clone());
+        }
+        tags.entry("collector.parser".to_string())
+            .or_insert_with(|| source.parser.as_tag().to_string());
         tags.insert(
             "collector.ingest_mode".to_string(),
             mode.as_tag().to_string(),
@@ -912,6 +927,15 @@ impl CollectorAgent {
         for (k, v) in &source.tags {
             tags.insert(k.clone(), v.clone());
         }
+        tags.entry("collector.agent".to_string())
+            .or_insert_with(|| {
+                source
+                    .server_name
+                    .clone()
+                    .unwrap_or_else(|| source.name.clone())
+            });
+        tags.entry("collector.parser".to_string())
+            .or_insert_with(|| CollectorParser::JsonLines.as_tag().to_string());
         tags.insert("collector.query_type".to_string(), line.file_type);
         tags.insert(
             "collector.ingest_mode".to_string(),

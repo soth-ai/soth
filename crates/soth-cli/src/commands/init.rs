@@ -130,9 +130,10 @@ cloud:
   metadata_max_compressed_batch_bytes: 5242880
   frontload_enabled: true
   frontload_max_events_per_batch: 1500
-  frontload_max_compressed_batch_bytes: 8388608
+  frontload_max_compressed_batch_bytes: 33554432
   frontload_hard_events_cap: 5000
-  frontload_hard_compressed_cap_bytes: 16777216
+  frontload_hard_compressed_cap_bytes: 67108864
+  frontload_exchange_upload_path: null
   body_upload_max_bytes: 15728640
   cache_path: "~/.soth/cloud_config_cache.json"
   tags: {}

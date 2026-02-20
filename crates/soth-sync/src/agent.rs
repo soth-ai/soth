@@ -3,7 +3,7 @@ use crate::cache;
 use crate::config_puller::ConfigPuller;
 use crate::heartbeat::HeartbeatSender;
 use crate::metadata_pusher::{
-    estimate_gzip_exchange_batch_size, ExchangePushResult, MetadataPusher,
+    estimate_gzip_exchange_batch_size, ExchangeBatchRoute, ExchangePushResult, MetadataPusher,
 };
 use crate::retry_queue::BodyRetryQueue;
 use anyhow::Context;
@@ -31,9 +31,9 @@ use uuid::Uuid;
 const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
 const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
 const DEFAULT_FRONTLOAD_METADATA_BATCH_EVENTS: usize = 1500;
-const DEFAULT_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FRONTLOAD_METADATA_BATCH_EVENTS_HARD_CAP: usize = 5000;
-const MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 16 * 1024 * 1024;
+const MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 64 * 1024 * 1024;
 const MAX_EXCHANGE_RETRY_BACKOFF_SECS: u64 = 15 * 60;
 const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
 const SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1: &str = "migration_exchange_uuid_cleanup_v1";
@@ -87,6 +87,7 @@ pub struct SyncAgentConfig {
     pub frontload_max_compressed_batch_bytes: usize,
     pub frontload_hard_events_cap: usize,
     pub frontload_hard_compressed_cap_bytes: usize,
+    pub frontload_exchange_upload_path: Option<String>,
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
@@ -273,7 +274,11 @@ impl SyncAgent {
                     .max(1)
                     .min(MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP),
             );
-        let metadata_pusher = MetadataPusher::new(&config.endpoint, &config.api_key);
+        let metadata_pusher = MetadataPusher::new(
+            &config.endpoint,
+            &config.api_key,
+            config.frontload_exchange_upload_path.clone(),
+        );
         let body_uploader = BodyUploader::new(&config.endpoint, &config.api_key);
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
         let retry_queue =
@@ -837,7 +842,11 @@ impl SyncAgent {
                 config_version: config_version.cloned(),
                 batch: batch.iter().map(|value| value.metadata.clone()).collect(),
             };
-            match self.metadata_pusher.push_exchange_batch(&request).await {
+            match self
+                .metadata_pusher
+                .push_exchange_batch(&request, exchange_batch_route_for_mode(mode))
+                .await
+            {
                 Ok(ExchangePushResult::Success(response)) if response.rejected == 0 => {
                     for item in batch {
                         self.delete_exchange_queue_entry(&item.row.exchange_id)?;
@@ -1512,6 +1521,13 @@ fn exchange_sync_mode(
     }
 }
 
+fn exchange_batch_route_for_mode(mode: ExchangeSyncMode) -> ExchangeBatchRoute {
+    match mode {
+        ExchangeSyncMode::Live => ExchangeBatchRoute::Live,
+        ExchangeSyncMode::Frontload => ExchangeBatchRoute::Frontload,
+    }
+}
+
 fn classify_exchange_rejection(reason: &str, code: Option<&str>) -> ExchangeRejectionDisposition {
     let candidate = code.unwrap_or(reason).trim().to_ascii_lowercase();
     match candidate.as_str() {
@@ -1941,6 +1957,7 @@ mod tests {
             frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
             frontload_hard_events_cap: 5000,
             frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+            frontload_exchange_upload_path: None,
             body_upload_max_bytes: 15 * 1024 * 1024,
             global_tags: BTreeMap::new(),
             heartbeat_telemetry: None,

@@ -338,6 +338,11 @@ pub fn spawn_cloud_pull_runtime(
     let sync_interval_secs = config.cloud.sync_interval_secs.max(5);
     let interval_secs = config.cloud.config_pull_interval_secs.max(15);
     let debounce_secs = config.cloud.config_debounce_secs.max(1);
+    let frontload_exchange_upload_path = std::env::var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| config.cloud.frontload_exchange_upload_path.clone());
     let registry_puller = RegistryPuller::new(
         endpoint.clone(),
         api_key.clone(),
@@ -384,6 +389,7 @@ pub fn spawn_cloud_pull_runtime(
                 .cloud
                 .frontload_hard_compressed_cap_bytes
                 .max(1) as usize,
+            frontload_exchange_upload_path: frontload_exchange_upload_path.clone(),
             body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
             global_tags: config.cloud.tags.clone(),
             heartbeat_telemetry: Some(std::sync::Arc::new(|| {

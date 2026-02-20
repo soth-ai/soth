@@ -1,6 +1,7 @@
 //! Shared API request/response structures for edge <-> cloud communication.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +149,67 @@ pub struct EventEnvelopeMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeBatchResponse {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub errors: Vec<EventError>,
+    #[serde(default)]
+    pub retry_after_secs: Option<u64>,
+    pub config_changed: bool,
+    pub server_time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSessionsBatchRequest {
+    pub agent_instance_id: String,
+    pub config_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_mode: Option<String>,
+    pub batch: Vec<LocalSessionArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSessionArtifact {
+    pub artifact_id: String,
+    pub observed_at: String,
+    pub local_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_db_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_inline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_blob_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSessionsBatchResponse {
     pub accepted: u64,
     pub rejected: u64,
     pub errors: Vec<EventError>,
@@ -565,5 +627,51 @@ mod tests {
         assert_eq!(parsed.batch.len(), 1);
         assert_eq!(parsed.batch[0].exchange_id, "ex-1");
         assert_eq!(parsed.batch[0].transport, "https");
+    }
+
+    #[test]
+    fn local_sessions_batch_roundtrip() {
+        let req = LocalSessionsBatchRequest {
+            agent_instance_id: "agent-local-1".to_string(),
+            config_version: Some("cv-local-1".to_string()),
+            ingest_mode: Some("frontload".to_string()),
+            batch: vec![LocalSessionArtifact {
+                artifact_id: "artifact-codex-1".to_string(),
+                observed_at: "2026-02-20T12:00:00Z".to_string(),
+                local_type: "codex".to_string(),
+                file_type: Some("session_transcript".to_string()),
+                parser_hint: Some("codex".to_string()),
+                source_path: Some("~/.codex/sessions/2026/02/example.jsonl".to_string()),
+                source_db_path: None,
+                source_query: None,
+                read_mode: Some("incremental".to_string()),
+                content_type: Some("json".to_string()),
+                body_inline: Some("{\"type\":\"message\",\"role\":\"user\"}".to_string()),
+                body_blob_key: None,
+                body_sha256: Some("sha256-local-1".to_string()),
+                body_bytes: Some(36),
+                session_id: Some("sess-local-1".to_string()),
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5".to_string()),
+                agent: Some("codex".to_string()),
+                tags: Some(HashMap::from([(
+                    "collector.ingest_mode".to_string(),
+                    "frontload".to_string(),
+                )])),
+                metadata: Some(serde_json::json!({
+                    "cursor": 1234,
+                    "source": "collector"
+                })),
+            }],
+        };
+
+        let json = serde_json::to_string(&req).expect("serialize local sessions batch");
+        let parsed: LocalSessionsBatchRequest =
+            serde_json::from_str(&json).expect("deserialize local sessions batch");
+        assert_eq!(parsed.agent_instance_id, "agent-local-1");
+        assert_eq!(parsed.ingest_mode.as_deref(), Some("frontload"));
+        assert_eq!(parsed.batch.len(), 1);
+        assert_eq!(parsed.batch[0].local_type, "codex");
+        assert_eq!(parsed.batch[0].artifact_id, "artifact-codex-1");
     }
 }

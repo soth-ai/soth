@@ -1064,6 +1064,11 @@ pub struct CloudConfig {
     #[serde(default = "default_cloud_frontload_hard_compressed_cap_bytes")]
     pub frontload_hard_compressed_cap_bytes: u64,
 
+    /// Optional dedicated upload path for collector frontload exchange batches.
+    /// When unset, frontload batches use `/api/v1/exchanges/batch`.
+    #[serde(default)]
+    pub frontload_exchange_upload_path: Option<String>,
+
     /// Maximum request/response body size eligible for cloud body upload.
     #[serde(default = "default_cloud_body_upload_max_bytes")]
     pub body_upload_max_bytes: u64,
@@ -1106,7 +1111,7 @@ fn default_cloud_frontload_max_events_per_batch() -> usize {
 }
 
 fn default_cloud_frontload_max_compressed_batch_bytes() -> u64 {
-    8 * 1024 * 1024
+    32 * 1024 * 1024
 }
 
 fn default_cloud_frontload_hard_events_cap() -> usize {
@@ -1114,7 +1119,7 @@ fn default_cloud_frontload_hard_events_cap() -> usize {
 }
 
 fn default_cloud_frontload_hard_compressed_cap_bytes() -> u64 {
-    16 * 1024 * 1024
+    64 * 1024 * 1024
 }
 
 fn default_cloud_body_upload_max_bytes() -> u64 {
@@ -1143,6 +1148,7 @@ impl Default for CloudConfig {
             frontload_hard_events_cap: default_cloud_frontload_hard_events_cap(),
             frontload_hard_compressed_cap_bytes: default_cloud_frontload_hard_compressed_cap_bytes(
             ),
+            frontload_exchange_upload_path: None,
             body_upload_max_bytes: default_cloud_body_upload_max_bytes(),
             cache_path: default_cloud_cache_path(),
         }
@@ -2251,6 +2257,7 @@ cloud:
   frontload_max_compressed_batch_bytes: 8388608
   frontload_hard_events_cap: 5000
   frontload_hard_compressed_cap_bytes: 16777216
+  frontload_exchange_upload_path: "/api/v1/exchanges/frontload/batch"
   body_upload_max_bytes: 10485760
   tags:
     project: "edge"
@@ -2276,6 +2283,10 @@ cloud:
         assert_eq!(
             config.cloud.frontload_hard_compressed_cap_bytes,
             16 * 1024 * 1024
+        );
+        assert_eq!(
+            config.cloud.frontload_exchange_upload_path.as_deref(),
+            Some("/api/v1/exchanges/frontload/batch")
         );
         assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.cloud.tags.get("project"), Some(&"edge".to_string()));

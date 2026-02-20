@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Run the start command
 pub async fn run(
@@ -368,6 +368,8 @@ fn spawn_proxy_runtime(
         fd_monitor_task = Some(runtime.task);
     }
 
+    apply_collector_env_overrides(config, &config.observe.collector);
+
     let mut cloud_shutdown_tx = None;
     let mut cloud_task = None;
     if let Some(runtime) = cloud_hooks::spawn_cloud_pull_runtime(config, event_db_path.clone()) {
@@ -377,7 +379,6 @@ fn spawn_proxy_runtime(
 
     let mut collector_shutdown_tx = None;
     let mut collector_task = None;
-    apply_collector_env_overrides(config, &config.observe.collector);
     if let Some(ref logger) = event_logger {
         if let Some(CollectorRuntime { shutdown_tx, task }) = soth_collector::spawn_from_env(
             logger.clone(),
@@ -435,54 +436,93 @@ struct RegistryCollectorSource {
     parser: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RegistryCollectorSqliteQuery {
+    file_type: String,
+    sql: String,
+    incremental_field: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RegistryCollectorSqliteSource {
+    agent: String,
+    db_path: String,
+    queries: Vec<RegistryCollectorSqliteQuery>,
+    tags: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RegistryCollectorHints {
+    file_sources: Vec<RegistryCollectorSource>,
+    sqlite_sources: Vec<RegistryCollectorSqliteSource>,
+    upload_endpoint: Option<String>,
+}
+
 fn set_env_if_present<T: ToString>(key: &str, value: Option<T>) {
     if let Some(value) = value {
         std::env::set_var(key, value.to_string());
     }
 }
 
-fn parse_registry_collector_sources(bundle: &serde_json::Value) -> Vec<RegistryCollectorSource> {
-    let mut parsed = Vec::new();
-    let mut seen = BTreeSet::new();
+fn parse_registry_collector_hints(bundle: &serde_json::Value) -> RegistryCollectorHints {
+    let mut file_sources = Vec::new();
+    let mut file_seen = BTreeSet::new();
+    let mut sqlite_sources = Vec::new();
     let mut sections = vec![bundle];
     if let Some(data) = bundle.get("data") {
         sections.push(data);
     }
+    let mut upload_endpoint = None;
 
     for section in sections {
+        if upload_endpoint.is_none() {
+            upload_endpoint = section
+                .get("localDataSources")
+                .and_then(|value| value.get("upload_endpoint"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
         parse_registry_collector_sources_from_array(
             section
                 .get("collector")
                 .and_then(|value| value.get("sources"))
                 .and_then(serde_json::Value::as_array),
-            &mut parsed,
-            &mut seen,
+            &mut file_sources,
+            &mut file_seen,
         );
         parse_registry_collector_sources_from_array(
             section
                 .get("collector_sources")
                 .and_then(serde_json::Value::as_array),
-            &mut parsed,
-            &mut seen,
+            &mut file_sources,
+            &mut file_seen,
         );
         parse_registry_collector_sources_from_local_artifacts(
             section
                 .get("local_artifacts")
                 .and_then(serde_json::Value::as_array),
-            &mut parsed,
-            &mut seen,
+            &mut file_sources,
+            &mut file_seen,
+            &mut sqlite_sources,
         );
         parse_registry_collector_sources_from_local_data_sources(
             section
                 .get("localDataSources")
                 .and_then(|value| value.get("sources"))
                 .and_then(serde_json::Value::as_array),
-            &mut parsed,
-            &mut seen,
+            &mut file_sources,
+            &mut file_seen,
+            &mut sqlite_sources,
         );
     }
 
-    parsed
+    RegistryCollectorHints {
+        file_sources,
+        sqlite_sources,
+        upload_endpoint,
+    }
 }
 
 fn parse_registry_collector_sources_from_array(
@@ -525,8 +565,9 @@ fn parse_registry_collector_sources_from_array(
 
 fn parse_registry_collector_sources_from_local_artifacts(
     artifacts: Option<&Vec<serde_json::Value>>,
-    parsed: &mut Vec<RegistryCollectorSource>,
-    seen: &mut BTreeSet<String>,
+    file_sources: &mut Vec<RegistryCollectorSource>,
+    file_seen: &mut BTreeSet<String>,
+    sqlite_sources: &mut Vec<RegistryCollectorSqliteSource>,
 ) {
     let Some(artifacts) = artifacts else {
         return;
@@ -567,19 +608,34 @@ fn parse_registry_collector_sources_from_local_artifacts(
             else {
                 continue;
             };
-            if !is_supported_registry_collector_glob(pattern) {
+            let content_type = glob
+                .get("content_type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim);
+            if !is_supported_registry_collector_glob(pattern, content_type) {
                 continue;
             }
-            let parser = parser.clone().or_else(|| Some("jsonl".to_string()));
-            push_registry_collector_source(parsed, seen, agent, pattern, parser);
+            let parser = parser.clone().or_else(|| {
+                Some(default_registry_collector_parser_for_glob(pattern, content_type).to_string())
+            });
+            push_registry_collector_source(file_sources, file_seen, agent, pattern, parser);
+        }
+        for sqlite_source in parse_registry_sqlite_sources_from_collection(
+            obj.get("collectionConfig")
+                .and_then(|value| value.get("sqlite"))
+                .and_then(serde_json::Value::as_array),
+            agent,
+        ) {
+            push_registry_sqlite_source(sqlite_sources, sqlite_source);
         }
     }
 }
 
 fn parse_registry_collector_sources_from_local_data_sources(
     sources: Option<&Vec<serde_json::Value>>,
-    parsed: &mut Vec<RegistryCollectorSource>,
-    seen: &mut BTreeSet<String>,
+    file_sources: &mut Vec<RegistryCollectorSource>,
+    file_seen: &mut BTreeSet<String>,
+    sqlite_sources: &mut Vec<RegistryCollectorSqliteSource>,
 ) {
     let Some(sources) = sources else {
         return;
@@ -603,25 +659,45 @@ fn parse_registry_collector_sources_from_local_data_sources(
         else {
             continue;
         };
-        let globs = source_obj
+        if let Some(globs) = source_obj
             .get("globs")
-            .and_then(serde_json::Value::as_array);
-        let Some(globs) = globs else {
-            continue;
-        };
-        for glob in globs {
-            let Some(pattern) = glob
-                .get("pattern")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            if !is_supported_registry_collector_glob(pattern) {
-                continue;
+            .and_then(serde_json::Value::as_array)
+        {
+            for glob in globs {
+                let Some(pattern) = glob
+                    .get("pattern")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                let content_type = glob
+                    .get("content_type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim);
+                if !is_supported_registry_collector_glob(pattern, content_type) {
+                    continue;
+                }
+                push_registry_collector_source(
+                    file_sources,
+                    file_seen,
+                    agent,
+                    pattern,
+                    Some(
+                        default_registry_collector_parser_for_glob(pattern, content_type)
+                            .to_string(),
+                    ),
+                );
             }
-            push_registry_collector_source(parsed, seen, agent, pattern, Some("jsonl".to_string()));
+        }
+        for sqlite_source in parse_registry_sqlite_sources_from_collection(
+            source_obj
+                .get("sqlite")
+                .and_then(serde_json::Value::as_array),
+            agent,
+        ) {
+            push_registry_sqlite_source(sqlite_sources, sqlite_source);
         }
     }
 }
@@ -644,34 +720,187 @@ fn push_registry_collector_source(
     });
 }
 
-fn is_supported_registry_collector_glob(pattern: &str) -> bool {
+fn is_supported_registry_collector_glob(pattern: &str, content_type: Option<&str>) -> bool {
+    let normalized_content_type = content_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
+    if matches!(normalized_content_type.as_deref(), Some("binary")) {
+        return false;
+    }
+    if matches!(normalized_content_type.as_deref(), Some("json" | "text")) {
+        return true;
+    }
+
     let lower = pattern.trim().to_ascii_lowercase();
-    lower.ends_with(".jsonl") || lower.ends_with(".ndjson")
+    [
+        ".jsonl", ".ndjson", ".json", ".toml", ".md", ".txt", ".log", ".yaml", ".yml", ".xml",
+        ".csv", ".pbtxt",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
 }
 
-fn load_registry_collector_sources(config: &SothConfig) -> Vec<RegistryCollectorSource> {
+fn default_registry_collector_parser_for_glob(
+    pattern: &str,
+    content_type: Option<&str>,
+) -> &'static str {
+    let normalized_content_type = content_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if normalized_content_type == "binary" {
+        return "text";
+    }
+    let lower = pattern.trim().to_ascii_lowercase();
+    if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
+        "jsonl"
+    } else {
+        "text"
+    }
+}
+
+fn parse_registry_sqlite_sources_from_collection(
+    sqlite_entries: Option<&Vec<serde_json::Value>>,
+    agent: &str,
+) -> Vec<RegistryCollectorSqliteSource> {
+    let Some(sqlite_entries) = sqlite_entries else {
+        return Vec::new();
+    };
+    let mut parsed = Vec::new();
+    for sqlite in sqlite_entries {
+        let Some(db_path) = sqlite
+            .get("db_path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let queries = sqlite
+            .get("queries")
+            .and_then(serde_json::Value::as_array)
+            .map(parse_registry_sqlite_queries)
+            .unwrap_or_default();
+        if queries.is_empty() {
+            continue;
+        }
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert(
+            "collector.discovery".to_string(),
+            "registry_bundle".to_string(),
+        );
+        tags.insert("collector.agent".to_string(), agent.to_string());
+        parsed.push(RegistryCollectorSqliteSource {
+            agent: agent.to_string(),
+            db_path: db_path.to_string(),
+            queries,
+            tags,
+        });
+    }
+    parsed
+}
+
+fn parse_registry_sqlite_queries(
+    queries: &Vec<serde_json::Value>,
+) -> Vec<RegistryCollectorSqliteQuery> {
+    let mut parsed = Vec::new();
+    for query in queries {
+        let Some(file_type) = query
+            .get("file_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(sql) = query
+            .get("sql")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let incremental_field = query
+            .get("incremental_field")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        parsed.push(RegistryCollectorSqliteQuery {
+            file_type: file_type.to_string(),
+            sql: sql.to_string(),
+            incremental_field,
+        });
+    }
+    parsed
+}
+
+fn push_registry_sqlite_source(
+    parsed: &mut Vec<RegistryCollectorSqliteSource>,
+    source: RegistryCollectorSqliteSource,
+) {
+    if let Some(existing) = parsed.iter_mut().find(|entry| {
+        entry.agent.eq_ignore_ascii_case(source.agent.as_str())
+            && entry.db_path.eq_ignore_ascii_case(source.db_path.as_str())
+    }) {
+        for (key, value) in source.tags {
+            existing.tags.entry(key).or_insert(value);
+        }
+        for query in source.queries {
+            if !existing.queries.iter().any(|entry| {
+                entry.file_type == query.file_type
+                    && entry.sql == query.sql
+                    && entry.incremental_field == query.incremental_field
+            }) {
+                existing.queries.push(query);
+            }
+        }
+        return;
+    }
+    parsed.push(source);
+}
+
+fn load_registry_collector_hints(config: &SothConfig) -> RegistryCollectorHints {
     let cache_path = resolve_registry_bundle_cache_path(config);
     let cached = match soth_sync::cache::load_registry_bundle_cache(cache_path.as_path()) {
         Ok(Some(cached)) => cached,
-        Ok(None) => return Vec::new(),
+        Ok(None) => return RegistryCollectorHints::default(),
         Err(error) => {
             warn!(
                 cache = %cache_path.display(),
                 error = %error,
                 "Failed to read registry cache for collector source hints"
             );
-            return Vec::new();
+            return RegistryCollectorHints::default();
         }
     };
-    parse_registry_collector_sources(&cached.bundle)
+    parse_registry_collector_hints(&cached.bundle)
 }
 
 fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollectorConfig) {
-    let registry_sources = load_registry_collector_sources(config);
+    let registry_hints = load_registry_collector_hints(config);
+    let registry_sources = &registry_hints.file_sources;
+    if config.cloud.frontload_exchange_upload_path.is_none() {
+        if let Some(upload_endpoint) = registry_hints.upload_endpoint.as_deref() {
+            let trimmed = upload_endpoint.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("/api/v1/exchanges/batch") {
+                std::env::set_var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH", trimmed);
+                info!(
+                    upload_endpoint = trimmed,
+                    "Applied registry localDataSources upload_endpoint for collector frontload exchange uploads"
+                );
+            }
+        }
+    }
     if !collector.enabled {
-        if !registry_sources.is_empty() {
+        if !registry_sources.is_empty() || !registry_hints.sqlite_sources.is_empty() {
             warn!(
-                sources = registry_sources.len(),
+                file_sources = registry_sources.len(),
+                sqlite_sources = registry_hints.sqlite_sources.len(),
                 "Registry collector sources available but observe.collector.enabled=false; collector remains disabled"
             );
         }
@@ -713,7 +942,7 @@ fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollect
         })
         .collect::<Vec<_>>();
 
-    for source in &registry_sources {
+    for source in registry_sources {
         source_paths.insert(source.path.clone());
         structured_sources.push(serde_json::json!({
             "name": format!("registry:{}", source.agent),
@@ -737,26 +966,41 @@ fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollect
             std::env::set_var("SOTH_COLLECTOR_SOURCES_JSON", raw);
         }
     }
-    if !collector.sqlite_sources.is_empty() {
-        let sqlite_sources = collector
-            .sqlite_sources
-            .iter()
-            .map(|source| {
-                serde_json::json!({
-                    "name": source.name,
-                    "db_path": cli_config::expand_tilde(&source.db_path).to_string_lossy().to_string(),
-                    "server_name": source.server_name,
-                    "provider": source.provider,
-                    "model": source.model,
-                    "tags": source.tags,
-                    "queries": source.queries.iter().map(|query| serde_json::json!({
-                        "file_type": query.file_type,
-                        "sql": query.sql,
-                        "incremental_field": query.incremental_field,
-                    })).collect::<Vec<_>>(),
-                })
+    let mut sqlite_sources = collector
+        .sqlite_sources
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "name": source.name,
+                "db_path": cli_config::expand_tilde(&source.db_path).to_string_lossy().to_string(),
+                "server_name": source.server_name,
+                "provider": source.provider,
+                "model": source.model,
+                "tags": source.tags,
+                "queries": source.queries.iter().map(|query| serde_json::json!({
+                    "file_type": query.file_type,
+                    "sql": query.sql,
+                    "incremental_field": query.incremental_field,
+                })).collect::<Vec<_>>(),
             })
-            .collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
+    for source in &registry_hints.sqlite_sources {
+        sqlite_sources.push(serde_json::json!({
+            "name": format!("registry:{}", source.agent),
+            "db_path": source.db_path,
+            "server_name": source.agent,
+            "provider": serde_json::Value::Null,
+            "model": serde_json::Value::Null,
+            "tags": source.tags,
+            "queries": source.queries.iter().map(|query| serde_json::json!({
+                "file_type": query.file_type,
+                "sql": query.sql,
+                "incremental_field": query.incremental_field,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    if !sqlite_sources.is_empty() {
         if let Ok(raw) = serde_json::to_string(&sqlite_sources) {
             std::env::set_var("SOTH_COLLECTOR_SQLITE_SOURCES", raw);
         }
@@ -796,7 +1040,7 @@ fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollect
 
 #[cfg(test)]
 mod tests {
-    use super::parse_registry_collector_sources;
+    use super::parse_registry_collector_hints;
 
     #[test]
     fn parse_registry_collector_sources_supports_sensor_local_sources() {
@@ -829,14 +1073,46 @@ mod tests {
             }
         });
 
-        let sources = parse_registry_collector_sources(&bundle);
-        assert_eq!(sources.len(), 2);
-        assert!(sources.iter().any(|source| {
+        let hints = parse_registry_collector_hints(&bundle);
+        assert_eq!(hints.file_sources.len(), 3);
+        assert!(hints.file_sources.iter().any(|source| {
             source.agent == "codex" && source.path == "~/.codex/sessions/**/*.jsonl"
         }));
-        assert!(sources
+        assert!(hints
+            .file_sources
             .iter()
             .any(|source| { source.agent == "codex" && source.path == "~/.codex/history.jsonl" }));
+        assert!(hints
+            .file_sources
+            .iter()
+            .any(|source| { source.agent == "codex" && source.path == "~/.codex/config.toml" }));
+    }
+
+    #[test]
+    fn parse_registry_collector_sources_skips_binary_globs() {
+        let bundle = serde_json::json!({
+            "data": {
+                "localDataSources": {
+                    "sources": [
+                        {
+                            "name": "antigravity",
+                            "enabled": true,
+                            "globs": [
+                                { "pattern": "~/.gemini/antigravity/conversations/*.pb", "content_type": "binary" },
+                                { "pattern": "~/.gemini/antigravity/annotations/*.pbtxt", "content_type": "text" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        let hints = parse_registry_collector_hints(&bundle);
+        assert_eq!(hints.file_sources.len(), 1);
+        assert_eq!(
+            hints.file_sources[0].path,
+            "~/.gemini/antigravity/annotations/*.pbtxt"
+        );
     }
 
     #[test]
@@ -847,9 +1123,53 @@ mod tests {
             ]
         });
 
-        let sources = parse_registry_collector_sources(&bundle);
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].agent, "claude_code");
-        assert_eq!(sources[0].path, "~/.claude/projects/*/*.jsonl");
+        let hints = parse_registry_collector_hints(&bundle);
+        assert_eq!(hints.file_sources.len(), 1);
+        assert_eq!(hints.file_sources[0].agent, "claude_code");
+        assert_eq!(hints.file_sources[0].path, "~/.claude/projects/*/*.jsonl");
+    }
+
+    #[test]
+    fn parse_registry_collector_hints_extracts_sqlite_sources() {
+        let bundle = serde_json::json!({
+            "data": {
+                "localDataSources": {
+                    "upload_endpoint": "/api/v1/ingest/local-sessions",
+                    "sources": [
+                        {
+                            "name": "cursor",
+                            "enabled": true,
+                            "sqlite": [
+                                {
+                                    "db_path": "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+                                    "queries": [
+                                        {
+                                            "file_type": "sqlite_composer",
+                                            "sql": "SELECT rowid, value FROM cursorDiskKV WHERE rowid > ?",
+                                            "incremental_field": "rowid"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        let hints = parse_registry_collector_hints(&bundle);
+        assert_eq!(
+            hints.upload_endpoint.as_deref(),
+            Some("/api/v1/ingest/local-sessions")
+        );
+        assert_eq!(hints.sqlite_sources.len(), 1);
+        let sqlite = &hints.sqlite_sources[0];
+        assert_eq!(sqlite.agent, "cursor");
+        assert_eq!(
+            sqlite.db_path,
+            "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+        );
+        assert_eq!(sqlite.queries.len(), 1);
+        assert_eq!(sqlite.queries[0].file_type, "sqlite_composer");
     }
 }

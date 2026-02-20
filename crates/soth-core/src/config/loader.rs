@@ -197,6 +197,12 @@ fn apply_env_overrides(config: &mut SothConfig) {
             config.cloud.frontload_hard_compressed_cap_bytes = parsed.max(1);
         }
     }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            config.cloud.frontload_exchange_upload_path = Some(trimmed.to_string());
+        }
+    }
     if let Ok(value) = std::env::var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES") {
         if let Ok(parsed) = value.parse::<u64>() {
             config.cloud.body_upload_max_bytes = parsed.max(1);
@@ -401,6 +407,10 @@ budget:
         std::env::set_var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES", "8388608");
         std::env::set_var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP", "5000");
         std::env::set_var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES", "16777216");
+        std::env::set_var(
+            "SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH",
+            "/api/v1/exchanges/frontload/batch",
+        );
         std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES", "10485760");
         std::env::set_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES", "7340032");
 
@@ -425,6 +435,10 @@ budget:
             config.cloud.frontload_hard_compressed_cap_bytes,
             16 * 1024 * 1024
         );
+        assert_eq!(
+            config.cloud.frontload_exchange_upload_path.as_deref(),
+            Some("/api/v1/exchanges/frontload/batch")
+        );
         assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.forward_proxy.capture_max_body_bytes, 7_340_032);
         assert_eq!(config.cloud.tags.get("project"), Some(&"soth".to_string()));
@@ -444,6 +458,7 @@ budget:
         std::env::remove_var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES");
         std::env::remove_var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP");
         std::env::remove_var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH");
         std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES");
         std::env::remove_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES");
     }
