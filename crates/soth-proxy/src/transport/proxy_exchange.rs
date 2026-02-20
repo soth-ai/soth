@@ -307,26 +307,55 @@ fn infer_agent_fallback_app_type(agent: Option<&str>) -> Option<String> {
 }
 
 fn detection_id_for_pending(pending: &PendingRequest) -> Option<String> {
-    pending
-        .target_entity_id
-        .clone()
-        .or_else(|| {
-            pending.envelope.as_ref().and_then(|envelope| {
-                process_bundle_id_from_executable(envelope.process_executable.as_deref())
-            })
-        })
-        .or_else(|| bundle_id_from_agent_hint(pending.agent.as_deref()))
-        .or_else(|| {
-            pending.provider.as_ref().map(|provider| {
-                let normalized = provider
-                    .chars()
-                    .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-                    .collect::<String>()
-                    .trim_matches('_')
-                    .to_ascii_lowercase();
-                format!("provider.{normalized}")
-            })
-        })
+    let detection_source_is_bundle = pending
+        .detection_source
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("bundle"))
+        .unwrap_or(false);
+    if !detection_source_is_bundle {
+        return None;
+    }
+    non_empty_string(pending.target_entity_id.clone())
+}
+
+fn is_strict_bundle_detection_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return false;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized.starts_with("provider.")
+        || normalized.starts_with("agent.")
+        || normalized.starts_with("bundle.")
+        || normalized.starts_with("unknown")
+    {
+        return false;
+    }
+
+    if let Some((prefix, suffix)) = normalized.split_once('_') {
+        if matches!(prefix, "prv" | "agt" | "mcp")
+            && suffix.len() >= 4
+            && suffix.len() <= 64
+            && suffix
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        {
+            return true;
+        }
+    }
+
+    let segments = normalized.split('.').collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return false;
+    }
+    segments.iter().all(|segment| {
+        !segment.is_empty()
+            && segment.len() <= 64
+            && segment
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    })
 }
 
 fn non_empty_string(value: Option<String>) -> Option<String> {
@@ -340,12 +369,8 @@ fn non_empty_string(value: Option<String>) -> Option<String> {
     })
 }
 
-fn detection_bundle_version_for_exchange(bundle_version: Option<&str>) -> String {
-    bundle_version
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "unversioned".to_string())
+fn detection_bundle_version_for_exchange(bundle_version: Option<&str>) -> Option<String> {
+    bundle_version.and_then(|value| non_empty_string(Some(value.to_string())))
 }
 
 fn enforce_required_detection_fields(
@@ -357,14 +382,62 @@ fn enforce_required_detection_fields(
         .effective_detection_id()
         .map(ToString::to_string)
         .or_else(|| detection_id_for_pending(pending))
-        .and_then(|value| non_empty_string(Some(value)))
-        .unwrap_or_else(|| "unknown.unclassified".to_string());
+        .and_then(|value| non_empty_string(Some(value)));
+    let Some(detection_id) = detection_id else {
+        warn!(
+            exchange_id = %event.exchange_id,
+            "Dropping proxy exchange: missing bundle-backed detection_id"
+        );
+        return false;
+    };
+    if !is_strict_bundle_detection_id(detection_id.as_str()) {
+        warn!(
+            exchange_id = %event.exchange_id,
+            detection_id = detection_id,
+            "Dropping proxy exchange: detection_id is not bundle-identity strict"
+        );
+        return false;
+    }
+    if pending
+        .detection_source
+        .as_deref()
+        .map(|value| !value.eq_ignore_ascii_case("bundle"))
+        .unwrap_or(true)
+    {
+        warn!(
+            exchange_id = %event.exchange_id,
+            detection_source = pending.detection_source.as_deref().unwrap_or_default(),
+            "Dropping proxy exchange: detection_source must be bundle"
+        );
+        return false;
+    }
+    if pending
+        .target_entity_id
+        .as_deref()
+        .and_then(|value| non_empty_string(Some(value.to_string())))
+        .as_deref()
+        != Some(detection_id.as_str())
+    {
+        warn!(
+            exchange_id = %event.exchange_id,
+            pending_target_entity_id = pending.target_entity_id.as_deref().unwrap_or_default(),
+            resolved_detection_id = detection_id,
+            "Dropping proxy exchange: detection_id must match target_entity_id"
+        );
+        return false;
+    }
     let detection_bundle_version = event
         .effective_detection_bundle_version()
         .map(ToString::to_string)
         .or_else(|| bundle_version.map(ToString::to_string))
-        .and_then(|value| non_empty_string(Some(value)))
-        .unwrap_or_else(|| "unversioned".to_string());
+        .and_then(|value| non_empty_string(Some(value)));
+    let Some(detection_bundle_version) = detection_bundle_version else {
+        warn!(
+            exchange_id = %event.exchange_id,
+            "Dropping proxy exchange: missing detection_bundle_version"
+        );
+        return false;
+    };
 
     event.detection_id = Some(detection_id.clone());
     event.detection_bundle_version = Some(detection_bundle_version.clone());
@@ -404,8 +477,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
     response_truncated_reason: Option<&str>,
     bundle_version: Option<&str>,
 ) {
-    let detection_id = non_empty_string(detection_id_for_pending(pending))
-        .unwrap_or_else(|| "unknown.unclassified".to_string());
+    let detection_id = non_empty_string(detection_id_for_pending(pending));
     let detection_bundle_version = detection_bundle_version_for_exchange(bundle_version);
 
     let mut assembler = ExchangeAssembler::new(
@@ -424,10 +496,10 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
     );
     assembler.set_client(exchange_client_from_pending(pending));
     assembler.set_parse(Some(ExchangeParse {
-        detection_id: Some(detection_id.clone()),
-        detection_bundle_version: Some(detection_bundle_version.clone()),
+        detection_id: detection_id.clone(),
+        detection_bundle_version: detection_bundle_version.clone(),
         parser_version: Some("exchange_v2_edge".to_string()),
-        bundle_version: Some(detection_bundle_version.clone()),
+        bundle_version: detection_bundle_version.clone(),
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
         target_entity_id: pending.target_entity_id.clone(),
@@ -465,7 +537,7 @@ pub(crate) fn finalize_and_enqueue_exchange_v2(
     assembler.set_cost(usage_meta.cost_usd.map(|estimated_usd| ExchangeCost {
         estimated_usd,
         currency: "USD".to_string(),
-        pricing_version: Some(detection_bundle_version.clone()),
+        pricing_version: detection_bundle_version.clone(),
     }));
     let is_discovery_capture = pending.catalog_discovery || pending.discovery_kind.is_some();
     assembler.set_discovery_capture(is_discovery_capture);
@@ -639,9 +711,25 @@ pub(crate) fn seed_exchange_v2_spool(
     session_id: &str,
     bundle_version: Option<&str>,
 ) {
-    let detection_id = non_empty_string(detection_id_for_pending(pending))
-        .unwrap_or_else(|| "unknown.unclassified".to_string());
+    let detection_id = non_empty_string(detection_id_for_pending(pending));
     let detection_bundle_version = detection_bundle_version_for_exchange(bundle_version);
+
+    if detection_id
+        .as_deref()
+        .map(is_strict_bundle_detection_id)
+        .unwrap_or(false)
+        && detection_bundle_version.is_some()
+    {
+        // continue
+    } else {
+        warn!(
+            exchange_id = %pending.exchange_id,
+            detection_id = detection_id.as_deref().unwrap_or_default(),
+            detection_bundle_version = detection_bundle_version.as_deref().unwrap_or_default(),
+            "Skipping exchange spool seed: strict detection contract unresolved"
+        );
+        return;
+    }
 
     let mut assembler = ExchangeAssembler::new(
         exchange_cfg.clone(),
@@ -669,10 +757,10 @@ pub(crate) fn seed_exchange_v2_spool(
     );
     assembler.set_discovery_capture(pending.catalog_discovery || pending.discovery_kind.is_some());
     assembler.set_parse(Some(ExchangeParse {
-        detection_id: Some(detection_id),
-        detection_bundle_version: Some(detection_bundle_version.clone()),
+        detection_id,
+        detection_bundle_version: detection_bundle_version.clone(),
         parser_version: Some("exchange_v2_edge".to_string()),
-        bundle_version: Some(detection_bundle_version),
+        bundle_version: detection_bundle_version,
         parse_confidence: pending.parse_confidence,
         detection_reason: pending.detection_reason.clone(),
         target_entity_id: pending.target_entity_id.clone(),
@@ -751,7 +839,10 @@ pub(crate) fn apply_process_identity(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_process_identity, exchange_client_from_envelope};
+    use super::{
+        apply_process_identity, detection_bundle_version_for_exchange,
+        exchange_client_from_envelope, is_strict_bundle_detection_id,
+    };
     use soth_core::types::TrafficEnvelope;
 
     #[test]
@@ -798,5 +889,31 @@ mod tests {
         assert_eq!(client.process_name.as_deref(), Some("codex"));
         assert_eq!(client.app_type.as_deref(), Some("cli"));
         assert_eq!(client.bundle_id.as_deref(), Some("agent.codex"));
+    }
+
+    #[test]
+    fn strict_bundle_detection_id_accepts_registry_entity_or_namespace_values() {
+        assert!(is_strict_bundle_detection_id("agt_chatgpt1"));
+        assert!(is_strict_bundle_detection_id("prv_openai1"));
+        assert!(is_strict_bundle_detection_id("mcp_github1"));
+        assert!(is_strict_bundle_detection_id("agent.openai.codex"));
+    }
+
+    #[test]
+    fn strict_bundle_detection_id_rejects_heuristic_fallback_values() {
+        assert!(!is_strict_bundle_detection_id("provider.openai"));
+        assert!(!is_strict_bundle_detection_id("agent.codex"));
+        assert!(!is_strict_bundle_detection_id("unknown.unclassified"));
+        assert!(!is_strict_bundle_detection_id("  "));
+    }
+
+    #[test]
+    fn detection_bundle_version_requires_non_empty_value() {
+        assert_eq!(
+            detection_bundle_version_for_exchange(Some("2026.02.20")),
+            Some("2026.02.20".to_string())
+        );
+        assert_eq!(detection_bundle_version_for_exchange(Some("  ")), None);
+        assert_eq!(detection_bundle_version_for_exchange(None), None);
     }
 }

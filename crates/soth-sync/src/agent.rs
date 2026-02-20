@@ -1516,8 +1516,29 @@ fn classify_exchange_rejection(reason: &str, code: Option<&str>) -> ExchangeReje
     let candidate = code.unwrap_or(reason).trim().to_ascii_lowercase();
     match candidate.as_str() {
         "duplicate" => ExchangeRejectionDisposition::Drop,
+        value if is_terminal_contract_rejection_code(value) => ExchangeRejectionDisposition::Drop,
         _ => ExchangeRejectionDisposition::Retry,
     }
+}
+
+fn is_terminal_contract_rejection_code(code: &str) -> bool {
+    if code.is_empty() {
+        return false;
+    }
+
+    matches!(
+        code,
+        "invalid_exchange_id"
+            | "invalid_observed_at"
+            | "invalid_schema_version"
+            | "invalid_source_class"
+            | "invalid_decision_contract"
+            | "detection_id_required"
+            | "detection_bundle_version_required"
+            | "validation_failed"
+    ) || code.starts_with("invalid_")
+        || code.ends_with("_required")
+        || code.contains("validation")
 }
 
 fn build_exchange_event_envelope_metadata(
@@ -2110,7 +2131,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_exchange_rejection_retries_non_terminal_reasons() {
+    fn classify_exchange_rejection_classifies_terminal_and_retryable_reasons() {
         assert!(matches!(
             classify_exchange_rejection("rate_limited", None),
             ExchangeRejectionDisposition::Retry
@@ -2121,11 +2142,19 @@ mod tests {
         ));
         assert!(matches!(
             classify_exchange_rejection("validation_failed", None),
-            ExchangeRejectionDisposition::Retry
+            ExchangeRejectionDisposition::Drop
         ));
         assert!(matches!(
             classify_exchange_rejection("invalid_exchange_id", None),
-            ExchangeRejectionDisposition::Retry
+            ExchangeRejectionDisposition::Drop
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("detection_id_required", None),
+            ExchangeRejectionDisposition::Drop
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("invalid_source_class", None),
+            ExchangeRejectionDisposition::Drop
         ));
     }
 
