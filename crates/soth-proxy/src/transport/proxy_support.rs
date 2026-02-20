@@ -527,9 +527,72 @@ pub(crate) fn decision_label_from_intercept_decision(decision: InterceptDecision
 
 pub(crate) fn process_bundle_id_from_executable(path: Option<&str>) -> Option<String> {
     let path = path?;
-    let lower = path.to_ascii_lowercase();
+    node_package_id_from_executable_path(path)
+        .or_else(|| macos_bundle_id_from_executable_path(path))
+}
+
+fn node_package_id_from_executable_path(path: &str) -> Option<String> {
+    let normalized_path = path.replace('\\', "/");
+    let lower = normalized_path.to_ascii_lowercase();
+    let marker = "/node_modules/";
+    let mut offset = 0usize;
+
+    while let Some(found) = lower[offset..].find(marker) {
+        let marker_start = offset + found;
+        if let Some(parent_package) =
+            scoped_parent_package_before_node_modules(&normalized_path, marker_start)
+        {
+            return Some(parent_package);
+        }
+        let start = marker_start + marker.len();
+        let remainder = &normalized_path[start..];
+        let mut segments = remainder.split('/');
+        let first = segments.next().map(str::trim).unwrap_or_default();
+        if first.is_empty() || first.starts_with('.') {
+            offset = start;
+            continue;
+        }
+        if first.starts_with('@') {
+            let second = segments
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(second) = second {
+                return Some(format!(
+                    "{}/{}",
+                    first.to_ascii_lowercase(),
+                    second.to_ascii_lowercase()
+                ));
+            }
+            offset = start;
+            continue;
+        }
+        return Some(first.to_ascii_lowercase());
+    }
+
+    None
+}
+
+fn scoped_parent_package_before_node_modules(path: &str, marker_start: usize) -> Option<String> {
+    let prefix = path.get(..marker_start)?;
+    let mut segments = prefix.rsplit('/');
+    let package = segments.next().map(str::trim).unwrap_or_default();
+    let scope = segments.next().map(str::trim).unwrap_or_default();
+    if package.is_empty() || !scope.starts_with('@') {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        scope.to_ascii_lowercase(),
+        package.to_ascii_lowercase()
+    ))
+}
+
+fn macos_bundle_id_from_executable_path(path: &str) -> Option<String> {
+    let normalized_path = path.replace('\\', "/");
+    let lower = normalized_path.to_ascii_lowercase();
     lower.find(".app/").and_then(|idx| {
-        let app_root = &path[..idx + 4];
+        let app_root = &normalized_path[..idx + 4];
         let app = app_root
             .rsplit('/')
             .next()
@@ -595,5 +658,37 @@ pub(crate) fn append_process_attribution_tags(
     }
     if let Some(app_type) = envelope.process_app_type.as_ref() {
         tags.insert("metadata.process_app_type".to_string(), app_type.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_bundle_id_from_executable;
+
+    #[test]
+    fn process_bundle_id_extracts_scoped_node_package() {
+        let path = "/Users/example/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex";
+        assert_eq!(
+            process_bundle_id_from_executable(Some(path)),
+            Some("@openai/codex".to_string())
+        );
+    }
+
+    #[test]
+    fn process_bundle_id_extracts_scoped_node_package_from_pnpm_layout() {
+        let path = "/Users/example/project/node_modules/.pnpm/@openai+codex@0.25.0/node_modules/@openai/codex/bin/codex";
+        assert_eq!(
+            process_bundle_id_from_executable(Some(path)),
+            Some("@openai/codex".to_string())
+        );
+    }
+
+    #[test]
+    fn process_bundle_id_falls_back_to_macos_app_identifier() {
+        let path = "/Applications/Warp.app/Contents/MacOS/Warp";
+        assert_eq!(
+            process_bundle_id_from_executable(Some(path)),
+            Some("macos.warp".to_string())
+        );
     }
 }
