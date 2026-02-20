@@ -287,21 +287,58 @@ fn validate_registry_bundle_contract(bundle: &Value) -> anyhow::Result<()> {
         anyhow::bail!("bundle payload `schema_version` must be greater than 0");
     }
 
-    let filters = object
-        .get("filters")
-        .and_then(Value::as_object)
-        .context("bundle payload missing required `filters` object")?;
+    if let Some(filters) = object.get("filters").and_then(Value::as_object) {
+        for key in ["whitelist", "blacklist", "passthrough", "noise_keywords"] {
+            let value = filters
+                .get(key)
+                .with_context(|| format!("bundle payload filters missing required `{key}`"))?;
+            if !value.is_array() {
+                anyhow::bail!("bundle payload filters.{key} must be an array");
+            }
+        }
+        return Ok(());
+    }
 
-    for key in ["whitelist", "blacklist", "passthrough", "noise_keywords"] {
-        let value = filters
-            .get(key)
-            .with_context(|| format!("bundle payload filters missing required `{key}`"))?;
-        if !value.is_array() {
-            anyhow::bail!("bundle payload filters.{key} must be an array");
+    let alias_sets = [
+        (
+            "whitelistedDomains",
+            lookup_registry_filter_alias(object, "whitelistedDomains"),
+        ),
+        (
+            "passthroughDomains",
+            lookup_registry_filter_alias(object, "passthroughDomains"),
+        ),
+        (
+            "blacklistedWords",
+            lookup_registry_filter_alias(object, "blacklistedWords"),
+        ),
+    ];
+    if alias_sets.iter().all(|(_, value)| value.is_none()) {
+        anyhow::bail!(
+            "bundle payload missing required `filters` object (or sensor-config aliases)"
+        );
+    }
+    for (key, value) in alias_sets {
+        if let Some(value) = value {
+            if !value.is_array() {
+                anyhow::bail!("bundle payload `{key}` must be an array");
+            }
         }
     }
 
     Ok(())
+}
+
+fn lookup_registry_filter_alias<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<&'a Value> {
+    object.get(key).or_else(|| {
+        object
+            .get("data")
+            .and_then(Value::as_object)
+            .and_then(|data| data.get(key))
+    })
 }
 
 fn normalize_registry_bundle_payload(bundle: Value) -> Value {
@@ -719,6 +756,41 @@ mod tests {
                 || message.contains("filters missing required"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn save_registry_bundle_cache_accepts_sensor_filter_aliases_without_filters_object() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("v1");
+        let bundle = serde_json::json!({
+            "schema_version": 3,
+            "version": "v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "name": "OpenAI",
+                        "type": "ai-inference",
+                        "domains": ["api.openai.com"]
+                    }
+                },
+                "domain_index": [
+                    { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" }
+                ]
+            },
+            "whitelistedDomains": ["api.openai.com"],
+            "passthroughDomains": ["metrics.openai.com"],
+            "blacklistedWords": ["telemetry"]
+        });
+
+        save_registry_bundle_cache(&path, &metadata, "etag-1", bundle.to_string().as_bytes())
+            .unwrap();
+
+        let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
+        assert_eq!(loaded.metadata.version, "v1");
     }
 
     #[test]

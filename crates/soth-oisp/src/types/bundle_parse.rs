@@ -576,42 +576,40 @@ fn parse_catalog_filters(
     domain_index: &[DomainIndexEntry],
     interception_patterns: Option<&Map<String, Value>>,
 ) -> anyhow::Result<DomainFilters> {
-    if let Some(raw_filters) = root.get("filters") {
-        let mut filters: DomainFilters =
-            serde_json::from_value(raw_filters.clone()).context("invalid filters object")?;
-        normalize_domain_filters(&mut filters);
-        return Ok(filters);
-    }
+    let mut filters = if let Some(raw_filters) = root.get("filters") {
+        serde_json::from_value(raw_filters.clone()).context("invalid filters object")?
+    } else {
+        let mut whitelist = interception_patterns
+            .map(|patterns| patterns.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if whitelist.is_empty() {
+            whitelist = domain_index
+                .iter()
+                .map(|entry| entry.host.clone())
+                .collect();
+        }
 
-    let mut whitelist = interception_patterns
-        .map(|patterns| patterns.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    if whitelist.is_empty() {
-        whitelist = domain_index
-            .iter()
-            .map(|entry| entry.host.clone())
-            .collect();
-    }
+        let mut passthrough =
+            extract_string_array(root.get("passthrough").and_then(|v| v.get("domains")));
+        passthrough.extend(
+            extract_string_array(root.get("passthrough").and_then(|v| v.get("patterns")))
+                .into_iter()
+                .map(|pattern| normalize_host_pattern_for_matching(&pattern)),
+        );
+        let mut noise_keywords =
+            extract_string_array(root.get("noise_filter").and_then(|v| v.get("words")));
+        noise_keywords.extend(extract_string_array(
+            root.get("noise_filter").and_then(|v| v.get("paths")),
+        ));
 
-    let mut passthrough =
-        extract_string_array(root.get("passthrough").and_then(|v| v.get("domains")));
-    passthrough.extend(
-        extract_string_array(root.get("passthrough").and_then(|v| v.get("patterns")))
-            .into_iter()
-            .map(|pattern| normalize_pattern_for_host_matching(&pattern)),
-    );
-    let mut noise_keywords =
-        extract_string_array(root.get("noise_filter").and_then(|v| v.get("words")));
-    noise_keywords.extend(extract_string_array(
-        root.get("noise_filter").and_then(|v| v.get("paths")),
-    ));
-
-    let mut filters = DomainFilters {
-        whitelist,
-        blacklist: Vec::new(),
-        passthrough,
-        noise_keywords,
+        DomainFilters {
+            whitelist,
+            blacklist: Vec::new(),
+            passthrough,
+            noise_keywords,
+        }
     };
+    merge_sensor_filter_aliases_into_filters(root, None, &mut filters);
     normalize_domain_filters(&mut filters);
     Ok(filters)
 }
@@ -622,13 +620,68 @@ fn parse_filters_section(
     domain_index: &[DomainIndexEntry],
     interception_patterns: Option<&Map<String, Value>>,
 ) -> anyhow::Result<DomainFilters> {
-    if let Some(raw_filters) = root.get("filters").or_else(|| core.get("filters")) {
-        let mut filters: DomainFilters =
+    let mut filters = if let Some(raw_filters) = root.get("filters").or_else(|| core.get("filters"))
+    {
+        let filters: DomainFilters =
             serde_json::from_value(raw_filters.clone()).context("invalid filters section")?;
-        normalize_domain_filters(&mut filters);
-        return Ok(filters);
+        filters
+    } else {
+        parse_catalog_filters(root, domain_index, interception_patterns)?
+    };
+    merge_sensor_filter_aliases_into_filters(root, Some(core), &mut filters);
+    normalize_domain_filters(&mut filters);
+    Ok(filters)
+}
+
+fn merge_sensor_filter_aliases_into_filters(
+    root: &Map<String, Value>,
+    core: Option<&Map<String, Value>>,
+    filters: &mut DomainFilters,
+) {
+    filters.whitelist.extend(extract_sensor_filter_alias_values(
+        root,
+        core,
+        "whitelistedDomains",
+    ));
+    for pattern in &mut filters.whitelist {
+        *pattern = normalize_host_pattern_for_matching(pattern.as_str());
     }
-    parse_catalog_filters(root, domain_index, interception_patterns)
+    filters
+        .passthrough
+        .extend(extract_sensor_filter_alias_values(
+            root,
+            core,
+            "passthroughDomains",
+        ));
+    for pattern in &mut filters.passthrough {
+        *pattern = normalize_host_pattern_for_matching(pattern.as_str());
+    }
+    filters
+        .noise_keywords
+        .extend(extract_sensor_filter_alias_values(
+            root,
+            core,
+            "blacklistedWords",
+        ));
+}
+
+fn extract_sensor_filter_alias_values(
+    root: &Map<String, Value>,
+    core: Option<&Map<String, Value>>,
+    key: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    out.extend(extract_string_array(root.get(key)));
+    if let Some(data) = root.get("data").and_then(Value::as_object) {
+        out.extend(extract_string_array(data.get(key)));
+    }
+    if let Some(core) = core {
+        out.extend(extract_string_array(core.get(key)));
+        if let Some(data) = core.get("data").and_then(Value::as_object) {
+            out.extend(extract_string_array(data.get(key)));
+        }
+    }
+    out
 }
 
 fn parse_catalog_domains(
@@ -665,6 +718,21 @@ fn parse_bundle_gating(
     allowed_host_origins.extend(extract_allowed_host_origins(
         root.get("allowed_host_origins"),
     ));
+    if let Some(data) = root.get("data").and_then(Value::as_object) {
+        collect_allowed_app_origins(data.get("allowed_app_origins"), &mut allowed_app_origins);
+        allowed_host_origins.extend(extract_allowed_host_origins(
+            data.get("allowed_host_origins"),
+        ));
+        if let Some(gating) = data.get("gating").and_then(Value::as_object) {
+            collect_allowed_app_origins(
+                gating.get("allowed_app_origins"),
+                &mut allowed_app_origins,
+            );
+            allowed_host_origins.extend(extract_allowed_host_origins(
+                gating.get("allowed_host_origins"),
+            ));
+        }
+    }
 
     if let Some(gating) = root.get("gating").and_then(Value::as_object) {
         collect_allowed_app_origins(gating.get("allowed_app_origins"), &mut allowed_app_origins);
@@ -678,6 +746,12 @@ fn parse_bundle_gating(
         allowed_host_origins.extend(extract_allowed_host_origins(
             core.get("allowed_host_origins"),
         ));
+        if let Some(data) = core.get("data").and_then(Value::as_object) {
+            collect_allowed_app_origins(data.get("allowed_app_origins"), &mut allowed_app_origins);
+            allowed_host_origins.extend(extract_allowed_host_origins(
+                data.get("allowed_host_origins"),
+            ));
+        }
         if let Some(gating) = core.get("gating").and_then(Value::as_object) {
             collect_allowed_app_origins(
                 gating.get("allowed_app_origins"),
@@ -898,10 +972,24 @@ fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
 }
 
 fn normalize_domain_filters(filters: &mut DomainFilters) {
+    normalize_filter_host_patterns(&mut filters.whitelist);
+    normalize_filter_host_patterns(&mut filters.passthrough);
     dedup_sort_strings(&mut filters.whitelist);
     dedup_sort_strings(&mut filters.blacklist);
     dedup_sort_strings(&mut filters.passthrough);
     dedup_sort_strings(&mut filters.noise_keywords);
+}
+
+fn normalize_filter_host_patterns(values: &mut Vec<String>) {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        let host = normalize_host_pattern_for_matching(value.as_str());
+        if host.is_empty() {
+            continue;
+        }
+        normalized.push(host);
+    }
+    *values = normalized;
 }
 
 fn normalize_bundle_gating(gating: &mut BundleGating) {
@@ -1172,4 +1260,15 @@ fn normalize_pattern_for_host_matching(pattern: &str) -> String {
         out = format!("*{}", &out[2..]);
     }
     out
+}
+
+fn normalize_host_pattern_for_matching(pattern: &str) -> String {
+    let normalized = normalize_pattern_for_host_matching(pattern);
+    let host_only = normalized
+        .split_once('/')
+        .map(|(host, _)| host)
+        .unwrap_or(normalized.as_str())
+        .trim_end_matches(':')
+        .trim();
+    host_only.to_string()
 }

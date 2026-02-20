@@ -1,7 +1,8 @@
 use crate::cache::BoundedCache;
 use crate::matchers::{
     contains_noise_keyword_for_host, contains_noise_keyword_text, host_matches_any,
-    normalize_host_for_matching, path_matches_any, select_best_domain_match,
+    identifier_matches_any, normalize_host_for_matching, normalize_identifier_for_matching,
+    path_matches_any, select_best_domain_match,
 };
 use crate::parse_helpers::{
     decode_grpc_frame_payloads, extract_string_from_field_path_value,
@@ -91,17 +92,17 @@ impl OispEngine {
     }
 
     pub fn classify_app_origin(&self, app_identifier: &str) -> Option<&'static str> {
-        let app_identifier = normalize_host_for_matching(app_identifier);
+        let app_identifier = normalize_identifier_for_matching(app_identifier);
         if app_identifier.is_empty() {
             return None;
         }
-        if host_matches_any(
+        if identifier_matches_any(
             app_identifier.as_str(),
             &self.bundle.gating.allowed_app_origins.hosts,
         ) {
             return Some("host");
         }
-        if host_matches_any(
+        if identifier_matches_any(
             app_identifier.as_str(),
             &self.bundle.gating.allowed_app_origins.non_hosts,
         ) {
@@ -111,11 +112,11 @@ impl OispEngine {
     }
 
     pub fn app_has_parser(&self, app_identifier: &str) -> bool {
-        let app_identifier = normalize_host_for_matching(app_identifier);
+        let app_identifier = normalize_identifier_for_matching(app_identifier);
         if app_identifier.is_empty() {
             return false;
         }
-        host_matches_any(
+        identifier_matches_any(
             app_identifier.as_str(),
             &self.bundle.gating.allowed_app_origins.apps_with_parsers,
         )

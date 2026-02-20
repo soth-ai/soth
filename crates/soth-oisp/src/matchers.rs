@@ -78,6 +78,24 @@ pub(crate) fn host_matches_any(host: &str, patterns: &[String]) -> bool {
         .any(|pattern| host_matches_pattern(host, pattern))
 }
 
+pub(crate) fn identifier_matches_any(identifier: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| identifier_matches_pattern(identifier, pattern))
+}
+
+pub(crate) fn identifier_matches_pattern(identifier: &str, pattern: &str) -> bool {
+    let identifier = normalize_identifier_for_matching(identifier);
+    let pattern = normalize_identifier_for_matching(pattern);
+    if identifier.is_empty() || pattern.is_empty() {
+        return false;
+    }
+    if pattern.contains('*') {
+        return wildcard_match(identifier.as_str(), pattern.as_str());
+    }
+    identifier == pattern
+}
+
 pub(crate) fn host_matches_pattern(host: &str, pattern: &str) -> bool {
     let host = normalize_host_for_matching(host);
     let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -134,6 +152,10 @@ pub(crate) fn normalize_host_for_matching(host: &str) -> String {
     }
 
     value.to_ascii_lowercase()
+}
+
+pub(crate) fn normalize_identifier_for_matching(identifier: &str) -> String {
+    identifier.trim().replace('\\', "/").to_ascii_lowercase()
 }
 
 pub(crate) fn path_matches_any(path: &str, patterns: &[String]) -> bool {

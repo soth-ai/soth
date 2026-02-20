@@ -75,18 +75,56 @@ fn validate_runtime_bundle_contract(bundle_value: &Value) -> anyhow::Result<()> 
         anyhow::bail!("bundle payload `schema_version` must be greater than 0");
     }
 
-    let filters = object
-        .get("filters")
-        .and_then(Value::as_object)
-        .context("bundle payload missing required `filters` object")?;
-    for key in ["whitelist", "blacklist", "passthrough", "noise_keywords"] {
-        let value = filters
-            .get(key)
-            .with_context(|| format!("bundle payload filters missing required `{key}`"))?;
-        if !value.is_array() {
-            anyhow::bail!("bundle payload filters.{key} must be an array");
+    if let Some(filters) = object.get("filters").and_then(Value::as_object) {
+        for key in ["whitelist", "blacklist", "passthrough", "noise_keywords"] {
+            let value = filters
+                .get(key)
+                .with_context(|| format!("bundle payload filters missing required `{key}`"))?;
+            if !value.is_array() {
+                anyhow::bail!("bundle payload filters.{key} must be an array");
+            }
+        }
+        return Ok(());
+    }
+
+    let alias_sets = [
+        (
+            "whitelistedDomains",
+            lookup_filter_alias(object, "whitelistedDomains"),
+        ),
+        (
+            "passthroughDomains",
+            lookup_filter_alias(object, "passthroughDomains"),
+        ),
+        (
+            "blacklistedWords",
+            lookup_filter_alias(object, "blacklistedWords"),
+        ),
+    ];
+    if alias_sets.iter().all(|(_, value)| value.is_none()) {
+        anyhow::bail!(
+            "bundle payload missing required `filters` object (or sensor-config aliases)"
+        );
+    }
+    for (key, value) in alias_sets {
+        if let Some(value) = value {
+            if !value.is_array() {
+                anyhow::bail!("bundle payload `{key}` must be an array");
+            }
         }
     }
 
     Ok(())
+}
+
+fn lookup_filter_alias<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<&'a Value> {
+    object.get(key).or_else(|| {
+        object
+            .get("data")
+            .and_then(Value::as_object)
+            .and_then(|data| data.get(key))
+    })
 }

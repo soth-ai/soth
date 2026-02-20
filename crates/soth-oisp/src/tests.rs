@@ -224,6 +224,82 @@ fn gating_rules_parse_and_match_app_and_host_origins() {
 }
 
 #[test]
+fn gating_rules_match_scoped_package_identifiers() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "v3",
+            "compiled_at": "2026-02-20T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "agent-app" }
+                },
+                "domain_index": [
+                    {
+                        "host": "chatgpt.com",
+                        "provider_id": "openai",
+                        "entry_type": "agent-app"
+                    }
+                ]
+            },
+            "filters": {},
+            "gating": {
+                "allowed_app_origins": {
+                    "non_hosts": ["@openai/codex"],
+                    "apps_with_parsers": ["@openai/codex"]
+                },
+                "allowed_host_origins": ["chatgpt.com"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.classify_app_origin("@openai/codex"),
+        Some("non_host")
+    );
+    assert!(engine.app_has_parser("@openai/codex"));
+    assert_eq!(engine.classify_app_origin("@openai"), None);
+}
+
+#[test]
+fn parse_filters_supports_sensor_config_alias_fields() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "alias-filters-v1",
+            "compiled_at": "2026-02-20T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" }
+                },
+                "domain_index": [
+                    { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" }
+                ]
+            },
+            "whitelistedDomains": ["api.openai.com"],
+            "passthroughDomains": ["metrics.openai.com"],
+            "blacklistedWords": ["telemetry"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        engine.should_intercept("api.openai.com", "/v1/responses"),
+        InterceptDecision::Intercept { .. }
+    ));
+    assert!(matches!(
+        engine.should_intercept("metrics.openai.com", "/events"),
+        InterceptDecision::Passthrough
+    ));
+    assert!(engine.matches_noise_keyword("telemetry ping"));
+}
+
+#[test]
 fn bundle_classification_depends_on_loaded_bundle_content() {
     let engine = OispEngine::new(
             parse_compiled_bundle(&json!({
