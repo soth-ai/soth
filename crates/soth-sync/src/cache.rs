@@ -46,6 +46,16 @@ pub struct RegistryBundleRuntimeStatus {
     pub cache_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RegistryCacheValidationStatusEnvelope {
+    #[serde(default = "registry_cache_schema_version")]
+    schema_version: u32,
+    updated_at: String,
+    validation_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation_failed_reason: Option<String>,
+}
+
 pub fn registry_cache_schema_version() -> u32 {
     1
 }
@@ -70,6 +80,9 @@ pub fn registry_bundle_runtime_status(
     path: &Path,
     stale_after: std::time::Duration,
 ) -> RegistryBundleRuntimeStatus {
+    let sidecar = load_registry_cache_validation_status(path)
+        .ok()
+        .and_then(|value| value);
     match load_registry_bundle_cache(path) {
         Ok(Some(cache)) => {
             let bundle_age_seconds = parse_bundle_age_seconds(cache.fetched_at.as_str());
@@ -83,21 +96,44 @@ pub fn registry_bundle_runtime_status(
                 fetched_at: Some(cache.fetched_at),
                 bundle_age_seconds,
                 stale,
-                validation_status: cache.validation_status.clone(),
-                validation_failed_reason: cache.validation_failed_reason.clone(),
+                validation_status: sidecar
+                    .as_ref()
+                    .map(|state| state.validation_status.clone())
+                    .or(cache.validation_status.clone()),
+                validation_failed_reason: sidecar
+                    .as_ref()
+                    .and_then(|state| state.validation_failed_reason.clone())
+                    .or(cache.validation_failed_reason.clone()),
                 cache_error: None,
             }
         }
-        Ok(None) => RegistryBundleRuntimeStatus {
-            cache_present: false,
-            ..RegistryBundleRuntimeStatus::default()
-        },
-        Err(error) => RegistryBundleRuntimeStatus {
-            cache_present: false,
-            stale: true,
-            cache_error: Some(error.to_string()),
-            ..RegistryBundleRuntimeStatus::default()
-        },
+        Ok(None) => {
+            let mut status = RegistryBundleRuntimeStatus {
+                cache_present: false,
+                ..RegistryBundleRuntimeStatus::default()
+            };
+            if let Some(sidecar) = sidecar {
+                status.validation_status = Some(sidecar.validation_status);
+                status.validation_failed_reason = sidecar.validation_failed_reason;
+                if status.validation_status.as_deref() == Some("failed") {
+                    status.stale = true;
+                }
+            }
+            status
+        }
+        Err(error) => {
+            let mut status = RegistryBundleRuntimeStatus {
+                cache_present: false,
+                stale: true,
+                cache_error: Some(error.to_string()),
+                ..RegistryBundleRuntimeStatus::default()
+            };
+            if let Some(sidecar) = sidecar {
+                status.validation_status = Some(sidecar.validation_status);
+                status.validation_failed_reason = sidecar.validation_failed_reason;
+            }
+            status
+        }
     }
 }
 
@@ -212,7 +248,22 @@ pub fn save_registry_bundle_cache(
             last_good_path.display()
         )
     })?;
+    let _ = mark_registry_validation_success(path);
     Ok(())
+}
+
+pub fn mark_registry_validation_success(path: &Path) -> anyhow::Result<()> {
+    write_registry_cache_validation_status(path, "ok", None)
+}
+
+pub fn mark_registry_validation_failed(path: &Path, reason: &str) -> anyhow::Result<()> {
+    let reason = reason.trim();
+    let normalized_reason = if reason.is_empty() {
+        "unknown".to_string()
+    } else {
+        reason.to_string()
+    };
+    write_registry_cache_validation_status(path, "failed", Some(normalized_reason.as_str()))
 }
 
 fn validate_registry_bundle_payload(bundle: &Value) -> anyhow::Result<()> {
@@ -296,6 +347,18 @@ fn registry_cache_last_good_path(path: &Path) -> PathBuf {
     }
 }
 
+fn registry_cache_validation_status_path(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "registry_bundle_cache.json".to_string());
+    let status_filename = format!("{filename}.status");
+    match path.parent() {
+        Some(parent) => parent.join(status_filename),
+        None => PathBuf::from(status_filename),
+    }
+}
+
 fn load_registry_bundle_cache_at(
     path: &Path,
 ) -> anyhow::Result<Option<CachedRegistryBundleEnvelope>> {
@@ -339,6 +402,72 @@ fn load_registry_bundle_cache_at(
         envelope.validation_status = Some("ok".to_string());
     }
     Ok(Some(envelope))
+}
+
+fn load_registry_cache_validation_status(
+    path: &Path,
+) -> anyhow::Result<Option<RegistryCacheValidationStatusEnvelope>> {
+    let status_path = registry_cache_validation_status_path(path);
+    if !status_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&status_path).with_context(|| {
+        format!(
+            "failed reading registry cache validation status {}",
+            status_path.display()
+        )
+    })?;
+    let mut status: RegistryCacheValidationStatusEnvelope = serde_json::from_str(&content)
+        .with_context(|| {
+            format!(
+                "failed parsing registry cache validation status {}",
+                status_path.display()
+            )
+        })?;
+    if status.schema_version != registry_cache_schema_version() {
+        anyhow::bail!(
+            "unsupported registry validation status schema_version {} (expected {})",
+            status.schema_version,
+            registry_cache_schema_version()
+        );
+    }
+    status.validation_status = status.validation_status.trim().to_ascii_lowercase();
+    if status.validation_status.is_empty() {
+        status.validation_status = "ok".to_string();
+    }
+    if status.validation_status != "failed" {
+        status.validation_failed_reason = None;
+    }
+    Ok(Some(status))
+}
+
+fn write_registry_cache_validation_status(
+    path: &Path,
+    validation_status: &str,
+    validation_failed_reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let status_path = registry_cache_validation_status_path(path);
+    let status = RegistryCacheValidationStatusEnvelope {
+        schema_version: registry_cache_schema_version(),
+        updated_at: Utc::now().to_rfc3339(),
+        validation_status: validation_status.trim().to_ascii_lowercase(),
+        validation_failed_reason: validation_failed_reason.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }),
+    };
+    let payload = serde_json::to_string_pretty(&status)
+        .context("failed serializing registry cache validation status")?;
+    write_atomic(&status_path, payload.as_bytes()).with_context(|| {
+        format!(
+            "failed writing registry cache validation status {}",
+            status_path.display()
+        )
+    })
 }
 
 fn write_atomic(path: &Path, payload: &[u8]) -> anyhow::Result<()> {
@@ -805,5 +934,63 @@ mod tests {
         assert!(status.cache_present);
         assert!(status.stale);
         assert!(status.bundle_age_seconds.unwrap_or(0) > 60);
+    }
+
+    #[test]
+    fn registry_bundle_runtime_status_surfaces_validation_failure_without_cache() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        mark_registry_validation_failed(&path, "integrity_verification_failed:sha_mismatch")
+            .unwrap();
+
+        let status =
+            registry_bundle_runtime_status(&path, std::time::Duration::from_secs(24 * 60 * 60));
+        assert!(!status.cache_present);
+        assert_eq!(status.validation_status.as_deref(), Some("failed"));
+        assert_eq!(
+            status.validation_failed_reason.as_deref(),
+            Some("integrity_verification_failed:sha_mismatch")
+        );
+        assert!(status.stale);
+    }
+
+    #[test]
+    fn save_registry_bundle_cache_marks_validation_success() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        mark_registry_validation_failed(&path, "cache_write_failed:disk_full").unwrap();
+
+        let metadata = sample_registry_metadata("validation-ok-v1");
+        let bundle = serde_json::json!({
+            "schema_version": 2,
+            "version": "validation-ok-v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "type": "ai-inference",
+                    "domains": ["api.openai.com"]
+                }
+            },
+            "domain_index": [],
+            "filters": {
+                "whitelist": [],
+                "blacklist": [],
+                "passthrough": [],
+                "noise_keywords": []
+            },
+            "pricing": {}
+        });
+
+        save_registry_bundle_cache(&path, &metadata, "etag-1", bundle.to_string().as_bytes())
+            .unwrap();
+
+        let status =
+            registry_bundle_runtime_status(&path, std::time::Duration::from_secs(24 * 60 * 60));
+        assert!(status.cache_present);
+        assert_eq!(status.validation_status.as_deref(), Some("ok"));
+        assert!(status.validation_failed_reason.is_none());
     }
 }

@@ -208,23 +208,61 @@ impl RegistryPuller {
         let Some(version) = self.fetch_version(endpoint, fetch_query).await? else {
             return Ok(None);
         };
+        let version_bundle_hash = normalize_optional(version.bundle_hash.as_deref());
         match self
-            .fetch_bundle(endpoint, if_none_match, fetch_query)
+            .fetch_bundle(
+                endpoint,
+                if_none_match,
+                fetch_query,
+                version_bundle_hash.as_deref(),
+            )
             .await?
         {
-            BundleFetchResult::NotModified => Ok(Some(RegistryPullOutcome {
-                checked: true,
-                downloaded: false,
-                version: Some(version.version),
-            })),
+            BundleFetchResult::NotModified => {
+                if let Err(error) = cache::mark_registry_validation_success(&self.cache_path) {
+                    tracing::warn!(
+                        error = %error,
+                        "Failed updating registry cache validation status after 304 revalidation"
+                    );
+                }
+                Ok(Some(RegistryPullOutcome {
+                    checked: true,
+                    downloaded: false,
+                    version: Some(version.version),
+                }))
+            }
             BundleFetchResult::Downloaded { bytes, etag } => {
-                let verified_metadata = verify_bundle_integrity(&version, &bytes, Some(&etag))?;
+                let verified_metadata = verify_bundle_integrity(&version, &bytes, Some(&etag))
+                    .inspect_err(|error| {
+                        if let Err(status_error) =
+                            cache::mark_registry_validation_failed(
+                                &self.cache_path,
+                                &format!("integrity_verification_failed:{error}"),
+                            )
+                        {
+                            tracing::warn!(
+                                error = %status_error,
+                                "Failed persisting registry validation status after integrity failure"
+                            );
+                        }
+                    })?;
                 cache::save_registry_bundle_cache(
                     &self.cache_path,
                     &verified_metadata,
                     &etag,
                     &bytes,
-                )?;
+                )
+                .inspect_err(|error| {
+                    if let Err(status_error) = cache::mark_registry_validation_failed(
+                        &self.cache_path,
+                        &format!("cache_write_failed:{error}"),
+                    ) {
+                        tracing::warn!(
+                            error = %status_error,
+                            "Failed persisting registry validation status after cache write failure"
+                        );
+                    }
+                })?;
                 if endpoint != self.endpoint {
                     tracing::warn!(
                         endpoint = endpoint,
@@ -283,10 +321,11 @@ impl RegistryPuller {
         endpoint: &str,
         if_none_match: Option<&str>,
         fetch_query: &RegistryBundleFetchQuery,
+        bundle_hash: Option<&str>,
     ) -> anyhow::Result<BundleFetchResult> {
         let url = format!("{endpoint}/api/v1/registry/bundle");
         let mut query_params = vec![("type", self.bundle_type.clone())];
-        query_params.extend(build_bundle_query_pairs(fetch_query));
+        query_params.extend(build_bundle_request_query_pairs(fetch_query, bundle_hash));
         let mut request = build_cloud_client(endpoint)
             .get(&url)
             .query(&query_params)
@@ -407,6 +446,17 @@ fn build_bundle_query_pairs(fetch_query: &RegistryBundleFetchQuery) -> Vec<(&'st
     }
 }
 
+fn build_bundle_request_query_pairs(
+    fetch_query: &RegistryBundleFetchQuery,
+    bundle_hash: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut pairs = build_bundle_query_pairs(fetch_query);
+    if let Some(bundle_hash) = normalize_optional(bundle_hash) {
+        pairs.push(("bundle_hash", bundle_hash));
+    }
+    pairs
+}
+
 fn verify_bundle_integrity(
     metadata: &RegistryVersionResponse,
     bundle_bytes: &[u8],
@@ -490,8 +540,8 @@ fn normalize_hash_candidate(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_bundle_query_pairs, extract_required_etag, normalize_etag, should_skip_pull,
-        verify_bundle_integrity,
+        build_bundle_query_pairs, build_bundle_request_query_pairs, extract_required_etag,
+        normalize_etag, should_skip_pull, verify_bundle_integrity,
     };
     use reqwest::header::HeaderMap;
     use reqwest::header::{HeaderValue, ETAG};
@@ -610,6 +660,23 @@ mod tests {
                 ("query", "diff".to_string()),
                 ("from_hash", "abc123".to_string()),
                 ("section", "tools".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn build_bundle_request_query_pairs_appends_bundle_hash() {
+        let pairs = build_bundle_request_query_pairs(
+            &RegistryBundleFetchQuery::Section {
+                section: "rules".to_string(),
+            },
+            Some("abc123"),
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("query", "section:rules".to_string()),
+                ("bundle_hash", "abc123".to_string())
             ]
         );
     }
