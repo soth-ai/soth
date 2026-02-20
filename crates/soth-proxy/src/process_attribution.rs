@@ -31,7 +31,10 @@ struct CacheEntry {
 impl ProcessAttribution {
     pub fn new(requested_enabled: bool, lookup_timeout: Duration, cache_ttl: Duration) -> Self {
         Self {
-            enabled: requested_enabled && (cfg!(target_os = "macos") || cfg!(target_os = "linux")),
+            enabled: requested_enabled
+                && (cfg!(target_os = "macos")
+                    || cfg!(target_os = "linux")
+                    || cfg!(target_os = "windows")),
             lookup_timeout,
             cache_ttl,
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -78,17 +81,70 @@ impl ProcessAttribution {
     }
 
     async fn resolve_uncached(&self, client_addr: SocketAddr) -> Option<ProcessIdentity> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(identity) =
+            resolve_with_native_socket_owner(client_addr, self.lookup_timeout).await
         {
-            return resolve_with_lsof(client_addr, self.lookup_timeout).await;
+            return Some(identity);
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = client_addr;
-            None
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(identity) = resolve_with_lsof(client_addr, self.lookup_timeout).await {
+            return Some(identity);
         }
+
+        resolve_with_ps_fallback(client_addr, self.lookup_timeout).await
     }
+}
+
+async fn build_process_identity(
+    pid: u32,
+    raw_name: String,
+    attribution_source: &str,
+    attribution_confidence: f64,
+    timeout: Duration,
+) -> ProcessIdentity {
+    let executable = lookup_executable(pid, timeout).await;
+    let name = normalize_process_name(raw_name, executable.as_deref());
+    let app_type = classify_app_type(name.as_str(), executable.as_deref());
+    ProcessIdentity {
+        pid,
+        name,
+        executable,
+        app_type,
+        attribution_source: attribution_source.to_string(),
+        attribution_confidence,
+    }
+}
+
+async fn resolve_with_native_socket_owner(
+    client_addr: SocketAddr,
+    timeout: Duration,
+) -> Option<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    if let Some((pid, raw_name, exact_socket_match)) = resolve_with_ss(client_addr, timeout).await {
+        let (source, confidence) = if exact_socket_match {
+            ("socket_owner_native_ss_exact", 0.98)
+        } else {
+            ("socket_owner_native_ss_fallback", 0.82)
+        };
+        return Some(build_process_identity(pid, raw_name, source, confidence, timeout).await);
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some((pid, raw_name, exact_socket_match)) =
+        resolve_with_windows_tcp_table(client_addr, timeout).await
+    {
+        let (source, confidence) = if exact_socket_match {
+            ("socket_owner_native_tcp_table_exact", 0.96)
+        } else {
+            ("socket_owner_native_tcp_table_fallback", 0.80)
+        };
+        return Some(build_process_identity(pid, raw_name, source, confidence, timeout).await);
+    }
+
+    let _ = client_addr;
+    let _ = timeout;
+    None
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -112,24 +168,421 @@ async fn resolve_with_lsof(client_addr: SocketAddr, timeout: Duration) -> Option
     }
 
     let (pid, raw_name, exact_socket_match) = parse_lsof_output(&output.stdout, client_addr)?;
-    let executable = lookup_executable(pid, timeout).await;
-    let name = normalize_process_name(raw_name, executable.as_deref());
-    let app_type = classify_app_type(name.as_str(), executable.as_deref());
-    let confidence = if exact_socket_match { 0.95 } else { 0.75 };
     let attribution_source = if exact_socket_match {
         "socket_owner_exact"
     } else {
         "socket_owner_fallback"
     };
+    let confidence = if exact_socket_match { 0.95 } else { 0.75 };
 
-    Some(ProcessIdentity {
-        pid,
-        name,
-        executable,
-        app_type,
-        attribution_source: attribution_source.to_string(),
-        attribution_confidence: confidence,
-    })
+    Some(build_process_identity(pid, raw_name, attribution_source, confidence, timeout).await)
+}
+
+#[cfg(target_os = "linux")]
+async fn resolve_with_ss(
+    client_addr: SocketAddr,
+    timeout: Duration,
+) -> Option<(u32, String, bool)> {
+    use tokio::process::Command;
+
+    let output = tokio::time::timeout(timeout, Command::new("ss").args(["-Hntp"]).output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_ss_output(&output.stdout, client_addr)
+}
+
+#[cfg(target_os = "windows")]
+async fn resolve_with_windows_tcp_table(
+    client_addr: SocketAddr,
+    timeout: Duration,
+) -> Option<(u32, String, bool)> {
+    use tokio::process::Command;
+
+    let output = tokio::time::timeout(
+        timeout,
+        Command::new("netstat").args(["-ano", "-p", "tcp"]).output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let (pid, exact_socket_match) = parse_windows_netstat_output(&output.stdout, client_addr)?;
+    let process_name = lookup_process_name_windows(pid, timeout)
+        .await
+        .unwrap_or_else(|| "unknown".to_string());
+    Some((pid, process_name, exact_socket_match))
+}
+
+#[cfg(target_os = "windows")]
+async fn lookup_process_name_windows(pid: u32, timeout: Duration) -> Option<String> {
+    use tokio::process::Command;
+
+    let filter = format!("PID eq {pid}");
+    let output = tokio::time::timeout(
+        timeout,
+        Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_tasklist_row(text.lines().next()?.trim()).map(|(_, name)| name)
+}
+
+async fn resolve_with_ps_fallback(
+    client_addr: SocketAddr,
+    timeout: Duration,
+) -> Option<ProcessIdentity> {
+    // Conservative fallback for local proxy mode only.
+    if !client_addr.ip().is_loopback() {
+        return None;
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use tokio::process::Command;
+
+        let output = tokio::time::timeout(
+            timeout,
+            Command::new("ps").args(["-axo", "pid=,comm="]).output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let self_pid = std::process::id();
+        let mut singleton: Option<(u32, String)> = None;
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(pid_raw) = parts.next() else {
+                continue;
+            };
+            let Ok(pid) = pid_raw.parse::<u32>() else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            let name = parts.collect::<Vec<_>>().join(" ");
+            if name.is_empty() || name.eq_ignore_ascii_case("soth") {
+                continue;
+            }
+            if !is_ps_fallback_candidate(name.as_str()) {
+                continue;
+            }
+            if singleton.is_some() {
+                return None;
+            }
+            singleton = Some((pid, name));
+        }
+
+        if let Some((pid, raw_name)) = singleton {
+            return Some(
+                build_process_identity(pid, raw_name, "process_scan_singleton", 0.20, timeout)
+                    .await,
+            );
+        }
+        return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use tokio::process::Command;
+
+        let output = tokio::time::timeout(
+            timeout,
+            Command::new("tasklist")
+                .args(["/FO", "CSV", "/NH"])
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut singleton: Option<(u32, String)> = None;
+
+        for line in text.lines() {
+            if let Some((pid, name)) = parse_tasklist_row(line) {
+                if !is_ps_fallback_candidate(name.as_str()) {
+                    continue;
+                }
+                if singleton.is_some() {
+                    return None;
+                }
+                singleton = Some((pid, name));
+            }
+        }
+
+        if let Some((pid, raw_name)) = singleton {
+            return Some(
+                build_process_identity(pid, raw_name, "process_scan_singleton", 0.20, timeout)
+                    .await,
+            );
+        }
+        return None;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = timeout;
+        None
+    }
+}
+
+fn is_ps_fallback_candidate(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "codex",
+        "claude",
+        "cursor",
+        "windsurf",
+        "chatgpt",
+        "anthropic",
+        "warp",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_ss_output(stdout: &[u8], client_addr: SocketAddr) -> Option<(u32, String, bool)> {
+    let text = String::from_utf8_lossy(stdout);
+    let self_pid = std::process::id();
+    let mut generic_match: Option<(u32, String, bool)> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let head = line
+            .split_once(" users:")
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(line);
+        let tokens: Vec<&str> = head.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let local_socket = tokens[tokens.len() - 2];
+        let exact_socket_match = socket_token_matches_client(local_socket, client_addr, true);
+        let fallback_socket_match = socket_token_matches_client(local_socket, client_addr, false);
+        if !fallback_socket_match {
+            continue;
+        }
+
+        let Some(pid) = extract_pid_marker(line) else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let process_name =
+            extract_first_quoted_value(line).unwrap_or_else(|| "unknown".to_string());
+        if process_name.eq_ignore_ascii_case("soth") {
+            continue;
+        }
+        if exact_socket_match {
+            return Some((pid, process_name, true));
+        }
+        if generic_match.is_none() {
+            generic_match = Some((pid, process_name, false));
+        }
+    }
+
+    generic_match
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_netstat_output(stdout: &[u8], client_addr: SocketAddr) -> Option<(u32, bool)> {
+    let text = String::from_utf8_lossy(stdout);
+    let self_pid = std::process::id();
+    let mut generic_match: Option<(u32, bool)> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(proto) = parts.next() else {
+            continue;
+        };
+        if !proto.eq_ignore_ascii_case("tcp") {
+            continue;
+        }
+        let Some(local) = parts.next() else {
+            continue;
+        };
+        let _foreign = parts.next();
+        let _state = parts.next();
+        let Some(pid_raw) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_raw.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+
+        let exact_socket_match = socket_token_matches_client(local, client_addr, true);
+        let fallback_socket_match = socket_token_matches_client(local, client_addr, false);
+        if !fallback_socket_match {
+            continue;
+        }
+        if exact_socket_match {
+            return Some((pid, true));
+        }
+        if generic_match.is_none() {
+            generic_match = Some((pid, false));
+        }
+    }
+
+    generic_match
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_tasklist_row(line: &str) -> Option<(u32, String)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    if line.starts_with("INFO:") {
+        return None;
+    }
+    let mut parts = line.split(',');
+    let image_name = parts.next()?.trim().trim_matches('"');
+    let pid_raw = parts.next()?.trim().trim_matches('"');
+    let pid = pid_raw.parse::<u32>().ok()?;
+    let normalized_name = image_name
+        .trim_end_matches(".exe")
+        .trim_end_matches(".EXE")
+        .to_string();
+    if normalized_name.is_empty() {
+        None
+    } else {
+        Some((pid, normalized_name))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn extract_pid_marker(line: &str) -> Option<u32> {
+    let marker = "pid=";
+    let start = line.find(marker)? + marker.len();
+    let digits: String = line[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u32>().ok()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn extract_first_quoted_value(line: &str) -> Option<String> {
+    let start = line.find('"')? + 1;
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn socket_token_matches_client(
+    token: &str,
+    client_addr: SocketAddr,
+    require_exact_ip: bool,
+) -> bool {
+    let Some((candidate_ip, candidate_port)) = parse_socket_token(token) else {
+        return false;
+    };
+    if candidate_port != client_addr.port() {
+        return false;
+    }
+
+    match candidate_ip {
+        Some(ip) => ip_matches(ip, client_addr.ip()),
+        None => !require_exact_ip,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn parse_socket_token(token: &str) -> Option<(Option<std::net::IpAddr>, u16)> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    if token.starts_with('[') {
+        let end = token.find(']')?;
+        let host = &token[1..end];
+        let rest = token.get(end + 1..)?.trim();
+        let port = rest.strip_prefix(':')?.parse::<u16>().ok()?;
+        return Some((parse_candidate_ip(host), port));
+    }
+
+    let (host, port_raw) = token.rsplit_once(':')?;
+    let port = port_raw.parse::<u16>().ok()?;
+    Some((parse_candidate_ip(host), port))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn parse_candidate_ip(host: &str) -> Option<std::net::IpAddr> {
+    let host = host.trim();
+    if host.is_empty()
+        || host == "*"
+        || host == "0.0.0.0"
+        || host == "::"
+        || host.eq_ignore_ascii_case("[::]")
+    {
+        return None;
+    }
+    let host = host.split('%').next().unwrap_or(host);
+    host.parse::<std::net::IpAddr>().ok()
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn ip_matches(candidate: std::net::IpAddr, target: std::net::IpAddr) -> bool {
+    if candidate == target {
+        return true;
+    }
+    match (candidate, target) {
+        (std::net::IpAddr::V6(v6), std::net::IpAddr::V4(v4))
+        | (std::net::IpAddr::V4(v4), std::net::IpAddr::V6(v6)) => {
+            v6.to_ipv4().map(|mapped| mapped == v4).unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 fn normalize_process_name(raw_name: String, executable: Option<&str>) -> String {
@@ -449,5 +902,53 @@ mod tests {
     fn normalize_process_name_uses_unknown_when_only_version_is_available() {
         let normalized = normalize_process_name("2.1.45".to_string(), None);
         assert_eq!(normalized, "unknown");
+    }
+
+    #[test]
+    fn parse_socket_token_handles_ipv4_ipv6_and_wildcard() {
+        assert_eq!(
+            parse_socket_token("127.0.0.1:8080"),
+            Some((Some("127.0.0.1".parse().unwrap()), 8080))
+        );
+        assert_eq!(
+            parse_socket_token("[::1]:3000"),
+            Some((Some("::1".parse().unwrap()), 3000))
+        );
+        assert_eq!(parse_socket_token("*:443"), Some((None, 443)));
+    }
+
+    #[test]
+    fn socket_token_matching_respects_exact_vs_fallback() {
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        assert!(socket_token_matches_client("127.0.0.1:8081", addr, true));
+        assert!(!socket_token_matches_client("*:8081", addr, true));
+        assert!(socket_token_matches_client("*:8081", addr, false));
+    }
+
+    #[test]
+    fn parse_ss_output_prefers_exact_socket_owner() {
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let sample = b"ESTAB 0 0 127.0.0.1:9999 127.0.0.1:8081 users:((\"fallback\",pid=1234,fd=11))\nESTAB 0 0 127.0.0.1:8081 127.0.0.1:3001 users:((\"codex\",pid=5678,fd=12))\n";
+        let parsed = parse_ss_output(sample, addr).unwrap();
+        assert_eq!(parsed.0, 5678);
+        assert_eq!(parsed.1, "codex");
+        assert!(parsed.2);
+    }
+
+    #[test]
+    fn parse_windows_netstat_output_prefers_exact_socket_owner() {
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let sample = b"  TCP    127.0.0.1:9999   127.0.0.1:8081   ESTABLISHED   1234\n  TCP    127.0.0.1:8081   127.0.0.1:3001   ESTABLISHED   5678\n";
+        let parsed = parse_windows_netstat_output(sample, addr).unwrap();
+        assert_eq!(parsed.0, 5678);
+        assert!(parsed.1);
+    }
+
+    #[test]
+    fn parse_tasklist_row_extracts_name_and_pid() {
+        let row = "\"Code.exe\",\"4108\",\"Console\",\"1\",\"238,252 K\"";
+        let parsed = parse_tasklist_row(row).unwrap();
+        assert_eq!(parsed.0, 4108);
+        assert_eq!(parsed.1, "Code");
     }
 }
