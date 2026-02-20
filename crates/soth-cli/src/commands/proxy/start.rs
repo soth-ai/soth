@@ -442,17 +442,57 @@ fn set_env_if_present<T: ToString>(key: &str, value: Option<T>) {
 }
 
 fn parse_registry_collector_sources(bundle: &serde_json::Value) -> Vec<RegistryCollectorSource> {
-    let sources = bundle
-        .get("collector")
-        .and_then(|value| value.get("sources"))
-        .or_else(|| bundle.get("collector_sources"))
-        .and_then(serde_json::Value::as_array);
-    let Some(sources) = sources else {
-        return Vec::new();
-    };
-
     let mut parsed = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut sections = vec![bundle];
+    if let Some(data) = bundle.get("data") {
+        sections.push(data);
+    }
+
+    for section in sections {
+        parse_registry_collector_sources_from_array(
+            section
+                .get("collector")
+                .and_then(|value| value.get("sources"))
+                .and_then(serde_json::Value::as_array),
+            &mut parsed,
+            &mut seen,
+        );
+        parse_registry_collector_sources_from_array(
+            section
+                .get("collector_sources")
+                .and_then(serde_json::Value::as_array),
+            &mut parsed,
+            &mut seen,
+        );
+        parse_registry_collector_sources_from_local_artifacts(
+            section
+                .get("local_artifacts")
+                .and_then(serde_json::Value::as_array),
+            &mut parsed,
+            &mut seen,
+        );
+        parse_registry_collector_sources_from_local_data_sources(
+            section
+                .get("localDataSources")
+                .and_then(|value| value.get("sources"))
+                .and_then(serde_json::Value::as_array),
+            &mut parsed,
+            &mut seen,
+        );
+    }
+
+    parsed
+}
+
+fn parse_registry_collector_sources_from_array(
+    sources: Option<&Vec<serde_json::Value>>,
+    parsed: &mut Vec<RegistryCollectorSource>,
+    seen: &mut BTreeSet<String>,
+) {
+    let Some(sources) = sources else {
+        return;
+    };
     for source in sources {
         let Some(source_obj) = source.as_object() else {
             continue;
@@ -479,18 +519,134 @@ fn parse_registry_collector_sources(bundle: &serde_json::Value) -> Vec<RegistryC
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let key = format!("{agent}|{path}");
-        if !seen.insert(key) {
+        push_registry_collector_source(parsed, seen, agent, path, parser);
+    }
+}
+
+fn parse_registry_collector_sources_from_local_artifacts(
+    artifacts: Option<&Vec<serde_json::Value>>,
+    parsed: &mut Vec<RegistryCollectorSource>,
+    seen: &mut BTreeSet<String>,
+) {
+    let Some(artifacts) = artifacts else {
+        return;
+    };
+    for artifact in artifacts {
+        let Some(obj) = artifact.as_object() else {
+            continue;
+        };
+        let Some(agent) = obj
+            .get("slug")
+            .or_else(|| obj.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let parser = obj
+            .get("parserConfig")
+            .and_then(|value| value.get("parserName"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let globs = obj
+            .get("collectionConfig")
+            .and_then(|value| value.get("globs"))
+            .and_then(serde_json::Value::as_array);
+        let Some(globs) = globs else {
+            continue;
+        };
+        for glob in globs {
+            let Some(pattern) = glob
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !is_supported_registry_collector_glob(pattern) {
+                continue;
+            }
+            let parser = parser.clone().or_else(|| Some("jsonl".to_string()));
+            push_registry_collector_source(parsed, seen, agent, pattern, parser);
+        }
+    }
+}
+
+fn parse_registry_collector_sources_from_local_data_sources(
+    sources: Option<&Vec<serde_json::Value>>,
+    parsed: &mut Vec<RegistryCollectorSource>,
+    seen: &mut BTreeSet<String>,
+) {
+    let Some(sources) = sources else {
+        return;
+    };
+    for source in sources {
+        let Some(source_obj) = source.as_object() else {
+            continue;
+        };
+        if source_obj
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|enabled| !enabled)
+        {
             continue;
         }
-        parsed.push(RegistryCollectorSource {
-            agent: agent.to_string(),
-            path: path.to_string(),
-            parser,
-        });
+        let Some(agent) = source_obj
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let globs = source_obj
+            .get("globs")
+            .and_then(serde_json::Value::as_array);
+        let Some(globs) = globs else {
+            continue;
+        };
+        for glob in globs {
+            let Some(pattern) = glob
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !is_supported_registry_collector_glob(pattern) {
+                continue;
+            }
+            push_registry_collector_source(parsed, seen, agent, pattern, Some("jsonl".to_string()));
+        }
     }
+}
 
-    parsed
+fn push_registry_collector_source(
+    parsed: &mut Vec<RegistryCollectorSource>,
+    seen: &mut BTreeSet<String>,
+    agent: &str,
+    path: &str,
+    parser: Option<String>,
+) {
+    let key = format!("{agent}|{path}");
+    if !seen.insert(key) {
+        return;
+    }
+    parsed.push(RegistryCollectorSource {
+        agent: agent.to_string(),
+        path: path.to_string(),
+        parser,
+    });
+}
+
+fn is_supported_registry_collector_glob(pattern: &str) -> bool {
+    let lower = pattern.trim().to_ascii_lowercase();
+    lower.ends_with(".jsonl") || lower.ends_with(".ndjson")
 }
 
 fn load_registry_collector_sources(config: &SothConfig) -> Vec<RegistryCollectorSource> {
@@ -636,4 +792,64 @@ fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollect
         "SOTH_COLLECTOR_EVENT_SOURCE",
         collector.event_source.clone(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_registry_collector_sources;
+
+    #[test]
+    fn parse_registry_collector_sources_supports_sensor_local_sources() {
+        let bundle = serde_json::json!({
+            "data": {
+                "local_artifacts": [
+                    {
+                        "slug": "codex",
+                        "parserConfig": { "parserName": "codex" },
+                        "collectionConfig": {
+                            "globs": [
+                                { "pattern": "~/.codex/sessions/**/*.jsonl" },
+                                { "pattern": "~/.codex/config.toml" }
+                            ]
+                        }
+                    }
+                ],
+                "localDataSources": {
+                    "sources": [
+                        {
+                            "name": "codex",
+                            "enabled": true,
+                            "globs": [
+                                { "pattern": "~/.codex/sessions/**/*.jsonl" },
+                                { "pattern": "~/.codex/history.jsonl" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        let sources = parse_registry_collector_sources(&bundle);
+        assert_eq!(sources.len(), 2);
+        assert!(sources.iter().any(|source| {
+            source.agent == "codex" && source.path == "~/.codex/sessions/**/*.jsonl"
+        }));
+        assert!(sources
+            .iter()
+            .any(|source| { source.agent == "codex" && source.path == "~/.codex/history.jsonl" }));
+    }
+
+    #[test]
+    fn parse_registry_collector_sources_supports_legacy_collector_sources() {
+        let bundle = serde_json::json!({
+            "collector_sources": [
+                { "agent": "claude_code", "path": "~/.claude/projects/*/*.jsonl", "parser": "jsonl" }
+            ]
+        });
+
+        let sources = parse_registry_collector_sources(&bundle);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].agent, "claude_code");
+        assert_eq!(sources[0].path, "~/.claude/projects/*/*.jsonl");
+    }
 }
