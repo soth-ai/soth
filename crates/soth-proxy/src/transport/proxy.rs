@@ -46,8 +46,8 @@ use crate::transport::proxy_detection::{
 pub use crate::transport::proxy_enforcer::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
 use crate::transport::proxy_error::handle_forward_error;
 use crate::transport::proxy_exchange::{
-    append_detection_tags, apply_process_identity, finalize_and_enqueue_exchange_v2,
-    record_proxy_budget_spend, seed_exchange_v2_spool,
+    append_detection_tags, apply_process_identity, finalize_and_enqueue_exchange,
+    record_proxy_budget_spend, seed_exchange_spool,
 };
 use crate::transport::proxy_payload::{
     capture_sanitized_headers, decode_payload_for_logging, extract_gemini_bard_stream_text,
@@ -70,8 +70,8 @@ use crate::transport::proxy_routing::{
 };
 use crate::transport::proxy_support::{
     acquire_stream_buffer, append_capture_tags, append_catalog_discovery_tags,
-    append_process_attribution_tags, append_stream_capture, decision_label_from_intercept_decision,
-    is_blacklist_detection_reason, process_bundle_id_from_executable, release_stream_buffer,
+    append_process_attribution_tags, append_stream_capture, classify_tls_intercept_forward_error,
+    decision_label_from_intercept_decision, is_blacklist_detection_reason, release_stream_buffer,
     should_shed_intercept_due_to_fd_pressure, CatalogDiscoveryLimiter, TunnelDebugRuntime,
     STREAM_CAPTURE_MAX_BYTES,
 };
@@ -86,23 +86,23 @@ use crate::transport::usage_enrichment::{
     extract_usage_meta_from_stream_usage, ResponseUsageMeta,
 };
 use soth_core::config::{
-    ExchangeV2Config, ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode,
+    ExchangeConfig, ForwardProxyConfig, HostAction, HostFilterConfig, HostFilterMode,
     ObserveConfig, RegistryMode,
 };
 use soth_core::types::TrafficEnvelope;
 use soth_core::EventLogger;
 use soth_core::{
     EXCHANGE_CLIENT_APP_TYPE_HOST, EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
-    EXCHANGE_DECISION_OUTCOME_CAPTURED, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
-    EXCHANGE_DECISION_OUTCOME_SKIPPED, EXCHANGE_DECISION_STEP_APP_GATE,
-    EXCHANGE_DECISION_STEP_APP_ORIGIN, EXCHANGE_DECISION_STEP_GRAPHQL_BLACKLIST,
-    EXCHANGE_DECISION_STEP_HOST_ORIGIN, EXCHANGE_DECISION_STEP_URL_BLACKLIST,
-    EXCHANGE_DECISION_STEP_WHITELIST, EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_CATALOG,
-    EXCHANGE_DISCOVERY_KIND_DOMAIN, EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED,
-    EXCHANGE_SKIP_REASON_APP_RATE_LIMITED, EXCHANGE_SKIP_REASON_BLACKLISTED,
-    EXCHANGE_SKIP_REASON_BLACKLISTED_GRAPHQL, EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED,
-    EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED, EXCHANGE_SKIP_REASON_NOT_WHITELISTED,
-    EXCHANGE_SKIP_REASON_NO_BUNDLE_ID,
+    EXCHANGE_CLIENT_APP_TYPE_UNKNOWN, EXCHANGE_DECISION_OUTCOME_CAPTURED,
+    EXCHANGE_DECISION_OUTCOME_METADATA_ONLY, EXCHANGE_DECISION_OUTCOME_SKIPPED,
+    EXCHANGE_DECISION_STEP_APP_GATE, EXCHANGE_DECISION_STEP_APP_ORIGIN,
+    EXCHANGE_DECISION_STEP_GRAPHQL_BLACKLIST, EXCHANGE_DECISION_STEP_HOST_ORIGIN,
+    EXCHANGE_DECISION_STEP_URL_BLACKLIST, EXCHANGE_DECISION_STEP_WHITELIST,
+    EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_CATALOG, EXCHANGE_DISCOVERY_KIND_DOMAIN,
+    EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED, EXCHANGE_SKIP_REASON_APP_RATE_LIMITED,
+    EXCHANGE_SKIP_REASON_BLACKLISTED, EXCHANGE_SKIP_REASON_BLACKLISTED_GRAPHQL,
+    EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED, EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED,
+    EXCHANGE_SKIP_REASON_NOT_WHITELISTED, EXCHANGE_SKIP_REASON_NO_BUNDLE_ID,
 };
 
 /// Pending request info for correlating with responses
@@ -130,6 +130,8 @@ pub(crate) struct PendingRequest {
     pub(crate) headers: Option<BTreeMap<String, String>>,
     /// Request content-type from ingress.
     pub(crate) request_content_type: Option<String>,
+    /// Whether the incoming request used HTTP/2.
+    pub(crate) is_http2: bool,
     /// Whether this is traffic from an agent app (chatgpt.com, claude.ai) vs direct API
     pub(crate) is_agent_app: bool,
     /// JSON-RPC MCP method (when this request is identified as MCP traffic)
@@ -182,15 +184,10 @@ fn next_proxy_request_id() -> u64 {
 const SELECTIVE_CAPTURE_MAX_BODY_BYTES: usize = 64 * 1024;
 
 fn should_downgrade_skip_reason_for_metadata_policy(reason: &str) -> bool {
-    matches!(
-        reason,
-        EXCHANGE_SKIP_REASON_NO_BUNDLE_ID
-            | EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED
-            | EXCHANGE_SKIP_REASON_APP_RATE_LIMITED
-            | EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED
-            | EXCHANGE_SKIP_REASON_NOT_WHITELISTED
-            | EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED
-    )
+    let _ = reason;
+    // Keep explicit skip reasons even under metadata-only capture so policy outcomes remain
+    // auditable and transport-consistent.
+    false
 }
 
 fn apply_request_capture_policy(
@@ -303,8 +300,8 @@ pub struct AiProxyHandler {
     registry_mode: RegistryMode,
     /// Bundle-driven classifier loaded from registry cache.
     oisp_engine: Arc<OispEngine>,
-    /// Optional exchange.v2 assembly config (disabled when None).
-    exchange_v2: Option<ExchangeAssemblerConfig>,
+    /// Optional Exchange assembly config (disabled when None).
+    exchange: Option<ExchangeAssemblerConfig>,
     /// One-time-per-day limiter for catalog-domain discovery captures.
     catalog_discovery_limiter: Arc<CatalogDiscoveryLimiter>,
     /// Maximum request/response body bytes to capture in observability payloads.
@@ -317,6 +314,8 @@ pub struct AiProxyHandler {
     force_intercept_all: bool,
     /// Optional expiry for the debug force-intercept-all override.
     force_intercept_all_until: Option<SystemTime>,
+    /// CONNECT host selected for MITM in this request lifecycle (used for TLS failure learning).
+    connect_intercept_host: Option<String>,
 }
 
 impl Clone for AiProxyHandler {
@@ -335,13 +334,14 @@ impl Clone for AiProxyHandler {
             process_attribution: self.process_attribution.clone(),
             registry_mode: self.registry_mode,
             oisp_engine: self.oisp_engine.clone(),
-            exchange_v2: self.exchange_v2.clone(),
+            exchange: self.exchange.clone(),
             catalog_discovery_limiter: self.catalog_discovery_limiter.clone(),
             capture_max_body_bytes: self.capture_max_body_bytes,
             tunnel_debug: self.tunnel_debug.clone(),
             request_correlation_id: next_proxy_request_id(),
             force_intercept_all: self.force_intercept_all,
             force_intercept_all_until: self.force_intercept_all_until,
+            connect_intercept_host: None,
         }
     }
 }
@@ -370,7 +370,7 @@ impl AiProxyHandler {
             )),
             registry_mode: config.registry_mode,
             oisp_engine,
-            exchange_v2: None,
+            exchange: None,
             catalog_discovery_limiter: Arc::new(CatalogDiscoveryLimiter::default()),
             capture_max_body_bytes: config.capture_max_body_bytes,
             tunnel_debug: TunnelDebugRuntime::new(
@@ -381,6 +381,7 @@ impl AiProxyHandler {
             request_correlation_id: next_proxy_request_id(),
             force_intercept_all: false,
             force_intercept_all_until: None,
+            connect_intercept_host: None,
         }
     }
 
@@ -401,12 +402,12 @@ impl AiProxyHandler {
         self
     }
 
-    /// Enable exchange.v2 assembly + queue output.
-    pub fn with_exchange_v2(mut self, exchange_cfg: ExchangeV2Config) -> Self {
+    /// Enable Exchange assembly + queue output.
+    pub fn with_exchange(mut self, exchange_cfg: ExchangeConfig) -> Self {
         if exchange_cfg.enabled {
-            self.exchange_v2 = Some(ExchangeAssemblerConfig::from(&exchange_cfg));
+            self.exchange = Some(ExchangeAssemblerConfig::from(&exchange_cfg));
         } else {
-            self.exchange_v2 = None;
+            self.exchange = None;
         }
         self
     }
@@ -557,6 +558,7 @@ impl HttpHandler for AiProxyHandler {
             self.capture_max_body_bytes,
         );
         let is_post = request_plan.is_post;
+        let is_http2_request = req.version() == hudsucker::hyper::Version::HTTP_2;
         let is_json = request_plan.is_json;
         let content_type = request_plan.content_type.clone();
         let request_content_encoding = request_plan.request_content_encoding.clone();
@@ -567,14 +569,12 @@ impl HttpHandler for AiProxyHandler {
         let oisp_engine = self.oisp_engine.clone();
         let event_logger = self.event_logger.clone();
         let learned_passthrough = self.learned_passthrough.clone();
-        let learned_failure_threshold = self.learned_failure_threshold;
-        let learned_failure_window = self.learned_failure_window;
         let process_attribution = self.process_attribution.clone();
         let capture_max_body_bytes = self.capture_max_body_bytes;
         let tunnel_debug = self.tunnel_debug.clone();
         let client_addr = ctx.client_addr;
-        let exchange_v2_cfg = self.exchange_v2.clone();
-        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+        let exchange_cfg = self.exchange.clone();
+        let exchange_bundle_version = if exchange_cfg.is_some() {
             Some(self.oisp_engine.bundle_version().to_string())
         } else {
             None
@@ -600,6 +600,12 @@ impl HttpHandler for AiProxyHandler {
         let pending_requests = self.pending_requests.clone();
         let request_id = self.request_correlation_id;
 
+        if is_connect && matches!(host_action, HostAction::Intercept) {
+            self.connect_intercept_host = Some(host.clone());
+        } else {
+            self.connect_intercept_host = None;
+        }
+
         async move {
             // Check if blocked
             if is_blocked {
@@ -624,9 +630,9 @@ impl HttpHandler for AiProxyHandler {
                 let process_pid = process_identity.as_ref().map(|value| value.pid);
                 let process_name = process_identity.as_ref().map(|value| value.name.as_str());
                 if tunnel_debug.should_log(decision_label, &host, process_pid, process_name) {
-                    let process_bundle_id = process_identity.as_ref().and_then(|value| {
-                        process_bundle_id_from_executable(value.executable.as_deref())
-                    });
+                    let process_bundle_id = process_identity
+                        .as_ref()
+                        .and_then(|value| value.bundle_id.clone());
                     info!(
                         host = %host,
                         method = "CONNECT",
@@ -641,26 +647,6 @@ impl HttpHandler for AiProxyHandler {
                         process_bundle_id = ?process_bundle_id,
                         "Tunnel debug CONNECT metadata (no body capture)"
                     );
-                }
-            }
-
-            if is_connect && matches!(host_action, HostAction::Intercept) {
-                if let Some(ref learned) = learned_passthrough {
-                    if !learned.should_passthrough(&host)
-                        && learned.record_connect_attempt(
-                            &host,
-                            learned_failure_threshold,
-                            learned_failure_window,
-                        )
-                    {
-                        metrics::record_tls_learned_passthrough("learn");
-                        metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
-                        warn!(
-                            host = %host,
-                            threshold = learned_failure_threshold,
-                            "Learned TLS passthrough host after repeated failed intercept attempts"
-                        );
-                    }
                 }
             }
 
@@ -752,9 +738,9 @@ impl HttpHandler for AiProxyHandler {
                 let process_pid = process_identity.as_ref().map(|value| value.pid);
                 let process_name = process_identity.as_ref().map(|value| value.name.as_str());
                 if tunnel_debug.should_log(decision_label, &host, process_pid, process_name) {
-                    let process_bundle_id = process_identity.as_ref().and_then(|value| {
-                        process_bundle_id_from_executable(value.executable.as_deref())
-                    });
+                    let process_bundle_id = process_identity
+                        .as_ref()
+                        .and_then(|value| value.bundle_id.clone());
                     info!(
                         host = %host,
                         path = %path,
@@ -783,12 +769,8 @@ impl HttpHandler for AiProxyHandler {
             }
             let process_bundle_id = process_identity
                 .as_ref()
-                .and_then(|value| process_bundle_id_from_executable(value.executable.as_deref()));
-            let app_identifier = process_bundle_id.clone().or_else(|| {
-                process_identity
-                    .as_ref()
-                    .map(|value| value.name.to_ascii_lowercase())
-            });
+                .and_then(|value| value.bundle_id.clone());
+            let app_identifier = process_bundle_id.clone();
             let app_origin = app_identifier
                 .as_deref()
                 .and_then(|value| oisp_engine.classify_app_origin(value));
@@ -861,11 +843,9 @@ impl HttpHandler for AiProxyHandler {
             } else {
                 None
             };
-            let mut client_app_type = app_origin.map(ToString::to_string).or_else(|| {
-                process_identity
-                    .as_ref()
-                    .map(|value| value.app_type.clone())
-            });
+            let client_app_type = app_origin
+                .map(ToString::to_string)
+                .or_else(|| Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string()));
             let client_referrer_origin = request_referrer_origin.clone();
             let client_host_origin = request_origin
                 .clone()
@@ -983,14 +963,6 @@ impl HttpHandler for AiProxyHandler {
                 decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY.to_string());
             } else if matches!(capture_policy, CapturePolicy::MetadataOnly) {
                 decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY.to_string());
-            }
-
-            if client_app_type.is_none() && app_origin == Some(EXCHANGE_CLIENT_APP_TYPE_HOST) {
-                client_app_type = Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
-            } else if client_app_type.is_none()
-                && app_origin == Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST)
-            {
-                client_app_type = Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
             }
 
             let mut policy_allowed = None;
@@ -1143,6 +1115,7 @@ impl HttpHandler for AiProxyHandler {
                             request_size_bytes,
                             headers: None,
                             request_content_type: content_type.clone(),
+                            is_http2: is_http2_request,
                             is_agent_app: host_is_agent_target,
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
@@ -1212,6 +1185,7 @@ impl HttpHandler for AiProxyHandler {
                         request_size_bytes,
                         headers: None,
                         request_content_type: content_type.clone(),
+                        is_http2: is_http2_request,
                         is_agent_app: false,
                         mcp_method: Some(mcp_method),
                         is_mcp_jsonrpc: true,
@@ -1237,7 +1211,7 @@ impl HttpHandler for AiProxyHandler {
             } else {
                 debug!(host = %host, path = %path, "Request (non-AI)");
                 if !is_connect
-                    && exchange_v2_cfg.is_some()
+                    && exchange_cfg.is_some()
                     && (decision_outcome.as_deref()
                         == Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY)
                         || decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_SKIPPED))
@@ -1280,6 +1254,7 @@ impl HttpHandler for AiProxyHandler {
                             request_size_bytes,
                             headers: None,
                             request_content_type: content_type.clone(),
+                            is_http2: is_http2_request,
                             is_agent_app: host_is_agent_target,
                             mcp_method: None,
                             is_mcp_jsonrpc: false,
@@ -1325,7 +1300,7 @@ impl HttpHandler for AiProxyHandler {
                         entry.request_size_bytes =
                             request_size_bytes.or(sanitized_request_size_bytes);
                     }
-                    if exchange_v2_cfg.is_some() {
+                    if exchange_cfg.is_some() {
                         Some(entry.clone())
                     } else {
                         None
@@ -1335,11 +1310,11 @@ impl HttpHandler for AiProxyHandler {
                 }
             };
             if let (Some(exchange_cfg), Some(logger), Some(entry)) = (
-                exchange_v2_cfg.as_ref(),
+                exchange_cfg.as_ref(),
                 event_logger.as_ref(),
                 pending_for_spool.as_ref(),
             ) {
-                seed_exchange_v2_spool(
+                seed_exchange_spool(
                     logger,
                     exchange_cfg,
                     entry,
@@ -1365,8 +1340,8 @@ impl HttpHandler for AiProxyHandler {
         let session_id = self.session_id.clone();
         let request_id = self.request_correlation_id;
         let oisp_engine = self.oisp_engine.clone();
-        let exchange_v2_cfg = self.exchange_v2.clone();
-        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+        let exchange_cfg = self.exchange.clone();
+        let exchange_bundle_version = if exchange_cfg.is_some() {
             Some(self.oisp_engine.bundle_version().to_string())
         } else {
             None
@@ -1439,7 +1414,7 @@ impl HttpHandler for AiProxyHandler {
                     event_logger.as_ref(),
                     &event_tags,
                     &pii_enricher,
-                    exchange_v2_cfg.as_ref(),
+                    exchange_cfg.as_ref(),
                     exchange_bundle_version.as_deref(),
                     &session_id,
                     response_capture_limit_bytes,
@@ -1456,8 +1431,14 @@ impl HttpHandler for AiProxyHandler {
                 .to_ascii_lowercase()
                 .contains("/backend-api/codex/responses");
             let is_gemini_bard_response_path = is_gemini_bard_stream_path(&pending.path);
-            let is_stream_response =
-                is_sse || is_codex_response_path || is_gemini_bard_response_path;
+            let is_streamable_http_path = pending
+                .path
+                .to_ascii_lowercase()
+                .contains("streamable-http");
+            let is_stream_response = is_sse
+                || is_codex_response_path
+                || is_gemini_bard_response_path
+                || is_streamable_http_path;
             let mut response_usage = ResponseUsageMeta::default();
             let response_declared_oversized = declared_response_size_bytes
                 .map(|size| size > response_capture_limit_bytes)
@@ -1548,7 +1529,7 @@ impl HttpHandler for AiProxyHandler {
                 let log_budget_tracker = budget_tracker.clone();
                 let log_event_tags = event_tags.clone();
                 let log_pii_enricher = pii_enricher.clone();
-                let log_exchange_v2_cfg = exchange_v2_cfg.clone();
+                let log_exchange_cfg = exchange_cfg.clone();
                 let log_exchange_bundle_version = exchange_bundle_version.clone();
                 let log_response_headers = response_headers.clone();
                 let log_provider = provider.clone();
@@ -1726,8 +1707,8 @@ impl HttpHandler for AiProxyHandler {
                             },
                         );
                         let content_for_exchange = content.clone();
-                        if let Some(exchange_cfg) = log_exchange_v2_cfg.as_ref() {
-                            finalize_and_enqueue_exchange_v2(
+                        if let Some(exchange_cfg) = log_exchange_cfg.as_ref() {
+                            finalize_and_enqueue_exchange(
                                 logger,
                                 exchange_cfg,
                                 &log_pii_enricher,
@@ -1792,7 +1773,7 @@ impl HttpHandler for AiProxyHandler {
                 if let Some(ref logger) = event_logger {
                     emit_non_stream_response_event(
                         logger,
-                        exchange_v2_cfg.as_ref(),
+                        exchange_cfg.as_ref(),
                         &pii_enricher,
                         &pending,
                         &session_id,
@@ -1828,13 +1809,41 @@ impl HttpHandler for AiProxyHandler {
         let event_tags = self.event_tags.clone();
         let pii_enricher = self.pii_enricher.clone();
         let session_id = self.session_id.clone();
-        let exchange_v2_cfg = self.exchange_v2.clone();
-        let exchange_bundle_version = if exchange_v2_cfg.is_some() {
+        let learned_passthrough = self.learned_passthrough.clone();
+        let learned_failure_threshold = self.learned_failure_threshold;
+        let learned_failure_window = self.learned_failure_window;
+        let connect_intercept_host = self.connect_intercept_host.take();
+        let exchange_cfg = self.exchange.clone();
+        let exchange_bundle_version = if exchange_cfg.is_some() {
             Some(self.oisp_engine.bundle_version().to_string())
         } else {
             None
         };
         async move {
+            if let (Some(learned), Some(host), Some(reason)) = (
+                learned_passthrough.as_ref(),
+                connect_intercept_host.as_deref(),
+                classify_tls_intercept_forward_error(&err),
+            ) {
+                if !learned.should_passthrough(host)
+                    && learned.record_intercept_failure(
+                        host,
+                        learned_failure_threshold,
+                        learned_failure_window,
+                        reason,
+                    )
+                {
+                    metrics::record_tls_learned_passthrough("learn");
+                    metrics::set_tls_learned_passthrough_active(learned.active_count() as f64);
+                    warn!(
+                        host = %host,
+                        threshold = learned_failure_threshold,
+                        failure_reason = reason,
+                        "Learned TLS passthrough host after repeated classified intercept failures"
+                    );
+                }
+            }
+
             handle_forward_error(
                 client_addr,
                 request_id,
@@ -1844,7 +1853,7 @@ impl HttpHandler for AiProxyHandler {
                 event_tags,
                 pii_enricher,
                 session_id,
-                exchange_v2_cfg,
+                exchange_cfg,
                 exchange_bundle_version,
             )
             .await

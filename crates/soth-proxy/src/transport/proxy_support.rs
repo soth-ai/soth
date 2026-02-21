@@ -7,6 +7,7 @@ use chrono::{NaiveDate, Utc};
 use hudsucker::hyper_util::client::legacy::Error as LegacyClientError;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use rustls::{AlertDescription, Error as RustlsError};
 use serde::{Deserialize, Serialize};
 use soth_core::types::TrafficEnvelope;
 use soth_core::EventLogger;
@@ -184,6 +185,78 @@ pub(crate) fn is_benign_proxy_forward_error(err: &LegacyClientError) -> bool {
         source = cause.source();
     }
     false
+}
+
+pub(crate) fn classify_tls_intercept_forward_error(
+    err: &LegacyClientError,
+) -> Option<&'static str> {
+    let mut saw_tls_error = false;
+    let mut saw_timeout = false;
+    let mut saw_certificate_error = false;
+
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if let Some(tls_error) = cause.downcast_ref::<RustlsError>() {
+            saw_tls_error = true;
+            match tls_error {
+                RustlsError::InvalidCertificate(_)
+                | RustlsError::NoCertificatesPresented
+                | RustlsError::UnsupportedNameType => {
+                    saw_certificate_error = true;
+                }
+                RustlsError::AlertReceived(alert) => {
+                    if matches!(
+                        alert,
+                        AlertDescription::BadCertificate
+                            | AlertDescription::UnsupportedCertificate
+                            | AlertDescription::CertificateRevoked
+                            | AlertDescription::CertificateExpired
+                            | AlertDescription::CertificateUnknown
+                            | AlertDescription::UnknownCA
+                            | AlertDescription::AccessDenied
+                    ) {
+                        saw_certificate_error = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            if io_error.kind() == std::io::ErrorKind::TimedOut {
+                saw_timeout = true;
+            }
+        }
+        source = cause.source();
+    }
+
+    if saw_certificate_error {
+        return Some("tls_certificate_validation_failed");
+    }
+    if saw_tls_error {
+        return Some("tls_handshake_failed");
+    }
+    if saw_timeout {
+        return Some("tls_handshake_timeout");
+    }
+
+    let error = err.to_string().to_ascii_lowercase();
+    if error.contains("certificate")
+        || error.contains("unknown ca")
+        || error.contains("bad certificate")
+        || error.contains("certificate verify")
+        || error.contains("authority invalid")
+    {
+        return Some("tls_certificate_validation_failed");
+    }
+    if error.contains("tls")
+        || error.contains("ssl")
+        || error.contains("handshake")
+        || error.contains("alert")
+    {
+        return Some("tls_handshake_failed");
+    }
+
+    None
 }
 
 pub(crate) fn is_emfile_proxy_forward_error(err: &LegacyClientError) -> bool {
@@ -590,33 +663,92 @@ fn scoped_parent_package_before_node_modules(path: &str, marker_start: usize) ->
 }
 
 fn macos_bundle_id_from_executable_path(path: &str) -> Option<String> {
-    let normalized_path = path.replace('\\', "/");
-    let lower = normalized_path.to_ascii_lowercase();
-    lower.find(".app/").and_then(|idx| {
-        let app_root = &normalized_path[..idx + 4];
-        let app = app_root
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        return None;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        static MACOS_BUNDLE_ID_CACHE: Lazy<Mutex<HashMap<String, Option<String>>>> =
+            Lazy::new(|| Mutex::new(HashMap::new()));
+
+        let normalized_path = path.replace('\\', "/");
+
+        if let Some(bundle_id) = macos_bundle_id_from_bundle_marker(
+            normalized_path.as_str(),
+            ".app",
+            &MACOS_BUNDLE_ID_CACHE,
+        ) {
+            return Some(bundle_id);
+        }
+        if let Some(bundle_id) = macos_bundle_id_from_bundle_marker(
+            normalized_path.as_str(),
+            ".xpc",
+            &MACOS_BUNDLE_ID_CACHE,
+        ) {
+            return Some(bundle_id);
+        }
+
+        let leaf = normalized_path
             .rsplit('/')
             .next()
-            .unwrap_or(app_root)
-            .trim_end_matches(".app")
-            .trim();
-        if app.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "macos.{}",
-                app.chars()
-                    .map(|ch| {
-                        if ch.is_ascii_alphanumeric() {
-                            ch.to_ascii_lowercase()
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect::<String>()
-                    .trim_matches('_')
-            ))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default();
+        if looks_like_bundle_id(leaf) {
+            return Some(leaf.to_string());
         }
+
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_id_from_bundle_marker(
+    path: &str,
+    marker: &str,
+    cache: &Mutex<HashMap<String, Option<String>>>,
+) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    let idx = lower.find(marker)?;
+    let bundle_root = format!("{}{}", &path[..idx], marker);
+
+    if let Some(cached) = cache.lock().get(&bundle_root).cloned() {
+        return cached;
+    }
+
+    let plist_path = format!("{bundle_root}/Contents/Info.plist");
+    let detected = std::process::Command::new("defaults")
+        .args(["read", plist_path.as_str(), "CFBundleIdentifier"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    cache.lock().insert(bundle_root, detected.clone());
+    detected
+}
+
+fn looks_like_bundle_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.matches('.').count() < 2 {
+        return false;
+    }
+    let parts = trimmed.split('.').collect::<Vec<_>>();
+    if !matches!(
+        parts.first().copied(),
+        Some("com" | "org" | "net" | "io" | "app" | "me" | "co" | "dev")
+    ) {
+        return false;
+    }
+    parts.iter().all(|segment| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
     })
 }
 
@@ -685,11 +817,11 @@ mod tests {
     }
 
     #[test]
-    fn process_bundle_id_falls_back_to_macos_app_identifier() {
-        let path = "/Applications/Warp.app/Contents/MacOS/Warp";
+    fn process_bundle_id_accepts_reverse_domain_executable_name() {
+        let path = "/System/Library/Frameworks/WebKit.framework/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking";
         assert_eq!(
             process_bundle_id_from_executable(Some(path)),
-            Some("macos.warp".to_string())
+            Some("com.apple.WebKit.Networking".to_string())
         );
     }
 }

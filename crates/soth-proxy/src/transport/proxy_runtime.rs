@@ -26,7 +26,7 @@ use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::proxy::AiProxyHandler;
 use crate::transport::proxy_enforcer::ProxyEnforcer;
 use crate::transport::proxy_websocket::AiWebSocketHandler;
-use soth_core::config::{ExchangeV2Config, ForwardProxyConfig, ObserveConfig};
+use soth_core::config::{ExchangeConfig, ForwardProxyConfig, ObserveConfig};
 use soth_core::EventLogger;
 
 pub(crate) fn load_oisp_engine(cache_path: Option<&Path>) -> Result<Arc<OispEngine>, ProxyError> {
@@ -160,7 +160,7 @@ pub async fn start_proxy_with_shutdown<F>(
     enforcer: Option<ProxyEnforcer>,
     observe_config: Option<ObserveConfig>,
     oisp_registry_cache_path: Option<PathBuf>,
-    exchange_v2_config: Option<ExchangeV2Config>,
+    exchange_config: Option<ExchangeConfig>,
     force_intercept_all: bool,
     force_intercept_all_for: Option<Duration>,
 ) -> Result<(), ProxyError>
@@ -215,6 +215,7 @@ where
         let learned = Arc::new(LearnedPassthrough::new(
             config.tls.learned_passthrough.state_path.clone(),
             ai_protected_patterns,
+            config.tls.learned_passthrough.ignore_hosts.clone(),
             config.tls.learned_passthrough.max_age,
         ));
         learned.load();
@@ -234,8 +235,8 @@ where
         if let Some(ref proxy_enforcer) = enforcer {
             h = h.with_enforcer(proxy_enforcer.clone());
         }
-        if let Some(ref exchange_cfg) = exchange_v2_config {
-            h = h.with_exchange_v2(exchange_cfg.clone());
+        if let Some(ref exchange_cfg) = exchange_config {
+            h = h.with_exchange(exchange_cfg.clone());
         }
         if let Some(ref learned) = learned_passthrough {
             h = h.with_learned_passthrough(
@@ -258,6 +259,7 @@ where
         oisp_engine.clone(),
         event_tags,
         pii_enricher,
+        exchange_config.clone(),
     );
 
     info!("Starting soth proxy on {}", listen_addr);
@@ -270,6 +272,20 @@ where
             min_log_interval_secs = config.tunnel_debug.min_log_interval.as_secs(),
             "  Tunnel debug -> metadata logging enabled for tunneled traffic"
         );
+    }
+    if !config.tls.learned_passthrough.ignore_hosts.is_empty() {
+        info!(
+            ignore_hosts = config.tls.learned_passthrough.ignore_hosts.len(),
+            "  TLS ignore_hosts -> explicit blind tunnel bypass enabled"
+        );
+    }
+    info!(
+        enabled = config.tls.http2_enabled,
+        max_header_list_size = config.tls.http2_max_header_list_size,
+        "  Protocol controls -> HTTP/2 inbound parser settings"
+    );
+    if config.tls.http3_passthrough {
+        info!("  Protocol controls -> HTTP/3 remains passthrough/tunnel");
     }
     if force_intercept_all {
         match force_intercept_all_for {
@@ -290,7 +306,11 @@ where
         .max_buf_size(1024 * 1024)
         .title_case_headers(true)
         .preserve_header_case(true);
-    server.http2().max_header_list_size(262_144);
+    if config.tls.http2_enabled {
+        server
+            .http2()
+            .max_header_list_size(config.tls.http2_max_header_list_size);
+    }
 
     let proxy = Proxy::builder()
         .with_addr(listen_addr)

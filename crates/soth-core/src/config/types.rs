@@ -50,9 +50,9 @@ pub struct SothConfig {
     #[serde(default)]
     pub cloud: CloudConfig,
 
-    /// Unified exchange v2 pipeline settings
+    /// Unified Exchange pipeline settings.
     #[serde(default)]
-    pub exchange_v2: ExchangeV2Config,
+    pub exchange: ExchangeConfig,
 
     /// Dashboard settings
     #[serde(default)]
@@ -88,7 +88,7 @@ impl Default for SothConfig {
             observe: ObserveConfig::default(),
             budget: BudgetConfig::default(),
             cloud: CloudConfig::default(),
-            exchange_v2: ExchangeV2Config::default(),
+            exchange: ExchangeConfig::default(),
             dashboard: DashboardConfig::default(),
             forward_proxy: ForwardProxyConfig::default(),
             production: ProductionConfig::default(),
@@ -1155,53 +1155,53 @@ impl Default for CloudConfig {
     }
 }
 
-/// Unified request/response exchange v2 configuration.
+/// Unified request/response Exchange configuration (schema_version=1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExchangeV2Config {
-    /// Enable unified exchange v2 event flow.
+pub struct ExchangeConfig {
+    /// Enable unified Exchange event flow.
     #[serde(default)]
     pub enabled: bool,
 
     /// Inline body cutoff before offload/reference mode.
-    #[serde(default = "default_exchange_v2_inline_max_bytes")]
+    #[serde(default = "default_exchange_inline_max_bytes")]
     pub inline_max_bytes: usize,
 
     /// Hard body capture cap for request/response payloads.
-    #[serde(default = "default_exchange_v2_max_body_bytes")]
+    #[serde(default = "default_exchange_max_body_bytes")]
     pub max_body_bytes: u64,
 
     /// Stream buffer cap before truncation fallback.
-    #[serde(default = "default_exchange_v2_max_stream_buffer_bytes")]
+    #[serde(default = "default_exchange_max_stream_buffer_bytes")]
     pub max_stream_buffer_bytes: u64,
 
     /// Idle timeout used for incomplete streaming finalization.
     #[serde(
-        default = "default_exchange_v2_stream_idle_timeout",
+        default = "default_exchange_stream_idle_timeout",
         with = "humantime_serde"
     )]
     pub stream_idle_timeout: Duration,
 
     /// Hard stop for total stream assembly lifetime.
     #[serde(
-        default = "default_exchange_v2_stream_max_duration",
+        default = "default_exchange_stream_max_duration",
         with = "humantime_serde"
     )]
     pub stream_max_duration: Duration,
 
     /// Local spool database path for in-flight exchanges.
-    #[serde(default = "default_exchange_v2_spool_path")]
+    #[serde(default = "default_exchange_spool_path")]
     pub spool_path: PathBuf,
 
     /// Maximum in-flight exchange assemblies retained in spool.
-    #[serde(default = "default_exchange_v2_spool_max_inflight")]
+    #[serde(default = "default_exchange_spool_max_inflight")]
     pub spool_max_inflight: usize,
 
     /// Maximum queued uploads retained locally.
-    #[serde(default = "default_exchange_v2_upload_queue_max_items")]
+    #[serde(default = "default_exchange_upload_queue_max_items")]
     pub upload_queue_max_items: usize,
 
     /// Maximum local upload queue disk budget.
-    #[serde(default = "default_exchange_v2_upload_queue_max_bytes")]
+    #[serde(default = "default_exchange_upload_queue_max_bytes")]
     pub upload_queue_max_bytes: u64,
 
     /// Recover in-flight assemblies on startup.
@@ -1209,55 +1209,55 @@ pub struct ExchangeV2Config {
     pub recover_inflight_on_start: bool,
 }
 
-fn default_exchange_v2_inline_max_bytes() -> usize {
+fn default_exchange_inline_max_bytes() -> usize {
     256 * 1024
 }
 
-fn default_exchange_v2_max_body_bytes() -> u64 {
+fn default_exchange_max_body_bytes() -> u64 {
     15 * 1024 * 1024
 }
 
-fn default_exchange_v2_max_stream_buffer_bytes() -> u64 {
+fn default_exchange_max_stream_buffer_bytes() -> u64 {
     15 * 1024 * 1024
 }
 
-fn default_exchange_v2_stream_idle_timeout() -> Duration {
+fn default_exchange_stream_idle_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
-fn default_exchange_v2_stream_max_duration() -> Duration {
+fn default_exchange_stream_max_duration() -> Duration {
     Duration::from_secs(600)
 }
 
-fn default_exchange_v2_spool_path() -> PathBuf {
+fn default_exchange_spool_path() -> PathBuf {
     PathBuf::from("~/.soth/runtime/exchange-spool.db")
 }
 
-fn default_exchange_v2_spool_max_inflight() -> usize {
+fn default_exchange_spool_max_inflight() -> usize {
     10_000
 }
 
-fn default_exchange_v2_upload_queue_max_items() -> usize {
+fn default_exchange_upload_queue_max_items() -> usize {
     20_000
 }
 
-fn default_exchange_v2_upload_queue_max_bytes() -> u64 {
+fn default_exchange_upload_queue_max_bytes() -> u64 {
     512 * 1024 * 1024
 }
 
-impl Default for ExchangeV2Config {
+impl Default for ExchangeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            inline_max_bytes: default_exchange_v2_inline_max_bytes(),
-            max_body_bytes: default_exchange_v2_max_body_bytes(),
-            max_stream_buffer_bytes: default_exchange_v2_max_stream_buffer_bytes(),
-            stream_idle_timeout: default_exchange_v2_stream_idle_timeout(),
-            stream_max_duration: default_exchange_v2_stream_max_duration(),
-            spool_path: default_exchange_v2_spool_path(),
-            spool_max_inflight: default_exchange_v2_spool_max_inflight(),
-            upload_queue_max_items: default_exchange_v2_upload_queue_max_items(),
-            upload_queue_max_bytes: default_exchange_v2_upload_queue_max_bytes(),
+            inline_max_bytes: default_exchange_inline_max_bytes(),
+            max_body_bytes: default_exchange_max_body_bytes(),
+            max_stream_buffer_bytes: default_exchange_max_stream_buffer_bytes(),
+            stream_idle_timeout: default_exchange_stream_idle_timeout(),
+            stream_max_duration: default_exchange_stream_max_duration(),
+            spool_path: default_exchange_spool_path(),
+            spool_max_inflight: default_exchange_spool_max_inflight(),
+            upload_queue_max_items: default_exchange_upload_queue_max_items(),
+            upload_queue_max_bytes: default_exchange_upload_queue_max_bytes(),
             recover_inflight_on_start: true,
         }
     }
@@ -1493,11 +1493,41 @@ impl Default for TunnelDebugConfig {
 }
 
 /// TLS-specific options for the forward proxy transport.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardProxyTlsConfig {
     /// Adaptive passthrough of learned cert-pinned hosts.
     #[serde(default)]
     pub learned_passthrough: LearnedPassthroughConfig,
+
+    /// Enable HTTP/2 parser path on the inbound proxy server.
+    #[serde(default = "default_true", alias = "http2Enabled")]
+    pub http2_enabled: bool,
+
+    /// Maximum HTTP/2 header list size accepted by the proxy server.
+    #[serde(
+        default = "default_forward_proxy_http2_max_header_list_size",
+        alias = "http2MaxHeaderListSize"
+    )]
+    pub http2_max_header_list_size: u32,
+
+    /// Keep HTTP/3 traffic as passthrough (CONNECT tunnel) for compatibility.
+    #[serde(default = "default_true", alias = "http3Passthrough")]
+    pub http3_passthrough: bool,
+}
+
+fn default_forward_proxy_http2_max_header_list_size() -> u32 {
+    262_144
+}
+
+impl Default for ForwardProxyTlsConfig {
+    fn default() -> Self {
+        Self {
+            learned_passthrough: LearnedPassthroughConfig::default(),
+            http2_enabled: default_true(),
+            http2_max_header_list_size: default_forward_proxy_http2_max_header_list_size(),
+            http3_passthrough: default_true(),
+        }
+    }
 }
 
 /// Learned TLS passthrough configuration.
@@ -1528,6 +1558,10 @@ pub struct LearnedPassthroughConfig {
         with = "humantime_serde"
     )]
     pub failure_window: Duration,
+
+    /// Hosts/patterns that should always bypass MITM interception.
+    #[serde(default, alias = "ignoreHosts")]
+    pub ignore_hosts: Vec<String>,
 }
 
 fn default_learned_passthrough_state_path() -> PathBuf {
@@ -1557,6 +1591,7 @@ impl Default for LearnedPassthroughConfig {
             max_age: default_learned_passthrough_max_age(),
             failure_threshold: default_learned_passthrough_failure_threshold(),
             failure_window: default_learned_passthrough_failure_window(),
+            ignore_hosts: Vec::new(),
         }
     }
 }
@@ -2205,9 +2240,9 @@ mod tests {
         assert!(!config.cloud.enabled);
         assert_eq!(config.cloud.endpoint, "https://api.soth.ai");
         assert_eq!(config.cloud.config_debounce_secs, 6);
-        assert!(!config.exchange_v2.enabled);
-        assert_eq!(config.exchange_v2.inline_max_bytes, 256 * 1024);
-        assert_eq!(config.exchange_v2.max_body_bytes, 15 * 1024 * 1024);
+        assert!(!config.exchange.enabled);
+        assert_eq!(config.exchange.inline_max_bytes, 256 * 1024);
+        assert_eq!(config.exchange.max_body_bytes, 15 * 1024 * 1024);
         assert!(config.forward_proxy.tls.learned_passthrough.enabled);
     }
 
@@ -2293,9 +2328,9 @@ cloud:
     }
 
     #[test]
-    fn test_parse_exchange_v2_yaml() {
+    fn test_parse_exchange_yaml() {
         let yaml = r#"
-exchange_v2:
+exchange:
   enabled: true
   inline_max_bytes: 131072
   max_body_bytes: 15728640
@@ -2309,22 +2344,19 @@ exchange_v2:
   recover_inflight_on_start: true
 "#;
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.exchange_v2.enabled);
-        assert_eq!(config.exchange_v2.inline_max_bytes, 131_072);
-        assert_eq!(config.exchange_v2.max_body_bytes, 15 * 1024 * 1024);
-        assert_eq!(config.exchange_v2.max_stream_buffer_bytes, 8 * 1024 * 1024);
+        assert!(config.exchange.enabled);
+        assert_eq!(config.exchange.inline_max_bytes, 131_072);
+        assert_eq!(config.exchange.max_body_bytes, 15 * 1024 * 1024);
+        assert_eq!(config.exchange.max_stream_buffer_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.exchange.stream_idle_timeout, Duration::from_secs(45));
         assert_eq!(
-            config.exchange_v2.stream_idle_timeout,
-            Duration::from_secs(45)
-        );
-        assert_eq!(
-            config.exchange_v2.stream_max_duration,
+            config.exchange.stream_max_duration,
             Duration::from_secs(900)
         );
-        assert_eq!(config.exchange_v2.spool_max_inflight, 5000);
-        assert_eq!(config.exchange_v2.upload_queue_max_items, 12000);
-        assert_eq!(config.exchange_v2.upload_queue_max_bytes, 256 * 1024 * 1024);
-        assert!(config.exchange_v2.recover_inflight_on_start);
+        assert_eq!(config.exchange.spool_max_inflight, 5000);
+        assert_eq!(config.exchange.upload_queue_max_items, 12000);
+        assert_eq!(config.exchange.upload_queue_max_bytes, 256 * 1024 * 1024);
+        assert!(config.exchange.recover_inflight_on_start);
     }
 
     #[test]
@@ -2786,6 +2818,7 @@ forward_proxy:
         assert_eq!(config.max_age, Duration::from_secs(24 * 60 * 60));
         assert_eq!(config.failure_threshold, 8);
         assert_eq!(config.failure_window, Duration::from_secs(120));
+        assert!(config.ignore_hosts.is_empty());
     }
 
     #[test]
@@ -2905,15 +2938,24 @@ production:
         let yaml = r#"
 forward_proxy:
   tls:
+    http2_enabled: false
+    http2_max_header_list_size: 131072
+    http3_passthrough: true
     learned_passthrough:
       enabled: true
       state_path: "/tmp/learned-passthrough.json"
       max_age: "5d"
       failure_threshold: 4
       failure_window: "2m"
+      ignore_hosts:
+        - "chatgpt.com"
+        - "*.claude.ai"
 "#;
 
         let config: SothConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.forward_proxy.tls.http2_enabled);
+        assert_eq!(config.forward_proxy.tls.http2_max_header_list_size, 131072);
+        assert!(config.forward_proxy.tls.http3_passthrough);
         let learned = &config.forward_proxy.tls.learned_passthrough;
         assert!(learned.enabled);
         assert_eq!(
@@ -2923,6 +2965,10 @@ forward_proxy:
         assert_eq!(learned.max_age, Duration::from_secs(5 * 24 * 60 * 60));
         assert_eq!(learned.failure_threshold, 4);
         assert_eq!(learned.failure_window, Duration::from_secs(120));
+        assert_eq!(
+            learned.ignore_hosts,
+            vec!["chatgpt.com".to_string(), "*.claude.ai".to_string()]
+        );
     }
 
     #[test]

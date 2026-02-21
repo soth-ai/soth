@@ -311,6 +311,40 @@ pub async fn run(
         }
 
         println!();
+        style::subtitle("App-Specific Trust Stores");
+        style::info(
+            "If a service still reports 'authority invalid', its client may use a separate trust store.",
+        );
+        println!(
+            "    {}",
+            format!("NODE_EXTRA_CA_CERTS={} <your_command>", cert_path.display()).dimmed()
+        );
+        println!(
+            "    {}",
+            format!(
+                "certutil -A -n \"SOTH Proxy CA\" -t \"C,,\" -i {} -d sql:$HOME/.pki/nssdb",
+                cert_path.display()
+            )
+            .dimmed()
+        );
+        println!(
+            "    {}",
+            format!(
+                "certutil -A -n \"SOTH Proxy CA\" -t \"C,,\" -i {} -d sql:<firefox-profile-dir>",
+                cert_path.display()
+            )
+            .dimmed()
+        );
+        println!(
+            "    {}",
+            format!(
+                "keytool -importcert -noprompt -trustcacerts -alias soth-proxy-ca -file {} -keystore <java-cacerts>",
+                cert_path.display()
+            )
+            .dimmed()
+        );
+
+        println!();
         style::info("Or use the CA certificate directly with curl:");
         println!(
             "    {}",
