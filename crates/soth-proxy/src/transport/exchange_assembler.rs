@@ -1,7 +1,7 @@
-//! Exchange assembler for unified `exchange.v2` events.
+//! Exchange assembler for unified Exchange events.
 //!
 //! This module collates request/response payload fragments into one finalized
-//! `ExchangeEventV2` and supports snapshot serialization for local spool
+//! `ExchangeEvent` and supports snapshot serialization for local spool
 //! persistence.
 
 use base64::Engine as _;
@@ -9,9 +9,9 @@ use chrono::{DateTime, Utc};
 use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use soth_core::config::types::ExchangeV2Config;
-use soth_core::types::exchange_v2::{
-    ExchangeBodyMode, ExchangeClient, ExchangeCost, ExchangeEventV2, ExchangeFlags,
+use soth_core::config::types::ExchangeConfig;
+use soth_core::types::exchange::{
+    ExchangeBodyMode, ExchangeClient, ExchangeCost, ExchangeEvent, ExchangeFlags,
     ExchangeIntegrity, ExchangeParse, ExchangeSourceClass, ExchangeTransport, ExchangeUsage,
 };
 use std::collections::BTreeMap;
@@ -27,8 +27,8 @@ pub struct ExchangeAssemblerConfig {
     pub stream_max_duration: Duration,
 }
 
-impl From<&ExchangeV2Config> for ExchangeAssemblerConfig {
-    fn from(value: &ExchangeV2Config) -> Self {
+impl From<&ExchangeConfig> for ExchangeAssemblerConfig {
+    fn from(value: &ExchangeConfig) -> Self {
         Self {
             inline_max_bytes: value.inline_max_bytes.max(1),
             max_body_bytes: value.max_body_bytes.max(1) as usize,
@@ -99,7 +99,7 @@ pub struct ExchangeBlobPayload {
 /// Finalized exchange + any blob payloads that must be uploaded separately.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeFinalizeResult {
-    pub event: ExchangeEventV2,
+    pub event: ExchangeEvent,
     #[serde(default)]
     pub blobs: Vec<ExchangeBlobPayload>,
 }
@@ -309,7 +309,7 @@ impl ExchangeAssembler {
         self.state.truncated_reason = Some(reason.into());
     }
 
-    pub fn finalize_complete(mut self) -> ExchangeEventV2 {
+    pub fn finalize_complete(mut self) -> ExchangeEvent {
         self.state.completed_at = Some(Utc::now());
         self.build_result().event
     }
@@ -319,7 +319,7 @@ impl ExchangeAssembler {
         self.build_result()
     }
 
-    pub fn finalize_timeout(mut self) -> ExchangeEventV2 {
+    pub fn finalize_timeout(mut self) -> ExchangeEvent {
         self.state.completed_at = Some(Utc::now());
         if self.state.truncated_reason.is_none() {
             self.mark_truncated("partial_timeout");
@@ -355,7 +355,7 @@ impl ExchangeAssembler {
         let cfg = self.cfg.clone();
         let state = self.state;
         let now = Utc::now();
-        let mut event = ExchangeEventV2::new(
+        let mut event = ExchangeEvent::new(
             state.exchange_id,
             state.source_class,
             state.transport,
@@ -479,9 +479,9 @@ fn build_body_with_cfg(
     content_type: Option<String>,
     truncated_reason: Option<String>,
     force_metadata_only: bool,
-) -> soth_core::types::exchange_v2::ExchangeBody {
+) -> soth_core::types::exchange::ExchangeBody {
     if force_metadata_only {
-        return soth_core::types::exchange_v2::ExchangeBody {
+        return soth_core::types::exchange::ExchangeBody {
             mode: ExchangeBodyMode::MetadataOnly,
             inline: None,
             reference: None,
@@ -514,7 +514,7 @@ fn build_body_with_cfg(
         preview = Some(build_preview(bytes, 256));
     }
 
-    soth_core::types::exchange_v2::ExchangeBody {
+    soth_core::types::exchange::ExchangeBody {
         mode,
         inline,
         reference,
@@ -528,7 +528,7 @@ fn build_body_with_cfg(
 }
 
 fn apply_blob_offload(
-    body: &mut soth_core::types::exchange_v2::ExchangeBody,
+    body: &mut soth_core::types::exchange::ExchangeBody,
     raw_bytes: &[u8],
     exchange_id: &str,
     side: &str,
@@ -576,7 +576,7 @@ fn gzip_bytes(input: &[u8]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
-fn compute_event_hash(event: &ExchangeEventV2) -> String {
+fn compute_event_hash(event: &ExchangeEvent) -> String {
     let mut canonical = event.clone();
     if let Some(integrity) = canonical.integrity.as_mut() {
         integrity.event_hash = None;

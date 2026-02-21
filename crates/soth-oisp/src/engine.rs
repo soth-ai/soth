@@ -2,8 +2,7 @@ use crate::cache::BoundedCache;
 use crate::matchers::{
     contains_noise_keyword_for_host, contains_noise_keyword_text, host_matches_any,
     host_matches_pattern, identifier_matches_any, normalize_host_for_matching,
-    normalize_identifier_for_matching,
-    path_matches_any, select_best_domain_match,
+    normalize_identifier_for_matching, path_matches_any, select_best_domain_match,
 };
 use crate::parse_helpers::{
     decode_grpc_frame_payloads, extract_string_from_field_path_value,
@@ -12,11 +11,12 @@ use crate::parse_helpers::{
     parse_stream_payload_with_config, strip_json_security_prefix_bytes,
 };
 use crate::pricing::{calculate_cost_from_pricing, find_model_pricing};
-use crate::registry_cache::{load_from_registry_cache_path, registry_cache_last_good_path};
+use crate::registry_cache::load_from_registry_cache_path;
 use crate::types;
 use crate::{
-    Classification, CompiledBundle, EntryType, InterceptDecision, OispEngine, OispStreamParser,
-    ProviderUsage,
+    Classification, CompiledBundle, ConnectDecision, ConnectDecisionAction, EntryType,
+    InterceptDecision, OispEngine, OispStreamParser, ProviderUsage, RequestDecision,
+    RequestDecisionOutcome,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -75,6 +75,18 @@ impl OispEngine {
         self.bundle.filters.whitelist.len()
     }
 
+    /// Debug helper for transport decision tracing.
+    ///
+    /// Returns whether the given host matches bundle whitelist filters.
+    /// When whitelist is empty, this returns `true` (allow-all semantics).
+    pub fn is_host_whitelisted_for_debug(&self, host: &str) -> bool {
+        let host = normalize_host_for_matching(host);
+        if host.is_empty() {
+            return false;
+        }
+        self.is_whitelisted_host(host.as_str())
+    }
+
     pub fn blacklist_count(&self) -> usize {
         self.bundle.filters.blacklist.len()
     }
@@ -128,25 +140,6 @@ impl OispEngine {
             || !self.bundle.gating.allowed_app_origins.non_hosts.is_empty()
     }
 
-    pub fn has_host_origin_rules(&self) -> bool {
-        !self.bundle.gating.allowed_host_origins.is_empty()
-    }
-
-    pub fn is_allowed_host_origin(&self, origin: &str) -> bool {
-        let origin = normalize_host_for_matching(origin);
-        if origin.is_empty() {
-            return false;
-        }
-        if self.bundle.gating.allowed_host_origins.is_empty() {
-            return true;
-        }
-        self.bundle
-            .gating
-            .allowed_host_origins
-            .iter()
-            .any(|allowed| host_origin_matches_allowed(origin.as_str(), allowed.as_str()))
-    }
-
     pub fn classify(&self, host: &str) -> Option<Classification> {
         let host = normalize_host_for_matching(host);
         if host.is_empty() {
@@ -178,65 +171,349 @@ impl OispEngine {
     }
 
     pub fn should_intercept(&self, host: &str, path: &str) -> InterceptDecision {
+        self.should_intercept_with_context(host, path, None, None)
+    }
+
+    pub fn should_intercept_with_context(
+        &self,
+        host: &str,
+        path: &str,
+        method: Option<&str>,
+        app_type: Option<&str>,
+    ) -> InterceptDecision {
+        let decision = self.evaluate_request_decision(host, path, method, app_type);
+        match decision.outcome {
+            RequestDecisionOutcome::Noise => InterceptDecision::Noise,
+            RequestDecisionOutcome::Passthrough => InterceptDecision::Passthrough,
+            RequestDecisionOutcome::Tunnel => InterceptDecision::Tunnel,
+            RequestDecisionOutcome::Full | RequestDecisionOutcome::MetadataOnly => {
+                let provider_id = decision.provider_id.or_else(|| {
+                    self.classify(host)
+                        .as_ref()
+                        .map(|classification| classification.provider_id.clone())
+                });
+                let Some(provider_id) = provider_id else {
+                    return InterceptDecision::Tunnel;
+                };
+                let entry_type = decision.entry_type.or_else(|| {
+                    self.resolve_provider(provider_id.as_str())
+                        .map(|provider| provider.entry_type.clone())
+                });
+                let Some(entry_type) = entry_type else {
+                    return InterceptDecision::Tunnel;
+                };
+                InterceptDecision::Intercept {
+                    provider_id,
+                    entry_type,
+                }
+            }
+        }
+    }
+
+    pub fn evaluate_request_decision(
+        &self,
+        host: &str,
+        path: &str,
+        method: Option<&str>,
+        app_type: Option<&str>,
+    ) -> RequestDecision {
         let host = normalize_host_for_matching(host);
+        if host.is_empty() {
+            return RequestDecision {
+                outcome: RequestDecisionOutcome::Tunnel,
+                provider_id: None,
+                entry_type: None,
+                detection_id: None,
+                rule_id: None,
+                reason: Some("host_missing".to_string()),
+            };
+        }
         let path_only = path.split_once('?').map(|(raw, _)| raw).unwrap_or(path);
 
         if contains_noise_keyword_for_host(host.as_str(), path, &self.bundle.filters.noise_keywords)
         {
-            return InterceptDecision::Noise;
+            return RequestDecision {
+                outcome: RequestDecisionOutcome::Noise,
+                provider_id: None,
+                entry_type: None,
+                detection_id: None,
+                rule_id: None,
+                reason: Some("noise_keyword".to_string()),
+            };
         }
 
         if host_matches_any(host.as_str(), &self.bundle.filters.passthrough) {
-            return InterceptDecision::Passthrough;
-        }
-
-        if !self.bundle.filters.whitelist.is_empty()
-            && !host_matches_any(host.as_str(), &self.bundle.filters.whitelist)
-        {
-            return InterceptDecision::Tunnel;
+            return RequestDecision {
+                outcome: RequestDecisionOutcome::Passthrough,
+                provider_id: None,
+                entry_type: None,
+                detection_id: None,
+                rule_id: None,
+                reason: Some("passthrough".to_string()),
+            };
         }
 
         if host_matches_any(host.as_str(), &self.bundle.filters.blacklist) {
-            return InterceptDecision::Tunnel;
+            return RequestDecision {
+                outcome: RequestDecisionOutcome::Tunnel,
+                provider_id: None,
+                entry_type: None,
+                detection_id: None,
+                rule_id: None,
+                reason: Some("blacklist".to_string()),
+            };
         }
 
-        let Some(entry) = select_best_domain_match(&self.bundle.domain_index, host.as_str()) else {
-            return InterceptDecision::Tunnel;
+        let app_type = normalize_app_type(app_type);
+        let classification = self.classify(host.as_str());
+        let precedence = path_precedence(
+            self.bundle
+                .decision_rules
+                .defaults
+                .path_precedence
+                .as_slice(),
+        );
+        let mut host_rule_seen = false;
+        for rule in &self.bundle.decision_rules.rules {
+            if !rule.enabled || !host_matches_pattern(host.as_str(), rule.host_pattern.as_str()) {
+                continue;
+            }
+            if !rule.app_type.is_empty()
+                && !rule
+                    .app_type
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(app_type))
+            {
+                continue;
+            }
+            if !matches_method(method, rule.method.as_slice()) {
+                continue;
+            }
+
+            host_rule_seen = true;
+
+            for check in &precedence {
+                if *check == "deny_paths_exact"
+                    && path_matches_exact(path_only, rule.deny_paths_exact.as_slice())
+                {
+                    return self.request_decision_from_rule(
+                        classification.as_ref(),
+                        rule,
+                        RequestDecisionOutcome::MetadataOnly,
+                        "deny_paths_exact",
+                    );
+                }
+                if *check == "deny_paths_glob"
+                    && path_matches_any(path_only, rule.deny_paths_glob.as_slice())
+                {
+                    return self.request_decision_from_rule(
+                        classification.as_ref(),
+                        rule,
+                        RequestDecisionOutcome::MetadataOnly,
+                        "deny_paths_glob",
+                    );
+                }
+                if *check == "allow_paths"
+                    && path_matches_any(path_only, rule.allow_paths.as_slice())
+                {
+                    let outcome = match rule.capture_mode.as_deref() {
+                        Some("metadata_only") => RequestDecisionOutcome::MetadataOnly,
+                        _ => RequestDecisionOutcome::Full,
+                    };
+                    let default_reason = rule
+                        .reason
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("rule.path_policy.matched");
+                    return self.request_decision_from_rule(
+                        classification.as_ref(),
+                        rule,
+                        outcome,
+                        default_reason,
+                    );
+                }
+            }
+        }
+
+        let host_whitelisted = self.is_whitelisted_host(host.as_str());
+        let miss_action = match app_type {
+            "host" => self
+                .bundle
+                .decision_rules
+                .defaults
+                .host_miss_action
+                .as_str(),
+            "non_host" => self
+                .bundle
+                .decision_rules
+                .defaults
+                .non_host_miss_action
+                .as_str(),
+            _ => self
+                .bundle
+                .decision_rules
+                .defaults
+                .unknown_app_action
+                .as_str(),
         };
 
-        if !entry.paths.is_empty() && !path_matches_any(path_only, &entry.paths) {
-            return InterceptDecision::Tunnel;
+        if host_rule_seen && host_whitelisted {
+            return self.request_decision_from_classification(
+                classification.as_ref(),
+                RequestDecisionOutcome::MetadataOnly,
+                self.bundle
+                    .decision_rules
+                    .defaults
+                    .whitelist_path_miss_reason
+                    .as_str(),
+            );
         }
 
-        let Some(provider) = self.bundle.providers.get(&entry.provider_id) else {
-            return InterceptDecision::Tunnel;
-        };
-
-        InterceptDecision::Intercept {
-            provider_id: entry.provider_id.clone(),
-            entry_type: provider.entry_type.clone(),
+        if host_whitelisted && miss_action == "metadata_only" {
+            return self.request_decision_from_classification(
+                classification.as_ref(),
+                RequestDecisionOutcome::MetadataOnly,
+                self.bundle
+                    .decision_rules
+                    .defaults
+                    .whitelist_path_miss_reason
+                    .as_str(),
+            );
         }
+
+        if miss_action == "metadata_only" {
+            return self.request_decision_from_classification(
+                classification.as_ref(),
+                RequestDecisionOutcome::MetadataOnly,
+                "rule_miss_metadata_only",
+            );
+        }
+
+        self.request_decision_from_classification(
+            classification.as_ref(),
+            RequestDecisionOutcome::Tunnel,
+            "rule_miss_tunnel",
+        )
     }
 
     /// Host-only interception decision for CONNECT/TLS handshake phase where path is unknown.
     pub fn should_intercept_host(&self, host: &str) -> bool {
-        let host = normalize_host_for_matching(host);
+        matches!(
+            self.evaluate_connect_decision(host, None, Some("unknown"))
+                .action,
+            ConnectDecisionAction::Intercept
+        )
+    }
 
-        if host_matches_any(host.as_str(), &self.bundle.filters.passthrough) {
-            return false;
+    pub fn evaluate_connect_decision(
+        &self,
+        host: &str,
+        app_identifier: Option<&str>,
+        app_type: Option<&str>,
+    ) -> ConnectDecision {
+        let host = normalize_host_for_matching(host);
+        if host.is_empty() {
+            return ConnectDecision {
+                action: ConnectDecisionAction::Tunnel,
+                rule_id: None,
+                reason: Some("host_missing".to_string()),
+            };
         }
 
-        if !self.bundle.filters.whitelist.is_empty()
-            && !host_matches_any(host.as_str(), &self.bundle.filters.whitelist)
-        {
-            return false;
+        if host_matches_any(host.as_str(), &self.bundle.filters.passthrough) {
+            return ConnectDecision {
+                action: ConnectDecisionAction::Passthrough,
+                rule_id: None,
+                reason: Some("passthrough".to_string()),
+            };
         }
 
         if host_matches_any(host.as_str(), &self.bundle.filters.blacklist) {
-            return false;
+            return ConnectDecision {
+                action: ConnectDecisionAction::Tunnel,
+                rule_id: None,
+                reason: Some("blacklist".to_string()),
+            };
         }
 
-        self.classify(host.as_str()).is_some()
+        let app_type = normalize_app_type(app_type);
+        let app_identifier = app_identifier
+            .map(normalize_identifier_for_matching)
+            .filter(|value| !value.is_empty());
+        let host_whitelisted = self.is_whitelisted_host(host.as_str());
+        let host_known = self.classify(host.as_str()).is_some()
+            || self.has_decision_rule_for_host(host.as_str());
+
+        for rule in &self.bundle.connect_policy.rules {
+            if !rule.enabled {
+                continue;
+            }
+            if !rule.app_type.is_empty()
+                && !rule
+                    .app_type
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(app_type))
+            {
+                continue;
+            }
+            if !rule.app_identifiers.is_empty() {
+                let Some(identifier) = app_identifier.as_deref() else {
+                    continue;
+                };
+                if !identifier_matches_any(identifier, rule.app_identifiers.as_slice()) {
+                    continue;
+                }
+            }
+            if !rule.host_allow.is_empty()
+                && !host_matches_any(host.as_str(), rule.host_allow.as_slice())
+            {
+                continue;
+            }
+            return connect_decision_from_action(
+                rule.action.as_str(),
+                Some(rule.id.as_str()),
+                rule.reason.as_deref(),
+                host_whitelisted && host_known,
+                self.bundle
+                    .connect_policy
+                    .defaults
+                    .non_whitelisted_host_action
+                    .as_str(),
+            );
+        }
+
+        if app_type == "unknown" && host_whitelisted && host_known {
+            return connect_decision_from_action(
+                self.bundle
+                    .connect_policy
+                    .defaults
+                    .whitelisted_unknown_app_action
+                    .as_str(),
+                None,
+                Some("whitelisted_unknown_app_action"),
+                true,
+                self.bundle
+                    .connect_policy
+                    .defaults
+                    .non_whitelisted_host_action
+                    .as_str(),
+            );
+        }
+        connect_decision_from_action(
+            self.bundle
+                .connect_policy
+                .defaults
+                .unknown_app_action
+                .as_str(),
+            None,
+            Some("connect_policy_default"),
+            host_whitelisted && host_known,
+            self.bundle
+                .connect_policy
+                .defaults
+                .non_whitelisted_host_action
+                .as_str(),
+        )
     }
 
     /// Returns true when `text` contains any bundle noise keyword.
@@ -386,27 +663,11 @@ impl OispEngine {
     }
 
     pub fn load_from_registry_cache(path: &Path) -> anyhow::Result<Option<Self>> {
-        match load_from_registry_cache_path(path) {
-            Ok(Some(engine)) => Ok(Some(engine)),
-            Ok(None) => load_from_registry_cache_path(&registry_cache_last_good_path(path)),
-            Err(primary_error) => {
-                let fallback_path = registry_cache_last_good_path(path);
-                if !fallback_path.exists() {
-                    return Err(primary_error);
-                }
-                match load_from_registry_cache_path(&fallback_path) {
-                    Ok(Some(engine)) => Ok(Some(engine)),
-                    Ok(None) => Err(primary_error),
-                    Err(fallback_error) => Err(anyhow::anyhow!(
-                        "primary registry cache invalid ({primary_error}); last-known-good cache invalid ({fallback_error})"
-                    )),
-                }
-            }
-        }
+        load_from_registry_cache_path(path)
     }
 
     fn resolve_provider_format(&self, provider_id: &str) -> Option<&Value> {
-        let provider = self.bundle.providers.get(provider_id)?;
+        let provider = self.resolve_provider(provider_id)?;
         let mut keys = Vec::with_capacity(2);
         if let Some(api_format) = provider.api_format.as_deref() {
             keys.push(api_format);
@@ -431,6 +692,20 @@ impl OispEngine {
         None
     }
 
+    pub fn canonical_provider_id(&self, provider_id: &str) -> Option<String> {
+        self.bundle
+            .providers
+            .get(provider_id)
+            .map(|_| provider_id.to_string())
+            .or_else(|| {
+                self.bundle
+                    .providers
+                    .keys()
+                    .find(|candidate| candidate.eq_ignore_ascii_case(provider_id))
+                    .cloned()
+            })
+    }
+
     pub(crate) fn resolve_provider(
         &self,
         provider_id: &str,
@@ -443,57 +718,160 @@ impl OispEngine {
                 .map(|(_, provider)| provider)
         })
     }
+
+    fn has_decision_rule_for_host(&self, host: &str) -> bool {
+        self.bundle
+            .decision_rules
+            .rules
+            .iter()
+            .any(|rule| rule.enabled && host_matches_pattern(host, rule.host_pattern.as_str()))
+    }
+
+    fn is_whitelisted_host(&self, host: &str) -> bool {
+        self.bundle.filters.whitelist.is_empty()
+            || host_matches_any(host, self.bundle.filters.whitelist.as_slice())
+    }
+
+    fn request_decision_from_rule(
+        &self,
+        classification: Option<&Classification>,
+        rule: &types::bundle::DecisionRule,
+        outcome: RequestDecisionOutcome,
+        reason: &str,
+    ) -> RequestDecision {
+        let provider_id = rule.provider.clone().or_else(|| {
+            classification
+                .as_ref()
+                .map(|classification| classification.provider_id.clone())
+        });
+        let entry_type = provider_id
+            .as_deref()
+            .and_then(|provider_id| self.resolve_provider(provider_id))
+            .map(|provider| provider.entry_type.clone())
+            .or_else(|| {
+                classification
+                    .as_ref()
+                    .map(|classification| classification.entry_type.clone())
+            });
+        let detection_id = rule.detection_id.clone();
+        RequestDecision {
+            outcome,
+            provider_id,
+            entry_type,
+            detection_id,
+            rule_id: (!rule.id.is_empty()).then(|| rule.id.clone()),
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    fn request_decision_from_classification(
+        &self,
+        classification: Option<&Classification>,
+        outcome: RequestDecisionOutcome,
+        reason: &str,
+    ) -> RequestDecision {
+        let provider_id = classification.map(|classification| classification.provider_id.clone());
+        let entry_type = classification.map(|classification| classification.entry_type.clone());
+        RequestDecision {
+            outcome,
+            provider_id,
+            entry_type,
+            detection_id: None,
+            rule_id: None,
+            reason: Some(reason.to_string()),
+        }
+    }
 }
 
-fn host_origin_matches_allowed(origin: &str, allowed: &str) -> bool {
-    let allowed = normalize_host_for_matching(allowed);
-    if allowed.is_empty() {
-        return false;
+fn normalize_app_type(app_type: Option<&str>) -> &'static str {
+    match app_type
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "host" => "host",
+        "non_host" => "non_host",
+        _ => "unknown",
     }
-    if host_matches_pattern(origin, allowed.as_str()) {
+}
+
+fn matches_method(method: Option<&str>, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
         return true;
     }
-    if allowed.contains('*') {
-        return false;
+    let Some(method) = method else {
+        return true;
+    };
+    let method = method.trim();
+    if method.is_empty() {
+        return true;
     }
-    if origin.len() <= allowed.len() || !origin.ends_with(allowed.as_str()) {
-        return false;
-    }
-    origin
-        .as_bytes()
-        .get(origin.len().saturating_sub(allowed.len() + 1))
-        .copied()
-        == Some(b'.')
+    allowed
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(method))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::host_origin_matches_allowed;
-
-    #[test]
-    fn host_origin_allowlist_accepts_exact_and_subdomain_matches() {
-        assert!(host_origin_matches_allowed("chatgpt.com", "chatgpt.com"));
-        assert!(host_origin_matches_allowed(
-            "labs.chatgpt.com",
-            "chatgpt.com"
-        ));
+fn path_matches_exact(path: &str, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
     }
+    let normalized = path.trim().to_ascii_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| pattern.trim().eq_ignore_ascii_case(normalized.as_str()))
+}
 
-    #[test]
-    fn host_origin_allowlist_rejects_partial_suffix_match() {
-        assert!(!host_origin_matches_allowed(
-            "evilchatgpt.com",
-            "chatgpt.com"
-        ));
-        assert!(!host_origin_matches_allowed(
-            "chatgpt.com.evil.com",
-            "chatgpt.com"
-        ));
+fn path_precedence(raw: &[String]) -> Vec<&str> {
+    let mut precedence = Vec::new();
+    for value in raw {
+        match value.trim() {
+            "deny_paths_exact" => precedence.push("deny_paths_exact"),
+            "deny_paths_glob" => precedence.push("deny_paths_glob"),
+            "allow_paths" => precedence.push("allow_paths"),
+            _ => {}
+        }
     }
+    if precedence.is_empty() {
+        precedence.extend(["deny_paths_exact", "deny_paths_glob", "allow_paths"]);
+    }
+    precedence
+}
 
-    #[test]
-    fn host_origin_allowlist_keeps_wildcard_behavior() {
-        assert!(host_origin_matches_allowed("foo.claude.ai", "*.claude.ai"));
-        assert!(!host_origin_matches_allowed("claude.ai", "*.claude.ai"));
+fn connect_decision_from_action(
+    action: &str,
+    rule_id: Option<&str>,
+    reason: Option<&str>,
+    host_allowed: bool,
+    non_whitelisted_fallback: &str,
+) -> ConnectDecision {
+    let normalized = action.trim().to_ascii_lowercase();
+    let fallback = non_whitelisted_fallback.trim().to_ascii_lowercase();
+    let action = match normalized.as_str() {
+        "intercept" => ConnectDecisionAction::Intercept,
+        "passthrough" => ConnectDecisionAction::Passthrough,
+        "host_only" => {
+            if host_allowed {
+                ConnectDecisionAction::Intercept
+            } else if fallback == "passthrough" {
+                ConnectDecisionAction::Passthrough
+            } else if fallback == "intercept" {
+                ConnectDecisionAction::Intercept
+            } else {
+                ConnectDecisionAction::Tunnel
+            }
+        }
+        _ => ConnectDecisionAction::Tunnel,
+    };
+    ConnectDecision {
+        action,
+        rule_id: rule_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        reason: reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
     }
 }

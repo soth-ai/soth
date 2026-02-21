@@ -43,7 +43,6 @@ pub struct ResponseEventInput<'a> {
     pub headers: Option<BTreeMap<String, String>>,
     pub tags: Option<&'a BTreeMap<String, String>>,
     pub usage_meta: &'a ResponseUsageMeta,
-    pub fallback_model: Option<&'a str>,
     pub response_kind: ResponseKind,
     pub traffic_envelope: Option<TrafficEnvelope>,
 }
@@ -52,15 +51,6 @@ pub fn empty_response_placeholder(method: &str, path: &str, status: u16, is_sse:
     if is_sse {
         return format!(
             "[no SSE payload captured for {} {} (HTTP {})]",
-            method, path, status
-        );
-    }
-    if path
-        .to_ascii_lowercase()
-        .contains("/backend-api/codex/responses")
-    {
-        return format!(
-            "[no HTTP response body captured for {} {} (HTTP {}) - Codex output may be streamed via WebSocket]",
             method, path, status
         );
     }
@@ -130,9 +120,7 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
         event = event.with_request(request_body.to_string(), "");
     }
     if let Some(response_body) = input.response_content {
-        event = event.with_response(response_body.clone(), "");
-        // Keep content populated for legacy inspectors that still read `content`.
-        event = event.with_content(response_body);
+        event = event.with_response(response_body, "");
     }
     event = event.with_payload_sizes(input.request_size_bytes, input.response_size_bytes);
     if let Some(headers) = input.headers {
@@ -156,7 +144,7 @@ pub fn build_paired_response_event(input: ResponseEventInput<'_>) -> WrapEvent {
         input.response_kind.preview_suffix(input.status)
     ));
 
-    if let Some(model) = input.usage_meta.model.as_deref().or(input.fallback_model) {
+    if let Some(model) = input.usage_meta.model.as_deref() {
         event = event.with_model(model.to_string());
     }
     let input_tokens = input.usage_meta.input_tokens.unwrap_or(0);

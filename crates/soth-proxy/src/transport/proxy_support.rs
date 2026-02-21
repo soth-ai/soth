@@ -318,7 +318,6 @@ pub(crate) fn append_stream_capture(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool 
 pub(crate) enum DiscoveryKind {
     Catalog,
     App,
-    Domain,
 }
 
 impl DiscoveryKind {
@@ -326,7 +325,6 @@ impl DiscoveryKind {
         match self {
             Self::Catalog => "catalog",
             Self::App => "app",
-            Self::Domain => "domain",
         }
     }
 }
@@ -367,7 +365,6 @@ pub(crate) struct CatalogDiscoveryLimiter {
     event_logger: Mutex<Option<Arc<EventLogger>>>,
     catalog_daily_cap: u32,
     app_daily_cap: u32,
-    domain_daily_cap: u32,
 }
 
 impl Default for CatalogDiscoveryLimiter {
@@ -377,7 +374,6 @@ impl Default for CatalogDiscoveryLimiter {
             event_logger: Mutex::new(None),
             catalog_daily_cap: 250,
             app_daily_cap: 250,
-            domain_daily_cap: 250,
         }
     }
 }
@@ -390,7 +386,6 @@ impl CatalogDiscoveryLimiter {
             event_logger: Mutex::new(None),
             catalog_daily_cap,
             app_daily_cap: 250,
-            domain_daily_cap: 250,
         }
     }
 
@@ -414,7 +409,6 @@ impl CatalogDiscoveryLimiter {
         match kind {
             DiscoveryKind::Catalog => self.catalog_daily_cap,
             DiscoveryKind::App => self.app_daily_cap,
-            DiscoveryKind::Domain => self.domain_daily_cap,
         }
     }
 
@@ -789,9 +783,6 @@ pub(crate) fn append_process_attribution_tags(
             format!("{confidence:.3}"),
         );
     }
-    if let Some(app_type) = envelope.process_app_type.as_ref() {
-        tags.insert("metadata.process_app_type".to_string(), app_type.clone());
-    }
 }
 
 #[cfg(test)]
@@ -800,19 +791,19 @@ mod tests {
 
     #[test]
     fn process_bundle_id_extracts_scoped_node_package() {
-        let path = "/Users/example/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex";
+        let path = "/Users/example/@vendor/tool/node_modules/@vendor/tool-darwin-arm64/vendor/aarch64-apple-darwin/tool/tool";
         assert_eq!(
             process_bundle_id_from_executable(Some(path)),
-            Some("@openai/codex".to_string())
+            Some("@vendor/tool".to_string())
         );
     }
 
     #[test]
     fn process_bundle_id_extracts_scoped_node_package_from_pnpm_layout() {
-        let path = "/Users/example/project/node_modules/.pnpm/@openai+codex@0.25.0/node_modules/@openai/codex/bin/codex";
+        let path = "/Users/example/project/node_modules/.pnpm/@vendor+tool@0.25.0/node_modules/@vendor/tool/bin/tool";
         assert_eq!(
             process_bundle_id_from_executable(Some(path)),
-            Some("@openai/codex".to_string())
+            Some("@vendor/tool".to_string())
         );
     }
 

@@ -14,7 +14,7 @@ use crate::transport::proxy_support::{
 use soth_core::config::{ExchangeConfig, HostFilterConfig, HostFilterMode};
 use soth_core::types::exchange::{
     EXCHANGE_DECISION_OUTCOME_CAPTURED, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
-    EXCHANGE_DECISION_STEP_HOST_ORIGIN, EXCHANGE_DISCOVERY_KIND_CATALOG,
+    EXCHANGE_DECISION_STEP_WHITELIST, EXCHANGE_DISCOVERY_KIND_CATALOG,
 };
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
@@ -243,7 +243,7 @@ impl WebSocketHandler for AiWebSocketHandler {
                             tags.insert("exchange.transport".to_string(), "ws".to_string());
                             tags.insert(
                                 "decision.step".to_string(),
-                                EXCHANGE_DECISION_STEP_HOST_ORIGIN.to_string(),
+                                EXCHANGE_DECISION_STEP_WHITELIST.to_string(),
                             );
                             let ws_decision_outcome = if is_catalog_discovery_ws {
                                 EXCHANGE_DECISION_OUTCOME_METADATA_ONLY

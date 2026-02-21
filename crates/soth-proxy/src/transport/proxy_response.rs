@@ -8,14 +8,14 @@ use std::sync::Arc;
 use crate::transport::exchange_assembler::ExchangeAssemblerConfig;
 use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::proxy::PendingRequest;
-use crate::transport::proxy_exchange::{append_detection_tags, finalize_and_enqueue_exchange_v2};
+use crate::transport::proxy_exchange::{append_detection_tags, finalize_and_enqueue_exchange};
 use crate::transport::proxy_payload::decode_payload_for_logging;
 use crate::transport::proxy_support::{
     append_capture_tags, append_catalog_discovery_tags, append_process_attribution_tags,
 };
 use crate::transport::response_event_builder::normalize_response_content;
 use crate::transport::usage_enrichment::ResponseUsageMeta;
-use soth_core::types::exchange_v2::EXCHANGE_DECISION_OUTCOME_METADATA_ONLY;
+use soth_core::types::exchange::EXCHANGE_DECISION_OUTCOME_METADATA_ONLY;
 use soth_core::EventLogger;
 
 #[allow(clippy::too_many_arguments)]
@@ -30,7 +30,7 @@ pub(crate) async fn handle_mcp_jsonrpc_response(
     event_logger: Option<&Arc<EventLogger>>,
     event_tags: &BTreeMap<String, String>,
     pii_enricher: &Arc<PiiEventEnricher>,
-    exchange_v2_cfg: Option<&ExchangeAssemblerConfig>,
+    exchange_cfg: Option<&ExchangeAssemblerConfig>,
     exchange_bundle_version: Option<&str>,
     session_id: &str,
     capture_max_body_bytes: u64,
@@ -93,8 +93,8 @@ pub(crate) async fn handle_mcp_jsonrpc_response(
         );
         let exchange_tags = tags;
 
-        if let Some(exchange_cfg) = exchange_v2_cfg {
-            finalize_and_enqueue_exchange_v2(
+        if let Some(exchange_cfg) = exchange_cfg {
+            finalize_and_enqueue_exchange(
                 logger,
                 exchange_cfg,
                 pii_enricher,
@@ -121,7 +121,7 @@ pub(crate) async fn handle_mcp_jsonrpc_response(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_non_stream_response_event(
     logger: &Arc<EventLogger>,
-    exchange_v2_cfg: Option<&ExchangeAssemblerConfig>,
+    exchange_cfg: Option<&ExchangeAssemblerConfig>,
     pii_enricher: &Arc<PiiEventEnricher>,
     pending: &PendingRequest,
     session_id: &str,
@@ -175,8 +175,8 @@ pub(crate) fn emit_non_stream_response_event(
             None
         },
     );
-    if let Some(exchange_cfg) = exchange_v2_cfg {
-        finalize_and_enqueue_exchange_v2(
+    if let Some(exchange_cfg) = exchange_cfg {
+        finalize_and_enqueue_exchange(
             logger,
             exchange_cfg,
             pii_enricher,

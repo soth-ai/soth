@@ -77,7 +77,7 @@ pub(crate) struct RequestBodyInspectionPlan {
 pub(crate) fn build_request_body_inspection_plan(
     req: &Request<Body>,
     _path: &str,
-    _http_method: &str,
+    http_method: &str,
     host_mode: HostFilterMode,
     should_capture_observability: bool,
     host_is_ai_target: bool,
@@ -108,8 +108,9 @@ pub(crate) fn build_request_body_inspection_plan(
     let request_capture_oversized = declared_request_size_bytes
         .map(|size| size > capture_max_body_bytes)
         .unwrap_or(false);
-    let should_log_inference_request =
-        !is_noise_intercept_decision(oisp_engine.should_intercept(host, path_for_filter));
+    let should_log_inference_request = !is_noise_intercept_decision(
+        oisp_engine.should_intercept_with_context(host, path_for_filter, Some(http_method), None),
+    );
     let should_inspect_body = is_post
         && should_capture_observability
         && (host_is_mcp_target

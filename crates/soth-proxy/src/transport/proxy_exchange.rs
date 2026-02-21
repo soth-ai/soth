@@ -9,15 +9,16 @@ use soth_budget::{BudgetTracker, TokenCounter};
 use soth_core::types::exchange::{
     ExchangeClient, ExchangeCost, ExchangeEvent, ExchangeParse, ExchangeSourceClass,
     ExchangeTransport, ExchangeUsage, EXCHANGE_CLIENT_APP_TYPE_HOST,
-    EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
-    EXCHANGE_DECISION_OUTCOME_SKIPPED, EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_DOMAIN,
+    EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
+    EXCHANGE_DECISION_OUTCOME_METADATA_ONLY, EXCHANGE_DECISION_OUTCOME_SKIPPED,
+    EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_DOMAIN,
 };
 use soth_core::types::{
     AgentInfo, DetectionSource, EventSource, TrafficEnvelope, WrapDirection, WrapEvent,
 };
 use soth_core::EventLogger;
 use std::collections::BTreeMap;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::transport::proxy::PendingRequest;
 
@@ -52,6 +53,29 @@ fn append_detection_tags_from_values(
     }
     if let Some(value) = detection_id {
         tags.insert("detection.id".to_string(), value.to_string());
+    }
+}
+
+fn append_decision_diagnostic_tags(tags: &mut BTreeMap<String, String>, pending: &PendingRequest) {
+    if let Some(rule_id) = pending.decision_rule_id.as_ref() {
+        tags.entry("decision.rule_id".to_string())
+            .or_insert_with(|| rule_id.clone());
+    }
+    if let Some(reason) = pending.decision_reason.as_ref() {
+        tags.entry("decision.reason".to_string())
+            .or_insert_with(|| reason.clone());
+    }
+    if let Some(capture_mode) = pending.decision_capture_mode.as_ref() {
+        tags.entry("decision.capture_mode".to_string())
+            .or_insert_with(|| capture_mode.clone());
+    }
+    if let Some(rule_id) = pending.connect_rule_id.as_ref() {
+        tags.entry("connect.rule_id".to_string())
+            .or_insert_with(|| rule_id.clone());
+    }
+    if let Some(reason) = pending.connect_reason.as_ref() {
+        tags.entry("connect.reason".to_string())
+            .or_insert_with(|| reason.clone());
     }
 }
 
@@ -160,13 +184,15 @@ fn exchange_client_from_pending(pending: &PendingRequest) -> Option<ExchangeClie
     if bundle_id.is_none() {
         bundle_id = bundle_id_from_agent_hint(pending.agent.as_deref());
     }
+    if app_type.is_none() {
+        app_type = Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string());
+    }
 
     let host_origin = pending.client_host_origin.clone();
     let referrer_origin = pending.client_referrer_origin.clone();
     if pid.is_none()
         && process_name.is_none()
         && bundle_id.is_none()
-        && app_type.is_none()
         && host_origin.is_none()
         && referrer_origin.is_none()
     {
@@ -193,10 +219,7 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
         .or_else(|| envelope.provider.clone());
     let bundle_id = process_bundle_id_from_executable(envelope.process_executable.as_deref())
         .or_else(|| bundle_id_from_agent_hint(envelope.agent.as_deref()));
-    let app_type = normalize_exchange_client_app_type(envelope.process_app_type.as_deref())
-        .or_else(|| classify_process_app_type(process_name.as_deref(), bundle_id.as_deref()))
-        .or_else(|| infer_agent_fallback_app_type(envelope.agent.as_deref()))
-        .or_else(|| Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string()));
+    let app_type = Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string());
 
     if envelope.process_pid.is_none()
         && process_name.is_none()
@@ -217,48 +240,6 @@ fn exchange_client_from_envelope(envelope: Option<&TrafficEnvelope>) -> Option<E
     })
 }
 
-fn classify_process_app_type(
-    process_name: Option<&str>,
-    bundle_id: Option<&str>,
-) -> Option<String> {
-    if let Some(name) = process_name {
-        let lower = name.to_ascii_lowercase();
-        let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-        if has_any(&[
-            "chrome", "firefox", "safari", "edge", "brave", "arc", "opera",
-        ]) {
-            return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
-        }
-        if has_any(&[
-            "terminal",
-            "bash",
-            "zsh",
-            "fish",
-            "python",
-            "node",
-            "npm",
-            "cargo",
-            "cursor",
-            "code",
-            "windsurf",
-            "jetbrains",
-            "zed",
-            "xcode",
-            "vim",
-            "service",
-            "daemon",
-            "launchd",
-            "systemd",
-        ]) {
-            return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
-        }
-    }
-    if bundle_id.is_some() {
-        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
-    }
-    None
-}
-
 fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
     let agent = agent
         .map(str::trim)
@@ -277,28 +258,20 @@ fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
     }
 }
 
-fn infer_agent_fallback_app_type(agent: Option<&str>) -> Option<String> {
-    let lower = agent?.to_ascii_lowercase();
-    let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-    if has_any(&[
-        "chrome", "firefox", "safari", "edge", "brave", "arc", "opera",
-    ]) {
-        return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
-    }
-    Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string())
-}
-
 fn normalize_exchange_client_app_type(raw: Option<&str>) -> Option<String> {
     let normalized = raw
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())?;
-    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST || normalized == "browser" {
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST {
         return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
     }
     if normalized == EXCHANGE_CLIENT_APP_TYPE_NON_HOST {
         return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
     }
-    Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string())
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_UNKNOWN {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string());
+    }
+    Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string())
 }
 
 fn detection_id_for_pending(pending: &PendingRequest) -> Option<String> {
@@ -354,6 +327,18 @@ fn non_empty_string(value: Option<String>) -> Option<String> {
     })
 }
 
+fn should_info_trace_for_pending(pending: &PendingRequest, detection_id: Option<&str>) -> bool {
+    pending.catalog_discovery
+        || pending
+            .provider
+            .as_deref()
+            .map(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("unknown"))
+            .unwrap_or(false)
+        || detection_id
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+}
+
 fn detection_bundle_version_for_exchange(bundle_version: Option<&str>) -> Option<String> {
     bundle_version.and_then(|value| non_empty_string(Some(value.to_string())))
 }
@@ -363,24 +348,39 @@ fn enforce_required_detection_fields(
     pending: &PendingRequest,
     bundle_version: Option<&str>,
 ) -> bool {
+    let trace_info = should_info_trace_for_pending(pending, pending.detection_id.as_deref());
     let detection_id = event
         .effective_detection_id()
         .map(ToString::to_string)
         .or_else(|| detection_id_for_pending(pending))
         .and_then(|value| non_empty_string(Some(value)));
     let Some(detection_id) = detection_id else {
-        warn!(
-            exchange_id = %event.exchange_id,
-            "Dropping proxy exchange: missing bundle-backed detection_id"
-        );
+        if trace_info {
+            warn!(
+                exchange_id = %event.exchange_id,
+                "Dropping proxy exchange: missing bundle-backed detection_id"
+            );
+        } else {
+            debug!(
+                exchange_id = %event.exchange_id,
+                "Decision trace: dropped exchange due to missing bundle-backed detection_id (suppressed detail)"
+            );
+        }
         return false;
     };
     if !is_strict_bundle_detection_id(detection_id.as_str()) {
-        warn!(
-            exchange_id = %event.exchange_id,
-            detection_id = detection_id,
-            "Dropping proxy exchange: detection_id is not bundle-identity strict"
-        );
+        if trace_info {
+            warn!(
+                exchange_id = %event.exchange_id,
+                detection_id = detection_id,
+                "Dropping proxy exchange: detection_id is not bundle-identity strict"
+            );
+        } else {
+            debug!(
+                exchange_id = %event.exchange_id,
+                "Decision trace: dropped exchange due to non-strict detection_id (suppressed detail)"
+            );
+        }
         return false;
     }
     if pending
@@ -389,11 +389,18 @@ fn enforce_required_detection_fields(
         .map(|value| !value.eq_ignore_ascii_case("bundle"))
         .unwrap_or(true)
     {
-        warn!(
-            exchange_id = %event.exchange_id,
-            detection_source = pending.detection_source.as_deref().unwrap_or_default(),
-            "Dropping proxy exchange: detection_source must be bundle"
-        );
+        if trace_info {
+            warn!(
+                exchange_id = %event.exchange_id,
+                detection_source = pending.detection_source.as_deref().unwrap_or_default(),
+                "Dropping proxy exchange: detection_source must be bundle"
+            );
+        } else {
+            debug!(
+                exchange_id = %event.exchange_id,
+                "Decision trace: dropped exchange due to non-bundle detection_source (suppressed detail)"
+            );
+        }
         return false;
     }
     let detection_bundle_version = event
@@ -402,10 +409,17 @@ fn enforce_required_detection_fields(
         .or_else(|| bundle_version.map(ToString::to_string))
         .and_then(|value| non_empty_string(Some(value)));
     let Some(detection_bundle_version) = detection_bundle_version else {
-        warn!(
-            exchange_id = %event.exchange_id,
-            "Dropping proxy exchange: missing detection_bundle_version"
-        );
+        if trace_info {
+            warn!(
+                exchange_id = %event.exchange_id,
+                "Dropping proxy exchange: missing detection_bundle_version"
+            );
+        } else {
+            debug!(
+                exchange_id = %event.exchange_id,
+                "Decision trace: dropped exchange due to missing detection_bundle_version (suppressed detail)"
+            );
+        }
         return false;
     };
 
@@ -418,11 +432,18 @@ fn enforce_required_detection_fields(
     }
 
     if let Err(missing) = event.validate_proxy_detection_contract() {
-        warn!(
-            exchange_id = %event.exchange_id,
-            missing = ?missing,
-            "Dropping proxy exchange: required detection contract fields unresolved"
-        );
+        if trace_info {
+            warn!(
+                exchange_id = %event.exchange_id,
+                missing = ?missing,
+                "Dropping proxy exchange: required detection contract fields unresolved"
+            );
+        } else {
+            debug!(
+                exchange_id = %event.exchange_id,
+                "Decision trace: dropped exchange due to unresolved detection contract fields (suppressed detail)"
+            );
+        }
         return false;
     }
     true
@@ -449,6 +470,36 @@ pub(crate) fn finalize_and_enqueue_exchange(
 ) {
     let detection_id = non_empty_string(detection_id_for_pending(pending));
     let detection_bundle_version = detection_bundle_version_for_exchange(bundle_version);
+    let trace_info = should_info_trace_for_pending(pending, detection_id.as_deref());
+
+    if trace_info {
+        info!(
+            exchange_id = %pending.exchange_id,
+            host = %pending.host,
+            path = %pending.path,
+            method = %pending.method,
+            provider = ?pending.provider.as_deref(),
+            status = status,
+            is_stream = is_stream,
+            is_sse = is_sse,
+            detection_id = ?detection_id.as_deref(),
+            detection_source = ?pending.detection_source.as_deref(),
+            detection_reason = ?pending.detection_reason.as_deref(),
+            parse_confidence = ?pending.parse_confidence,
+            decision_outcome = ?pending.decision_outcome.as_deref(),
+            skip_reason = ?pending.skip_reason.as_deref(),
+            bundle_version = ?bundle_version,
+            "Decision trace: finalizing exchange before enqueue"
+        );
+    } else {
+        debug!(
+            exchange_id = %pending.exchange_id,
+            host = %pending.host,
+            method = %pending.method,
+            status = status,
+            "Decision trace: finalizing exchange before enqueue (suppressed detail)"
+        );
+    }
 
     let mut assembler = ExchangeAssembler::new(
         exchange_cfg.clone(),
@@ -561,6 +612,7 @@ pub(crate) fn finalize_and_enqueue_exchange(
             .or_insert_with(|| method.clone());
     }
     append_detection_tags(&mut exchange_tags, pending);
+    append_decision_diagnostic_tags(&mut exchange_tags, pending);
     if let Some(envelope) = pending.envelope.as_ref() {
         assembler.set_integrity_signature(envelope.signature.clone(), envelope.key_id.clone());
         if let Some(did) = envelope.did.as_ref() {
@@ -627,6 +679,24 @@ pub(crate) fn finalize_and_enqueue_exchange(
     };
     result.event.pii_types = pii_probe.pii_types;
     if !enforce_required_detection_fields(&mut result.event, pending, bundle_version) {
+        if trace_info {
+            warn!(
+                exchange_id = %pending.exchange_id,
+                host = %pending.host,
+                path = %pending.path,
+                method = %pending.method,
+                detection_id = ?pending.detection_id.as_deref(),
+                detection_source = ?pending.detection_source.as_deref(),
+                decision_outcome = ?pending.decision_outcome.as_deref(),
+                skip_reason = ?pending.skip_reason.as_deref(),
+                "Decision trace: exchange dropped before enqueue due to detection contract enforcement"
+            );
+        } else {
+            debug!(
+                exchange_id = %pending.exchange_id,
+                "Decision trace: exchange dropped before enqueue due to detection contract enforcement (suppressed detail)"
+            );
+        }
         return;
     }
 
@@ -669,8 +739,59 @@ pub(crate) fn finalize_and_enqueue_exchange(
         );
         return;
     }
-    let _ = logger.finalize_exchange_spool(&pending.exchange_id, None);
-    let _ = logger.delete_exchange_spool(&pending.exchange_id);
+    if trace_info {
+        info!(
+            exchange_id = %pending.exchange_id,
+            payload_bytes = payload_json.len(),
+            blob_bytes = blobs_json.as_ref().map(|value| value.len()).unwrap_or(0),
+            "Decision trace: exchange enqueued to local upload queue"
+        );
+    } else {
+        debug!(
+            exchange_id = %pending.exchange_id,
+            "Decision trace: exchange enqueued to local upload queue (suppressed detail)"
+        );
+    }
+    match logger.finalize_exchange_spool(&pending.exchange_id, None) {
+        Ok(()) => {
+            if trace_info {
+                info!(
+                    exchange_id = %pending.exchange_id,
+                    "Decision trace: exchange spool row marked finalized"
+                )
+            } else {
+                debug!(
+                    exchange_id = %pending.exchange_id,
+                    "Decision trace: exchange spool row marked finalized (suppressed detail)"
+                )
+            }
+        }
+        Err(error) => warn!(
+            exchange_id = %pending.exchange_id,
+            error = %error,
+            "Decision trace: failed to mark exchange spool row finalized"
+        ),
+    }
+    match logger.delete_exchange_spool(&pending.exchange_id) {
+        Ok(()) => {
+            if trace_info {
+                info!(
+                    exchange_id = %pending.exchange_id,
+                    "Decision trace: exchange spool row deleted after enqueue"
+                )
+            } else {
+                debug!(
+                    exchange_id = %pending.exchange_id,
+                    "Decision trace: exchange spool row deleted after enqueue (suppressed detail)"
+                )
+            }
+        }
+        Err(error) => warn!(
+            exchange_id = %pending.exchange_id,
+            error = %error,
+            "Decision trace: failed deleting exchange spool row after enqueue"
+        ),
+    }
 }
 
 pub(crate) fn seed_exchange_spool(
@@ -682,6 +803,30 @@ pub(crate) fn seed_exchange_spool(
 ) {
     let detection_id = non_empty_string(detection_id_for_pending(pending));
     let detection_bundle_version = detection_bundle_version_for_exchange(bundle_version);
+    let trace_info = should_info_trace_for_pending(pending, detection_id.as_deref());
+
+    if trace_info {
+        info!(
+            exchange_id = %pending.exchange_id,
+            host = %pending.host,
+            path = %pending.path,
+            method = %pending.method,
+            provider = ?pending.provider.as_deref(),
+            detection_id = ?detection_id.as_deref(),
+            detection_source = ?pending.detection_source.as_deref(),
+            detection_bundle_version = ?detection_bundle_version.as_deref(),
+            decision_outcome = ?pending.decision_outcome.as_deref(),
+            skip_reason = ?pending.skip_reason.as_deref(),
+            "Decision trace: attempting exchange spool seed"
+        );
+    } else {
+        debug!(
+            exchange_id = %pending.exchange_id,
+            host = %pending.host,
+            method = %pending.method,
+            "Decision trace: attempting exchange spool seed (suppressed detail)"
+        );
+    }
 
     if detection_id
         .as_deref()
@@ -691,12 +836,19 @@ pub(crate) fn seed_exchange_spool(
     {
         // continue
     } else {
-        warn!(
-            exchange_id = %pending.exchange_id,
-            detection_id = detection_id.as_deref().unwrap_or_default(),
-            detection_bundle_version = detection_bundle_version.as_deref().unwrap_or_default(),
-            "Skipping exchange spool seed: strict detection contract unresolved"
-        );
+        if trace_info {
+            warn!(
+                exchange_id = %pending.exchange_id,
+                detection_id = detection_id.as_deref().unwrap_or_default(),
+                detection_bundle_version = detection_bundle_version.as_deref().unwrap_or_default(),
+                "Skipping exchange spool seed: strict detection contract unresolved"
+            );
+        } else {
+            debug!(
+                exchange_id = %pending.exchange_id,
+                "Decision trace: skipped exchange spool seed due to unresolved strict detection contract (suppressed detail)"
+            );
+        }
         return;
     }
 
@@ -762,6 +914,19 @@ pub(crate) fn seed_exchange_spool(
             error = %error,
             "Failed writing exchange spool snapshot"
         );
+    } else {
+        if trace_info {
+            info!(
+                exchange_id = %pending.exchange_id,
+                snapshot_bytes = snapshot_json.len(),
+                "Decision trace: exchange spool seed written"
+            );
+        } else {
+            debug!(
+                exchange_id = %pending.exchange_id,
+                "Decision trace: exchange spool seed written (suppressed detail)"
+            );
+        }
     }
 }
 
@@ -773,34 +938,8 @@ pub(crate) fn apply_process_identity(
         envelope.process_pid = Some(process.pid);
         envelope.process_name = Some(process.name.clone());
         envelope.process_executable = process.executable.clone();
-        envelope.process_app_type = Some(process.app_type.clone());
         envelope.process_attribution_source = Some(process.attribution_source.clone());
         envelope.process_attribution_confidence = Some(process.attribution_confidence);
-    } else {
-        if envelope.process_name.is_none() {
-            envelope.process_name = envelope
-                .agent
-                .clone()
-                .or_else(|| envelope.provider.clone())
-                .or_else(|| envelope.host.clone());
-        }
-        if envelope.process_app_type.is_none() {
-            envelope.process_app_type = classify_process_app_type(
-                envelope.process_name.as_deref(),
-                process_bundle_id_from_executable(envelope.process_executable.as_deref())
-                    .as_deref(),
-            )
-            .or_else(|| infer_agent_fallback_app_type(envelope.agent.as_deref()));
-            if envelope.process_app_type.is_none() {
-                envelope.process_app_type = Some("unknown".to_string());
-            }
-        }
-        if envelope.process_attribution_source.is_none() && envelope.process_name.is_some() {
-            envelope.process_attribution_source = Some("heuristic_agent_fallback".to_string());
-        }
-        if envelope.process_attribution_confidence.is_none() && envelope.process_name.is_some() {
-            envelope.process_attribution_confidence = Some(0.35);
-        }
     }
     envelope
 }
@@ -808,12 +947,14 @@ pub(crate) fn apply_process_identity(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_process_identity, detection_bundle_version_for_exchange,
-        exchange_client_from_envelope, is_strict_bundle_detection_id, transport_for_pending,
+        append_decision_diagnostic_tags, apply_process_identity,
+        detection_bundle_version_for_exchange, exchange_client_from_envelope,
+        is_strict_bundle_detection_id, transport_for_pending,
     };
     use crate::transport::proxy::PendingRequest;
     use crate::transport::proxy_detection::CapturePolicy;
     use soth_core::types::TrafficEnvelope;
+    use std::collections::BTreeMap;
     use std::time::Instant;
 
     fn sample_pending() -> PendingRequest {
@@ -846,6 +987,11 @@ mod tests {
             decision_step: None,
             decision_outcome: None,
             skip_reason: None,
+            decision_rule_id: None,
+            decision_reason: None,
+            decision_capture_mode: None,
+            connect_rule_id: None,
+            connect_reason: None,
             capture_policy: CapturePolicy::Full,
             discovery_kind: None,
             client_app_type: None,
@@ -859,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_process_identity_uses_heuristic_fallback_when_lookup_missing() {
+    fn apply_process_identity_leaves_process_fields_empty_when_lookup_missing() {
         let envelope = TrafficEnvelope::proxy(
             "s1",
             "r1",
@@ -874,17 +1020,13 @@ mod tests {
             Some("{}"),
         );
         let enriched = apply_process_identity(envelope, None);
-        assert_eq!(enriched.process_name.as_deref(), Some("claude"));
-        assert_eq!(enriched.process_app_type.as_deref(), Some("non_host"));
-        assert_eq!(
-            enriched.process_attribution_source.as_deref(),
-            Some("heuristic_agent_fallback")
-        );
-        assert_eq!(enriched.process_attribution_confidence, Some(0.35));
+        assert_eq!(enriched.process_name, None);
+        assert_eq!(enriched.process_attribution_source, None);
+        assert_eq!(enriched.process_attribution_confidence, None);
     }
 
     #[test]
-    fn exchange_client_falls_back_to_agent_when_process_fields_missing() {
+    fn exchange_client_defaults_to_unknown_app_type_when_process_fields_missing() {
         let envelope = TrafficEnvelope::proxy(
             "s1",
             "r1",
@@ -900,7 +1042,7 @@ mod tests {
         );
         let client = exchange_client_from_envelope(Some(&envelope)).expect("client expected");
         assert_eq!(client.process_name.as_deref(), Some("codex"));
-        assert_eq!(client.app_type.as_deref(), Some("non_host"));
+        assert_eq!(client.app_type.as_deref(), Some("unknown"));
         assert_eq!(client.bundle_id.as_deref(), Some("agent.codex"));
     }
 
@@ -958,6 +1100,40 @@ mod tests {
         assert_eq!(
             transport_for_pending(&pending, false, false),
             soth_core::types::exchange::ExchangeTransport::Jsonrpc
+        );
+    }
+
+    #[test]
+    fn append_decision_diagnostic_tags_emits_decision_and_connect_fields() {
+        let mut pending = sample_pending();
+        pending.decision_rule_id = Some("rule.openai.chat".to_string());
+        pending.decision_reason = Some("rule.path_policy.matched".to_string());
+        pending.decision_capture_mode = Some("full".to_string());
+        pending.connect_rule_id = Some("connect.non_host.codex.openai".to_string());
+        pending.connect_reason = Some("connect.allowed_app_override".to_string());
+
+        let mut tags = BTreeMap::new();
+        append_decision_diagnostic_tags(&mut tags, &pending);
+
+        assert_eq!(
+            tags.get("decision.rule_id").map(String::as_str),
+            Some("rule.openai.chat")
+        );
+        assert_eq!(
+            tags.get("decision.reason").map(String::as_str),
+            Some("rule.path_policy.matched")
+        );
+        assert_eq!(
+            tags.get("decision.capture_mode").map(String::as_str),
+            Some("full")
+        );
+        assert_eq!(
+            tags.get("connect.rule_id").map(String::as_str),
+            Some("connect.non_host.codex.openai")
+        );
+        assert_eq!(
+            tags.get("connect.reason").map(String::as_str),
+            Some("connect.allowed_app_override")
         );
     }
 }

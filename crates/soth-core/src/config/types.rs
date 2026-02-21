@@ -1763,8 +1763,8 @@ impl HostFilterConfig {
 
     /// Match a host against a pattern with wildcard support
     /// Supports:
-    /// - Exact match: "api.openai.com"
-    /// - Prefix wildcard: "*.openai.azure.com" matches "foo.openai.azure.com"
+    /// - Exact match: "api.example.com"
+    /// - Prefix wildcard: "*.example.com" matches "foo.example.com"
     /// - Prefix wildcard (no dot): "*-aiplatform.googleapis.com" matches "us-central1-aiplatform.googleapis.com"
     /// - Middle wildcard: "bedrock.*.amazonaws.com" matches "bedrock.us-east-1.amazonaws.com"
     fn matches_pattern(host: &str, pattern: &str) -> bool {

@@ -19,7 +19,7 @@ use soth_core::api::{
     ExchangeBatchResponse, HeartbeatRequest, HeartbeatResponse, RegistryVersionResponse,
 };
 use soth_core::types::{
-    exchange_v2::{ExchangeBodyMode, ExchangeEventV2, ExchangeSourceClass, ExchangeTransport},
+    exchange::{ExchangeBodyMode, ExchangeEvent, ExchangeSourceClass, ExchangeTransport},
     AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent,
 };
 use soth_sync::agent::{SyncAgent, SyncAgentConfig};
@@ -975,7 +975,7 @@ fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
     seed_exchange_upload_queue_event(path, &event);
 }
 
-fn seed_exchange_upload_queue_event(path: &Path, event: &ExchangeEventV2) {
+fn seed_exchange_upload_queue_event(path: &Path, event: &ExchangeEvent) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
         r#"
@@ -1035,8 +1035,8 @@ fn make_event(id: &str) -> WrapEvent {
     event
 }
 
-fn make_exchange_event(exchange_id: &str) -> ExchangeEventV2 {
-    let mut event = ExchangeEventV2::new(
+fn make_exchange_event(exchange_id: &str) -> ExchangeEvent {
+    let mut event = ExchangeEvent::new(
         exchange_id,
         ExchangeSourceClass::AiInference,
         ExchangeTransport::Https,

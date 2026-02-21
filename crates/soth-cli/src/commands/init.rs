@@ -138,8 +138,8 @@ cloud:
   cache_path: "~/.soth/cloud_config_cache.json"
   tags: {}
 
-# Unified exchange v2 pipeline (disabled by default)
-exchange_v2:
+# Unified Exchange pipeline (schema_version=1, disabled by default)
+exchange:
   enabled: false
   inline_max_bytes: 262144
   max_body_bytes: 15728640

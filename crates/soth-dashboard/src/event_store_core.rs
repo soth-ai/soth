@@ -496,7 +496,7 @@ fn read_sqlite_events_from_exchange(
             .map_err(to_io_err)?;
         for row in rows {
             let (seq, json) = row.map_err(to_io_err)?;
-            let Ok(exchange) = serde_json::from_str::<ExchangeEventV2>(&json) else {
+            let Ok(exchange) = serde_json::from_str::<ExchangeEvent>(&json) else {
                 continue;
             };
             events.push((seq, exchange_to_wrap_event(seq, exchange)));
@@ -527,7 +527,7 @@ fn read_sqlite_events_from_exchange(
             .map_err(to_io_err)?;
         for row in rows {
             let (seq, json) = row.map_err(to_io_err)?;
-            let Ok(exchange) = serde_json::from_str::<ExchangeEventV2>(&json) else {
+            let Ok(exchange) = serde_json::from_str::<ExchangeEvent>(&json) else {
                 continue;
             };
             events.push((seq, exchange_to_wrap_event(seq, exchange)));
@@ -551,7 +551,7 @@ fn read_sqlite_events_from_exchange(
         .map_err(to_io_err)?;
     for row in rows {
         let (seq, json) = row.map_err(to_io_err)?;
-        let Ok(exchange) = serde_json::from_str::<ExchangeEventV2>(&json) else {
+        let Ok(exchange) = serde_json::from_str::<ExchangeEvent>(&json) else {
             continue;
         };
         events.push((seq, exchange_to_wrap_event(seq, exchange)));
@@ -1134,7 +1134,7 @@ fn project_sqlite_exchange_rows(tx: &rusqlite::Transaction<'_>) -> std::io::Resu
     }
 
     for (seq, event_json) in queued_rows {
-        let Ok(event) = serde_json::from_str::<ExchangeEventV2>(&event_json) else {
+        let Ok(event) = serde_json::from_str::<ExchangeEvent>(&event_json) else {
             continue;
         };
         update_rollup_1m_from_exchange(tx, &event)?;
@@ -1357,7 +1357,7 @@ fn update_rollup_1m(tx: &rusqlite::Transaction<'_>, event: &WrapEvent) -> std::i
 
 fn update_rollup_1m_from_exchange(
     tx: &rusqlite::Transaction<'_>,
-    event: &ExchangeEventV2,
+    event: &ExchangeEvent,
 ) -> std::io::Result<()> {
     let bucket_start = event.observed_at.format("%Y-%m-%dT%H:%M:00Z").to_string();
     let source = match event.source_class {
@@ -1429,7 +1429,7 @@ fn update_rollup_1m_from_exchange(
 fn upsert_cluster_from_exchange(
     tx: &rusqlite::Transaction<'_>,
     seq: i64,
-    event: &ExchangeEventV2,
+    event: &ExchangeEvent,
 ) -> std::io::Result<()> {
     let source = match event.source_class {
         ExchangeSourceClass::AiInference => "ai_proxy",
@@ -1860,7 +1860,7 @@ fn read_sqlite_event_payload(
     let exchange_json = exchange_stmt.query_row([event_id], |row| row.get::<_, String>(0));
     match exchange_json {
         Ok(json) => {
-            let exchange = serde_json::from_str::<ExchangeEventV2>(&json)
+            let exchange = serde_json::from_str::<ExchangeEvent>(&json)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             Ok(match payload_kind {
                 "request" => exchange
@@ -1907,7 +1907,7 @@ fn has_exchange_rows_conn(conn: &Connection) -> std::io::Result<bool> {
     Ok(count > 0)
 }
 
-fn exchange_to_wrap_event(seq: i64, event: ExchangeEventV2) -> WrapEvent {
+fn exchange_to_wrap_event(seq: i64, event: ExchangeEvent) -> WrapEvent {
     let source = match event.source_class {
         ExchangeSourceClass::AiInference => EventSource::AiProxy,
         ExchangeSourceClass::AgentApp => EventSource::AgentApp,

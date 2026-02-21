@@ -1,8 +1,6 @@
 use super::*;
-use crate::transport::proxy_detection::{
-    detect_agent_from_user_agent, should_log_request, should_treat_anthropic_api_as_agent,
-};
-use crate::transport::proxy_payload::is_chat_ui_host;
+use crate::transport::proxy_detection::should_log_request;
+use crate::transport::proxy_payload::is_header_budget_sensitive_host;
 use crate::transport::proxy_support::{DiscoveryKind, DiscoveryReserveResult};
 use flate2::{write::GzEncoder, Compression};
 use hudsucker::hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoServerBuilder};
@@ -65,10 +63,14 @@ fn test_oisp_engine() -> Arc<OispEngine> {
 }
 
 #[test]
-fn load_oisp_engine_without_cache_path_falls_open() {
-    let engine = load_oisp_engine(None).expect("missing cache path should fail-open");
-    assert!(engine.classify("api.openai.com").is_none());
-    assert!(!engine.should_intercept_host("api.openai.com"));
+fn load_oisp_engine_without_cache_path_returns_error() {
+    let error = match load_oisp_engine(None) {
+        Ok(_) => panic!("missing cache path should error"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("registry cache path not configured"));
 }
 
 #[test]
@@ -127,12 +129,14 @@ fn load_oisp_engine_uses_cache_bundle_without_embedded_overlay() {
 }
 
 #[test]
-fn load_oisp_engine_missing_cache_bundle_falls_open() {
+fn load_oisp_engine_missing_cache_bundle_returns_error() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("missing_registry_bundle_cache.json");
-    let engine = load_oisp_engine(Some(path.as_path())).expect("missing cache should fail-open");
-    assert!(engine.classify("chatgpt.com").is_none());
-    assert!(!engine.should_intercept_host("chatgpt.com"));
+    let error = match load_oisp_engine(Some(path.as_path())) {
+        Ok(_) => panic!("missing cache should return error"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("registry cache not found"));
 }
 
 #[test]
@@ -180,15 +184,15 @@ fn test_registry_mode_action_uses_oisp_engine() {
     let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
     assert_eq!(
-        handler.get_action("api.openai.com", "/v1/chat/completions"),
+        handler.get_action("api.openai.com", "/v1/chat/completions", "POST"),
         HostAction::Intercept
     );
     assert_eq!(
-        handler.get_action("api.github.com", "/mcp"),
+        handler.get_action("api.github.com", "/mcp", "POST"),
         HostAction::Intercept
     );
     assert_eq!(
-        handler.get_action("unknown.example.com", "/v1/messages"),
+        handler.get_action("unknown.example.com", "/v1/messages", "POST"),
         HostAction::Tunnel
     );
 }
@@ -201,7 +205,7 @@ fn test_registry_mode_tunnels_unclassified_hosts() {
     let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
     assert_eq!(
-        handler.get_action("unknown.example.com", "/v1/chat/completions"),
+        handler.get_action("unknown.example.com", "/v1/chat/completions", "POST"),
         HostAction::Tunnel
     );
 }
@@ -215,7 +219,7 @@ fn test_registry_mode_does_not_fall_back_to_configured_hosts() {
     let handler = AiProxyHandler::new(&config, &observe, test_oisp_engine());
 
     assert_eq!(
-        handler.get_action("fallback-only.example", "/v1/chat/completions"),
+        handler.get_action("fallback-only.example", "/v1/chat/completions", "POST"),
         HostAction::Block
     );
 }
@@ -340,231 +344,6 @@ fn test_catalog_discovery_limiter_enforces_daily_cap() {
 }
 
 #[test]
-fn test_detect_agent_from_user_agent_codex() {
-    let req = Request::builder()
-        .uri("https://chatgpt.com/backend-api/codex/responses")
-        .header("user-agent", "OpenAI-Codex/1.0")
-        .body(())
-        .unwrap();
-    assert_eq!(detect_agent_from_user_agent(&req), Some("codex"));
-}
-
-#[test]
-fn test_detect_agent_from_user_agent_warp() {
-    let req = Request::builder()
-        .uri("https://api.anthropic.com/v1/messages")
-        .header("user-agent", "Warp/0.2026.01")
-        .body(())
-        .unwrap();
-    assert_eq!(detect_agent_from_user_agent(&req), Some("warp"));
-}
-
-#[test]
-fn test_detect_agent_from_user_agent_claude_code() {
-    let req = Request::builder()
-        .uri("https://api.anthropic.com/v1/messages")
-        .header("user-agent", "claude-code/1.0")
-        .body(())
-        .unwrap();
-    assert_eq!(detect_agent_from_user_agent(&req), Some("claude-code"));
-}
-
-#[test]
-fn test_detect_agent_from_user_agent_claude_code_with_space() {
-    let req = Request::builder()
-        .uri("https://api.anthropic.com/v1/messages")
-        .header("user-agent", "Claude Code/1.0")
-        .body(())
-        .unwrap();
-    assert_eq!(detect_agent_from_user_agent(&req), Some("claude-code"));
-}
-
-#[test]
-fn test_anthropic_api_key_header_marks_inference() {
-    let req = Request::builder()
-        .uri("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", "sk-ant-test")
-        .body(())
-        .unwrap();
-    assert!(has_anthropic_api_key_header(&req));
-    assert!(!should_treat_anthropic_api_as_agent(
-        "api.anthropic.com",
-        &req
-    ));
-}
-
-#[test]
-fn test_anthropic_without_api_key_marks_agent() {
-    let req = Request::builder()
-        .uri("https://api.anthropic.com/v1/messages")
-        .header("user-agent", "Warp/0.2026.01")
-        .body(())
-        .unwrap();
-    assert!(!has_anthropic_api_key_header(&req));
-    assert!(should_treat_anthropic_api_as_agent(
-        "api.anthropic.com",
-        &req
-    ));
-}
-
-#[test]
-fn test_detect_agent_with_context_promotes_codex_path() {
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(
-            Some("chatgpt"),
-            "chatgpt.com",
-            "/backend-api/codex/responses",
-            None
-        ),
-        Some("codex")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(
-            Some("chatgpt"),
-            "chat.openai.com",
-            "/backend-api/codex/responses",
-            None
-        ),
-        Some("codex")
-    );
-}
-
-#[test]
-fn test_detect_agent_with_context_promotes_codex_model() {
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(
-            Some("chatgpt"),
-            "chatgpt.com",
-            "/backend-api/f/conversation",
-            Some("gpt-5.3-codex")
-        ),
-        Some("codex")
-    );
-}
-
-#[test]
-fn test_detect_agent_with_context_promotes_codex_model_on_api_openai() {
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(
-            Some("chatgpt"),
-            "api.openai.com",
-            "/v1/responses",
-            Some("gpt-5.3-codex")
-        ),
-        Some("codex")
-    );
-}
-
-#[test]
-fn test_detect_agent_with_context_defaults_chatgpt_when_ua_missing() {
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(
-            None,
-            "chatgpt.com",
-            "/backend-api/f/conversation",
-            None
-        ),
-        Some("chatgpt")
-    );
-}
-
-#[test]
-fn test_detect_agent_with_context_defaults_claude_when_ua_missing() {
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(None, "claude.ai", "/api/organizations", None),
-        Some("claude")
-    );
-}
-
-#[test]
-fn test_detect_agent_with_context_defaults_gemini_when_ua_missing() {
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(None, "gemini.google.com", "/app", None),
-        Some("gemini")
-    );
-}
-
-#[test]
-fn test_detect_agent_with_context_gated_disables_host_fallbacks() {
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context_gated(
-            None,
-            "gemini.google.com",
-            "/app",
-            None,
-            false
-        ),
-        None
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context_gated(
-            Some("chatgpt"),
-            "chatgpt.com",
-            "/backend-api/f/conversation",
-            None,
-            false
-        ),
-        Some("chatgpt")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context_gated(
-            None,
-            "api.openai.com",
-            "/v1/responses",
-            Some("gpt-5.3-codex"),
-            false
-        ),
-        Some("codex")
-    );
-}
-
-#[test]
-fn test_detect_agent_with_context_domain_fallbacks() {
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(None, "api2.cursor.sh", "/", None),
-        Some("cursor")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(
-            None,
-            "enterprise.githubcopilot.com",
-            "/",
-            None
-        ),
-        Some("github-copilot")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(None, "server.codeium.com", "/", None),
-        Some("windsurf")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(None, "cloud.zed.dev", "/", None),
-        Some("zed")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(None, "api.jetbrains.ai", "/", None),
-        Some("junie")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(
-            None,
-            "codewhisperer.us-east-1.amazonaws.com",
-            "/",
-            None
-        ),
-        Some("amazon-q")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(None, "statsig.anthropic.com", "/", None),
-        Some("claude-code")
-    );
-    assert_eq!(
-        host_fingerprint::detect_agent_with_context(None, "gemini.google.com", "/", None),
-        Some("gemini")
-    );
-}
-
-#[test]
 fn test_should_log_request_skips_connect() {
     assert!(!should_log_request("/", "CONNECT"));
 }
@@ -572,22 +351,6 @@ fn test_should_log_request_skips_connect() {
 #[test]
 fn test_should_log_request_skips_event_logging_paths() {
     assert!(!should_log_request("/api/event_logging/batch", "POST"));
-}
-
-#[test]
-fn test_extract_gemini_bard_stream_text_prefers_latest_longest_chunk() {
-    let body = r#"
-)]}'
-160
-[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"I'm listening\"]]]]"]]
-220
-[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"I'm listening! Full answer\"]]]]"]]
-"#;
-
-    assert_eq!(
-        extract_gemini_bard_stream_text(body),
-        Some("I'm listening! Full answer".to_string())
-    );
 }
 
 #[test]
@@ -603,6 +366,7 @@ fn test_empty_response_placeholder_http() {
         empty_response_placeholder("POST", "/backend-api/codex/responses", 200, false);
     assert!(placeholder.contains("no HTTP response body captured"));
     assert!(placeholder.contains("POST /backend-api/codex/responses"));
+    assert!(!placeholder.contains("Codex output may be streamed via WebSocket"));
 }
 
 #[test]
@@ -828,7 +592,7 @@ fn test_append_stream_capture_caps_buffer() {
 }
 
 #[test]
-fn test_trim_cookie_header_for_chatgpt_keeps_auth_under_limit() {
+fn test_trim_cookie_header_for_budget_keeps_auth_under_limit() {
     let mut cookies = vec![
         "__Secure-next-auth.session-token=primary-session-token-value".to_string(),
         "__Host-next-auth.csrf-token=csrf-token".to_string(),
@@ -841,16 +605,16 @@ fn test_trim_cookie_header_for_chatgpt_keeps_auth_under_limit() {
     }
 
     let raw = cookies.join("; ");
-    let trimmed = trim_cookie_header_for_chatgpt(&raw, CHATGPT_MAX_COOKIE_HEADER_BYTES)
+    let trimmed = trim_cookie_header_for_budget(&raw, COOKIE_MAX_HEADER_BYTES)
         .expect("expected cookie trimming result");
 
-    assert!(trimmed.len() <= CHATGPT_MAX_COOKIE_HEADER_BYTES);
+    assert!(trimmed.len() <= COOKIE_MAX_HEADER_BYTES);
     assert!(trimmed.contains("__Secure-next-auth.session-token="));
     assert!(trimmed.contains("__Host-next-auth.csrf-token="));
 }
 
 #[test]
-fn test_sanitize_request_headers_trims_chatgpt_cookie_header() {
+fn test_sanitize_request_headers_trims_cookie_header() {
     let mut req = Request::builder()
         .uri("https://chatgpt.com/backend-api/conversation")
         .header("host", "chatgpt.com")
@@ -877,7 +641,7 @@ fn test_sanitize_request_headers_trims_chatgpt_cookie_header() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(!cookie.is_empty());
-    assert!(cookie.len() <= CHATGPT_MAX_COOKIE_HEADER_BYTES);
+    assert!(cookie.len() <= COOKIE_MAX_HEADER_BYTES);
 }
 
 #[test]
@@ -908,7 +672,7 @@ fn test_sanitize_request_headers_trims_chat_openai_cookie_header() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(!cookie.is_empty());
-    assert!(cookie.len() <= CHATGPT_MAX_COOKIE_HEADER_BYTES);
+    assert!(cookie.len() <= COOKIE_MAX_HEADER_BYTES);
 }
 
 #[test]
@@ -941,7 +705,7 @@ fn test_sanitize_request_headers_reduces_total_budget_for_backend_api() {
     sanitize_request_headers(&mut req, "chatgpt.com", "/backend-api/codex/responses");
 
     let total_size = header_size_bytes(req.headers());
-    assert!(total_size <= CHAT_UI_STRICT_TOTAL_HEADER_BYTES + 400);
+    assert!(total_size <= HEADER_STRICT_TOTAL_BYTES + 400);
     assert!(req.headers().get("x-debug-big-header").is_none());
     assert!(req.headers().get("cookie").is_none());
 }
@@ -1001,13 +765,10 @@ fn test_sanitize_request_headers_keeps_cookie_for_non_backend_auth_routes() {
 }
 
 #[test]
-fn test_is_chat_ui_host_detection() {
-    assert!(is_chat_ui_host("chatgpt.com"));
-    assert!(is_chat_ui_host("chat.openai.com"));
-    assert!(is_chat_ui_host("foo.chat.openai.com"));
-    assert!(is_chat_ui_host("auth.openai.com"));
-    assert!(!is_chat_ui_host("api.openai.com"));
-    assert!(!is_chat_ui_host("example.com"));
+fn test_is_header_budget_sensitive_host_detection() {
+    assert!(is_header_budget_sensitive_host("agent.example.com"));
+    assert!(is_header_budget_sensitive_host("api.example.com"));
+    assert!(!is_header_budget_sensitive_host(""));
 }
 
 #[test]
@@ -1039,7 +800,56 @@ fn test_metadata_policy_never_downgrades_skip_reason() {
     assert!(!should_downgrade_skip_reason_for_metadata_policy(
         EXCHANGE_SKIP_REASON_NOT_WHITELISTED
     ));
-    assert!(!should_downgrade_skip_reason_for_metadata_policy(
-        EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED
-    ));
+}
+
+#[test]
+fn test_map_request_decision_reason_to_skip_reason_contract_safe_values() {
+    assert_eq!(
+        map_request_decision_reason_to_skip_reason(Some("whitelist_path_miss")),
+        EXCHANGE_SKIP_REASON_NOT_WHITELISTED
+    );
+    assert_eq!(
+        map_request_decision_reason_to_skip_reason(Some("deny_paths_exact")),
+        EXCHANGE_SKIP_REASON_BLACKLISTED
+    );
+    assert_eq!(
+        map_request_decision_reason_to_skip_reason(Some("metadata_only")),
+        EXCHANGE_SKIP_REASON_NOT_WHITELISTED
+    );
+    assert_eq!(
+        map_request_decision_reason_to_skip_reason(Some("some_unknown_reason")),
+        EXCHANGE_SKIP_REASON_NOT_WHITELISTED
+    );
+}
+
+#[test]
+fn test_decision_step_from_request_decision_maps_bundle_reasons() {
+    assert_eq!(
+        decision_step_from_request_decision(
+            Some("app_origin_not_allowed"),
+            &RequestDecisionOutcome::Tunnel
+        ),
+        EXCHANGE_DECISION_STEP_APP_GATE
+    );
+    assert_eq!(
+        decision_step_from_request_decision(
+            Some("whitelist_path_miss"),
+            &RequestDecisionOutcome::MetadataOnly
+        ),
+        EXCHANGE_DECISION_STEP_WHITELIST
+    );
+    assert_eq!(
+        decision_step_from_request_decision(
+            Some("deny_paths_exact"),
+            &RequestDecisionOutcome::MetadataOnly
+        ),
+        EXCHANGE_DECISION_STEP_URL_BLACKLIST
+    );
+    assert_eq!(
+        decision_step_from_request_decision(
+            Some("blacklisted_graphql"),
+            &RequestDecisionOutcome::Noise
+        ),
+        EXCHANGE_DECISION_STEP_URL_BLACKLIST
+    );
 }

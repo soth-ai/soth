@@ -12,8 +12,7 @@ use hudsucker::{
 };
 use parking_lot::Mutex;
 use soth_crypto::tls::LearnedPassthrough;
-use soth_oisp::OispEngine;
-use soth_oisp::OispStreamParser;
+use soth_oisp::{ConnectDecisionAction, OispEngine, OispStreamParser, RequestDecisionOutcome};
 #[cfg(test)]
 use soth_policy::PolicyEngine;
 #[cfg(test)]
@@ -32,14 +31,10 @@ use crate::metrics;
 use crate::process_attribution::ProcessAttribution;
 use crate::transport::exchange_assembler::ExchangeAssemblerConfig;
 use crate::transport::graphql_enrichment::extract_graphql_operation;
-#[cfg(test)]
-use crate::transport::host_fingerprint;
 use crate::transport::mcp_detection::extract_mcp_request_method;
 #[cfg(test)]
 use crate::transport::mcp_detection::is_jsonrpc_response_for_mcp;
 use crate::transport::pii_enrichment::PiiEventEnricher;
-#[cfg(test)]
-use crate::transport::proxy_detection::has_anthropic_api_key_header;
 use crate::transport::proxy_detection::{
     classify_capture_policy, extract_host, resolve_bundle_detection, CapturePolicy,
 };
@@ -50,13 +45,13 @@ use crate::transport::proxy_exchange::{
     record_proxy_budget_spend, seed_exchange_spool,
 };
 use crate::transport::proxy_payload::{
-    capture_sanitized_headers, decode_payload_for_logging, extract_gemini_bard_stream_text,
-    is_gemini_bard_stream_path, parse_content_length, sanitize_request_headers,
+    capture_sanitized_headers, decode_payload_for_logging, parse_content_length,
+    sanitize_request_headers,
 };
 #[cfg(test)]
 use crate::transport::proxy_payload::{
-    decode_body_for_logging, header_size_bytes, trim_cookie_header_for_chatgpt, try_decompress,
-    CHATGPT_MAX_COOKIE_HEADER_BYTES, CHAT_UI_STRICT_TOTAL_HEADER_BYTES,
+    decode_body_for_logging, header_size_bytes, trim_cookie_header_for_budget, try_decompress,
+    COOKIE_MAX_HEADER_BYTES, HEADER_STRICT_TOTAL_BYTES,
 };
 use crate::transport::proxy_request::{
     build_request_body_inspection_plan, resolve_host_target_info,
@@ -92,16 +87,13 @@ use soth_core::config::{
 use soth_core::types::TrafficEnvelope;
 use soth_core::EventLogger;
 use soth_core::{
-    EXCHANGE_CLIENT_APP_TYPE_HOST, EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
-    EXCHANGE_CLIENT_APP_TYPE_UNKNOWN, EXCHANGE_DECISION_OUTCOME_CAPTURED,
-    EXCHANGE_DECISION_OUTCOME_METADATA_ONLY, EXCHANGE_DECISION_OUTCOME_SKIPPED,
-    EXCHANGE_DECISION_STEP_APP_GATE, EXCHANGE_DECISION_STEP_APP_ORIGIN,
-    EXCHANGE_DECISION_STEP_GRAPHQL_BLACKLIST, EXCHANGE_DECISION_STEP_HOST_ORIGIN,
-    EXCHANGE_DECISION_STEP_URL_BLACKLIST, EXCHANGE_DECISION_STEP_WHITELIST,
-    EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_CATALOG, EXCHANGE_DISCOVERY_KIND_DOMAIN,
+    EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
+    EXCHANGE_DECISION_OUTCOME_CAPTURED, EXCHANGE_DECISION_OUTCOME_METADATA_ONLY,
+    EXCHANGE_DECISION_OUTCOME_SKIPPED, EXCHANGE_DECISION_STEP_APP_GATE,
+    EXCHANGE_DECISION_STEP_APP_ORIGIN, EXCHANGE_DECISION_STEP_URL_BLACKLIST,
+    EXCHANGE_DECISION_STEP_WHITELIST, EXCHANGE_DISCOVERY_KIND_APP, EXCHANGE_DISCOVERY_KIND_CATALOG,
     EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED, EXCHANGE_SKIP_REASON_APP_RATE_LIMITED,
-    EXCHANGE_SKIP_REASON_BLACKLISTED, EXCHANGE_SKIP_REASON_BLACKLISTED_GRAPHQL,
-    EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED, EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED,
+    EXCHANGE_SKIP_REASON_BLACKLISTED, EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED,
     EXCHANGE_SKIP_REASON_NOT_WHITELISTED, EXCHANGE_SKIP_REASON_NO_BUNDLE_ID,
 };
 
@@ -132,7 +124,7 @@ pub(crate) struct PendingRequest {
     pub(crate) request_content_type: Option<String>,
     /// Whether the incoming request used HTTP/2.
     pub(crate) is_http2: bool,
-    /// Whether this is traffic from an agent app (chatgpt.com, claude.ai) vs direct API
+    /// Whether this is traffic from an agent app versus direct API.
     pub(crate) is_agent_app: bool,
     /// JSON-RPC MCP method (when this request is identified as MCP traffic)
     pub(crate) mcp_method: Option<String>,
@@ -154,6 +146,16 @@ pub(crate) struct PendingRequest {
     pub(crate) decision_outcome: Option<String>,
     /// Canonical skip reason when decision outcome is skipped.
     pub(crate) skip_reason: Option<String>,
+    /// Decision table rule id selected at request evaluation time.
+    pub(crate) decision_rule_id: Option<String>,
+    /// Decision table reason selected at request evaluation time.
+    pub(crate) decision_reason: Option<String>,
+    /// Decision table capture mode (`full|metadata_only|none`).
+    pub(crate) decision_capture_mode: Option<String>,
+    /// CONNECT policy rule id evaluated for this request host/app context.
+    pub(crate) connect_rule_id: Option<String>,
+    /// CONNECT policy reason evaluated for this request host/app context.
+    pub(crate) connect_reason: Option<String>,
     /// Confidence-based capture policy (`full|selective_body|metadata_only`).
     pub(crate) capture_policy: CapturePolicy,
     /// Discovery subtype (`catalog|app|domain`) when discovery mode is active.
@@ -188,6 +190,105 @@ fn should_downgrade_skip_reason_for_metadata_policy(reason: &str) -> bool {
     // Keep explicit skip reasons even under metadata-only capture so policy outcomes remain
     // auditable and transport-consistent.
     false
+}
+
+fn map_request_decision_reason_to_skip_reason(reason: Option<&str>) -> String {
+    let normalized = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(EXCHANGE_SKIP_REASON_NOT_WHITELISTED);
+    match normalized {
+        "no_bundle_id" => EXCHANGE_SKIP_REASON_NO_BUNDLE_ID.to_string(),
+        "app_not_allowed" | "app_origin_not_allowed" => {
+            EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED.to_string()
+        }
+        "app_rate_limited" => EXCHANGE_SKIP_REASON_APP_RATE_LIMITED.to_string(),
+        "domain_rate_limited" => EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED.to_string(),
+        "noise_keyword"
+        | "blacklist"
+        | "blacklisted"
+        | "blacklisted_graphql"
+        | "deny_paths_exact"
+        | "deny_paths_glob" => EXCHANGE_SKIP_REASON_BLACKLISTED.to_string(),
+        "passthrough"
+        | "rule_miss_tunnel"
+        | "whitelist_path_miss"
+        | "host_miss_action"
+        | "non_host_miss_action"
+        | "unknown_app_action"
+        | "metadata_only"
+        | "connect.allowed_app_override"
+        | "whitelisted_unknown_app_action"
+        | "non_whitelisted_host_action" => EXCHANGE_SKIP_REASON_NOT_WHITELISTED.to_string(),
+        _ => EXCHANGE_SKIP_REASON_NOT_WHITELISTED.to_string(),
+    }
+}
+
+fn decision_step_from_request_decision(
+    reason: Option<&str>,
+    outcome: &RequestDecisionOutcome,
+) -> &'static str {
+    let normalized = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    match normalized {
+        "app_not_allowed" | "app_origin_not_allowed" | "app_rate_limited" => {
+            EXCHANGE_DECISION_STEP_APP_GATE
+        }
+        "noise_keyword" | "blacklist" | "blacklisted" | "deny_paths_exact" | "deny_paths_glob" => {
+            EXCHANGE_DECISION_STEP_URL_BLACKLIST
+        }
+        _ => match outcome {
+            RequestDecisionOutcome::Noise => EXCHANGE_DECISION_STEP_URL_BLACKLIST,
+            _ => EXCHANGE_DECISION_STEP_WHITELIST,
+        },
+    }
+}
+
+fn host_action_from_connect_decision(action: &ConnectDecisionAction) -> HostAction {
+    match action {
+        ConnectDecisionAction::Intercept => HostAction::Intercept,
+        ConnectDecisionAction::Passthrough | ConnectDecisionAction::Tunnel => HostAction::Tunnel,
+    }
+}
+
+fn host_action_label(action: HostAction) -> &'static str {
+    match action {
+        HostAction::Intercept => "intercept",
+        HostAction::Tunnel => "tunnel",
+        HostAction::Block => "block",
+    }
+}
+
+fn capture_policy_label(policy: CapturePolicy) -> &'static str {
+    match policy {
+        CapturePolicy::Full => "full",
+        CapturePolicy::SelectiveBody => "selective_body",
+        CapturePolicy::MetadataOnly => "metadata_only",
+    }
+}
+
+fn should_info_trace_for_request(
+    should_capture_observability: bool,
+    is_catalog_discovery_host: bool,
+    is_blocked: bool,
+) -> bool {
+    should_capture_observability || is_catalog_discovery_host || is_blocked
+}
+
+fn should_info_trace_for_pending(pending: &PendingRequest) -> bool {
+    pending.catalog_discovery
+        || pending
+            .provider
+            .as_deref()
+            .map(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("unknown"))
+            .unwrap_or(false)
+        || pending
+            .detection_id
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
 }
 
 fn apply_request_capture_policy(
@@ -315,7 +416,7 @@ pub struct AiProxyHandler {
     /// Optional expiry for the debug force-intercept-all override.
     force_intercept_all_until: Option<SystemTime>,
     /// CONNECT host selected for MITM in this request lifecycle (used for TLS failure learning).
-    connect_intercept_host: Option<String>,
+    connect_intercept_host: Arc<Mutex<Option<String>>>,
 }
 
 impl Clone for AiProxyHandler {
@@ -341,7 +442,7 @@ impl Clone for AiProxyHandler {
             request_correlation_id: next_proxy_request_id(),
             force_intercept_all: self.force_intercept_all,
             force_intercept_all_until: self.force_intercept_all_until,
-            connect_intercept_host: None,
+            connect_intercept_host: self.connect_intercept_host.clone(),
         }
     }
 }
@@ -381,7 +482,7 @@ impl AiProxyHandler {
             request_correlation_id: next_proxy_request_id(),
             force_intercept_all: false,
             force_intercept_all_until: None,
-            connect_intercept_host: None,
+            connect_intercept_host: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -451,7 +552,7 @@ impl AiProxyHandler {
 
     /// Resolve action for host/path using registry engine decisions.
     /// Uses bundle-driven decisions only (no host-list fallback).
-    fn get_action(&self, host: &str, path: &str) -> HostAction {
+    fn get_action(&self, host: &str, path: &str, method: &str) -> HostAction {
         routing_get_action(
             &self.hosts,
             self.oisp_engine.as_ref(),
@@ -460,6 +561,7 @@ impl AiProxyHandler {
             self.force_intercept_all_until,
             host,
             path,
+            method,
         )
     }
 
@@ -502,8 +604,10 @@ impl HttpHandler for AiProxyHandler {
         let host_action = if is_connect {
             self.get_connect_action(&host)
         } else {
-            self.get_action(&host, &path_for_filter)
+            self.get_action(&host, &path_for_filter, &http_method)
         };
+        let host_action_label = host_action_label(host_action);
+        let host_whitelisted = self.oisp_engine.is_host_whitelisted_for_debug(&host);
         let is_blocked = matches!(host_action, HostAction::Block);
         let host_mode = self.hosts.mode;
         let catalog_discovery_limiter = self.catalog_discovery_limiter.clone();
@@ -579,13 +683,16 @@ impl HttpHandler for AiProxyHandler {
         } else {
             None
         };
-        let should_resolve_process = !is_connect
-            && ((should_capture_observability
+        let should_resolve_process = if is_connect {
+            false
+        } else {
+            (should_capture_observability
                 && (host_is_ai_target
                     || host_is_mcp_target
                     || host_is_agent_target
                     || (host_mode == HostFilterMode::Discovery)))
-                || (tunnel_debug.enabled && !should_capture_observability));
+                || (tunnel_debug.enabled && !should_capture_observability)
+        };
 
         debug!(
             is_post = is_post,
@@ -599,11 +706,43 @@ impl HttpHandler for AiProxyHandler {
 
         let pending_requests = self.pending_requests.clone();
         let request_id = self.request_correlation_id;
-
-        if is_connect && matches!(host_action, HostAction::Intercept) {
-            self.connect_intercept_host = Some(host.clone());
+        let request_trace_info = should_info_trace_for_request(
+            should_capture_observability,
+            is_catalog_discovery_host,
+            is_blocked,
+        );
+        if request_trace_info {
+            info!(
+                request_id = request_id,
+                host = %host,
+                path = %path,
+                method = %http_method,
+                is_connect = is_connect,
+                host_action = host_action_label,
+                host_whitelisted = host_whitelisted,
+                host_mode = ?host_mode,
+                should_capture_observability = should_capture_observability,
+                is_catalog_discovery_host = is_catalog_discovery_host,
+                host_is_ai_target = host_is_ai_target,
+                host_is_mcp_target = host_is_mcp_target,
+                host_is_agent_target = host_is_agent_target,
+                provider_hint = ?provider,
+                request_content_type = ?content_type.as_deref(),
+                request_declared_size_bytes = ?declared_request_size_bytes,
+                request_capture_oversized = request_capture_oversized,
+                should_inspect_body = should_inspect_body,
+                "Decision trace: ingress request classification"
+            );
         } else {
-            self.connect_intercept_host = None;
+            debug!(
+                request_id = request_id,
+                host = %host,
+                method = %http_method,
+                is_connect = is_connect,
+                host_action = host_action_label,
+                host_whitelisted = host_whitelisted,
+                "Decision trace: ingress request classification (suppressed detail)"
+            );
         }
 
         async move {
@@ -620,13 +759,97 @@ impl HttpHandler for AiProxyHandler {
             } else {
                 None
             };
+            let process_bundle_id = process_identity
+                .as_ref()
+                .and_then(|value| value.bundle_id.clone());
+            let app_identifier = process_bundle_id.clone();
+            let app_origin = app_identifier
+                .as_deref()
+                .and_then(|value| oisp_engine.classify_app_origin(value));
+            let connect_decision = if !matches!(host_action, HostAction::Block) {
+                Some(oisp_engine.evaluate_connect_decision(&host, None, app_origin))
+            } else {
+                None
+            };
 
-            if is_connect && !matches!(host_action, HostAction::Intercept) {
-                let decision_label = match host_action {
-                    HostAction::Tunnel => "tunnel",
-                    HostAction::Block => "block",
-                    HostAction::Intercept => "intercept",
+            if request_trace_info {
+                info!(
+                    request_id = request_id,
+                    host = %host,
+                    method = %http_method,
+                    should_resolve_process = should_resolve_process,
+                    host_whitelisted = oisp_engine.is_host_whitelisted_for_debug(&host),
+                    process_pid = ?process_identity.as_ref().map(|value| value.pid),
+                    process_name = ?process_identity.as_ref().map(|value| value.name.as_str()),
+                    process_executable = ?process_identity
+                        .as_ref()
+                        .and_then(|value| value.executable.as_deref()),
+                    process_bundle_id = ?app_identifier.as_deref(),
+                    process_attribution_source = ?process_identity
+                        .as_ref()
+                        .map(|value| value.attribution_source.as_str()),
+                    process_attribution_confidence = ?process_identity
+                        .as_ref()
+                        .map(|value| value.attribution_confidence),
+                    app_origin = ?app_origin,
+                    connect_action = ?connect_decision.as_ref().map(|decision| &decision.action),
+                    connect_rule_id = ?connect_decision.as_ref().and_then(|decision| decision.rule_id.as_deref()),
+                    connect_reason = ?connect_decision.as_ref().and_then(|decision| decision.reason.as_deref()),
+                    "Decision trace: process attribution and CONNECT policy evaluation"
+                );
+            } else {
+                debug!(
+                    request_id = request_id,
+                    host = %host,
+                    method = %http_method,
+                    should_resolve_process = should_resolve_process,
+                    process_bundle_id = ?app_identifier.as_deref(),
+                    app_origin = ?app_origin,
+                    connect_action = ?connect_decision.as_ref().map(|decision| &decision.action),
+                    connect_reason = ?connect_decision.as_ref().and_then(|decision| decision.reason.as_deref()),
+                    "Decision trace: process attribution and CONNECT policy evaluation (suppressed detail)"
+                );
+            }
+
+            if is_connect {
+                let decision_label = if matches!(host_action, HostAction::Block) {
+                    "block"
+                } else {
+                    match connect_decision
+                        .as_ref()
+                        .map(|decision| &decision.action)
+                        .unwrap_or(&ConnectDecisionAction::Tunnel)
+                    {
+                        ConnectDecisionAction::Intercept => "intercept",
+                        ConnectDecisionAction::Passthrough => "passthrough",
+                        ConnectDecisionAction::Tunnel => "tunnel",
+                    }
                 };
+                let connect_decision_step = Some(EXCHANGE_DECISION_STEP_APP_ORIGIN.to_string());
+                let (connect_decision_outcome, connect_skip_reason) =
+                    if matches!(host_action, HostAction::Block) {
+                        (
+                            Some(EXCHANGE_DECISION_OUTCOME_SKIPPED.to_string()),
+                            Some(EXCHANGE_SKIP_REASON_NOT_WHITELISTED.to_string()),
+                        )
+                    } else if let Some(connect_decision) = connect_decision.as_ref() {
+                        match connect_decision.action {
+                            ConnectDecisionAction::Intercept => {
+                                (Some(EXCHANGE_DECISION_OUTCOME_CAPTURED.to_string()), None)
+                            }
+                            ConnectDecisionAction::Passthrough | ConnectDecisionAction::Tunnel => (
+                                Some(EXCHANGE_DECISION_OUTCOME_SKIPPED.to_string()),
+                                Some(map_request_decision_reason_to_skip_reason(
+                                    connect_decision.reason.as_deref(),
+                                )),
+                            ),
+                        }
+                    } else {
+                        (
+                            Some(EXCHANGE_DECISION_OUTCOME_SKIPPED.to_string()),
+                            Some(EXCHANGE_SKIP_REASON_NOT_WHITELISTED.to_string()),
+                        )
+                    };
                 let process_pid = process_identity.as_ref().map(|value| value.pid);
                 let process_name = process_identity.as_ref().map(|value| value.name.as_str());
                 if tunnel_debug.should_log(decision_label, &host, process_pid, process_name) {
@@ -640,11 +863,12 @@ impl HttpHandler for AiProxyHandler {
                         client_addr = %client_addr,
                         process_pid = ?process_pid,
                         process_name = %process_name.unwrap_or("-"),
-                        process_app_type = %process_identity
-                            .as_ref()
-                            .map(|value| value.app_type.as_str())
-                            .unwrap_or("-"),
                         process_bundle_id = ?process_bundle_id,
+                        decision_step = ?connect_decision_step.as_deref(),
+                        decision_outcome = ?connect_decision_outcome.as_deref(),
+                        skip_reason = ?connect_skip_reason.as_deref(),
+                        connect_rule_id = ?connect_decision.as_ref().and_then(|decision| decision.rule_id.as_deref()),
+                        connect_reason = ?connect_decision.as_ref().and_then(|decision| decision.reason.as_deref()),
                         "Tunnel debug CONNECT metadata (no body capture)"
                     );
                 }
@@ -674,24 +898,20 @@ impl HttpHandler for AiProxyHandler {
                         );
 
                         // Extract model strictly from bundle parser configuration.
-                        let model = provider.as_deref().and_then(|provider_name| {
-                            extract_model_from_request_for_mode(
-                                Some(oisp_engine.as_ref()),
-                                provider_name,
-                                &host,
-                                &decoded_bytes,
-                            )
-                        });
+                        let provider_hint_for_parse = provider.as_deref().unwrap_or("unknown");
+                        let model = extract_model_from_request_for_mode(
+                            Some(oisp_engine.as_ref()),
+                            provider_hint_for_parse,
+                            &host,
+                            &decoded_bytes,
+                        );
                         // Extract parsed prompt/query text for PII detection.
-                        let request_content_for_pii =
-                            provider.as_deref().and_then(|provider_name| {
-                                extract_request_pii_probe_for_mode(
-                                    Some(oisp_engine.as_ref()),
-                                    provider_name,
-                                    &host,
-                                    &decoded_bytes,
-                                )
-                            });
+                        let request_content_for_pii = extract_request_pii_probe_for_mode(
+                            Some(oisp_engine.as_ref()),
+                            provider_hint_for_parse,
+                            &host,
+                            &decoded_bytes,
+                        );
 
                         // Reconstruct request with body
                         let new_body = Body::from(Full::new(bytes));
@@ -731,7 +951,12 @@ impl HttpHandler for AiProxyHandler {
                     request_capture_oversized,
                 )
             };
-            let intercept_decision = oisp_engine.should_intercept(&host, &path_for_filter);
+            let intercept_decision = oisp_engine.should_intercept_with_context(
+                &host,
+                &path_for_filter,
+                Some(http_method.as_str()),
+                app_origin,
+            );
             if !is_connect && !should_capture_observability {
                 let decision_label =
                     decision_label_from_intercept_decision(intercept_decision.clone());
@@ -750,10 +975,6 @@ impl HttpHandler for AiProxyHandler {
                         provider_hint = ?provider,
                         process_pid = ?process_pid,
                         process_name = %process_name.unwrap_or("-"),
-                        process_app_type = %process_identity
-                            .as_ref()
-                            .map(|value| value.app_type.as_str())
-                            .unwrap_or("-"),
                         process_bundle_id = ?process_bundle_id,
                         user_agent = ?ua_header,
                         "Tunnel debug metadata (no body capture)"
@@ -767,13 +988,6 @@ impl HttpHandler for AiProxyHandler {
                     );
                 }
             }
-            let process_bundle_id = process_identity
-                .as_ref()
-                .and_then(|value| value.bundle_id.clone());
-            let app_identifier = process_bundle_id.clone();
-            let app_origin = app_identifier
-                .as_deref()
-                .and_then(|value| oisp_engine.classify_app_origin(value));
             let bundle_detection = resolve_bundle_detection(
                 oisp_engine.as_ref(),
                 provider.as_deref(),
@@ -805,8 +1019,6 @@ impl HttpHandler for AiProxyHandler {
                     "Bundle detection resolved"
                 );
             }
-            let capture_policy =
-                classify_capture_policy(parse_confidence, detection_reason.as_deref());
             let mcp_request_method = if !is_connect
                 && should_capture_observability
                 && (host_is_mcp_target || (host_mode == HostFilterMode::Discovery))
@@ -822,22 +1034,22 @@ impl HttpHandler for AiProxyHandler {
             } else {
                 None
             };
-            let graphql_blacklisted = graphql_operation
-                .as_deref()
-                .map(|operation| oisp_engine.matches_noise_keyword(operation))
-                .unwrap_or(false);
-            if graphql_blacklisted {
-                metrics::record_filter_decision("http", "blacklist_graphql");
-                info!(
-                    host = %host,
-                    path = %path,
-                    graphql_operation = ?graphql_operation,
-                    "Skipping observability capture for blacklisted GraphQL operation"
-                );
-            }
-            let mut decision_step = Some(EXCHANGE_DECISION_STEP_APP_ORIGIN.to_string());
+            let mut decision_step: Option<String> = if is_connect {
+                Some(EXCHANGE_DECISION_STEP_APP_ORIGIN.to_string())
+            } else {
+                None
+            };
             let mut decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_CAPTURED.to_string());
             let mut skip_reason: Option<String> = None;
+            let mut decision_rule_id: Option<String> = None;
+            let mut decision_reason: Option<String> = None;
+            let mut decision_capture_mode: Option<String> = None;
+            let connect_rule_id = connect_decision
+                .as_ref()
+                .and_then(|decision| decision.rule_id.clone());
+            let connect_reason = connect_decision
+                .as_ref()
+                .and_then(|decision| decision.reason.clone());
             let mut discovery_kind = if is_catalog_discovery_host {
                 Some(EXCHANGE_DISCOVERY_KIND_CATALOG.to_string())
             } else {
@@ -850,20 +1062,15 @@ impl HttpHandler for AiProxyHandler {
             let client_host_origin = request_origin
                 .clone()
                 .or_else(|| request_referrer_origin.clone());
-
-            if !is_connect && oisp_engine.has_app_origin_rules() {
-                decision_step = Some(EXCHANGE_DECISION_STEP_APP_GATE.to_string());
-                if app_identifier.is_none() && !cfg!(target_os = "windows") {
-                    skip_reason = Some(EXCHANGE_SKIP_REASON_NO_BUNDLE_ID.to_string());
-                } else if let Some(identifier) = app_identifier.as_deref() {
-                    if app_origin.is_none() {
-                        skip_reason = Some(EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED.to_string());
-                    } else if app_origin == Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST)
+            if !is_connect {
+                if let Some(identifier) = app_identifier.as_deref() {
+                    if app_origin == Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST)
                         && !oisp_engine.app_has_parser(identifier)
                     {
-                        match catalog_discovery_limiter
-                            .reserve_once_per_day(crate::transport::proxy_support::DiscoveryKind::App, identifier)
-                        {
+                        match catalog_discovery_limiter.reserve_once_per_day(
+                            crate::transport::proxy_support::DiscoveryKind::App,
+                            identifier,
+                        ) {
                             crate::transport::proxy_support::DiscoveryReserveResult::Reserved => {
                                 discovery_kind = Some(EXCHANGE_DISCOVERY_KIND_APP.to_string());
                             }
@@ -874,80 +1081,108 @@ impl HttpHandler for AiProxyHandler {
                         }
                     }
                 }
-            }
 
-            if !is_connect
-                && skip_reason.is_none()
-                && discovery_kind.is_none()
-                && !should_capture_observability
-                && (oisp_engine.has_app_origin_rules() || oisp_engine.has_host_origin_rules())
-            {
-                decision_step = Some(EXCHANGE_DECISION_STEP_WHITELIST.to_string());
-                if app_origin == Some(EXCHANGE_CLIENT_APP_TYPE_HOST) {
-                    if let Some(origin) = client_host_origin.as_deref() {
-                        if oisp_engine.is_allowed_host_origin(origin) {
-                            match catalog_discovery_limiter.reserve_once_per_day(
-                                crate::transport::proxy_support::DiscoveryKind::Domain,
-                                host.as_str(),
-                            ) {
-                                crate::transport::proxy_support::DiscoveryReserveResult::Reserved => {
-                                    discovery_kind = Some(EXCHANGE_DISCOVERY_KIND_DOMAIN.to_string());
-                                }
-                                crate::transport::proxy_support::DiscoveryReserveResult::AlreadySeen
-                                | crate::transport::proxy_support::DiscoveryReserveResult::DailyCapReached => {
-                                    skip_reason =
-                                        Some(EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED.to_string());
-                                }
-                            }
-                        } else {
-                            skip_reason = Some(EXCHANGE_SKIP_REASON_NOT_WHITELISTED.to_string());
-                        }
-                    } else {
-                        skip_reason = Some(EXCHANGE_SKIP_REASON_NOT_WHITELISTED.to_string());
-                    }
+                let request_decision = oisp_engine.evaluate_request_decision(
+                    &host,
+                    &path_for_filter,
+                    Some(http_method.as_str()),
+                    app_origin,
+                );
+                decision_rule_id = request_decision.rule_id.clone();
+                decision_reason = request_decision.reason.clone();
+                let request_reason = request_decision.reason.clone();
+                let request_outcome = request_decision.outcome.clone();
+                decision_step = Some(
+                    decision_step_from_request_decision(
+                        request_reason.as_deref(),
+                        &request_outcome,
+                    )
+                    .to_string(),
+                );
+                if request_trace_info
+                    || request_decision
+                        .provider_id
+                        .as_deref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                    || request_decision
+                        .detection_id
+                        .as_deref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    info!(
+                        request_id = request_id,
+                        host = %host,
+                        path = %path_for_filter,
+                        method = %http_method,
+                        app_origin = ?app_origin,
+                        request_outcome = ?request_outcome,
+                        decision_rule_id = ?request_decision.rule_id.as_deref(),
+                        decision_reason = ?request_reason.as_deref(),
+                        decision_detection_id = ?request_decision.detection_id.as_deref(),
+                        decision_provider_id = ?request_decision.provider_id.as_deref(),
+                        "Decision trace: request decision evaluated"
+                    );
                 } else {
-                    skip_reason = Some(EXCHANGE_SKIP_REASON_NOT_WHITELISTED.to_string());
+                    debug!(
+                        request_id = request_id,
+                        host = %host,
+                        method = %http_method,
+                        request_outcome = ?request_outcome,
+                        decision_reason = ?request_reason.as_deref(),
+                        "Decision trace: request decision evaluated (suppressed detail)"
+                    );
+                }
+                match request_outcome {
+                    RequestDecisionOutcome::Full => {
+                        decision_capture_mode = Some("full".to_string());
+                        decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_CAPTURED.to_string());
+                    }
+                    RequestDecisionOutcome::MetadataOnly => {
+                        decision_capture_mode = Some("metadata_only".to_string());
+                        decision_outcome =
+                            Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY.to_string());
+                        skip_reason = None;
+                    }
+                    RequestDecisionOutcome::Tunnel | RequestDecisionOutcome::Passthrough => {
+                        decision_capture_mode = Some("none".to_string());
+                        decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_SKIPPED.to_string());
+                        skip_reason = Some(map_request_decision_reason_to_skip_reason(
+                            request_reason.as_deref(),
+                        ));
+                    }
+                    RequestDecisionOutcome::Noise => {
+                        decision_capture_mode = Some("none".to_string());
+                        decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_SKIPPED.to_string());
+                        skip_reason = Some(EXCHANGE_SKIP_REASON_BLACKLISTED.to_string());
+                    }
                 }
             }
 
-            if !is_connect
-                && skip_reason.is_none()
-                && (should_capture_observability || discovery_kind.is_some())
-            {
-                decision_step = Some(EXCHANGE_DECISION_STEP_URL_BLACKLIST.to_string());
+            if !is_connect && (should_capture_observability || discovery_kind.is_some()) {
                 if matches!(intercept_decision, soth_oisp::InterceptDecision::Noise)
                     || is_blacklist_detection_reason(detection_reason.as_deref())
                 {
+                    decision_step = Some(EXCHANGE_DECISION_STEP_URL_BLACKLIST.to_string());
+                    decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_SKIPPED.to_string());
                     skip_reason = Some(EXCHANGE_SKIP_REASON_BLACKLISTED.to_string());
                 }
             }
 
-            if !is_connect
-                && skip_reason.is_none()
-                && (should_capture_observability || discovery_kind.is_some())
-            {
-                decision_step = Some(EXCHANGE_DECISION_STEP_GRAPHQL_BLACKLIST.to_string());
-                if graphql_blacklisted {
-                    skip_reason = Some(EXCHANGE_SKIP_REASON_BLACKLISTED_GRAPHQL.to_string());
-                }
+            if decision_step.is_none() {
+                decision_step = Some(
+                    if is_connect {
+                        EXCHANGE_DECISION_STEP_APP_ORIGIN
+                    } else {
+                        EXCHANGE_DECISION_STEP_WHITELIST
+                    }
+                    .to_string(),
+                );
             }
 
-            if !is_connect && skip_reason.is_none() {
-                decision_step = Some(EXCHANGE_DECISION_STEP_HOST_ORIGIN.to_string());
-                if client_app_type.as_deref() == Some(EXCHANGE_CLIENT_APP_TYPE_HOST)
-                    && discovery_kind.is_none()
-                    && oisp_engine.has_host_origin_rules()
-                {
-                    let allowed = client_host_origin
-                        .as_deref()
-                        .map(|origin| oisp_engine.is_allowed_host_origin(origin))
-                        .unwrap_or(false);
-                    if !allowed {
-                        skip_reason =
-                            Some(EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED.to_string());
-                    }
-                }
-            }
+            let capture_policy =
+                classify_capture_policy(parse_confidence, detection_reason.as_deref());
 
             if let Some(reason) = skip_reason.as_deref() {
                 if matches!(capture_policy, CapturePolicy::MetadataOnly)
@@ -957,16 +1192,79 @@ impl HttpHandler for AiProxyHandler {
                 }
             }
 
-            if skip_reason.is_some() {
-                decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_SKIPPED.to_string());
-            } else if discovery_kind.is_some() {
+            if discovery_kind.is_some() {
                 decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY.to_string());
-            } else if matches!(capture_policy, CapturePolicy::MetadataOnly) {
+            } else if matches!(capture_policy, CapturePolicy::MetadataOnly)
+                && decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_CAPTURED)
+                && decision_capture_mode.as_deref() != Some("full")
+            {
                 decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY.to_string());
+            }
+
+            // Cloud contract requires skip_reason only when decision_outcome=skipped.
+            if decision_outcome.as_deref() != Some(EXCHANGE_DECISION_OUTCOME_SKIPPED) {
+                skip_reason = None;
+            }
+
+            let has_detection = detection_id
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+            if !is_connect && !has_detection {
+                decision_outcome = Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY.to_string());
+                decision_capture_mode = Some("metadata_only".to_string());
+                skip_reason = None;
+            }
+            if !is_connect && exchange_cfg.is_some() && !has_detection && request_trace_info {
+                info!(
+                    request_id = request_id,
+                    host = %host,
+                    path = %path,
+                    method = %http_method,
+                    decision_outcome = ?decision_outcome.as_deref(),
+                    "Decision trace: unresolved detection_id forcing metadata-only forwarding without exchange enqueue"
+                );
+            }
+            if request_trace_info || has_detection {
+                info!(
+                    request_id = request_id,
+                    host = %host,
+                    path = %path,
+                    method = %http_method,
+                    detection_id = ?detection_id.as_deref(),
+                    detection_source = ?detection_source.as_deref(),
+                    detection_reason = ?detection_reason.as_deref(),
+                    parse_confidence = ?parse_confidence,
+                    capture_policy = capture_policy_label(capture_policy),
+                    decision_step = ?decision_step.as_deref(),
+                    decision_outcome = ?decision_outcome.as_deref(),
+                    skip_reason = ?skip_reason.as_deref(),
+                    decision_rule_id = ?decision_rule_id.as_deref(),
+                    decision_reason = ?decision_reason.as_deref(),
+                    decision_capture_mode = ?decision_capture_mode.as_deref(),
+                    connect_rule_id = ?connect_rule_id.as_deref(),
+                    connect_reason = ?connect_reason.as_deref(),
+                    discovery_kind = ?discovery_kind.as_deref(),
+                    client_app_type = ?client_app_type.as_deref(),
+                    client_host_origin = ?client_host_origin.as_deref(),
+                    client_referrer_origin = ?client_referrer_origin.as_deref(),
+                    "Decision trace: final request capture decision"
+                );
+            } else {
+                debug!(
+                    request_id = request_id,
+                    host = %host,
+                    method = %http_method,
+                    decision_outcome = ?decision_outcome.as_deref(),
+                    skip_reason = ?skip_reason.as_deref(),
+                    capture_policy = capture_policy_label(capture_policy),
+                    "Decision trace: final request capture decision (suppressed detail)"
+                );
             }
 
             let mut policy_allowed = None;
             let mut policy_version = None;
+            let should_enqueue_exchange = has_detection;
 
             if !is_connect {
                 if let Some(ref learned) = learned_passthrough {
@@ -1049,14 +1347,19 @@ impl HttpHandler for AiProxyHandler {
                 };
 
                 // Check if this request should be logged (blacklist non-inference content)
-                let should_log = (is_catalog_discovery_host || should_log_inference_request)
-                    && !graphql_blacklisted;
-                let should_track_request = should_log
-                    || decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY)
-                    || decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_SKIPPED);
+                let should_log = is_catalog_discovery_host || should_log_inference_request;
+                let should_track_request = should_enqueue_exchange
+                    && (should_log
+                        || decision_outcome.as_deref()
+                            == Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY)
+                        || decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_SKIPPED));
+                let pending_exchange_id =
+                    should_track_request.then(|| uuid::Uuid::new_v4().to_string());
 
                 if should_log {
                     info!(
+                        request_id = request_id,
+                        exchange_id = ?pending_exchange_id.as_deref(),
                         agent = ?agent,
                         provider = provider,
                         host = %host,
@@ -1070,9 +1373,26 @@ impl HttpHandler for AiProxyHandler {
                     debug!(
                         provider = provider,
                         path = %display_path,
-                        graphql_blacklisted = graphql_blacklisted,
                         "Skipping non-inference or blacklisted endpoint"
                     );
+                }
+                if !should_track_request && !should_enqueue_exchange {
+                    if request_trace_info {
+                        info!(
+                            request_id = request_id,
+                            host = %host,
+                            path = %display_path,
+                            method = %http_method,
+                            "Decision trace: AI request forwarded without exchange enqueue due to unresolved detection identity"
+                        );
+                    } else {
+                        debug!(
+                            request_id = request_id,
+                            host = %host,
+                            method = %http_method,
+                            "Decision trace: AI request forwarded without exchange enqueue due to unresolved detection identity (suppressed detail)"
+                        );
+                    }
                 }
 
                 // Store pending request for response correlation.
@@ -1095,11 +1415,14 @@ impl HttpHandler for AiProxyHandler {
                         ),
                         process_identity.as_ref(),
                     );
+                    let exchange_id = pending_exchange_id
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                     let mut pending = pending_requests.lock();
                     pending.insert(
                         request_id,
                         PendingRequest {
-                            exchange_id: uuid::Uuid::new_v4().to_string(),
+                            exchange_id: exchange_id.clone(),
                             envelope: Some(envelope),
                             host: host.clone(),
                             path: display_path.clone(),
@@ -1127,6 +1450,11 @@ impl HttpHandler for AiProxyHandler {
                             decision_step: decision_step.clone(),
                             decision_outcome: decision_outcome.clone(),
                             skip_reason: skip_reason.clone(),
+                            decision_rule_id: decision_rule_id.clone(),
+                            decision_reason: decision_reason.clone(),
+                            decision_capture_mode: decision_capture_mode.clone(),
+                            connect_rule_id: connect_rule_id.clone(),
+                            connect_reason: connect_reason.clone(),
                             capture_policy,
                             discovery_kind: discovery_kind.clone(),
                             client_app_type: client_app_type.clone(),
@@ -1138,80 +1466,134 @@ impl HttpHandler for AiProxyHandler {
                             policy_version,
                         },
                     );
+                    info!(
+                        request_id = request_id,
+                        exchange_id = %exchange_id,
+                        host = %host,
+                        path = %display_path,
+                        method = %http_method,
+                        provider = %provider,
+                        capture_policy = capture_policy_label(capture_policy),
+                        decision_outcome = ?decision_outcome.as_deref(),
+                        skip_reason = ?skip_reason.as_deref(),
+                        detection_id = ?detection_id.as_deref(),
+                        "Decision trace: pending AI exchange stored"
+                    );
                 }
 
                 // Note: We don't log request events separately anymore.
                 // Instead, we log a paired request/response event when the response arrives.
             } else if let Some(mcp_method) = mcp_request_method {
-                info!(
-                    host = %host,
-                    path = %path,
-                    method = %http_method,
-                    mcp_method = %mcp_method,
-                    "MCP JSON-RPC request"
-                );
+                if should_enqueue_exchange {
+                    let exchange_id = uuid::Uuid::new_v4().to_string();
+                    info!(
+                        request_id = request_id,
+                        exchange_id = %exchange_id,
+                        host = %host,
+                        path = %path,
+                        method = %http_method,
+                        mcp_method = %mcp_method,
+                        "MCP JSON-RPC request"
+                    );
 
-                let mut pending = pending_requests.lock();
-                let blacklist_match = is_blacklist_detection_reason(detection_reason.as_deref());
-                pending.insert(
-                    request_id,
-                    PendingRequest {
-                        exchange_id: uuid::Uuid::new_v4().to_string(),
-                        envelope: Some(apply_process_identity(
-                            TrafficEnvelope::mcp_http(
-                                &session_id,
-                                Some(request_id.to_string()),
-                                mcp_method.clone(),
-                                &host,
-                                &path,
-                                agent.as_deref(),
-                                identity_did.as_deref(),
-                                identity_signature.as_deref(),
-                                body_content.as_deref(),
-                            ),
-                            process_identity.as_ref(),
-                        )),
-                        host: host.clone(),
-                        path: path.clone(),
-                        method: http_method.clone(),
-                        provider: None,
-                        agent: agent.clone(),
-                        model: None,
-                        graphql_operation: None,
-                        started_at: Instant::now(),
-                        request_content: request_content_for_exchange.clone(),
-                        request_content_for_pii: None,
-                        request_body_truncated: request_body_truncated_for_exchange,
-                        request_size_bytes,
-                        headers: None,
-                        request_content_type: content_type.clone(),
-                        is_http2: is_http2_request,
-                        is_agent_app: false,
-                        mcp_method: Some(mcp_method),
-                        is_mcp_jsonrpc: true,
-                        catalog_discovery: is_catalog_discovery_host,
-                        detection_reason: detection_reason.clone(),
-                        parse_confidence,
-                        detection_id: detection_id.clone(),
-                        detection_source: detection_source.clone(),
-                        decision_step: decision_step.clone(),
-                        decision_outcome: decision_outcome.clone(),
-                        skip_reason: skip_reason.clone(),
-                        capture_policy,
-                        discovery_kind: discovery_kind.clone(),
-                        client_app_type: client_app_type.clone(),
-                        client_host_origin: client_host_origin.clone(),
-                        client_referrer_origin: client_referrer_origin.clone(),
-                        blacklist_match,
-                        policy_allowed: None,
-                        policy_reason: None,
-                        policy_version: None,
-                    },
-                );
+                    let mut pending = pending_requests.lock();
+                    let blacklist_match =
+                        is_blacklist_detection_reason(detection_reason.as_deref());
+                    pending.insert(
+                        request_id,
+                        PendingRequest {
+                            exchange_id: exchange_id.clone(),
+                            envelope: Some(apply_process_identity(
+                                TrafficEnvelope::mcp_http(
+                                    &session_id,
+                                    Some(request_id.to_string()),
+                                    mcp_method.clone(),
+                                    &host,
+                                    &path,
+                                    agent.as_deref(),
+                                    identity_did.as_deref(),
+                                    identity_signature.as_deref(),
+                                    body_content.as_deref(),
+                                ),
+                                process_identity.as_ref(),
+                            )),
+                            host: host.clone(),
+                            path: path.clone(),
+                            method: http_method.clone(),
+                            provider: None,
+                            agent: agent.clone(),
+                            model: None,
+                            graphql_operation: None,
+                            started_at: Instant::now(),
+                            request_content: request_content_for_exchange.clone(),
+                            request_content_for_pii: None,
+                            request_body_truncated: request_body_truncated_for_exchange,
+                            request_size_bytes,
+                            headers: None,
+                            request_content_type: content_type.clone(),
+                            is_http2: is_http2_request,
+                            is_agent_app: false,
+                            mcp_method: Some(mcp_method.clone()),
+                            is_mcp_jsonrpc: true,
+                            catalog_discovery: is_catalog_discovery_host,
+                            detection_reason: detection_reason.clone(),
+                            parse_confidence,
+                            detection_id: detection_id.clone(),
+                            detection_source: detection_source.clone(),
+                            decision_step: decision_step.clone(),
+                            decision_outcome: decision_outcome.clone(),
+                            skip_reason: skip_reason.clone(),
+                            decision_rule_id: decision_rule_id.clone(),
+                            decision_reason: decision_reason.clone(),
+                            decision_capture_mode: decision_capture_mode.clone(),
+                            connect_rule_id: connect_rule_id.clone(),
+                            connect_reason: connect_reason.clone(),
+                            capture_policy,
+                            discovery_kind: discovery_kind.clone(),
+                            client_app_type: client_app_type.clone(),
+                            client_host_origin: client_host_origin.clone(),
+                            client_referrer_origin: client_referrer_origin.clone(),
+                            blacklist_match,
+                            policy_allowed: None,
+                            policy_reason: None,
+                            policy_version: None,
+                        },
+                    );
+                    info!(
+                        request_id = request_id,
+                        exchange_id = %exchange_id,
+                        host = %host,
+                        path = %path,
+                        method = %http_method,
+                        mcp_method = %mcp_method,
+                        capture_policy = capture_policy_label(capture_policy),
+                        decision_outcome = ?decision_outcome.as_deref(),
+                        skip_reason = ?skip_reason.as_deref(),
+                        detection_id = ?detection_id.as_deref(),
+                        "Decision trace: pending MCP exchange stored"
+                    );
+                } else if request_trace_info {
+                    info!(
+                        request_id = request_id,
+                        host = %host,
+                        path = %path,
+                        method = %http_method,
+                        mcp_method = %mcp_method,
+                        "Decision trace: MCP request forwarded without exchange enqueue due to unresolved detection identity"
+                    );
+                } else {
+                    debug!(
+                        request_id = request_id,
+                        host = %host,
+                        method = %http_method,
+                        "Decision trace: MCP request forwarded without exchange enqueue due to unresolved detection identity (suppressed detail)"
+                    );
+                }
             } else {
                 debug!(host = %host, path = %path, "Request (non-AI)");
                 if !is_connect
                     && exchange_cfg.is_some()
+                    && should_enqueue_exchange
                     && (decision_outcome.as_deref()
                         == Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY)
                         || decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_SKIPPED))
@@ -1234,11 +1616,12 @@ impl HttpHandler for AiProxyHandler {
                     );
                     let blacklist_match =
                         is_blacklist_detection_reason(detection_reason.as_deref());
+                    let exchange_id = uuid::Uuid::new_v4().to_string();
                     let mut pending = pending_requests.lock();
                     pending.insert(
                         request_id,
                         PendingRequest {
-                            exchange_id: uuid::Uuid::new_v4().to_string(),
+                            exchange_id: exchange_id.clone(),
                             envelope: Some(envelope),
                             host: host.clone(),
                             path: path.clone(),
@@ -1266,6 +1649,11 @@ impl HttpHandler for AiProxyHandler {
                             decision_step: decision_step.clone(),
                             decision_outcome: decision_outcome.clone(),
                             skip_reason: skip_reason.clone(),
+                            decision_rule_id: decision_rule_id.clone(),
+                            decision_reason: decision_reason.clone(),
+                            decision_capture_mode: decision_capture_mode.clone(),
+                            connect_rule_id: connect_rule_id.clone(),
+                            connect_reason: connect_reason.clone(),
                             capture_policy,
                             discovery_kind: discovery_kind.clone(),
                             client_app_type: client_app_type.clone(),
@@ -1277,6 +1665,62 @@ impl HttpHandler for AiProxyHandler {
                             policy_version: policy_version.clone(),
                         },
                     );
+                    if provider
+                        .as_deref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                        || detection_id
+                            .as_deref()
+                            .map(|value| !value.trim().is_empty())
+                            .unwrap_or(false)
+                    {
+                        info!(
+                            request_id = request_id,
+                            exchange_id = %exchange_id,
+                            host = %host,
+                            path = %path,
+                            method = %http_method,
+                            provider = ?provider.as_deref(),
+                            capture_policy = capture_policy_label(capture_policy),
+                            decision_outcome = ?decision_outcome.as_deref(),
+                            skip_reason = ?skip_reason.as_deref(),
+                            detection_id = ?detection_id.as_deref(),
+                            "Decision trace: pending metadata/skipped exchange stored"
+                        );
+                    } else {
+                        debug!(
+                            request_id = request_id,
+                            exchange_id = %exchange_id,
+                            host = %host,
+                            method = %http_method,
+                            decision_outcome = ?decision_outcome.as_deref(),
+                            skip_reason = ?skip_reason.as_deref(),
+                            "Decision trace: pending metadata/skipped exchange stored (suppressed detail)"
+                        );
+                    }
+                } else if !is_connect
+                    && exchange_cfg.is_some()
+                    && !should_enqueue_exchange
+                    && (decision_outcome.as_deref()
+                        == Some(EXCHANGE_DECISION_OUTCOME_METADATA_ONLY)
+                        || decision_outcome.as_deref() == Some(EXCHANGE_DECISION_OUTCOME_SKIPPED))
+                {
+                    if request_trace_info {
+                        info!(
+                            request_id = request_id,
+                            host = %host,
+                            path = %path,
+                            method = %http_method,
+                            "Decision trace: metadata/skipped request forwarded without exchange enqueue due to unresolved detection identity"
+                        );
+                    } else {
+                        debug!(
+                            request_id = request_id,
+                            host = %host,
+                            method = %http_method,
+                            "Decision trace: metadata/skipped request forwarded without exchange enqueue due to unresolved detection identity (suppressed detail)"
+                        );
+                    }
                 }
             }
 
@@ -1314,6 +1758,28 @@ impl HttpHandler for AiProxyHandler {
                 event_logger.as_ref(),
                 pending_for_spool.as_ref(),
             ) {
+                if should_info_trace_for_pending(entry) {
+                    info!(
+                        request_id = request_id,
+                        exchange_id = %entry.exchange_id,
+                        host = %entry.host,
+                        path = %entry.path,
+                        method = %entry.method,
+                        detection_id = ?entry.detection_id.as_deref(),
+                        detection_source = ?entry.detection_source.as_deref(),
+                        decision_outcome = ?entry.decision_outcome.as_deref(),
+                        skip_reason = ?entry.skip_reason.as_deref(),
+                        "Decision trace: seeding exchange spool before upstream forward"
+                    );
+                } else {
+                    debug!(
+                        request_id = request_id,
+                        exchange_id = %entry.exchange_id,
+                        host = %entry.host,
+                        method = %entry.method,
+                        "Decision trace: seeding exchange spool before upstream forward (suppressed detail)"
+                    );
+                }
                 seed_exchange_spool(
                     logger,
                     exchange_cfg,
@@ -1402,6 +1868,29 @@ impl HttpHandler for AiProxyHandler {
             };
 
             let latency_ms = pending.started_at.elapsed().as_millis() as u64;
+            if should_info_trace_for_pending(&pending) {
+                info!(
+                    request_id = request_id,
+                    exchange_id = %pending.exchange_id,
+                    host = %pending.host,
+                    path = %pending.path,
+                    method = %pending.method,
+                    provider = ?pending.provider.as_deref(),
+                    capture_policy = capture_policy_label(pending.capture_policy),
+                    decision_outcome = ?pending.decision_outcome.as_deref(),
+                    skip_reason = ?pending.skip_reason.as_deref(),
+                    detection_id = ?pending.detection_id.as_deref(),
+                    "Decision trace: correlated upstream response to pending request"
+                );
+            } else {
+                debug!(
+                    request_id = request_id,
+                    exchange_id = %pending.exchange_id,
+                    host = %pending.host,
+                    method = %pending.method,
+                    "Decision trace: correlated upstream response to pending request (suppressed detail)"
+                );
+            }
             if pending.is_mcp_jsonrpc {
                 return handle_mcp_jsonrpc_response(
                     res,
@@ -1426,19 +1915,17 @@ impl HttpHandler for AiProxyHandler {
                 .provider
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let is_codex_response_path = pending
-                .path
-                .to_ascii_lowercase()
-                .contains("/backend-api/codex/responses");
-            let is_gemini_bard_response_path = is_gemini_bard_stream_path(&pending.path);
+            let has_bundle_stream_parser = create_stream_usage_parser(
+                Some(oisp_engine.as_ref()),
+                provider.as_str(),
+                &pending.host,
+            )
+            .is_some();
             let is_streamable_http_path = pending
                 .path
                 .to_ascii_lowercase()
                 .contains("streamable-http");
-            let is_stream_response = is_sse
-                || is_codex_response_path
-                || is_gemini_bard_response_path
-                || is_streamable_http_path;
+            let is_stream_response = is_sse || has_bundle_stream_parser || is_streamable_http_path;
             let mut response_usage = ResponseUsageMeta::default();
             let response_declared_oversized = declared_response_size_bytes
                 .map(|size| size > response_capture_limit_bytes)
@@ -1472,13 +1959,12 @@ impl HttpHandler for AiProxyHandler {
             // Streamed responses can be long-lived. Keep persistence append-only by emitting a
             // single finalized event once stream capture completes (no placeholder upsert).
 
-            // For JSON responses, capture the body for logging (with decompression)
-            // For SSE/Codex streams, use tee to forward immediately while accumulating for logging
+            // For JSON responses, capture the body for logging (with decompression).
+            // For bundle-defined/protocol streams, use tee to forward immediately
+            // while accumulating for logging.
             let (body_content, res, logged_in_stream) = if !skip_response_capture
                 && (is_json || is_grpc)
-                && !is_sse
-                && !is_codex_response_path
-                && !is_gemini_bard_response_path
+                && !is_stream_response
             {
                 let (parts, body) = res.into_parts();
                 match body.collect().await {
@@ -1535,10 +2021,10 @@ impl HttpHandler for AiProxyHandler {
                 let log_provider = provider.clone();
                 let log_stream_kind: &'static str = if is_sse {
                     "sse"
-                } else if is_codex_response_path {
-                    "codex"
-                } else if is_gemini_bard_response_path {
-                    "gemini_bard"
+                } else if has_bundle_stream_parser {
+                    "bundle_stream"
+                } else if is_streamable_http_path {
+                    "streamable_http"
                 } else {
                     "stream"
                 };
@@ -1546,11 +2032,15 @@ impl HttpHandler for AiProxyHandler {
                 let tee_stream = stream! {
                     let mut body = body;
                     let mut capture_limit_reported = false;
-                    let mut stream_usage_parser: Option<OispStreamParser> = create_stream_usage_parser(
-                        Some(log_oisp_engine.as_ref()),
-                        log_provider.as_str(),
-                        &log_pending.host,
-                    );
+                    let mut stream_usage_parser: Option<OispStreamParser> = if has_bundle_stream_parser {
+                        create_stream_usage_parser(
+                            Some(log_oisp_engine.as_ref()),
+                            log_provider.as_str(),
+                            &log_pending.host,
+                        )
+                    } else {
+                        None
+                    };
                     loop {
                         match body.frame().await {
                             Some(Ok(frame)) => {
@@ -1637,11 +2127,7 @@ impl HttpHandler for AiProxyHandler {
                             &usage_meta,
                         );
                     }
-                    let response_text = if is_gemini_bard_stream_path(&log_pending.path) {
-                        extract_gemini_bard_stream_text(&raw_content).unwrap_or(raw_content)
-                    } else {
-                        raw_content
-                    };
+                    let response_text = raw_content;
                     let content = normalize_response_content(
                         Some(response_text.as_str()),
                         log_pending.request_content.as_deref(),
@@ -1753,14 +2239,29 @@ impl HttpHandler for AiProxyHandler {
                 (placeholder, res, false)
             };
 
-            info!(
-                provider = %provider,
-                host = %pending.host,
-                path = %pending.path,
-                status = status,
-                latency_ms = latency_ms,
-                "AI API response"
-            );
+            if should_info_trace_for_pending(&pending) {
+                info!(
+                    request_id = request_id,
+                    exchange_id = %pending.exchange_id,
+                    provider = %provider,
+                    host = %pending.host,
+                    path = %pending.path,
+                    status = status,
+                    latency_ms = latency_ms,
+                    "AI API response"
+                );
+            } else {
+                debug!(
+                    request_id = request_id,
+                    exchange_id = %pending.exchange_id,
+                    provider = %provider,
+                    host = %pending.host,
+                    path = %pending.path,
+                    status = status,
+                    latency_ms = latency_ms,
+                    "AI API response (suppressed detail)"
+                );
+            }
 
             if !logged_in_stream {
                 if let Some(ref tracker) = budget_tracker {
@@ -1812,7 +2313,7 @@ impl HttpHandler for AiProxyHandler {
         let learned_passthrough = self.learned_passthrough.clone();
         let learned_failure_threshold = self.learned_failure_threshold;
         let learned_failure_window = self.learned_failure_window;
-        let connect_intercept_host = self.connect_intercept_host.take();
+        let connect_intercept_host = self.connect_intercept_host.lock().take();
         let exchange_cfg = self.exchange.clone();
         let exchange_bundle_version = if exchange_cfg.is_some() {
             Some(self.oisp_engine.bundle_version().to_string())
@@ -1867,23 +2368,120 @@ impl HttpHandler for AiProxyHandler {
         req: &Request<Body>,
     ) -> impl std::future::Future<Output = bool> + Send {
         let host = extract_host(req);
-        let action = self.get_connect_action(&host);
+        let base_action = self.get_connect_action(&host);
         let learned_passthrough = self.learned_passthrough.clone();
         let debug_force_intercept = self.is_force_intercept_all_active();
+        let process_attribution = self.process_attribution.clone();
+        let oisp_engine = self.oisp_engine.clone();
+        let connect_intercept_host = self.connect_intercept_host.clone();
+        let client_addr = _ctx.client_addr;
 
         async move {
+            let process_identity = if !matches!(base_action, HostAction::Block) {
+                process_attribution.resolve(client_addr).await
+            } else {
+                None
+            };
+            let app_identifier = process_identity
+                .as_ref()
+                .and_then(|value| value.bundle_id.as_deref());
+            let app_origin =
+                app_identifier.and_then(|value| oisp_engine.classify_app_origin(value));
+
+            let connect_decision = if !matches!(base_action, HostAction::Block) {
+                Some(oisp_engine.evaluate_connect_decision(&host, None, app_origin))
+            } else {
+                None
+            };
+            let should_info_connect_trace = matches!(base_action, HostAction::Intercept)
+                || oisp_engine.is_host_whitelisted_for_debug(&host);
+            if should_info_connect_trace {
+                info!(
+                    host = %host,
+                    client_addr = %client_addr,
+                    base_action = host_action_label(base_action),
+                    host_whitelisted = oisp_engine.is_host_whitelisted_for_debug(&host),
+                    process_pid = ?process_identity.as_ref().map(|value| value.pid),
+                    process_name = ?process_identity.as_ref().map(|value| value.name.as_str()),
+                    process_bundle_id = ?app_identifier,
+                    app_origin = ?app_origin,
+                    connect_action = ?connect_decision.as_ref().map(|decision| &decision.action),
+                    connect_rule_id = ?connect_decision.as_ref().and_then(|decision| decision.rule_id.as_deref()),
+                    connect_reason = ?connect_decision.as_ref().and_then(|decision| decision.reason.as_deref()),
+                    "Decision trace: CONNECT should_intercept evaluation"
+                );
+            } else {
+                debug!(
+                    host = %host,
+                    client_addr = %client_addr,
+                    base_action = host_action_label(base_action),
+                    process_bundle_id = ?app_identifier,
+                    app_origin = ?app_origin,
+                    connect_action = ?connect_decision.as_ref().map(|decision| &decision.action),
+                    connect_reason = ?connect_decision.as_ref().and_then(|decision| decision.reason.as_deref()),
+                    "Decision trace: CONNECT should_intercept evaluation (suppressed detail)"
+                );
+            }
+
+            let mut action = base_action;
+            if let Some(connect_decision) = connect_decision.as_ref() {
+                let policy_action = host_action_from_connect_decision(&connect_decision.action);
+                if policy_action != base_action {
+                    action = policy_action;
+                    if matches!(policy_action, HostAction::Intercept) {
+                        metrics::record_filter_decision(
+                            "connect",
+                            "connect_policy_override_intercept",
+                        );
+                    }
+                    if should_info_connect_trace {
+                        info!(
+                            host = %host,
+                            from_action = host_action_label(base_action),
+                            to_action = host_action_label(policy_action),
+                            connect_rule_id = ?connect_decision.rule_id.as_deref(),
+                            connect_reason = ?connect_decision.reason.as_deref(),
+                            app_identifier = ?app_identifier,
+                            app_type = ?app_origin,
+                            "Decision trace: CONNECT action resolved by process-aware policy evaluation"
+                        );
+                    } else {
+                        debug!(
+                            host = %host,
+                            from_action = host_action_label(base_action),
+                            to_action = host_action_label(policy_action),
+                            connect_rule_id = ?connect_decision.rule_id.as_deref(),
+                            connect_reason = ?connect_decision.reason.as_deref(),
+                            "Decision trace: CONNECT action resolved by process-aware policy evaluation (suppressed detail)"
+                        );
+                    }
+                }
+            }
+            if !matches!(base_action, HostAction::Block) && debug_force_intercept {
+                action = HostAction::Intercept;
+            }
+
+            {
+                let mut selected_host = connect_intercept_host.lock();
+                if matches!(action, HostAction::Intercept) {
+                    *selected_host = Some(host.clone());
+                } else {
+                    *selected_host = None;
+                }
+            }
+
             match action {
                 HostAction::Intercept => {
                     if !debug_force_intercept {
                         if let Some(fd_snapshot) = should_shed_intercept_due_to_fd_pressure() {
                             metrics::record_filter_decision("connect", "fd_pressure_tunnel");
-                            debug!(
+                            warn!(
                                 host = %host,
                                 open_fds = fd_snapshot.open_fds,
                                 soft_limit = fd_snapshot.soft_limit,
                                 hard_limit = fd_snapshot.hard_limit,
                                 utilization_pct = format!("{:.1}", fd_snapshot.utilization * 100.0),
-                                "FD pressure fail-open: tunneling CONNECT instead of MITM"
+                                "Decision trace: CONNECT fail-open due to FD pressure (tunnel)"
                             );
                             return false;
                         }
@@ -1893,26 +2491,37 @@ impl HttpHandler for AiProxyHandler {
                                 metrics::set_tls_learned_passthrough_active(
                                     learned.active_count() as f64
                                 );
-                                debug!(host = %host, "Learned passthrough: blind tunnel");
+                                debug!(
+                                    host = %host,
+                                    active_learned_hosts = learned.active_count(),
+                                    "Decision trace: learned passthrough bypass applied (tunnel)"
+                                );
                                 return false;
                             }
                         }
                     } else {
                         debug!(
                             host = %host,
-                            "Debug catch-all interception bypassing learned passthrough"
+                            "Decision trace: debug force-intercept bypassed learned passthrough"
                         );
                     }
-                    debug!(host = %host, "MITM intercept");
+                    if should_info_connect_trace {
+                        info!(host = %host, "Decision trace: CONNECT final action intercept");
+                    } else {
+                        debug!(
+                            host = %host,
+                            "Decision trace: CONNECT final action intercept (suppressed detail)"
+                        );
+                    }
                     true
                 }
                 HostAction::Tunnel => {
-                    debug!(host = %host, "Blind tunnel");
+                    debug!(host = %host, "Decision trace: CONNECT final action tunnel");
                     false
                 }
                 HostAction::Block => {
                     // Intercept so we can return 403 in handle_request
-                    debug!(host = %host, "Will block");
+                    warn!(host = %host, "Decision trace: CONNECT final action block");
                     true
                 }
             }

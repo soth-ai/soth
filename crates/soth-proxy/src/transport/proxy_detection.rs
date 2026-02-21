@@ -1,7 +1,6 @@
 //! Request/agent detection helpers for proxy transport.
 
 use hudsucker::hyper::Request;
-use soth_oisp::types::provider::EntryType;
 use soth_oisp::{DetectionContext, InterceptDecision, OispEngine};
 
 #[derive(Debug, Clone, Default)]
@@ -44,83 +43,6 @@ pub(crate) fn extract_host<T>(req: &Request<T>) -> String {
 
 pub(crate) fn is_noise_intercept_decision(decision: InterceptDecision) -> bool {
     matches!(decision, InterceptDecision::Noise)
-}
-
-/// Detect agent/client from User-Agent header.
-#[cfg(test)]
-pub(crate) fn detect_agent_from_user_agent<T>(req: &Request<T>) -> Option<&'static str> {
-    let ua = req
-        .headers()
-        .get("user-agent")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    let ua_lower = ua.to_lowercase();
-
-    if ua_lower.contains("openai-codex") || ua_lower.contains("codex/") {
-        Some("codex")
-    } else if ua_lower.contains("warp") {
-        Some("warp")
-    } else if ua_lower.contains("claude-code")
-        || ua_lower.contains("claude_code")
-        || ua_lower.contains("claude code")
-    {
-        Some("claude-code")
-    } else if ua_lower.contains("cursor") {
-        Some("cursor")
-    } else if ua_lower.contains("continue") {
-        Some("continue")
-    } else if ua_lower.contains("copilot") {
-        Some("github-copilot")
-    } else if ua_lower.contains("vscode") || ua_lower.contains("visual studio code") {
-        Some("vscode")
-    } else if ua_lower.contains("intellij") || ua_lower.contains("jetbrains") {
-        Some("jetbrains")
-    } else if ua_lower.contains("neovim") || ua_lower.contains("nvim") {
-        Some("neovim")
-    } else if ua_lower.contains("emacs") {
-        Some("emacs")
-    } else if ua_lower.contains("zed") {
-        Some("zed")
-    } else if ua_lower.contains("windsurf") {
-        Some("windsurf")
-    } else if ua_lower.contains("anthropic") || ua_lower.contains("claude") {
-        Some("claude")
-    } else if ua_lower.contains("openai") || ua_lower.contains("chatgpt") {
-        Some("chatgpt")
-    } else {
-        // Unrecognized/non-empty User-Agent currently has no stable agent mapping.
-        None
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn is_anthropic_api_host(host: &str) -> bool {
-    let normalized = host.trim().to_ascii_lowercase();
-    normalized == "api.anthropic.com"
-        || normalized.ends_with(".api.anthropic.com")
-        || normalized == "api.claude.ai"
-        || normalized.ends_with(".api.claude.ai")
-}
-
-#[cfg(test)]
-pub(crate) fn has_anthropic_api_key_header<T>(req: &Request<T>) -> bool {
-    if req.headers().contains_key("x-api-key") {
-        return true;
-    }
-
-    req.headers()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase().contains("sk-ant-"))
-        .unwrap_or(false)
-}
-
-/// Anthropic API hosts can represent either direct inference traffic
-/// (API key present) or agent-orchestrated traffic (no API key).
-#[cfg(test)]
-pub(crate) fn should_treat_anthropic_api_as_agent<T>(host: &str, req: &Request<T>) -> bool {
-    is_anthropic_api_host(host) && !has_anthropic_api_key_header(req)
 }
 
 /// Check if a request should be logged for observability.
@@ -222,42 +144,19 @@ pub(crate) fn resolve_bundle_detection(
         env_keys: Vec::new(),
     };
 
-    let provider_scoped_detection = provider
-        .and_then(|provider_id| oisp_engine.evaluate_detection(provider_id, &detection_context))
-        .or_else(|| oisp_engine.evaluate_detection_for_host(host, &detection_context));
-    let provider_scoped_is_generic = provider_scoped_detection
-        .as_ref()
-        .map(|value| is_generic_detection_reason(value.detection_reason.as_str()))
-        .unwrap_or(true);
-    let cross_entry_detection = if provider_scoped_detection.is_none() || provider_scoped_is_generic
-    {
-        oisp_engine
-            .evaluate_detection_across_entry_types(&detection_context, &[EntryType::AgentApp])
-    } else {
-        None
-    };
-    let bundle_detection = provider_scoped_detection.clone().or_else(|| {
-        cross_entry_detection
-            .as_ref()
-            .map(|value| value.outcome.clone())
-    });
+    let bundle_detection = provider
+        .and_then(|provider_id| oisp_engine.evaluate_detection(provider_id, &detection_context));
     let bundle_agent = bundle_detection
         .as_ref()
-        .and_then(|value| value.agent.clone())
-        .or_else(|| {
-            cross_entry_detection.as_ref().and_then(|value| {
-                value
-                    .outcome
-                    .agent
-                    .clone()
-                    .or_else(|| Some(value.provider_id.clone()))
-            })
-        });
+        .and_then(|value| value.agent.clone());
+    let detection_id = bundle_detection
+        .as_ref()
+        .and_then(|value| value.detection_id.clone());
 
     let (detection_reason, parse_confidence, detection_source) =
         if let Some(value) = bundle_detection.as_ref() {
             let reason = normalize_detection_reason(value.detection_reason.as_str());
-            let confidence = if is_generic_detection_reason(reason.as_str()) {
+            let confidence = if reason.eq_ignore_ascii_case("bundle_unclassified") {
                 0.0
             } else {
                 value.parse_confidence
@@ -276,24 +175,23 @@ pub(crate) fn resolve_bundle_detection(
         detection_reason,
         parse_confidence,
         detection_source,
-        detection_id: bundle_detection
-            .as_ref()
-            .and_then(|value| value.detection_id.clone()),
+        detection_id,
     }
 }
 
 fn is_generic_detection_reason(reason: &str) -> bool {
     matches!(
         reason.trim().to_ascii_lowercase().as_str(),
-        "bundle_unclassified" | "fallback_unknown" | "unknown" | "unclassified"
+        "bundle_unclassified"
     )
 }
 
 fn normalize_detection_reason(reason: &str) -> String {
-    if is_generic_detection_reason(reason) {
+    let normalized = reason.trim();
+    if normalized.is_empty() || is_generic_detection_reason(normalized) {
         "bundle_unclassified".to_string()
     } else {
-        reason.trim().to_string()
+        normalized.to_string()
     }
 }
 
@@ -301,10 +199,7 @@ pub(crate) fn classify_capture_policy(
     parse_confidence: Option<f64>,
     detection_reason: Option<&str>,
 ) -> CapturePolicy {
-    if detection_reason
-        .map(is_generic_detection_reason)
-        .unwrap_or(true)
-    {
+    if detection_reason.is_none() {
         return CapturePolicy::MetadataOnly;
     }
     let confidence = parse_confidence.unwrap_or(0.0);
@@ -321,26 +216,28 @@ pub(crate) fn classify_capture_policy(
 mod tests {
     use super::{
         classify_capture_policy, is_generic_detection_reason, normalize_detection_reason,
-        CapturePolicy,
+        resolve_bundle_detection, CapturePolicy,
     };
+    use serde_json::json;
+    use soth_oisp::types::bundle::parse_compiled_bundle;
+    use soth_oisp::OispEngine;
 
     #[test]
-    fn generic_reasons_are_normalized() {
-        assert_eq!(
-            normalize_detection_reason("fallback_unknown"),
-            "bundle_unclassified"
-        );
-        assert_eq!(normalize_detection_reason("unknown"), "bundle_unclassified");
+    fn bundle_unclassified_reason_is_normalized() {
         assert_eq!(
             normalize_detection_reason("bundle_unclassified"),
             "bundle_unclassified"
+        );
+        assert_eq!(
+            normalize_detection_reason("host_classification"),
+            "host_classification"
         );
     }
 
     #[test]
     fn non_generic_reason_is_preserved() {
         assert_eq!(normalize_detection_reason("ua_match"), "ua_match");
-        assert!(!is_generic_detection_reason("host_classification"));
+        assert!(!is_generic_detection_reason("path_match"));
     }
 
     #[test]
@@ -359,11 +256,200 @@ mod tests {
         );
         assert_eq!(
             classify_capture_policy(Some(0.99), Some("bundle_unclassified")),
-            CapturePolicy::MetadataOnly
+            CapturePolicy::Full
         );
         assert_eq!(
             classify_capture_policy(None, None),
             CapturePolicy::MetadataOnly
         );
+    }
+
+    #[test]
+    fn resolve_bundle_detection_does_not_fallback_across_entry_types() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v3",
+                "compiled_at": "2026-02-21T00:00:00Z",
+                "bundle_type": "local",
+                "core": {
+                    "providers": {
+                        "chatgpt": {
+                            "id": "chatgpt",
+                            "name": "ChatGPT",
+                            "type": "agent-app",
+                            "detection_id": "agent.chatgpt.app",
+                            "detection": {
+                                "process_rules": [
+                                    {
+                                        "agent": "codex",
+                                        "reason": "process_match",
+                                        "bundle_id": "@openai/codex"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "domain_index": [
+                        {
+                            "host": "chatgpt.com",
+                            "provider_id": "chatgpt",
+                            "entry_type": "agent-app"
+                        }
+                    ]
+                },
+                "filters": {},
+                "gating": {
+                    "allowed_app_origins": {
+                        "non_hosts": ["@openai/codex"]
+                    },
+                    "allowed_host_origins": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = resolve_bundle_detection(
+            &engine,
+            None,
+            "unknown.example.com",
+            "/backend-api/codex/responses",
+            None,
+            None,
+            Some("codex"),
+            Some("@openai/codex"),
+            None,
+        );
+
+        assert_eq!(result.detection_id, None);
+        assert_eq!(result.agent, None);
+        assert_eq!(
+            result.detection_reason.as_deref(),
+            Some("bundle_unclassified")
+        );
+    }
+
+    #[test]
+    fn resolve_bundle_detection_requires_provider_context() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v3",
+                "compiled_at": "2026-02-21T00:00:00Z",
+                "bundle_type": "local",
+                "core": {
+                    "providers": {
+                        "chatgpt": {
+                            "id": "chatgpt",
+                            "name": "ChatGPT",
+                            "type": "agent-app",
+                            "detection_id": "agent.chatgpt.app",
+                            "detection": {
+                                "path_rules": [
+                                    {
+                                        "agent": "chatgpt",
+                                        "reason": "path_match",
+                                        "path": "**/backend-api/conversation"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "domain_index": [
+                        {
+                            "host": "chatgpt.com",
+                            "provider_id": "chatgpt",
+                            "entry_type": "agent-app"
+                        }
+                    ]
+                },
+                "filters": {},
+                "gating": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = resolve_bundle_detection(
+            &engine,
+            None,
+            "chatgpt.com",
+            "/backend-api/conversation",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(result.detection_id, None);
+        assert_eq!(result.agent, None);
+        assert_eq!(
+            result.detection_reason.as_deref(),
+            Some("bundle_unclassified")
+        );
+    }
+
+    #[test]
+    fn resolve_bundle_detection_keeps_host_classification_identity() {
+        let engine = OispEngine::new(
+            parse_compiled_bundle(&json!({
+                "schema_version": 3,
+                "version": "v3",
+                "compiled_at": "2026-02-21T00:00:00Z",
+                "bundle_type": "local",
+                "core": {
+                    "providers": {
+                        "chatgpt": {
+                            "id": "chatgpt",
+                            "name": "ChatGPT",
+                            "type": "agent-app",
+                            "detection_id": "agent.chatgpt.app",
+                            "detection": {
+                                "path_rules": [
+                                    {
+                                        "agent": "chatgpt",
+                                        "reason": "host_classification",
+                                        "path": "/backend-api/**"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "domain_index": [
+                        {
+                            "host": "chatgpt.com",
+                            "provider_id": "chatgpt",
+                            "entry_type": "agent-app"
+                        }
+                    ]
+                },
+                "filters": {},
+                "gating": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = resolve_bundle_detection(
+            &engine,
+            Some("chatgpt"),
+            "chatgpt.com",
+            "/backend-api/conversation",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(result.detection_id.as_deref(), Some("agent.chatgpt.app"));
+        assert_eq!(result.agent.as_deref(), Some("chatgpt"));
+        assert_eq!(
+            result.detection_reason.as_deref(),
+            Some("host_classification")
+        );
+        assert_eq!(result.parse_confidence, Some(0.95));
     }
 }

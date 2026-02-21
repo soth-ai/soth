@@ -1,7 +1,7 @@
 //! Core types for SOTH
 
 pub mod budget;
-pub mod exchange_v2;
+pub mod exchange;
 pub mod identity;
 pub mod mcp;
 pub mod name_generator;

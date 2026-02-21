@@ -11,7 +11,7 @@ pub struct ProcessIdentity {
     pub pid: u32,
     pub name: String,
     pub executable: Option<String>,
-    pub app_type: String,
+    pub bundle_id: Option<String>,
     pub attribution_source: String,
     pub attribution_confidence: f64,
 }
@@ -101,7 +101,42 @@ impl ProcessAttribution {
             return Some(identity);
         }
 
-        resolve_with_ps_fallback(client_addr, self.lookup_timeout).await
+        None
+    }
+}
+
+/// Probe process attribution for a specific PID using the same internal attribution
+/// normalization/classification logic as runtime resolution.
+///
+/// This helper is intended for diagnostics and contract validation.
+pub async fn probe_process_identity_by_pid(pid: u32, timeout: Duration) -> Option<ProcessIdentity> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(table) = load_unix_process_table(timeout).await {
+        if let Some(row) = table.get(&pid) {
+            return Some(
+                build_process_identity(pid, row.name.clone(), "pid_probe", 1.00, timeout).await,
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(raw_name) = lookup_process_name_windows(pid, timeout).await {
+        return Some(build_process_identity(pid, raw_name, "pid_probe", 1.00, timeout).await);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let executable = lookup_executable(pid, timeout).await;
+        let raw_name = process_name_from_executable(executable.as_deref())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Some(build_process_identity(pid, raw_name, "pid_probe", 1.00, timeout).await);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = pid;
+        let _ = timeout;
+        None
     }
 }
 
@@ -114,10 +149,12 @@ async fn build_process_identity(
 ) -> ProcessIdentity {
     let executable = lookup_executable(pid, timeout).await;
     let name = normalize_process_name(raw_name, executable.as_deref());
-    let app_type = classify_app_type(name.as_str(), executable.as_deref());
+    let bundle_id =
+        crate::transport::proxy_support::process_bundle_id_from_executable(executable.as_deref());
+    let inferred_type = classify_app_type(name.as_str(), executable.as_deref());
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if should_attempt_parent_walk(name.as_str(), app_type.as_str()) {
+    if should_attempt_parent_walk(name.as_str(), inferred_type.as_str()) {
         if let Some(parent_identity) = resolve_parent_process_identity(
             pid,
             attribution_source,
@@ -134,7 +171,7 @@ async fn build_process_identity(
         pid,
         name,
         executable,
-        app_type,
+        bundle_id,
         attribution_source: attribution_source.to_string(),
         attribution_confidence,
     }
@@ -266,117 +303,6 @@ async fn lookup_process_name_windows(pid: u32, timeout: Duration) -> Option<Stri
     parse_tasklist_row(text.lines().next()?.trim()).map(|(_, name)| name)
 }
 
-async fn resolve_with_ps_fallback(
-    client_addr: SocketAddr,
-    timeout: Duration,
-) -> Option<ProcessIdentity> {
-    // Conservative fallback for local proxy mode only.
-    if !client_addr.ip().is_loopback() {
-        return None;
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        use tokio::process::Command;
-
-        let output = tokio::time::timeout(
-            timeout,
-            Command::new("ps").args(["-axo", "pid=,comm="]).output(),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let self_pid = std::process::id();
-        let mut singleton: Option<(u32, String)> = None;
-
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            let Some(pid_raw) = parts.next() else {
-                continue;
-            };
-            let Ok(pid) = pid_raw.parse::<u32>() else {
-                continue;
-            };
-            if pid == self_pid {
-                continue;
-            }
-            let name = parts.collect::<Vec<_>>().join(" ");
-            if name.is_empty() || name.eq_ignore_ascii_case("soth") {
-                continue;
-            }
-            if !is_ps_fallback_candidate(name.as_str()) {
-                continue;
-            }
-            if singleton.is_some() {
-                return None;
-            }
-            singleton = Some((pid, name));
-        }
-
-        if let Some((pid, raw_name)) = singleton {
-            return Some(
-                build_process_identity(pid, raw_name, "process_scan_singleton", 0.20, timeout)
-                    .await,
-            );
-        }
-        return None;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use tokio::process::Command;
-
-        let output = tokio::time::timeout(
-            timeout,
-            Command::new("tasklist")
-                .args(["/FO", "CSV", "/NH"])
-                .output(),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut singleton: Option<(u32, String)> = None;
-
-        for line in text.lines() {
-            if let Some((pid, name)) = parse_tasklist_row(line) {
-                if !is_ps_fallback_candidate(name.as_str()) {
-                    continue;
-                }
-                if singleton.is_some() {
-                    return None;
-                }
-                singleton = Some((pid, name));
-            }
-        }
-
-        if let Some((pid, raw_name)) = singleton {
-            return Some(
-                build_process_identity(pid, raw_name, "process_scan_singleton", 0.20, timeout)
-                    .await,
-            );
-        }
-        return None;
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = timeout;
-        None
-    }
-}
-
 fn should_attempt_parent_walk(name: &str, app_type: &str) -> bool {
     if matches!(app_type, "service") || is_system_helper_process_name(name) {
         return true;
@@ -460,13 +386,15 @@ async fn resolve_parent_process_identity(
         let parent_executable = lookup_executable(parent_pid, per_hop_timeout).await;
         let parent_name =
             normalize_process_name(parent_row.name.clone(), parent_executable.as_deref());
-        let parent_app_type = classify_app_type(parent_name.as_str(), parent_executable.as_deref());
+        let parent_bundle_id = crate::transport::proxy_support::process_bundle_id_from_executable(
+            parent_executable.as_deref(),
+        );
         if is_responsible_parent_candidate(parent_name.as_str(), parent_executable.as_deref()) {
             return Some(ProcessIdentity {
                 pid: parent_pid,
                 name: parent_name,
                 executable: parent_executable,
-                app_type: parent_app_type,
+                bundle_id: parent_bundle_id,
                 attribution_source: format!("{attribution_source}_parent_walk"),
                 attribution_confidence: attribution_confidence.min(0.90).max(0.55),
             });
@@ -525,21 +453,6 @@ fn parse_unix_process_table(stdout: &[u8]) -> HashMap<u32, ProcessTableRow> {
         table.insert(pid, ProcessTableRow { ppid, name });
     }
     table
-}
-
-fn is_ps_fallback_candidate(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    [
-        "codex",
-        "claude",
-        "cursor",
-        "windsurf",
-        "chatgpt",
-        "anthropic",
-        "warp",
-    ]
-    .iter()
-    .any(|needle| name.contains(needle))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -949,21 +862,7 @@ fn classify_app_type(name: &str, executable: Option<&str>) -> String {
         return "browser".to_string();
     }
     if contains_any(&[
-        "claude-code",
-        "claude-cli",
-        "claude --",
-        "codex",
-        "terminal",
-        "bash",
-        "zsh",
-        "fish",
-        "sh ",
-        "python",
-        "node",
-        "npm",
-        "pnpm",
-        "yarn",
-        "cargo",
+        "terminal", "bash", "zsh", "fish", "sh ", "python", "node", "npm", "pnpm", "yarn", "cargo",
         "go ",
     ]) {
         return "cli".to_string();
@@ -1052,11 +951,8 @@ mod tests {
     fn classify_app_type_detects_browser_and_editor_and_cli() {
         assert_eq!(classify_app_type("Google Chrome", None), "browser");
         assert_eq!(classify_app_type("Cursor", None), "editor");
-        assert_eq!(classify_app_type("claude-code", None), "cli");
-        assert_eq!(
-            classify_app_type("2.1.47", Some("claude --resume 1234")),
-            "cli"
-        );
+        assert_eq!(classify_app_type("Terminal", None), "cli");
+        assert_eq!(classify_app_type("2.1.47", Some("python -m app")), "cli");
         assert_eq!(
             classify_app_type(
                 "Unknown",
@@ -1068,8 +964,8 @@ mod tests {
 
     #[test]
     fn normalize_process_name_replaces_version_only_name_with_executable_name() {
-        let normalized = normalize_process_name("2.1.45".to_string(), Some("claude"));
-        assert_eq!(normalized, "claude");
+        let normalized = normalize_process_name("2.1.45".to_string(), Some("terminal"));
+        assert_eq!(normalized, "terminal");
     }
 
     #[test]
@@ -1102,10 +998,10 @@ mod tests {
     #[test]
     fn parse_ss_output_prefers_exact_socket_owner() {
         let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
-        let sample = b"ESTAB 0 0 127.0.0.1:9999 127.0.0.1:8081 users:((\"fallback\",pid=1234,fd=11))\nESTAB 0 0 127.0.0.1:8081 127.0.0.1:3001 users:((\"codex\",pid=5678,fd=12))\n";
+        let sample = b"ESTAB 0 0 127.0.0.1:9999 127.0.0.1:8081 users:((\"fallback\",pid=1234,fd=11))\nESTAB 0 0 127.0.0.1:8081 127.0.0.1:3001 users:((\"terminal\",pid=5678,fd=12))\n";
         let parsed = parse_ss_output(sample, addr).unwrap();
         assert_eq!(parsed.0, 5678);
-        assert_eq!(parsed.1, "codex");
+        assert_eq!(parsed.1, "terminal");
         assert!(parsed.2);
     }
 

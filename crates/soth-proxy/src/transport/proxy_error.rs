@@ -10,7 +10,7 @@ use crate::metrics;
 use crate::transport::exchange_assembler::ExchangeAssemblerConfig;
 use crate::transport::pii_enrichment::PiiEventEnricher;
 use crate::transport::proxy::PendingRequests;
-use crate::transport::proxy_exchange::{append_detection_tags, finalize_and_enqueue_exchange_v2};
+use crate::transport::proxy_exchange::{append_detection_tags, finalize_and_enqueue_exchange};
 use crate::transport::proxy_support::{
     append_catalog_discovery_tags, append_process_attribution_tags, is_benign_proxy_forward_error,
     is_emfile_proxy_forward_error,
@@ -27,7 +27,7 @@ pub(crate) async fn handle_forward_error(
     event_tags: Arc<BTreeMap<String, String>>,
     pii_enricher: Arc<PiiEventEnricher>,
     session_id: String,
-    exchange_v2_cfg: Option<ExchangeAssemblerConfig>,
+    exchange_cfg: Option<ExchangeAssemblerConfig>,
     exchange_bundle_version: Option<String>,
 ) -> Response<Body> {
     let benign = is_benign_proxy_forward_error(&err);
@@ -59,9 +59,9 @@ pub(crate) async fn handle_forward_error(
         append_process_attribution_tags(&mut tags, pending_req.envelope.as_ref());
         append_detection_tags(&mut tags, pending_req);
         let usage_meta = ResponseUsageMeta::default();
-        if let Some(exchange_cfg) = exchange_v2_cfg.as_ref() {
+        if let Some(exchange_cfg) = exchange_cfg.as_ref() {
             let error_content = format!("[forward error] {error}");
-            finalize_and_enqueue_exchange_v2(
+            finalize_and_enqueue_exchange(
                 logger,
                 exchange_cfg,
                 &pii_enricher,

@@ -1,5 +1,9 @@
 use super::*;
-use crate::types::exchange::{EXCHANGE_CLIENT_APP_TYPE_HOST, EXCHANGE_CLIENT_APP_TYPE_NON_HOST};
+use crate::types::exchange::{
+    EXCHANGE_CLIENT_APP_TYPE_HOST, EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
+};
+use tracing::{debug, warn};
 
 const SQLITE_METADATA_BUSY_TIMEOUT_MS: u64 = 10_000;
 const SQLITE_METADATA_LOCK_RETRY_MAX: u32 = 5;
@@ -132,6 +136,12 @@ impl EventLogger {
             params![exchange_id, state_json, started_at],
         )
         .map_err(to_io_err)?;
+        debug!(
+            exchange_id = %exchange_id,
+            state_json_bytes = state_json.len(),
+            started_at = %started_at,
+            "Decision trace: exchange_spool upsert committed to SQLite"
+        );
         Ok(())
     }
 
@@ -155,6 +165,11 @@ impl EventLogger {
                     params![exchange_id, state_json],
                 )
                 .map_err(to_io_err)?;
+                debug!(
+                    exchange_id = %exchange_id,
+                    final_state_json_bytes = state_json.len(),
+                    "Decision trace: exchange_spool finalized with state snapshot"
+                );
             }
             None => {
                 conn.execute(
@@ -167,6 +182,10 @@ impl EventLogger {
                     params![exchange_id],
                 )
                 .map_err(to_io_err)?;
+                debug!(
+                    exchange_id = %exchange_id,
+                    "Decision trace: exchange_spool finalized without snapshot update"
+                );
             }
         }
         Ok(())
@@ -180,6 +199,10 @@ impl EventLogger {
             params![exchange_id],
         )
         .map_err(to_io_err)?;
+        debug!(
+            exchange_id = %exchange_id,
+            "Decision trace: exchange_spool row deleted from SQLite"
+        );
         Ok(())
     }
 
@@ -300,6 +323,13 @@ impl EventLogger {
                 )
                 .map_err(to_io_err)?;
                 tx.commit().map_err(to_io_err)?;
+                debug!(
+                    exchange_id = %exchange_id,
+                    observed_at = %observed_at,
+                    payload_json_bytes = payload_json.len(),
+                    blobs_json_bytes = blobs_json.map(str::len).unwrap_or(0),
+                    "Decision trace: exchange_events and exchange_upload_queue transaction committed"
+                );
                 Ok(())
             })();
             match write_result {
@@ -1335,10 +1365,8 @@ fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> 
     let app_type = event
         .collector_source
         .as_ref()
-        .map(|_| "collector".to_string())
-        .or_else(|| envelope.and_then(|value| value.process_app_type.clone()))
-        .or_else(|| infer_app_type_from_name(process_name.as_deref(), bundle_id.as_deref()))
-        .or_else(|| Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string()));
+        .map(|_| EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string())
+        .or_else(|| Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string()));
     let app_type = normalize_exchange_client_app_type(app_type.as_deref());
 
     if envelope.and_then(|value| value.process_pid).is_none()
@@ -1407,57 +1435,20 @@ fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
     }
 }
 
-fn infer_app_type_from_name(process_name: Option<&str>, bundle_id: Option<&str>) -> Option<String> {
-    if let Some(name) = process_name {
-        let lower = name.to_ascii_lowercase();
-        let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-        if has_any(&[
-            "chrome", "firefox", "safari", "edge", "brave", "arc", "opera", "chromium",
-        ]) {
-            return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
-        }
-        if has_any(&[
-            "codex",
-            "claude-code",
-            "terminal",
-            "shell",
-            "bash",
-            "zsh",
-            "fish",
-            "python",
-            "node",
-            "npm",
-            "cargo",
-            "cursor",
-            "windsurf",
-            "vscode",
-            "jetbrains",
-            "zed",
-            "copilot",
-            "chatgpt",
-            "claude",
-            "warp",
-        ]) {
-            return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
-        }
-    }
-    if bundle_id.is_some() {
-        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
-    }
-    Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string())
-}
-
 fn normalize_exchange_client_app_type(raw: Option<&str>) -> Option<String> {
     let normalized = raw
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())?;
-    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST || normalized == "browser" {
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST {
         return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
     }
     if normalized == EXCHANGE_CLIENT_APP_TYPE_NON_HOST {
         return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
     }
-    Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string())
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_UNKNOWN {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string());
+    }
+    Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string())
 }
 
 fn exchange_body_from_text(
@@ -2140,7 +2131,7 @@ mod tests {
                 "0.9300".to_string(),
             ),
             ("detection.id".to_string(), "agent.bundle01.app".to_string()),
-            ("decision.step".to_string(), "step5_host_origin".to_string()),
+            ("decision.step".to_string(), "step1_whitelist".to_string()),
             ("decision.outcome".to_string(), "captured".to_string()),
         ]));
 
@@ -2167,14 +2158,14 @@ mod tests {
             .contains("\"detection_id\":\"agent.bundle01.app\""));
         assert!(ready[0]
             .payload_json
-            .contains("\"decision_step\":\"step5_host_origin\""));
+            .contains("\"decision_step\":\"step1_whitelist\""));
         assert!(ready[0]
             .payload_json
             .contains("\"decision_outcome\":\"captured\""));
         assert!(ready[0]
             .payload_json
             .contains("\"process_name\":\"claude-code\""));
-        assert!(ready[0].payload_json.contains("\"app_type\":\"non_host\""));
+        assert!(ready[0].payload_json.contains("\"app_type\":\"unknown\""));
     }
 
     #[test]
@@ -2232,7 +2223,7 @@ mod tests {
         .with_source(EventSource::AiProxy)
         .with_method("WebSocket /backend-api/realtime")
         .with_tags(std::collections::BTreeMap::from([
-            ("decision.step".to_string(), "step5_host_origin".to_string()),
+            ("decision.step".to_string(), "step1_whitelist".to_string()),
             ("decision.outcome".to_string(), "metadata_only".to_string()),
             (
                 "decision.skip_reason".to_string(),
@@ -2243,7 +2234,7 @@ mod tests {
 
         let payload = wrap_event_to_exchange(&event, &cfg, None);
         let parse = payload.parse.expect("parse should exist");
-        assert_eq!(parse.decision_step.as_deref(), Some("step5_host_origin"));
+        assert_eq!(parse.decision_step.as_deref(), Some("step1_whitelist"));
         assert_eq!(parse.decision_outcome.as_deref(), Some("metadata_only"));
         assert_eq!(parse.skip_reason.as_deref(), Some("not_whitelisted"));
         assert_eq!(parse.discovery_kind.as_deref(), Some("catalog"));

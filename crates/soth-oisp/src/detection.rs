@@ -1,4 +1,4 @@
-use crate::matchers::{host_matches_pattern, path_matches_pattern, wildcard_match};
+use crate::matchers::{path_matches_pattern, wildcard_match};
 use crate::parse_helpers::normalize_string;
 use crate::types::bundle::ResolvedProvider;
 use crate::types::provider::{DetectionRule, EntryType};
@@ -114,14 +114,8 @@ pub(crate) fn collect_detection_candidates(
     }
 }
 
-fn detection_group_precedence(group: DetectionRuleGroup) -> i32 {
-    match group {
-        DetectionRuleGroup::Model => 5_000,
-        DetectionRuleGroup::Path => 4_000,
-        DetectionRuleGroup::Ua => 3_000,
-        DetectionRuleGroup::Process => 2_000,
-        DetectionRuleGroup::Env => 1_000,
-    }
+fn detection_group_precedence(_group: DetectionRuleGroup) -> i32 {
+    0
 }
 
 fn detection_group_default_reason(group: DetectionRuleGroup) -> &'static str {
@@ -171,10 +165,6 @@ fn detection_rule_matches_context(
                 .path
                 .as_deref()
                 .is_some_and(|path| match_patterns(path, value, path_matches_pattern)),
-            "host" => context
-                .host
-                .as_deref()
-                .is_some_and(|host| match_patterns(host, value, host_matches_pattern)),
             "model" => context
                 .model
                 .as_deref()

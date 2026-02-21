@@ -11,8 +11,8 @@ use soth_core::api::{
     version::{API_VERSION, API_VERSION_HEADER},
     LocalSessionArtifact, LocalSessionsBatchRequest, LocalSessionsBatchResponse,
 };
-use soth_core::config::types::ExchangeV2Config;
-use soth_core::types::exchange_v2::ExchangeSourceClass;
+use soth_core::config::types::ExchangeConfig;
+use soth_core::types::exchange::ExchangeSourceClass;
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
 use soth_observe::PiiRedactor;
@@ -56,7 +56,7 @@ pub struct CollectorConfig {
     pub frontload_max_read_bytes_per_source: usize,
     pub agent_name: String,
     pub event_source: EventSource,
-    pub exchange_v2: ExchangeV2Config,
+    pub exchange: ExchangeConfig,
     pub direct_upload: Option<CollectorDirectUploadConfig>,
     pub sources: Vec<CollectorSource>,
     pub sqlite_sources: Vec<CollectorSqliteSource>,
@@ -100,6 +100,7 @@ pub struct CollectorSource {
     pub name: String,
     pub path: PathBuf,
     pub parser: CollectorParser,
+    pub skip_patterns: Vec<String>,
     pub agent: Option<String>,
     pub server_name: Option<String>,
     pub provider: Option<String>,
@@ -163,6 +164,8 @@ struct EnvFileSource {
     path: String,
     #[serde(default)]
     parser: Option<String>,
+    #[serde(default)]
+    skip_patterns: Vec<String>,
     #[serde(default)]
     agent: Option<String>,
     #[serde(default)]
@@ -281,7 +284,7 @@ impl CollectorConfig {
             frontload_max_read_bytes_per_source,
             agent_name,
             event_source,
-            exchange_v2: ExchangeV2Config::default(),
+            exchange: ExchangeConfig::default(),
             direct_upload,
             sources,
             sqlite_sources,
@@ -622,6 +625,7 @@ fn parse_file_sources_from_env() -> Vec<CollectorSource> {
             name,
             path,
             parser,
+            skip_patterns: Vec::new(),
             agent: None,
             server_name: None,
             provider: None,
@@ -664,6 +668,7 @@ fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
                 .map(str::to_string)
                 .unwrap_or_else(|| default_source_name(&path));
             let parser = parser_for_path_and_hint(&path, source.parser.as_deref());
+            let skip_patterns = normalize_skip_patterns(source.skip_patterns);
             let agent = normalize_optional_text(source.agent.as_deref());
             let server_name = normalize_optional_text(source.server_name.as_deref());
             let provider = normalize_optional_text(source.provider.as_deref());
@@ -672,6 +677,7 @@ fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
                 name,
                 path,
                 parser,
+                skip_patterns,
                 agent,
                 server_name,
                 provider,
@@ -711,6 +717,14 @@ fn default_source_name(path: &Path) -> String {
         .to_string()
 }
 
+fn normalize_skip_patterns(patterns: Vec<String>) -> Vec<String> {
+    patterns
+        .into_iter()
+        .map(|pattern| pattern.trim().to_string())
+        .filter(|pattern| !pattern.is_empty())
+        .collect()
+}
+
 fn normalize_optional_text(value: Option<&str>) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
@@ -734,10 +748,10 @@ fn parse_bool_env(key: &str) -> Option<bool> {
 pub fn spawn_from_env(
     event_logger: EventLogger,
     global_tags: BTreeMap<String, String>,
-    exchange_v2: ExchangeV2Config,
+    exchange: ExchangeConfig,
 ) -> Option<CollectorRuntime> {
     let mut config = CollectorConfig::from_env()?;
-    config.exchange_v2 = exchange_v2;
+    config.exchange = exchange;
     Some(spawn_runtime(event_logger, global_tags, config))
 }
 
@@ -787,13 +801,18 @@ pub fn spawn_runtime(
                 warn!("Collector state reset failed: {}", error);
             }
         }
-        if collector.config.frontload_on_start {
-            if let Err(error) = collector.run_frontload(&event_logger).await {
-                warn!("Collector frontload failed: {}", error);
-            } else if should_force_first_run_frontload {
+        let should_run_frontload = collector.config.frontload_on_start
+            && (!collector.config.frontload_force_first_run || should_force_first_run_frontload);
+        if should_run_frontload {
+            let frontload_result = collector.run_frontload(&event_logger).await;
+            if should_force_first_run_frontload {
+                // Mark bootstrap complete after first-run attempt so we never loop in perpetual frontload.
                 if let Err(error) = collector.mark_frontload_bootstrap_complete() {
                     warn!("Collector frontload bootstrap mark failed: {}", error);
                 }
+            }
+            if let Err(error) = frontload_result {
+                warn!("Collector frontload failed: {}", error);
             }
         }
         let mut interval = tokio::time::interval(collector.config.poll_interval);
@@ -1036,7 +1055,7 @@ impl CollectorAgent {
                     if let Some(event) = self.build_event(&source, source_line, mode) {
                         events_emitted += 1;
                         logger.log(&event);
-                        if self.config.exchange_v2.enabled {
+                        if self.config.exchange.enabled {
                             let source_class = if source.agent.is_some() {
                                 ExchangeSourceClass::AgentApp
                             } else {
@@ -1044,13 +1063,13 @@ impl CollectorAgent {
                             };
                             if let Err(error) = logger.enqueue_exchange_from_wrap_event(
                                 &event,
-                                &self.config.exchange_v2,
+                                &self.config.exchange,
                                 Some(source_class),
                             ) {
                                 warn!(
                                     event_id = %event.id,
                                     error = %error,
-                                    "Collector failed to enqueue exchange.v2 payload"
+                                    "Collector failed to enqueue exchange payload"
                                 );
                             }
                         }
@@ -1113,16 +1132,16 @@ impl CollectorAgent {
                         if let Some(event) = self.build_sqlite_event(source, source_line, mode) {
                             events_emitted += 1;
                             logger.log(&event);
-                            if self.config.exchange_v2.enabled {
+                            if self.config.exchange.enabled {
                                 if let Err(error) = logger.enqueue_exchange_from_wrap_event(
                                     &event,
-                                    &self.config.exchange_v2,
+                                    &self.config.exchange,
                                     Some(ExchangeSourceClass::Collector),
                                 ) {
                                     warn!(
                                         event_id = %event.id,
                                         error = %error,
-                                        "Collector failed to enqueue exchange.v2 payload"
+                                        "Collector failed to enqueue exchange payload"
                                     );
                                 }
                             }
@@ -1806,6 +1825,9 @@ fn resolve_collector_sources_for_scan(sources: &[CollectorSource]) -> Vec<Collec
 
     for source in sources {
         for path in expand_source_paths_for_scan(&source.path) {
+            if source_path_matches_skip_patterns(&path, &source.skip_patterns) {
+                continue;
+            }
             let key = format!(
                 "{}|{}|{}",
                 source.name,
@@ -1855,6 +1877,31 @@ fn expand_source_paths_for_scan(path: &Path) -> Vec<PathBuf> {
 fn source_path_contains_glob(path: &Path) -> bool {
     let raw = path.to_string_lossy();
     raw.contains('*') || raw.contains('?')
+}
+
+fn source_path_matches_skip_patterns(path: &Path, skip_patterns: &[String]) -> bool {
+    if skip_patterns.is_empty() {
+        return false;
+    }
+    let normalized_path = normalize_glob_path(path);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+
+    skip_patterns.iter().any(|pattern| {
+        let normalized_pattern = normalize_skip_pattern(pattern);
+        glob_pattern_matches(&normalized_pattern, &normalized_path)
+            || glob_pattern_matches(&normalized_pattern, file_name)
+    })
+}
+
+fn normalize_skip_pattern(pattern: &str) -> String {
+    if pattern.starts_with("~/") {
+        normalize_glob_path(&expand_home_path(Path::new(pattern)))
+    } else {
+        pattern.replace('\\', "/")
+    }
 }
 
 fn normalize_glob_path(path: &Path) -> String {
@@ -2619,6 +2666,7 @@ fn discover_default_sources(limit: usize) -> Vec<CollectorSource> {
                 name: format!("{}:{}", root_name, rel),
                 path,
                 parser,
+                skip_patterns: Vec::new(),
                 agent: None,
                 server_name: None,
                 provider: None,
@@ -2763,7 +2811,7 @@ mod tests {
             frontload_max_read_bytes_per_source: 64 * 1024,
             agent_name: "collector".to_string(),
             event_source: EventSource::AgentApp,
-            exchange_v2: ExchangeV2Config::default(),
+            exchange: ExchangeConfig::default(),
             direct_upload: None,
             sources: Vec::new(),
             sqlite_sources: Vec::new(),
@@ -2828,6 +2876,7 @@ mod tests {
             name: "registry:codex".to_string(),
             path: PathBuf::from("/tmp/codex-history.jsonl"),
             parser: CollectorParser::JsonLines,
+            skip_patterns: Vec::new(),
             agent: Some("codex".to_string()),
             server_name: Some("codex".to_string()),
             provider: None,
@@ -2891,6 +2940,7 @@ mod tests {
             name: "events".to_string(),
             path,
             parser: CollectorParser::JsonLines,
+            skip_patterns: Vec::new(),
             agent: None,
             server_name: None,
             provider: None,
@@ -2916,6 +2966,7 @@ mod tests {
             name: "events".to_string(),
             path,
             parser: CollectorParser::JsonLines,
+            skip_patterns: Vec::new(),
             agent: None,
             server_name: None,
             provider: None,
@@ -2962,6 +3013,7 @@ mod tests {
             name: "registry:codex".to_string(),
             path: sessions.join("**").join("rollout-*.jsonl"),
             parser: CollectorParser::JsonLines,
+            skip_patterns: Vec::new(),
             agent: Some("codex".to_string()),
             server_name: Some("codex".to_string()),
             provider: None,
@@ -2989,6 +3041,66 @@ mod tests {
                 "sessions/2026/01/rollout-a.jsonl".to_string(),
                 "sessions/2026/02/rollout-b.jsonl".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn source_path_matches_skip_patterns_supports_filename_globs() {
+        let path = Path::new("/tmp/sessions/rollout-a.deleted.jsonl");
+        let skip_patterns = vec![
+            "*.deleted.*".to_string(),
+            "*.resolved".to_string(),
+            "*.resolved.*".to_string(),
+        ];
+        assert!(source_path_matches_skip_patterns(path, &skip_patterns));
+        assert!(!source_path_matches_skip_patterns(
+            Path::new("/tmp/sessions/rollout-a.jsonl"),
+            &skip_patterns
+        ));
+    }
+
+    #[test]
+    fn resolve_collector_sources_for_scan_applies_skip_patterns() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let month_dir = sessions.join("2026").join("02");
+        std::fs::create_dir_all(&month_dir).unwrap();
+        std::fs::write(month_dir.join("rollout-a.jsonl"), b"{}\n").unwrap();
+        std::fs::write(month_dir.join("rollout-a.deleted.jsonl"), b"{}\n").unwrap();
+        std::fs::write(month_dir.join("rollout-a.resolved"), b"{}\n").unwrap();
+
+        let source = CollectorSource {
+            name: "registry:codex".to_string(),
+            path: sessions.join("**").join("rollout-a*"),
+            parser: CollectorParser::JsonLines,
+            skip_patterns: vec![
+                "*.deleted.*".to_string(),
+                "*.resolved".to_string(),
+                "*.resolved.*".to_string(),
+            ],
+            agent: Some("codex".to_string()),
+            server_name: Some("codex".to_string()),
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        };
+
+        let resolved = resolve_collector_sources_for_scan(&[source]);
+        let relative = resolved
+            .iter()
+            .map(|source| {
+                source
+                    .path
+                    .strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            relative,
+            vec!["sessions/2026/02/rollout-a.jsonl".to_string()]
         );
     }
 

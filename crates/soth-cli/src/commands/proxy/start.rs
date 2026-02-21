@@ -386,7 +386,7 @@ fn spawn_proxy_runtime(
         if let Some(CollectorRuntime { shutdown_tx, task }) = soth_collector::spawn_from_env(
             logger.clone(),
             config.observe.event_tags.clone(),
-            config.exchange_v2.clone(),
+            config.exchange.clone(),
         ) {
             collector_shutdown_tx = Some(shutdown_tx);
             collector_task = Some(task);
@@ -396,7 +396,7 @@ fn spawn_proxy_runtime(
     let shutdown_event_logger = event_logger.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let oisp_registry_cache_path = resolve_registry_bundle_cache_path(config);
-    let exchange_v2_config = config.exchange_v2.clone();
+    let exchange_config = config.exchange.clone();
     let handle = tokio::spawn(async move {
         proxy::start_proxy_with_shutdown(
             proxy_config,
@@ -409,7 +409,7 @@ fn spawn_proxy_runtime(
             Some(enforcer),
             Some(observe_config),
             Some(oisp_registry_cache_path),
-            Some(exchange_v2_config),
+            Some(exchange_config),
             debug_intercept_all_enabled,
             debug_intercept_all_for,
         )
@@ -437,6 +437,7 @@ struct RegistryCollectorSource {
     agent: String,
     path: String,
     parser: Option<String>,
+    skip_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -569,7 +570,8 @@ fn parse_registry_collector_sources_from_array(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        push_registry_collector_source(parsed, seen, agent, path, parser);
+        let skip_patterns = parse_registry_skip_patterns(source_obj.get("skip_patterns"));
+        push_registry_collector_source(parsed, seen, agent, path, parser, skip_patterns);
     }
 }
 
@@ -650,6 +652,7 @@ fn parse_registry_collector_sources_from_local_sources_v2(
                     None
                 }
             });
+        let source_skip_patterns = parse_registry_skip_patterns(source_obj.get("skip_patterns"));
 
         let Some(collectors) = source_obj
             .get("collectors")
@@ -690,12 +693,18 @@ fn parse_registry_collector_sources_from_local_sources_v2(
                                 .to_string(),
                         )
                     });
+                    let mut skip_patterns = source_skip_patterns.clone();
+                    merge_registry_skip_patterns(
+                        &mut skip_patterns,
+                        parse_registry_skip_patterns(entry_obj.get("skip_patterns")),
+                    );
                     push_registry_collector_source(
                         file_sources,
                         file_seen,
                         agent,
                         pattern,
                         parser_name,
+                        skip_patterns,
                     );
                 }
                 "sqlite_query" => {
@@ -797,6 +806,14 @@ fn parse_registry_collector_sources_from_local_artifacts(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let mut source_skip_patterns = parse_registry_skip_patterns(obj.get("skip_patterns"));
+        merge_registry_skip_patterns(
+            &mut source_skip_patterns,
+            parse_registry_skip_patterns(
+                obj.get("collectionConfig")
+                    .and_then(|value| value.get("skip_patterns")),
+            ),
+        );
         let globs = obj
             .get("collectionConfig")
             .and_then(|value| value.get("globs"))
@@ -823,7 +840,19 @@ fn parse_registry_collector_sources_from_local_artifacts(
             let parser = parser.clone().or_else(|| {
                 Some(default_registry_collector_parser_for_glob(pattern, content_type).to_string())
             });
-            push_registry_collector_source(file_sources, file_seen, agent, pattern, parser);
+            let mut skip_patterns = source_skip_patterns.clone();
+            merge_registry_skip_patterns(
+                &mut skip_patterns,
+                parse_registry_skip_patterns(glob.get("skip_patterns")),
+            );
+            push_registry_collector_source(
+                file_sources,
+                file_seen,
+                agent,
+                pattern,
+                parser,
+                skip_patterns,
+            );
         }
         for sqlite_source in parse_registry_sqlite_sources_from_collection(
             obj.get("collectionConfig")
@@ -864,6 +893,7 @@ fn parse_registry_collector_sources_from_local_data_sources(
         else {
             continue;
         };
+        let source_skip_patterns = parse_registry_skip_patterns(source_obj.get("skip_patterns"));
         if let Some(globs) = source_obj
             .get("globs")
             .and_then(serde_json::Value::as_array)
@@ -884,6 +914,11 @@ fn parse_registry_collector_sources_from_local_data_sources(
                 if !is_supported_registry_collector_glob(pattern, content_type) {
                     continue;
                 }
+                let mut skip_patterns = source_skip_patterns.clone();
+                merge_registry_skip_patterns(
+                    &mut skip_patterns,
+                    parse_registry_skip_patterns(glob.get("skip_patterns")),
+                );
                 push_registry_collector_source(
                     file_sources,
                     file_seen,
@@ -893,6 +928,7 @@ fn parse_registry_collector_sources_from_local_data_sources(
                         default_registry_collector_parser_for_glob(pattern, content_type)
                             .to_string(),
                     ),
+                    skip_patterns,
                 );
             }
         }
@@ -913,16 +949,51 @@ fn push_registry_collector_source(
     agent: &str,
     path: &str,
     parser: Option<String>,
+    skip_patterns: Vec<String>,
 ) {
     let key = format!("{agent}|{path}");
     if !seen.insert(key) {
+        if let Some(existing) = parsed
+            .iter_mut()
+            .find(|source| source.agent == agent && source.path == path)
+        {
+            if existing.parser.is_none() {
+                existing.parser = parser;
+            }
+            merge_registry_skip_patterns(&mut existing.skip_patterns, skip_patterns);
+        }
         return;
     }
     parsed.push(RegistryCollectorSource {
         agent: agent.to_string(),
         path: path.to_string(),
         parser,
+        skip_patterns,
     });
+}
+
+fn parse_registry_skip_patterns(value: Option<&serde_json::Value>) -> Vec<String> {
+    let mut parsed = value
+        .and_then(serde_json::Value::as_array)
+        .map(|patterns| {
+            patterns
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    parsed.sort();
+    parsed.dedup();
+    parsed
+}
+
+fn merge_registry_skip_patterns(target: &mut Vec<String>, incoming: Vec<String>) {
+    target.extend(incoming);
+    target.sort();
+    target.dedup();
 }
 
 fn is_supported_registry_collector_glob(pattern: &str, content_type: Option<&str>) -> bool {
@@ -1193,6 +1264,7 @@ fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollect
             "name": format!("registry:{}", source.agent),
             "path": source.path,
             "parser": source.parser.clone().unwrap_or_else(|| "jsonl".to_string()),
+            "skip_patterns": source.skip_patterns,
             "agent": source.agent,
             "server_name": source.agent,
             "tags": {
@@ -1433,6 +1505,11 @@ mod tests {
                                     "id": "glob_session_transcript_1",
                                     "kind": "glob",
                                     "pattern": "~/.codex/sessions/**/*.jsonl",
+                                    "skip_patterns": [
+                                        "*.deleted.*",
+                                        "*.resolved",
+                                        "*.resolved.*"
+                                    ],
                                     "file_type": "session_transcript",
                                     "read_mode": "incremental",
                                     "content_type": "json"
@@ -1474,6 +1551,21 @@ mod tests {
             .iter()
             .any(|source| source.agent == "agent.codex.app"
                 && source.path == "~/.codex/sessions/**/*.jsonl"));
+        let codex = hints
+            .file_sources
+            .iter()
+            .find(|source| {
+                source.agent == "agent.codex.app" && source.path == "~/.codex/sessions/**/*.jsonl"
+            })
+            .expect("codex source present");
+        assert_eq!(
+            codex.skip_patterns,
+            vec![
+                "*.deleted.*".to_string(),
+                "*.resolved".to_string(),
+                "*.resolved.*".to_string()
+            ]
+        );
         assert_eq!(hints.sqlite_sources.len(), 1);
         assert_eq!(hints.sqlite_sources[0].agent, "agent.cursor.app");
         assert_eq!(hints.sqlite_sources[0].queries.len(), 1);

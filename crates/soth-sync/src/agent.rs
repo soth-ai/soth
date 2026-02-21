@@ -17,7 +17,7 @@ use soth_core::api::{
 use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
 use soth_core::types::exchange::{
     ExchangeBodyMode, ExchangeEvent, EXCHANGE_CLIENT_APP_TYPE_HOST,
-    EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
 };
 use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
 use std::collections::{BTreeMap, HashMap};
@@ -1730,15 +1730,10 @@ fn normalize_client_app_type_for_contract(raw: Option<&str>) -> Option<String> {
     if normalized == EXCHANGE_CLIENT_APP_TYPE_NON_HOST {
         return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
     }
-
-    // Legacy/local process categories collapse to frozen two-bucket contract:
-    // only browser-like identifiers map to host; everything else is non_host.
-    let mapped = if matches!(normalized.as_str(), "browser" | "host_app") {
-        EXCHANGE_CLIENT_APP_TYPE_HOST
-    } else {
-        EXCHANGE_CLIENT_APP_TYPE_NON_HOST
-    };
-    Some(mapped.to_string())
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_UNKNOWN {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string());
+    }
+    Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string())
 }
 
 fn is_missing_table_error(error: &rusqlite::Error, table: &str) -> bool {
@@ -2148,25 +2143,25 @@ mod tests {
         });
 
         let metadata = exchange_event_to_metadata(&event, None);
-        assert_eq!(metadata.client_app_type.as_deref(), Some("non_host"));
+        assert_eq!(metadata.client_app_type.as_deref(), Some("unknown"));
         let envelope = metadata.event_envelope.expect("event_envelope");
         let client = envelope.client.expect("event_envelope.client");
-        assert_eq!(client.app_type.as_deref(), Some("non_host"));
+        assert_eq!(client.app_type.as_deref(), Some("unknown"));
     }
 
     #[test]
-    fn normalize_client_app_type_maps_browser_to_host() {
+    fn normalize_client_app_type_maps_browser_to_unknown() {
         assert_eq!(
             normalize_client_app_type_for_contract(Some("browser")).as_deref(),
-            Some("host")
+            Some("unknown")
         );
     }
 
     #[test]
-    fn normalize_client_app_type_maps_editor_to_non_host() {
+    fn normalize_client_app_type_maps_editor_to_unknown() {
         assert_eq!(
             normalize_client_app_type_for_contract(Some("editor")).as_deref(),
-            Some("non_host")
+            Some("unknown")
         );
     }
 

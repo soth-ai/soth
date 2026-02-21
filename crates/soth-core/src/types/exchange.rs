@@ -8,14 +8,14 @@ use std::collections::BTreeMap;
 
 /// Canonical exchange schema version.
 pub const EXCHANGE_SCHEMA_VERSION: &str = "1";
-/// Backward-compat alias while callsites still reference "v2" naming.
-pub const EXCHANGE_SCHEMA_VERSION_V2: &str = EXCHANGE_SCHEMA_VERSION;
 
 pub const EXCHANGE_CLIENT_APP_TYPE_HOST: &str = "host";
 pub const EXCHANGE_CLIENT_APP_TYPE_NON_HOST: &str = "non_host";
+pub const EXCHANGE_CLIENT_APP_TYPE_UNKNOWN: &str = "unknown";
 pub const EXCHANGE_CLIENT_APP_TYPES: &[&str] = &[
     EXCHANGE_CLIENT_APP_TYPE_HOST,
     EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
 ];
 
 pub const EXCHANGE_DECISION_STEP_APP_GATE: &str = "step0_app_gate";
@@ -23,14 +23,12 @@ pub const EXCHANGE_DECISION_STEP_WHITELIST: &str = "step1_whitelist";
 pub const EXCHANGE_DECISION_STEP_URL_BLACKLIST: &str = "step2_url_blacklist";
 pub const EXCHANGE_DECISION_STEP_GRAPHQL_BLACKLIST: &str = "step3_graphql_blacklist";
 pub const EXCHANGE_DECISION_STEP_APP_ORIGIN: &str = "step4_app_origin";
-pub const EXCHANGE_DECISION_STEP_HOST_ORIGIN: &str = "step5_host_origin";
 pub const EXCHANGE_DECISION_STEPS: &[&str] = &[
     EXCHANGE_DECISION_STEP_APP_GATE,
     EXCHANGE_DECISION_STEP_WHITELIST,
     EXCHANGE_DECISION_STEP_URL_BLACKLIST,
     EXCHANGE_DECISION_STEP_GRAPHQL_BLACKLIST,
     EXCHANGE_DECISION_STEP_APP_ORIGIN,
-    EXCHANGE_DECISION_STEP_HOST_ORIGIN,
 ];
 
 pub const EXCHANGE_DECISION_OUTCOME_CAPTURED: &str = "captured";
@@ -51,7 +49,6 @@ pub const EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED: &str = "domain_rate_limited"
 pub const EXCHANGE_SKIP_REASON_NOT_WHITELISTED: &str = "not_whitelisted";
 pub const EXCHANGE_SKIP_REASON_BLACKLISTED: &str = "blacklisted";
 pub const EXCHANGE_SKIP_REASON_BLACKLISTED_GRAPHQL: &str = "blacklisted_graphql";
-pub const EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED: &str = "host_origin_not_allowed";
 pub const EXCHANGE_SKIP_REASONS: &[&str] = &[
     EXCHANGE_SKIP_REASON_NO_BUNDLE_ID,
     EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED,
@@ -60,7 +57,6 @@ pub const EXCHANGE_SKIP_REASONS: &[&str] = &[
     EXCHANGE_SKIP_REASON_NOT_WHITELISTED,
     EXCHANGE_SKIP_REASON_BLACKLISTED,
     EXCHANGE_SKIP_REASON_BLACKLISTED_GRAPHQL,
-    EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED,
 ];
 
 pub const EXCHANGE_DISCOVERY_KIND_CATALOG: &str = "catalog";
@@ -108,6 +104,7 @@ pub enum ExchangeSourceClass {
 pub enum ExchangeTransport {
     Http,
     Https,
+    Http2,
     Ws,
     Sse,
     Ndjson,
@@ -273,7 +270,7 @@ pub struct ExchangeParse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExchangeEventV2 {
+pub struct ExchangeEvent {
     pub schema_version: String,
     pub exchange_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -341,7 +338,7 @@ pub struct ExchangeEventV2 {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-impl ExchangeEventV2 {
+impl ExchangeEvent {
     pub fn new(
         exchange_id: impl Into<String>,
         source_class: ExchangeSourceClass,
@@ -464,15 +461,15 @@ impl ExchangeEventV2 {
 }
 
 /// Canonical type name moving forward.
-pub type Exchange = ExchangeEventV2;
+pub type Exchange = ExchangeEvent;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn exchange_v2_roundtrip() {
-        let event = ExchangeEventV2::new(
+    fn exchange_roundtrip() {
+        let event = ExchangeEvent::new(
             "ex_123",
             ExchangeSourceClass::AiInference,
             ExchangeTransport::Https,
@@ -480,7 +477,7 @@ mod tests {
             ExchangeBodyMode::Offloaded,
         );
         let raw = serde_json::to_string(&event).expect("serialize exchange");
-        let parsed: ExchangeEventV2 = serde_json::from_str(&raw).expect("deserialize exchange");
+        let parsed: ExchangeEvent = serde_json::from_str(&raw).expect("deserialize exchange");
         assert_eq!(parsed.schema_version, EXCHANGE_SCHEMA_VERSION);
         assert_eq!(parsed.exchange_id, "ex_123");
         assert_eq!(parsed.request.body.mode, ExchangeBodyMode::Inline);
@@ -489,7 +486,7 @@ mod tests {
 
     #[test]
     fn validate_proxy_detection_contract_requires_detection_fields() {
-        let mut event = ExchangeEventV2::new(
+        let mut event = ExchangeEvent::new(
             "ex_123",
             ExchangeSourceClass::AiInference,
             ExchangeTransport::Https,
@@ -510,7 +507,7 @@ mod tests {
 
     #[test]
     fn validate_proxy_detection_contract_skips_collector_events() {
-        let event = ExchangeEventV2::new(
+        let event = ExchangeEvent::new(
             "ex_123",
             ExchangeSourceClass::Collector,
             ExchangeTransport::Https,

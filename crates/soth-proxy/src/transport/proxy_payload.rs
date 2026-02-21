@@ -7,8 +7,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
 use tracing::{debug, warn};
 
-use crate::json_security::strip_json_security_prefix_text;
-
 /// Headers to remove from proxied requests to prevent 431 errors.
 /// These headers can accumulate or cause issues when passing through a MITM proxy.
 const HEADERS_TO_STRIP: &[&str] = &[
@@ -40,20 +38,21 @@ const HEADERS_TO_STRIP: &[&str] = &[
 ];
 
 /// Keep cookie header reasonably bounded without breaking login/session state.
-pub(crate) const CHATGPT_MAX_COOKIE_HEADER_BYTES: usize = 3500;
+pub(crate) const COOKIE_MAX_HEADER_BYTES: usize = 3500;
 /// Second-pass cap when total header budget is still too high.
-const CHATGPT_STRICT_COOKIE_HEADER_BYTES: usize = 900;
-/// Chat UI upstreams can be stricter than generic HTTP servers.
-pub(crate) const CHAT_UI_STRICT_TOTAL_HEADER_BYTES: usize = 5200;
-const CHAT_UI_MAX_TOTAL_HEADER_BYTES: usize = 3000;
+const COOKIE_STRICT_HEADER_BYTES: usize = 900;
+/// Upstreams with strict header budgets can reject oversized requests.
+pub(crate) const HEADER_STRICT_TOTAL_BYTES: usize = 5200;
+const HEADER_MAX_TOTAL_BYTES: usize = 3000;
 const LARGE_HEADER_DEBUG_BYTES: usize = 8000;
 const LARGE_HEADER_WARN_BYTES: usize = 12000;
 
-pub(crate) fn is_chat_ui_host(host: &str) -> bool {
-    !host.trim().is_empty()
+pub(crate) fn is_header_budget_sensitive_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    !host.is_empty()
 }
 
-fn chatgpt_cookie_priority(name: &str) -> u8 {
+fn session_cookie_priority(name: &str) -> u8 {
     match name {
         // NextAuth/Auth.js session and csrf cookies (highest priority for login state).
         "__Secure-next-auth.session-token" => 0,
@@ -68,7 +67,7 @@ fn chatgpt_cookie_priority(name: &str) -> u8 {
             if name.starts_with("__Secure-") || name.starts_with("__Host-") {
                 return 2;
             }
-            if name.starts_with("oai-") || name.starts_with("__cf") || name.starts_with("cf_") {
+            if name.starts_with("__cf") || name.starts_with("cf_") {
                 return 3;
             }
             if name.contains("session") || name.contains("token") || name.contains("auth") {
@@ -79,7 +78,7 @@ fn chatgpt_cookie_priority(name: &str) -> u8 {
     }
 }
 
-pub(crate) fn trim_cookie_header_for_chatgpt(cookie_str: &str, max_bytes: usize) -> Option<String> {
+pub(crate) fn trim_cookie_header_for_budget(cookie_str: &str, max_bytes: usize) -> Option<String> {
     let parts: Vec<&str> = cookie_str
         .split(';')
         .map(str::trim)
@@ -110,7 +109,7 @@ pub(crate) fn trim_cookie_header_for_chatgpt(cookie_str: &str, max_bytes: usize)
     let mut ranked: Vec<(u8, usize, String)> = by_name
         .into_iter()
         .map(|(name, (idx, value))| {
-            let prio = chatgpt_cookie_priority(&name);
+            let prio = session_cookie_priority(&name);
             (prio, idx, format!("{}={}", name, value))
         })
         .collect();
@@ -178,7 +177,7 @@ pub(crate) fn capture_sanitized_headers(headers: &hyper::HeaderMap) -> BTreeMap<
     out
 }
 
-fn is_required_chat_ui_header(name: &str) -> bool {
+fn is_required_session_header(name: &str) -> bool {
     matches!(
         name,
         "host"
@@ -202,29 +201,29 @@ fn is_required_chat_ui_header(name: &str) -> bool {
     )
 }
 
-fn reduce_chat_ui_headers_for_budget<T>(req: &mut Request<T>, path: &str) {
+fn reduce_headers_for_budget<T>(req: &mut Request<T>, path: &str) {
     let headers = req.headers_mut();
-    if header_size_bytes(headers) <= CHAT_UI_STRICT_TOTAL_HEADER_BYTES {
+    if header_size_bytes(headers) <= HEADER_STRICT_TOTAL_BYTES {
         return;
     }
 
     let names: Vec<hyper::header::HeaderName> = headers.keys().cloned().collect();
     for name in names {
         let key = name.as_str().to_ascii_lowercase();
-        if is_required_chat_ui_header(&key) {
+        if is_required_session_header(&key) {
             continue;
         }
         headers.remove(&name);
-        if header_size_bytes(headers) <= CHAT_UI_STRICT_TOTAL_HEADER_BYTES {
+        if header_size_bytes(headers) <= HEADER_STRICT_TOTAL_BYTES {
             break;
         }
     }
 
-    if header_size_bytes(headers) > CHAT_UI_STRICT_TOTAL_HEADER_BYTES {
+    if header_size_bytes(headers) > HEADER_STRICT_TOTAL_BYTES {
         if let Some(cookie) = headers.get(hyper::header::COOKIE).cloned() {
             if let Ok(cookie_str) = cookie.to_str() {
                 if let Some(trimmed) =
-                    trim_cookie_header_for_chatgpt(cookie_str, CHATGPT_STRICT_COOKIE_HEADER_BYTES)
+                    trim_cookie_header_for_budget(cookie_str, COOKIE_STRICT_HEADER_BYTES)
                 {
                     if let Ok(hv) = hyper::header::HeaderValue::from_str(&trimmed) {
                         headers.insert(hyper::header::COOKIE, hv);
@@ -240,11 +239,11 @@ fn reduce_chat_ui_headers_for_budget<T>(req: &mut Request<T>, path: &str) {
         }
     }
 
-    if header_size_bytes(headers) > CHAT_UI_MAX_TOTAL_HEADER_BYTES {
+    if header_size_bytes(headers) > HEADER_MAX_TOTAL_BYTES {
         headers.remove(hyper::header::COOKIE);
     }
 
-    if header_size_bytes(headers) > CHAT_UI_MAX_TOTAL_HEADER_BYTES {
+    if header_size_bytes(headers) > HEADER_MAX_TOTAL_BYTES {
         headers.remove(hyper::header::AUTHORIZATION);
     }
 
@@ -253,20 +252,20 @@ fn reduce_chat_ui_headers_for_budget<T>(req: &mut Request<T>, path: &str) {
 
 pub(crate) fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path: &str) {
     let headers = req.headers_mut();
-    let is_chatgpt = is_chat_ui_host(host);
-    let is_chat_backend_path = path.contains("/backend-api/");
+    let budget_sensitive_host = is_header_budget_sensitive_host(host);
+    let is_backend_path = path.contains("/backend-api/");
 
     for header in HEADERS_TO_STRIP {
         headers.remove(*header);
     }
 
-    if is_chatgpt {
+    if budget_sensitive_host {
         // Reduce duplicate/oversized cookies first.
         if let Some(cookie) = headers.get(hyper::header::COOKIE).cloned() {
             if let Ok(cookie_str) = cookie.to_str() {
-                if cookie_str.len() > CHATGPT_MAX_COOKIE_HEADER_BYTES {
+                if cookie_str.len() > COOKIE_MAX_HEADER_BYTES {
                     if let Some(trimmed) =
-                        trim_cookie_header_for_chatgpt(cookie_str, CHATGPT_MAX_COOKIE_HEADER_BYTES)
+                        trim_cookie_header_for_budget(cookie_str, COOKIE_MAX_HEADER_BYTES)
                     {
                         if let Ok(hv) = hyper::header::HeaderValue::from_str(&trimmed) {
                             headers.insert(hyper::header::COOKIE, hv);
@@ -275,7 +274,7 @@ pub(crate) fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path
                                 path = %path,
                                 original = cookie_str.len(),
                                 trimmed = trimmed.len(),
-                                max = CHATGPT_MAX_COOKIE_HEADER_BYTES,
+                                max = COOKIE_MAX_HEADER_BYTES,
                                 "Trimmed oversized cookie header"
                             );
                         } else {
@@ -287,7 +286,7 @@ pub(crate) fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path
                 } else {
                     // Re-pack once to dedupe even when under max.
                     if let Some(trimmed) =
-                        trim_cookie_header_for_chatgpt(cookie_str, CHATGPT_MAX_COOKIE_HEADER_BYTES)
+                        trim_cookie_header_for_budget(cookie_str, COOKIE_MAX_HEADER_BYTES)
                     {
                         if let Ok(hv) = hyper::header::HeaderValue::from_str(&trimmed) {
                             headers.insert(hyper::header::COOKIE, hv);
@@ -300,11 +299,11 @@ pub(crate) fn sanitize_request_headers<T>(req: &mut Request<T>, host: &str, path
         }
     }
 
-    // If header budget is still too large, reduce to required Chat UI set.
-    if is_chatgpt && is_chat_backend_path {
+    // If header budget is still too large, reduce to a required baseline set.
+    if budget_sensitive_host && is_backend_path {
         let total_size = header_size_bytes(headers);
-        if total_size > CHAT_UI_STRICT_TOTAL_HEADER_BYTES {
-            reduce_chat_ui_headers_for_budget(req, path);
+        if total_size > HEADER_STRICT_TOTAL_BYTES {
+            reduce_headers_for_budget(req, path);
             debug!(
                 host = %host,
                 path = %path,
@@ -483,85 +482,4 @@ pub(crate) fn decode_payload_for_logging(
     let decoded = try_decompress(bytes, encoding);
     let rendered = render_decoded_body_for_logging(&decoded, encoding);
     (decoded, rendered)
-}
-
-pub(crate) fn is_gemini_bard_stream_path(path: &str) -> bool {
-    path.contains("/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate")
-        || path.contains("/batchexecute")
-}
-
-fn update_longest_text(candidate: &str, longest: &mut Option<String>) {
-    let trimmed = candidate.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    let should_replace = longest
-        .as_ref()
-        .map(|existing| trimmed.len() > existing.len())
-        .unwrap_or(true);
-    if should_replace {
-        *longest = Some(trimmed.to_string());
-    }
-}
-
-fn collect_bard_response_text(value: &serde_json::Value, longest: &mut Option<String>) {
-    match value {
-        serde_json::Value::String(text) => update_longest_text(text, longest),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_bard_response_text(item, longest);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for v in map.values() {
-                collect_bard_response_text(v, longest);
-            }
-        }
-        _ => {}
-    }
-}
-
-pub(crate) fn extract_gemini_bard_stream_text(raw: &str) -> Option<String> {
-    let mut longest: Option<String> = None;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        let sanitized = strip_json_security_prefix_text(trimmed);
-        if sanitized.is_empty() {
-            continue;
-        }
-
-        if !sanitized.starts_with('[') {
-            // Batch framing length lines are numeric and can be ignored.
-            continue;
-        }
-
-        let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(sanitized) else {
-            continue;
-        };
-
-        let Some(records) = wrapper.as_array() else {
-            continue;
-        };
-
-        for record in records {
-            let Some(entry) = record.as_array() else {
-                continue;
-            };
-            if entry.first().and_then(|v| v.as_str()) != Some("wrb.fr") {
-                continue;
-            }
-
-            let Some(inner_json) = entry.get(2).and_then(|v| v.as_str()) else {
-                continue;
-            };
-
-            let Ok(inner) = serde_json::from_str::<serde_json::Value>(inner_json) else {
-                continue;
-            };
-            collect_bard_response_text(&inner, &mut longest);
-        }
-    }
-
-    longest
 }

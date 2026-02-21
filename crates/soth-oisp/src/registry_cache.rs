@@ -4,18 +4,6 @@ use anyhow::Context;
 use serde_json::Value;
 use std::path::Path;
 
-pub(crate) fn registry_cache_last_good_path(path: &Path) -> std::path::PathBuf {
-    let filename = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "registry_bundle_cache.json".to_string());
-    let fallback_filename = format!("{filename}.last_good");
-    match path.parent() {
-        Some(parent) => parent.join(fallback_filename),
-        None => std::path::PathBuf::from(fallback_filename),
-    }
-}
-
 pub(crate) fn load_from_registry_cache_path(path: &Path) -> anyhow::Result<Option<OispEngine>> {
     if !path.exists() {
         return Ok(None);
@@ -41,18 +29,7 @@ fn extract_compiled_bundle_value(root: &Value) -> anyhow::Result<Value> {
     if let Some(inner) = object.get("bundle").cloned() {
         return Ok(inner);
     }
-    if let Some(inner) = object.get("compiled_bundle").cloned() {
-        return Ok(inner);
-    }
-    if let Some(data) = object.get("data").and_then(Value::as_object) {
-        if let Some(inner) = data.get("bundle").cloned() {
-            return Ok(inner);
-        }
-        if let Some(inner) = data.get("compiled_bundle").cloned() {
-            return Ok(inner);
-        }
-    }
-    anyhow::bail!("registry cache envelope does not contain bundle/compiled_bundle field");
+    anyhow::bail!("registry cache envelope does not contain required `bundle` field");
 }
 
 fn build_engine_from_bundle_value(bundle_value: &Value) -> anyhow::Result<OispEngine> {
@@ -86,45 +63,5 @@ fn validate_runtime_bundle_contract(bundle_value: &Value) -> anyhow::Result<()> 
         }
         return Ok(());
     }
-
-    let alias_sets = [
-        (
-            "whitelistedDomains",
-            lookup_filter_alias(object, "whitelistedDomains"),
-        ),
-        (
-            "passthroughDomains",
-            lookup_filter_alias(object, "passthroughDomains"),
-        ),
-        (
-            "blacklistedWords",
-            lookup_filter_alias(object, "blacklistedWords"),
-        ),
-    ];
-    if alias_sets.iter().all(|(_, value)| value.is_none()) {
-        anyhow::bail!(
-            "bundle payload missing required `filters` object (or sensor-config aliases)"
-        );
-    }
-    for (key, value) in alias_sets {
-        if let Some(value) = value {
-            if !value.is_array() {
-                anyhow::bail!("bundle payload `{key}` must be an array");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn lookup_filter_alias<'a>(
-    object: &'a serde_json::Map<String, Value>,
-    key: &str,
-) -> Option<&'a Value> {
-    object.get(key).or_else(|| {
-        object
-            .get("data")
-            .and_then(Value::as_object)
-            .and_then(|data| data.get(key))
-    })
+    anyhow::bail!("bundle payload missing required `filters` object");
 }

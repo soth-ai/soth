@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use soth_core::event_logger::default_event_log_write_path;
-use soth_core::types::exchange_v2::{ExchangeEventV2, ExchangeSourceClass};
+use soth_core::types::exchange::{ExchangeEvent, ExchangeSourceClass};
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_storage::open_sqlite_read_write_with_timeout;
 use std::collections::{HashMap, VecDeque};

@@ -16,6 +16,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
     }
 
     let content = std::fs::read_to_string(path)?;
+    reject_legacy_exchange_v2_key(&content)?;
     let mut config: SothConfig = serde_yaml::from_str(&content)?;
 
     // Apply environment variable overrides
@@ -28,11 +29,27 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 
 /// Load configuration from a string
 pub fn load_config_from_str(content: &str) -> Result<SothConfig> {
+    reject_legacy_exchange_v2_key(content)?;
     let mut config: SothConfig = serde_yaml::from_str(content)?;
     apply_env_overrides(&mut config);
     normalize_cloud_config(&mut config);
     normalize_budget_db_path(&mut config);
     Ok(config)
+}
+
+fn reject_legacy_exchange_v2_key(content: &str) -> Result<()> {
+    let raw: serde_yaml::Value = serde_yaml::from_str(content)?;
+    let Some(root) = raw.as_mapping() else {
+        return Ok(());
+    };
+    let legacy_key = serde_yaml::Value::String("exchange_v2".to_string());
+    if root.contains_key(&legacy_key) {
+        return Err(SothError::ConfigInvalid(
+            "legacy config key `exchange_v2` is no longer supported; rename it to `exchange`"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_budget_db_path(config: &mut SothConfig) {
@@ -48,11 +65,11 @@ fn normalize_cloud_config(config: &mut SothConfig) {
     if config.cloud.api_key.is_none() {
         config.cloud.enabled = false;
     }
-    // Unified exchange pipeline is required for cloud sync.
+    // Unified Exchange pipeline is required for cloud sync.
     // Keep this fail-open and deterministic: if cloud is enabled with credentials,
-    // runtime ingestion/upload should always use exchange.v2.
+    // runtime ingestion/upload should always use Exchange (schema_version=1).
     if config.cloud.enabled {
-        config.exchange_v2.enabled = true;
+        config.exchange.enabled = true;
     }
 }
 
@@ -478,5 +495,21 @@ cloud:
 
         std::env::remove_var("SOTH_CLOUD_ENABLED");
         std::env::remove_var("SOTH_CLOUD_API_KEY");
+    }
+
+    #[test]
+    fn test_exchange_v2_key_is_rejected() {
+        let yaml = r#"
+exchange_v2:
+  enabled: true
+"#;
+        let err = load_config_from_str(yaml).expect_err("legacy exchange_v2 key must fail");
+        match err {
+            SothError::ConfigInvalid(message) => {
+                assert!(message.contains("exchange_v2"));
+                assert!(message.contains("exchange"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

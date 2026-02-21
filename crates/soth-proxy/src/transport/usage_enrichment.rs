@@ -112,16 +112,16 @@ pub async fn extract_usage_meta_for_mode(
     }
 }
 
-fn resolve_provider_id(engine: &OispEngine, provider: &str, host: &str) -> Option<String> {
-    let _ = host;
+fn resolve_provider_id(engine: &OispEngine, provider: &str, _host: &str) -> Option<String> {
     let provider = provider.trim();
     if !provider.is_empty()
         && !provider.eq_ignore_ascii_case("unknown")
         && !provider.eq_ignore_ascii_case("-")
     {
-        return Some(provider.to_string());
+        if let Some(canonical) = engine.canonical_provider_id(provider) {
+            return Some(canonical);
+        }
     }
-    let _ = engine;
     None
 }
 
@@ -243,6 +243,17 @@ mod tests {
                                     "prompt_tokens": "$.usage.prompt_tokens",
                                     "completion_tokens": "$.usage.completion_tokens"
                                 }
+                            },
+                            "stream": {
+                                "format": "sse",
+                                "rules": [
+                                    {
+                                        "extract_usage": {
+                                            "prompt_tokens": "$.usage.prompt_tokens",
+                                            "completion_tokens": "$.usage.completion_tokens"
+                                        }
+                                    }
+                                ]
                             }
                         }
                     }
@@ -295,5 +306,38 @@ mod tests {
         let probe =
             extract_request_pii_probe_for_mode(Some(&engine), "openai", "api.openai.com", body);
         assert_eq!(probe.as_deref(), Some("email me at pii@example.com"));
+    }
+
+    #[test]
+    fn request_model_requires_provider_context() {
+        let engine = test_oisp_engine();
+        let body = br#"{"model":"gpt-4o"}"#;
+        let model =
+            extract_model_from_request_for_mode(Some(&engine), "unknown", "api.openai.com", body);
+        assert!(model.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_usage_requires_provider_context() {
+        let engine = test_oisp_engine();
+        let body = br#"{"model":"gpt-4o","usage":{"prompt_tokens":8,"completion_tokens":4}}"#;
+        let outcome = extract_usage_meta_for_mode(
+            Some(&engine),
+            "unknown",
+            "api.openai.com",
+            body,
+            false,
+            Some("application/json"),
+            None,
+        )
+        .await;
+        assert!(!outcome.primary.has_signal());
+    }
+
+    #[test]
+    fn stream_parser_requires_provider_context() {
+        let engine = test_oisp_engine();
+        let parser = create_stream_usage_parser(Some(&engine), "unknown", "api.openai.com");
+        assert!(parser.is_none());
     }
 }

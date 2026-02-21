@@ -644,7 +644,8 @@ fn rule_matches(when: Option<&str>, root: &Value) -> bool {
             continue;
         }
 
-        // Unknown clause syntax: fail open for compatibility.
+        // Unknown clause syntax: fail closed to keep rule execution deterministic.
+        return false;
     }
 
     true

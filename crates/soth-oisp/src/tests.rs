@@ -62,7 +62,7 @@ fn should_intercept_honors_noise_and_passthrough() {
 }
 
 #[test]
-fn should_intercept_honors_path_filters_when_present() {
+fn should_intercept_without_decision_rules_defaults_to_metadata_only() {
     let engine = OispEngine::new(
         parse_compiled_bundle(&json!({
             "version": "v1",
@@ -102,8 +102,14 @@ fn should_intercept_honors_path_filters_when_present() {
     );
     assert_eq!(
         engine.should_intercept("api.openai.com", "/v1/models"),
-        InterceptDecision::Tunnel
+        InterceptDecision::Intercept {
+            provider_id: "openai".to_string(),
+            entry_type: EntryType::AiInference
+        }
     );
+    let miss = engine.evaluate_request_decision("api.openai.com", "/v1/models", None, None);
+    assert_eq!(miss.outcome, RequestDecisionOutcome::MetadataOnly);
+    assert_eq!(miss.reason.as_deref(), Some("whitelist_path_miss"));
 
     assert!(engine.should_intercept_host("api.openai.com"));
 }
@@ -143,6 +149,313 @@ fn should_intercept_honors_path_filters_with_query_string() {
 }
 
 #[test]
+fn decision_rules_deny_exact_takes_precedence_over_allow_paths() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 4,
+            "version": "v4",
+            "compiled_at": "2026-02-21T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "claude": {
+                        "id": "claude",
+                        "detection_id": "agent.claude.app",
+                        "name": "Claude",
+                        "type": "agent-app"
+                    }
+                },
+                "domain_index": [
+                    {
+                        "host": "api.anthropic.com",
+                        "provider_id": "claude",
+                        "entry_type": "agent-app"
+                    }
+                ]
+            },
+            "filters": {
+                "whitelist": ["api.anthropic.com"]
+            },
+            "decision_rules": {
+                "version": 1,
+                "defaults": {
+                    "host_miss_action": "tunnel",
+                    "non_host_miss_action": "metadata_only",
+                    "unknown_app_action": "metadata_only",
+                    "path_precedence": ["deny_paths_exact", "deny_paths_glob", "allow_paths"],
+                    "whitelist_path_miss_reason": "whitelist_path_miss"
+                },
+                "rules": [
+                    {
+                        "id": "rule.non_host.agent.claude.app.api.anthropic.com.v1.messages",
+                        "enabled": true,
+                        "priority": 9500,
+                        "host_pattern": "api.anthropic.com",
+                        "app_type": ["non_host"],
+                        "method": ["POST"],
+                        "allow_paths": ["/v1/messages", "/v1/messages/**"],
+                        "deny_paths_exact": ["/v1/messages/count"],
+                        "deny_paths_glob": ["/v1/messages/*/metrics*"],
+                        "detection_id": "agent.claude.app",
+                        "provider": "claude",
+                        "capture_mode": "full"
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let decision = engine.evaluate_request_decision(
+        "api.anthropic.com",
+        "/v1/messages/count",
+        Some("POST"),
+        Some("non_host"),
+    );
+    assert_eq!(decision.outcome, RequestDecisionOutcome::MetadataOnly);
+    assert_eq!(decision.reason.as_deref(), Some("deny_paths_exact"));
+    assert_eq!(decision.detection_id.as_deref(), Some("agent.claude.app"));
+
+    assert!(matches!(
+        engine.should_intercept_with_context(
+            "api.anthropic.com",
+            "/v1/messages/count",
+            Some("POST"),
+            Some("non_host")
+        ),
+        InterceptDecision::Intercept { .. }
+    ));
+}
+
+#[test]
+fn decision_rules_whitelist_path_miss_returns_metadata_only() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 4,
+            "version": "v4",
+            "compiled_at": "2026-02-21T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "chatgpt": {
+                        "id": "chatgpt",
+                        "detection_id": "agent.chatgpt.app",
+                        "name": "ChatGPT",
+                        "type": "agent-app"
+                    }
+                },
+                "domain_index": [
+                    {
+                        "host": "chatgpt.com",
+                        "provider_id": "chatgpt",
+                        "entry_type": "agent-app"
+                    }
+                ]
+            },
+            "filters": {
+                "whitelist": ["chatgpt.com"]
+            },
+            "decision_rules": {
+                "version": 1,
+                "defaults": {
+                    "host_miss_action": "tunnel",
+                    "non_host_miss_action": "metadata_only",
+                    "unknown_app_action": "metadata_only",
+                    "path_precedence": ["deny_paths_exact", "deny_paths_glob", "allow_paths"],
+                    "whitelist_path_miss_reason": "whitelist_path_miss"
+                },
+                "rules": [
+                    {
+                        "id": "rule.unknown.agent.chatgpt.app.chatgpt.com.conversation",
+                        "enabled": true,
+                        "priority": 9000,
+                        "host_pattern": "chatgpt.com",
+                        "app_type": ["unknown"],
+                        "method": [],
+                        "allow_paths": ["/backend-api/**/conversation"],
+                        "deny_paths_exact": [],
+                        "deny_paths_glob": [],
+                        "detection_id": "agent.chatgpt.app",
+                        "provider": "chatgpt",
+                        "capture_mode": "full"
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let decision = engine.evaluate_request_decision(
+        "chatgpt.com",
+        "/backend-api/wham/usage",
+        Some("GET"),
+        Some("unknown"),
+    );
+    assert_eq!(decision.outcome, RequestDecisionOutcome::MetadataOnly);
+    assert_eq!(decision.reason.as_deref(), Some("whitelist_path_miss"));
+    assert_eq!(decision.provider_id.as_deref(), Some("chatgpt"));
+    assert_eq!(decision.detection_id, None);
+}
+
+#[test]
+fn decision_rule_without_detection_id_does_not_fallback_to_provider_detection_id() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 4,
+            "version": "v4",
+            "compiled_at": "2026-02-21T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "detection_id": "ai.openai.service",
+                        "name": "OpenAI",
+                        "type": "ai-inference"
+                    }
+                },
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference"
+                    }
+                ]
+            },
+            "filters": {
+                "whitelist": ["api.openai.com"]
+            },
+            "decision_rules": {
+                "version": 1,
+                "defaults": {
+                    "host_miss_action": "tunnel",
+                    "non_host_miss_action": "metadata_only",
+                    "unknown_app_action": "metadata_only",
+                    "path_precedence": ["deny_paths_exact", "deny_paths_glob", "allow_paths"],
+                    "whitelist_path_miss_reason": "whitelist_path_miss"
+                },
+                "rules": [
+                    {
+                        "id": "rule.host.openai.chat",
+                        "enabled": true,
+                        "priority": 9000,
+                        "host_pattern": "api.openai.com",
+                        "app_type": ["host"],
+                        "method": ["POST"],
+                        "allow_paths": ["/v1/chat/completions"],
+                        "deny_paths_exact": [],
+                        "deny_paths_glob": [],
+                        "provider": "openai",
+                        "capture_mode": "full"
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let decision = engine.evaluate_request_decision(
+        "api.openai.com",
+        "/v1/chat/completions",
+        Some("POST"),
+        Some("host"),
+    );
+    assert_eq!(decision.outcome, RequestDecisionOutcome::Full);
+    assert_eq!(decision.provider_id.as_deref(), Some("openai"));
+    assert_eq!(decision.detection_id, None);
+}
+
+#[test]
+fn connect_policy_non_host_override_enables_intercept() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 4,
+            "version": "v4",
+            "compiled_at": "2026-02-21T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "detection_id": "ai.openai.service",
+                        "name": "OpenAI",
+                        "type": "ai-inference"
+                    }
+                },
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference"
+                    }
+                ]
+            },
+            "filters": {
+                "whitelist": ["api.openai.com"]
+            },
+            "connect_policy": {
+                "version": 1,
+                "defaults": {
+                    "non_whitelisted_host_action": "tunnel",
+                    "unknown_app_action": "host_only",
+                    "whitelisted_unknown_app_action": "intercept"
+                },
+                "rules": [
+                    {
+                        "id": "connect.non_host.codex.openai",
+                        "enabled": true,
+                        "app_type": ["non_host"],
+                        "app_identifiers": ["@openai/codex"],
+                        "host_allow": ["api.openai.com"],
+                        "action": "intercept",
+                        "reason": "connect.allowed_app_override"
+                    }
+                ]
+            },
+            "decision_rules": {
+                "version": 1,
+                "defaults": {
+                    "host_miss_action": "tunnel",
+                    "non_host_miss_action": "metadata_only",
+                    "unknown_app_action": "metadata_only",
+                    "path_precedence": ["deny_paths_exact", "deny_paths_glob", "allow_paths"],
+                    "whitelist_path_miss_reason": "whitelist_path_miss"
+                },
+                "rules": [
+                    {
+                        "id": "rule.host.ai.openai.service.api.openai.com.chat",
+                        "enabled": true,
+                        "priority": 9000,
+                        "host_pattern": "api.openai.com",
+                        "app_type": ["host"],
+                        "method": ["POST"],
+                        "allow_paths": ["/v1/chat/completions"],
+                        "deny_paths_exact": [],
+                        "deny_paths_glob": [],
+                        "detection_id": "ai.openai.service",
+                        "provider": "openai",
+                        "capture_mode": "full"
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let connect =
+        engine.evaluate_connect_decision("api.openai.com", Some("@openai/codex"), Some("non_host"));
+    assert_eq!(connect.action, ConnectDecisionAction::Intercept);
+    assert_eq!(
+        connect.rule_id.as_deref(),
+        Some("connect.non_host.codex.openai")
+    );
+}
+
+#[test]
 fn catalog_domains_are_available_for_discovery_checks() {
     let engine = OispEngine::new(
         parse_compiled_bundle(&json!({
@@ -176,7 +489,7 @@ fn catalog_domains_are_available_for_discovery_checks() {
 }
 
 #[test]
-fn gating_rules_parse_and_match_app_and_host_origins() {
+fn gating_rules_parse_and_match_app_origins() {
     let engine = OispEngine::new(
         parse_compiled_bundle(&json!({
             "schema_version": 3,
@@ -218,9 +531,6 @@ fn gating_rules_parse_and_match_app_and_host_origins() {
         Some("non_host")
     );
     assert!(engine.app_has_parser("com.anthropic.claudefordesktop"));
-    assert!(engine.has_host_origin_rules());
-    assert!(engine.is_allowed_host_origin("https://chatgpt.com/backend-api"));
-    assert!(!engine.is_allowed_host_origin("https://example.com"));
 }
 
 #[test]
@@ -265,38 +575,68 @@ fn gating_rules_match_scoped_package_identifiers() {
 }
 
 #[test]
-fn parse_filters_supports_sensor_config_alias_fields() {
+fn gating_rules_prefer_non_host_when_identifier_matches_both_lists() {
     let engine = OispEngine::new(
         parse_compiled_bundle(&json!({
             "schema_version": 3,
-            "version": "alias-filters-v1",
+            "version": "v3",
             "compiled_at": "2026-02-20T00:00:00Z",
             "bundle_type": "cloud",
             "core": {
                 "providers": {
-                    "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" }
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "agent-app" }
                 },
                 "domain_index": [
-                    { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" }
+                    {
+                        "host": "chatgpt.com",
+                        "provider_id": "openai",
+                        "entry_type": "agent-app"
+                    }
                 ]
             },
-            "whitelistedDomains": ["api.openai.com"],
-            "passthroughDomains": ["metrics.openai.com"],
-            "blacklistedWords": ["telemetry"]
+            "filters": {},
+            "gating": {
+                "allowed_app_origins": {
+                    "hosts": ["@openai/codex"],
+                    "non_hosts": ["@openai/codex"]
+                }
+            }
         }))
         .unwrap(),
     )
     .unwrap();
 
-    assert!(matches!(
-        engine.should_intercept("api.openai.com", "/v1/responses"),
-        InterceptDecision::Intercept { .. }
-    ));
-    assert!(matches!(
-        engine.should_intercept("metrics.openai.com", "/events"),
-        InterceptDecision::Passthrough
-    ));
-    assert!(engine.matches_noise_keyword("telemetry ping"));
+    assert_eq!(
+        engine.classify_app_origin("@openai/codex"),
+        Some("non_host")
+    );
+}
+
+#[test]
+fn parse_filters_requires_canonical_filters_object() {
+    let result = parse_compiled_bundle(&json!({
+        "schema_version": 3,
+        "version": "alias-filters-v1",
+        "compiled_at": "2026-02-20T00:00:00Z",
+        "bundle_type": "cloud",
+        "core": {
+            "providers": {
+                "openai": {
+                    "name": "OpenAI",
+                    "category": "ai-inference",
+                    "api_domains": ["api.openai.com"]
+                }
+            },
+            "domain_index": [
+                { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" }
+            ]
+        },
+        "whitelistedDomains": ["api.openai.com"],
+        "passthroughDomains": ["metrics.openai.com"],
+        "blacklistedWords": ["telemetry"]
+    }));
+
+    assert!(result.is_err());
 }
 
 #[test]
@@ -575,12 +915,23 @@ fn launch_subset_supports_openai_and_anthropic_app_and_path_detection() {
     );
     assert_eq!(
         engine.should_intercept("api.openai.com", "/v1/models"),
-        InterceptDecision::Tunnel
+        InterceptDecision::Intercept {
+            provider_id: "openai".to_string(),
+            entry_type: EntryType::AiInference
+        }
     );
     assert_eq!(
         engine.should_intercept("api.anthropic.com", "/v1/complete"),
-        InterceptDecision::Tunnel
+        InterceptDecision::Intercept {
+            provider_id: "anthropic".to_string(),
+            entry_type: EntryType::AiInference
+        }
     );
+    let openai_miss = engine.evaluate_request_decision("api.openai.com", "/v1/models", None, None);
+    assert_eq!(openai_miss.outcome, RequestDecisionOutcome::MetadataOnly);
+    let anthropic_miss =
+        engine.evaluate_request_decision("api.anthropic.com", "/v1/complete", None, None);
+    assert_eq!(anthropic_miss.outcome, RequestDecisionOutcome::MetadataOnly);
 
     let codex = engine
         .evaluate_detection_for_host(
@@ -593,6 +944,19 @@ fn launch_subset_supports_openai_and_anthropic_app_and_path_detection() {
         )
         .expect("codex detection should exist");
     assert_eq!(codex.agent.as_deref(), Some("codex"));
+
+    let chatgpt_fallback = engine.evaluate_detection_for_host(
+        "chatgpt.com",
+        &DetectionContext {
+            host: Some("chatgpt.com".to_string()),
+            path: Some("/backend-api/wham/usage".to_string()),
+            ..DetectionContext::default()
+        },
+    );
+    assert!(
+        chatgpt_fallback.is_none(),
+        "host-classification detection fallback should not synthesize identity"
+    );
 
     let claude_code = engine
         .evaluate_detection_for_host(
@@ -705,6 +1069,48 @@ fn host_matches_pattern_normalizes_host_port_and_trailing_dot() {
 }
 
 #[test]
+fn host_matches_pattern_supports_regex_style_patterns() {
+    assert!(host_matches_pattern(
+        "api.openai.com",
+        r"^api\.openai\.com$"
+    ));
+    assert!(host_matches_pattern("foo.apple.com", r"^.*\.apple\.com$"));
+    assert!(!host_matches_pattern(
+        "apple.com.evil.com",
+        r"^.*\.apple\.com$"
+    ));
+}
+
+#[test]
+fn passthrough_filters_accept_regex_style_host_patterns() {
+    let engine = OispEngine::new(
+        parse_compiled_bundle(&json!({
+            "schema_version": 3,
+            "version": "v3",
+            "compiled_at": "2026-02-20T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": { "id": "openai", "name": "OpenAI", "type": "ai-inference" }
+                },
+                "domain_index": [
+                    { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" }
+                ]
+            },
+            "filters": {
+                "whitelist": ["api.openai.com"],
+                "passthrough": [r"^.*\.apple\.com$"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(!engine.should_intercept_host("foo.apple.com"));
+    assert!(engine.should_intercept_host("api.openai.com"));
+}
+
+#[test]
 fn classify_accepts_connect_authority_shape() {
     let engine = OispEngine::new(sample_bundle()).unwrap();
     assert!(engine.classify("api.openai.com:443").is_some());
@@ -737,6 +1143,21 @@ fn contains_noise_keyword_host_scoped_pattern_requires_host_match() {
     assert!(!contains_noise_keyword_for_host(
         "chatgpt.com",
         "/api/hello",
+        &keywords
+    ));
+}
+
+#[test]
+fn contains_noise_keyword_matches_host_when_keyword_is_not_host_scoped() {
+    let keywords = vec!["telemetry".to_string()];
+    assert!(contains_noise_keyword_for_host(
+        "telemetry.example.com",
+        "/v1/messages",
+        &keywords
+    ));
+    assert!(!contains_noise_keyword_for_host(
+        "api.openai.com",
+        "/v1/messages",
         &keywords
     ));
 }
@@ -1164,7 +1585,7 @@ fn load_from_registry_cache_accepts_catalog_registry_shape() {
 }
 
 #[test]
-fn load_from_registry_cache_falls_back_to_last_good_when_primary_invalid() {
+fn load_from_registry_cache_does_not_fall_back_to_last_good_when_primary_invalid() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("registry_bundle_cache.json");
     let valid_envelope = json!({
@@ -1211,16 +1632,70 @@ fn load_from_registry_cache_falls_back_to_last_good_when_primary_invalid() {
     });
     std::fs::write(&path, serde_json::to_vec_pretty(&invalid_primary).unwrap()).unwrap();
 
-    let engine = OispEngine::load_from_registry_cache(&path)
-        .unwrap()
-        .unwrap();
+    let error = match OispEngine::load_from_registry_cache(&path) {
+        Ok(Some(_)) => panic!("expected invalid primary cache to fail without last-good fallback"),
+        Ok(None) => panic!("expected invalid primary cache to return error"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("bundle payload failed runtime contract validation"));
+}
 
-    assert_eq!(
-        engine.should_intercept("api.openai.com", "/v1/chat/completions"),
-        InterceptDecision::Intercept {
-            provider_id: "openai".to_string(),
-            entry_type: EntryType::AiInference
+#[test]
+fn load_from_registry_cache_rejects_alias_only_filters_payload() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("registry_bundle_cache.json");
+    let envelope = json!({
+        "schema_version": 1,
+        "fetched_at": "2026-02-13T00:00:00Z",
+        "etag": "etag-1",
+        "metadata": {
+            "bundle_type": "local",
+            "version": "alias-only-v1",
+            "sha256": "abc",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "provider_count": 1,
+            "domain_count": 1,
+            "format_count": 1,
+            "size_bytes": 123
+        },
+        "bundle": {
+            "schema_version": 3,
+            "version": "alias-only-v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "name": "OpenAI",
+                        "type": "ai-inference"
+                    }
+                },
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference"
+                    }
+                ]
+            },
+            "whitelistedDomains": ["api.openai.com"],
+            "passthroughDomains": ["metrics.openai.com"],
+            "blacklistedWords": ["telemetry"]
         }
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+    let error = match OispEngine::load_from_registry_cache(&path) {
+        Ok(_) => panic!("expected alias-only payload to be rejected"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("runtime contract validation")
+            || message.contains("missing required `filters` object"),
+        "unexpected error: {message}"
     );
-    assert_eq!(engine.bundle_version(), "v1");
 }
