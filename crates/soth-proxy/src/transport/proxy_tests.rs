@@ -2,6 +2,7 @@ use super::*;
 use crate::transport::proxy_detection::{
     detect_agent_from_user_agent, should_log_request, should_treat_anthropic_api_as_agent,
 };
+use crate::transport::proxy_payload::is_chat_ui_host;
 use crate::transport::proxy_support::{DiscoveryKind, DiscoveryReserveResult};
 use flate2::{write::GzEncoder, Compression};
 use hudsucker::hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoServerBuilder};
@@ -814,13 +815,15 @@ fn test_append_stream_capture_caps_buffer() {
     assert!(!append_stream_capture(&mut buffer, &[1, 2, 3]));
     assert_eq!(buffer.len(), 3);
 
-    let remaining = STREAM_CAPTURE_MAX_BYTES - buffer.len();
-    let mut chunk = vec![9u8; remaining + 16];
-    assert!(append_stream_capture(&mut buffer, &chunk));
+    let chunk = vec![9u8; 64 * 1024];
+    while buffer.len() < STREAM_CAPTURE_MAX_BYTES {
+        let remaining = STREAM_CAPTURE_MAX_BYTES - buffer.len();
+        let write_len = remaining.min(chunk.len());
+        assert!(!append_stream_capture(&mut buffer, &chunk[..write_len]));
+    }
     assert_eq!(buffer.len(), STREAM_CAPTURE_MAX_BYTES);
 
-    chunk.truncate(1);
-    assert!(append_stream_capture(&mut buffer, &chunk));
+    assert!(append_stream_capture(&mut buffer, &[9u8; 1]));
     assert_eq!(buffer.len(), STREAM_CAPTURE_MAX_BYTES);
 }
 
@@ -1017,4 +1020,26 @@ fn test_custom_server_builder_accepts_large_headers_config() {
         .title_case_headers(true)
         .preserve_header_case(true);
     server.http2().max_header_list_size(262_144);
+}
+
+#[test]
+fn test_metadata_policy_never_downgrades_skip_reason() {
+    assert!(!should_downgrade_skip_reason_for_metadata_policy(
+        EXCHANGE_SKIP_REASON_NO_BUNDLE_ID
+    ));
+    assert!(!should_downgrade_skip_reason_for_metadata_policy(
+        EXCHANGE_SKIP_REASON_APP_NOT_ALLOWED
+    ));
+    assert!(!should_downgrade_skip_reason_for_metadata_policy(
+        EXCHANGE_SKIP_REASON_APP_RATE_LIMITED
+    ));
+    assert!(!should_downgrade_skip_reason_for_metadata_policy(
+        EXCHANGE_SKIP_REASON_DOMAIN_RATE_LIMITED
+    ));
+    assert!(!should_downgrade_skip_reason_for_metadata_policy(
+        EXCHANGE_SKIP_REASON_NOT_WHITELISTED
+    ));
+    assert!(!should_downgrade_skip_reason_for_metadata_policy(
+        EXCHANGE_SKIP_REASON_HOST_ORIGIN_NOT_ALLOWED
+    ));
 }

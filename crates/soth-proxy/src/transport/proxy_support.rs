@@ -202,9 +202,10 @@ pub(crate) fn is_emfile_proxy_forward_error(err: &LegacyClientError) -> bool {
     false
 }
 
-pub(crate) const STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const STREAM_CAPTURE_MAX_BYTES: usize = 100 * 1024 * 1024;
 const STREAM_CAPTURE_INITIAL_CAPACITY: usize = 64 * 1024;
 const STREAM_BUFFER_POOL_MAX_BUFFERS: usize = 32;
+const STREAM_BUFFER_POOL_MAX_RETAINED_CAPACITY: usize = 4 * 1024 * 1024;
 
 static STREAM_BUFFER_POOL: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -218,7 +219,7 @@ pub(crate) fn acquire_stream_buffer() -> Vec<u8> {
 }
 
 pub(crate) fn release_stream_buffer(mut buffer: Vec<u8>) {
-    if buffer.capacity() > STREAM_CAPTURE_MAX_BYTES {
+    if buffer.capacity() > STREAM_BUFFER_POOL_MAX_RETAINED_CAPACITY {
         return;
     }
     buffer.clear();
