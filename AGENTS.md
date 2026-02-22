@@ -13,8 +13,7 @@ Policy, budget, identity/crypto, and observability apply across all paths and no
 
 ## Workspace Map
 - `crates/soth-cli`: CLI surface and runtime lifecycle (`start/up/down/stop/logs/on/off`, `wrap`, `runtime`, `dev`).
-- `crates/soth-proxy`: MITM transport + exchange assembly.
-- `crates/soth-oisp`: bundle-driven classification, detection, filters, parsing, pricing.
+- `crates/soth-edge`: MITM transport + bundle-driven classification + exchange assembly.
 - `crates/soth-sync`: cloud sync, exchange upload queue, registry bundle cache refresh.
 - `crates/soth-dashboard`: API + WS backend for local dashboard/TUI data.
 - `crates/soth-collector`: local session collectors and incremental scans.
@@ -32,10 +31,10 @@ Bundle classification splits traffic into:
 2. `mcp`
 3. `agent_apps`
 
-Host lists can still be configured under `forward_proxy.hosts`, but runtime interception/classification is bundle-driven through OISP.
+Host lists can still be configured under `forward_proxy.hosts`, but runtime interception/classification is bundle-driven through the edge registry bundle.
 
 ## Detection Model
-- Proxy: OISP bundle rules are primary (`ua_rules`, `path_rules`, `model_rules`, `process_rules`, `env_rules`).
+- Proxy: edge registry bundle rules are primary.
 - Wrap: precedence is `--agent` override, MCP `initialize.clientInfo`, env/process hints, then unknown.
 - Events carry detection metadata (`detection_id`, `detection_reason`, `parse_confidence`, `detection_source`).
 
@@ -52,5 +51,5 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
 ## Practical Checklist for New Provider/Agent
 1. Add/update provider + domain + detection rules in cloud bundle seed/compiler.
 2. Ensure `detection_id` values are present and stable in compiled bundle/providers.
-3. Validate local classification with OISP tests and proxy integration tests.
+3. Validate local classification with edge registry tests and proxy integration tests.
 4. Verify detection metadata appears in local DB and dashboard/TUI views.

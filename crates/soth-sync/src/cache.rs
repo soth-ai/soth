@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use soth_core::api::{ConfigResponse, RegistryBundleManifest, RegistryVersionResponse};
-use soth_oisp::types::bundle::parse_compiled_bundle;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -272,8 +271,8 @@ fn validate_registry_bundle_payload(bundle: &Value) -> anyhow::Result<()> {
     if is_edge_bundle_shape(bundle) {
         return Ok(());
     }
-    parse_compiled_bundle(bundle)
-        .context("bundle payload must match supported OISP bundle schema")?;
+    validate_cloud_bundle_contract(bundle)
+        .context("bundle payload must match supported cloud bundle schema")?;
     Ok(())
 }
 
@@ -407,6 +406,77 @@ fn validate_edge_bundle_contract_object(
     }
 
     Ok(())
+}
+
+fn validate_cloud_bundle_contract(bundle: &Value) -> anyhow::Result<()> {
+    let object = bundle
+        .as_object()
+        .context("cloud bundle payload root must be a JSON object")?;
+
+    if let Some(core) = object.get("core").and_then(Value::as_object) {
+        validate_cloud_bundle_providers(core.get("providers"), "core.providers")?;
+        validate_cloud_bundle_domain_index(core.get("domain_index"), "core.domain_index")?;
+        return Ok(());
+    }
+
+    validate_cloud_bundle_providers(object.get("providers"), "providers")?;
+    validate_cloud_bundle_domain_index(object.get("domain_index"), "domain_index")?;
+    Ok(())
+}
+
+fn validate_cloud_bundle_providers(providers: Option<&Value>, path: &str) -> anyhow::Result<()> {
+    let providers = providers.with_context(|| format!("cloud bundle payload missing `{path}`"))?;
+    let providers_object = providers
+        .as_object()
+        .with_context(|| format!("cloud bundle payload `{path}` must be a JSON object"))?;
+    if providers_object.is_empty() {
+        anyhow::bail!("cloud bundle payload `{path}` must include at least one provider");
+    }
+    for (provider_id, provider_value) in providers_object {
+        if provider_id.trim().is_empty() {
+            anyhow::bail!("cloud bundle payload `{path}` contains empty provider id");
+        }
+        if !provider_value.is_object() {
+            anyhow::bail!(
+                "cloud bundle payload `{path}` provider `{provider_id}` must be a JSON object"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_cloud_bundle_domain_index(
+    domain_index: Option<&Value>,
+    path: &str,
+) -> anyhow::Result<()> {
+    let domain_index =
+        domain_index.with_context(|| format!("cloud bundle payload missing `{path}`"))?;
+    match domain_index {
+        Value::Array(entries) => {
+            for (idx, entry) in entries.iter().enumerate() {
+                if !entry.is_object() {
+                    anyhow::bail!(
+                        "cloud bundle payload `{path}` entry at index {idx} must be a JSON object"
+                    );
+                }
+            }
+            Ok(())
+        }
+        Value::Object(entries) => {
+            for (host, entry) in entries {
+                if host.trim().is_empty() {
+                    anyhow::bail!("cloud bundle payload `{path}` contains empty host key");
+                }
+                if !entry.is_object() {
+                    anyhow::bail!(
+                        "cloud bundle payload `{path}` host `{host}` must map to a JSON object"
+                    );
+                }
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("cloud bundle payload `{path}` must be an array or object"),
+    }
 }
 
 fn lookup_registry_filter_alias<'a>(
@@ -1001,6 +1071,37 @@ mod tests {
             message.contains("registry bundle payload failed schema validation")
                 || message.contains("bundle payload failed contract validation")
                 || message.contains("filters missing required"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn save_registry_bundle_cache_rejects_non_object_providers_shape() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("v1");
+        let bundle = serde_json::json!({
+            "schema_version": 2,
+            "version": "v1",
+            "compiled_at": "2026-02-13T00:00:00Z",
+            "bundle_type": "cloud",
+            "providers": [],
+            "domain_index": [],
+            "filters": {
+                "whitelist": [],
+                "blacklist": [],
+                "passthrough": [],
+                "noise_keywords": []
+            }
+        });
+
+        let err =
+            save_registry_bundle_cache(&path, &metadata, "etag-1", bundle.to_string().as_bytes())
+                .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("registry bundle payload failed schema validation")
+                || message.contains("cloud bundle payload `providers` must be a JSON object"),
             "unexpected error: {message}"
         );
     }

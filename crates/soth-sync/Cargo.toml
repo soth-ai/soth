@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 soth-core = { workspace = true }
-soth-oisp = { workspace = true }
 soth-observe = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["json", "multipart"] }

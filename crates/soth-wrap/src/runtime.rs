@@ -19,8 +19,6 @@ use soth_core::{
 use soth_helper::pii::PiiEventEnricher;
 use soth_helper::pipeline::RequestContext as PipelineRequestContext;
 use soth_helper::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
-use soth_oisp::types::provider::EntryType;
-use soth_oisp::{DetectionContext, OispEngine};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -72,8 +70,6 @@ struct WrapSession {
     server_name: String,
     agent: RwLock<AgentInfo>,
     detection_metadata: RwLock<WrapDetectionMetadata>,
-    oisp_engine: Option<Arc<OispEngine>>,
-    env_keys: Arc<Vec<String>>,
     event_logger: Option<EventLogger>,
     exchange: soth_core::config::types::ExchangeConfig,
     request_contexts: RwLock<std::collections::HashMap<String, WrapRequestContext>>,
@@ -216,120 +212,13 @@ fn initialize_detection_metadata() -> WrapDetectionMetadata {
     }
 }
 
-fn bundle_unknown_detection_metadata() -> WrapDetectionMetadata {
+fn unknown_detection_metadata() -> WrapDetectionMetadata {
     WrapDetectionMetadata {
-        detection_reason: Some("bundle_unclassified".to_string()),
+        detection_reason: Some("unknown".to_string()),
         parse_confidence: Some(0.0),
         detection_id: None,
-        detection_source: Some("bundle".to_string()),
+        detection_source: Some("unknown".to_string()),
     }
-}
-
-fn collect_environment_keys() -> Arc<Vec<String>> {
-    let mut keys = std::env::vars()
-        .map(|(key, _)| key)
-        .filter(|key| !key.trim().is_empty())
-        .collect::<Vec<String>>();
-    keys.sort();
-    keys.dedup();
-    Arc::new(keys)
-}
-
-fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
-    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
-    if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
-        if let Some(parent) = config_cache_path.parent() {
-            return parent.join(cache_name);
-        }
-    }
-    dirs::home_dir()
-        .map(|home| home.join(".soth").join(cache_name))
-        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
-}
-
-fn load_wrap_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
-    let cache_path = resolve_registry_bundle_cache_path(config);
-    let engine = match OispEngine::load_from_registry_cache(cache_path.as_path()) {
-        Ok(Some(engine)) => {
-            info!(
-                cache = %cache_path.display(),
-                bundle_version = %engine.bundle_version(),
-                providers = engine.provider_count(),
-                "Loaded OISP bundle for wrap detection"
-            );
-            engine
-        }
-        Ok(None) => {
-            warn!(
-                cache = %cache_path.display(),
-                "Wrap detection registry cache missing; detection bundle unavailable"
-            );
-            return None;
-        }
-        Err(error) => {
-            warn!(
-                cache = %cache_path.display(),
-                error = %error,
-                "Failed loading wrap detection registry cache; detection bundle unavailable"
-            );
-            return None;
-        }
-    };
-
-    Some(Arc::new(engine))
-}
-
-fn build_bundle_detection_context(
-    params: Option<&serde_json::Value>,
-    env_keys: &[String],
-) -> DetectionContext {
-    let client_name = params
-        .and_then(|value| value.get("clientInfo"))
-        .and_then(|info| info.get("name"))
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned);
-    let client_version = params
-        .and_then(|value| value.get("clientInfo"))
-        .and_then(|info| info.get("version"))
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned);
-
-    DetectionContext {
-        client_name,
-        client_version,
-        env_keys: env_keys.to_vec(),
-        ..DetectionContext::default()
-    }
-}
-
-fn evaluate_bundle_detection(
-    oisp_engine: &OispEngine,
-    params: Option<&serde_json::Value>,
-    env_keys: &[String],
-) -> Option<WrapDetectionResolution> {
-    let context = build_bundle_detection_context(params, env_keys);
-    let scoped = oisp_engine
-        .evaluate_detection_across_entry_types(&context, &[EntryType::AgentApp, EntryType::Mcp])?;
-    let detected_name = scoped
-        .outcome
-        .agent
-        .clone()
-        .unwrap_or(scoped.provider_id.clone());
-    let normalized = agent_detect::canonicalize_agent_name(detected_name.as_str());
-    let mut agent = AgentInfo::new(normalized, DetectionSource::McpInitialize);
-    if let Some(version) = context.client_version {
-        agent = agent.with_version(version);
-    }
-
-    Some(WrapDetectionResolution {
-        agent,
-        metadata: WrapDetectionMetadata {
-            detection_reason: Some(scoped.outcome.detection_reason),
-            parse_confidence: Some(scoped.outcome.parse_confidence),
-            detection_id: scoped.outcome.detection_id,
-            detection_source: Some("bundle".to_string()),
-        },
-    })
 }
 
 fn evaluate_initialize_detection(params: &serde_json::Value) -> Option<WrapDetectionResolution> {
@@ -361,8 +250,6 @@ impl WrapSession {
         server_name: String,
         agent: AgentInfo,
         detection_metadata: WrapDetectionMetadata,
-        oisp_engine: Option<Arc<OispEngine>>,
-        env_keys: Arc<Vec<String>>,
         event_logger: Option<EventLogger>,
         exchange: soth_core::config::types::ExchangeConfig,
         enforcement: Option<Arc<WrapEnforcement>>,
@@ -392,8 +279,6 @@ impl WrapSession {
             server_name,
             agent: RwLock::new(agent),
             detection_metadata: RwLock::new(detection_metadata),
-            oisp_engine,
-            env_keys,
             event_logger,
             exchange,
             enforcement,
@@ -667,7 +552,8 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     // Derive server name
     let server_name = name.unwrap_or_else(|| derive_server_name(cmd, cmd_args));
 
-    // Resolve initial agent identity from explicit override or bundle detection.
+    // Resolve initial agent identity from explicit override; otherwise remain unknown
+    // until MCP initialize provides clientInfo.
     let initial_resolution = if let Some(ref agent_name) = agent {
         let explicit_agent = AgentInfo::new(agent_name.clone(), DetectionSource::CommandLine);
         WrapDetectionResolution {
@@ -677,22 +563,10 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     } else {
         WrapDetectionResolution {
             agent: AgentInfo::unknown(),
-            metadata: bundle_unknown_detection_metadata(),
+            metadata: unknown_detection_metadata(),
         }
     };
     let config = load_wrap_config(config.as_ref())?;
-    let oisp_engine = load_wrap_oisp_engine(&config);
-    let env_keys = collect_environment_keys();
-    let initial_resolution = if matches!(
-        initial_resolution.agent.detected_from,
-        DetectionSource::CommandLine
-    ) {
-        initial_resolution
-    } else if let Some(engine) = oisp_engine.as_ref() {
-        evaluate_bundle_detection(engine, None, env_keys.as_ref()).unwrap_or(initial_resolution)
-    } else {
-        initial_resolution
-    };
 
     let pii_enricher = PiiEventEnricher::from_observe_config(&config.observe);
     let enforcement = enforcement::build_wrap_enforcement_runtime(&config)?
@@ -725,8 +599,6 @@ pub async fn run(args: WrapArgs) -> Result<()> {
         server_name.clone(),
         initial_resolution.agent,
         initial_resolution.metadata,
-        oisp_engine,
-        env_keys,
         event_logger,
         config.exchange.clone(),
         enforcement,
@@ -1004,18 +876,14 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
             // Handle initialize message - extract agent info
             if method == "initialize" {
                 if let Some(params) = msg.get("params") {
-                    let bundle_resolution = session.oisp_engine.as_ref().and_then(|engine| {
-                        evaluate_bundle_detection(engine, Some(params), session.env_keys.as_ref())
-                    });
-                    let resolution =
-                        bundle_resolution.or_else(|| evaluate_initialize_detection(params));
+                    let resolution = evaluate_initialize_detection(params);
 
                     if let Some(resolution) = resolution {
                         session.update_agent(resolution.agent).await;
                         session.update_detection_metadata(resolution.metadata).await;
                     } else {
                         session
-                            .update_detection_metadata(bundle_unknown_detection_metadata())
+                            .update_detection_metadata(unknown_detection_metadata())
                             .await;
                     }
                     // Update event with latest agent info.

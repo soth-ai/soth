@@ -6,7 +6,6 @@ pub mod metrics;
 pub mod pii;
 pub mod pipeline;
 pub mod protocol;
-pub mod usage;
 
 pub use error::{ProxyError, Result};
 pub use pipeline::{

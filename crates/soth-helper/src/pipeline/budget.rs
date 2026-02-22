@@ -6,7 +6,6 @@ use crate::metrics;
 use crate::protocol::{methods, JsonRpcError, JsonRpcMessage, JsonRpcRequest};
 use soth_budget::BudgetTracker;
 use soth_core::types::budget::BudgetScope;
-use soth_oisp::OispEngine;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -39,8 +38,6 @@ pub struct BudgetLayer {
     config: BudgetConfig,
     /// Budget tracker
     tracker: Arc<BudgetTracker>,
-    /// Bundle-driven pricing source of truth.
-    oisp_engine: Option<Arc<OispEngine>>,
 }
 
 impl BudgetLayer {
@@ -49,7 +46,6 @@ impl BudgetLayer {
         Self {
             config,
             tracker: Arc::new(BudgetTracker::new()),
-            oisp_engine: None,
         }
     }
 
@@ -58,14 +54,7 @@ impl BudgetLayer {
         Self {
             config,
             tracker: Arc::new(tracker),
-            oisp_engine: None,
         }
-    }
-
-    /// Attach an OISP engine for bundle-backed pricing lookups.
-    pub fn with_oisp_engine(mut self, oisp_engine: Arc<OispEngine>) -> Self {
-        self.oisp_engine = Some(oisp_engine);
-        self
     }
 
     /// Set global budget limits
@@ -125,10 +114,13 @@ impl BudgetLayer {
         Arc::clone(&self.tracker)
     }
 
-    fn estimate_cost_usd(&self, model: &str, input_tokens: u64, output_tokens: u64) -> Option<f64> {
-        self.oisp_engine.as_ref().and_then(|engine| {
-            engine.calculate_cost(&[], model, input_tokens, output_tokens, None, None)
-        })
+    fn estimate_cost_usd(
+        &self,
+        _model: &str,
+        _input_tokens: u64,
+        _output_tokens: u64,
+    ) -> Option<f64> {
+        None
     }
 
     /// Extract model name from message or context

@@ -8,7 +8,6 @@ use soth_helper::pipeline::budget::{BudgetConfig, BudgetLayer};
 use soth_helper::pipeline::identity::{IdentityConfig, IdentityLayer, IdentityMode};
 use soth_helper::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
 use soth_helper::pipeline::{Pipeline, PipelineBuilder};
-use soth_oisp::OispEngine;
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine, PolicyLoader};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -277,47 +276,6 @@ fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTrac
     Ok(Some(tracker))
 }
 
-fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
-    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
-    if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
-        if let Some(parent) = config_cache_path.parent() {
-            return parent.join(cache_name);
-        }
-    }
-    dirs::home_dir()
-        .map(|home| home.join(".soth").join(cache_name))
-        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
-}
-
-fn load_budget_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
-    let cache_path = resolve_registry_bundle_cache_path(config);
-    match OispEngine::load_from_registry_cache(cache_path.as_path()) {
-        Ok(Some(engine)) => {
-            info!(
-                cache = %cache_path.display(),
-                bundle_version = %engine.bundle_version(),
-                "Loaded OISP bundle for wrap budget pricing"
-            );
-            Some(Arc::new(engine))
-        }
-        Ok(None) => {
-            warn!(
-                cache = %cache_path.display(),
-                "Wrap budget pricing bundle unavailable; budget cost metadata disabled"
-            );
-            None
-        }
-        Err(error) => {
-            warn!(
-                cache = %cache_path.display(),
-                error = %error,
-                "Failed loading bundle for wrap budget pricing; budget cost metadata disabled"
-            );
-            None
-        }
-    }
-}
-
 pub fn build_wrap_enforcement_runtime(
     config: &SothConfig,
 ) -> anyhow::Result<Option<WrapEnforcementRuntime>> {
@@ -376,7 +334,7 @@ pub fn build_wrap_enforcement_runtime(
 
     if let Some(tracker) = build_budget_tracker(config)? {
         enabled = true;
-        let mut layer = BudgetLayer::with_tracker(
+        let layer = BudgetLayer::with_tracker(
             BudgetConfig {
                 enabled: true,
                 block_on_exceeded: true,
@@ -384,9 +342,6 @@ pub fn build_wrap_enforcement_runtime(
             },
             tracker,
         );
-        if let Some(engine) = load_budget_oisp_engine(config) {
-            layer = layer.with_oisp_engine(engine);
-        }
         pipeline_builder = pipeline_builder.layer(layer);
     }
 

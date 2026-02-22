@@ -14,7 +14,6 @@ soth-budget = { workspace = true }
 soth-core = { workspace = true }
 soth-crypto = { workspace = true }
 soth-observe = { workspace = true }
-soth-oisp = { workspace = true }
 soth-policy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
