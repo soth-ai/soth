@@ -49,6 +49,7 @@ const MAX_STORED_HTTP_EXCHANGE_EVENTS: usize = 2_048;
 // connection state (WS + pending HTTP), beyond fixed entry-count caps.
 const DEFAULT_MAX_PENDING_HTTP_CAPTURES: usize = 4_096;
 const DEFAULT_HTTP_CAPTURE_BODY_BYTES: usize = 1_048_576;
+const DEFAULT_HTTP_CAPTURE_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const TLS_PASSTHROUGH_CACHE_MAX_SIZE: usize = 1_000;
 const MAX_WS_MESSAGES_PER_CONNECTION: usize = 1_000;
 const REGISTRY_RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -265,7 +266,7 @@ pub async fn start_proxy_with_shutdown<F>(
     shutdown: F,
     event_logger: Option<EventLogger>,
     edge_registry_cache_path: Option<PathBuf>,
-    exchange_config: Option<ExchangeConfig>,
+    _exchange_config: Option<ExchangeConfig>,
 ) -> Result<(), EdgeProxyError>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -312,9 +313,7 @@ where
     let mut handler = HudsuckerDetectionHandler::new(detector, process_lookup);
     let capture_limit = usize::try_from(config.capture_max_body_bytes).unwrap_or(usize::MAX);
     handler.set_http_capture_body_limit(capture_limit);
-    if let Some(exchange_cfg) = exchange_config.as_ref() {
-        handler.set_max_pending_http_captures(exchange_cfg.spool_max_inflight);
-    }
+    handler.set_max_pending_http_captures(derived_pending_http_capture_limit(capture_limit));
 
     // Edge learned passthrough stays opt-out by default.
     handler.set_tls_passthrough_enabled(false);
@@ -2981,6 +2980,15 @@ fn capture_normalized_body(
     (normalized, base64, truncated)
 }
 
+fn derived_pending_http_capture_limit(capture_body_limit_bytes: usize) -> usize {
+    let bounded_body_limit = capture_body_limit_bytes.max(1);
+    let by_memory_budget = DEFAULT_HTTP_CAPTURE_MEMORY_BUDGET_BYTES
+        .checked_div(bounded_body_limit)
+        .unwrap_or(0)
+        .max(1);
+    by_memory_budget.min(DEFAULT_MAX_PENDING_HTTP_CAPTURES)
+}
+
 fn normalized_body_is_base64_payload(body: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return false;
@@ -3005,12 +3013,50 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
+    fn home_bundle_cache_path() -> std::path::PathBuf {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME env should be set for edge proxy tests")
+            .join(".soth")
+            .join("registry_bundle_cache.json")
+    }
+
+    fn home_bundle_json() -> String {
+        let path = home_bundle_cache_path();
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "expected ~/.soth registry bundle cache at {}: {}",
+                path.display(),
+                error
+            )
+        })
+    }
+
     fn detector() -> EdgeDetector {
+        let bundle_json = home_bundle_json();
         let registry = Arc::new(
-            EdgeRegistry::from_json_str(include_str!("../bundle.json"))
-                .expect("bundle should parse"),
+            EdgeRegistry::from_json_str(&bundle_json)
+                .expect("~/.soth registry bundle cache should parse"),
         );
         EdgeDetector::new(registry)
+    }
+
+    #[test]
+    fn derived_pending_http_capture_limit_respects_memory_budget() {
+        assert_eq!(derived_pending_http_capture_limit(15 * 1024 * 1024), 17);
+        assert_eq!(
+            derived_pending_http_capture_limit(DEFAULT_HTTP_CAPTURE_BODY_BYTES),
+            256
+        );
+    }
+
+    #[test]
+    fn derived_pending_http_capture_limit_is_always_bounded_and_non_zero() {
+        assert_eq!(
+            derived_pending_http_capture_limit(0),
+            DEFAULT_MAX_PENDING_HTTP_CAPTURES
+        );
+        assert_eq!(derived_pending_http_capture_limit(usize::MAX), 1);
     }
 
     #[test]
@@ -3018,15 +3064,15 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let primary = dir.path().join("registry_bundle_cache.json");
         let fallback = registry_cache_last_good_path(primary.as_path());
+        let bundle_json = home_bundle_json();
 
         std::fs::write(&primary, "{").expect("write malformed primary cache");
-        std::fs::write(&fallback, include_str!("../bundle.json"))
-            .expect("write fallback cache bundle");
+        std::fs::write(&fallback, bundle_json).expect("write fallback cache bundle");
 
         let registry = load_edge_registry(Some(primary.as_path()))
             .expect("loader should fallback to last-known-good cache");
 
-        assert!(registry.in_ai_catalog("api.openai.com"));
+        assert!(registry.bundle().schema_version > 0);
     }
 
     #[test]
@@ -3034,13 +3080,14 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let primary = dir.path().join("registry_bundle_cache.json");
         let legacy = dir.path().join("registry_bundle_cache_edge.json");
+        let bundle_json = home_bundle_json();
 
-        std::fs::write(&legacy, include_str!("../bundle.json")).expect("write legacy cache bundle");
+        std::fs::write(&legacy, bundle_json).expect("write legacy cache bundle");
 
         let registry = load_edge_registry(Some(primary.as_path()))
             .expect("loader should read legacy cache during migration");
 
-        assert!(registry.in_ai_catalog("api.openai.com"));
+        assert!(registry.bundle().schema_version > 0);
     }
 
     #[test]

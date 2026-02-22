@@ -96,10 +96,13 @@ impl ConfigPuller {
     }
 
     fn should_apply_version(&self, version: &str) -> bool {
-        let mut state = self
-            .debounce_state
-            .lock()
-            .expect("config pull debounce state lock poisoned");
+        let mut state = match self.debounce_state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                warn!("config pull debounce state lock poisoned; recovering state");
+                poisoned.into_inner()
+            }
+        };
         evaluate_debounce(&mut state, version, self.debounce_window, Instant::now())
     }
 }

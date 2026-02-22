@@ -53,8 +53,11 @@ async fn compile_policies(input: PathBuf, output: Option<PathBuf>) -> Result<()>
 
             match PolicyCompiler::compile_yaml(&content) {
                 Ok(rego) => {
-                    let output_name =
-                        path.file_stem().unwrap().to_string_lossy().to_string() + ".rego";
+                    let Some(stem) = path.file_stem() else {
+                        println!("Skipped malformed policy filename: {path:?}");
+                        continue;
+                    };
+                    let output_name = stem.to_string_lossy().to_string() + ".rego";
                     let output_path = output_dir.join(&output_name);
 
                     fs::write(&output_path, &rego).await?;

@@ -33,6 +33,7 @@ use tempfile::TempDir;
 
 const TEST_BUNDLE_VERSION: &str = "bundle-v1";
 const TEST_BUNDLE_JSON: &str = r#"{
+  "schema_version": 1,
   "version":"bundle-v1",
   "compiled_at":"2026-02-13T00:00:00Z",
   "bundle_type":"local",
@@ -45,7 +46,12 @@ const TEST_BUNDLE_JSON: &str = r#"{
       "domains":["api.openai.com"]
     }
   },
-  "filters":{},
+  "filters":{
+    "whitelist":[],
+    "blacklist":[],
+    "passthrough":[],
+    "noise_keywords":[]
+  },
   "pricing":{},
   "stats":{"providers":1,"domains":1,"formats":1}
 }"#;
@@ -80,6 +86,12 @@ async fn contract_sync_endpoints_and_cursors() {
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, false);
+    let first_exchange = make_exchange_event("11111111-2222-3333-4444-555555555551");
+    seed_exchange_upload_queue_event_with_blobs(
+        &db_path,
+        &first_exchange,
+        Some(test_blob_payload_items()),
+    );
     let cache_path = temp.path().join("cloud_cache.json");
     let registry_cache_path = temp.path().join("registry_cache.json");
     let retry_queue_dir = temp.path().join("retry");
@@ -96,7 +108,7 @@ async fn contract_sync_endpoints_and_cursors() {
         api_key: "test-key".to_string(),
         event_db_path: db_path.clone(),
         cache_path,
-        registry_cache_path: None,
+        registry_cache_path: Some(registry_cache_path.clone()),
         agent_instance_id: "agent-instance-test".to_string(),
         proxy_version: "0.1.0-test".to_string(),
         retry_queue_dir,
@@ -129,22 +141,12 @@ async fn contract_sync_endpoints_and_cursors() {
     assert!(heartbeat_ok);
 
     let conn = Connection::open(&db_path).unwrap();
-    let metadata_cursor: String = conn
-        .query_row(
-            "SELECT value FROM sync_state WHERE key = 'last_synced_seq'",
-            [],
-            |row| row.get(0),
-        )
+    let queue_depth: i64 = conn
+        .query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
+            row.get(0)
+        })
         .unwrap();
-    let body_cursor: String = conn
-        .query_row(
-            "SELECT value FROM sync_state WHERE key = 'last_body_synced_seq'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(metadata_cursor, "1");
-    assert_eq!(body_cursor, "1");
+    assert_eq!(queue_depth, 0);
 
     let captured = state.lock().unwrap().clone();
     assert_eq!(captured.metadata_requests.len(), 1);
@@ -265,6 +267,12 @@ async fn contract_retry_queue_on_body_upload_failure() {
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, false);
+    let first_exchange = make_exchange_event("11111111-2222-3333-4444-555555555561");
+    seed_exchange_upload_queue_event_with_blobs(
+        &db_path,
+        &first_exchange,
+        Some(test_blob_payload_items()),
+    );
     let cache_path = temp.path().join("cloud_cache.json");
     let registry_cache_path = temp.path().join("registry_cache.json");
     let retry_queue_dir = temp.path().join("retry");
@@ -309,19 +317,28 @@ async fn contract_retry_queue_on_body_upload_failure() {
     assert_eq!(first.exchange_retry_deferred, 1);
     assert_eq!(first.exchange_dropped, 0);
 
-    let queued_files = std::fs::read_dir(&retry_queue_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .count();
-    assert!(
-        queued_files > 0,
-        "retry queue should persist failed body upload"
-    );
+    let conn = Connection::open(&db_path).unwrap();
+    let attempt_count: i64 = conn
+        .query_row(
+            "SELECT attempt_count FROM exchange_upload_queue WHERE exchange_id = ?1",
+            [first_exchange.exchange_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_count, 1);
+    let next_attempt_at: String = conn
+        .query_row(
+            "SELECT next_attempt_at FROM exchange_upload_queue WHERE exchange_id = ?1",
+            [first_exchange.exchange_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!next_attempt_at.is_empty());
 
     let second = agent.tick().await.unwrap();
     assert_eq!(second.exchange_sent, 0);
     assert_eq!(second.exchange_blob_uploaded, 0);
-    assert_eq!(second.exchange_retry_deferred, 1);
+    assert_eq!(second.exchange_retry_deferred, 0);
     assert_eq!(second.exchange_dropped, 0);
 }
 
@@ -338,6 +355,14 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("events.db");
     create_test_db(&db_path, true);
+    let first_exchange = make_exchange_event("11111111-2222-3333-4444-555555555571");
+    seed_exchange_upload_queue_event_with_blobs(
+        &db_path,
+        &first_exchange,
+        Some(test_blob_payload_items()),
+    );
+    let second_exchange = make_exchange_event("11111111-2222-3333-4444-555555555572");
+    seed_exchange_upload_queue_event(&db_path, &second_exchange);
     let cache_path = temp.path().join("cloud_cache.json");
     let registry_cache_path = temp.path().join("registry_cache.json");
     let retry_queue_dir = temp.path().join("retry");
@@ -380,18 +405,21 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
     assert_eq!(summary.exchange_sent, 2);
     assert_eq!(summary.exchange_blob_uploaded, 1);
     let captured = state.lock().unwrap().clone();
-    assert_eq!(captured.metadata_requests.len(), 1);
-    assert_eq!(captured.metadata_requests[0].batch.len(), 2);
+    assert_eq!(captured.metadata_requests.len(), 2);
+    let total_events_sent: usize = captured
+        .metadata_requests
+        .iter()
+        .map(|request| request.batch.len())
+        .sum();
+    assert_eq!(total_events_sent, 2);
 
     let conn = Connection::open(&db_path).unwrap();
-    let metadata_cursor: String = conn
-        .query_row(
-            "SELECT value FROM sync_state WHERE key = 'last_synced_seq'",
-            [],
-            |row| row.get(0),
-        )
+    let queue_depth: i64 = conn
+        .query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
+            row.get(0)
+        })
         .unwrap();
-    assert_eq!(metadata_cursor, "2");
+    assert_eq!(queue_depth, 0);
 }
 
 #[tokio::test]
@@ -978,10 +1006,18 @@ fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
     .unwrap();
 
     let event = make_exchange_event(exchange_id);
-    seed_exchange_upload_queue_event(path, &event);
+    seed_exchange_upload_queue_event_with_blobs(path, &event, None);
 }
 
 fn seed_exchange_upload_queue_event(path: &Path, event: &ExchangeEvent) {
+    seed_exchange_upload_queue_event_with_blobs(path, event, None);
+}
+
+fn seed_exchange_upload_queue_event_with_blobs(
+    path: &Path,
+    event: &ExchangeEvent,
+    blobs_json: Option<String>,
+) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
         r#"
@@ -1004,15 +1040,30 @@ fn seed_exchange_upload_queue_event(path: &Path, event: &ExchangeEvent) {
         INSERT INTO exchange_upload_queue (
             exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
         )
-        VALUES (?1, ?2, NULL, 0, NULL, ?3, ?3)
+        VALUES (?1, ?2, ?3, 0, NULL, ?4, ?4)
         "#,
         (
             event.exchange_id.as_str(),
             serde_json::to_string(event).unwrap(),
+            blobs_json,
             now,
         ),
     )
     .unwrap();
+}
+
+fn test_blob_payload_items() -> String {
+    serde_json::to_string(&vec![json!({
+        "side": "request",
+        "reference": "blob://local/request-1",
+        "content_encoding": "gzip",
+        "content_type": "application/json",
+        "sha256": "f".repeat(64),
+        "bytes_raw": 128,
+        "bytes_gzip": 80,
+        "payload_gzip_b64": "H4sIAAAAAAAA/0tMTEwEAEXLMt0EAAAA"
+    })])
+    .unwrap()
 }
 
 fn make_event(id: &str) -> WrapEvent {

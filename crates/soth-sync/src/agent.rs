@@ -284,6 +284,7 @@ impl SyncAgent {
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
         let retry_queue =
             BodyRetryQueue::new(&config.retry_queue_dir, config.retry_queue_max_bytes)?;
+        ensure_exchange_sync_schema(config.event_db_path.as_path())?;
         if let Err(error) = run_exchange_uuid_cleanup_migration(config.event_db_path.as_path()) {
             warn!(
                 error = %error,
@@ -627,11 +628,15 @@ impl SyncAgent {
             .metadata_max_events_per_batch
             .max(self.config.batch_size)
             .max(1);
-        if self.config.frontload_enabled {
+        let mut load_limit = if self.config.frontload_enabled {
             live_limit.max(self.config.frontload_max_events_per_batch.max(1))
         } else {
             live_limit
+        };
+        if self.config.body_upload_enabled {
+            load_limit = load_limit.min(self.config.body_batch_size.max(1));
         }
+        load_limit
     }
 
     async fn prepare_exchange_queue_row(
@@ -1045,22 +1050,23 @@ impl SyncAgent {
 
     fn load_exchange_queue_ready(&self, limit: usize) -> anyhow::Result<Vec<ExchangeQueueRow>> {
         let conn = open_read_conn(&self.config.event_db_path)?;
-        let mut stmt = match conn.prepare(
-            r#"
-            SELECT exchange_id, payload_json, blobs_json, attempt_count
-            FROM exchange_upload_queue
-            WHERE next_attempt_at IS NULL
-               OR next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            ORDER BY updated_at ASC
-            LIMIT ?1
-            "#,
-        ) {
-            Ok(stmt) => stmt,
-            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => {
-                return Ok(Vec::new());
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT exchange_id, payload_json, blobs_json, attempt_count
+                FROM exchange_upload_queue
+                WHERE next_attempt_at IS NULL
+                   OR next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ORDER BY updated_at ASC
+                LIMIT ?1
+                "#,
+            )
+            .with_context(|| {
+                format!(
+                    "failed preparing exchange upload queue read {}",
+                    self.config.event_db_path.display()
+                )
+            })?;
 
         let mut rows = stmt.query([limit.max(1) as i64])?;
         let mut out = Vec::new();
@@ -1078,14 +1084,17 @@ impl SyncAgent {
 
     fn load_exchange_queue_depth(&self) -> anyhow::Result<u64> {
         let conn = open_read_conn(&self.config.event_db_path)?;
-        let depth = match conn.query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
-            row.get::<_, i64>(0)
-        }) {
-            Ok(count) => count.max(0) as u64,
-            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => 0,
-            Err(error) => return Err(error.into()),
-        };
-        Ok(depth)
+        let depth = conn
+            .query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .with_context(|| {
+                format!(
+                    "failed reading exchange upload queue depth {}",
+                    self.config.event_db_path.display()
+                )
+            })?;
+        Ok(depth.max(0) as u64)
     }
 
     fn mark_exchange_queue_attempt(
@@ -1101,7 +1110,7 @@ impl SyncAgent {
             .min(MAX_EXCHANGE_RETRY_BACKOFF_SECS)
             .max(1);
 
-        match conn.execute(
+        conn.execute(
             r#"
             UPDATE exchange_upload_queue
             SET attempt_count = attempt_count + 1,
@@ -1110,23 +1119,31 @@ impl SyncAgent {
             WHERE exchange_id = ?1
             "#,
             params![exchange_id, retry_secs as i64],
-        ) {
-            Ok(_) => Ok(()),
-            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        )
+        .with_context(|| {
+            format!(
+                "failed updating exchange upload queue attempt {} ({})",
+                exchange_id,
+                self.config.event_db_path.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn delete_exchange_queue_entry(&self, exchange_id: &str) -> anyhow::Result<()> {
         let conn = open_rw_conn(&self.config.event_db_path)?;
-        match conn.execute(
+        conn.execute(
             "DELETE FROM exchange_upload_queue WHERE exchange_id = ?1",
             [exchange_id],
-        ) {
-            Ok(_) => Ok(()),
-            Err(error) if is_missing_table_error(&error, "exchange_upload_queue") => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        )
+        .with_context(|| {
+            format!(
+                "failed deleting exchange upload queue entry {} ({})",
+                exchange_id,
+                self.config.event_db_path.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn cached_config_version(&self) -> Option<String> {
@@ -1151,6 +1168,50 @@ impl SyncAgent {
     fn set_sync_error(&self, error: &str) -> anyhow::Result<()> {
         self.write_sync_value(SYNC_KEY_SYNC_ERRORS, error)
     }
+}
+
+fn ensure_exchange_sync_schema(path: &Path) -> anyhow::Result<()> {
+    let conn = open_rw_conn(path)?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS exchange_upload_queue (
+            exchange_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            blobs_json TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_upload_queue_next_attempt
+            ON exchange_upload_queue(next_attempt_at);
+        CREATE INDEX IF NOT EXISTS idx_exchange_upload_queue_updated_at
+            ON exchange_upload_queue(updated_at);
+        "#,
+    )
+    .with_context(|| {
+        format!(
+            "failed initializing exchange upload queue schema {}",
+            path.display()
+        )
+    })?;
+
+    if let Err(error) = conn.execute(
+        "ALTER TABLE exchange_upload_queue ADD COLUMN blobs_json TEXT",
+        [],
+    ) {
+        let message = error.to_string().to_ascii_lowercase();
+        if !message.contains("duplicate column name") {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed applying exchange_upload_queue blobs_json migration {}",
+                    path.display()
+                )
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
@@ -1742,15 +1803,6 @@ fn normalize_client_app_type_for_contract(raw: Option<&str>) -> Option<String> {
     Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string())
 }
 
-fn is_missing_table_error(error: &rusqlite::Error, table: &str) -> bool {
-    if let rusqlite::Error::SqliteFailure(_, Some(message)) = error {
-        return message
-            .to_ascii_lowercase()
-            .contains(&format!("no such table: {}", table.to_ascii_lowercase()));
-    }
-    false
-}
-
 fn is_timeout_error(error: &anyhow::Error) -> bool {
     for cause in error.chain() {
         if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
@@ -1986,6 +2038,17 @@ mod tests {
     fn create_test_agent() -> SyncAgent {
         let (_dir, agent) = create_test_agent_with_tempdir();
         agent
+    }
+
+    #[test]
+    fn ready_queue_load_limit_respects_body_batch_size_when_body_upload_enabled() {
+        let (_dir, mut agent) = create_test_agent_with_tempdir();
+        agent.config.frontload_enabled = false;
+        agent.config.batch_size = 200;
+        agent.config.metadata_max_events_per_batch = 200;
+        agent.config.body_upload_enabled = true;
+        agent.config.body_batch_size = 7;
+        assert_eq!(agent.ready_queue_load_limit(), 7);
     }
 
     fn noisy_text(len: usize, seed: u64) -> String {

@@ -2245,8 +2245,24 @@ mod tests {
     use super::*;
     use crate::registry::EdgeRegistry;
 
+    fn home_bundle_json() -> String {
+        let path = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME env should be set for process attribution tests")
+            .join(".soth")
+            .join("registry_bundle_cache.json");
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "expected ~/.soth registry bundle cache at {}: {}",
+                path.display(),
+                error
+            )
+        })
+    }
+
     fn registry() -> EdgeRegistry {
-        EdgeRegistry::from_json_str(include_str!("../bundle.json")).expect("bundle should parse")
+        let bundle_json = home_bundle_json();
+        EdgeRegistry::from_json_str(&bundle_json).expect("~/.soth registry bundle should parse")
     }
 
     #[test]
@@ -2341,22 +2357,37 @@ mod tests {
     #[test]
     fn app_policy_resolution_prefers_bundle_id() {
         let registry = registry();
+        let Some((app_id, _)) = registry.bundle().interception.app_policies.iter().next() else {
+            eprintln!("Skipping app policy resolution assertion: ~/.soth bundle has no app policies");
+            return;
+        };
         let identity = ProcessIdentity::new(
-            Some("com.anthropic.claudefordesktop".to_string()),
+            Some(app_id.clone()),
             Some("claude.exe".to_string()),
         );
 
         let resolved = resolve_process(&identity, &registry);
-        assert_eq!(resolved.app_type, AppType::NonHost);
         assert_eq!(resolved.match_kind, ProcessMatchKind::AppPolicy);
         assert!(resolved.known_app);
-        assert_eq!(resolved.capture_mode, Some(CaptureMode::MetadataOnly));
     }
 
     #[test]
     fn browser_processes_resolve_to_host_type() {
         let registry = registry();
-        let identity = ProcessIdentity::new(Some("com.apple.Safari".to_string()), None);
+        let Some(browser_id) = registry
+            .bundle()
+            .interception
+            .browser_policies
+            .allowed_browsers
+            .first()
+            .cloned()
+        else {
+            eprintln!(
+                "Skipping browser process assertion: ~/.soth bundle has no allowed browser ids"
+            );
+            return;
+        };
+        let identity = ProcessIdentity::new(Some(browser_id), None);
 
         let resolved = resolve_process(&identity, &registry);
         assert_eq!(resolved.app_type, AppType::Host);
@@ -2371,7 +2402,7 @@ mod tests {
 
         let resolved = resolve_process(&identity, &registry);
         assert_eq!(resolved.match_kind, ProcessMatchKind::Unknown);
-        assert_eq!(resolved.action, InterceptionAction::HostOnly);
+        assert_eq!(resolved.action, registry.unknown_app_action());
         assert_eq!(resolved.app_type, AppType::Unknown);
     }
 

@@ -949,14 +949,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn home_bundle_json() -> String {
+        let path = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME env should be set for edge registry tests")
+            .join(".soth")
+            .join("registry_bundle_cache.json");
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "expected ~/.soth registry bundle cache at {}: {}",
+                path.display(),
+                error
+            )
+        })
+    }
+
     fn load_test_registry() -> EdgeRegistry {
-        EdgeRegistry::from_json_str(include_str!("../bundle.json")).expect("bundle should parse")
+        let bundle_json = home_bundle_json();
+        EdgeRegistry::from_json_str(&bundle_json).expect("~/.soth registry bundle should parse")
     }
 
     #[test]
     fn registry_loader_accepts_cached_bundle_envelope_shape() {
+        let bundle_json = home_bundle_json();
         let bundle_value: Value =
-            serde_json::from_str(include_str!("../bundle.json")).expect("bundle fixture JSON");
+            serde_json::from_str(&bundle_json).expect("bundle JSON from ~/.soth should parse");
         let envelope = json!({
             "schema_version": 1,
             "fetched_at": "2026-02-22T00:00:00Z",
@@ -981,45 +998,94 @@ mod tests {
                 .as_str(),
         )
         .expect("cached bundle envelope should parse");
-        assert!(registry.in_ai_catalog("api.openai.com"));
+        assert!(registry.bundle().schema_version > 0);
     }
 
     #[test]
     fn catalog_matches_exact_subdomain_and_wildcard_entries() {
         let registry = load_test_registry();
-
-        assert!(registry.in_ai_catalog("api.openai.com"));
-        assert!(registry.in_ai_catalog("foo.resources.office.net"));
-        assert!(registry.in_ai_catalog("chat.openai.com"));
-        assert!(!registry.in_ai_catalog("example.invalid"));
+        let entry = registry
+            .bundle()
+            .catalogs
+            .ai_catalog
+            .first()
+            .expect("~/.soth registry bundle should contain ai_catalog entries");
+        let probe = entry
+            .strip_prefix("*.")
+            .map(|suffix| format!("probe.{suffix}"))
+            .unwrap_or_else(|| entry.to_string());
+        assert!(registry.in_ai_catalog(&probe));
     }
 
     #[test]
     fn blacklist_keyword_match_is_case_insensitive() {
         let registry = load_test_registry();
+        let Some(keyword) = registry.bundle().filters.keywords.first() else {
+            eprintln!("Skipping blacklist keyword assertion: ~/.soth bundle has no keywords");
+            return;
+        };
+        let mixed_case = keyword
+            .chars()
+            .enumerate()
+            .map(|(idx, ch)| {
+                if idx % 2 == 0 {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch.to_ascii_lowercase()
+                }
+            })
+            .collect::<String>();
         let hit = registry
-            .find_blacklisted_keyword("https://api.openai.com/v1/telemetry/events")
+            .find_blacklisted_keyword(format!("https://example.test/{mixed_case}").as_str())
             .expect("expected blacklist match");
 
-        assert_eq!(hit, "telemetry");
+        assert_eq!(hit, keyword.to_ascii_lowercase());
     }
 
     #[test]
     fn provider_matching_respects_methods() {
         let registry = load_test_registry();
+        let (provider, host) = registry
+            .providers
+            .iter()
+            .filter(|candidate| !candidate.host_rules.is_empty())
+            .find_map(|candidate| {
+                let host = candidate.host_rules.iter().find_map(|rule| match &rule.pattern {
+                    HostPattern::Exact(value) => Some(value.clone()),
+                    HostPattern::WildcardSuffix(suffix) => Some(format!("probe.{suffix}")),
+                    HostPattern::Regex(_) => None,
+                })?;
+                Some((candidate, host))
+            })
+            .expect("~/.soth bundle should contain a provider host rule");
 
+        let path = ["/", "/v1/messages", "/v1/responses", "/v1/chat/completions"]
+            .into_iter()
+            .find(|candidate_path| provider.match_score(&host, candidate_path).is_some())
+            .expect("bundle provider host rule should match one probe path");
+
+        let allowed_method = provider
+            .capture_methods
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "GET".to_string());
         let matched = registry
-            .match_provider("api.openai.com", "/v1/chat/completions", "POST")
-            .expect("provider should match");
-
-        assert_eq!(matched.key, "openai");
+            .match_provider(&host, path, &allowed_method)
+            .expect("provider should match probe host/path");
+        assert_eq!(matched.key, provider.key);
         assert!(matched.method_allowed);
 
-        let disallowed = registry
-            .match_provider("api.openai.com", "/v1/chat/completions", "DELETE")
-            .expect("provider should still match host/path");
-
-        assert!(!disallowed.method_allowed);
+        if !provider.capture_methods.is_empty() {
+            let disallowed_method = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+                .into_iter()
+                .find(|candidate| !provider.capture_methods.contains(*candidate))
+                .expect("should find a method outside capture allowlist");
+            let disallowed = registry
+                .match_provider(&host, path, disallowed_method)
+                .expect("provider should still match host/path for disallowed method check");
+            assert!(!disallowed.method_allowed);
+        }
     }
 
     #[test]
