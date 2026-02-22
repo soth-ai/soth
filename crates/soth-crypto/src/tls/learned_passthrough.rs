@@ -34,16 +34,23 @@ pub struct LearnedPassthrough {
     entries: Arc<DashMap<String, LearnedEntry>>,
     failures: Arc<DashMap<String, ConnectFailureState>>,
     protected_patterns: Arc<Vec<String>>,
+    ignore_patterns: Arc<Vec<String>>,
     state_path: PathBuf,
     max_age: Duration,
 }
 
 impl LearnedPassthrough {
-    pub fn new(state_path: PathBuf, protected_patterns: Vec<String>, max_age: Duration) -> Self {
+    pub fn new(
+        state_path: PathBuf,
+        protected_patterns: Vec<String>,
+        ignore_patterns: Vec<String>,
+        max_age: Duration,
+    ) -> Self {
         Self {
             entries: Arc::new(DashMap::new()),
             failures: Arc::new(DashMap::new()),
             protected_patterns: Arc::new(protected_patterns),
+            ignore_patterns: Arc::new(ignore_patterns),
             state_path,
             max_age,
         }
@@ -116,6 +123,9 @@ impl LearnedPassthrough {
     }
 
     pub fn should_passthrough(&self, host: &str) -> bool {
+        if self.is_ignored(host) {
+            return true;
+        }
         if self.is_protected(host) {
             self.entries.remove(host);
             return false;
@@ -132,11 +142,12 @@ impl LearnedPassthrough {
         false
     }
 
-    pub fn record_connect_attempt(
+    pub fn record_intercept_failure(
         &self,
         host: &str,
         failure_threshold: u32,
         failure_window: Duration,
+        reason: &str,
     ) -> bool {
         if self.is_protected(host) || self.should_passthrough(host) {
             return false;
@@ -170,7 +181,7 @@ impl LearnedPassthrough {
             host.to_string(),
             LearnedEntry {
                 learned_at: Utc::now(),
-                reason: "connect_retries_without_decrypted_request".to_string(),
+                reason: reason.to_string(),
                 failure_count,
             },
         );
@@ -180,10 +191,16 @@ impl LearnedPassthrough {
 
     pub fn record_decrypted_request(&self, host: &str) {
         self.failures.remove(host);
-        if self.entries.contains_key(host) {
+        if self.entries.contains_key(host) && !self.is_ignored(host) {
             self.entries.remove(host);
             self.persist();
         }
+    }
+
+    fn is_ignored(&self, host: &str) -> bool {
+        self.ignore_patterns
+            .iter()
+            .any(|pattern| host_matches_pattern(host, pattern))
     }
 
     fn is_protected(&self, host: &str) -> bool {
@@ -235,10 +252,16 @@ mod tests {
         let learned = LearnedPassthrough::new(
             dir.path().join("lp.json"),
             vec!["api.openai.com".to_string()],
+            vec![],
             Duration::from_secs(3600),
         );
         for _ in 0..5 {
-            let _ = learned.record_connect_attempt("api.openai.com", 3, Duration::from_secs(60));
+            let _ = learned.record_intercept_failure(
+                "api.openai.com",
+                3,
+                Duration::from_secs(60),
+                "tls_handshake_failed",
+            );
         }
         assert!(!learned.should_passthrough("api.openai.com"));
         assert_eq!(learned.active_count(), 0);
@@ -250,11 +273,27 @@ mod tests {
         let learned = LearnedPassthrough::new(
             dir.path().join("lp.json"),
             vec![],
+            vec![],
             Duration::from_secs(3600),
         );
-        assert!(!learned.record_connect_attempt("example.com", 3, Duration::from_secs(60)));
-        assert!(!learned.record_connect_attempt("example.com", 3, Duration::from_secs(60)));
-        assert!(learned.record_connect_attempt("example.com", 3, Duration::from_secs(60)));
+        assert!(!learned.record_intercept_failure(
+            "example.com",
+            3,
+            Duration::from_secs(60),
+            "tls_handshake_failed",
+        ));
+        assert!(!learned.record_intercept_failure(
+            "example.com",
+            3,
+            Duration::from_secs(60),
+            "tls_handshake_failed",
+        ));
+        assert!(learned.record_intercept_failure(
+            "example.com",
+            3,
+            Duration::from_secs(60),
+            "tls_handshake_failed",
+        ));
         assert!(learned.should_passthrough("example.com"));
     }
 
@@ -264,10 +303,16 @@ mod tests {
         let learned = LearnedPassthrough::new(
             dir.path().join("lp.json"),
             vec![],
+            vec![],
             Duration::from_secs(3600),
         );
         for _ in 0..3 {
-            let _ = learned.record_connect_attempt("example.com", 3, Duration::from_secs(60));
+            let _ = learned.record_intercept_failure(
+                "example.com",
+                3,
+                Duration::from_secs(60),
+                "tls_handshake_failed",
+            );
         }
         assert!(learned.should_passthrough("example.com"));
         learned.record_decrypted_request("example.com");
@@ -279,15 +324,38 @@ mod tests {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("lp.json");
         {
-            let learned =
-                LearnedPassthrough::new(state_path.clone(), vec![], Duration::from_secs(3600));
+            let learned = LearnedPassthrough::new(
+                state_path.clone(),
+                vec![],
+                vec![],
+                Duration::from_secs(3600),
+            );
             for _ in 0..3 {
-                let _ = learned.record_connect_attempt("example.com", 3, Duration::from_secs(60));
+                let _ = learned.record_intercept_failure(
+                    "example.com",
+                    3,
+                    Duration::from_secs(60),
+                    "tls_handshake_failed",
+                );
             }
             assert!(learned.should_passthrough("example.com"));
         }
-        let learned2 = LearnedPassthrough::new(state_path, vec![], Duration::from_secs(3600));
+        let learned2 =
+            LearnedPassthrough::new(state_path, vec![], vec![], Duration::from_secs(3600));
         learned2.load();
         assert!(learned2.should_passthrough("example.com"));
+    }
+
+    #[test]
+    fn ignored_host_always_passthrough() {
+        let dir = tempdir().unwrap();
+        let learned = LearnedPassthrough::new(
+            dir.path().join("lp.json"),
+            vec![],
+            vec!["chatgpt.com".to_string()],
+            Duration::from_secs(3600),
+        );
+        assert!(learned.should_passthrough("chatgpt.com"));
+        assert_eq!(learned.active_count(), 0);
     }
 }

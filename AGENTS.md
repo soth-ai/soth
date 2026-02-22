@@ -37,7 +37,7 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
 ## Detection Model
 - Proxy: OISP bundle rules are primary (`ua_rules`, `path_rules`, `model_rules`, `process_rules`, `env_rules`).
 - Wrap: precedence is `--agent` override, MCP `initialize.clientInfo`, env/process hints, then unknown.
-- Events carry detection metadata (`detection_reason`, `parse_confidence`, `target_entity_id`, `detection_source`).
+- Events carry detection metadata (`detection_id`, `detection_reason`, `parse_confidence`, `detection_source`).
 
 ## Event Encoding
 - MCP stdio: `EventSource::Mcp` + `TrafficSource::McpStdio`.
@@ -51,6 +51,6 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
 
 ## Practical Checklist for New Provider/Agent
 1. Add/update provider + domain + detection rules in cloud bundle seed/compiler.
-2. Ensure entity IDs are present and stable in compiled bundle (`provider_entity_id` / `entity_id`).
+2. Ensure `detection_id` values are present and stable in compiled bundle/providers.
 3. Validate local classification with OISP tests and proxy integration tests.
 4. Verify detection metadata appears in local DB and dashboard/TUI views.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::matchers::normalize_host_for_matching;
 use crate::types::provider::{DetectionRule, ProviderDefinition};
 use anyhow::Context;
 use serde_json::{Map, Value};
@@ -100,7 +101,7 @@ fn parse_catalog_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         &provider_path_hints,
         interception_patterns,
     )?;
-    let filters = parse_catalog_filters(object, &domain_index, interception_patterns)?;
+    let filters = parse_catalog_filters(object)?;
     let pricing = parse_pricing_catalog(object.get("pricing"));
 
     let stats = object
@@ -125,6 +126,9 @@ fn parse_catalog_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let catalog_domains = parse_catalog_domains(object, None);
+    let gating = parse_bundle_gating(object, None);
+    let connect_policy = parse_bundle_connect_policy(object, None);
+    let decision_rules = parse_bundle_decision_rules(object, None);
 
     Ok(CompiledBundle {
         schema_version: compiled_bundle_schema_version(),
@@ -138,6 +142,9 @@ fn parse_catalog_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         stats,
         formats,
         catalog_domains,
+        gating,
+        connect_policy,
+        decision_rules,
         meta: object.get("meta").cloned(),
         signatures: object.get("signatures").cloned(),
     })
@@ -192,7 +199,7 @@ fn parse_sectioned_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         &provider_path_hints,
         interception_patterns,
     )?;
-    let filters = parse_filters_section(root, core, &domain_index, interception_patterns)?;
+    let filters = parse_filters_section(root, core)?;
     let pricing = parse_pricing_catalog(core.get("pricing").or_else(|| root.get("pricing")));
     let formats = root
         .get("formats")
@@ -203,6 +210,9 @@ fn parse_sectioned_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let catalog_domains = parse_catalog_domains(root, Some(core));
+    let gating = parse_bundle_gating(root, Some(core));
+    let connect_policy = parse_bundle_connect_policy(root, Some(core));
+    let decision_rules = parse_bundle_decision_rules(root, Some(core));
 
     let stats = root
         .get("stats")
@@ -226,6 +236,9 @@ fn parse_sectioned_bundle(value: &Value) -> anyhow::Result<CompiledBundle> {
         stats,
         formats,
         catalog_domains,
+        gating,
+        connect_policy,
+        decision_rules,
         meta: root.get("meta").cloned(),
         signatures: root.get("signatures").cloned(),
     })
@@ -265,8 +278,8 @@ fn parse_catalog_providers(
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToString::to_string);
-        let entity_id = provider_obj
-            .get("entity_id")
+        let detection_id = provider_obj
+            .get("detection_id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
@@ -298,7 +311,7 @@ fn parse_catalog_providers(
             provider_id.clone(),
             ResolvedProvider {
                 id: provider_id.clone(),
-                entity_id,
+                detection_id,
                 name,
                 entry_type,
                 api_format,
@@ -403,11 +416,6 @@ fn parse_catalog_domain_index(
             if let Some(extra) = provider_path_hints.get(&entry.provider_id) {
                 entry.paths.extend(extra.iter().cloned());
             }
-            if entry.provider_entity_id.is_none() {
-                entry.provider_entity_id = providers
-                    .get(&entry.provider_id)
-                    .and_then(|provider| provider.entity_id.clone());
-            }
             if let Some(host_rules) = interception_patterns
                 .and_then(|patterns| patterns.get(&entry.host))
                 .and_then(Value::as_array)
@@ -474,14 +482,9 @@ fn parse_catalog_domain_index(
         }
         prune_catch_all_path_rules(&mut paths, &entry_type);
         dedup_sort_strings(&mut paths);
-        let provider_entity_id = providers
-            .get(&provider_id)
-            .and_then(|provider| provider.entity_id.clone());
-
         out.push(DomainIndexEntry {
             host: host.clone(),
             provider_id,
-            provider_entity_id,
             entry_type,
             paths,
         });
@@ -553,60 +556,20 @@ fn parse_catalog_domain_index_array_entry(
     }
     prune_catch_all_path_rules(&mut paths, &entry_type);
     dedup_sort_strings(&mut paths);
-    let provider_entity_id = providers
-        .get(&provider_id)
-        .and_then(|provider| provider.entity_id.clone());
-
     Ok(DomainIndexEntry {
         host,
         provider_id,
-        provider_entity_id,
         entry_type,
         paths,
     })
 }
 
-fn parse_catalog_filters(
-    root: &Map<String, Value>,
-    domain_index: &[DomainIndexEntry],
-    interception_patterns: Option<&Map<String, Value>>,
-) -> anyhow::Result<DomainFilters> {
-    if let Some(raw_filters) = root.get("filters") {
-        let mut filters: DomainFilters =
-            serde_json::from_value(raw_filters.clone()).context("invalid filters object")?;
-        normalize_domain_filters(&mut filters);
-        return Ok(filters);
-    }
-
-    let mut whitelist = interception_patterns
-        .map(|patterns| patterns.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    if whitelist.is_empty() {
-        whitelist = domain_index
-            .iter()
-            .map(|entry| entry.host.clone())
-            .collect();
-    }
-
-    let mut passthrough =
-        extract_string_array(root.get("passthrough").and_then(|v| v.get("domains")));
-    passthrough.extend(
-        extract_string_array(root.get("passthrough").and_then(|v| v.get("patterns")))
-            .into_iter()
-            .map(|pattern| normalize_pattern_for_host_matching(&pattern)),
-    );
-    let mut noise_keywords =
-        extract_string_array(root.get("noise_filter").and_then(|v| v.get("words")));
-    noise_keywords.extend(extract_string_array(
-        root.get("noise_filter").and_then(|v| v.get("paths")),
-    ));
-
-    let mut filters = DomainFilters {
-        whitelist,
-        blacklist: Vec::new(),
-        passthrough,
-        noise_keywords,
-    };
+fn parse_catalog_filters(root: &Map<String, Value>) -> anyhow::Result<DomainFilters> {
+    let raw_filters = root
+        .get("filters")
+        .context("bundle requires canonical `filters` object")?;
+    let mut filters: DomainFilters =
+        serde_json::from_value(raw_filters.clone()).context("invalid filters object")?;
     normalize_domain_filters(&mut filters);
     Ok(filters)
 }
@@ -614,16 +577,15 @@ fn parse_catalog_filters(
 fn parse_filters_section(
     root: &Map<String, Value>,
     core: &Map<String, Value>,
-    domain_index: &[DomainIndexEntry],
-    interception_patterns: Option<&Map<String, Value>>,
 ) -> anyhow::Result<DomainFilters> {
-    if let Some(raw_filters) = root.get("filters").or_else(|| core.get("filters")) {
-        let mut filters: DomainFilters =
-            serde_json::from_value(raw_filters.clone()).context("invalid filters section")?;
-        normalize_domain_filters(&mut filters);
-        return Ok(filters);
-    }
-    parse_catalog_filters(root, domain_index, interception_patterns)
+    let raw_filters = root
+        .get("filters")
+        .or_else(|| core.get("filters"))
+        .context("bundle requires canonical `filters` object")?;
+    let mut filters: DomainFilters =
+        serde_json::from_value(raw_filters.clone()).context("invalid filters section")?;
+    normalize_domain_filters(&mut filters);
+    Ok(filters)
 }
 
 fn parse_catalog_domains(
@@ -647,6 +609,145 @@ fn parse_catalog_domains(
 
     dedup_sort_strings(&mut domains);
     domains
+}
+
+fn parse_bundle_gating(
+    root: &Map<String, Value>,
+    core: Option<&Map<String, Value>>,
+) -> BundleGating {
+    let mut allowed_app_origins = AllowedAppOrigins::default();
+    let mut allowed_host_origins = Vec::new();
+
+    collect_allowed_app_origins(root.get("allowed_app_origins"), &mut allowed_app_origins);
+    allowed_host_origins.extend(extract_allowed_host_origins(
+        root.get("allowed_host_origins"),
+    ));
+    if let Some(data) = root.get("data").and_then(Value::as_object) {
+        collect_allowed_app_origins(data.get("allowed_app_origins"), &mut allowed_app_origins);
+        allowed_host_origins.extend(extract_allowed_host_origins(
+            data.get("allowed_host_origins"),
+        ));
+        if let Some(gating) = data.get("gating").and_then(Value::as_object) {
+            collect_allowed_app_origins(
+                gating.get("allowed_app_origins"),
+                &mut allowed_app_origins,
+            );
+            allowed_host_origins.extend(extract_allowed_host_origins(
+                gating.get("allowed_host_origins"),
+            ));
+        }
+    }
+
+    if let Some(gating) = root.get("gating").and_then(Value::as_object) {
+        collect_allowed_app_origins(gating.get("allowed_app_origins"), &mut allowed_app_origins);
+        allowed_host_origins.extend(extract_allowed_host_origins(
+            gating.get("allowed_host_origins"),
+        ));
+    }
+
+    if let Some(core) = core {
+        collect_allowed_app_origins(core.get("allowed_app_origins"), &mut allowed_app_origins);
+        allowed_host_origins.extend(extract_allowed_host_origins(
+            core.get("allowed_host_origins"),
+        ));
+        if let Some(data) = core.get("data").and_then(Value::as_object) {
+            collect_allowed_app_origins(data.get("allowed_app_origins"), &mut allowed_app_origins);
+            allowed_host_origins.extend(extract_allowed_host_origins(
+                data.get("allowed_host_origins"),
+            ));
+        }
+        if let Some(gating) = core.get("gating").and_then(Value::as_object) {
+            collect_allowed_app_origins(
+                gating.get("allowed_app_origins"),
+                &mut allowed_app_origins,
+            );
+            allowed_host_origins.extend(extract_allowed_host_origins(
+                gating.get("allowed_host_origins"),
+            ));
+        }
+    }
+
+    normalize_identifier_patterns(&mut allowed_app_origins.hosts);
+    normalize_identifier_patterns(&mut allowed_app_origins.non_hosts);
+    normalize_identifier_patterns(&mut allowed_app_origins.apps_with_parsers);
+    normalize_host_origin_patterns(&mut allowed_host_origins);
+
+    BundleGating {
+        allowed_app_origins,
+        allowed_host_origins,
+    }
+}
+
+fn parse_bundle_connect_policy(
+    root: &Map<String, Value>,
+    core: Option<&Map<String, Value>>,
+) -> ConnectPolicy {
+    root.get("connect_policy")
+        .or_else(|| core.and_then(|core| core.get("connect_policy")))
+        .and_then(|value| serde_json::from_value::<ConnectPolicy>(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn parse_bundle_decision_rules(
+    root: &Map<String, Value>,
+    core: Option<&Map<String, Value>>,
+) -> DecisionRules {
+    root.get("decision_rules")
+        .or_else(|| core.and_then(|core| core.get("decision_rules")))
+        .and_then(|value| serde_json::from_value::<DecisionRules>(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn collect_allowed_app_origins(value: Option<&Value>, out: &mut AllowedAppOrigins) {
+    let Some(value) = value else {
+        return;
+    };
+    let Some(object) = value.as_object() else {
+        return;
+    };
+
+    out.hosts.extend(extract_string_array(
+        object.get("hosts").or_else(|| object.get("host")),
+    ));
+    out.non_hosts.extend(extract_string_array(
+        object
+            .get("non_hosts")
+            .or_else(|| object.get("nonHosts"))
+            .or_else(|| object.get("non_hosts_apps")),
+    ));
+    out.apps_with_parsers.extend(extract_string_array(
+        object
+            .get("apps_with_parsers")
+            .or_else(|| object.get("appsWithParsers"))
+            .or_else(|| object.get("with_parsers")),
+    ));
+}
+
+fn extract_allowed_host_origins(value: Option<&Value>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+
+    if let Some(object) = value.as_object() {
+        let mut out = Vec::new();
+        out.extend(extract_string_array(object.get("domains")));
+        out.extend(extract_string_array(object.get("hosts")));
+        out.extend(extract_string_array(object.get("origins")));
+        out.extend(extract_string_array(object.get("allowed")));
+        return out;
+    }
+
+    Vec::new()
 }
 
 fn extract_catalog_domains_from_value(value: Option<&Value>) -> Vec<String> {
@@ -772,7 +873,7 @@ fn has_any_pricing_field(pricing: &ModelPricing) -> bool {
 
 fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
     for provider in bundle.providers.values_mut() {
-        provider.entity_id = normalize_optional_string(provider.entity_id.take());
+        provider.detection_id = normalize_optional_string(provider.detection_id.take());
         dedup_sort_strings(&mut provider.domains);
         dedup_sort_strings(&mut provider.user_agent_patterns);
         if let Some(detection) = provider.detection.as_mut() {
@@ -780,11 +881,13 @@ fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
         }
     }
     for entry in &mut bundle.domain_index {
-        entry.provider_entity_id = normalize_optional_string(entry.provider_entity_id.take());
         dedup_sort_strings(&mut entry.paths);
     }
     normalize_domain_filters(&mut bundle.filters);
     dedup_sort_strings(&mut bundle.catalog_domains);
+    normalize_bundle_gating(&mut bundle.gating);
+    normalize_connect_policy(&mut bundle.connect_policy);
+    normalize_decision_rules(&mut bundle.decision_rules);
     if bundle.stats.providers == 0 {
         bundle.stats.providers = bundle.providers.len();
     }
@@ -794,10 +897,174 @@ fn normalize_compiled_bundle(bundle: &mut CompiledBundle) {
 }
 
 fn normalize_domain_filters(filters: &mut DomainFilters) {
+    normalize_filter_host_patterns(&mut filters.whitelist);
+    normalize_filter_host_patterns(&mut filters.passthrough);
     dedup_sort_strings(&mut filters.whitelist);
     dedup_sort_strings(&mut filters.blacklist);
     dedup_sort_strings(&mut filters.passthrough);
     dedup_sort_strings(&mut filters.noise_keywords);
+}
+
+fn normalize_filter_host_patterns(values: &mut Vec<String>) {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        let host = normalize_host_pattern_for_matching(value.as_str());
+        if host.is_empty() {
+            continue;
+        }
+        normalized.push(host);
+    }
+    *values = normalized;
+}
+
+fn normalize_bundle_gating(gating: &mut BundleGating) {
+    normalize_identifier_patterns(&mut gating.allowed_app_origins.hosts);
+    normalize_identifier_patterns(&mut gating.allowed_app_origins.non_hosts);
+    normalize_identifier_patterns(&mut gating.allowed_app_origins.apps_with_parsers);
+    normalize_host_origin_patterns(&mut gating.allowed_host_origins);
+}
+
+fn normalize_connect_policy(policy: &mut ConnectPolicy) {
+    policy.defaults.non_whitelisted_host_action =
+        normalize_optional_string(Some(policy.defaults.non_whitelisted_host_action.clone()))
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| matches!(value.as_str(), "tunnel" | "intercept" | "passthrough"))
+            .unwrap_or_else(|| "tunnel".to_string());
+    policy.defaults.unknown_app_action =
+        normalize_optional_string(Some(policy.defaults.unknown_app_action.clone()))
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| {
+                matches!(
+                    value.as_str(),
+                    "host_only" | "tunnel" | "intercept" | "passthrough"
+                )
+            })
+            .unwrap_or_else(|| "host_only".to_string());
+    policy.defaults.whitelisted_unknown_app_action =
+        normalize_optional_string(Some(policy.defaults.whitelisted_unknown_app_action.clone()))
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| matches!(value.as_str(), "intercept" | "tunnel" | "passthrough"))
+            .unwrap_or_else(|| "intercept".to_string());
+
+    for rule in &mut policy.rules {
+        rule.id = normalize_optional_string(Some(rule.id.clone())).unwrap_or_default();
+        normalize_app_type_values(&mut rule.app_type);
+        normalize_identifier_patterns(&mut rule.app_identifiers);
+        normalize_filter_host_patterns(&mut rule.host_allow);
+        rule.action = normalize_optional_string(Some(rule.action.clone()))
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_else(|| "intercept".to_string());
+        if !matches!(
+            rule.action.as_str(),
+            "intercept" | "tunnel" | "passthrough" | "host_only"
+        ) {
+            rule.action = "intercept".to_string();
+        }
+        rule.reason = normalize_optional_string(rule.reason.take());
+    }
+
+    policy.rules.retain(|rule| {
+        rule.enabled
+            && !rule.action.is_empty()
+            && (!rule.app_type.is_empty() || !rule.app_identifiers.is_empty())
+    });
+}
+
+fn normalize_decision_rules(decision_rules: &mut DecisionRules) {
+    decision_rules.defaults.host_miss_action =
+        normalize_optional_string(Some(decision_rules.defaults.host_miss_action.clone()))
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| matches!(value.as_str(), "tunnel" | "metadata_only"))
+            .unwrap_or_else(|| "tunnel".to_string());
+    decision_rules.defaults.non_host_miss_action =
+        normalize_optional_string(Some(decision_rules.defaults.non_host_miss_action.clone()))
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| matches!(value.as_str(), "tunnel" | "metadata_only"))
+            .unwrap_or_else(|| "metadata_only".to_string());
+    decision_rules.defaults.unknown_app_action =
+        normalize_optional_string(Some(decision_rules.defaults.unknown_app_action.clone()))
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| matches!(value.as_str(), "tunnel" | "metadata_only"))
+            .unwrap_or_else(|| "metadata_only".to_string());
+    for value in &mut decision_rules.defaults.path_precedence {
+        *value = value.trim().to_ascii_lowercase();
+    }
+    decision_rules.defaults.path_precedence.retain(|value| {
+        matches!(
+            value.as_str(),
+            "deny_paths_exact" | "deny_paths_glob" | "allow_paths"
+        )
+    });
+    if decision_rules.defaults.path_precedence.is_empty() {
+        decision_rules.defaults.path_precedence = vec![
+            "deny_paths_exact".to_string(),
+            "deny_paths_glob".to_string(),
+            "allow_paths".to_string(),
+        ];
+    }
+    dedup_preserve_order(&mut decision_rules.defaults.path_precedence);
+    decision_rules.defaults.whitelist_path_miss_reason = normalize_optional_string(Some(
+        decision_rules.defaults.whitelist_path_miss_reason.clone(),
+    ))
+    .unwrap_or_else(|| "whitelist_path_miss".to_string());
+
+    for rule in &mut decision_rules.rules {
+        rule.id = normalize_optional_string(Some(rule.id.clone())).unwrap_or_default();
+        rule.host_pattern = normalize_host_pattern_for_matching(rule.host_pattern.as_str());
+        normalize_app_type_values(&mut rule.app_type);
+        normalize_http_methods(&mut rule.method);
+        normalize_paths(&mut rule.allow_paths);
+        normalize_paths(&mut rule.deny_paths_exact);
+        normalize_paths(&mut rule.deny_paths_glob);
+        rule.detection_id = normalize_optional_string(rule.detection_id.take());
+        rule.provider = normalize_optional_string(rule.provider.take());
+        rule.capture_mode = normalize_optional_string(rule.capture_mode.take())
+            .map(|value| value.to_ascii_lowercase());
+        rule.reason = normalize_optional_string(rule.reason.take());
+    }
+
+    decision_rules.rules.retain(|rule| {
+        rule.enabled && !rule.host_pattern.is_empty() && !rule.allow_paths.is_empty()
+    });
+    decision_rules.rules.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn normalize_app_type_values(values: &mut Vec<String>) {
+    for value in values.iter_mut() {
+        *value = value.trim().to_ascii_lowercase();
+    }
+    values.retain(|value| matches!(value.as_str(), "host" | "non_host" | "unknown"));
+    dedup_sort_strings(values);
+}
+
+fn normalize_http_methods(values: &mut Vec<String>) {
+    for value in values.iter_mut() {
+        *value = value.trim().to_ascii_uppercase();
+    }
+    values.retain(|value| !value.is_empty());
+    dedup_sort_strings(values);
+}
+
+fn normalize_paths(values: &mut Vec<String>) {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.starts_with('/') {
+            out.push(value.to_string());
+        } else {
+            out.push(format!("/{value}"));
+        }
+    }
+    *values = out;
+    dedup_sort_strings(values);
 }
 
 fn normalize_detection_spec(detection: &mut DetectionSpec) {
@@ -1003,6 +1270,37 @@ fn dedup_sort_strings(values: &mut Vec<String>) {
     values.dedup();
 }
 
+fn dedup_preserve_order(values: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
+fn normalize_identifier_patterns(values: &mut Vec<String>) {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        let text = value.trim();
+        if text.is_empty() {
+            continue;
+        }
+        normalized.push(text.to_ascii_lowercase());
+    }
+    *values = normalized;
+    dedup_sort_strings(values);
+}
+
+fn normalize_host_origin_patterns(values: &mut Vec<String>) {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        let origin = normalize_host_for_matching(value.as_str());
+        if origin.is_empty() {
+            continue;
+        }
+        normalized.push(origin);
+    }
+    *values = normalized;
+    dedup_sort_strings(values);
+}
+
 fn prune_catch_all_path_rules(paths: &mut Vec<String>, entry_type: &EntryType) {
     if !matches!(entry_type, EntryType::AgentApp) {
         return;
@@ -1022,6 +1320,12 @@ fn is_catch_all_path_pattern(pattern: &str) -> bool {
 
 fn normalize_pattern_for_host_matching(pattern: &str) -> String {
     let mut out = pattern.trim().to_string();
+    if out.is_empty() {
+        return out;
+    }
+    if is_regex_like_host_pattern(out.as_str()) {
+        return out;
+    }
     if out.starts_with('^') {
         out.remove(0);
     }
@@ -1035,4 +1339,30 @@ fn normalize_pattern_for_host_matching(pattern: &str) -> String {
         out = format!("*{}", &out[2..]);
     }
     out
+}
+
+fn normalize_host_pattern_for_matching(pattern: &str) -> String {
+    let normalized = normalize_pattern_for_host_matching(pattern);
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if is_regex_like_host_pattern(normalized.as_str()) {
+        return normalized;
+    }
+    let host_only = normalized
+        .split_once('/')
+        .map(|(host, _)| host)
+        .unwrap_or(normalized.as_str())
+        .trim_end_matches(':')
+        .trim();
+    host_only.to_string()
+}
+
+fn is_regex_like_host_pattern(pattern: &str) -> bool {
+    pattern.chars().any(|ch| {
+        matches!(
+            ch,
+            '^' | '$' | '\\' | '[' | ']' | '(' | ')' | '|' | '+' | '?' | '{' | '}'
+        )
+    })
 }

@@ -1,10 +1,12 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::Serialize;
 use soth_core::config::SothConfig;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::cli_config;
 use soth_core::config::{BudgetLimit, RegistryMode};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
@@ -12,6 +14,7 @@ use tracing::info;
 pub struct CloudPullRuntime {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
     pub task: JoinHandle<()>,
+    _singleton_lock: CloudRuntimeSingletonLock,
 }
 
 const STARTUP_REGISTRY_REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -20,6 +23,8 @@ const FINAL_CLOUD_SYNC_TIMEOUT: Duration = Duration::from_secs(4);
 const FINAL_CLOUD_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 const FINAL_CLOUD_SYNC_MAX_ROUNDS: usize = 3;
 const CLOUD_BACKOFF_MAX_CAP: Duration = Duration::from_secs(15 * 60);
+const CLOUD_RUNTIME_LOCK_FILE: &str = "cloud.pull.runtime.lock";
+const REGISTRY_BUNDLE_DEGRADED_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistryRuntimeSource {
@@ -37,12 +42,12 @@ impl RegistryRuntimeSource {
         }
     }
 
-    fn as_metric(self) -> soth_proxy::metrics::RegistryBundleSourceState {
+    fn as_metric(self) -> soth_helper::metrics::RegistryBundleSourceState {
         match self {
-            Self::HealthyCloud => soth_proxy::metrics::RegistryBundleSourceState::HealthyCloud,
-            Self::DegradedCached => soth_proxy::metrics::RegistryBundleSourceState::DegradedCached,
+            Self::HealthyCloud => soth_helper::metrics::RegistryBundleSourceState::HealthyCloud,
+            Self::DegradedCached => soth_helper::metrics::RegistryBundleSourceState::DegradedCached,
             Self::DegradedEmbedded => {
-                soth_proxy::metrics::RegistryBundleSourceState::DegradedEmbedded
+                soth_helper::metrics::RegistryBundleSourceState::DegradedEmbedded
             }
         }
     }
@@ -55,6 +60,23 @@ fn resolve_registry_runtime_source(registry_cache_path: &Path) -> RegistryRuntim
     }
 }
 
+fn resolve_registry_runtime_source_after_success(
+    registry_cache_path: &Path,
+) -> RegistryRuntimeSource {
+    let status = soth_sync::cache::registry_bundle_runtime_status(
+        registry_cache_path,
+        Duration::from_secs(REGISTRY_BUNDLE_DEGRADED_MAX_AGE_SECS),
+    );
+    if !status.cache_present {
+        return RegistryRuntimeSource::DegradedEmbedded;
+    }
+    if status.stale {
+        RegistryRuntimeSource::DegradedCached
+    } else {
+        RegistryRuntimeSource::HealthyCloud
+    }
+}
+
 fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -64,14 +86,27 @@ fn current_unix_secs() -> u64 {
 }
 
 #[derive(Debug, Serialize)]
-struct RegistryRuntimeStateSnapshot<'a> {
+struct RegistryRuntimeStateSnapshot {
     schema_version: u32,
-    source: &'a str,
+    source: String,
     consecutive_failures: u64,
     updated_at_unix_secs: u64,
     last_success_unix_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<&'a str>,
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_age_seconds: Option<u64>,
+    degraded_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_failed_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_error: Option<String>,
 }
 
 fn registry_runtime_state_path() -> PathBuf {
@@ -85,18 +120,30 @@ fn registry_runtime_state_path() -> PathBuf {
 }
 
 fn persist_registry_runtime_state(
+    registry_cache_path: &Path,
     source: RegistryRuntimeSource,
     consecutive_failures: u64,
     last_success_unix_secs: u64,
     detail: Option<&str>,
 ) {
+    let runtime_status = soth_sync::cache::registry_bundle_runtime_status(
+        registry_cache_path,
+        Duration::from_secs(REGISTRY_BUNDLE_DEGRADED_MAX_AGE_SECS),
+    );
     let snapshot = RegistryRuntimeStateSnapshot {
-        schema_version: 1,
-        source: source.as_label(),
+        schema_version: 2,
+        source: source.as_label().to_string(),
         consecutive_failures,
         updated_at_unix_secs: current_unix_secs(),
         last_success_unix_secs,
-        detail,
+        detail: detail.map(|value| value.to_string()),
+        bundle_hash: runtime_status.bundle_hash,
+        bundle_version: runtime_status.bundle_version,
+        bundle_age_seconds: runtime_status.bundle_age_seconds,
+        degraded_stale: runtime_status.stale,
+        validation_status: runtime_status.validation_status,
+        validation_failed_reason: runtime_status.validation_failed_reason,
+        cache_error: runtime_status.cache_error,
     };
     let path = registry_runtime_state_path();
     if let Some(parent) = path.parent() {
@@ -177,9 +224,10 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
     let mut consecutive_failures = 0_u64;
     let mut last_success_unix_secs = 0_u64;
 
-    soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
-    soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+    soth_helper::metrics::set_registry_source_state(runtime_source.as_metric());
+    soth_helper::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
     persist_registry_runtime_state(
+        &registry_cache_path,
         runtime_source,
         consecutive_failures,
         last_success_unix_secs,
@@ -187,19 +235,21 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
     );
 
     let puller = RegistryPuller::new(config.cloud.endpoint.clone(), api_key, registry_cache_path)
+        .with_bundle_type(config.forward_proxy.engine.registry_bundle_type())
         .with_fallback_endpoints(config.cloud.registry_bundle_fallback_endpoints.clone());
 
     match tokio::time::timeout(STARTUP_REGISTRY_REFRESH_TIMEOUT, puller.refresh_now()).await {
         Ok(Ok(outcome)) => {
-            runtime_source = RegistryRuntimeSource::HealthyCloud;
+            runtime_source = resolve_registry_runtime_source_after_success(puller.cache_path());
             consecutive_failures = 0;
             last_success_unix_secs = current_unix_secs();
-            soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
-            soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
-            soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(
+            soth_helper::metrics::set_registry_source_state(runtime_source.as_metric());
+            soth_helper::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+            soth_helper::metrics::set_registry_refresh_last_success_unix_secs(
                 last_success_unix_secs,
             );
             persist_registry_runtime_state(
+                puller.cache_path(),
                 runtime_source,
                 consecutive_failures,
                 last_success_unix_secs,
@@ -216,9 +266,10 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
         Ok(Err(error)) => {
             consecutive_failures = consecutive_failures.saturating_add(1);
             runtime_source = resolve_registry_runtime_source(puller.cache_path());
-            soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
-            soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+            soth_helper::metrics::set_registry_source_state(runtime_source.as_metric());
+            soth_helper::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
             persist_registry_runtime_state(
+                puller.cache_path(),
                 runtime_source,
                 consecutive_failures,
                 last_success_unix_secs,
@@ -234,9 +285,10 @@ pub async fn refresh_registry_bundle_on_start(config: &SothConfig) {
         Err(_) => {
             consecutive_failures = consecutive_failures.saturating_add(1);
             runtime_source = resolve_registry_runtime_source(puller.cache_path());
-            soth_proxy::metrics::set_registry_source_state(runtime_source.as_metric());
-            soth_proxy::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
+            soth_helper::metrics::set_registry_source_state(runtime_source.as_metric());
+            soth_helper::metrics::set_registry_refresh_consecutive_failures(consecutive_failures);
             persist_registry_runtime_state(
+                puller.cache_path(),
                 runtime_source,
                 consecutive_failures,
                 last_success_unix_secs,
@@ -264,6 +316,23 @@ pub fn spawn_cloud_pull_runtime(
         return None;
     }
 
+    let singleton_lock = match try_acquire_cloud_runtime_singleton_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            info!(
+                "Cloud runtime already active in another process; skipping duplicate runtime startup"
+            );
+            return None;
+        }
+        Err(error) => {
+            warn!(
+                "Failed to acquire cloud runtime singleton lock; skipping cloud runtime: {:#}",
+                error
+            );
+            return None;
+        }
+    };
+
     let api_key = config.cloud.api_key.clone()?;
     let endpoint = config.cloud.endpoint.clone();
     let cache_path = resolve_cache_path(config);
@@ -271,11 +340,23 @@ pub fn spawn_cloud_pull_runtime(
     let sync_interval_secs = config.cloud.sync_interval_secs.max(5);
     let interval_secs = config.cloud.config_pull_interval_secs.max(15);
     let debounce_secs = config.cloud.config_debounce_secs.max(1);
+    let mut global_tags = config.cloud.tags.clone();
+    if !global_tags.contains_key("device_id") {
+        if let Some(device_id) = cli_config::read_client_device_id() {
+            global_tags.insert("device_id".to_string(), device_id);
+        }
+    }
+    let frontload_exchange_upload_path = std::env::var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| config.cloud.frontload_exchange_upload_path.clone());
     let registry_puller = RegistryPuller::new(
         endpoint.clone(),
         api_key.clone(),
         registry_cache_path.clone(),
     )
+    .with_bundle_type(config.forward_proxy.engine.registry_bundle_type())
     .with_fallback_endpoints(config.cloud.registry_bundle_fallback_endpoints.clone());
     let puller = ConfigPuller::new(endpoint, api_key, cache_path)
         .with_registry_puller(registry_puller)
@@ -293,6 +374,7 @@ pub fn spawn_cloud_pull_runtime(
             api_key: config.cloud.api_key.clone().unwrap_or_default(),
             event_db_path,
             cache_path: puller.cache_path().clone(),
+            registry_cache_path: Some(registry_cache_path.clone()),
             agent_instance_id: build_agent_instance_id(),
             proxy_version: env!("CARGO_PKG_VERSION").to_string(),
             retry_queue_dir: default_retry_queue_dir(),
@@ -317,10 +399,11 @@ pub fn spawn_cloud_pull_runtime(
                 .cloud
                 .frontload_hard_compressed_cap_bytes
                 .max(1) as usize,
+            frontload_exchange_upload_path: frontload_exchange_upload_path.clone(),
             body_upload_max_bytes: config.cloud.body_upload_max_bytes.max(1) as usize,
-            global_tags: config.cloud.tags.clone(),
+            global_tags: global_tags.clone(),
             heartbeat_telemetry: Some(std::sync::Arc::new(|| {
-                let snapshot = soth_proxy::metrics::heartbeat_telemetry_snapshot();
+                let snapshot = soth_helper::metrics::heartbeat_telemetry_snapshot();
                 if snapshot.counters.values().all(|value| *value == 0) {
                     None
                 } else {
@@ -351,11 +434,12 @@ pub fn spawn_cloud_pull_runtime(
         let mut registry_source = resolve_registry_runtime_source(&registry_cache_path);
         let mut registry_consecutive_failures = 0_u64;
         let mut registry_last_success_unix_secs = 0_u64;
-        soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
-        soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+        soth_helper::metrics::set_registry_source_state(registry_source.as_metric());
+        soth_helper::metrics::set_registry_refresh_consecutive_failures(
             registry_consecutive_failures,
         );
         persist_registry_runtime_state(
+            &registry_cache_path,
             registry_source,
             registry_consecutive_failures,
             registry_last_success_unix_secs,
@@ -369,7 +453,7 @@ pub fn spawn_cloud_pull_runtime(
         if let Err(error) = puller.pull_once().await {
             let retry_in = config_pull_backoff.record_failure();
             registry_consecutive_failures = registry_consecutive_failures.saturating_add(1);
-            soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+            soth_helper::metrics::set_registry_refresh_consecutive_failures(
                 registry_consecutive_failures,
             );
             let degraded = resolve_registry_runtime_source(&registry_cache_path);
@@ -381,8 +465,9 @@ pub fn spawn_cloud_pull_runtime(
                 );
             }
             registry_source = degraded;
-            soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
+            soth_helper::metrics::set_registry_source_state(registry_source.as_metric());
             persist_registry_runtime_state(
+                &registry_cache_path,
                 registry_source,
                 registry_consecutive_failures,
                 registry_last_success_unix_secs,
@@ -397,24 +482,26 @@ pub fn spawn_cloud_pull_runtime(
             );
         } else {
             config_pull_backoff.record_success();
-            if registry_source != RegistryRuntimeSource::HealthyCloud {
+            let next_source = resolve_registry_runtime_source_after_success(&registry_cache_path);
+            if registry_source != next_source {
                 info!(
                     previous_source = registry_source.as_label(),
-                    source = RegistryRuntimeSource::HealthyCloud.as_label(),
-                    "Registry runtime source transitioned to healthy cloud"
+                    source = next_source.as_label(),
+                    "Registry runtime source transitioned after pull success"
                 );
             }
-            registry_source = RegistryRuntimeSource::HealthyCloud;
+            registry_source = next_source;
             registry_consecutive_failures = 0;
-            soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
-            soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+            soth_helper::metrics::set_registry_source_state(registry_source.as_metric());
+            soth_helper::metrics::set_registry_refresh_consecutive_failures(
                 registry_consecutive_failures,
             );
             registry_last_success_unix_secs = current_unix_secs();
-            soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(
+            soth_helper::metrics::set_registry_refresh_last_success_unix_secs(
                 registry_last_success_unix_secs,
             );
             persist_registry_runtime_state(
+                &registry_cache_path,
                 registry_source,
                 registry_consecutive_failures,
                 registry_last_success_unix_secs,
@@ -476,7 +563,7 @@ pub fn spawn_cloud_pull_runtime(
                     if let Err(error) = puller.pull_once().await {
                         let retry_in = config_pull_backoff.record_failure();
                         registry_consecutive_failures = registry_consecutive_failures.saturating_add(1);
-                        soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+                        soth_helper::metrics::set_registry_refresh_consecutive_failures(
                             registry_consecutive_failures,
                         );
                         let degraded = resolve_registry_runtime_source(&registry_cache_path);
@@ -488,8 +575,9 @@ pub fn spawn_cloud_pull_runtime(
                             );
                         }
                         registry_source = degraded;
-                        soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
+                        soth_helper::metrics::set_registry_source_state(registry_source.as_metric());
                         persist_registry_runtime_state(
+                            &registry_cache_path,
                             registry_source,
                             registry_consecutive_failures,
                             registry_last_success_unix_secs,
@@ -504,24 +592,27 @@ pub fn spawn_cloud_pull_runtime(
                         );
                     } else {
                         config_pull_backoff.record_success();
-                        if registry_source != RegistryRuntimeSource::HealthyCloud {
+                        let next_source =
+                            resolve_registry_runtime_source_after_success(&registry_cache_path);
+                        if registry_source != next_source {
                             info!(
                                 previous_source = registry_source.as_label(),
-                                source = RegistryRuntimeSource::HealthyCloud.as_label(),
-                                "Registry runtime source transitioned to healthy cloud"
+                                source = next_source.as_label(),
+                                "Registry runtime source transitioned after pull success"
                             );
                         }
-                        registry_source = RegistryRuntimeSource::HealthyCloud;
+                        registry_source = next_source;
                         registry_consecutive_failures = 0;
-                        soth_proxy::metrics::set_registry_source_state(registry_source.as_metric());
-                        soth_proxy::metrics::set_registry_refresh_consecutive_failures(
+                        soth_helper::metrics::set_registry_source_state(registry_source.as_metric());
+                        soth_helper::metrics::set_registry_refresh_consecutive_failures(
                             registry_consecutive_failures,
                         );
                         registry_last_success_unix_secs = current_unix_secs();
-                        soth_proxy::metrics::set_registry_refresh_last_success_unix_secs(
+                        soth_helper::metrics::set_registry_refresh_last_success_unix_secs(
                             registry_last_success_unix_secs,
                         );
                         persist_registry_runtime_state(
+                            &registry_cache_path,
                             registry_source,
                             registry_consecutive_failures,
                             registry_last_success_unix_secs,
@@ -583,7 +674,61 @@ pub fn spawn_cloud_pull_runtime(
         }
     });
 
-    Some(CloudPullRuntime { shutdown_tx, task })
+    Some(CloudPullRuntime {
+        shutdown_tx,
+        task,
+        _singleton_lock: singleton_lock,
+    })
+}
+
+struct CloudRuntimeSingletonLock {
+    #[allow(dead_code)]
+    file: File,
+}
+
+impl Drop for CloudRuntimeSingletonLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn try_acquire_cloud_runtime_singleton_lock() -> Result<Option<CloudRuntimeSingletonLock>> {
+    let path = cloud_runtime_lock_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(anyhow!(
+                "failed acquiring cloud runtime singleton lock {}: {}",
+                path.display(),
+                error
+            ));
+        }
+    }
+    Ok(Some(CloudRuntimeSingletonLock { file }))
+}
+
+fn cloud_runtime_lock_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join("run").join(CLOUD_RUNTIME_LOCK_FILE))
+        .unwrap_or_else(|| PathBuf::from(".soth/run").join(CLOUD_RUNTIME_LOCK_FILE))
 }
 
 #[derive(Debug, Clone)]
@@ -797,20 +942,19 @@ fn resolve_cache_path(config: &SothConfig) -> PathBuf {
 }
 
 fn resolve_registry_cache_path(config: &SothConfig, config_cache_path: &Path) -> PathBuf {
+    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
     if config.cloud.cache_path.is_some() {
         if let Some(parent) = config_cache_path.parent() {
-            return parent.join("registry_bundle_cache.json");
+            return parent.join(cache_name);
         }
     }
-    default_registry_cache_path()
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join(cache_name))
+        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
 }
 
 fn default_cache_path() -> PathBuf {
     soth_sync::cache::default_cache_path()
-}
-
-fn default_registry_cache_path() -> PathBuf {
-    soth_sync::cache::default_registry_cache_path()
 }
 
 fn slugify(value: &str) -> String {

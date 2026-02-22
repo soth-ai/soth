@@ -11,6 +11,7 @@ version: "1.0"
 # Forward proxy configuration
 forward_proxy:
   enabled: true
+  engine: "edge"
   address: "127.0.0.1"
   port: 8080
   autostart_on_boot: true
@@ -18,7 +19,7 @@ forward_proxy:
   process_attribution:
     enabled: true
     lookup_timeout: "200ms"
-    cache_ttl: "30s"
+    cache_ttl: "1h"
   tunnel_debug:
     enabled: false
     include_noise: false
@@ -130,15 +131,16 @@ cloud:
   metadata_max_compressed_batch_bytes: 5242880
   frontload_enabled: true
   frontload_max_events_per_batch: 1500
-  frontload_max_compressed_batch_bytes: 8388608
+  frontload_max_compressed_batch_bytes: 33554432
   frontload_hard_events_cap: 5000
-  frontload_hard_compressed_cap_bytes: 16777216
+  frontload_hard_compressed_cap_bytes: 67108864
+  frontload_exchange_upload_path: null
   body_upload_max_bytes: 15728640
   cache_path: "~/.soth/cloud_config_cache.json"
   tags: {}
 
-# Unified exchange v2 pipeline (disabled by default)
-exchange_v2:
+# Unified Exchange pipeline (schema_version=1, disabled by default)
+exchange:
   enabled: false
   inline_max_bytes: 262144
   max_body_bytes: 15728640

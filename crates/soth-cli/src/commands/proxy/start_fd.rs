@@ -1,6 +1,6 @@
 //! FD budget and monitor helpers for proxy start command.
 
-use soth_proxy::metrics;
+use soth_helper::metrics;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};

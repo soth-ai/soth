@@ -118,6 +118,14 @@ fn now_unix_secs() -> u64 {
 
 fn acquire_lifecycle_lock() -> anyhow::Result<DaemonLifecycleLock> {
     let path = lock_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating lifecycle lock directory {}",
+                parent.display()
+            )
+        })?;
+    }
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -712,6 +720,11 @@ pub async fn run_start_daemon(
     }
 
     let log_file_path = log_path();
+    if let Some(parent) = log_file_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed creating daemon log directory {}", parent.display())
+        })?;
+    }
     let (log_max_bytes, log_max_backups) = proxy_log_rotation_limits();
     if let Err(error) = rotate_proxy_log_if_needed(&log_file_path, log_max_bytes, log_max_backups) {
         if !quiet {
@@ -1108,7 +1121,15 @@ mod tests {
                 .build()
                 .expect("runtime");
             let err = runtime
-                .block_on(run_start_daemon(Some(18888), None, true, false, None, true))
+                .block_on(run_start_daemon(
+                    Some(18888),
+                    None,
+                    true,
+                    None,
+                    false,
+                    None,
+                    true,
+                ))
                 .expect_err("daemon start should fail in unit test binary");
             let text = format!("{err:#}");
             assert!(

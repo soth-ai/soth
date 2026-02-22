@@ -8,7 +8,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-const SERVICE_NAME: &str = "soth-proxy";
+const SERVICE_NAME: &str = "soth-edge";
+
+#[cfg(target_os = "macos")]
+const MACOS_SERVICE_LABEL: &str = "ai.soth.edge";
+
+#[cfg(target_os = "linux")]
+const XDG_AUTOSTART_FILE: &str = "soth-edge.desktop";
+
+#[cfg(target_os = "windows")]
+const WINDOWS_RUN_KEY_VALUE: &str = "SothEdge";
 
 fn resolve_abs_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
@@ -114,7 +123,7 @@ pub fn managed_status() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
-        let label = "ai.soth.proxy";
+        let label = MACOS_SERVICE_LABEL;
         let plist_path = home
             .join("Library")
             .join("LaunchAgents")
@@ -143,7 +152,7 @@ pub fn managed_status() -> Result<String> {
             let desktop_path = home
                 .join(".config")
                 .join("autostart")
-                .join("soth-proxy.desktop");
+                .join(XDG_AUTOSTART_FILE);
             if desktop_path.exists() {
                 return Ok(format!(
                     "XDG autostart enabled at {}",
@@ -162,15 +171,21 @@ pub fn managed_status() -> Result<String> {
                 "query",
                 r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
                 "/v",
-                "SothProxy",
+                WINDOWS_RUN_KEY_VALUE,
             ])
             .creation_flags(0x08000000)
             .output()
             .context("failed querying Windows startup Run key")?;
         if output.status.success() {
-            return Ok("windows Run key enabled (HKCU\\...\\Run\\SothProxy)".to_string());
+            return Ok(format!(
+                "windows Run key enabled (HKCU\\...\\Run\\{})",
+                WINDOWS_RUN_KEY_VALUE
+            ));
         }
-        return Ok("windows Run key disabled (HKCU\\...\\Run\\SothProxy)".to_string());
+        return Ok(format!(
+            "windows Run key disabled (HKCU\\...\\Run\\{})",
+            WINDOWS_RUN_KEY_VALUE
+        ));
     }
     #[allow(unreachable_code)]
     Ok("autostart unsupported on this OS".to_string())
@@ -179,7 +194,7 @@ pub fn managed_status() -> Result<String> {
 #[cfg(target_os = "macos")]
 fn stop_macos_launch_agent() -> Result<String> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
-    let label = "ai.soth.proxy";
+    let label = MACOS_SERVICE_LABEL;
     let plist_path = home
         .join("Library")
         .join("LaunchAgents")
@@ -202,7 +217,7 @@ fn stop_macos_launch_agent() -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn stop_macos_launch_agent_runtime_only() -> Result<String> {
-    let label = "ai.soth.proxy";
+    let label = MACOS_SERVICE_LABEL;
     let uid = unsafe { libc::geteuid() }.to_string();
     let gui_target = format!("gui/{uid}/{label}");
     let user_target = format!("user/{uid}/{label}");
@@ -257,7 +272,7 @@ fn stop_linux_autostart() -> Result<String> {
         let desktop_path = home
             .join(".config")
             .join("autostart")
-            .join("soth-proxy.desktop");
+            .join(XDG_AUTOSTART_FILE);
         if desktop_path.exists() {
             let _ = std::fs::remove_file(&desktop_path);
         }
@@ -286,7 +301,7 @@ fn stop_windows_autostart() -> Result<String> {
             "delete",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
             "/v",
-            "SothProxy",
+            WINDOWS_RUN_KEY_VALUE,
             "/f",
         ])
         .creation_flags(0x08000000)
@@ -303,7 +318,10 @@ fn stop_windows_autostart() -> Result<String> {
             );
         }
     }
-    Ok("windows Run key removed (HKCU\\...\\Run\\SothProxy)".to_string())
+    Ok(format!(
+        "windows Run key removed (HKCU\\...\\Run\\{})",
+        WINDOWS_RUN_KEY_VALUE
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -317,7 +335,7 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
         )
     })?;
 
-    let label = "ai.soth.proxy";
+    let label = MACOS_SERVICE_LABEL;
     let plist_path = launch_agents.join(format!("{label}.plist"));
     let mut program_arguments = String::new();
     program_arguments.push_str(&format!(
@@ -329,7 +347,7 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
     }
     let logs_dir = home.join(".soth").join("logs");
     std::fs::create_dir_all(&logs_dir).ok();
-    let stdout_path = logs_dir.join("proxy-autostart.log");
+    let stdout_path = logs_dir.join("edge-autostart.log");
 
     let body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -427,7 +445,7 @@ fn ensure_linux_autostart(exe: &Path, args: &[String]) -> Result<String> {
         let unit_path = user_dir.join(format!("{SERVICE_NAME}.service"));
         let exec = render_exec_start(exe, args);
         let body = format!(
-            "[Unit]\nDescription=SOTH Proxy Sensor\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n"
+            "[Unit]\nDescription=SOTH Edge Sensor\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n"
         );
         std::fs::write(&unit_path, body)
             .with_context(|| format!("failed writing {}", unit_path.display()))?;
@@ -454,10 +472,10 @@ fn ensure_linux_autostart(exe: &Path, args: &[String]) -> Result<String> {
             autostart_dir.display()
         )
     })?;
-    let desktop_path = autostart_dir.join("soth-proxy.desktop");
+    let desktop_path = autostart_dir.join(XDG_AUTOSTART_FILE);
     let exec = shell_escape_command(exe, args);
     let body = format!(
-        "[Desktop Entry]\nType=Application\nName=SOTH Proxy\nExec={exec}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n"
+        "[Desktop Entry]\nType=Application\nName=SOTH Edge\nExec={exec}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n"
     );
     std::fs::write(&desktop_path, body)
         .with_context(|| format!("failed writing {}", desktop_path.display()))?;
@@ -536,7 +554,7 @@ fn ensure_windows_run_key(exe: &Path, args: &[String]) -> Result<String> {
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
             "/v",
-            "SothProxy",
+            WINDOWS_RUN_KEY_VALUE,
             "/t",
             "REG_SZ",
             "/d",
@@ -552,7 +570,10 @@ fn ensure_windows_run_key(exe: &Path, args: &[String]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok("windows Run key enabled (HKCU\\...\\Run\\SothProxy)".to_string())
+    Ok(format!(
+        "windows Run key enabled (HKCU\\...\\Run\\{})",
+        WINDOWS_RUN_KEY_VALUE
+    ))
 }
 
 #[cfg(target_os = "windows")]

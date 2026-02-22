@@ -1,6 +1,7 @@
 //! Shared API request/response structures for edge <-> cloud communication.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +16,12 @@ pub struct ExchangeMetadata {
     pub exchange_id: String,
     pub schema_version: String,
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_is_synthetic: Option<bool>,
     pub observed_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
@@ -30,7 +37,15 @@ pub struct ExchangeMetadata {
     pub model: Option<String>,
     pub endpoint: Option<String>,
     pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_bundle_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_identity_key: Option<String>,
     pub status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_device_id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -62,6 +77,8 @@ pub struct ExchangeMetadata {
     pub mcp_tool_name: Option<String>,
     pub graphql_operation: Option<String>,
     pub event_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_status: Option<String>,
     pub signature: Option<String>,
     pub signature_key_id: Option<String>,
     pub parser_version: Option<String>,
@@ -69,9 +86,21 @@ pub struct ExchangeMetadata {
     pub parse_confidence: Option<f64>,
     pub detection_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_entity_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_app_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_host_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_referrer_origin: Option<String>,
     pub tags: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_envelope: Option<EventEnvelopeMetadata>,
@@ -80,10 +109,15 @@ pub struct ExchangeMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventClientMetadata {
     pub pid: Option<u32>,
+    pub device_id: Option<String>,
     pub bundle_id: Option<String>,
     pub process_name: Option<String>,
     pub process_executable: Option<String>,
     pub app_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referrer_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +147,69 @@ pub struct EventEnvelopeMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeBatchResponse {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub errors: Vec<EventError>,
+    #[serde(default)]
+    pub retry_after_secs: Option<u64>,
+    pub config_changed: bool,
+    pub server_time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSessionsBatchRequest {
+    pub agent_instance_id: String,
+    pub config_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_mode: Option<String>,
+    pub batch: Vec<LocalSessionArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSessionArtifact {
+    pub artifact_id: String,
+    pub observed_at: String,
+    pub local_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_db_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_inline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_blob_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSessionsBatchResponse {
     pub accepted: u64,
     pub rejected: u64,
     pub errors: Vec<EventError>,
@@ -183,11 +280,71 @@ pub struct RegistryVersionResponse {
     pub bundle_type: String,
     pub version: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_hash: Option<String>,
     pub compiled_at: String,
     pub provider_count: u64,
     pub domain_count: u64,
     pub format_count: u64,
     pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<RegistryBundleManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryBundleManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<RegistryBundleComponentHash>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub changed_sections: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<RegistryBundleIntegrity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryBundleComponentHash {
+    pub name: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryBundleIntegrity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_alg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RegistryBundleFetchQuery {
+    Full,
+    Section {
+        section: String,
+    },
+    Diff {
+        from_hash: String,
+        section: Option<String>,
+    },
+}
+
+impl Default for RegistryBundleFetchQuery {
+    fn default() -> Self {
+        Self::Full
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +401,10 @@ pub struct HeartbeatRequest {
     pub hostname: Option<String>,
     pub active_connections: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_details: Option<HeartbeatHostDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<HeartbeatRegistryDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<HeartbeatTelemetry>,
 }
 
@@ -258,6 +419,40 @@ pub struct HeartbeatResponse {
 pub struct HeartbeatTelemetry {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counters: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeartbeatHostDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_logical_cores: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeartbeatRegistryDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_age_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_failed_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_stale: Option<bool>,
 }
 
 // ============================================================================
@@ -348,8 +543,11 @@ mod tests {
             config_version: Some("v2".to_string()),
             batch: vec![ExchangeMetadata {
                 exchange_id: "ex-1".to_string(),
-                schema_version: "2.0".to_string(),
+                schema_version: "1".to_string(),
                 session_id: Some("sess-1".to_string()),
+                edge_session_id: Some("edge-1".to_string()),
+                provider_session_id: Some("provider-1".to_string()),
+                session_is_synthetic: Some(false),
                 observed_at: "2026-02-01T00:00:00Z".to_string(),
                 started_at: Some("2026-02-01T00:00:00Z".to_string()),
                 completed_at: Some("2026-02-01T00:00:01Z".to_string()),
@@ -365,7 +563,11 @@ mod tests {
                 model: Some("gpt-5.3-codex".to_string()),
                 endpoint: Some("/v1/responses".to_string()),
                 method: Some("POST".to_string()),
+                detection_id: Some("openai.codex".to_string()),
+                detection_bundle_version: Some("2026.02.19".to_string()),
+                tool_identity_key: Some("entity:openai.codex".to_string()),
                 status_code: Some(200),
+                client_device_id: Some("device_1".to_string()),
                 input_tokens: Some(12),
                 output_tokens: Some(34),
                 cache_read_tokens: Some(0),
@@ -397,14 +599,21 @@ mod tests {
                 mcp_tool_name: None,
                 graphql_operation: None,
                 event_hash: Some("hash".to_string()),
+                integrity_status: Some("signed".to_string()),
                 signature: None,
                 signature_key_id: None,
                 parser_version: Some("v1".to_string()),
                 bundle_version: Some("bundle-1".to_string()),
                 parse_confidence: Some(0.98),
                 detection_reason: Some("model_marker".to_string()),
-                target_entity_id: Some("agt_abc123".to_string()),
                 detection_source: Some("bundle".to_string()),
+                decision_step: None,
+                decision_outcome: None,
+                skip_reason: None,
+                discovery_kind: None,
+                client_app_type: None,
+                client_host_origin: None,
+                client_referrer_origin: None,
                 tags: None,
                 event_envelope: None,
             }],
@@ -417,5 +626,53 @@ mod tests {
         assert_eq!(parsed.batch.len(), 1);
         assert_eq!(parsed.batch[0].exchange_id, "ex-1");
         assert_eq!(parsed.batch[0].transport, "https");
+    }
+
+    #[test]
+    fn local_sessions_batch_roundtrip() {
+        let req = LocalSessionsBatchRequest {
+            agent_instance_id: "agent-local-1".to_string(),
+            config_version: Some("cv-local-1".to_string()),
+            client_device_id: Some("device-local-1".to_string()),
+            ingest_mode: Some("frontload".to_string()),
+            batch: vec![LocalSessionArtifact {
+                artifact_id: "artifact-codex-1".to_string(),
+                observed_at: "2026-02-20T12:00:00Z".to_string(),
+                local_type: "codex".to_string(),
+                file_type: Some("session_transcript".to_string()),
+                parser_hint: Some("codex".to_string()),
+                source_path: Some("~/.codex/sessions/2026/02/example.jsonl".to_string()),
+                source_db_path: None,
+                source_query: None,
+                read_mode: Some("incremental".to_string()),
+                content_type: Some("json".to_string()),
+                body_inline: Some("{\"type\":\"message\",\"role\":\"user\"}".to_string()),
+                body_blob_key: None,
+                body_sha256: Some("sha256-local-1".to_string()),
+                body_bytes: Some(36),
+                session_id: Some("sess-local-1".to_string()),
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5".to_string()),
+                agent: Some("codex".to_string()),
+                tags: Some(HashMap::from([(
+                    "collector.ingest_mode".to_string(),
+                    "frontload".to_string(),
+                )])),
+                metadata: Some(serde_json::json!({
+                    "cursor": 1234,
+                    "source": "collector"
+                })),
+            }],
+        };
+
+        let json = serde_json::to_string(&req).expect("serialize local sessions batch");
+        let parsed: LocalSessionsBatchRequest =
+            serde_json::from_str(&json).expect("deserialize local sessions batch");
+        assert_eq!(parsed.agent_instance_id, "agent-local-1");
+        assert_eq!(parsed.client_device_id.as_deref(), Some("device-local-1"));
+        assert_eq!(parsed.ingest_mode.as_deref(), Some("frontload"));
+        assert_eq!(parsed.batch.len(), 1);
+        assert_eq!(parsed.batch[0].local_type, "codex");
+        assert_eq!(parsed.batch[0].artifact_id, "artifact-codex-1");
     }
 }

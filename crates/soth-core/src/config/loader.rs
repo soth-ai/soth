@@ -16,6 +16,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
     }
 
     let content = std::fs::read_to_string(path)?;
+    reject_legacy_exchange_v2_key(&content)?;
     let mut config: SothConfig = serde_yaml::from_str(&content)?;
 
     // Apply environment variable overrides
@@ -28,11 +29,27 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SothConfig> {
 
 /// Load configuration from a string
 pub fn load_config_from_str(content: &str) -> Result<SothConfig> {
+    reject_legacy_exchange_v2_key(content)?;
     let mut config: SothConfig = serde_yaml::from_str(content)?;
     apply_env_overrides(&mut config);
     normalize_cloud_config(&mut config);
     normalize_budget_db_path(&mut config);
     Ok(config)
+}
+
+fn reject_legacy_exchange_v2_key(content: &str) -> Result<()> {
+    let raw: serde_yaml::Value = serde_yaml::from_str(content)?;
+    let Some(root) = raw.as_mapping() else {
+        return Ok(());
+    };
+    let legacy_key = serde_yaml::Value::String("exchange_v2".to_string());
+    if root.contains_key(&legacy_key) {
+        return Err(SothError::ConfigInvalid(
+            "legacy config key `exchange_v2` is no longer supported; rename it to `exchange`"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_budget_db_path(config: &mut SothConfig) {
@@ -48,11 +65,11 @@ fn normalize_cloud_config(config: &mut SothConfig) {
     if config.cloud.api_key.is_none() {
         config.cloud.enabled = false;
     }
-    // Unified exchange pipeline is required for cloud sync.
+    // Unified Exchange pipeline is required for cloud sync.
     // Keep this fail-open and deterministic: if cloud is enabled with credentials,
-    // runtime ingestion/upload should always use exchange.v2.
+    // runtime ingestion/upload should always use Exchange (schema_version=1).
     if config.cloud.enabled {
-        config.exchange_v2.enabled = true;
+        config.exchange.enabled = true;
     }
 }
 
@@ -195,6 +212,12 @@ fn apply_env_overrides(config: &mut SothConfig) {
     if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES") {
         if let Ok(parsed) = value.parse::<u64>() {
             config.cloud.frontload_hard_compressed_cap_bytes = parsed.max(1);
+        }
+    }
+    if let Ok(value) = std::env::var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            config.cloud.frontload_exchange_upload_path = Some(trimmed.to_string());
         }
     }
     if let Ok(value) = std::env::var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES") {
@@ -401,6 +424,10 @@ budget:
         std::env::set_var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES", "8388608");
         std::env::set_var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP", "5000");
         std::env::set_var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES", "16777216");
+        std::env::set_var(
+            "SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH",
+            "/api/v1/exchanges/frontload/batch",
+        );
         std::env::set_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES", "10485760");
         std::env::set_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES", "7340032");
 
@@ -425,6 +452,10 @@ budget:
             config.cloud.frontload_hard_compressed_cap_bytes,
             16 * 1024 * 1024
         );
+        assert_eq!(
+            config.cloud.frontload_exchange_upload_path.as_deref(),
+            Some("/api/v1/exchanges/frontload/batch")
+        );
         assert_eq!(config.cloud.body_upload_max_bytes, 10_485_760);
         assert_eq!(config.forward_proxy.capture_max_body_bytes, 7_340_032);
         assert_eq!(config.cloud.tags.get("project"), Some(&"soth".to_string()));
@@ -444,6 +475,7 @@ budget:
         std::env::remove_var("SOTH_CLOUD_FRONTLOAD_MAX_COMPRESSED_BATCH_BYTES");
         std::env::remove_var("SOTH_CLOUD_FRONTLOAD_HARD_EVENTS_CAP");
         std::env::remove_var("SOTH_CLOUD_FRONTLOAD_HARD_COMPRESSED_CAP_BYTES");
+        std::env::remove_var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH");
         std::env::remove_var("SOTH_CLOUD_BODY_UPLOAD_MAX_BYTES");
         std::env::remove_var("SOTH_FORWARD_PROXY_CAPTURE_MAX_BODY_BYTES");
     }
@@ -463,5 +495,21 @@ cloud:
 
         std::env::remove_var("SOTH_CLOUD_ENABLED");
         std::env::remove_var("SOTH_CLOUD_API_KEY");
+    }
+
+    #[test]
+    fn test_exchange_v2_key_is_rejected() {
+        let yaml = r#"
+exchange_v2:
+  enabled: true
+"#;
+        let err = load_config_from_str(yaml).expect_err("legacy exchange_v2 key must fail");
+        match err {
+            SothError::ConfigInvalid(message) => {
+                assert!(message.contains("exchange_v2"));
+                assert!(message.contains("exchange"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

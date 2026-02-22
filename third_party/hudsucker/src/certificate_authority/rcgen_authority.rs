@@ -1,0 +1,190 @@
+use crate::certificate_authority::{
+    CACHE_TTL, CertificateAuthority, NOT_BEFORE_OFFSET, TTL_SECS, UpstreamCertificateInfo,
+};
+use http::uri::Authority;
+use moka::future::Cache;
+use rand::{Rng, rng};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, Issuer, KeyPair, SanType, string::Ia5String,
+};
+use std::sync::Arc;
+use time::{Duration, OffsetDateTime};
+use tokio_rustls::rustls::{
+    ServerConfig,
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+};
+use tracing::debug;
+
+/// Issues certificates for use when communicating with clients.
+///
+/// Issues certificates for communicating with clients over TLS. Certificates are cached in memory
+/// up to a max size that is provided when creating the authority. Certificates are generated using
+/// the `rcgen` crate.
+///
+/// # Examples
+///
+/// ```rust
+/// use hudsucker::{certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
+/// use rcgen::{Issuer, KeyPair};
+///
+/// let key_pair = include_str!("../../examples/ca/hudsucker.key");
+/// let ca_cert = include_str!("../../examples/ca/hudsucker.cer");
+/// let key_pair = KeyPair::from_pem(key_pair).expect("Failed to parse private key");
+/// let issuer =
+///     Issuer::from_ca_cert_pem(ca_cert, key_pair).expect("Failed to parse CA certificate");
+///
+/// let ca = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
+/// ```
+pub struct RcgenAuthority {
+    issuer: Issuer<'static, KeyPair>,
+    private_key: PrivateKeyDer<'static>,
+    cache: Cache<Authority, Arc<ServerConfig>>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl RcgenAuthority {
+    /// Creates a new rcgen authority.
+    pub fn new(
+        issuer: Issuer<'static, KeyPair>,
+        cache_size: u64,
+        provider: CryptoProvider,
+    ) -> Self {
+        let private_key =
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(issuer.key().serialize_der()));
+
+        Self {
+            issuer,
+            private_key,
+            cache: Cache::builder()
+                .max_capacity(cache_size)
+                .time_to_live(std::time::Duration::from_secs(CACHE_TTL))
+                .build(),
+            provider: Arc::new(provider),
+        }
+    }
+
+    fn gen_cert_with_upstream(
+        &self,
+        authority: &Authority,
+        upstream: Option<&UpstreamCertificateInfo>,
+    ) -> CertificateDer<'static> {
+        let mut params = CertificateParams::default();
+        params.serial_number = Some(rng().random::<u64>().into());
+
+        let not_before = OffsetDateTime::now_utc() - Duration::seconds(NOT_BEFORE_OFFSET);
+        params.not_before = not_before;
+        params.not_after = not_before + Duration::seconds(TTL_SECS);
+
+        let mut distinguished_name = DistinguishedName::new();
+        let common_name = upstream
+            .and_then(|value| value.common_name.as_deref())
+            .unwrap_or_else(|| authority.host());
+        distinguished_name.push(DnType::CommonName, common_name);
+        params.distinguished_name = distinguished_name;
+
+        let mut names = vec![authority.host().to_ascii_lowercase()];
+        if let Some(upstream) = upstream {
+            for name in &upstream.dns_names {
+                let normalized = name.trim().to_ascii_lowercase();
+                if !normalized.is_empty() && !names.iter().any(|existing| existing == &normalized) {
+                    names.push(normalized);
+                }
+            }
+        }
+
+        for name in names {
+            if let Ok(ia5) = Ia5String::try_from(name) {
+                params.subject_alt_names.push(SanType::DnsName(ia5));
+            }
+        }
+
+        params
+            .signed_by(self.issuer.key(), &self.issuer)
+            .expect("Failed to sign certificate")
+            .into()
+    }
+}
+
+impl CertificateAuthority for RcgenAuthority {
+    async fn gen_server_config(&self, authority: &Authority) -> Arc<ServerConfig> {
+        self.gen_server_config_with_upstream(authority, None).await
+    }
+
+    async fn gen_server_config_with_upstream(
+        &self,
+        authority: &Authority,
+        upstream: Option<&UpstreamCertificateInfo>,
+    ) -> Arc<ServerConfig> {
+        if let Some(server_cfg) = self.cache.get(authority).await {
+            debug!("Using cached server config");
+            return server_cfg;
+        }
+        debug!("Generating server config");
+
+        let certs = vec![self.gen_cert_with_upstream(authority, upstream)];
+
+        let mut server_cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
+            .with_safe_default_protocol_versions()
+            .expect("Failed to specify protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, self.private_key.clone_key())
+            .expect("Failed to build ServerConfig");
+
+        server_cfg.alpn_protocols = vec![
+            #[cfg(feature = "http2")]
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+        ];
+
+        let server_cfg = Arc::new(server_cfg);
+
+        self.cache
+            .insert(authority.clone(), Arc::clone(&server_cfg))
+            .await;
+
+        server_cfg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_rustls::rustls::crypto::aws_lc_rs;
+
+    fn build_ca(cache_size: u64) -> RcgenAuthority {
+        let key_pair = include_str!("../../examples/ca/hudsucker.key");
+        let ca_cert = include_str!("../../examples/ca/hudsucker.cer");
+        let key_pair = KeyPair::from_pem(key_pair).expect("Failed to parse private key");
+        let issuer =
+            Issuer::from_ca_cert_pem(ca_cert, key_pair).expect("Failed to parse CA certificate");
+
+        RcgenAuthority::new(issuer, cache_size, aws_lc_rs::default_provider())
+    }
+
+    #[test]
+    fn unique_serial_numbers() {
+        let ca = build_ca(0);
+
+        let authority1 = Authority::from_static("example.com");
+        let authority2 = Authority::from_static("example2.com");
+
+        let c1 = ca.gen_cert(&authority1);
+        let c2 = ca.gen_cert(&authority2);
+        let c3 = ca.gen_cert(&authority1);
+        let c4 = ca.gen_cert(&authority2);
+
+        let (_, cert1) = x509_parser::parse_x509_certificate(&c1).unwrap();
+        let (_, cert2) = x509_parser::parse_x509_certificate(&c2).unwrap();
+
+        assert_ne!(cert1.raw_serial(), cert2.raw_serial());
+
+        let (_, cert3) = x509_parser::parse_x509_certificate(&c3).unwrap();
+        let (_, cert4) = x509_parser::parse_x509_certificate(&c4).unwrap();
+
+        assert_ne!(cert3.raw_serial(), cert4.raw_serial());
+
+        assert_ne!(cert1.raw_serial(), cert3.raw_serial());
+        assert_ne!(cert2.raw_serial(), cert4.raw_serial());
+    }
+}

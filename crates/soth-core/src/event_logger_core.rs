@@ -1,4 +1,13 @@
 use super::*;
+use crate::types::exchange::{
+    EXCHANGE_CLIENT_APP_TYPE_HOST, EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
+};
+use tracing::{debug, warn};
+
+const SQLITE_METADATA_BUSY_TIMEOUT_MS: u64 = 10_000;
+const SQLITE_METADATA_LOCK_RETRY_MAX: u32 = 5;
+const SQLITE_METADATA_LOCK_RETRY_BASE_MS: u64 = 25;
 
 impl EventLogger {
     /// Create a new event logger that writes to the given path.
@@ -127,6 +136,12 @@ impl EventLogger {
             params![exchange_id, state_json, started_at],
         )
         .map_err(to_io_err)?;
+        debug!(
+            exchange_id = %exchange_id,
+            state_json_bytes = state_json.len(),
+            started_at = %started_at,
+            "Decision trace: exchange_spool upsert committed to SQLite"
+        );
         Ok(())
     }
 
@@ -150,6 +165,11 @@ impl EventLogger {
                     params![exchange_id, state_json],
                 )
                 .map_err(to_io_err)?;
+                debug!(
+                    exchange_id = %exchange_id,
+                    final_state_json_bytes = state_json.len(),
+                    "Decision trace: exchange_spool finalized with state snapshot"
+                );
             }
             None => {
                 conn.execute(
@@ -162,6 +182,10 @@ impl EventLogger {
                     params![exchange_id],
                 )
                 .map_err(to_io_err)?;
+                debug!(
+                    exchange_id = %exchange_id,
+                    "Decision trace: exchange_spool finalized without snapshot update"
+                );
             }
         }
         Ok(())
@@ -175,6 +199,10 @@ impl EventLogger {
             params![exchange_id],
         )
         .map_err(to_io_err)?;
+        debug!(
+            exchange_id = %exchange_id,
+            "Decision trace: exchange_spool row deleted from SQLite"
+        );
         Ok(())
     }
 
@@ -260,48 +288,74 @@ impl EventLogger {
         payload_json: &str,
         blobs_json: Option<&str>,
     ) -> std::io::Result<()> {
-        let conn = self.open_sqlite_metadata_conn()?;
         let observed_at =
             extract_exchange_observed_at(payload_json).unwrap_or_else(|| Utc::now().to_rfc3339());
-        conn.execute(
-            r#"
-            INSERT INTO exchange_events (
-                exchange_id, observed_at, event_json, created_at, updated_at
-            )
-            VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            ON CONFLICT(exchange_id) DO UPDATE SET
-                observed_at = excluded.observed_at,
-                event_json = excluded.event_json,
-                updated_at = excluded.updated_at
-            "#,
-            params![exchange_id, observed_at, payload_json],
-        )
-        .map_err(to_io_err)?;
-        conn.execute(
-            r#"
-            INSERT INTO exchange_upload_queue (
-                exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
-            )
-            VALUES (?1, ?2, ?3, 0, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            ON CONFLICT(exchange_id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                blobs_json = excluded.blobs_json,
-                updated_at = excluded.updated_at
-            "#,
-            params![exchange_id, payload_json, blobs_json],
-        )
-        .map_err(to_io_err)?;
-        Ok(())
+        for retry in 0..=SQLITE_METADATA_LOCK_RETRY_MAX {
+            let mut conn = self.open_sqlite_metadata_conn()?;
+            let write_result = (|| -> std::io::Result<()> {
+                let tx = conn.transaction().map_err(to_io_err)?;
+                tx.execute(
+                    r#"
+                    INSERT INTO exchange_events (
+                        exchange_id, observed_at, event_json, created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(exchange_id) DO UPDATE SET
+                        observed_at = excluded.observed_at,
+                        event_json = excluded.event_json,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![exchange_id, observed_at, payload_json],
+                )
+                .map_err(to_io_err)?;
+                tx.execute(
+                    r#"
+                    INSERT INTO exchange_upload_queue (
+                        exchange_id, payload_json, blobs_json, attempt_count, next_attempt_at, created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, 0, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(exchange_id) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        blobs_json = excluded.blobs_json,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![exchange_id, payload_json, blobs_json],
+                )
+                .map_err(to_io_err)?;
+                tx.commit().map_err(to_io_err)?;
+                debug!(
+                    exchange_id = %exchange_id,
+                    observed_at = %observed_at,
+                    payload_json_bytes = payload_json.len(),
+                    blobs_json_bytes = blobs_json.map(str::len).unwrap_or(0),
+                    "Decision trace: exchange_events and exchange_upload_queue transaction committed"
+                );
+                Ok(())
+            })();
+            match write_result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if retry < SQLITE_METADATA_LOCK_RETRY_MAX
+                        && is_sqlite_lock_io_error(&error) =>
+                {
+                    std::thread::sleep(sqlite_lock_retry_backoff(retry));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(
+            "sqlite metadata retry loop exited unexpectedly",
+        ))
     }
 
-    /// Convert a [`WrapEvent`] into an `exchange.v2` payload and enqueue it for cloud upload.
+    /// Convert a [`WrapEvent`] into an Exchange payload and enqueue it for cloud upload.
     ///
     /// This is used by wrap/collector paths so they share the same cloud upload mechanism
     /// as proxy traffic (`exchange_upload_queue` -> `/api/v1/exchanges/batch`).
     pub fn enqueue_exchange_from_wrap_event(
         &self,
         event: &WrapEvent,
-        exchange_cfg: &ExchangeV2Config,
+        exchange_cfg: &ExchangeConfig,
         source_class_override: Option<ExchangeSourceClass>,
     ) -> std::io::Result<()> {
         if !exchange_cfg.enabled {
@@ -309,9 +363,9 @@ impl EventLogger {
         }
 
         let exchange_id = event.id.clone();
-        let payload = wrap_event_to_exchange_v2(event, exchange_cfg, source_class_override);
+        let payload = wrap_event_to_exchange(event, exchange_cfg, source_class_override);
         let payload_json = serde_json::to_string(&payload)
-            .map_err(|error| std::io::Error::other(format!("serialize exchange.v2: {error}")))?;
+            .map_err(|error| std::io::Error::other(format!("serialize exchange: {error}")))?;
         self.enqueue_exchange_upload(exchange_id.as_str(), payload_json.as_str())
     }
 
@@ -467,9 +521,10 @@ impl EventLogger {
     }
 
     fn open_sqlite_metadata_conn(&self) -> std::io::Result<Connection> {
-        let conn = open_sqlite_read_write(&self.path)?;
-        init_sqlite_schema(&conn)?;
-        Ok(conn)
+        open_sqlite_read_write_with_timeout(
+            &self.path,
+            Duration::from_millis(SQLITE_METADATA_BUSY_TIMEOUT_MS),
+        )
     }
 }
 
@@ -1048,14 +1103,30 @@ fn extract_exchange_observed_at(payload_json: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn wrap_event_to_exchange_v2(
+fn is_sqlite_lock_io_error(error: &std::io::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database busy")
+}
+
+fn sqlite_lock_retry_backoff(retry: u32) -> Duration {
+    let multiplier = 1u64.checked_shl(retry.min(10)).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        SQLITE_METADATA_LOCK_RETRY_BASE_MS
+            .saturating_mul(multiplier)
+            .min(1_000),
+    )
+}
+
+fn wrap_event_to_exchange(
     event: &WrapEvent,
-    exchange_cfg: &ExchangeV2Config,
+    exchange_cfg: &ExchangeConfig,
     source_class_override: Option<ExchangeSourceClass>,
-) -> ExchangeEventV2 {
+) -> ExchangeEvent {
     let source_class = source_class_override.unwrap_or_else(|| source_class_from_wrap_event(event));
     let transport = transport_from_wrap_event(event);
-    let mut payload = ExchangeEventV2::new(
+    let mut payload = ExchangeEvent::new(
         event.id.clone(),
         source_class,
         transport,
@@ -1173,7 +1244,9 @@ fn wrap_event_to_exchange_v2(
     };
     payload.pii_types = event.pii_types.clone();
     payload.integrity = Some(ExchangeIntegrity {
+        status: None,
         event_hash: event.event_hash.clone(),
+        canonical_form: None,
         signature: event
             .traffic_envelope
             .as_ref()
@@ -1182,36 +1255,51 @@ fn wrap_event_to_exchange_v2(
             .traffic_envelope
             .as_ref()
             .and_then(|envelope| envelope.key_id.clone()),
+        proof_log_id: None,
+        batch_id: None,
+        leaf_index: None,
+        leaf_hash: None,
+        root_hash: None,
+        siblings: Vec::new(),
+        path: Vec::new(),
+        anchor_status: None,
+        anchor_chain: None,
+        anchor_tx_hash: None,
+        anchor_block_number: None,
+        anchor_block_hash: None,
+        anchor_confirmed_at: None,
     });
-    let detection_source = event
-        .tags
-        .as_ref()
-        .and_then(|tags| tags.get("detection.source").cloned())
-        .or_else(|| {
-            serde_json::to_value(event.agent.detected_from)
-                .ok()
-                .and_then(|value| value.as_str().map(ToString::to_string))
-        });
-    let target_entity_id = event
-        .tags
-        .as_ref()
-        .and_then(|tags| tags.get("detection.target_entity_id").cloned());
-    let detection_reason = event
-        .tags
-        .as_ref()
-        .and_then(|tags| tags.get("detection.reason").cloned())
+    let tags = event.tags.as_ref();
+    let tag = |key: &str| tags.and_then(|values| values.get(key).cloned());
+    let detection_source = tag("detection.source").or_else(|| {
+        serde_json::to_value(event.agent.detected_from)
+            .ok()
+            .and_then(|value| value.as_str().map(ToString::to_string))
+    });
+    let detection_reason = tag("detection.reason")
         .or_else(|| Some(format!("{:?}", event.agent.detected_from).to_ascii_lowercase()));
-    let parse_confidence = event.tags.as_ref().and_then(|tags| {
-        tags.get("detection.parse_confidence")
-            .and_then(|raw| raw.parse::<f64>().ok())
-    });
+    let parse_confidence =
+        tag("detection.parse_confidence").and_then(|raw| raw.parse::<f64>().ok());
+    let decision_step = tag("decision.step").or_else(|| tag("decision_step"));
+    let decision_outcome = tag("decision.outcome").or_else(|| tag("decision_outcome"));
+    let skip_reason = tag("decision.skip_reason")
+        .or_else(|| tag("skip_reason"))
+        .or_else(|| tag("decision.skipReason"));
+    let discovery_kind = tag("discovery.kind")
+        .or_else(|| tag("discovery_kind"))
+        .or_else(|| tag("discovery_mode"));
     payload.parse = Some(ExchangeParse {
-        parser_version: Some("exchange_v2_wrap".to_string()),
+        detection_id: tag("detection.id"),
+        detection_bundle_version: tag("detection.bundle_version"),
+        parser_version: Some("exchange_wrap".to_string()),
         bundle_version: None,
         parse_confidence,
         detection_reason,
-        target_entity_id,
         detection_source,
+        decision_step,
+        decision_outcome,
+        skip_reason,
+        discovery_kind,
     });
     payload.tags = merge_exchange_tags(event);
 
@@ -1231,6 +1319,23 @@ fn source_class_from_wrap_event(event: &WrapEvent) -> ExchangeSourceClass {
 
 fn transport_from_wrap_event(event: &WrapEvent) -> ExchangeTransport {
     use crate::types::TrafficSource;
+
+    if let Some(transport_hint) = event
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.get("exchange.transport"))
+        .map(|value| value.trim().to_ascii_lowercase())
+    {
+        match transport_hint.as_str() {
+            "http" => return ExchangeTransport::Http,
+            "https" => return ExchangeTransport::Https,
+            "http2" | "h2" => return ExchangeTransport::Http2,
+            "ws" | "websocket" => return ExchangeTransport::Ws,
+            "sse" => return ExchangeTransport::Sse,
+            "ndjson" | "streamable_http" | "stream" => return ExchangeTransport::Ndjson,
+            _ => {}
+        }
+    }
 
     if let Some(envelope) = event.traffic_envelope.as_ref() {
         return match envelope.source {
@@ -1260,10 +1365,9 @@ fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> 
     let app_type = event
         .collector_source
         .as_ref()
-        .map(|_| "collector".to_string())
-        .or_else(|| envelope.and_then(|value| value.process_app_type.clone()))
-        .or_else(|| infer_app_type_from_name(process_name.as_deref(), bundle_id.as_deref()))
-        .or_else(|| Some("unknown".to_string()));
+        .map(|_| EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string())
+        .or_else(|| Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string()));
+    let app_type = normalize_exchange_client_app_type(app_type.as_deref());
 
     if envelope.and_then(|value| value.process_pid).is_none()
         && process_name.is_none()
@@ -1275,9 +1379,11 @@ fn exchange_client_from_wrap_event(event: &WrapEvent) -> Option<ExchangeClient> 
 
     Some(ExchangeClient {
         pid: envelope.and_then(|value| value.process_pid),
+        device_id: None,
         bundle_id,
         process_name,
         app_type,
+        host_origin: None,
         referrer_origin: None,
     })
 }
@@ -1329,43 +1435,20 @@ fn bundle_id_from_agent_hint(agent: Option<&str>) -> Option<String> {
     }
 }
 
-fn infer_app_type_from_name(process_name: Option<&str>, bundle_id: Option<&str>) -> Option<String> {
-    let lower = process_name?.to_ascii_lowercase();
-    let has_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-    if has_any(&[
-        "chrome", "firefox", "safari", "edge", "brave", "arc", "opera", "chromium",
-    ]) {
-        return Some("browser".to_string());
+fn normalize_exchange_client_app_type(raw: Option<&str>) -> Option<String> {
+    let normalized = raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())?;
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
     }
-    if has_any(&[
-        "codex",
-        "claude-code",
-        "terminal",
-        "shell",
-        "bash",
-        "zsh",
-        "fish",
-        "python",
-        "node",
-        "npm",
-        "cargo",
-    ]) {
-        return Some("cli".to_string());
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_NON_HOST {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
     }
-    if has_any(&[
-        "cursor",
-        "windsurf",
-        "vscode",
-        "jetbrains",
-        "zed",
-        "copilot",
-    ]) {
-        return Some("editor".to_string());
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_UNKNOWN {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string());
     }
-    if has_any(&["chatgpt", "claude", "warp"]) || bundle_id.is_some() {
-        return Some("desktop_app".to_string());
-    }
-    Some("unknown".to_string())
+    Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string())
 }
 
 fn exchange_body_from_text(
@@ -1373,7 +1456,7 @@ fn exchange_body_from_text(
     preview: Option<&str>,
     size_hint: Option<u64>,
     content_type: Option<String>,
-    exchange_cfg: &ExchangeV2Config,
+    exchange_cfg: &ExchangeConfig,
 ) -> (ExchangeBody, bool) {
     if let Some(value) = text {
         let bytes = value.as_bytes();
@@ -2026,7 +2109,7 @@ mod tests {
         let path = dir.path().join("events.db");
         let logger = EventLogger::new(path).unwrap();
 
-        let mut cfg = ExchangeV2Config::default();
+        let mut cfg = ExchangeConfig::default();
         cfg.enabled = true;
 
         let event = WrapEvent::new(
@@ -2047,10 +2130,9 @@ mod tests {
                 "detection.parse_confidence".to_string(),
                 "0.9300".to_string(),
             ),
-            (
-                "detection.target_entity_id".to_string(),
-                "agt_bundle01".to_string(),
-            ),
+            ("detection.id".to_string(), "agent.bundle01.app".to_string()),
+            ("decision.step".to_string(), "step1_whitelist".to_string()),
+            ("decision.outcome".to_string(), "captured".to_string()),
         ]));
 
         logger
@@ -2060,7 +2142,7 @@ mod tests {
         let ready = logger.load_exchange_upload_queue_ready(10).unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].exchange_id, event.id);
-        assert!(ready[0].payload_json.contains("\"schema_version\":\"2.0\""));
+        assert!(ready[0].payload_json.contains("\"schema_version\":\"1\""));
         assert!(ready[0].payload_json.contains("\"source_class\":\"mcp\""));
         assert!(ready[0].payload_json.contains("\"method\":\"tools/call\""));
         assert!(ready[0].payload_json.contains("\"input_tokens\":12"));
@@ -2073,10 +2155,88 @@ mod tests {
             .contains("\"detection_reason\":\"mcp_initialize\""));
         assert!(ready[0]
             .payload_json
-            .contains("\"target_entity_id\":\"agt_bundle01\""));
+            .contains("\"detection_id\":\"agent.bundle01.app\""));
+        assert!(ready[0]
+            .payload_json
+            .contains("\"decision_step\":\"step1_whitelist\""));
+        assert!(ready[0]
+            .payload_json
+            .contains("\"decision_outcome\":\"captured\""));
         assert!(ready[0]
             .payload_json
             .contains("\"process_name\":\"claude-code\""));
-        assert!(ready[0].payload_json.contains("\"app_type\":\"cli\""));
+        assert!(ready[0].payload_json.contains("\"app_type\":\"unknown\""));
+    }
+
+    #[test]
+    fn transport_hint_tag_sets_ws_transport_for_exchange_upload() {
+        let mut cfg = ExchangeConfig::default();
+        cfg.enabled = true;
+        let event = WrapEvent::new(
+            "session-ws",
+            "chatgpt.com",
+            WrapDirection::Out,
+            AgentInfo::new("chatgpt", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_method("WebSocket /backend-api/realtime")
+        .with_tags(std::collections::BTreeMap::from([(
+            "exchange.transport".to_string(),
+            "ws".to_string(),
+        )]));
+
+        let payload = wrap_event_to_exchange(&event, &cfg, None);
+        assert_eq!(payload.transport, ExchangeTransport::Ws);
+    }
+
+    #[test]
+    fn transport_hint_tag_sets_http2_transport_for_exchange_upload() {
+        let mut cfg = ExchangeConfig::default();
+        cfg.enabled = true;
+        let event = WrapEvent::new(
+            "session-h2",
+            "api.openai.com",
+            WrapDirection::Out,
+            AgentInfo::new("openai", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_method("POST /v1/responses")
+        .with_tags(std::collections::BTreeMap::from([(
+            "exchange.transport".to_string(),
+            "http2".to_string(),
+        )]));
+
+        let payload = wrap_event_to_exchange(&event, &cfg, None);
+        assert_eq!(payload.transport, ExchangeTransport::Http2);
+    }
+
+    #[test]
+    fn wrap_exchange_parse_extracts_decision_and_discovery_fields_from_tags() {
+        let mut cfg = ExchangeConfig::default();
+        cfg.enabled = true;
+        let event = WrapEvent::new(
+            "session-decision",
+            "chatgpt.com",
+            WrapDirection::Out,
+            AgentInfo::new("chatgpt", DetectionSource::Environment),
+        )
+        .with_source(EventSource::AiProxy)
+        .with_method("WebSocket /backend-api/realtime")
+        .with_tags(std::collections::BTreeMap::from([
+            ("decision.step".to_string(), "step1_whitelist".to_string()),
+            ("decision.outcome".to_string(), "metadata_only".to_string()),
+            (
+                "decision.skip_reason".to_string(),
+                "not_whitelisted".to_string(),
+            ),
+            ("discovery_mode".to_string(), "catalog".to_string()),
+        ]));
+
+        let payload = wrap_event_to_exchange(&event, &cfg, None);
+        let parse = payload.parse.expect("parse should exist");
+        assert_eq!(parse.decision_step.as_deref(), Some("step1_whitelist"));
+        assert_eq!(parse.decision_outcome.as_deref(), Some("metadata_only"));
+        assert_eq!(parse.skip_reason.as_deref(), Some("not_whitelisted"));
+        assert_eq!(parse.discovery_kind.as_deref(), Some("catalog"));
     }
 }

@@ -43,11 +43,12 @@ pub async fn run(args: LoginArgs, global_config: Option<PathBuf>) -> anyhow::Res
     let api_key = resolve_api_key(&args)?;
     config.cloud.api_key = Some(api_key);
     config.cloud.enabled = true;
-    // Cloud sync uses unified exchange.v2 pipeline.
-    config.exchange_v2.enabled = true;
+    // Cloud sync uses the unified Exchange pipeline (schema_version=1).
+    config.exchange.enabled = true;
     if let Some(endpoint) = args.endpoint {
         config.cloud.endpoint = endpoint;
     }
+    let device_id = cli_config::sync_client_device_id(&mut config, None)?;
 
     let serialized = serde_yaml::to_string(&config).context("failed serializing config")?;
     std::fs::write(&config_path, serialized)
@@ -56,7 +57,8 @@ pub async fn run(args: LoginArgs, global_config: Option<PathBuf>) -> anyhow::Res
     println!("Saved cloud credentials to {}", config_path.display());
     println!("Cloud sync enabled: {}", config.cloud.enabled);
     println!("Cloud endpoint: {}", config.cloud.endpoint);
-    println!("Exchange v2 enabled: {}", config.exchange_v2.enabled);
+    println!("Exchange enabled: {}", config.exchange.enabled);
+    println!("Client device ID: {device_id}");
     println!("For enterprise invites, use: soth enroll <token>");
     Ok(())
 }

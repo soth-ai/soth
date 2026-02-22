@@ -60,7 +60,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Wrap an MCP server to intercept all traffic
-    Wrap(commands::wrap::WrapArgs),
+    Wrap(soth_wrap::WrapArgs),
 
     /// Auto-configure MCP clients to route through soth wrap
     Install {
@@ -659,7 +659,7 @@ async fn async_main() -> anyhow::Result<()> {
             if args.config.is_none() {
                 args.config = cli.config.clone();
             }
-            commands::wrap::run(args).await?;
+            soth_wrap::run(args).await?;
         }
         Commands::Install { target, dry_run } => {
             commands::install::run_install(target, dry_run).await?;

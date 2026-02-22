@@ -19,7 +19,7 @@ use soth_core::api::{
     ExchangeBatchResponse, HeartbeatRequest, HeartbeatResponse, RegistryVersionResponse,
 };
 use soth_core::types::{
-    exchange_v2::{ExchangeBodyMode, ExchangeEventV2, ExchangeSourceClass, ExchangeTransport},
+    exchange::{ExchangeBodyMode, ExchangeEvent, ExchangeSourceClass, ExchangeTransport},
     AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent,
 };
 use soth_sync::agent::{SyncAgent, SyncAgentConfig};
@@ -57,6 +57,7 @@ fn test_bundle_sha() -> String {
 #[derive(Debug, Clone, Default)]
 struct CapturedState {
     metadata_requests: Vec<ExchangeBatchRequest>,
+    metadata_request_paths: Vec<String>,
     body_upload_payloads: Vec<String>,
     heartbeat_requests: Vec<HeartbeatRequest>,
     registry_version_requests: usize,
@@ -95,6 +96,7 @@ async fn contract_sync_endpoints_and_cursors() {
         api_key: "test-key".to_string(),
         event_db_path: db_path.clone(),
         cache_path,
+        registry_cache_path: None,
         agent_instance_id: "agent-instance-test".to_string(),
         proxy_version: "0.1.0-test".to_string(),
         retry_queue_dir,
@@ -110,6 +112,7 @@ async fn contract_sync_endpoints_and_cursors() {
         frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        frontload_exchange_upload_path: None,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
         heartbeat_telemetry: None,
@@ -170,6 +173,47 @@ async fn contract_sync_endpoints_and_cursors() {
     assert_eq!(
         telemetry.counters.get("sync.exchange.queue_depth"),
         Some(&0)
+    );
+    assert_eq!(
+        telemetry.counters.get("sync.registry.cache_present"),
+        Some(&1)
+    );
+    assert_eq!(
+        telemetry.counters.get("sync.registry.degraded_stale"),
+        Some(&0)
+    );
+    assert!(
+        telemetry
+            .counters
+            .get("sync.registry.bundle_age_seconds")
+            .is_some(),
+        "heartbeat should include registry bundle age telemetry"
+    );
+    let registry = captured.heartbeat_requests[0]
+        .registry
+        .as_ref()
+        .expect("heartbeat registry details should be populated");
+    assert!(registry.bundle_hash.is_some());
+    assert_eq!(
+        registry.bundle_version.as_deref(),
+        Some(TEST_BUNDLE_VERSION)
+    );
+    assert_eq!(registry.degraded_stale, Some(false));
+    let host_details = captured.heartbeat_requests[0]
+        .host_details
+        .as_ref()
+        .expect("heartbeat host_details should be populated");
+    assert!(
+        host_details.platform.is_some(),
+        "heartbeat host_details.platform should be populated"
+    );
+    assert!(
+        host_details.arch.is_some(),
+        "heartbeat host_details.arch should be populated"
+    );
+    assert!(
+        host_details.cpu_logical_cores.is_some(),
+        "heartbeat host_details.cpu_logical_cores should be populated"
     );
 
     let metadata = &captured.metadata_requests[0];
@@ -236,6 +280,7 @@ async fn contract_retry_queue_on_body_upload_failure() {
         api_key: "test-key".to_string(),
         event_db_path: db_path.clone(),
         cache_path,
+        registry_cache_path: None,
         agent_instance_id: "agent-instance-retry".to_string(),
         proxy_version: "0.1.0-test".to_string(),
         retry_queue_dir: retry_queue_dir.clone(),
@@ -251,6 +296,7 @@ async fn contract_retry_queue_on_body_upload_failure() {
         frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        frontload_exchange_upload_path: None,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -307,6 +353,7 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         api_key: "test-key".to_string(),
         event_db_path: db_path.clone(),
         cache_path,
+        registry_cache_path: None,
         agent_instance_id: "agent-instance-shutdown".to_string(),
         proxy_version: "0.1.0-test".to_string(),
         retry_queue_dir,
@@ -322,6 +369,7 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        frontload_exchange_upload_path: None,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -359,6 +407,7 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         api_key: "test-key".to_string(),
         event_db_path: db_path.clone(),
         cache_path: temp.path().join("cloud_cache.json"),
+        registry_cache_path: None,
         agent_instance_id: "agent-instance-failure".to_string(),
         proxy_version: "0.1.0-test".to_string(),
         retry_queue_dir: temp.path().join("retry"),
@@ -374,6 +423,7 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        frontload_exchange_upload_path: None,
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -438,6 +488,7 @@ async fn contract_frontload_and_live_batches_are_separated() {
         api_key: "test-key".to_string(),
         event_db_path: db_path.clone(),
         cache_path,
+        registry_cache_path: None,
         agent_instance_id: "agent-instance-mode-separation".to_string(),
         proxy_version: "0.1.0-test".to_string(),
         retry_queue_dir,
@@ -453,6 +504,7 @@ async fn contract_frontload_and_live_batches_are_separated() {
         frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        frontload_exchange_upload_path: Some("/api/v1/exchanges/frontload/batch".to_string()),
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -484,11 +536,92 @@ async fn contract_frontload_and_live_batches_are_separated() {
     });
     assert!(has_frontload_batch);
     assert!(has_live_batch);
+    assert!(captured
+        .metadata_request_paths
+        .iter()
+        .any(|path| path == "/api/v1/exchanges/frontload/batch"));
+    assert!(captured
+        .metadata_request_paths
+        .iter()
+        .any(|path| path == "/api/v1/exchanges/batch"));
+}
+
+#[tokio::test]
+async fn contract_frontload_batch_endpoint_falls_back_to_default_exchange_batch() {
+    let state = Arc::new(Mutex::new(CapturedState::default()));
+    let Some(server_url) = start_mock_server(state.clone()).await else {
+        eprintln!(
+            "Skipping contract_frontload_batch_endpoint_falls_back_to_default_exchange_batch: cannot bind localhost listener"
+        );
+        return;
+    };
+
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("events.db");
+    create_test_db(&db_path, false);
+    let cache_path = temp.path().join("cloud_cache.json");
+    let registry_cache_path = temp.path().join("registry_cache.json");
+    let retry_queue_dir = temp.path().join("retry");
+
+    let mut frontload_event = make_exchange_event("11111111-2222-3333-4444-555555555553");
+    frontload_event.tags = Some(BTreeMap::from([(
+        "collector.ingest_mode".to_string(),
+        "frontload".to_string(),
+    )]));
+    seed_exchange_upload_queue_event(&db_path, &frontload_event);
+
+    let registry_puller =
+        RegistryPuller::new(server_url.clone(), "test-key", registry_cache_path.clone());
+    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone())
+        .with_registry_puller(registry_puller);
+    let _ = puller.pull_once().await.unwrap();
+
+    let config = SyncAgentConfig {
+        endpoint: server_url,
+        api_key: "test-key".to_string(),
+        event_db_path: db_path.clone(),
+        cache_path,
+        registry_cache_path: None,
+        agent_instance_id: "agent-instance-frontload-fallback".to_string(),
+        proxy_version: "0.1.0-test".to_string(),
+        retry_queue_dir,
+        retry_queue_max_bytes: 10 * 1024 * 1024,
+        sync_interval: Duration::from_secs(1),
+        batch_size: 200,
+        body_batch_size: 200,
+        body_upload_enabled: true,
+        metadata_max_events_per_batch: 200,
+        metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        frontload_exchange_upload_path: Some("/api/v1/exchanges/missing/batch".to_string()),
+        body_upload_max_bytes: 15 * 1024 * 1024,
+        global_tags: BTreeMap::new(),
+        heartbeat_telemetry: None,
+    };
+
+    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+    let summary = agent.tick().await.unwrap();
+    assert_eq!(summary.exchange_sent, 1);
+
+    let captured = state.lock().unwrap().clone();
+    assert_eq!(captured.metadata_requests.len(), 1);
+    assert_eq!(
+        captured.metadata_request_paths,
+        vec!["/api/v1/exchanges/batch".to_string()]
+    );
 }
 
 async fn start_mock_server(state: SharedState) -> Option<String> {
     let app = Router::new()
         .route("/api/v1/exchanges/batch", post(exchange_batch_handler))
+        .route(
+            "/api/v1/exchanges/frontload/batch",
+            post(exchange_frontload_batch_handler),
+        )
         .route("/api/v1/blobs", post(blob_upload_handler))
         .route("/api/v1/config", get(config_handler))
         .route("/api/v1/heartbeat", post(heartbeat_handler))
@@ -517,6 +650,23 @@ async fn exchange_batch_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<ExchangeBatchResponse>) {
+    exchange_batch_handler_at_path(state, headers, body, "/api/v1/exchanges/batch").await
+}
+
+async fn exchange_frontload_batch_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<ExchangeBatchResponse>) {
+    exchange_batch_handler_at_path(state, headers, body, "/api/v1/exchanges/frontload/batch").await
+}
+
+async fn exchange_batch_handler_at_path(
+    state: SharedState,
+    headers: HeaderMap,
+    body: Bytes,
+    path: &'static str,
+) -> (StatusCode, Json<ExchangeBatchResponse>) {
     record_headers(&state, &headers);
     let request = match decode_exchange_batch_request(&headers, body.as_ref()) {
         Ok(request) => request,
@@ -538,11 +688,11 @@ async fn exchange_batch_handler(
             );
         }
     };
-    state
-        .lock()
-        .unwrap()
-        .metadata_requests
-        .push(request.clone());
+    {
+        let mut locked = state.lock().unwrap();
+        locked.metadata_requests.push(request.clone());
+        locked.metadata_request_paths.push(path.to_string());
+    }
     (
         StatusCode::OK,
         Json(ExchangeBatchResponse {
@@ -689,11 +839,14 @@ async fn registry_version_handler(
             bundle_type: "local".to_string(),
             version: TEST_BUNDLE_VERSION.to_string(),
             sha256: test_bundle_sha(),
+            bundle_hash: Some(test_bundle_sha()),
             compiled_at: Utc::now().to_rfc3339(),
             provider_count: 3,
             domain_count: 10,
             format_count: 5,
             size_bytes: TEST_BUNDLE_JSON.as_bytes().len() as u64,
+            manifest: None,
+            channel: Some("stable".to_string()),
         }),
     )
 }
@@ -828,7 +981,7 @@ fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
     seed_exchange_upload_queue_event(path, &event);
 }
 
-fn seed_exchange_upload_queue_event(path: &Path, event: &ExchangeEventV2) {
+fn seed_exchange_upload_queue_event(path: &Path, event: &ExchangeEvent) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
         r#"
@@ -888,8 +1041,8 @@ fn make_event(id: &str) -> WrapEvent {
     event
 }
 
-fn make_exchange_event(exchange_id: &str) -> ExchangeEventV2 {
-    let mut event = ExchangeEventV2::new(
+fn make_exchange_event(exchange_id: &str) -> ExchangeEvent {
+    let mut event = ExchangeEvent::new(
         exchange_id,
         ExchangeSourceClass::AiInference,
         ExchangeTransport::Https,

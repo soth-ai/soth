@@ -49,6 +49,39 @@ pub enum InterceptDecision {
     Tunnel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectDecisionAction {
+    Intercept,
+    Passthrough,
+    Tunnel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectDecision {
+    pub action: ConnectDecisionAction,
+    pub rule_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestDecisionOutcome {
+    Full,
+    MetadataOnly,
+    Passthrough,
+    Noise,
+    Tunnel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestDecision {
+    pub outcome: RequestDecisionOutcome,
+    pub provider_id: Option<String>,
+    pub entry_type: Option<EntryType>,
+    pub detection_id: Option<String>,
+    pub rule_id: Option<String>,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderUsage {
     pub input_tokens: u64,
@@ -93,7 +126,7 @@ pub struct DetectionOutcome {
     pub agent: Option<String>,
     pub detection_reason: String,
     pub parse_confidence: f64,
-    pub target_entity_id: Option<String>,
+    pub detection_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

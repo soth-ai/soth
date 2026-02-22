@@ -3,8 +3,8 @@
 //! Tests PII detection optional and cache configuration.
 
 use soth_core::config::{CacheConfig, SothConfig};
+use soth_helper::pipeline::observe::{ObserveConfig, ObserveLayer};
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine};
-use soth_proxy::pipeline::observe::{ObserveConfig, ObserveLayer};
 use std::time::Duration;
 
 /// Test: PII detection disabled means no detector/redactor allocation

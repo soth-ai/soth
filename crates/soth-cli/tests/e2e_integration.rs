@@ -4,7 +4,7 @@
 
 use serde_json::json;
 use soth_core::types::policy::PolicyData;
-use soth_proxy::{
+use soth_helper::{
     pipeline::budget::BudgetConfig,
     pipeline::middleware::RequestContext,
     pipeline::observe::ObserveConfig,

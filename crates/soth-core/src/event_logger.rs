@@ -9,9 +9,10 @@ pub use self::event_logger_core::default_event_log_write_path;
 use self::event_logger_core::{
     compute_merkle_root, hash_root_link, hex_decode_32, hex_encode, to_io_err,
 };
-use crate::config::types::{CryptoIdentityConfig, ExchangeV2Config};
-use crate::types::exchange_v2::{
-    ExchangeBody, ExchangeBodyMode, ExchangeClient, ExchangeCost, ExchangeEventV2, ExchangeFlags,
+use crate::config::types::{CryptoIdentityConfig, ExchangeConfig};
+use crate::storage::{open_sqlite_read_write_with_timeout, read_sync_state, write_sync_state};
+use crate::types::exchange::{
+    ExchangeBody, ExchangeBodyMode, ExchangeClient, ExchangeCost, ExchangeEvent, ExchangeFlags,
     ExchangeIntegrity, ExchangeParse, ExchangeSide, ExchangeSourceClass, ExchangeTransport,
     ExchangeUsage,
 };
@@ -21,13 +22,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
-use soth_storage::{open_sqlite_read_write, read_sync_state, write_sync_state};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tracing::warn;
 
 pub const EVENT_LOG_SQLITE_FILE: &str = "events.db";
 pub const SYNC_KEY_LAST_SYNCED_SEQ: &str = "last_synced_seq";

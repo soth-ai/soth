@@ -145,7 +145,7 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .as_ref()
         .map(|v| v.trim())
         .filter(|v| !v.is_empty());
-    let exchange_v2_enabled = config.exchange_v2.enabled;
+    let exchange_enabled = config.exchange.enabled;
 
     let mut cloud_table = style::table();
     cloud_table.set_header(vec!["Property", "Value"]);
@@ -178,8 +178,8 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         ),
     ]);
     cloud_table.add_row(vec![
-        Cell::new("Exchange V2"),
-        Cell::new(if exchange_v2_enabled {
+        Cell::new("Exchange"),
+        Cell::new(if exchange_enabled {
             "enabled".green().to_string()
         } else {
             "disabled".yellow().to_string()

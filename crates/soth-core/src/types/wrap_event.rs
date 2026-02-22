@@ -15,9 +15,9 @@ pub enum EventSource {
     /// MCP traffic from soth wrap (stdio interception)
     #[default]
     Mcp,
-    /// Direct AI API inference traffic (api.openai.com, api.anthropic.com, etc.)
+    /// Direct AI API inference traffic.
     AiProxy,
-    /// AI agent app traffic (chatgpt.com, claude.ai - end-user applications)
+    /// AI agent app traffic (end-user applications).
     AgentApp,
 }
 

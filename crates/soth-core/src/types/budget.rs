@@ -19,7 +19,7 @@ pub struct ModelPricingEntry {
     /// Display name (e.g., "GPT-4o")
     pub model_name: String,
 
-    /// Provider (e.g., "openai", "anthropic", "google")
+    /// Provider identifier.
     pub provider: String,
 
     /// Input cost per million tokens (USD)
@@ -119,7 +119,7 @@ impl CostTag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpendRequestType {
-    /// Direct AI API call (api.openai.com, api.anthropic.com)
+    /// Direct AI API call.
     #[default]
     AiInference,
 
@@ -154,7 +154,7 @@ pub struct TaggedSpendRecord {
     #[serde(default)]
     pub request_type: SpendRequestType,
 
-    /// Provider name (openai, anthropic, google)
+    /// Provider identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 }

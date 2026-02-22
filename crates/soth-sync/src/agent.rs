@@ -3,7 +3,7 @@ use crate::cache;
 use crate::config_puller::ConfigPuller;
 use crate::heartbeat::HeartbeatSender;
 use crate::metadata_pusher::{
-    estimate_gzip_exchange_batch_size, ExchangePushResult, MetadataPusher,
+    estimate_gzip_exchange_batch_size, ExchangeBatchRoute, ExchangePushResult, MetadataPusher,
 };
 use crate::retry_queue::BodyRetryQueue;
 use anyhow::Context;
@@ -11,30 +11,36 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use soth_core::api::{
     BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
-    ExchangeMetadata, HeartbeatRequest, HeartbeatTelemetry,
+    ExchangeMetadata, HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest,
+    HeartbeatTelemetry,
 };
 use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
-use soth_core::types::exchange_v2::{ExchangeBodyMode, ExchangeEventV2};
-use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
+use soth_core::storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
+use soth_core::types::exchange::{
+    ExchangeBodyMode, ExchangeEvent, EXCHANGE_CLIENT_APP_TYPE_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 const MAX_METADATA_BATCH_EVENTS_HARD_CAP: usize = 200;
 const MAX_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 5 * 1024 * 1024;
 const DEFAULT_FRONTLOAD_METADATA_BATCH_EVENTS: usize = 1500;
-const DEFAULT_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FRONTLOAD_METADATA_BATCH_EVENTS_HARD_CAP: usize = 5000;
-const MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 16 * 1024 * 1024;
+const MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP: usize = 64 * 1024 * 1024;
 const MAX_EXCHANGE_RETRY_BACKOFF_SECS: u64 = 15 * 60;
 const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
 const SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1: &str = "migration_exchange_uuid_cleanup_v1";
 const EXCHANGE_SPOOL_STALE_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 const EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT: usize = 10_000;
+const EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX: u32 = 4;
+const EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_BASE_MS: u64 = 50;
 const SYNC_TELEMETRY_EXCHANGE_SENT: &str = "sync.exchange.sent";
 const SYNC_TELEMETRY_EXCHANGE_BLOB_UPLOADED: &str = "sync.exchange.blob_uploaded";
 const SYNC_TELEMETRY_EXCHANGE_RETRY_DEFERRED: &str = "sync.exchange.retry_deferred";
@@ -46,6 +52,11 @@ const SYNC_TELEMETRY_EXCHANGE_BATCH_COMPRESSED_BYTES: &str = "sync.exchange.batc
 const SYNC_TELEMETRY_EXCHANGE_BATCH_SPLIT_COUNT: &str = "sync.exchange.batch.split_count";
 const SYNC_TELEMETRY_EXCHANGE_FRONTLOAD_SENT: &str = "sync.exchange.frontload.sent";
 const SYNC_TELEMETRY_EXCHANGE_LIVE_SENT: &str = "sync.exchange.live.sent";
+const SYNC_TELEMETRY_REGISTRY_CACHE_PRESENT: &str = "sync.registry.cache_present";
+const SYNC_TELEMETRY_REGISTRY_BUNDLE_AGE_SECS: &str = "sync.registry.bundle_age_seconds";
+const SYNC_TELEMETRY_REGISTRY_DEGRADED_STALE: &str = "sync.registry.degraded_stale";
+const SYNC_TELEMETRY_REGISTRY_VALIDATION_FAILED: &str = "sync.registry.validation_failed";
+const REGISTRY_BUNDLE_DEGRADED_AGE_SECS: u64 = 24 * 60 * 60;
 
 const MIN_LIVE_EVENTS: usize = 25;
 const MIN_LIVE_COMPRESSED_BYTES: usize = 1 * 1024 * 1024;
@@ -61,6 +72,7 @@ pub struct SyncAgentConfig {
     pub api_key: String,
     pub event_db_path: PathBuf,
     pub cache_path: PathBuf,
+    pub registry_cache_path: Option<PathBuf>,
     pub agent_instance_id: String,
     pub proxy_version: String,
     pub retry_queue_dir: PathBuf,
@@ -76,6 +88,7 @@ pub struct SyncAgentConfig {
     pub frontload_max_compressed_batch_bytes: usize,
     pub frontload_hard_events_cap: usize,
     pub frontload_hard_compressed_cap_bytes: usize,
+    pub frontload_exchange_upload_path: Option<String>,
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
@@ -262,7 +275,11 @@ impl SyncAgent {
                     .max(1)
                     .min(MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP),
             );
-        let metadata_pusher = MetadataPusher::new(&config.endpoint, &config.api_key);
+        let metadata_pusher = MetadataPusher::new(
+            &config.endpoint,
+            &config.api_key,
+            config.frontload_exchange_upload_path.clone(),
+        );
         let body_uploader = BodyUploader::new(&config.endpoint, &config.api_key);
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
         let retry_queue =
@@ -278,10 +295,17 @@ impl SyncAgent {
             Duration::from_secs(EXCHANGE_SPOOL_STALE_MAX_AGE_SECS),
             EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT,
         ) {
-            warn!(
-                error = %error,
-                "Failed exchange spool stale cleanup; continuing"
-            );
+            if is_sqlite_lock_anyhow(&error) {
+                debug!(
+                    error = %error,
+                    "Exchange spool stale cleanup skipped due to sqlite lock; continuing"
+                );
+            } else {
+                warn!(
+                    error = %error,
+                    "Failed exchange spool stale cleanup; continuing"
+                );
+            }
         }
         let adaptive_batch_state = Mutex::new(AdaptiveBatchState::new(&config));
 
@@ -368,14 +392,23 @@ impl SyncAgent {
 
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
         let config_version = self.cached_config_version();
-        let telemetry = self.compose_heartbeat_telemetry();
+        let registry = self.collect_registry_heartbeat_details();
+        let telemetry = self.compose_heartbeat_telemetry(registry.as_ref());
+        let host_details = collect_heartbeat_host_details();
+        let heartbeat_os = host_details
+            .platform
+            .clone()
+            .or_else(|| Some(std::env::consts::OS.to_string()));
+        let heartbeat_hostname = host_details.hostname.clone();
         let request = HeartbeatRequest {
             agent_instance_id: self.config.agent_instance_id.clone(),
             proxy_version: self.config.proxy_version.clone(),
             config_version,
-            os: Some(std::env::consts::OS.to_string()),
-            hostname: resolve_hostname(),
+            os: heartbeat_os,
+            hostname: heartbeat_hostname,
             active_connections: None,
+            host_details: Some(host_details),
+            registry,
             telemetry,
         };
 
@@ -401,7 +434,10 @@ impl SyncAgent {
         }
     }
 
-    fn compose_heartbeat_telemetry(&self) -> Option<HeartbeatTelemetry> {
+    fn compose_heartbeat_telemetry(
+        &self,
+        registry: Option<&HeartbeatRegistryDetails>,
+    ) -> Option<HeartbeatTelemetry> {
         let mut telemetry = self
             .config
             .heartbeat_telemetry
@@ -457,11 +493,77 @@ impl SyncAgent {
             SYNC_TELEMETRY_EXCHANGE_LIVE_SENT.to_string(),
             self.sync_exchange_live_sent_total.load(Ordering::Relaxed),
         );
+        if let Some(registry) = registry {
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_CACHE_PRESENT.to_string(), 1);
+            telemetry.counters.insert(
+                SYNC_TELEMETRY_REGISTRY_BUNDLE_AGE_SECS.to_string(),
+                registry.bundle_age_seconds.unwrap_or(0),
+            );
+            telemetry.counters.insert(
+                SYNC_TELEMETRY_REGISTRY_DEGRADED_STALE.to_string(),
+                if registry.degraded_stale.unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            );
+            telemetry.counters.insert(
+                SYNC_TELEMETRY_REGISTRY_VALIDATION_FAILED.to_string(),
+                if registry.validation_status.as_deref() == Some("failed")
+                    || registry.validation_failed_reason.is_some()
+                {
+                    1
+                } else {
+                    0
+                },
+            );
+        } else {
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_CACHE_PRESENT.to_string(), 0);
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_BUNDLE_AGE_SECS.to_string(), 0);
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_DEGRADED_STALE.to_string(), 1);
+            telemetry
+                .counters
+                .insert(SYNC_TELEMETRY_REGISTRY_VALIDATION_FAILED.to_string(), 0);
+        }
         if telemetry.counters.is_empty() {
             None
         } else {
             Some(telemetry)
         }
+    }
+
+    fn collect_registry_heartbeat_details(&self) -> Option<HeartbeatRegistryDetails> {
+        let registry_cache_path = self
+            .config
+            .registry_cache_path
+            .clone()
+            .unwrap_or_else(|| resolve_registry_cache_path(&self.config.cache_path));
+        let status = cache::registry_bundle_runtime_status(
+            &registry_cache_path,
+            Duration::from_secs(REGISTRY_BUNDLE_DEGRADED_AGE_SECS),
+        );
+        let has_validation_signal =
+            status.validation_status.is_some() || status.validation_failed_reason.is_some();
+        if !status.cache_present && !has_validation_signal {
+            return None;
+        }
+        Some(HeartbeatRegistryDetails {
+            bundle_hash: status.bundle_hash,
+            bundle_version: status.bundle_version,
+            fetched_at: status.fetched_at,
+            bundle_age_seconds: status.bundle_age_seconds,
+            validation_status: status.validation_status,
+            validation_failed_reason: status.validation_failed_reason,
+            degraded_stale: Some(status.stale || !status.cache_present),
+        })
     }
 
     async fn sync_exchange_queue_once(&self) -> anyhow::Result<ExchangeQueueStats> {
@@ -536,7 +638,7 @@ impl SyncAgent {
         &self,
         row: ExchangeQueueRow,
     ) -> anyhow::Result<PreparedRowResult> {
-        let mut event = match serde_json::from_str::<ExchangeEventV2>(&row.payload_json) {
+        let mut event = match serde_json::from_str::<ExchangeEvent>(&row.payload_json) {
             Ok(value) => value,
             Err(error) => {
                 return Ok(PreparedRowResult::Drop {
@@ -605,7 +707,8 @@ impl SyncAgent {
             }
         }
 
-        let mut metadata = exchange_event_to_metadata(&event);
+        let global_device_id = normalized_global_device_id(&self.config.global_tags);
+        let mut metadata = exchange_event_to_metadata(&event, global_device_id.as_deref());
         metadata.tags = merge_tags_for_exchange(&self.config.global_tags, event.tags.as_ref());
         let mode = exchange_sync_mode(metadata.tags.as_ref(), self.config.frontload_enabled);
         Ok(PreparedRowResult::Prepared(PreparedExchangeQueueRow {
@@ -745,7 +848,11 @@ impl SyncAgent {
                 config_version: config_version.cloned(),
                 batch: batch.iter().map(|value| value.metadata.clone()).collect(),
             };
-            match self.metadata_pusher.push_exchange_batch(&request).await {
+            match self
+                .metadata_pusher
+                .push_exchange_batch(&request, exchange_batch_route_for_mode(mode))
+                .await
+            {
                 Ok(ExchangePushResult::Success(response)) if response.rejected == 0 => {
                     for item in batch {
                         self.delete_exchange_queue_entry(&item.row.exchange_id)?;
@@ -1089,6 +1196,28 @@ fn run_exchange_spool_stale_cleanup(
     max_age: Duration,
     limit: usize,
 ) -> anyhow::Result<()> {
+    for retry in 0..=EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX {
+        match run_exchange_spool_stale_cleanup_once(path, max_age, limit) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if retry < EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX
+                    && is_sqlite_lock_anyhow(&error) =>
+            {
+                std::thread::sleep(exchange_spool_cleanup_retry_backoff(retry));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "exchange spool stale cleanup retry loop exited unexpectedly"
+    ))
+}
+
+fn run_exchange_spool_stale_cleanup_once(
+    path: &Path,
+    max_age: Duration,
+    limit: usize,
+) -> anyhow::Result<()> {
     let conn = open_rw_conn(path)?;
     if !sqlite_table_exists(&conn, "exchange_spool")? {
         return Ok(());
@@ -1117,6 +1246,25 @@ fn run_exchange_spool_stale_cleanup(
         );
     }
     Ok(())
+}
+
+fn exchange_spool_cleanup_retry_backoff(retry: u32) -> Duration {
+    let shift = retry.min(10);
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_BASE_MS
+            .saturating_mul(multiplier)
+            .min(1_000),
+    )
+}
+
+fn is_sqlite_lock_anyhow(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("database is locked")
+            || message.contains("database table is locked")
+            || message.contains("database busy")
+    })
 }
 
 fn sqlite_table_exists(conn: &Connection, table_name: &str) -> anyhow::Result<bool> {
@@ -1183,7 +1331,10 @@ fn merge_tags(
     Some(merged)
 }
 
-fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
+fn exchange_event_to_metadata(
+    event: &ExchangeEvent,
+    global_device_id: Option<&str>,
+) -> ExchangeMetadata {
     let policy_allowed = event
         .tags
         .as_ref()
@@ -1217,6 +1368,9 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         exchange_id: event.exchange_id.clone(),
         schema_version: event.schema_version.clone(),
         session_id: event.session_id.clone(),
+        edge_session_id: event.edge_session_id.clone(),
+        provider_session_id: event.provider_session_id.clone(),
+        session_is_synthetic: event.session_is_synthetic,
         observed_at: event.observed_at.to_rfc3339(),
         started_at: event.started_at.map(|value| value.to_rfc3339()),
         completed_at: event.completed_at.map(|value| value.to_rfc3339()),
@@ -1232,7 +1386,22 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
         model: event.model.clone(),
         endpoint: event.endpoint.clone(),
         method: event.method.clone(),
+        detection_id: event.effective_detection_id().map(ToString::to_string),
+        detection_bundle_version: event
+            .effective_detection_bundle_version()
+            .map(ToString::to_string),
+        tool_identity_key: event.tool_identity_key.clone(),
         status_code: event.status_code,
+        client_device_id: event
+            .client_device_id
+            .clone()
+            .or_else(|| {
+                event
+                    .client
+                    .as_ref()
+                    .and_then(|value| value.device_id.clone())
+            })
+            .or_else(|| global_device_id.map(str::to_string)),
         input_tokens: event.usage.input_tokens,
         output_tokens: event.usage.output_tokens,
         cache_read_tokens: event.usage.cache_read_tokens,
@@ -1270,6 +1439,10 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
             .integrity
             .as_ref()
             .and_then(|value| value.event_hash.clone()),
+        integrity_status: event
+            .integrity
+            .as_ref()
+            .and_then(|value| value.status.clone()),
         signature: event
             .integrity
             .as_ref()
@@ -1294,17 +1467,54 @@ fn exchange_event_to_metadata(event: &ExchangeEventV2) -> ExchangeMetadata {
             .parse
             .as_ref()
             .and_then(|value| value.detection_reason.clone()),
-        target_entity_id: event
-            .parse
-            .as_ref()
-            .and_then(|value| value.target_entity_id.clone()),
         detection_source: event
             .parse
             .as_ref()
             .and_then(|value| value.detection_source.clone()),
+        decision_step: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.decision_step.clone()),
+        decision_outcome: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.decision_outcome.clone()),
+        skip_reason: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.skip_reason.clone()),
+        discovery_kind: event
+            .parse
+            .as_ref()
+            .and_then(|value| value.discovery_kind.clone()),
+        client_app_type: normalize_client_app_type_for_contract(
+            event
+                .client
+                .as_ref()
+                .and_then(|value| value.app_type.as_deref()),
+        ),
+        client_host_origin: event
+            .client
+            .as_ref()
+            .and_then(|value| value.host_origin.clone()),
+        client_referrer_origin: event
+            .client
+            .as_ref()
+            .and_then(|value| value.referrer_origin.clone()),
         tags: event.tags.as_ref().map(tree_to_hash),
         event_envelope: build_exchange_event_envelope_metadata(event),
     }
+}
+
+fn normalized_global_device_id(tags: &BTreeMap<String, String>) -> Option<String> {
+    tags.get("device_id").and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn merge_tags_for_exchange(
@@ -1331,17 +1541,44 @@ fn exchange_sync_mode(
     }
 }
 
+fn exchange_batch_route_for_mode(mode: ExchangeSyncMode) -> ExchangeBatchRoute {
+    match mode {
+        ExchangeSyncMode::Live => ExchangeBatchRoute::Live,
+        ExchangeSyncMode::Frontload => ExchangeBatchRoute::Frontload,
+    }
+}
+
 fn classify_exchange_rejection(reason: &str, code: Option<&str>) -> ExchangeRejectionDisposition {
     let candidate = code.unwrap_or(reason).trim().to_ascii_lowercase();
     match candidate.as_str() {
         "duplicate" => ExchangeRejectionDisposition::Drop,
+        value if is_terminal_contract_rejection_code(value) => ExchangeRejectionDisposition::Drop,
         _ => ExchangeRejectionDisposition::Retry,
     }
 }
 
-fn build_exchange_event_envelope_metadata(
-    event: &ExchangeEventV2,
-) -> Option<EventEnvelopeMetadata> {
+fn is_terminal_contract_rejection_code(code: &str) -> bool {
+    if code.is_empty() {
+        return false;
+    }
+
+    matches!(
+        code,
+        "invalid_exchange_id"
+            | "invalid_observed_at"
+            | "invalid_schema_version"
+            | "invalid_source_class"
+            | "invalid_decision_contract"
+            | "detection_id_invalid"
+            | "detection_id_required"
+            | "detection_bundle_version_required"
+            | "validation_failed"
+    ) || code.starts_with("invalid_")
+        || code.ends_with("_required")
+        || code.contains("validation")
+}
+
+fn build_exchange_event_envelope_metadata(event: &ExchangeEvent) -> Option<EventEnvelopeMetadata> {
     let (host, path) = split_endpoint_host_path(event.endpoint.as_deref());
     let tags = event.tags.as_ref();
     let process_executable = tags
@@ -1349,10 +1586,13 @@ fn build_exchange_event_envelope_metadata(
         .cloned();
     let client = event.client.as_ref().map(|value| EventClientMetadata {
         pid: value.pid,
+        device_id: value.device_id.clone(),
         bundle_id: value.bundle_id.clone(),
         process_name: value.process_name.clone(),
         process_executable,
-        app_type: value.app_type.clone(),
+        app_type: normalize_client_app_type_for_contract(value.app_type.as_deref()),
+        host_origin: value.host_origin.clone(),
+        referrer_origin: value.referrer_origin.clone(),
     });
     let headers = event
         .request
@@ -1369,7 +1609,7 @@ fn build_exchange_event_envelope_metadata(
         envelope_id: None,
         request_id: event.trace_id.clone(),
         capture_source: Some(match event.source_class {
-            soth_core::types::exchange_v2::ExchangeSourceClass::Mcp => "wrap".to_string(),
+            soth_core::types::exchange::ExchangeSourceClass::Mcp => "wrap".to_string(),
             _ => "proxy".to_string(),
         }),
         source: Some(exchange_transport_to_str(event.transport).to_string()),
@@ -1450,27 +1690,28 @@ fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<S
 }
 
 fn exchange_source_class_to_str(
-    source: soth_core::types::exchange_v2::ExchangeSourceClass,
+    source: soth_core::types::exchange::ExchangeSourceClass,
 ) -> &'static str {
     match source {
-        soth_core::types::exchange_v2::ExchangeSourceClass::AiInference => "ai_inference",
-        soth_core::types::exchange_v2::ExchangeSourceClass::AgentApp => "agent_app",
-        soth_core::types::exchange_v2::ExchangeSourceClass::Mcp => "mcp",
-        soth_core::types::exchange_v2::ExchangeSourceClass::Collector => "collector",
+        soth_core::types::exchange::ExchangeSourceClass::AiInference => "ai_inference",
+        soth_core::types::exchange::ExchangeSourceClass::AgentApp => "agent_app",
+        soth_core::types::exchange::ExchangeSourceClass::Mcp => "mcp",
+        soth_core::types::exchange::ExchangeSourceClass::Collector => "collector",
     }
 }
 
 fn exchange_transport_to_str(
-    transport: soth_core::types::exchange_v2::ExchangeTransport,
+    transport: soth_core::types::exchange::ExchangeTransport,
 ) -> &'static str {
     match transport {
-        soth_core::types::exchange_v2::ExchangeTransport::Http => "http",
-        soth_core::types::exchange_v2::ExchangeTransport::Https => "https",
-        soth_core::types::exchange_v2::ExchangeTransport::Ws => "ws",
-        soth_core::types::exchange_v2::ExchangeTransport::Sse => "sse",
-        soth_core::types::exchange_v2::ExchangeTransport::Ndjson => "ndjson",
-        soth_core::types::exchange_v2::ExchangeTransport::Stdio => "stdio",
-        soth_core::types::exchange_v2::ExchangeTransport::Jsonrpc => "jsonrpc",
+        soth_core::types::exchange::ExchangeTransport::Http => "http",
+        soth_core::types::exchange::ExchangeTransport::Https => "https",
+        soth_core::types::exchange::ExchangeTransport::Http2 => "http2",
+        soth_core::types::exchange::ExchangeTransport::Ws => "ws",
+        soth_core::types::exchange::ExchangeTransport::Sse => "sse",
+        soth_core::types::exchange::ExchangeTransport::Ndjson => "ndjson",
+        soth_core::types::exchange::ExchangeTransport::Stdio => "stdio",
+        soth_core::types::exchange::ExchangeTransport::Jsonrpc => "jsonrpc",
     }
 }
 
@@ -1478,9 +1719,27 @@ fn exchange_body_mode_to_str(mode: ExchangeBodyMode) -> &'static str {
     match mode {
         ExchangeBodyMode::Inline => "inline",
         ExchangeBodyMode::Offloaded => "offloaded",
-        ExchangeBodyMode::PreviewOnly => "preview_only",
+        // Cloud contract freeze only accepts inline|offloaded|metadata_only.
+        // Legacy local events may still carry PreviewOnly; normalize on upload.
+        ExchangeBodyMode::PreviewOnly => "metadata_only",
         ExchangeBodyMode::MetadataOnly => "metadata_only",
     }
+}
+
+fn normalize_client_app_type_for_contract(raw: Option<&str>) -> Option<String> {
+    let normalized = raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())?;
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_HOST {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_HOST.to_string());
+    }
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_NON_HOST {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_NON_HOST.to_string());
+    }
+    if normalized == EXCHANGE_CLIENT_APP_TYPE_UNKNOWN {
+        return Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string());
+    }
+    Some(EXCHANGE_CLIENT_APP_TYPE_UNKNOWN.to_string())
 }
 
 fn is_missing_table_error(error: &rusqlite::Error, table: &str) -> bool {
@@ -1509,19 +1768,186 @@ fn tree_to_hash(map: &BTreeMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
+fn resolve_registry_cache_path(config_cache_path: &Path) -> PathBuf {
+    if let Some(parent) = config_cache_path.parent() {
+        return parent.join("registry_bundle_cache.json");
+    }
+    cache::default_registry_cache_path()
+}
+
 fn resolve_hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| run_trimmed_command_output(hostname_resolution_command()))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone)]
+struct HostOsIdentity {
+    platform: String,
+    family: String,
+    version: Option<String>,
+}
+
+fn collect_heartbeat_host_details() -> HeartbeatHostDetails {
+    let identity = detect_host_os_identity();
+    HeartbeatHostDetails {
+        platform: Some(identity.platform),
+        os_family: Some(identity.family),
+        os_version: identity.version,
+        hostname: resolve_hostname(),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        cpu_logical_cores: std::thread::available_parallelism()
+            .ok()
+            .map(|value| value.get() as u64),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_host_os_identity() -> HostOsIdentity {
+    HostOsIdentity {
+        platform: "macos".to_string(),
+        family: "unix".to_string(),
+        // Mirrors os_info macOS strategy: parse ProductVersion from sw_vers output.
+        version: detect_macos_version(),
+    }
+}
+
+#[cfg(windows)]
+fn detect_host_os_identity() -> HostOsIdentity {
+    HostOsIdentity {
+        platform: "windows".to_string(),
+        family: "windows".to_string(),
+        // Keep a lightweight subset of os_info behavior by extracting the semantic version
+        // from `cmd /C ver` output.
+        version: detect_windows_version(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_host_os_identity() -> HostOsIdentity {
+    detect_linux_identity()
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn detect_host_os_identity() -> HostOsIdentity {
+    HostOsIdentity {
+        platform: std::env::consts::OS.to_string(),
+        family: std::env::consts::FAMILY.to_string(),
+        version: None,
+    }
+}
+
+fn normalize_os_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_version() -> Option<String> {
+    let output = run_trimmed_command_output(("sw_vers", &[]))?;
+    parse_prefixed_word(&output, "ProductVersion:")
+}
+
+#[cfg(windows)]
+fn detect_windows_version() -> Option<String> {
+    let output = run_trimmed_command_output(("cmd", &["/C", "ver"]))?;
+    parse_windows_ver_output(&output)
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_identity() -> HostOsIdentity {
+    let release = std::fs::read_to_string("/etc/os-release").ok();
+    let distro_id = release
+        .as_deref()
+        .and_then(|contents| parse_os_release_key(contents, "ID"));
+    let distro_version = release
+        .as_deref()
+        .and_then(|contents| parse_os_release_key(contents, "VERSION_ID"));
+    if distro_id
+        .as_deref()
+        .map(|id| id.eq_ignore_ascii_case("ubuntu"))
+        .unwrap_or(false)
+    {
+        HostOsIdentity {
+            platform: "ubuntu".to_string(),
+            family: "unix".to_string(),
+            version: distro_version,
+        }
+    } else {
+        HostOsIdentity {
+            platform: std::env::consts::OS.to_string(),
+            family: std::env::consts::FAMILY.to_string(),
+            version: distro_version,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_prefixed_word(text: &str, prefix: &str) -> Option<String> {
+    let prefix_start = text.find(prefix)?;
+    let suffix = text[prefix_start + prefix.len()..].trim_start();
+    let word_end = suffix
+        .find(|ch: char| ch.is_whitespace())
+        .unwrap_or(suffix.len());
+    normalize_os_text(&suffix[..word_end])
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_ver_output(text: &str) -> Option<String> {
+    let marker = "Version ";
+    let start = text.find(marker)?;
+    let suffix = &text[start + marker.len()..];
+    let end = suffix
+        .find(']')
+        .or_else(|| suffix.find(|ch: char| ch.is_whitespace()))
+        .unwrap_or(suffix.len());
+    normalize_os_text(&suffix[..end])
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_os_release_key(contents: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    contents.lines().find_map(|line| {
+        let raw = line.strip_prefix(&prefix)?;
+        normalize_os_text(raw.trim_matches(|ch: char| ch == '"' || ch.is_whitespace()))
+    })
+}
+
+fn run_trimmed_command_output(command: (&'static str, &'static [&'static str])) -> Option<String> {
+    let output = std::process::Command::new(command.0)
+        .args(command.1.iter().copied())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn hostname_resolution_command() -> (&'static str, &'static [&'static str]) {
+    ("hostname", &[])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
-    fn create_test_agent() -> SyncAgent {
+    fn create_test_agent_with_tempdir() -> (TempDir, SyncAgent) {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("events.db");
         let retry_dir = dir.path().join("retry");
@@ -1532,6 +1958,7 @@ mod tests {
             api_key: "test-key".to_string(),
             event_db_path: db_path,
             cache_path: dir.path().join("cache.json"),
+            registry_cache_path: None,
             agent_instance_id: "agent-test".to_string(),
             proxy_version: "test".to_string(),
             retry_queue_dir: retry_dir,
@@ -1547,11 +1974,18 @@ mod tests {
             frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
             frontload_hard_events_cap: 5000,
             frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+            frontload_exchange_upload_path: None,
             body_upload_max_bytes: 15 * 1024 * 1024,
             global_tags: BTreeMap::new(),
             heartbeat_telemetry: None,
         };
-        SyncAgent::new(config, None).expect("sync agent")
+        let agent = SyncAgent::new(config, None).expect("sync agent");
+        (dir, agent)
+    }
+
+    fn create_test_agent() -> SyncAgent {
+        let (_dir, agent) = create_test_agent_with_tempdir();
+        agent
     }
 
     fn noisy_text(len: usize, seed: u64) -> String {
@@ -1566,16 +2000,16 @@ mod tests {
     }
 
     fn build_prepared_row(exchange_id: &str, preview_len: usize) -> PreparedExchangeQueueRow {
-        let mut event = ExchangeEventV2::new(
+        let mut event = ExchangeEvent::new(
             exchange_id,
-            soth_core::types::exchange_v2::ExchangeSourceClass::Collector,
-            soth_core::types::exchange_v2::ExchangeTransport::Https,
+            soth_core::types::exchange::ExchangeSourceClass::Collector,
+            soth_core::types::exchange::ExchangeTransport::Https,
             ExchangeBodyMode::MetadataOnly,
             ExchangeBodyMode::MetadataOnly,
         );
         event.request.body.preview = Some(noisy_text(preview_len, 7));
         event.response.body.preview = Some(noisy_text(preview_len, 13));
-        let metadata = exchange_event_to_metadata(&event);
+        let metadata = exchange_event_to_metadata(&event, None);
         PreparedExchangeQueueRow {
             row: ExchangeQueueRow {
                 exchange_id: exchange_id.to_string(),
@@ -1587,6 +2021,69 @@ mod tests {
             mode: ExchangeSyncMode::Live,
             blob_uploaded: 0,
         }
+    }
+
+    #[test]
+    fn heartbeat_host_details_include_platform_arch_and_cores() {
+        let details = collect_heartbeat_host_details();
+        assert!(!details.platform.unwrap_or_default().is_empty());
+        assert!(!details.os_family.unwrap_or_default().is_empty());
+        assert!(!details.arch.unwrap_or_default().is_empty());
+        assert!(details.cpu_logical_cores.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn parse_prefixed_word_extracts_macos_product_version() {
+        let sw_vers = "ProductName:\tmacOS\nProductVersion:\t14.6.1\nBuildVersion:\t23G93";
+        assert_eq!(
+            parse_prefixed_word(sw_vers, "ProductVersion:").as_deref(),
+            Some("14.6.1")
+        );
+    }
+
+    #[test]
+    fn parse_windows_ver_output_extracts_version() {
+        let ver = "Microsoft Windows [Version 10.0.22631.3296]";
+        assert_eq!(
+            parse_windows_ver_output(ver).as_deref(),
+            Some("10.0.22631.3296")
+        );
+    }
+
+    #[test]
+    fn parse_os_release_key_extracts_quoted_values() {
+        let os_release = "NAME=\"Ubuntu\"\nID=ubuntu\nVERSION_ID=\"24.04\"\n";
+        assert_eq!(
+            parse_os_release_key(os_release, "ID").as_deref(),
+            Some("ubuntu")
+        );
+        assert_eq!(
+            parse_os_release_key(os_release, "VERSION_ID").as_deref(),
+            Some("24.04")
+        );
+    }
+
+    #[test]
+    fn collect_registry_heartbeat_details_reports_validation_failure_without_cache() {
+        let (_dir, agent) = create_test_agent_with_tempdir();
+        let registry_cache_path = resolve_registry_cache_path(&agent.config.cache_path);
+        cache::mark_registry_validation_failed(
+            &registry_cache_path,
+            "integrity_verification_failed:sha_mismatch",
+        )
+        .unwrap();
+
+        let details = agent
+            .collect_registry_heartbeat_details()
+            .expect("registry details");
+        assert_eq!(details.validation_status.as_deref(), Some("failed"));
+        assert_eq!(
+            details.validation_failed_reason.as_deref(),
+            Some("integrity_verification_failed:sha_mismatch")
+        );
+        assert!(details.bundle_hash.is_none());
+        assert!(details.bundle_version.is_none());
+        assert_eq!(details.degraded_stale, Some(true));
     }
 
     #[test]
@@ -1616,6 +2113,66 @@ mod tests {
     }
 
     #[test]
+    fn exchange_event_to_metadata_normalizes_preview_only_body_mode() {
+        let event = ExchangeEvent::new(
+            "123e4567-e89b-42d3-a456-426614174000",
+            soth_core::types::exchange::ExchangeSourceClass::AgentApp,
+            soth_core::types::exchange::ExchangeTransport::Https,
+            ExchangeBodyMode::PreviewOnly,
+            ExchangeBodyMode::PreviewOnly,
+        );
+
+        let metadata = exchange_event_to_metadata(&event, None);
+        assert_eq!(metadata.request_body_mode.as_deref(), Some("metadata_only"));
+        assert_eq!(
+            metadata.response_body_mode.as_deref(),
+            Some("metadata_only")
+        );
+    }
+
+    #[test]
+    fn exchange_event_to_metadata_normalizes_legacy_client_app_type() {
+        let mut event = ExchangeEvent::new(
+            "123e4567-e89b-42d3-a456-426614174001",
+            soth_core::types::exchange::ExchangeSourceClass::AgentApp,
+            soth_core::types::exchange::ExchangeTransport::Https,
+            ExchangeBodyMode::Inline,
+            ExchangeBodyMode::MetadataOnly,
+        );
+        event.client = Some(soth_core::types::exchange::ExchangeClient {
+            pid: None,
+            device_id: Some("device_local_01".to_string()),
+            bundle_id: Some("agent.codex".to_string()),
+            process_name: Some("codex".to_string()),
+            app_type: Some("collector".to_string()),
+            host_origin: None,
+            referrer_origin: None,
+        });
+
+        let metadata = exchange_event_to_metadata(&event, None);
+        assert_eq!(metadata.client_app_type.as_deref(), Some("unknown"));
+        let envelope = metadata.event_envelope.expect("event_envelope");
+        let client = envelope.client.expect("event_envelope.client");
+        assert_eq!(client.app_type.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn normalize_client_app_type_maps_browser_to_unknown() {
+        assert_eq!(
+            normalize_client_app_type_for_contract(Some("browser")).as_deref(),
+            Some("unknown")
+        );
+    }
+
+    #[test]
+    fn normalize_client_app_type_maps_editor_to_unknown() {
+        assert_eq!(
+            normalize_client_app_type_for_contract(Some("editor")).as_deref(),
+            Some("unknown")
+        );
+    }
+
+    #[test]
     fn classify_exchange_rejection_drops_terminal_reasons() {
         assert!(matches!(
             classify_exchange_rejection("duplicate", None),
@@ -1624,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_exchange_rejection_retries_non_terminal_reasons() {
+    fn classify_exchange_rejection_classifies_terminal_and_retryable_reasons() {
         assert!(matches!(
             classify_exchange_rejection("rate_limited", None),
             ExchangeRejectionDisposition::Retry
@@ -1635,12 +2192,34 @@ mod tests {
         ));
         assert!(matches!(
             classify_exchange_rejection("validation_failed", None),
-            ExchangeRejectionDisposition::Retry
+            ExchangeRejectionDisposition::Drop
         ));
         assert!(matches!(
             classify_exchange_rejection("invalid_exchange_id", None),
-            ExchangeRejectionDisposition::Retry
+            ExchangeRejectionDisposition::Drop
         ));
+        assert!(matches!(
+            classify_exchange_rejection("detection_id_required", None),
+            ExchangeRejectionDisposition::Drop
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("detection_id_invalid", None),
+            ExchangeRejectionDisposition::Drop
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("invalid_source_class", None),
+            ExchangeRejectionDisposition::Drop
+        ));
+    }
+
+    #[test]
+    fn is_sqlite_lock_anyhow_detects_lock_errors() {
+        let locked = anyhow::anyhow!("database is locked");
+        assert!(is_sqlite_lock_anyhow(&locked));
+        let busy = anyhow::anyhow!("database busy");
+        assert!(is_sqlite_lock_anyhow(&busy));
+        let other = anyhow::anyhow!("connection refused");
+        assert!(!is_sqlite_lock_anyhow(&other));
     }
 
     #[test]

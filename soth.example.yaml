@@ -135,6 +135,7 @@ dashboard:
 # HTTP/HTTPS proxy for intercepting AI provider traffic (OpenAI, Anthropic, Google)
 forward_proxy:
   enabled: false           # Set to true to enable the forward proxy
+  engine: "proxy"          # proxy | edge
   port: 8080               # Port for the proxy to listen on
   address: "127.0.0.1"     # Bind address (use 0.0.0.0 for all interfaces)
   request_timeout: "5m"    # Timeout for AI requests (streaming can be long)

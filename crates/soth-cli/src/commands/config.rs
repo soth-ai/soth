@@ -11,6 +11,7 @@ use serde_json::Value;
 use soth_core::config::{HostFilterMode, SothConfig};
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::fs;
 use tracing::info;
 
@@ -428,12 +429,35 @@ async fn show_registry_status(global_config: Option<PathBuf>) -> Result<()> {
 
     match cache::load_registry_bundle_cache(&registry_cache_path) {
         Ok(Some(bundle_cache)) => {
+            let runtime_status = cache::registry_bundle_runtime_status(
+                &registry_cache_path,
+                Duration::from_secs(24 * 60 * 60),
+            );
             println!("  Registry cache: valid");
             println!("  Cache schema version: {}", bundle_cache.schema_version);
             println!("  Bundle version: {}", bundle_cache.metadata.version);
+            println!(
+                "  Bundle hash: {}",
+                runtime_status.bundle_hash.as_deref().unwrap_or("-")
+            );
             println!("  Bundle type: {}", bundle_cache.metadata.bundle_type);
             println!("  ETag: {}", bundle_cache.etag);
             println!("  Fetched at: {}", bundle_cache.fetched_at);
+            println!(
+                "  Bundle age seconds: {}",
+                runtime_status
+                    .bundle_age_seconds
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            println!("  Degraded stale (>24h): {}", runtime_status.stale);
+            println!(
+                "  Validation status: {}",
+                runtime_status.validation_status.as_deref().unwrap_or("ok")
+            );
+            if let Some(reason) = runtime_status.validation_failed_reason.as_deref() {
+                println!("  Validation failed reason: {reason}");
+            }
             println!(
                 "  Providers/domains/formats: {}/{}/{}",
                 bundle_cache.metadata.provider_count,
@@ -491,10 +515,13 @@ fn resolve_config_cache_path(config: &SothConfig) -> PathBuf {
 }
 
 fn resolve_registry_cache_path(config: &SothConfig, config_cache_path: &Path) -> PathBuf {
+    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
     if config.cloud.cache_path.is_some() {
         if let Some(parent) = config_cache_path.parent() {
-            return parent.join("registry_bundle_cache.json");
+            return parent.join(cache_name);
         }
     }
-    soth_sync::cache::default_registry_cache_path()
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join(cache_name))
+        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
 }

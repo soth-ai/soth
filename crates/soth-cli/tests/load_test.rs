@@ -2,12 +2,12 @@
 //!
 //! Tests throughput and latency under concurrent load.
 
+use soth_helper::pipeline::middleware::RequestContext;
+use soth_helper::pipeline::observe::{ObserveConfig, ObserveLayer};
+use soth_helper::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
+use soth_helper::protocol::{JsonRpcMessage, JsonRpcRequest, RequestId};
+use soth_helper::{Pipeline, PipelineBuilder};
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine};
-use soth_proxy::pipeline::middleware::RequestContext;
-use soth_proxy::pipeline::observe::{ObserveConfig, ObserveLayer};
-use soth_proxy::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
-use soth_proxy::protocol::{JsonRpcMessage, JsonRpcRequest, RequestId};
-use soth_proxy::{Pipeline, PipelineBuilder};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

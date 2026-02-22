@@ -1,7 +1,9 @@
 use anyhow::Context;
 use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH};
 use sha2::{Digest, Sha256};
-use soth_core::api::{version::API_VERSION_HEADER, RegistryVersionResponse, API_VERSION};
+use soth_core::api::{
+    version::API_VERSION_HEADER, RegistryBundleFetchQuery, RegistryVersionResponse, API_VERSION,
+};
 use std::path::PathBuf;
 
 use crate::cache;
@@ -101,7 +103,7 @@ impl RegistryPuller {
         }
 
         let if_none_match = cached.as_ref().map(|value| value.etag.as_str());
-        self.pull_with_fallbacks(if_none_match)
+        self.pull_with_fallbacks(if_none_match, &RegistryBundleFetchQuery::Full)
             .await
             .or_else(|error| {
                 if expected_bundle_version.is_some() {
@@ -134,16 +136,42 @@ impl RegistryPuller {
         };
 
         let if_none_match = cached.as_ref().map(|value| value.etag.as_str());
-        self.pull_with_fallbacks(if_none_match).await
+        self.pull_with_fallbacks(if_none_match, &RegistryBundleFetchQuery::Full)
+            .await
+    }
+
+    /// Force a registry refresh with explicit bundle query semantics.
+    ///
+    /// This allows section/diff fetches on the same endpoint contract while
+    /// preserving default full-bundle behavior for existing callers.
+    pub async fn refresh_with_query(
+        &self,
+        fetch_query: RegistryBundleFetchQuery,
+    ) -> anyhow::Result<RegistryPullOutcome> {
+        let cached = match cache::load_registry_bundle_cache(&self.cache_path) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed reading cached registry bundle {}; continuing without cache: {}",
+                    self.cache_path.display(),
+                    err
+                );
+                None
+            }
+        };
+
+        let if_none_match = cached.as_ref().map(|value| value.etag.as_str());
+        self.pull_with_fallbacks(if_none_match, &fetch_query).await
     }
 
     async fn pull_with_fallbacks(
         &self,
         if_none_match: Option<&str>,
+        fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<RegistryPullOutcome> {
         let mut last_error: Option<anyhow::Error> = None;
         for endpoint in self.endpoint_candidates() {
-            match self.pull_once(endpoint, if_none_match).await {
+            match self.pull_once(endpoint, if_none_match, fetch_query).await {
                 Ok(Some(outcome)) => return Ok(outcome),
                 Ok(None) => continue,
                 Err(error) => {
@@ -175,24 +203,66 @@ impl RegistryPuller {
         &self,
         endpoint: &str,
         if_none_match: Option<&str>,
+        fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<Option<RegistryPullOutcome>> {
-        let Some(version) = self.fetch_version(endpoint).await? else {
+        let Some(version) = self.fetch_version(endpoint, fetch_query).await? else {
             return Ok(None);
         };
-        match self.fetch_bundle(endpoint, if_none_match).await? {
-            BundleFetchResult::NotModified => Ok(Some(RegistryPullOutcome {
-                checked: true,
-                downloaded: false,
-                version: Some(version.version),
-            })),
+        let version_bundle_hash = normalize_optional(version.bundle_hash.as_deref());
+        match self
+            .fetch_bundle(
+                endpoint,
+                if_none_match,
+                fetch_query,
+                version_bundle_hash.as_deref(),
+            )
+            .await?
+        {
+            BundleFetchResult::NotModified => {
+                if let Err(error) = cache::mark_registry_validation_success(&self.cache_path) {
+                    tracing::warn!(
+                        error = %error,
+                        "Failed updating registry cache validation status after 304 revalidation"
+                    );
+                }
+                Ok(Some(RegistryPullOutcome {
+                    checked: true,
+                    downloaded: false,
+                    version: Some(version.version),
+                }))
+            }
             BundleFetchResult::Downloaded { bytes, etag } => {
-                let verified_metadata = verify_bundle_integrity(&version, &bytes, Some(&etag))?;
+                let verified_metadata = verify_bundle_integrity(&version, &bytes, Some(&etag))
+                    .inspect_err(|error| {
+                        if let Err(status_error) =
+                            cache::mark_registry_validation_failed(
+                                &self.cache_path,
+                                &format!("integrity_verification_failed:{error}"),
+                            )
+                        {
+                            tracing::warn!(
+                                error = %status_error,
+                                "Failed persisting registry validation status after integrity failure"
+                            );
+                        }
+                    })?;
                 cache::save_registry_bundle_cache(
                     &self.cache_path,
                     &verified_metadata,
                     &etag,
                     &bytes,
-                )?;
+                )
+                .inspect_err(|error| {
+                    if let Err(status_error) = cache::mark_registry_validation_failed(
+                        &self.cache_path,
+                        &format!("cache_write_failed:{error}"),
+                    ) {
+                        tracing::warn!(
+                            error = %status_error,
+                            "Failed persisting registry validation status after cache write failure"
+                        );
+                    }
+                })?;
                 if endpoint != self.endpoint {
                     tracing::warn!(
                         endpoint = endpoint,
@@ -212,11 +282,14 @@ impl RegistryPuller {
     async fn fetch_version(
         &self,
         endpoint: &str,
+        fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<Option<RegistryVersionResponse>> {
         let url = format!("{endpoint}/api/v1/registry/version");
+        let mut query_params = vec![("type", self.bundle_type.clone())];
+        query_params.extend(build_bundle_query_pairs(fetch_query));
         let response = build_cloud_client(endpoint)
             .get(&url)
-            .query(&[("type", self.bundle_type.as_str())])
+            .query(&query_params)
             .header(API_VERSION_HEADER, API_VERSION)
             .bearer_auth(&self.api_key)
             .send()
@@ -247,11 +320,15 @@ impl RegistryPuller {
         &self,
         endpoint: &str,
         if_none_match: Option<&str>,
+        fetch_query: &RegistryBundleFetchQuery,
+        bundle_hash: Option<&str>,
     ) -> anyhow::Result<BundleFetchResult> {
         let url = format!("{endpoint}/api/v1/registry/bundle");
+        let mut query_params = vec![("type", self.bundle_type.clone())];
+        query_params.extend(build_bundle_request_query_pairs(fetch_query, bundle_hash));
         let mut request = build_cloud_client(endpoint)
             .get(&url)
-            .query(&[("type", self.bundle_type.as_str())])
+            .query(&query_params)
             .header(API_VERSION_HEADER, API_VERSION)
             .bearer_auth(&self.api_key);
 
@@ -331,6 +408,55 @@ fn should_skip_pull(expected_bundle_version: Option<&str>, cached_version: Optio
     }
 }
 
+fn build_bundle_query_pairs(fetch_query: &RegistryBundleFetchQuery) -> Vec<(&'static str, String)> {
+    match fetch_query {
+        RegistryBundleFetchQuery::Full => Vec::new(),
+        RegistryBundleFetchQuery::Section { section } => {
+            let section = section.trim();
+            if section.is_empty() {
+                Vec::new()
+            } else {
+                vec![("query", format!("section:{section}"))]
+            }
+        }
+        RegistryBundleFetchQuery::Diff { from_hash, section } => {
+            let from_hash = from_hash.trim();
+            if from_hash.is_empty() {
+                Vec::new()
+            } else if let Some(section) = section.as_deref().and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }) {
+                vec![
+                    ("query", "diff".to_string()),
+                    ("from_hash", from_hash.to_string()),
+                    ("section", section.to_string()),
+                ]
+            } else {
+                vec![
+                    ("query", "diff".to_string()),
+                    ("from_hash", from_hash.to_string()),
+                ]
+            }
+        }
+    }
+}
+
+fn build_bundle_request_query_pairs(
+    fetch_query: &RegistryBundleFetchQuery,
+    bundle_hash: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut pairs = build_bundle_query_pairs(fetch_query);
+    if let Some(bundle_hash) = normalize_optional(bundle_hash) {
+        pairs.push(("bundle_hash", bundle_hash));
+    }
+    pairs
+}
+
 fn verify_bundle_integrity(
     metadata: &RegistryVersionResponse,
     bundle_bytes: &[u8],
@@ -341,7 +467,13 @@ fn verify_bundle_integrity(
         metadata.size_bytes > 0 && metadata.size_bytes as usize != bundle_bytes.len();
     let actual_hash = format!("{:x}", Sha256::digest(bundle_bytes));
 
-    let expected_hash = metadata.sha256.trim().to_ascii_lowercase();
+    let expected_hash = metadata
+        .bundle_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| metadata.sha256.trim())
+        .to_ascii_lowercase();
     let etag_hash = normalize_hash_candidate(bundle_etag);
     if !expected_hash.is_empty() {
         if actual_hash != expected_hash {
@@ -407,22 +539,28 @@ fn normalize_hash_candidate(value: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_required_etag, normalize_etag, should_skip_pull, verify_bundle_integrity};
+    use super::{
+        build_bundle_query_pairs, build_bundle_request_query_pairs, extract_required_etag,
+        normalize_etag, should_skip_pull, verify_bundle_integrity,
+    };
     use reqwest::header::HeaderMap;
     use reqwest::header::{HeaderValue, ETAG};
     use sha2::{Digest, Sha256};
-    use soth_core::api::RegistryVersionResponse;
+    use soth_core::api::{RegistryBundleFetchQuery, RegistryVersionResponse};
 
     fn sample_metadata(sha256: &str, size_bytes: u64) -> RegistryVersionResponse {
         RegistryVersionResponse {
             bundle_type: "local".to_string(),
             version: "bundle-v1".to_string(),
             sha256: sha256.to_string(),
+            bundle_hash: None,
             compiled_at: "2026-02-13T00:00:00Z".to_string(),
             provider_count: 1,
             domain_count: 1,
             format_count: 1,
             size_bytes,
+            manifest: None,
+            channel: None,
         }
     }
 
@@ -494,5 +632,52 @@ mod tests {
         let verified = verify_bundle_integrity(&metadata, payload, Some(&etag)).unwrap();
         assert_eq!(verified.sha256, format!("{:x}", digest));
         assert_eq!(verified.size_bytes as usize, payload.len());
+    }
+
+    #[test]
+    fn build_bundle_query_pairs_full_is_empty() {
+        let pairs = build_bundle_query_pairs(&RegistryBundleFetchQuery::Full);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn build_bundle_query_pairs_section_sets_section_query() {
+        let pairs = build_bundle_query_pairs(&RegistryBundleFetchQuery::Section {
+            section: "rules".to_string(),
+        });
+        assert_eq!(pairs, vec![("query", "section:rules".to_string())]);
+    }
+
+    #[test]
+    fn build_bundle_query_pairs_diff_sets_from_hash_and_optional_section() {
+        let pairs = build_bundle_query_pairs(&RegistryBundleFetchQuery::Diff {
+            from_hash: "abc123".to_string(),
+            section: Some("tools".to_string()),
+        });
+        assert_eq!(
+            pairs,
+            vec![
+                ("query", "diff".to_string()),
+                ("from_hash", "abc123".to_string()),
+                ("section", "tools".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn build_bundle_request_query_pairs_appends_bundle_hash() {
+        let pairs = build_bundle_request_query_pairs(
+            &RegistryBundleFetchQuery::Section {
+                section: "rules".to_string(),
+            },
+            Some("abc123"),
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("query", "section:rules".to_string()),
+                ("bundle_hash", "abc123".to_string())
+            ]
+        );
     }
 }

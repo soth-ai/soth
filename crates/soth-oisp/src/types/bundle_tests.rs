@@ -58,6 +58,7 @@ mod tests {
                     { "action": "intercept", "path": "/v1/chat/completions" }
                 ]
             },
+            "filters": {},
             "pricing": {
                 "openai": [
                     {
@@ -112,6 +113,7 @@ mod tests {
                     }
                 }
             },
+            "filters": {},
             "pricing": {}
         });
 
@@ -231,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_compiled_bundle_accepts_sectioned_v3_shape_with_entity_ids() {
+    fn parse_compiled_bundle_accepts_sectioned_v3_shape_with_detection_ids() {
         let value = json!({
             "schema_version": 3,
             "version": "2026.02.13-r3",
@@ -248,7 +250,7 @@ mod tests {
                 "providers": {
                     "openai": {
                         "id": "openai",
-                        "entity_id": "prv_4n7k2q9m1x",
+                        "detection_id": "prv_4n7k2q9m1x",
                         "name": "OpenAI",
                         "type": "ai-inference",
                         "api_format": "openai",
@@ -278,7 +280,7 @@ mod tests {
         let parsed = parse_compiled_bundle(&value).unwrap();
         assert_eq!(parsed.schema_version, 3);
         let provider = parsed.providers.get("openai").unwrap();
-        assert_eq!(provider.entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
+        assert_eq!(provider.detection_id.as_deref(), Some("prv_4n7k2q9m1x"));
         let detection = provider
             .detection
             .as_ref()
@@ -290,6 +292,112 @@ mod tests {
             Some("path_match")
         );
         let entry = parsed.domain_index.first().unwrap();
-        assert_eq!(entry.provider_entity_id.as_deref(), Some("prv_4n7k2q9m1x"));
+        assert_eq!(entry.provider_id, "openai");
+    }
+
+    #[test]
+    fn parse_compiled_bundle_accepts_sectioned_v4_shape_with_connect_and_decision_rules() {
+        let value = json!({
+            "schema_version": 4,
+            "version": "2026.02.21-r4",
+            "compiled_at": "2026-02-21T00:00:00Z",
+            "bundle_type": "cloud",
+            "core": {
+                "providers": {
+                    "openai": {
+                        "id": "openai",
+                        "detection_id": "ai.openai.service",
+                        "name": "OpenAI",
+                        "type": "ai-inference",
+                        "api_format": "openai"
+                    }
+                },
+                "domain_index": [
+                    {
+                        "host": "api.openai.com",
+                        "provider_id": "openai",
+                        "entry_type": "ai-inference"
+                    }
+                ],
+                "pricing": {}
+            },
+            "filters": {
+                "whitelist": ["api.openai.com"],
+                "blacklist": [],
+                "passthrough": [],
+                "noise_keywords": []
+            },
+            "formats": {
+                "openai": {
+                    "request": { "model": "$.model" },
+                    "response": { "json": { "extract": { "model": "$.model" } } }
+                }
+            },
+            "gating": {
+                "allowed_app_origins": {
+                    "hosts": ["com.google.chrome"],
+                    "non_hosts": ["@openai/codex"],
+                    "apps_with_parsers": ["@openai/codex"]
+                },
+                "allowed_host_origins": ["api.openai.com"]
+            },
+            "connect_policy": {
+                "version": 1,
+                "defaults": {
+                    "non_whitelisted_host_action": "tunnel",
+                    "unknown_app_action": "host_only",
+                    "whitelisted_unknown_app_action": "intercept"
+                },
+                "rules": [
+                    {
+                        "id": "connect.non_host.codex.openai",
+                        "enabled": true,
+                        "app_type": ["non_host"],
+                        "app_identifiers": ["@openai/codex"],
+                        "host_allow": ["api.openai.com"],
+                        "action": "intercept"
+                    }
+                ]
+            },
+            "decision_rules": {
+                "version": 1,
+                "defaults": {
+                    "host_miss_action": "tunnel",
+                    "non_host_miss_action": "metadata_only",
+                    "unknown_app_action": "metadata_only",
+                    "path_precedence": ["deny_paths_exact", "deny_paths_glob", "allow_paths"],
+                    "whitelist_path_miss_reason": "whitelist_path_miss"
+                },
+                "rules": [
+                    {
+                        "id": "rule.host.ai.openai.service.api.openai.com.chat",
+                        "enabled": true,
+                        "priority": 9000,
+                        "host_pattern": "api.openai.com",
+                        "app_type": ["host"],
+                        "method": ["POST"],
+                        "allow_paths": ["/v1/chat/completions"],
+                        "deny_paths_exact": ["/v1/chat/completions/metrics"],
+                        "deny_paths_glob": ["/v1/chat/completions/*/metrics*"],
+                        "detection_id": "ai.openai.service",
+                        "provider": "openai",
+                        "capture_mode": "full"
+                    }
+                ]
+            }
+        });
+
+        let parsed = parse_compiled_bundle(&value).unwrap();
+        assert_eq!(parsed.schema_version, 4);
+        assert_eq!(parsed.connect_policy.rules.len(), 1);
+        assert_eq!(parsed.decision_rules.rules.len(), 1);
+        assert_eq!(
+            parsed.decision_rules.defaults.path_precedence,
+            vec![
+                "deny_paths_exact".to_string(),
+                "deny_paths_glob".to_string(),
+                "allow_paths".to_string()
+            ]
+        );
     }
 }
