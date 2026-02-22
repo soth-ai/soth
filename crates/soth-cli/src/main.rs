@@ -487,6 +487,10 @@ enum AuditCommands {
         /// Event ID
         event_id: String,
 
+        /// Audit log path
+        #[arg(short, long)]
+        log: Option<PathBuf>,
+
         /// Output file
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -496,7 +500,7 @@ enum AuditCommands {
     Stats {
         /// Audit log path
         #[arg(short, long)]
-        log: PathBuf,
+        log: Option<PathBuf>,
     },
 }
 

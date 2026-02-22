@@ -245,8 +245,6 @@ fn is_benign_websocket_close_error(error: &tungstenite::Error) -> bool {
         tungstenite::Error::ConnectionClosed
             | tungstenite::Error::AlreadyClosed
             | tungstenite::Error::Protocol(tungstenite::error::ProtocolError::SendAfterClosing)
-            | tungstenite::Error::Protocol(
-                tungstenite::error::ProtocolError::ReceivedAfterClosing
-            )
+            | tungstenite::Error::Protocol(tungstenite::error::ProtocolError::ReceivedAfterClosing)
     )
 }

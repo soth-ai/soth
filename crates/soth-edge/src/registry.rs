@@ -1050,11 +1050,14 @@ mod tests {
             .iter()
             .filter(|candidate| !candidate.host_rules.is_empty())
             .find_map(|candidate| {
-                let host = candidate.host_rules.iter().find_map(|rule| match &rule.pattern {
-                    HostPattern::Exact(value) => Some(value.clone()),
-                    HostPattern::WildcardSuffix(suffix) => Some(format!("probe.{suffix}")),
-                    HostPattern::Regex(_) => None,
-                })?;
+                let host = candidate
+                    .host_rules
+                    .iter()
+                    .find_map(|rule| match &rule.pattern {
+                        HostPattern::Exact(value) => Some(value.clone()),
+                        HostPattern::WildcardSuffix(suffix) => Some(format!("probe.{suffix}")),
+                        HostPattern::Regex(_) => None,
+                    })?;
                 Some((candidate, host))
             })
             .expect("~/.soth bundle should contain a provider host rule");

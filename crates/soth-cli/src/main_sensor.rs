@@ -314,11 +314,13 @@ enum AuditCommands {
     Proof {
         event_id: String,
         #[arg(short, long)]
+        log: Option<PathBuf>,
+        #[arg(short, long)]
         output: Option<PathBuf>,
     },
     Stats {
         #[arg(short, long)]
-        log: PathBuf,
+        log: Option<PathBuf>,
     },
 }
 

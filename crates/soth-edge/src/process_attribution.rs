@@ -2358,13 +2358,12 @@ mod tests {
     fn app_policy_resolution_prefers_bundle_id() {
         let registry = registry();
         let Some((app_id, _)) = registry.bundle().interception.app_policies.iter().next() else {
-            eprintln!("Skipping app policy resolution assertion: ~/.soth bundle has no app policies");
+            eprintln!(
+                "Skipping app policy resolution assertion: ~/.soth bundle has no app policies"
+            );
             return;
         };
-        let identity = ProcessIdentity::new(
-            Some(app_id.clone()),
-            Some("claude.exe".to_string()),
-        );
+        let identity = ProcessIdentity::new(Some(app_id.clone()), Some("claude.exe".to_string()));
 
         let resolved = resolve_process(&identity, &registry);
         assert_eq!(resolved.match_kind, ProcessMatchKind::AppPolicy);
