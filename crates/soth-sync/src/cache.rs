@@ -269,6 +269,9 @@ pub fn mark_registry_validation_failed(path: &Path, reason: &str) -> anyhow::Res
 fn validate_registry_bundle_payload(bundle: &Value) -> anyhow::Result<()> {
     validate_registry_bundle_contract(bundle)
         .context("bundle payload failed contract validation")?;
+    if is_edge_bundle_shape(bundle) {
+        return Ok(());
+    }
     parse_compiled_bundle(bundle)
         .context("bundle payload must match supported OISP bundle schema")?;
     Ok(())
@@ -285,6 +288,10 @@ fn validate_registry_bundle_contract(bundle: &Value) -> anyhow::Result<()> {
         .context("bundle payload missing required `schema_version`")?;
     if schema_version == 0 {
         anyhow::bail!("bundle payload `schema_version` must be greater than 0");
+    }
+
+    if is_edge_bundle_shape_object(object) {
+        return validate_edge_bundle_contract_object(object);
     }
 
     if let Some(filters) = object.get("filters").and_then(Value::as_object) {
@@ -323,6 +330,79 @@ fn validate_registry_bundle_contract(bundle: &Value) -> anyhow::Result<()> {
             if !value.is_array() {
                 anyhow::bail!("bundle payload `{key}` must be an array");
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_edge_bundle_shape(bundle: &Value) -> bool {
+    bundle.as_object().is_some_and(is_edge_bundle_shape_object)
+}
+
+fn is_edge_bundle_shape_object(object: &serde_json::Map<String, Value>) -> bool {
+    let has_metadata_bundle_version = object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("bundle_version"))
+        .and_then(Value::as_str)
+        .is_some();
+    let has_edge_targets =
+        object.get("llm_providers").is_some() || object.get("applications").is_some();
+    has_metadata_bundle_version && has_edge_targets
+}
+
+fn validate_edge_bundle_contract_object(
+    object: &serde_json::Map<String, Value>,
+) -> anyhow::Result<()> {
+    let metadata = object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .context("edge bundle payload missing required `metadata` object")?;
+    let bundle_version = metadata
+        .get("bundle_version")
+        .and_then(Value::as_str)
+        .context("edge bundle payload missing required `metadata.bundle_version`")?;
+    if bundle_version.trim().is_empty() {
+        anyhow::bail!("edge bundle payload `metadata.bundle_version` must not be empty");
+    }
+
+    for key in [
+        "llm_providers",
+        "applications",
+        "catalogs",
+        "interception",
+        "detection_index",
+        "formats",
+    ] {
+        let value = object
+            .get(key)
+            .with_context(|| format!("edge bundle payload missing required `{key}` object"))?;
+        if !value.is_object() {
+            anyhow::bail!("edge bundle payload `{key}` must be a JSON object");
+        }
+    }
+
+    if let Some(ai_catalog) = object
+        .get("catalogs")
+        .and_then(Value::as_object)
+        .and_then(|catalogs| catalogs.get("ai_catalog"))
+    {
+        if !ai_catalog.is_array() {
+            anyhow::bail!("edge bundle payload `catalogs.ai_catalog` must be an array");
+        }
+    }
+
+    let filters = object
+        .get("filters")
+        .and_then(Value::as_object)
+        .context("edge bundle payload missing required `filters` object")?;
+    for key in ["domain_patterns", "path_patterns", "keywords"] {
+        let value = filters
+            .get(key)
+            .with_context(|| format!("edge bundle payload filters missing required `{key}`"))?;
+        if !value.is_array() {
+            anyhow::bail!("edge bundle payload filters.{key} must be an array");
         }
     }
 
@@ -1000,6 +1080,56 @@ mod tests {
                 .get("version")
                 .and_then(serde_json::Value::as_str),
             Some("wrapped-v1")
+        );
+    }
+
+    #[test]
+    fn save_registry_bundle_cache_accepts_edge_bundle_shape_without_legacy_filters() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("edge-v4");
+        let bundle = serde_json::json!({
+            "schema_version": 4,
+            "metadata": {
+                "bundle_version": "edge-v4",
+                "compiled_at": "2026-02-22T00:00:00Z"
+            },
+            "llm_providers": {},
+            "applications": {},
+            "catalogs": {
+                "ai_catalog": []
+            },
+            "interception": {
+                "defaults": {
+                    "unknown_app_action": "skip"
+                },
+                "browser_policies": {
+                    "default_action": "intercept",
+                    "allowed_browsers": [],
+                    "allowed_apps": []
+                },
+                "app_policies": {}
+            },
+            "detection_index": {},
+            "formats": {},
+            "filters": {
+                "domain_patterns": [],
+                "path_patterns": [],
+                "keywords": []
+            }
+        });
+
+        save_registry_bundle_cache(&path, &metadata, "etag-edge", bundle.to_string().as_bytes())
+            .unwrap();
+
+        let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
+        assert_eq!(loaded.metadata.version, "edge-v4");
+        assert_eq!(
+            loaded
+                .bundle
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
         );
     }
 

@@ -31,7 +31,7 @@ use http::uri::Authority;
 use hyper::{Request, Response, StatusCode, Uri};
 use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::{self, Message};
-use tracing::error;
+use tracing::{debug, error};
 
 pub use futures;
 pub use hyper;
@@ -195,22 +195,31 @@ pub trait WebSocketHandler: Clone + Send + Sync + 'static {
                         };
 
                         match sink.send(message).await {
-                            Err(tungstenite::Error::ConnectionClosed) => (),
+                            Err(e) if is_benign_websocket_close_error(&e) => {
+                                debug!("WebSocket send dropped on closed connection: {}", e);
+                            }
                             Err(e) => error!("WebSocket send error: {}", e),
                             _ => (),
                         }
                     }
                     Err(e) => {
+                        if is_benign_websocket_close_error(&e) {
+                            debug!("WebSocket message stream closed: {}", e);
+                            break;
+                        }
+
                         error!("WebSocket message error: {}", e);
 
                         match sink.send(Message::Close(None)).await {
-                            Err(
-                                tungstenite::Error::ConnectionClosed
-                                | tungstenite::Error::AlreadyClosed,
-                            ) => (),
-                            Err(e) => error!("WebSocket close error: {}", e),
+                            Err(close_err) if is_benign_websocket_close_error(&close_err) => {
+                                debug!(
+                                    "WebSocket close frame dropped on closed connection: {}",
+                                    close_err
+                                );
+                            }
+                            Err(close_err) => error!("WebSocket close error: {}", close_err),
                             _ => (),
-                        };
+                        }
 
                         break;
                     }
@@ -228,4 +237,16 @@ pub trait WebSocketHandler: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Option<Message>> + Send {
         async { Some(message) }
     }
+}
+
+fn is_benign_websocket_close_error(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::AlreadyClosed
+            | tungstenite::Error::Protocol(tungstenite::error::ProtocolError::SendAfterClosing)
+            | tungstenite::Error::Protocol(
+                tungstenite::error::ProtocolError::ReceivedAfterClosing
+            )
+    )
 }

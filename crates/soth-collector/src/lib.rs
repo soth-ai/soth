@@ -35,6 +35,8 @@ const DEFAULT_LOCAL_SESSIONS_UPLOAD_PATH: &str = "/api/v1/ingest/local-sessions"
 const DEFAULT_LOCAL_SESSIONS_UPLOAD_BATCH_SIZE: usize = 200;
 const DEFAULT_LOCAL_SESSIONS_UPLOAD_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_LOCAL_SESSIONS_RATE_LIMIT_BACKOFF_SECS: u64 = 15;
+const DEFAULT_LOCAL_SESSIONS_READINESS_PATH: &str = "/healthz";
+const DEFAULT_LOCAL_SESSIONS_READINESS_BACKOFF_SECS: u64 = 5;
 
 #[derive(Debug)]
 pub struct CollectorRuntime {
@@ -67,6 +69,8 @@ pub struct CollectorDirectUploadConfig {
     pub endpoint: String,
     pub api_key: String,
     pub upload_path: String,
+    pub readiness_path: String,
+    pub readiness_backoff_secs: u64,
     pub batch_size: usize,
     pub request_timeout: Duration,
     pub agent_instance_id: String,
@@ -85,6 +89,7 @@ struct CollectorUploadError {
     message: String,
     rate_limited: bool,
     retry_after_secs: Option<u64>,
+    connectivity_error: bool,
 }
 
 impl std::fmt::Display for CollectorUploadError {
@@ -320,6 +325,16 @@ impl CollectorDirectUploadConfig {
             .ok()
             .and_then(|value| normalize_upload_path_or_url(value.as_str()))
             .unwrap_or_else(|| DEFAULT_LOCAL_SESSIONS_UPLOAD_PATH.to_string());
+        let readiness_path = std::env::var("SOTH_COLLECTOR_UPLOAD_READINESS_PATH")
+            .ok()
+            .and_then(|value| normalize_upload_path_or_url(value.as_str()))
+            .unwrap_or_else(|| DEFAULT_LOCAL_SESSIONS_READINESS_PATH.to_string());
+        let readiness_backoff_secs = std::env::var("SOTH_COLLECTOR_UPLOAD_READINESS_BACKOFF_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LOCAL_SESSIONS_READINESS_BACKOFF_SECS)
+            .max(1)
+            .min(300);
         let batch_size = std::env::var("SOTH_COLLECTOR_UPLOAD_BATCH_SIZE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -348,6 +363,8 @@ impl CollectorDirectUploadConfig {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             api_key,
             upload_path,
+            readiness_path,
+            readiness_backoff_secs,
             batch_size,
             request_timeout: Duration::from_secs(timeout_secs),
             agent_instance_id,
@@ -394,9 +411,13 @@ impl CollectorDirectUploader {
                 .send()
                 .await
                 .map_err(|error| CollectorUploadError {
-                    message: format!("collector local sessions upload failed for {url}: {error}"),
+                    message: format!(
+                        "collector local sessions upload failed for {url}: {}",
+                        render_upload_request_error(&error)
+                    ),
                     rate_limited: false,
                     retry_after_secs: None,
+                    connectivity_error: error.is_connect() || error.is_timeout(),
                 })?;
             let status = response.status();
             if !status.is_success() {
@@ -417,6 +438,7 @@ impl CollectorDirectUploader {
                     ),
                     rate_limited: status == reqwest::StatusCode::TOO_MANY_REQUESTS,
                     retry_after_secs,
+                    connectivity_error: false,
                 });
             }
             let decoded = response
@@ -426,6 +448,7 @@ impl CollectorDirectUploader {
                     message: format!("failed decoding local sessions upload response: {error}"),
                     rate_limited: false,
                     retry_after_secs: None,
+                    connectivity_error: false,
                 })?;
             if decoded.rejected > 0 {
                 let mut duplicate_rejections = 0u64;
@@ -476,6 +499,46 @@ impl CollectorDirectUploader {
 
         Ok(())
     }
+
+    async fn probe_readiness(&self) -> Result<(), CollectorUploadError> {
+        let url = compose_upload_url(self.cfg.endpoint.as_str(), self.cfg.readiness_path.as_str());
+        let response = self
+            .client
+            .get(url.as_str())
+            .header(API_VERSION_HEADER, API_VERSION)
+            .send()
+            .await
+            .map_err(|error| CollectorUploadError {
+                message: format!(
+                    "collector local sessions readiness check failed for {url}: {}",
+                    render_upload_request_error(&error)
+                ),
+                rate_limited: false,
+                retry_after_secs: None,
+                connectivity_error: error.is_connect() || error.is_timeout(),
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+        let body = truncate_utf8(body.as_str(), 256);
+        Err(CollectorUploadError {
+            message: format!(
+                "collector local sessions readiness check returned status {} body={}",
+                status.as_u16(),
+                body
+            ),
+            rate_limited: false,
+            retry_after_secs: None,
+            connectivity_error: false,
+        })
+    }
 }
 
 fn normalize_upload_path_or_url(path: &str) -> Option<String> {
@@ -516,6 +579,23 @@ fn parse_retry_after_secs_body(body: &str) -> Option<u64> {
     value
         .get("retry_after_secs")
         .and_then(|value| value.as_u64())
+}
+
+fn render_upload_request_error(error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_status() {
+        "status"
+    } else {
+        "unknown"
+    };
+    format!("kind={kind} detail={error:#}")
 }
 
 fn build_default_agent_instance_id() -> String {
@@ -787,6 +867,18 @@ pub fn spawn_runtime(
         frontload_reset_offsets_on_start = collector.config.frontload_reset_offsets_on_start,
         frontload_cycles = collector.config.frontload_max_cycles,
         direct_upload_enabled = collector.uploader.is_some(),
+        upload_readiness_path = collector
+            .config
+            .direct_upload
+            .as_ref()
+            .map(|cfg| cfg.readiness_path.as_str())
+            .unwrap_or("-"),
+        upload_readiness_backoff_secs = collector
+            .config
+            .direct_upload
+            .as_ref()
+            .map(|cfg| cfg.readiness_backoff_secs)
+            .unwrap_or(0),
         poll_secs = collector.config.poll_interval.as_secs(),
         state_path = %collector.config.state_path.display(),
         "Local collector enabled"
@@ -862,6 +954,8 @@ struct CollectorAgent {
     session_id: String,
     redactor: PiiRedactor,
     uploader: Option<CollectorDirectUploader>,
+    upload_readiness_confirmed: bool,
+    upload_readiness_backoff_until: Option<Instant>,
     upload_backoff_until: Option<Instant>,
 }
 
@@ -902,6 +996,7 @@ impl CollectorAgent {
                         None
                     }
                 });
+        let upload_readiness_confirmed = uploader.is_none();
         Self {
             config,
             global_tags,
@@ -909,6 +1004,8 @@ impl CollectorAgent {
             session_id: uuid::Uuid::new_v4().to_string(),
             redactor: PiiRedactor::new().with_preserve_length(false),
             uploader,
+            upload_readiness_confirmed,
+            upload_readiness_backoff_until: None,
             upload_backoff_until: None,
         }
     }
@@ -1014,6 +1111,63 @@ impl CollectorAgent {
             self.upload_backoff_until = None;
         }
 
+        if let Some(uploader) = self.uploader.as_ref() {
+            if !self.upload_readiness_confirmed {
+                if let Some(until) = self.upload_readiness_backoff_until {
+                    let now = Instant::now();
+                    if now < until {
+                        let remaining = until.saturating_duration_since(now).as_secs().max(1);
+                        if matches!(mode, CollectorIngestMode::Frontload) {
+                            return Err(anyhow::anyhow!(
+                                "collector local sessions readiness probe backoff active ({}s remaining)",
+                                remaining
+                            ));
+                        }
+                        return Ok(PollStats {
+                            events_emitted: 0,
+                            state_changed: false,
+                        });
+                    }
+                    self.upload_readiness_backoff_until = None;
+                }
+
+                match uploader.probe_readiness().await {
+                    Ok(()) => {
+                        self.upload_readiness_confirmed = true;
+                        self.upload_readiness_backoff_until = None;
+                        info!(
+                            endpoint = %uploader.cfg.endpoint,
+                            readiness_path = %uploader.cfg.readiness_path,
+                            "Collector local sessions upload endpoint is ready"
+                        );
+                    }
+                    Err(error) => {
+                        let backoff_secs = uploader.cfg.readiness_backoff_secs.max(1).min(300);
+                        self.upload_readiness_backoff_until =
+                            Some(Instant::now() + Duration::from_secs(backoff_secs));
+                        warn!(
+                            mode = mode.as_tag(),
+                            endpoint = %uploader.cfg.endpoint,
+                            readiness_path = %uploader.cfg.readiness_path,
+                            backoff_secs,
+                            error = %error.message,
+                            "Collector local sessions upload endpoint not ready; deferring uploads"
+                        );
+                        if matches!(mode, CollectorIngestMode::Frontload) {
+                            return Err(anyhow::anyhow!(
+                                "collector local sessions readiness probe failed; backoff={}s",
+                                backoff_secs
+                            ));
+                        }
+                        return Ok(PollStats {
+                            events_emitted: 0,
+                            state_changed: false,
+                        });
+                    }
+                }
+            }
+        }
+
         let mut state_changed = false;
         let mut events_emitted = 0usize;
         let mut rate_limited_backoff: Option<u64> = None;
@@ -1053,6 +1207,21 @@ impl CollectorAgent {
                                 mode = mode.as_tag(),
                                 backoff_secs,
                                 "Collector local sessions upload rate-limited; pausing uploads"
+                            );
+                            break 'file_sources;
+                        }
+                        if error.connectivity_error {
+                            let backoff_secs = uploader.cfg.readiness_backoff_secs.max(1).min(300);
+                            self.upload_readiness_confirmed = false;
+                            self.upload_readiness_backoff_until =
+                                Some(Instant::now() + Duration::from_secs(backoff_secs));
+                            warn!(
+                                source = %source.name,
+                                path = %source.path.display(),
+                                mode = mode.as_tag(),
+                                backoff_secs,
+                                error = %error.message,
+                                "Collector local artifact upload lost connectivity; re-checking readiness before retry"
                             );
                             break 'file_sources;
                         }
@@ -1130,6 +1299,22 @@ impl CollectorAgent {
                                     mode = mode.as_tag(),
                                     backoff_secs,
                                     "Collector local sessions upload rate-limited; pausing uploads"
+                                );
+                                break 'sqlite_sources;
+                            }
+                            if error.connectivity_error {
+                                let backoff_secs =
+                                    uploader.cfg.readiness_backoff_secs.max(1).min(300);
+                                self.upload_readiness_confirmed = false;
+                                self.upload_readiness_backoff_until =
+                                    Some(Instant::now() + Duration::from_secs(backoff_secs));
+                                warn!(
+                                    source = %source.name,
+                                    db_path = %source.db_path.display(),
+                                    mode = mode.as_tag(),
+                                    backoff_secs,
+                                    error = %error.message,
+                                    "Collector sqlite artifact upload lost connectivity; re-checking readiness before retry"
                                 );
                                 break 'sqlite_sources;
                             }
