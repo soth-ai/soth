@@ -22,6 +22,38 @@ const DEFAULT_CA_CN: &str = "SOTH Proxy CA";
 const DEFAULT_CACHE_ENTRIES: usize = 10_000;
 const IDENTITY_METADATA_FILE: &str = "ca.identity.json";
 
+#[cfg(windows)]
+fn harden_windows_private_key_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let path_str = path.to_string_lossy().to_string();
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args([
+        "/C",
+        "icacls",
+        &path_str,
+        "/inheritance:r",
+        "/grant:r",
+        "%USERNAME%:(F)",
+    ])
+    .creation_flags(CREATE_NO_WINDOW);
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "failed to harden CA private key ACL with icacls for {}: {}",
+            path.display(),
+            stderr.trim()
+        ),
+    ))
+}
+
 /// Persisted CA identity metadata for TLS key lifecycle traceability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaIdentityMetadata {
@@ -79,6 +111,10 @@ impl CertificateAuthority {
             let mut perms = fs::metadata(&key_path)?.permissions();
             perms.set_mode(0o600);
             fs::set_permissions(&key_path, perms)?;
+        }
+        #[cfg(windows)]
+        {
+            harden_windows_private_key_permissions(&key_path)?;
         }
 
         info!("CA certificate generated: {:?}", cert_path);

@@ -121,6 +121,10 @@ pub async fn enable_quiet(port: Option<u16>) -> Result<()> {
 async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<()> {
     let proxy_port = port.unwrap_or(DEFAULT_PROXY_PORT);
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    #[cfg(target_os = "linux")]
+    let mut managed_apply = true;
+    #[cfg(not(target_os = "linux"))]
+    let managed_apply = true;
 
     if print_user_output {
         println!(
@@ -137,7 +141,7 @@ async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<(
 
     #[cfg(target_os = "linux")]
     {
-        configure_linux_proxy(true, proxy_port, print_user_output).await?;
+        managed_apply = configure_linux_proxy(true, proxy_port, print_user_output).await?;
     }
 
     #[cfg(target_os = "windows")]
@@ -145,30 +149,48 @@ async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<(
         configure_windows_proxy(true, proxy_port, print_user_output).await?;
     }
 
-    if print_user_output {
-        println!("\n{} System proxy enabled", style::success_prefix());
-        println!("   All HTTPS traffic will now route through SOTH proxy");
-        println!(
-            "   {} AI traffic: MITM intercepted (inspection enabled)",
-            style::INFO
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = proxy_port;
+        let _ = print_user_output;
+        anyhow::bail!(
+            "system proxy automation is not supported on this OS ({})",
+            std::env::consts::OS
         );
-        println!(
-            "   {} Other traffic: Tunneled (no inspection)",
-            style::ARROW_RIGHT
-        );
-        println!(
-            "   {} Bypass: localhost, 127.0.0.1, *.local, private IPs",
-            style::ARROW_RIGHT
-        );
+    }
 
-        // Check if CA is trusted
-        let ca_path = get_ca_path();
-        if !ca_path.exists() {
+    if print_user_output {
+        if managed_apply {
+            println!("\n{} System proxy enabled", style::success_prefix());
+            println!("   All HTTPS traffic will now route through SOTH proxy");
             println!(
-                "\n{} CA certificate not found. Run: {}",
-                style::WARNING,
-                style::highlight("soth runtime setup-ca")
+                "   {} AI traffic: MITM intercepted (inspection enabled)",
+                style::INFO
             );
+            println!(
+                "   {} Other traffic: Tunneled (no inspection)",
+                style::ARROW_RIGHT
+            );
+            println!(
+                "   {} Bypass: localhost, 127.0.0.1, *.local, private IPs",
+                style::ARROW_RIGHT
+            );
+
+            // Check if CA is trusted
+            let ca_path = get_ca_path();
+            if !ca_path.exists() {
+                println!(
+                    "\n{} CA certificate not found. Run: {}",
+                    style::WARNING,
+                    style::highlight("soth runtime setup-ca")
+                );
+            }
+        } else {
+            println!(
+                "\n{} System proxy was not auto-configured on this Linux desktop",
+                style::WARNING
+            );
+            println!("   Apply the printed shell instructions manually.");
         }
     }
 
@@ -186,6 +208,11 @@ pub async fn disable_quiet() -> Result<()> {
 }
 
 async fn disable_internal(print_user_output: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let mut managed_apply = true;
+    #[cfg(not(target_os = "linux"))]
+    let managed_apply = true;
+
     if print_user_output {
         println!(
             "{} Removing system proxy configuration...",
@@ -200,7 +227,7 @@ async fn disable_internal(print_user_output: bool) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        configure_linux_proxy(false, 0, print_user_output).await?;
+        managed_apply = configure_linux_proxy(false, 0, print_user_output).await?;
     }
 
     #[cfg(target_os = "windows")]
@@ -208,9 +235,25 @@ async fn disable_internal(print_user_output: bool) -> Result<()> {
         configure_windows_proxy(false, 0, print_user_output).await?;
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = print_user_output;
+        anyhow::bail!(
+            "system proxy automation is not supported on this OS ({})",
+            std::env::consts::OS
+        );
+    }
+
     if print_user_output {
-        println!("\n{} System proxy disabled", style::success_prefix());
-        println!("   Direct connections restored");
+        if managed_apply {
+            println!("\n{} System proxy disabled", style::success_prefix());
+            println!("   Direct connections restored");
+        } else {
+            println!(
+                "\n{} No managed Linux system proxy backend detected; manual cleanup may still be required.",
+                style::WARNING
+            );
+        }
     }
 
     Ok(())
@@ -232,6 +275,14 @@ pub async fn status() -> Result<bool> {
     #[cfg(target_os = "windows")]
     {
         return check_windows_proxy_status().await;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!(
+            "system proxy status is not supported on this OS ({})",
+            std::env::consts::OS
+        );
     }
 
     #[allow(unreachable_code)]
@@ -804,11 +855,11 @@ async fn check_macos_proxy_status() -> Result<bool> {
 // === Linux Implementation ===
 
 #[cfg(target_os = "linux")]
-async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<()> {
+async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<bool> {
     // Try GNOME gsettings first
     if which::which("gsettings").is_ok() {
         configure_gnome_proxy(enable, port, print_user_output)?;
-        return Ok(());
+        return Ok(true);
     }
 
     // Fall back to environment variable instructions
@@ -825,7 +876,7 @@ async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool)
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]

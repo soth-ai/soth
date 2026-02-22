@@ -42,6 +42,92 @@ const PROXY_ENV_KEYS: &[&str] = &[
     "AWS_CA_BUNDLE",
 ];
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowsOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    h_event: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_lock_file_exclusive(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LockFileEx(
+            h_file: *mut std::ffi::c_void,
+            flags: u32,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut WindowsOverlapped,
+        ) -> i32;
+    }
+
+    let mut overlapped = WindowsOverlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: std::ptr::null_mut(),
+    };
+    let rc = unsafe {
+        LockFileEx(
+            file.as_raw_handle().cast(),
+            WINDOWS_LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if rc == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_unlock_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn UnlockFileEx(
+            h_file: *mut std::ffi::c_void,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut WindowsOverlapped,
+        ) -> i32;
+    }
+
+    let mut overlapped = WindowsOverlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: std::ptr::null_mut(),
+    };
+    let _ = unsafe { UnlockFileEx(file.as_raw_handle().cast(), 0, 1, 0, &mut overlapped) };
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_hidden_process_flags(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonPidMetadata {
     schema_version: u32,
@@ -64,6 +150,10 @@ impl Drop for DaemonLifecycleLock {
         {
             use std::os::fd::AsRawFd;
             let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows_unlock_file(&self.file);
         }
     }
 }
@@ -144,6 +234,12 @@ fn acquire_lifecycle_lock() -> anyhow::Result<DaemonLifecycleLock> {
                 error
             ));
         }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_lock_file_exclusive(&file).with_context(|| {
+            format!("failed acquiring daemon lifecycle lock {}", path.display())
+        })?;
     }
     Ok(DaemonLifecycleLock { file })
 }
@@ -349,11 +445,102 @@ fn is_process_running(pid: u32) -> bool {
             .map(|status| status.success())
             .unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        let filter = format!("PID eq {}", pid);
+        let mut cmd = Command::new("tasklist");
+        cmd.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
+        apply_windows_hidden_process_flags(&mut cmd);
+        let output = cmd.output().ok();
+        let Some(output) = output else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.to_ascii_lowercase().starts_with("info:") {
+                return false;
+            }
+            let cols = parse_csv_columns(trimmed);
+            if cols
+                .get(1)
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                == Some(pid)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = pid;
         false
     }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_csv_columns(line: &str) -> Vec<String> {
+    line.split(',')
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn process_commandline_via_powershell(pid: u32) -> Option<String> {
+    let script = format!(
+        "(Get-CimInstance Win32_Process -Filter \"ProcessId = {}\" | Select-Object -ExpandProperty CommandLine)",
+        pid
+    );
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
+    ]);
+    apply_windows_hidden_process_flags(&mut cmd);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_commandline_via_wmic(pid: u32) -> Option<String> {
+    let mut cmd = Command::new("wmic");
+    cmd.args([
+        "process",
+        "where",
+        &format!("processid={}", pid),
+        "get",
+        "CommandLine",
+        "/value",
+    ]);
+    apply_windows_hidden_process_flags(&mut cmd);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("CommandLine="))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(unix)]
@@ -373,7 +560,12 @@ fn process_commandline(pid: u32) -> Option<String> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn process_commandline(pid: u32) -> Option<String> {
+    process_commandline_via_powershell(pid).or_else(|| process_commandline_via_wmic(pid))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn process_commandline(_pid: u32) -> Option<String> {
     None
 }
@@ -385,9 +577,15 @@ fn is_expected_daemon_process(pid: u32) -> bool {
     let Some(command) = process_commandline(pid) else {
         return false;
     };
-    command.contains(" start ")
-        && command.contains("--daemon-child")
-        && (command.contains("/soth") || command.contains(" soth"))
+    let normalized = command.to_ascii_lowercase();
+    let looks_like_soth_binary = normalized.contains("soth.exe")
+        || normalized.contains("/soth")
+        || normalized.contains("\\soth")
+        || normalized.starts_with("soth ")
+        || normalized == "soth";
+    normalized.contains(" start ")
+        && normalized.contains("--daemon-child")
+        && looks_like_soth_binary
 }
 
 #[cfg(unix)]
@@ -413,18 +611,64 @@ fn listener_owner_pids(port: u16) -> Option<Vec<u32>> {
     Some(owners)
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn parse_endpoint_port(endpoint: &str) -> Option<u16> {
+    let trimmed = endpoint.trim();
+    let (_, port_part) = trimmed.rsplit_once(':')?;
+    port_part.trim().parse::<u16>().ok()
+}
+
+#[cfg(target_os = "windows")]
+fn listener_owner_pids(port: u16) -> Option<Vec<u32>> {
+    let mut cmd = Command::new("netstat");
+    cmd.args(["-ano", "-p", "tcp"]);
+    apply_windows_hidden_process_flags(&mut cmd);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut owners = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("TCP") {
+            continue;
+        }
+        let columns: Vec<&str> = trimmed.split_whitespace().collect();
+        if columns.len() < 5 {
+            continue;
+        }
+        let local_addr = columns[1];
+        let state = columns[3];
+        let pid = columns[4];
+        if !state.eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+        if parse_endpoint_port(local_addr) != Some(port) {
+            continue;
+        }
+        if let Ok(parsed_pid) = pid.parse::<u32>() {
+            owners.push(parsed_pid);
+        }
+    }
+
+    owners.sort_unstable();
+    owners.dedup();
+    Some(owners)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn listener_owner_pids(_port: u16) -> Option<Vec<u32>> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 fn is_listener_owned_by_pid(port: u16, pid: u32) -> Option<bool> {
     let owners = listener_owner_pids(port)?;
     Some(owners.into_iter().any(|owner_pid| owner_pid == pid))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 fn is_listener_owned_by_pid(_port: u16, _pid: u32) -> Option<bool> {
     None
 }
@@ -446,6 +690,13 @@ fn send_term(pid: u32) {
                 .status();
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T"]);
+        apply_windows_hidden_process_flags(&mut cmd);
+        let _ = cmd.status();
+    }
 }
 
 fn send_kill(pid: u32) {
@@ -464,6 +715,13 @@ fn send_kill(pid: u32) {
                 .stderr(Stdio::null())
                 .status();
         }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        apply_windows_hidden_process_flags(&mut cmd);
+        let _ = cmd.status();
     }
 }
 
@@ -1121,15 +1379,7 @@ mod tests {
                 .build()
                 .expect("runtime");
             let err = runtime
-                .block_on(run_start_daemon(
-                    Some(18888),
-                    None,
-                    true,
-                    None,
-                    false,
-                    None,
-                    true,
-                ))
+                .block_on(run_start_daemon(Some(18888), None, true, false, None, true))
                 .expect_err("daemon start should fail in unit test binary");
             let text = format!("{err:#}");
             assert!(

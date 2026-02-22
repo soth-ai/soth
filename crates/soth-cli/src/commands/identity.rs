@@ -6,6 +6,37 @@ use soth_crypto::identity::{Did, KeyPair, TrustStore};
 use std::path::PathBuf;
 use tokio::fs;
 
+#[cfg(target_os = "windows")]
+fn harden_windows_private_key_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let path_str = path.to_string_lossy().to_string();
+    let output = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "icacls",
+            &path_str,
+            "/inheritance:r",
+            "/grant:r",
+            "%USERNAME%:(F)",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| anyhow::anyhow!("failed to execute icacls: {}", error))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!(
+        "failed to harden key permissions with icacls for {}: {}",
+        path.display(),
+        stderr.trim()
+    )
+}
+
 /// Run identity command
 pub async fn run(action: IdentityCommands) -> Result<()> {
     match action {
@@ -64,6 +95,10 @@ async fn generate_keypair(output: Option<PathBuf>) -> Result<()> {
         let mut perms = fs::metadata(&output_path).await?.permissions();
         perms.set_mode(0o600);
         fs::set_permissions(&output_path, perms).await?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        harden_windows_private_key_permissions(&output_path)?;
     }
 
     println!("Generated new keypair");

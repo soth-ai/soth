@@ -220,6 +220,18 @@ fn stop_child(child: &mut ManagedChild, quiet: bool) {
             return;
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.pid().to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        if child.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+    }
 
     if let Err(error) = child.child.kill() {
         if !quiet {

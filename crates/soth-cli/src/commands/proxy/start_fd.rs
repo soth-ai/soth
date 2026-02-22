@@ -9,6 +9,8 @@ const MIN_NOFILE_SOFT_LIMIT: u64 = 8192;
 const WARN_NOFILE_SOFT_LIMIT: u64 = 2048;
 const FD_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 const FD_MONITOR_WARN_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(target_os = "windows")]
+const WINDOWS_HANDLE_WARN_THRESHOLD: u64 = 16_384;
 
 #[cfg(unix)]
 pub(crate) fn ensure_fd_budget() {
@@ -64,7 +66,28 @@ pub(crate) fn ensure_fd_budget() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+pub(crate) fn ensure_fd_budget() {
+    // Windows does not expose RLIMIT_NOFILE; monitor process handle pressure instead.
+    if let Some(open_handles) = current_open_handle_count() {
+        if open_handles >= WINDOWS_HANDLE_WARN_THRESHOLD {
+            warn!(
+                open_handles = open_handles,
+                threshold = WINDOWS_HANDLE_WARN_THRESHOLD,
+                "High process handle count detected on Windows"
+            );
+        } else {
+            info!(
+                open_handles = open_handles,
+                "Windows handle monitor initialized"
+            );
+        }
+    } else {
+        warn!("Unable to read Windows process handle count");
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 pub(crate) fn ensure_fd_budget() {}
 
 pub(crate) struct FdMonitorRuntime {
@@ -72,7 +95,7 @@ pub(crate) struct FdMonitorRuntime {
     pub(crate) task: JoinHandle<()>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub(crate) fn spawn_fd_monitor_runtime() -> Option<FdMonitorRuntime> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
@@ -103,6 +126,23 @@ pub(crate) fn spawn_fd_monitor_runtime() -> Option<FdMonitorRuntime> {
                                     );
                                 }
                             }
+                        } else {
+                            #[cfg(target_os = "windows")]
+                            {
+                                if open_fds >= WINDOWS_HANDLE_WARN_THRESHOLD {
+                                    let should_warn = last_warn_at
+                                        .map(|last| last.elapsed() >= FD_MONITOR_WARN_INTERVAL)
+                                        .unwrap_or(true);
+                                    if should_warn {
+                                        last_warn_at = Some(Instant::now());
+                                        warn!(
+                                            open_handles = open_fds,
+                                            threshold = WINDOWS_HANDLE_WARN_THRESHOLD,
+                                            "High process handle usage detected on Windows"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -113,7 +153,7 @@ pub(crate) fn spawn_fd_monitor_runtime() -> Option<FdMonitorRuntime> {
     Some(FdMonitorRuntime { shutdown_tx, task })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 pub(crate) fn spawn_fd_monitor_runtime() -> Option<FdMonitorRuntime> {
     None
 }
@@ -123,6 +163,13 @@ fn current_fd_snapshot() -> Option<(u64, u64, u64)> {
     let (soft_limit, hard_limit) = current_nofile_limits()?;
     let open_fds = current_open_fd_count()?;
     Some((open_fds, soft_limit, hard_limit))
+}
+
+#[cfg(target_os = "windows")]
+fn current_fd_snapshot() -> Option<(u64, u64, u64)> {
+    // No direct RLIMIT equivalent on Windows; emit open handle count only.
+    let open_handles = current_open_handle_count()?;
+    Some((open_handles, 0, 0))
 }
 
 #[cfg(unix)]
@@ -150,4 +197,23 @@ fn current_open_fd_count() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(target_os = "windows")]
+fn current_open_handle_count() -> Option<u64> {
+    type Handle = *mut std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn GetProcessHandleCount(process: Handle, handle_count: *mut u32) -> i32;
+    }
+
+    let process = unsafe { GetCurrentProcess() };
+    let mut count = 0u32;
+    let ok = unsafe { GetProcessHandleCount(process, &mut count) };
+    if ok == 0 {
+        return None;
+    }
+    Some(count as u64)
 }

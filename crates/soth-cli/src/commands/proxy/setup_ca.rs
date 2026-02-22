@@ -8,9 +8,13 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "linux")]
+use std::process::Command;
+#[cfg(target_os = "windows")]
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use which::which;
@@ -315,6 +319,37 @@ fn ensure_linux_trust(cert_path: &Path) -> anyhow::Result<()> {
     anyhow::bail!("no supported Linux trust command found (update-ca-certificates/update-ca-trust)")
 }
 
+#[cfg(target_os = "windows")]
+fn ensure_windows_trust(cert_path: &Path) -> anyhow::Result<()> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let cert = cert_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid certificate path"))?;
+
+    // CurrentUser Root store avoids elevation while still trusting for the current account.
+    let output = Command::new("certutil")
+        .args(["-user", "-addstore", "Root", cert])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| anyhow::anyhow!("failed to execute certutil: {}", error))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stdout.contains("already") || stderr.contains("already") {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "certutil -user -addstore Root failed: {} {}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
 /// Run the setup-ca command
 pub async fn run(
     output: Option<String>,
@@ -521,8 +556,23 @@ pub async fn run(
 
         #[cfg(target_os = "windows")]
         {
+            match ensure_windows_trust(&cert_path) {
+                Ok(()) => {
+                    style::success("Installed SOTH CA into Windows CurrentUser Root trust store.");
+                }
+                Err(error) => {
+                    style::warning(&format!(
+                        "Auto trust install failed (continuing fail-open): {}",
+                        error
+                    ));
+                }
+            }
+
             println!();
-            println!("  {} (requires admin PowerShell):", "Windows".bold());
+            println!(
+                "  {} (optional machine-wide trust, requires admin):",
+                "Windows".bold()
+            );
             println!(
                 "    {}",
                 format!(

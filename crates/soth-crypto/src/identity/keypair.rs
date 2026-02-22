@@ -192,6 +192,10 @@ impl KeyPair {
             let perms = std::fs::Permissions::from_mode(0o600);
             std::fs::set_permissions(path.as_ref(), perms)?;
         }
+        #[cfg(windows)]
+        {
+            harden_windows_private_key_permissions(path.as_ref())?;
+        }
 
         Ok(())
     }
@@ -288,6 +292,39 @@ impl std::hash::Hash for KeyPair {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.public_key_bytes().hash(state);
     }
+}
+
+#[cfg(windows)]
+fn harden_windows_private_key_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let path_str = path.to_string_lossy().to_string();
+
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args([
+        "/C",
+        "icacls",
+        &path_str,
+        "/inheritance:r",
+        "/grant:r",
+        "%USERNAME%:(F)",
+    ])
+    .creation_flags(CREATE_NO_WINDOW);
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "failed to harden private key ACL with icacls for {}: {}",
+            path.display(),
+            stderr.trim()
+        ),
+    ))
 }
 
 // Hex encoding helper

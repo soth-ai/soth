@@ -26,6 +26,93 @@ const CLOUD_BACKOFF_MAX_CAP: Duration = Duration::from_secs(15 * 60);
 const CLOUD_RUNTIME_LOCK_FILE: &str = "cloud.pull.runtime.lock";
 const REGISTRY_BUNDLE_DEGRADED_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
+#[cfg(target_os = "windows")]
+const WINDOWS_LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowsOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    h_event: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_try_lock_file_exclusive(file: &File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LockFileEx(
+            h_file: *mut std::ffi::c_void,
+            flags: u32,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut WindowsOverlapped,
+        ) -> i32;
+    }
+
+    let mut overlapped = WindowsOverlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: std::ptr::null_mut(),
+    };
+    let rc = unsafe {
+        LockFileEx(
+            file.as_raw_handle().cast(),
+            WINDOWS_LOCKFILE_EXCLUSIVE_LOCK | WINDOWS_LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if rc != 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(WINDOWS_ERROR_LOCK_VIOLATION) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_unlock_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn UnlockFileEx(
+            h_file: *mut std::ffi::c_void,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut WindowsOverlapped,
+        ) -> i32;
+    }
+
+    let mut overlapped = WindowsOverlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: std::ptr::null_mut(),
+    };
+    let _ = unsafe { UnlockFileEx(file.as_raw_handle().cast(), 0, 1, 0, &mut overlapped) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistryRuntimeSource {
     HealthyCloud,
@@ -693,6 +780,10 @@ impl Drop for CloudRuntimeSingletonLock {
             use std::os::fd::AsRawFd;
             let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
         }
+        #[cfg(target_os = "windows")]
+        {
+            windows_unlock_file(&self.file);
+        }
     }
 }
 
@@ -720,6 +811,20 @@ fn try_acquire_cloud_runtime_singleton_lock() -> Result<Option<CloudRuntimeSingl
                 path.display(),
                 error
             ));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match windows_try_lock_file_exclusive(&file) {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed acquiring cloud runtime singleton lock {}: {}",
+                    path.display(),
+                    error
+                ));
+            }
         }
     }
     Ok(Some(CloudRuntimeSingletonLock { file }))
