@@ -4,7 +4,6 @@ use crate::cli_config;
 use crate::style;
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
-use soth_core::config::ForwardProxyEngine;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader};
@@ -606,7 +605,6 @@ pub async fn run_start_daemon(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     quiet: bool,
-    engine_override: Option<ForwardProxyEngine>,
     intercept_all: bool,
     intercept_all_for: Option<u64>,
     no_autostart: bool,
@@ -629,11 +627,7 @@ pub async fn run_start_daemon(
                     compact_path(&log_path())
                 ));
                 if autostart_enabled {
-                    match super::autostart::ensure_enabled(
-                        expected_port,
-                        config_path.as_ref(),
-                        engine_override,
-                    ) {
+                    match super::autostart::ensure_enabled(expected_port, config_path.as_ref()) {
                         Ok(details) => {
                             style::info(&format!("Startup autostart ensured: {details}"))
                         }
@@ -684,8 +678,7 @@ pub async fn run_start_daemon(
     }
 
     if autostart_enabled && super::autostart::supports_managed_mode() {
-        match super::autostart::start_managed(expected_port, config_path.as_ref(), engine_override)
-        {
+        match super::autostart::start_managed(expected_port, config_path.as_ref()) {
             Ok(details) => {
                 let startup_timeout = daemon_startup_timeout();
                 let startup_deadline = std::time::Instant::now() + startup_timeout;
@@ -761,9 +754,6 @@ pub async fn run_start_daemon(
 
     if quiet {
         cmd.arg("--quiet");
-    }
-    if let Some(engine) = engine_override {
-        cmd.arg("--engine").arg(engine.to_string());
     }
     if intercept_all {
         cmd.arg("--intercept-all");
@@ -852,8 +842,7 @@ pub async fn run_start_daemon(
     }
 
     if autostart_enabled {
-        match super::autostart::ensure_enabled(expected_port, config_path.as_ref(), engine_override)
-        {
+        match super::autostart::ensure_enabled(expected_port, config_path.as_ref()) {
             Ok(details) => {
                 if !quiet {
                     style::info(&format!("Startup autostart ensured: {details}"));

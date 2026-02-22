@@ -15,7 +15,7 @@ use crate::commands::proxy::system;
 use crate::style;
 use owo_colors::OwoColorize;
 use soth_collector::CollectorRuntime;
-use soth_core::config::{ForwardProxyEngine, HostFilterMode, ObserveCollectorConfig, SothConfig};
+use soth_core::config::{HostFilterMode, ObserveCollectorConfig, SothConfig};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
 use soth_edge::proxy as edge_proxy;
@@ -34,7 +34,6 @@ pub async fn run(
     config_path: Option<PathBuf>,
     quiet: bool,
     foreground: bool,
-    engine_override: Option<ForwardProxyEngine>,
     intercept_all: bool,
     intercept_all_for: Option<u64>,
     daemon_child: bool,
@@ -45,7 +44,6 @@ pub async fn run(
             port,
             config_path,
             quiet,
-            engine_override,
             intercept_all,
             intercept_all_for,
             no_autostart,
@@ -60,9 +58,6 @@ pub async fn run(
         let _ = cli_config::sync_client_device_id(&mut config, None)?;
     }
     cloud_hooks::apply_cached_controls(&mut config)?;
-    if let Some(engine) = engine_override {
-        config.forward_proxy.engine = engine;
-    }
 
     // Override port if specified
     let mut proxy_config = config.forward_proxy.clone();
@@ -346,20 +341,13 @@ async fn run_forward_proxy(
 
 fn spawn_proxy_runtime(
     config: &SothConfig,
-    mut proxy_config: soth_core::config::ForwardProxyConfig,
+    proxy_config: soth_core::config::ForwardProxyConfig,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
     event_logger: Option<EventLogger>,
     debug_intercept_all_enabled: bool,
     _debug_intercept_all_for: Option<Duration>,
 ) -> anyhow::Result<ProxyRuntime> {
-    if matches!(proxy_config.engine, ForwardProxyEngine::Proxy) {
-        warn!(
-            "Legacy proxy runtime has been removed; redirecting to edge runtime for this session"
-        );
-        proxy_config.engine = ForwardProxyEngine::Edge;
-    }
-
     let event_db_path = event_logger
         .as_ref()
         .map(|logger| logger.path().clone())

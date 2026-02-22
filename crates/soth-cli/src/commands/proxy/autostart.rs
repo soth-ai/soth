@@ -4,7 +4,6 @@
 //! it comes back on boot/login without requiring manual re-configuration.
 
 use anyhow::{anyhow, Context, Result};
-use soth_core::config::ForwardProxyEngine;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -28,11 +27,7 @@ fn resolve_abs_path(path: &Path) -> Result<PathBuf> {
     Ok(cwd.join(path))
 }
 
-fn build_args(
-    port: u16,
-    config_path: Option<&PathBuf>,
-    engine: Option<ForwardProxyEngine>,
-) -> Result<Vec<String>> {
+fn build_args(port: u16, config_path: Option<&PathBuf>) -> Result<Vec<String>> {
     let mut args = vec![
         "start".to_string(),
         "--daemon-child".to_string(),
@@ -40,10 +35,6 @@ fn build_args(
         "--port".to_string(),
         port.to_string(),
     ];
-    if let Some(engine) = engine {
-        args.push("--engine".to_string());
-        args.push(engine.to_string());
-    }
     if let Some(config_path) = config_path {
         let abs = resolve_abs_path(config_path)?;
         args.push("--config".to_string());
@@ -56,13 +47,9 @@ fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("failed resolving current executable for autostart")
 }
 
-pub fn ensure_enabled(
-    port: u16,
-    config_path: Option<&PathBuf>,
-    engine: Option<ForwardProxyEngine>,
-) -> Result<String> {
+pub fn ensure_enabled(port: u16, config_path: Option<&PathBuf>) -> Result<String> {
     let exe = current_exe()?;
-    let args = build_args(port, config_path, engine)?;
+    let args = build_args(port, config_path)?;
     #[cfg(target_os = "macos")]
     {
         ensure_macos_launch_agent(&exe, &args)
@@ -91,12 +78,8 @@ pub fn supports_managed_mode() -> bool {
     ))
 }
 
-pub fn start_managed(
-    port: u16,
-    config_path: Option<&PathBuf>,
-    engine: Option<ForwardProxyEngine>,
-) -> Result<String> {
-    ensure_enabled(port, config_path, engine)
+pub fn start_managed(port: u16, config_path: Option<&PathBuf>) -> Result<String> {
+    ensure_enabled(port, config_path)
 }
 
 pub fn stop_managed_runtime_only() -> Result<Option<String>> {
@@ -611,7 +594,7 @@ mod tests {
 
     #[test]
     fn build_args_includes_daemon_child_and_port() {
-        let args = build_args(8080, None, None).expect("args");
+        let args = build_args(8080, None).expect("args");
         assert!(args.iter().any(|v| v == "--daemon-child"));
         assert!(args.iter().any(|v| v == "--quiet"));
         assert!(args.iter().any(|v| v == "8080"));

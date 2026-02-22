@@ -2,7 +2,6 @@
 
 use crate::cli_config;
 use crate::style;
-use clap::ValueEnum;
 #[cfg(feature = "local-debug")]
 mod api;
 mod autostart;
@@ -31,7 +30,6 @@ mod system;
 mod ui;
 
 use clap::Subcommand;
-use soth_core::config::ForwardProxyEngine;
 use std::path::PathBuf;
 
 /// Proxy subcommands
@@ -110,21 +108,6 @@ pub enum ProxyCommands {
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ProxyEngineArg {
-    Proxy,
-    Edge,
-}
-
-impl From<ProxyEngineArg> for ForwardProxyEngine {
-    fn from(value: ProxyEngineArg) -> Self {
-        match value {
-            ProxyEngineArg::Proxy => ForwardProxyEngine::Proxy,
-            ProxyEngineArg::Edge => ForwardProxyEngine::Edge,
-        }
-    }
-}
-
 pub async fn run_on(port: Option<u16>, global_config: Option<PathBuf>) -> anyhow::Result<()> {
     let selected_port = if port.is_some() {
         port
@@ -144,7 +127,6 @@ pub async fn run_start_internal(
     config: Option<PathBuf>,
     quiet: bool,
     foreground: bool,
-    engine: Option<ForwardProxyEngine>,
     intercept_all: bool,
     intercept_all_for: Option<u64>,
     daemon_child: bool,
@@ -155,7 +137,6 @@ pub async fn run_start_internal(
         config,
         quiet,
         foreground,
-        engine,
         intercept_all,
         intercept_all_for,
         daemon_child,
@@ -233,7 +214,7 @@ pub async fn run_autostart(
                     .port
             };
             let details =
-                autostart::ensure_enabled(selected_port, effective_config.as_ref(), None)?;
+                autostart::ensure_enabled(selected_port, effective_config.as_ref())?;
             style::success(&format!("Startup autostart enabled: {details}"));
         }
         AutostartAction::Disable => match autostart::disable_managed_autostart()? {

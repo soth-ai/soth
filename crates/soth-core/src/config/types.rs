@@ -1745,12 +1745,17 @@ pub enum RegistryMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ForwardProxyEngine {
-    /// Legacy proxy transport.
-    #[serde(alias = "soth_proxy", alias = "soth-proxy")]
-    Proxy,
-    /// New edge transport.
+    /// Edge transport runtime.
+    ///
+    /// Legacy engine aliases are retained so existing configs continue to parse.
     #[default]
-    #[serde(alias = "soth_edge", alias = "soth-edge")]
+    #[serde(
+        alias = "soth_edge",
+        alias = "soth-edge",
+        alias = "proxy",
+        alias = "soth_proxy",
+        alias = "soth-proxy"
+    )]
     Edge,
 }
 
@@ -1760,11 +1765,8 @@ impl ForwardProxyEngine {
     }
 
     pub fn registry_bundle_type(self) -> &'static str {
-        match self {
-            Self::Proxy => "local",
-            // Cloud currently serves edge-format bundle payloads under `type=local`.
-            Self::Edge => "local",
-        }
+        // Cloud currently serves edge-format bundle payloads under `type=local`.
+        "local"
     }
 }
 
@@ -1788,7 +1790,6 @@ impl std::fmt::Display for HostFilterMode {
 impl std::fmt::Display for ForwardProxyEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Proxy => write!(f, "proxy"),
             Self::Edge => write!(f, "edge"),
         }
     }
@@ -2713,9 +2714,9 @@ forward_proxy:
     #[test]
     fn test_parse_forward_proxy_engine_yaml() {
         for (raw, expected) in [
-            ("proxy", ForwardProxyEngine::Proxy),
-            ("soth_proxy", ForwardProxyEngine::Proxy),
-            ("soth-proxy", ForwardProxyEngine::Proxy),
+            ("proxy", ForwardProxyEngine::Edge),
+            ("soth_proxy", ForwardProxyEngine::Edge),
+            ("soth-proxy", ForwardProxyEngine::Edge),
             ("edge", ForwardProxyEngine::Edge),
             ("soth_edge", ForwardProxyEngine::Edge),
             ("soth-edge", ForwardProxyEngine::Edge),

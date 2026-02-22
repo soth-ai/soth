@@ -133,10 +133,6 @@ enum Commands {
         #[arg(long)]
         foreground: bool,
 
-        /// Proxy engine override
-        #[arg(long, value_enum)]
-        engine: Option<commands::proxy::ProxyEngineArg>,
-
         /// Debug: intercept all non-local hosts (full MITM) while this process runs.
         #[arg(long)]
         intercept_all: bool,
@@ -171,10 +167,6 @@ enum Commands {
         /// Run in the foreground (do not daemonize)
         #[arg(long)]
         foreground: bool,
-
-        /// Proxy engine override
-        #[arg(long, value_enum)]
-        engine: Option<commands::proxy::ProxyEngineArg>,
 
         /// Debug: intercept all non-local hosts (full MITM) while this process runs.
         #[arg(long)]
@@ -749,7 +741,6 @@ async fn async_main() -> anyhow::Result<()> {
             config,
             quiet,
             foreground,
-            engine,
             intercept_all,
             intercept_all_for,
             daemon_child,
@@ -760,7 +751,6 @@ async fn async_main() -> anyhow::Result<()> {
                 config.or(cli.config.clone()),
                 quiet,
                 foreground,
-                engine.map(Into::into),
                 intercept_all,
                 intercept_all_for,
                 daemon_child,
@@ -773,7 +763,6 @@ async fn async_main() -> anyhow::Result<()> {
             config,
             quiet,
             foreground,
-            engine,
             intercept_all,
             intercept_all_for,
             no_autostart,
@@ -788,7 +777,6 @@ async fn async_main() -> anyhow::Result<()> {
                     effective_config,
                     quiet,
                     true,
-                    engine.map(Into::into),
                     intercept_all,
                     intercept_all_for,
                     false,
@@ -801,7 +789,6 @@ async fn async_main() -> anyhow::Result<()> {
                     effective_config.clone(),
                     quiet,
                     false,
-                    engine.map(Into::into),
                     intercept_all,
                     intercept_all_for,
                     false,
