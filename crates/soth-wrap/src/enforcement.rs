@@ -1,25 +1,19 @@
-//! Shared enforcement runtime builders used by proxy and wrap commands.
+//! Wrap enforcement runtime builder.
 
 use soth_budget::BudgetTracker;
 use soth_core::config::SothConfig;
 use soth_core::types::policy::PolicyInputBuilder;
 use soth_crypto::identity::TrustStore;
+use soth_helper::pipeline::budget::{BudgetConfig, BudgetLayer};
+use soth_helper::pipeline::identity::{IdentityConfig, IdentityLayer, IdentityMode};
+use soth_helper::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
+use soth_helper::pipeline::{Pipeline, PipelineBuilder};
 use soth_oisp::OispEngine;
 use soth_policy::{CacheConfig as PolicyCacheConfig, PolicyEngine, PolicyLoader};
-use soth_proxy::metrics;
-use soth_proxy::pipeline::budget::{BudgetConfig, BudgetLayer};
-use soth_proxy::pipeline::identity::{IdentityConfig, IdentityLayer, IdentityMode};
-use soth_proxy::pipeline::policy::{PolicyConfig, PolicyLayer, PolicyMode};
-use soth_proxy::pipeline::{Pipeline, PipelineBuilder};
-use soth_proxy::transport::proxy::{ProxyEnforcer, ProxyIdentityMode, ProxyPolicyMode};
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub struct WrapEnforcementRuntime {
     pub pipeline: Arc<Pipeline>,
@@ -78,16 +72,6 @@ impl CryptoIdentityRollout {
         }
     }
 
-    fn proxy_identity_mode(&self) -> ProxyIdentityMode {
-        match self.mode {
-            CryptoRolloutMode::Disabled => ProxyIdentityMode::Disabled,
-            CryptoRolloutMode::Audit | CryptoRolloutMode::EnforceSelected => {
-                ProxyIdentityMode::Optional
-            }
-            CryptoRolloutMode::EnforceGlobal => ProxyIdentityMode::Required,
-        }
-    }
-
     fn wrap_identity_mode(&self) -> IdentityMode {
         match self.mode {
             CryptoRolloutMode::Disabled => IdentityMode::Disabled,
@@ -122,7 +106,6 @@ fn normalize_principals(principals: &[String]) -> HashSet<String> {
 struct PolicyArtifacts {
     modules: HashMap<String, String>,
     data: Option<soth_core::types::policy::PolicyData>,
-    fingerprint: String,
 }
 
 fn resolve_trust_store_file(path: &Path) -> PathBuf {
@@ -185,26 +168,7 @@ fn load_policy_artifacts(config: &SothConfig) -> anyhow::Result<PolicyArtifacts>
         None
     };
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut keys: Vec<_> = modules.keys().cloned().collect();
-    keys.sort();
-    for key in keys {
-        key.hash(&mut hasher);
-        if let Some(module) = modules.get(&key) {
-            module.hash(&mut hasher);
-        }
-    }
-    if let Some(ref data) = data {
-        serde_json::to_string(data)
-            .unwrap_or_default()
-            .hash(&mut hasher);
-    }
-
-    Ok(PolicyArtifacts {
-        modules,
-        data,
-        fingerprint: format!("{:016x}", hasher.finish()),
-    })
+    Ok(PolicyArtifacts { modules, data })
 }
 
 fn validate_policy_artifacts(
@@ -219,7 +183,6 @@ fn validate_policy_artifacts(
         probe_engine.load_modules(artifacts.modules.clone())?;
     }
 
-    // Validate by executing one probe evaluation.
     let probe_input = PolicyInputBuilder::new()
         .session_id("policy-reload-probe")
         .method("tools/call")
@@ -253,7 +216,6 @@ fn build_policy_engine(config: &SothConfig) -> anyhow::Result<Option<PolicyEngin
     let artifacts = load_policy_artifacts(config)?;
 
     if let Err(error) = validate_policy_artifacts(config.policy.cache.clone().into(), &artifacts) {
-        metrics::record_policy_reload(false);
         warn!(
             error = %error,
             "Policy artifacts invalid at startup; continuing fail-open with policy layer disabled"
@@ -262,7 +224,6 @@ fn build_policy_engine(config: &SothConfig) -> anyhow::Result<Option<PolicyEngin
     }
 
     if let Err(error) = apply_policy_artifacts(&engine, &artifacts) {
-        metrics::record_policy_reload(false);
         warn!(
             error = %error,
             "Policy artifacts failed to apply at startup; continuing fail-open with policy layer disabled"
@@ -270,78 +231,7 @@ fn build_policy_engine(config: &SothConfig) -> anyhow::Result<Option<PolicyEngin
         return Ok(None);
     }
 
-    metrics::record_policy_reload(true);
-    metrics::set_policy_active_version(&engine.active_policy_version());
     Ok(Some(engine))
-}
-
-pub fn spawn_policy_hot_reload(
-    config: &SothConfig,
-    engine: Arc<PolicyEngine>,
-) -> Option<JoinHandle<()>> {
-    if !config.policy.enabled || !config.policy.watch_for_changes {
-        return None;
-    }
-
-    let policy_config = config.clone();
-    Some(tokio::spawn(async move {
-        let mut current_fingerprint = match load_policy_artifacts(&policy_config) {
-            Ok(artifacts) => artifacts.fingerprint,
-            Err(error) => {
-                warn!("Policy hot reload startup snapshot failed: {}", error);
-                String::new()
-            }
-        };
-
-        info!("Policy hot reload watcher started");
-        let mut ticker = tokio::time::interval(Duration::from_secs(2));
-        loop {
-            ticker.tick().await;
-            let artifacts = match load_policy_artifacts(&policy_config) {
-                Ok(artifacts) => artifacts,
-                Err(error) => {
-                    warn!("Policy hot reload: failed to load artifacts: {}", error);
-                    continue;
-                }
-            };
-            if artifacts.fingerprint == current_fingerprint {
-                continue;
-            }
-
-            match validate_policy_artifacts(policy_config.policy.cache.clone().into(), &artifacts) {
-                Ok(()) => match apply_policy_artifacts(&engine, &artifacts) {
-                    Ok(()) => {
-                        metrics::record_policy_reload(true);
-                        let active_version = engine.active_policy_version();
-                        metrics::set_policy_active_version(&active_version);
-                        info!(
-                            "Policy hot reload applied successfully (version={})",
-                            active_version
-                        );
-                        current_fingerprint = artifacts.fingerprint;
-                    }
-                    Err(error) => {
-                        metrics::record_policy_reload(false);
-                        warn!(
-                            "Policy hot reload candidate rejected during activation (rollback kept): {}",
-                            error
-                        );
-                    }
-                },
-                Err(error) => {
-                    metrics::record_policy_reload(false);
-                    warn!(
-                        "Policy hot reload candidate rejected during validation (rollback kept): {}",
-                        error
-                    );
-                }
-            }
-            debug!(
-                active_version = %engine.active_policy_version(),
-                "Policy hot reload tick complete"
-            );
-        }
-    }))
 }
 
 fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTracker>> {
@@ -388,14 +278,15 @@ fn build_budget_tracker(config: &SothConfig) -> anyhow::Result<Option<BudgetTrac
 }
 
 fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
+    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
     if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
         if let Some(parent) = config_cache_path.parent() {
-            return parent.join("registry_bundle_cache.json");
+            return parent.join(cache_name);
         }
     }
     dirs::home_dir()
-        .map(|home| home.join(".soth").join("registry_bundle_cache.json"))
-        .unwrap_or_else(|| PathBuf::from(".soth/registry_bundle_cache.json"))
+        .map(|home| home.join(".soth").join(cache_name))
+        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
 }
 
 fn load_budget_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
@@ -425,49 +316,6 @@ fn load_budget_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
             None
         }
     }
-}
-
-pub fn build_proxy_enforcer(config: &SothConfig) -> anyhow::Result<ProxyEnforcer> {
-    let rollout = CryptoIdentityRollout::from_config(config);
-    let identity_mode = rollout.proxy_identity_mode();
-    let required_principals = rollout.required_principals();
-    match rollout.mode {
-        CryptoRolloutMode::Disabled => info!("Crypto identity rollout: disabled"),
-        CryptoRolloutMode::Audit => info!("Crypto identity rollout: audit"),
-        CryptoRolloutMode::EnforceSelected => info!(
-            "Crypto identity rollout: enforce selected principals ({})",
-            required_principals.len()
-        ),
-        CryptoRolloutMode::EnforceGlobal => info!("Crypto identity rollout: enforce global"),
-    }
-
-    let trusted_dids = collect_trusted_dids(config)?;
-
-    let mut enforcer = ProxyEnforcer::new()
-        .with_identity_mode(identity_mode, trusted_dids)
-        .with_required_principals(required_principals)
-        .with_identity_headers("X-Agent-DID", "X-Agent-Signature")
-        .with_fail_open(
-            config.production.fail_open.enabled,
-            config.production.fail_open.enforcement_timeout,
-            config.production.fail_open.policy_fail_open,
-            config.production.fail_open.budget_fail_open,
-        );
-
-    if let Some(engine) = build_policy_engine(config)? {
-        let policy_mode = match config.policy.mode.as_str() {
-            "audit" => ProxyPolicyMode::Audit,
-            "enforce" => ProxyPolicyMode::Enforce,
-            _ => ProxyPolicyMode::Enforce,
-        };
-        enforcer = enforcer.with_policy(policy_mode, engine);
-    }
-
-    if let Some(tracker) = build_budget_tracker(config)? {
-        enforcer = enforcer.with_budget(tracker, true, "gpt-4o");
-    }
-
-    Ok(enforcer)
 }
 
 pub fn build_wrap_enforcement_runtime(
@@ -562,21 +410,7 @@ mod tests {
         let config = SothConfig::default();
         let rollout = CryptoIdentityRollout::from_config(&config);
         assert_eq!(rollout.mode, CryptoRolloutMode::Disabled);
-        assert_eq!(rollout.proxy_identity_mode(), ProxyIdentityMode::Disabled);
         assert_eq!(rollout.wrap_identity_mode(), IdentityMode::Disabled);
-    }
-
-    #[test]
-    fn rollout_audit_when_enabled_in_audit_mode() {
-        let mut config = SothConfig::default();
-        config.crypto_identity.enabled = true;
-        config.crypto_identity.mode = "audit".to_string();
-
-        let rollout = CryptoIdentityRollout::from_config(&config);
-        assert_eq!(rollout.mode, CryptoRolloutMode::Audit);
-        assert_eq!(rollout.proxy_identity_mode(), ProxyIdentityMode::Optional);
-        assert_eq!(rollout.wrap_identity_mode(), IdentityMode::Optional);
-        assert!(rollout.required_principals().is_empty());
     }
 
     #[test]
@@ -588,23 +422,9 @@ mod tests {
 
         let rollout = CryptoIdentityRollout::from_config(&config);
         assert_eq!(rollout.mode, CryptoRolloutMode::EnforceSelected);
-        assert_eq!(rollout.proxy_identity_mode(), ProxyIdentityMode::Optional);
         assert_eq!(rollout.wrap_identity_mode(), IdentityMode::Optional);
         let required = rollout.required_principals();
         assert!(required.contains("Codex"));
         assert!(required.contains("codex"));
-    }
-
-    #[test]
-    fn rollout_enforce_global_when_principals_empty() {
-        let mut config = SothConfig::default();
-        config.crypto_identity.enabled = true;
-        config.crypto_identity.mode = "enforce".to_string();
-        config.crypto_identity.enforce_principals.clear();
-
-        let rollout = CryptoIdentityRollout::from_config(&config);
-        assert_eq!(rollout.mode, CryptoRolloutMode::EnforceGlobal);
-        assert_eq!(rollout.proxy_identity_mode(), ProxyIdentityMode::Required);
-        assert_eq!(rollout.wrap_identity_mode(), IdentityMode::Required);
     }
 }

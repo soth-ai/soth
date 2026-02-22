@@ -1362,6 +1362,10 @@ pub struct ForwardProxyConfig {
     #[serde(default)]
     pub registry_mode: RegistryMode,
 
+    /// Active proxy transport engine.
+    #[serde(default)]
+    pub engine: ForwardProxyEngine,
+
     /// Maximum HTTP request/response body size to capture for observability.
     #[serde(default = "default_forward_proxy_capture_max_body_bytes")]
     pub capture_max_body_bytes: u64,
@@ -1400,7 +1404,7 @@ fn default_process_attr_lookup_timeout() -> Duration {
 }
 
 fn default_process_attr_cache_ttl() -> Duration {
-    Duration::from_secs(30)
+    Duration::from_secs(60 * 60)
 }
 
 fn default_tunnel_debug_min_log_interval() -> Duration {
@@ -1419,6 +1423,7 @@ impl Default for ForwardProxyConfig {
             tls: ForwardProxyTlsConfig::default(),
             request_timeout: default_ai_timeout(),
             registry_mode: RegistryMode::default(),
+            engine: ForwardProxyEngine::default(),
             capture_max_body_bytes: default_forward_proxy_capture_max_body_bytes(),
             process_attribution: ProcessAttributionConfig::default(),
             tunnel_debug: TunnelDebugConfig::default(),
@@ -1736,6 +1741,33 @@ pub enum RegistryMode {
     BundleOnly,
 }
 
+/// Runtime engine selection for forward proxy interception.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardProxyEngine {
+    /// Legacy proxy transport.
+    #[serde(alias = "soth_proxy", alias = "soth-proxy")]
+    Proxy,
+    /// New edge transport.
+    #[default]
+    #[serde(alias = "soth_edge", alias = "soth-edge")]
+    Edge,
+}
+
+impl ForwardProxyEngine {
+    pub fn registry_bundle_cache_filename(self) -> &'static str {
+        "registry_bundle_cache.json"
+    }
+
+    pub fn registry_bundle_type(self) -> &'static str {
+        match self {
+            Self::Proxy => "local",
+            // Cloud currently serves edge-format bundle payloads under `type=local`.
+            Self::Edge => "local",
+        }
+    }
+}
+
 impl std::fmt::Display for RegistryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1749,6 +1781,15 @@ impl std::fmt::Display for HostFilterMode {
         match self {
             Self::Selective => write!(f, "selective"),
             Self::Discovery => write!(f, "discovery"),
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardProxyEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proxy => write!(f, "proxy"),
+            Self::Edge => write!(f, "edge"),
         }
     }
 }
@@ -2420,6 +2461,12 @@ crypto_identity:
         assert_eq!(config.address, "127.0.0.1");
         assert_eq!(config.socket_addr(), "127.0.0.1:8080");
         assert_eq!(config.registry_mode, RegistryMode::BundleOnly);
+        assert_eq!(config.engine, ForwardProxyEngine::Edge);
+        assert_eq!(
+            config.engine.registry_bundle_cache_filename(),
+            "registry_bundle_cache.json"
+        );
+        assert_eq!(config.engine.registry_bundle_type(), "local");
         assert!(config.process_attribution.enabled);
         assert_eq!(
             config.process_attribution.lookup_timeout,
@@ -2427,7 +2474,7 @@ crypto_identity:
         );
         assert_eq!(
             config.process_attribution.cache_ttl,
-            Duration::from_secs(30)
+            Duration::from_secs(60 * 60)
         );
         assert!(!config.tunnel_debug.enabled);
         assert!(!config.tunnel_debug.include_noise);
@@ -2660,6 +2707,28 @@ forward_proxy:
             );
             let config: SothConfig = serde_yaml::from_str(&yaml).unwrap();
             assert_eq!(config.forward_proxy.registry_mode, RegistryMode::BundleOnly);
+        }
+    }
+
+    #[test]
+    fn test_parse_forward_proxy_engine_yaml() {
+        for (raw, expected) in [
+            ("proxy", ForwardProxyEngine::Proxy),
+            ("soth_proxy", ForwardProxyEngine::Proxy),
+            ("soth-proxy", ForwardProxyEngine::Proxy),
+            ("edge", ForwardProxyEngine::Edge),
+            ("soth_edge", ForwardProxyEngine::Edge),
+            ("soth-edge", ForwardProxyEngine::Edge),
+        ] {
+            let yaml = format!(
+                r#"
+forward_proxy:
+  enabled: true
+  engine: {raw}
+"#
+            );
+            let config: SothConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(config.forward_proxy.engine, expected);
         }
     }
 

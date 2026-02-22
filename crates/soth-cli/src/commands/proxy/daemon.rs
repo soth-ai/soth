@@ -4,6 +4,7 @@ use crate::cli_config;
 use crate::style;
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
+use soth_core::config::ForwardProxyEngine;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader};
@@ -118,6 +119,14 @@ fn now_unix_secs() -> u64 {
 
 fn acquire_lifecycle_lock() -> anyhow::Result<DaemonLifecycleLock> {
     let path = lock_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating lifecycle lock directory {}",
+                parent.display()
+            )
+        })?;
+    }
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -597,6 +606,7 @@ pub async fn run_start_daemon(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     quiet: bool,
+    engine_override: Option<ForwardProxyEngine>,
     intercept_all: bool,
     intercept_all_for: Option<u64>,
     no_autostart: bool,
@@ -619,7 +629,11 @@ pub async fn run_start_daemon(
                     compact_path(&log_path())
                 ));
                 if autostart_enabled {
-                    match super::autostart::ensure_enabled(expected_port, config_path.as_ref()) {
+                    match super::autostart::ensure_enabled(
+                        expected_port,
+                        config_path.as_ref(),
+                        engine_override,
+                    ) {
                         Ok(details) => {
                             style::info(&format!("Startup autostart ensured: {details}"))
                         }
@@ -670,7 +684,8 @@ pub async fn run_start_daemon(
     }
 
     if autostart_enabled && super::autostart::supports_managed_mode() {
-        match super::autostart::start_managed(expected_port, config_path.as_ref()) {
+        match super::autostart::start_managed(expected_port, config_path.as_ref(), engine_override)
+        {
             Ok(details) => {
                 let startup_timeout = daemon_startup_timeout();
                 let startup_deadline = std::time::Instant::now() + startup_timeout;
@@ -712,6 +727,11 @@ pub async fn run_start_daemon(
     }
 
     let log_file_path = log_path();
+    if let Some(parent) = log_file_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed creating daemon log directory {}", parent.display())
+        })?;
+    }
     let (log_max_bytes, log_max_backups) = proxy_log_rotation_limits();
     if let Err(error) = rotate_proxy_log_if_needed(&log_file_path, log_max_bytes, log_max_backups) {
         if !quiet {
@@ -741,6 +761,9 @@ pub async fn run_start_daemon(
 
     if quiet {
         cmd.arg("--quiet");
+    }
+    if let Some(engine) = engine_override {
+        cmd.arg("--engine").arg(engine.to_string());
     }
     if intercept_all {
         cmd.arg("--intercept-all");
@@ -829,7 +852,8 @@ pub async fn run_start_daemon(
     }
 
     if autostart_enabled {
-        match super::autostart::ensure_enabled(expected_port, config_path.as_ref()) {
+        match super::autostart::ensure_enabled(expected_port, config_path.as_ref(), engine_override)
+        {
             Ok(details) => {
                 if !quiet {
                     style::info(&format!("Startup autostart ensured: {details}"));
@@ -1108,7 +1132,15 @@ mod tests {
                 .build()
                 .expect("runtime");
             let err = runtime
-                .block_on(run_start_daemon(Some(18888), None, true, false, None, true))
+                .block_on(run_start_daemon(
+                    Some(18888),
+                    None,
+                    true,
+                    None,
+                    false,
+                    None,
+                    true,
+                ))
                 .expect_err("daemon start should fail in unit test binary");
             let text = format!("{err:#}");
             assert!(

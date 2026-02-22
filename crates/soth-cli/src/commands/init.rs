@@ -11,6 +11,7 @@ version: "1.0"
 # Forward proxy configuration
 forward_proxy:
   enabled: true
+  engine: "edge"
   address: "127.0.0.1"
   port: 8080
   autostart_on_boot: true
@@ -18,7 +19,7 @@ forward_proxy:
   process_attribution:
     enabled: true
     lookup_timeout: "200ms"
-    cache_ttl: "30s"
+    cache_ttl: "1h"
   tunnel_debug:
     enabled: false
     include_noise: false

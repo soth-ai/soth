@@ -12,11 +12,11 @@ use soth_core::api::{
     LocalSessionArtifact, LocalSessionsBatchRequest, LocalSessionsBatchResponse,
 };
 use soth_core::config::types::ExchangeConfig;
+use soth_core::storage::open_sqlite_read_only;
 use soth_core::types::exchange::ExchangeSourceClass;
 use soth_core::types::{AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent};
 use soth_core::EventLogger;
 use soth_observe::PiiRedactor;
-use soth_storage::open_sqlite_read_only;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -100,6 +100,7 @@ pub struct CollectorSource {
     pub name: String,
     pub path: PathBuf,
     pub parser: CollectorParser,
+    pub parser_hint: Option<String>,
     pub skip_patterns: Vec<String>,
     pub agent: Option<String>,
     pub server_name: Option<String>,
@@ -138,6 +139,14 @@ impl CollectorParser {
             Self::JsonLines => "jsonl",
             Self::TextLines => "text",
         }
+    }
+}
+
+impl CollectorSource {
+    fn effective_parser_hint(&self) -> &str {
+        self.parser_hint
+            .as_deref()
+            .unwrap_or_else(|| self.parser.as_tag())
     }
 }
 
@@ -625,6 +634,7 @@ fn parse_file_sources_from_env() -> Vec<CollectorSource> {
             name,
             path,
             parser,
+            parser_hint: None,
             skip_patterns: Vec::new(),
             agent: None,
             server_name: None,
@@ -641,18 +651,21 @@ fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
         Ok(value) => value,
         Err(_) => return Vec::new(),
     };
-    let parsed = match serde_json::from_str::<Vec<EnvFileSource>>(&raw) {
+    match parse_file_sources_json(raw.as_str()) {
         Ok(value) => value,
         Err(error) => {
             warn!(
                 error = %error,
                 "Invalid SOTH_COLLECTOR_SOURCES_JSON; falling back to path-based source parsing"
             );
-            return Vec::new();
+            Vec::new()
         }
-    };
+    }
+}
 
-    parsed
+fn parse_file_sources_json(raw: &str) -> Result<Vec<CollectorSource>, serde_json::Error> {
+    let parsed = serde_json::from_str::<Vec<EnvFileSource>>(raw)?;
+    let sources = parsed
         .into_iter()
         .filter_map(|source| {
             let raw_path = source.path.trim();
@@ -667,7 +680,8 @@ fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| default_source_name(&path));
-            let parser = parser_for_path_and_hint(&path, source.parser.as_deref());
+            let parser_hint = normalize_optional_text(source.parser.as_deref());
+            let parser = parser_for_path_and_hint(&path, parser_hint.as_deref());
             let skip_patterns = normalize_skip_patterns(source.skip_patterns);
             let agent = normalize_optional_text(source.agent.as_deref());
             let server_name = normalize_optional_text(source.server_name.as_deref());
@@ -677,6 +691,7 @@ fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
                 name,
                 path,
                 parser,
+                parser_hint,
                 skip_patterns,
                 agent,
                 server_name,
@@ -685,7 +700,8 @@ fn parse_file_sources_json_from_env() -> Vec<CollectorSource> {
                 tags: source.tags,
             })
         })
-        .collect()
+        .collect();
+    Ok(sources)
 }
 
 fn parser_for_path_and_hint(path: &Path, parser_hint: Option<&str>) -> CollectorParser {
@@ -1194,6 +1210,7 @@ impl CollectorAgent {
                 .or(parsed.agent.as_deref())
                 .unwrap_or(source.name.as_str()),
         );
+        let parser_hint = source.effective_parser_hint().to_string();
         let content_type = if matches!(source.parser, CollectorParser::JsonLines) {
             Some("application/json".to_string())
         } else {
@@ -1215,7 +1232,7 @@ impl CollectorAgent {
         tags.entry("collector.source".to_string())
             .or_insert_with(|| source.name.clone());
         tags.entry("collector.parser".to_string())
-            .or_insert_with(|| source.parser.as_tag().to_string());
+            .or_insert_with(|| parser_hint.clone());
         tags.insert(
             "collector.ingest_mode".to_string(),
             mode.as_tag().to_string(),
@@ -1238,7 +1255,7 @@ impl CollectorAgent {
             "collector": {
                 "source": source.name,
                 "offset": line.end_offset,
-                "parser": source.parser.as_tag(),
+                "parser": parser_hint,
                 "ingest_mode": mode.as_tag(),
                 "source_path": source.path.to_string_lossy().to_string(),
             },
@@ -1260,7 +1277,7 @@ impl CollectorAgent {
             observed_at: observed_at.to_rfc3339(),
             local_type,
             file_type: Some(source.parser.as_tag().to_string()),
-            parser_hint: Some(source.parser.as_tag().to_string()),
+            parser_hint: Some(source.effective_parser_hint().to_string()),
             source_path: Some(source.path.to_string_lossy().to_string()),
             source_db_path: None,
             source_query: None,
@@ -1476,7 +1493,7 @@ impl CollectorAgent {
                 .or_insert_with(|| agent.clone());
         }
         tags.entry("collector.parser".to_string())
-            .or_insert_with(|| source.parser.as_tag().to_string());
+            .or_insert_with(|| source.effective_parser_hint().to_string());
         tags.insert(
             "collector.ingest_mode".to_string(),
             mode.as_tag().to_string(),
@@ -2666,6 +2683,7 @@ fn discover_default_sources(limit: usize) -> Vec<CollectorSource> {
                 name: format!("{}:{}", root_name, rel),
                 path,
                 parser,
+                parser_hint: None,
                 skip_patterns: Vec::new(),
                 agent: None,
                 server_name: None,
@@ -2876,6 +2894,7 @@ mod tests {
             name: "registry:codex".to_string(),
             path: PathBuf::from("/tmp/codex-history.jsonl"),
             parser: CollectorParser::JsonLines,
+            parser_hint: Some("codex".to_string()),
             skip_patterns: Vec::new(),
             agent: Some("codex".to_string()),
             server_name: Some("codex".to_string()),
@@ -2905,6 +2924,69 @@ mod tests {
                 .and_then(|tags| tags.get("collector.project")),
             Some(&"/tmp/example".to_string())
         );
+    }
+
+    #[test]
+    fn build_local_session_artifact_preserves_bundle_parser_hint() {
+        let agent = CollectorAgent::new(test_collector_config(), BTreeMap::new());
+        let source = CollectorSource {
+            name: "registry:agent.codex.app".to_string(),
+            path: PathBuf::from("/tmp/codex-history.jsonl"),
+            parser: CollectorParser::JsonLines,
+            parser_hint: Some("codex".to_string()),
+            skip_patterns: Vec::new(),
+            agent: Some("agent.codex.app".to_string()),
+            server_name: Some("agent.codex.app".to_string()),
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        };
+        let line = SourceLine {
+            content: "{\"session_id\":\"source-session-1\",\"text\":\"hello\"}".to_string(),
+            end_offset: 21,
+        };
+
+        let artifact = agent
+            .build_local_session_artifact(&source, line, CollectorIngestMode::Incremental)
+            .expect("artifact");
+
+        assert_eq!(artifact.parser_hint.as_deref(), Some("codex"));
+        assert_eq!(artifact.file_type.as_deref(), Some("jsonl"));
+        assert_eq!(
+            artifact
+                .tags
+                .as_ref()
+                .and_then(|tags| tags.get("collector.parser"))
+                .map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            artifact
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("collector"))
+                .and_then(|collector| collector.get("parser"))
+                .and_then(|value| value.as_str()),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn parse_file_sources_json_preserves_custom_parser_hint() {
+        let raw = serde_json::json!([
+            {
+                "name": "registry:agent.codex.app",
+                "path": "~/.codex/sessions/**/*.jsonl",
+                "parser": "codex",
+                "skip_patterns": ["*.deleted.*"]
+            }
+        ])
+        .to_string();
+        let sources = parse_file_sources_json(raw.as_str()).expect("sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].parser, CollectorParser::JsonLines);
+        assert_eq!(sources[0].parser_hint.as_deref(), Some("codex"));
+        assert_eq!(sources[0].skip_patterns, vec!["*.deleted.*".to_string()]);
     }
 
     #[test]
@@ -2940,6 +3022,7 @@ mod tests {
             name: "events".to_string(),
             path,
             parser: CollectorParser::JsonLines,
+            parser_hint: None,
             skip_patterns: Vec::new(),
             agent: None,
             server_name: None,
@@ -2966,6 +3049,7 @@ mod tests {
             name: "events".to_string(),
             path,
             parser: CollectorParser::JsonLines,
+            parser_hint: None,
             skip_patterns: Vec::new(),
             agent: None,
             server_name: None,
@@ -3013,6 +3097,7 @@ mod tests {
             name: "registry:codex".to_string(),
             path: sessions.join("**").join("rollout-*.jsonl"),
             parser: CollectorParser::JsonLines,
+            parser_hint: None,
             skip_patterns: Vec::new(),
             agent: Some("codex".to_string()),
             server_name: Some("codex".to_string()),
@@ -3073,11 +3158,55 @@ mod tests {
             name: "registry:codex".to_string(),
             path: sessions.join("**").join("rollout-a*"),
             parser: CollectorParser::JsonLines,
+            parser_hint: None,
             skip_patterns: vec![
                 "*.deleted.*".to_string(),
                 "*.resolved".to_string(),
                 "*.resolved.*".to_string(),
             ],
+            agent: Some("codex".to_string()),
+            server_name: Some("codex".to_string()),
+            provider: None,
+            model: None,
+            tags: BTreeMap::new(),
+        };
+
+        let resolved = resolve_collector_sources_for_scan(&[source]);
+        let relative = resolved
+            .iter()
+            .map(|source| {
+                source
+                    .path
+                    .strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            relative,
+            vec!["sessions/2026/02/rollout-a.jsonl".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_collector_sources_for_scan_applies_full_path_skip_patterns() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let month_dir = sessions.join("2026").join("02");
+        std::fs::create_dir_all(&month_dir).unwrap();
+        std::fs::write(month_dir.join("rollout-a.jsonl"), b"{}\n").unwrap();
+        std::fs::write(month_dir.join("rollout-a.resolved.jsonl"), b"{}\n").unwrap();
+
+        let source = CollectorSource {
+            name: "registry:codex".to_string(),
+            path: sessions.join("**").join("rollout-a*.jsonl"),
+            parser: CollectorParser::JsonLines,
+            parser_hint: None,
+            skip_patterns: vec![normalize_glob_path(
+                &sessions.join("**").join("*.resolved.*"),
+            )],
             agent: Some("codex".to_string()),
             server_name: Some("codex".to_string()),
             provider: None,

@@ -1,7 +1,4 @@
 //! Agent name canonicalization for wrap sessions.
-//!
-//! Bundle-driven detection determines agent attribution; this module only normalizes
-//! labels to a stable naming convention.
 
 /// Canonicalize arbitrary agent labels to the naming convention used by wrap detection.
 pub fn canonicalize_agent_name(raw: &str) -> String {

@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 soth-core = { workspace = true }
-soth-storage = { workspace = true }
 soth-observe = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

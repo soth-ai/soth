@@ -1,15 +1,13 @@
-//! Wrap command - Wrap MCP servers for interception
+//! Wrap command runtime.
 //!
 //! Usage:
 //!   soth wrap -- npx -y @modelcontextprotocol/server-postgres
 //!   soth wrap --name "postgres-prod" -- npx -y @modelcontextprotocol/server-postgres
 //!   soth wrap --record -- npx -y @modelcontextprotocol/server-postgres
 
-pub mod agent_detect;
-
-use crate::cli_config;
-use crate::commands::cloud_hooks;
-use crate::commands::enforcement;
+use crate::agent_detect;
+use crate::config as wrap_config;
+use crate::enforcement;
 use anyhow::{Context, Result};
 use clap::Args;
 use soth_core::config::SothConfig;
@@ -18,11 +16,11 @@ use soth_core::{
     generate_session_name, EventLogger, ExchangeSourceClass, MessageDirection, SessionRecorder,
     SessionStorage,
 };
+use soth_helper::pii::PiiEventEnricher;
+use soth_helper::pipeline::RequestContext as PipelineRequestContext;
+use soth_helper::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
 use soth_oisp::types::provider::EntryType;
 use soth_oisp::{DetectionContext, OispEngine};
-use soth_proxy::pipeline::middleware::RequestContext as PipelineRequestContext;
-use soth_proxy::transport::pii_enrichment::PiiEventEnricher;
-use soth_proxy::{JsonRpcError, JsonRpcMessage, JsonRpcResponse, RequestId};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -238,14 +236,15 @@ fn collect_environment_keys() -> Arc<Vec<String>> {
 }
 
 fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
+    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
     if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
         if let Some(parent) = config_cache_path.parent() {
-            return parent.join("registry_bundle_cache.json");
+            return parent.join(cache_name);
         }
     }
     dirs::home_dir()
-        .map(|home| home.join(".soth").join("registry_bundle_cache.json"))
-        .unwrap_or_else(|| PathBuf::from(".soth/registry_bundle_cache.json"))
+        .map(|home| home.join(".soth").join(cache_name))
+        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
 }
 
 fn load_wrap_oisp_engine(config: &SothConfig) -> Option<Arc<OispEngine>> {
@@ -533,9 +532,9 @@ impl WrapSession {
 
 fn load_wrap_config(path: Option<&PathBuf>) -> Result<SothConfig> {
     let mut config =
-        cli_config::load_effective_config(path, None).context("Failed to load wrap config")?;
+        wrap_config::load_effective_config(path).context("Failed to load wrap config")?;
     if config.cloud.enabled {
-        let _ = cli_config::sync_client_device_id(&mut config, None)?;
+        let _ = wrap_config::sync_client_device_id(&mut config, None)?;
     }
     Ok(config)
 }
@@ -722,9 +721,6 @@ pub async fn run(args: WrapArgs) -> Result<()> {
             .context("Failed to initialize event logger")?,
         )
     };
-    let event_db_path = event_logger.as_ref().map(|logger| logger.path().clone());
-    let mut cloud_runtime = cloud_hooks::spawn_cloud_pull_runtime(&config, event_db_path);
-
     let session = Arc::new(WrapSession::new(
         server_name.clone(),
         initial_resolution.agent,
@@ -861,11 +857,6 @@ pub async fn run(args: WrapArgs) -> Result<()> {
     // Finalize session recording if enabled
     if let Some(path) = session.finalize_recording().await? {
         eprintln!("Session saved to: {}", path.display());
-    }
-
-    if let Some(runtime) = cloud_runtime.take() {
-        let _ = runtime.shutdown_tx.send(());
-        let _ = runtime.task.await;
     }
 
     Ok(())
@@ -1096,32 +1087,33 @@ async fn process_inbound_message(session: &WrapSession, content: &str) -> Inboun
                         &enforcement.runtime.signature_metadata_key,
                         &mut req_ctx,
                     );
-
                     match enforcement
                         .runtime
                         .pipeline
                         .process(&mut req_ctx, jsonrpc_msg)
                         .await
                     {
-                        Ok(Some(JsonRpcMessage::Request(req))) => {
-                            if let Ok(serialized) = serde_json::to_string(&req) {
-                                forward_content = Some(serialized);
+                        Ok(Some(pipeline_out)) => match pipeline_out {
+                            JsonRpcMessage::Request(_) => {
+                                if let Ok(serialized) = pipeline_out.to_json_string() {
+                                    forward_content = Some(serialized);
+                                }
+                                apply_enforcement_metadata(&mut event, &req_ctx);
+                                pipeline_ctx = Some(req_ctx);
                             }
-                            apply_enforcement_metadata(&mut event, &req_ctx);
-                            pipeline_ctx = Some(req_ctx);
-                        }
-                        Ok(Some(JsonRpcMessage::Response(resp))) => {
-                            forward_content = None;
-                            if let Ok(serialized) = serde_json::to_string(&resp) {
-                                immediate_response_to_client = Some(serialized.clone());
+                            JsonRpcMessage::Response(_) => {
+                                forward_content = None;
+                                if let Ok(serialized) = pipeline_out.to_json_string() {
+                                    immediate_response_to_client = Some(serialized.clone());
+                                }
+                                apply_enforcement_metadata(&mut event, &req_ctx);
+                                event = event.with_policy(
+                                    false,
+                                    Some("Request denied by enforcement".to_string()),
+                                );
+                                pipeline_ctx = Some(req_ctx);
                             }
-                            apply_enforcement_metadata(&mut event, &req_ctx);
-                            event = event.with_policy(
-                                false,
-                                Some("Request denied by enforcement".to_string()),
-                            );
-                            pipeline_ctx = Some(req_ctx);
-                        }
+                        },
                         Ok(None) => {
                             forward_content = None;
                             apply_enforcement_metadata(&mut event, &req_ctx);
@@ -1231,13 +1223,14 @@ async fn process_outbound_message(session: &WrapSession, content: &str) -> Outbo
                                     .process(pipeline_ctx, jsonrpc_msg)
                                     .await
                                 {
-                                    Ok(Some(JsonRpcMessage::Response(resp))) => {
-                                        if let Ok(serialized) = serde_json::to_string(&resp) {
-                                            forward_content = Some(serialized);
+                                    Ok(Some(pipeline_out)) => {
+                                        if let JsonRpcMessage::Response(_) = pipeline_out {
+                                            if let Ok(serialized) = pipeline_out.to_json_string() {
+                                                forward_content = Some(serialized);
+                                            }
+                                            apply_enforcement_metadata(&mut event, pipeline_ctx);
                                         }
-                                        apply_enforcement_metadata(&mut event, pipeline_ctx);
                                     }
-                                    Ok(Some(JsonRpcMessage::Request(_))) => {}
                                     Ok(None) => {
                                         forward_content = None;
                                         apply_enforcement_metadata(&mut event, pipeline_ctx);
@@ -1361,7 +1354,7 @@ fn truncate_content(content: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use soth_proxy::pipeline::middleware::RequestContext as PipelineCtx;
+    use soth_helper::pipeline::RequestContext as PipelineCtx;
 
     #[test]
     fn test_derive_server_name_npx() {

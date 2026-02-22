@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/soth-core",
-    "crates/soth-storage",
+    "crates/soth-helper",
     "crates/soth-oisp",
     "crates/soth-crypto",
     "crates/soth-policy",
@@ -13,10 +13,12 @@ members = [
     "crates/soth-dashboard",
     "crates/soth-cli",
     "crates/soth-sync",
+    "crates/soth-edge",
+    "crates/soth-wrap",
 ]
 default-members = [
     "crates/soth-core",
-    "crates/soth-storage",
+    "crates/soth-helper",
     "crates/soth-oisp",
     "crates/soth-crypto",
     "crates/soth-policy",
@@ -26,6 +28,8 @@ default-members = [
     "crates/soth-proxy",
     "crates/soth-cli",
     "crates/soth-sync",
+    "crates/soth-edge",
+    "crates/soth-wrap",
 ]
 exclude = [
     "tests/tools/mock_mcp_server",
@@ -42,7 +46,7 @@ authors = ["Labterminal"]
 [workspace.dependencies]
 # Internal crates
 soth-core = { path = "crates/soth-core" }
-soth-storage = { path = "crates/soth-storage" }
+soth-helper = { path = "crates/soth-helper" }
 soth-oisp = { path = "crates/soth-oisp" }
 soth-crypto = { path = "crates/soth-crypto" }
 soth-policy = { path = "crates/soth-policy" }
@@ -52,6 +56,8 @@ soth-collector = { path = "crates/soth-collector" }
 soth-proxy = { path = "crates/soth-proxy" }
 soth-dashboard = { path = "crates/soth-dashboard" }
 soth-sync = { path = "crates/soth-sync" }
+soth-edge = { path = "crates/soth-edge" }
+soth-wrap = { path = "crates/soth-wrap" }
 
 # Async runtime
 tokio = { version = "1", features = [

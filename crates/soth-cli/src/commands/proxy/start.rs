@@ -10,17 +10,16 @@ use super::start_shutdown::{
 use super::start_ui::{compact_path, print_logo_banner, render_startup_panel};
 use crate::cli_config;
 use crate::commands::cloud_hooks;
-use crate::commands::enforcement;
 use crate::commands::proxy::retention;
 use crate::commands::proxy::system;
 use crate::style;
 use owo_colors::OwoColorize;
 use soth_collector::CollectorRuntime;
-use soth_core::config::{HostFilterMode, ObserveCollectorConfig, SothConfig};
+use soth_core::config::{ForwardProxyEngine, HostFilterMode, ObserveCollectorConfig, SothConfig};
 use soth_core::event_logger::default_event_log_write_path;
 use soth_core::EventLogger;
-use soth_proxy::metrics;
-use soth_proxy::transport::proxy;
+use soth_edge::proxy as edge_proxy;
+use soth_helper::metrics;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +34,7 @@ pub async fn run(
     config_path: Option<PathBuf>,
     quiet: bool,
     foreground: bool,
+    engine_override: Option<ForwardProxyEngine>,
     intercept_all: bool,
     intercept_all_for: Option<u64>,
     daemon_child: bool,
@@ -45,6 +45,7 @@ pub async fn run(
             port,
             config_path,
             quiet,
+            engine_override,
             intercept_all,
             intercept_all_for,
             no_autostart,
@@ -59,6 +60,9 @@ pub async fn run(
         let _ = cli_config::sync_client_device_id(&mut config, None)?;
     }
     cloud_hooks::apply_cached_controls(&mut config)?;
+    if let Some(engine) = engine_override {
+        config.forward_proxy.engine = engine;
+    }
 
     // Override port if specified
     let mut proxy_config = config.forward_proxy.clone();
@@ -139,7 +143,8 @@ pub async fn run(
         };
 
     let runtime_line = format!(
-        "soth sensor | {} | {} | {}",
+        "soth sensor | {} | {} | {} | {}",
+        proxy_config.engine,
         proxy_config.registry_mode,
         proxy_config.hosts.mode,
         proxy_config.socket_addr()
@@ -209,16 +214,17 @@ pub async fn run(
 }
 
 fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
+    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
     if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
         let expanded = cli_config::expand_tilde(config_cache_path);
         if let Some(parent) = expanded.parent() {
-            return parent.join("registry_bundle_cache.json");
+            return parent.join(cache_name);
         }
     }
 
     dirs::home_dir()
-        .map(|home| home.join(".soth").join("registry_bundle_cache.json"))
-        .unwrap_or_else(|| PathBuf::from(".soth/registry_bundle_cache.json"))
+        .map(|home| home.join(".soth").join(cache_name))
+        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
 }
 
 struct ProxyRuntime {
@@ -340,22 +346,24 @@ async fn run_forward_proxy(
 
 fn spawn_proxy_runtime(
     config: &SothConfig,
-    proxy_config: soth_core::config::ForwardProxyConfig,
+    mut proxy_config: soth_core::config::ForwardProxyConfig,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
     event_logger: Option<EventLogger>,
     debug_intercept_all_enabled: bool,
-    debug_intercept_all_for: Option<Duration>,
+    _debug_intercept_all_for: Option<Duration>,
 ) -> anyhow::Result<ProxyRuntime> {
-    let enforcer = enforcement::build_proxy_enforcer(config)?;
-    let observe_config = config.observe.clone();
+    if matches!(proxy_config.engine, ForwardProxyEngine::Proxy) {
+        warn!(
+            "Legacy proxy runtime has been removed; redirecting to edge runtime for this session"
+        );
+        proxy_config.engine = ForwardProxyEngine::Edge;
+    }
+
     let event_db_path = event_logger
         .as_ref()
         .map(|logger| logger.path().clone())
         .or_else(|| default_event_log_write_path().ok());
-    let _policy_reload_task = enforcer
-        .policy_engine()
-        .and_then(|engine| enforcement::spawn_policy_hot_reload(config, engine));
 
     let mut retention_shutdown_tx = None;
     let mut retention_task = None;
@@ -398,23 +406,25 @@ fn spawn_proxy_runtime(
     let oisp_registry_cache_path = resolve_registry_bundle_cache_path(config);
     let exchange_config = config.exchange.clone();
     let handle = tokio::spawn(async move {
-        proxy::start_proxy_with_shutdown(
+        let shutdown = async move {
+            shutdown_rx.await.ok();
+        };
+        if debug_intercept_all_enabled {
+            warn!(
+                "Debug intercept-all flags are not yet implemented for edge engine; continuing without override"
+            );
+        }
+        edge_proxy::start_proxy_with_shutdown(
             proxy_config,
             &ca_cert_path,
             &ca_key_path,
-            async move {
-                shutdown_rx.await.ok();
-            },
+            shutdown,
             event_logger,
-            Some(enforcer),
-            Some(observe_config),
             Some(oisp_registry_cache_path),
             Some(exchange_config),
-            debug_intercept_all_enabled,
-            debug_intercept_all_for,
         )
         .await
-        .map_err(|error| anyhow::anyhow!("Proxy error: {}", error))
+        .map_err(|error| anyhow::anyhow!("Edge proxy error: {}", error))
     });
 
     Ok(ProxyRuntime {

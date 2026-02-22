@@ -1,3 +1,5 @@
+//! Shared SQLite storage helpers used by core/sync/dashboard/collector.
+
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
