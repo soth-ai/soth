@@ -7,7 +7,6 @@ pub mod budget;
 pub mod cloud_hooks;
 #[cfg(feature = "ops")]
 pub mod config;
-pub mod enforcement;
 pub mod enroll;
 #[cfg(feature = "ops")]
 pub mod identity;
@@ -26,4 +25,3 @@ pub mod setup;
 pub mod test;
 #[cfg(feature = "local-debug")]
 pub mod tui;
-pub mod wrap;

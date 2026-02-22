@@ -7,6 +7,8 @@ use soth_crypto::tls::CertificateAuthority;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::Command;
@@ -28,6 +30,13 @@ fn expand_path(path: &str) -> PathBuf {
 enum MacOsTrustResult {
     Installed,
     AlreadyPresent,
+    Reinstalled(usize),
+}
+
+#[cfg(target_os = "macos")]
+struct MacOsTrustDrift {
+    login_hashes: Vec<String>,
+    system_hashes: Vec<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -40,18 +49,140 @@ fn macos_login_keychain_path() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_macos_login_keychain_trust(cert_path: &Path) -> anyhow::Result<MacOsTrustResult> {
-    let keychain_path = macos_login_keychain_path();
+fn macos_system_keychain_path() -> PathBuf {
+    PathBuf::from("/Library/Keychains/System.keychain")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_soth_ca_name() -> &'static str {
+    "SOTH Proxy CA"
+}
+
+#[cfg(target_os = "macos")]
+fn macos_output_indicates_item_not_found(stdout: &str, stderr: &str) -> bool {
+    let combined = format!("{} {}", stdout, stderr).to_ascii_lowercase();
+    combined.contains("could not be found")
+        || combined.contains("specified item could not be found")
+        || combined.contains("errsecitemnotfound")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_parse_certificate_hashes(output: &str) -> Vec<String> {
+    let mut hashes = BTreeSet::new();
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("hash:") {
+            continue;
+        }
+
+        let Some((_, suffix)) = line.split_once(':') else {
+            continue;
+        };
+        let normalized: String = suffix.chars().filter(|ch| ch.is_ascii_hexdigit()).collect();
+        if normalized.len() == 40 || normalized.len() == 64 {
+            hashes.insert(normalized.to_ascii_uppercase());
+        }
+    }
+    hashes.into_iter().collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_collect_certificate_hashes(
+    keychain_path: &Path,
+    common_name: &str,
+) -> anyhow::Result<Vec<String>> {
     let output = Command::new("security")
-        .args(["add-trusted-cert", "-d", "-r", "trustRoot", "-k"])
-        .arg(&keychain_path)
-        .arg(cert_path)
+        .args(["find-certificate", "-a", "-Z", "-c", common_name])
+        .arg(keychain_path)
         .output()
         .map_err(|error| {
-            anyhow::anyhow!("failed to execute security add-trusted-cert: {}", error)
+            anyhow::anyhow!("failed to execute security find-certificate: {}", error)
         })?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() && !macos_output_indicates_item_not_found(&stdout, &stderr) {
+        anyhow::bail!(
+            "security find-certificate failed for {}: {} {}",
+            keychain_path.display(),
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    Ok(macos_parse_certificate_hashes(&stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_delete_certificates_by_common_name(
+    keychain_path: &Path,
+    common_name: &str,
+) -> anyhow::Result<usize> {
+    let mut removed = 0usize;
+
+    for _ in 0..32 {
+        let output = Command::new("security")
+            .args(["delete-certificate", "-c", common_name])
+            .arg(keychain_path)
+            .output()
+            .map_err(|error| {
+                anyhow::anyhow!("failed to execute security delete-certificate: {}", error)
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            removed += 1;
+            continue;
+        }
+
+        if macos_output_indicates_item_not_found(&stdout, &stderr) {
+            break;
+        }
+
+        anyhow::bail!(
+            "security delete-certificate failed for {}: {} {}",
+            keychain_path.display(),
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    Ok(removed)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_add_trusted_cert(
+    cert_path: &Path,
+    keychain_path: &Path,
+) -> anyhow::Result<std::process::Output> {
+    Command::new("security")
+        .args(["add-trusted-cert", "-d", "-r", "trustRoot", "-k"])
+        .arg(keychain_path)
+        .arg(cert_path)
+        .output()
+        .map_err(|error| anyhow::anyhow!("failed to execute security add-trusted-cert: {}", error))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_login_keychain_trust(
+    cert_path: &Path,
+    generated_new_ca: bool,
+) -> anyhow::Result<MacOsTrustResult> {
+    let keychain_path = macos_login_keychain_path();
+    let mut removed_stale = 0usize;
+    if generated_new_ca {
+        removed_stale =
+            macos_delete_certificates_by_common_name(&keychain_path, macos_soth_ca_name())?;
+    }
+
+    let output = macos_add_trusted_cert(cert_path, &keychain_path)?;
+
     if output.status.success() {
+        if removed_stale > 0 {
+            return Ok(MacOsTrustResult::Reinstalled(removed_stale));
+        }
         return Ok(MacOsTrustResult::Installed);
     }
 
@@ -60,6 +191,31 @@ fn ensure_macos_login_keychain_trust(cert_path: &Path) -> anyhow::Result<MacOsTr
     let combined = format!("{} {}", stdout.trim(), stderr.trim()).to_ascii_lowercase();
     if combined.contains("already exists") || combined.contains("the specified item already exists")
     {
+        // If multiple cert hashes are present in the login keychain, clean and reinstall
+        // to avoid stale local trust anchors.
+        let hashes = macos_collect_certificate_hashes(&keychain_path, macos_soth_ca_name())?;
+        if hashes.len() > 1 {
+            let removed =
+                macos_delete_certificates_by_common_name(&keychain_path, macos_soth_ca_name())?;
+            let reinstall_output = macos_add_trusted_cert(cert_path, &keychain_path)?;
+            if reinstall_output.status.success() {
+                return Ok(MacOsTrustResult::Reinstalled(removed.max(1)));
+            }
+
+            let reinstall_stdout = String::from_utf8_lossy(&reinstall_output.stdout);
+            let reinstall_stderr = String::from_utf8_lossy(&reinstall_output.stderr);
+            anyhow::bail!(
+                "security add-trusted-cert failed for {} after cleanup: {} {}",
+                keychain_path.display(),
+                reinstall_stdout.trim(),
+                reinstall_stderr.trim()
+            );
+        }
+
+        if removed_stale > 0 {
+            return Ok(MacOsTrustResult::Reinstalled(removed_stale));
+        }
+
         return Ok(MacOsTrustResult::AlreadyPresent);
     }
 
@@ -68,6 +224,34 @@ fn ensure_macos_login_keychain_trust(cert_path: &Path) -> anyhow::Result<MacOsTr
         keychain_path.display(),
         combined.trim()
     )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_detect_trust_drift() -> anyhow::Result<Option<MacOsTrustDrift>> {
+    let login_hashes =
+        macos_collect_certificate_hashes(&macos_login_keychain_path(), macos_soth_ca_name())?;
+    if login_hashes.is_empty() {
+        return Ok(None);
+    }
+
+    let system_hashes =
+        macos_collect_certificate_hashes(&macos_system_keychain_path(), macos_soth_ca_name())?;
+    if system_hashes.is_empty() {
+        return Ok(None);
+    }
+
+    let login_set: BTreeSet<_> = login_hashes.iter().cloned().collect();
+    let has_mismatch = system_hashes
+        .iter()
+        .any(|fingerprint| !login_set.contains(fingerprint));
+    if !has_mismatch {
+        return Ok(None);
+    }
+
+    Ok(Some(MacOsTrustDrift {
+        login_hashes,
+        system_hashes,
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -224,7 +408,7 @@ pub async fn run(
 
         #[cfg(target_os = "macos")]
         {
-            match ensure_macos_login_keychain_trust(&cert_path) {
+            match ensure_macos_login_keychain_trust(&cert_path, generated_new_ca) {
                 Ok(MacOsTrustResult::Installed) => {
                     style::success(
                         "Installed SOTH CA into macOS login keychain trust store (auto).",
@@ -233,12 +417,51 @@ pub async fn run(
                 Ok(MacOsTrustResult::AlreadyPresent) => {
                     style::info("SOTH CA already present in macOS login keychain trust store.");
                 }
+                Ok(MacOsTrustResult::Reinstalled(removed)) => {
+                    style::success(
+                        "Reinstalled SOTH CA in macOS login keychain after stale-entry cleanup.",
+                    );
+                    style::kv("Removed stale login certs", &removed.to_string());
+                }
                 Err(error) => {
                     style::warning(&format!(
                         "Auto trust install failed (continuing fail-open): {}",
                         error
                     ));
                 }
+            }
+
+            match macos_detect_trust_drift() {
+                Ok(Some(drift)) => {
+                    style::warning(
+                        "Detected conflicting SOTH CA fingerprints between login and system keychains.",
+                    );
+                    style::warning(
+                        "This can trigger ERR_CERT_AUTHORITY_INVALID when browsers pick the stale system cert.",
+                    );
+                    style::kv("Login keychain hashes", &drift.login_hashes.join(", "));
+                    style::kv("System keychain hashes", &drift.system_hashes.join(", "));
+                    style::info(
+                        "Cleanup stale system keychain entries, then reinstall current CA:",
+                    );
+                    println!(
+                        "    {}",
+                        "while sudo security delete-certificate -c \"SOTH Proxy CA\" /Library/Keychains/System.keychain >/dev/null 2>&1; do :; done".dimmed()
+                    );
+                    println!(
+                        "    {}",
+                        format!(
+                            "sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
+                            cert_path.display()
+                        )
+                        .dimmed()
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => style::warning(&format!(
+                    "Unable to verify macOS keychain CA consistency: {}",
+                    error
+                )),
             }
 
             println!();
@@ -366,4 +589,43 @@ pub async fn run(
 
     style::footer();
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_certificate_hashes_extracts_sha_lines() {
+        let output = r#"
+keychain: "/Library/Keychains/System.keychain"
+SHA-1 hash: 07 73 e6 f7 dd 3d bb 4d f2 40 b3 b6 2b f9 2f 4a d8 dd 68 ac
+keychain: "/Users/test/Library/Keychains/login.keychain-db"
+SHA-256 hash: 7A3FB1A1D8CF53C72AE4E860D9FDFB31D6A29BF77D1B14B8177CB3C85F8A305A
+"#;
+
+        let hashes = macos_parse_certificate_hashes(output);
+
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(&"0773E6F7DD3DBB4DF240B3B62BF92F4AD8DD68AC".to_string()));
+        assert!(hashes.contains(
+            &"7A3FB1A1D8CF53C72AE4E860D9FDFB31D6A29BF77D1B14B8177CB3C85F8A305A".to_string()
+        ));
+    }
+
+    #[test]
+    fn output_indicates_item_not_found_recognizes_security_strings() {
+        assert!(macos_output_indicates_item_not_found(
+            "",
+            "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."
+        ));
+        assert!(macos_output_indicates_item_not_found(
+            "",
+            "errSecItemNotFound"
+        ));
+        assert!(!macos_output_indicates_item_not_found(
+            "",
+            "permission denied"
+        ));
+    }
 }

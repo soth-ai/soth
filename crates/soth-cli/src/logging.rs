@@ -191,6 +191,7 @@ fn should_suppress_noisy_proxy_error(target: &str, level: &Level, message: &str)
     normalized.contains("failed to forward request: client error (sendrequest)")
         || normalized
             .contains("error serving connection: connection closed before message completed")
+        || normalized.contains("error serving connection: error writing a body to connection")
 }
 
 #[derive(Default)]

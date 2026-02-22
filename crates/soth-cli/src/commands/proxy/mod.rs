@@ -213,7 +213,8 @@ pub async fn run_autostart(
                     .forward_proxy
                     .port
             };
-            let details = autostart::ensure_enabled(selected_port, effective_config.as_ref())?;
+            let details =
+                autostart::ensure_enabled(selected_port, effective_config.as_ref())?;
             style::success(&format!("Startup autostart enabled: {details}"));
         }
         AutostartAction::Disable => match autostart::disable_managed_autostart()? {

@@ -269,6 +269,9 @@ pub fn mark_registry_validation_failed(path: &Path, reason: &str) -> anyhow::Res
 fn validate_registry_bundle_payload(bundle: &Value) -> anyhow::Result<()> {
     validate_registry_bundle_contract(bundle)
         .context("bundle payload failed contract validation")?;
+    if is_edge_bundle_shape(bundle) {
+        return Ok(());
+    }
     parse_compiled_bundle(bundle)
         .context("bundle payload must match supported OISP bundle schema")?;
     Ok(())
@@ -285,6 +288,10 @@ fn validate_registry_bundle_contract(bundle: &Value) -> anyhow::Result<()> {
         .context("bundle payload missing required `schema_version`")?;
     if schema_version == 0 {
         anyhow::bail!("bundle payload `schema_version` must be greater than 0");
+    }
+
+    if is_edge_bundle_shape_object(object) {
+        return validate_edge_bundle_contract_object(object);
     }
 
     if let Some(filters) = object.get("filters").and_then(Value::as_object) {
@@ -323,6 +330,79 @@ fn validate_registry_bundle_contract(bundle: &Value) -> anyhow::Result<()> {
             if !value.is_array() {
                 anyhow::bail!("bundle payload `{key}` must be an array");
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_edge_bundle_shape(bundle: &Value) -> bool {
+    bundle.as_object().is_some_and(is_edge_bundle_shape_object)
+}
+
+fn is_edge_bundle_shape_object(object: &serde_json::Map<String, Value>) -> bool {
+    let has_metadata_bundle_version = object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("bundle_version"))
+        .and_then(Value::as_str)
+        .is_some();
+    let has_edge_targets =
+        object.get("llm_providers").is_some() || object.get("applications").is_some();
+    has_metadata_bundle_version && has_edge_targets
+}
+
+fn validate_edge_bundle_contract_object(
+    object: &serde_json::Map<String, Value>,
+) -> anyhow::Result<()> {
+    let metadata = object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .context("edge bundle payload missing required `metadata` object")?;
+    let bundle_version = metadata
+        .get("bundle_version")
+        .and_then(Value::as_str)
+        .context("edge bundle payload missing required `metadata.bundle_version`")?;
+    if bundle_version.trim().is_empty() {
+        anyhow::bail!("edge bundle payload `metadata.bundle_version` must not be empty");
+    }
+
+    for key in [
+        "llm_providers",
+        "applications",
+        "catalogs",
+        "interception",
+        "detection_index",
+        "formats",
+    ] {
+        let value = object
+            .get(key)
+            .with_context(|| format!("edge bundle payload missing required `{key}` object"))?;
+        if !value.is_object() {
+            anyhow::bail!("edge bundle payload `{key}` must be a JSON object");
+        }
+    }
+
+    if let Some(ai_catalog) = object
+        .get("catalogs")
+        .and_then(Value::as_object)
+        .and_then(|catalogs| catalogs.get("ai_catalog"))
+    {
+        if !ai_catalog.is_array() {
+            anyhow::bail!("edge bundle payload `catalogs.ai_catalog` must be an array");
+        }
+    }
+
+    let filters = object
+        .get("filters")
+        .and_then(Value::as_object)
+        .context("edge bundle payload missing required `filters` object")?;
+    for key in ["domain_patterns", "path_patterns", "keywords"] {
+        let value = filters
+            .get(key)
+            .with_context(|| format!("edge bundle payload filters missing required `{key}`"))?;
+        if !value.is_array() {
+            anyhow::bail!("edge bundle payload filters.{key} must be an array");
         }
     }
 
@@ -404,8 +484,20 @@ fn load_registry_bundle_cache_at(
     }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed reading registry cache {}", path.display()))?;
-    let mut envelope: CachedRegistryBundleEnvelope = serde_json::from_str(&content)
-        .with_context(|| format!("failed parsing registry cache {}", path.display()))?;
+    let (mut envelope, legacy_raw_fallback) = match serde_json::from_str(&content) {
+        Ok(envelope) => (envelope, false),
+        Err(envelope_error) => (
+            parse_legacy_raw_registry_cache(path, &content).map_err(|legacy_error| {
+                anyhow::anyhow!(
+                    "failed parsing registry cache {} (envelope: {}; raw_bundle: {})",
+                    path.display(),
+                    envelope_error,
+                    legacy_error
+                )
+            })?,
+            true,
+        ),
+    };
     if envelope.schema_version != registry_cache_schema_version() {
         anyhow::bail!(
             "unsupported registry cache schema_version {} (expected {})",
@@ -414,8 +506,10 @@ fn load_registry_bundle_cache_at(
         );
     }
     envelope.bundle = normalize_registry_bundle_payload(envelope.bundle);
-    validate_registry_bundle_payload(&envelope.bundle)
-        .context("cached registry bundle payload failed schema validation")?;
+    if !legacy_raw_fallback {
+        validate_registry_bundle_payload(&envelope.bundle)
+            .context("cached registry bundle payload failed schema validation")?;
+    }
     if envelope.bundle_hash.is_none() {
         envelope.bundle_hash = derive_bundle_hash(
             &envelope.metadata,
@@ -439,6 +533,159 @@ fn load_registry_bundle_cache_at(
         envelope.validation_status = Some("ok".to_string());
     }
     Ok(Some(envelope))
+}
+
+fn parse_legacy_raw_registry_cache(
+    path: &Path,
+    content: &str,
+) -> anyhow::Result<CachedRegistryBundleEnvelope> {
+    let raw_bundle: Value = serde_json::from_str(content)
+        .with_context(|| format!("failed parsing legacy registry cache {}", path.display()))?;
+    let bundle = normalize_registry_bundle_payload(raw_bundle);
+    let bundle_object = bundle
+        .as_object()
+        .context("legacy raw registry cache must be a JSON object")?;
+
+    let bundle_hash = derive_bundle_hash_from_json(&bundle);
+    let sha256 = bundle_hash.clone().unwrap_or_else(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        format!("{:x}", hasher.finalize())
+    });
+
+    let version = bundle_object
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            bundle_object
+                .get("metadata")
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get("bundle_version"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "legacy-raw-cache".to_string());
+
+    let compiled_at = bundle_object
+        .get("compiled_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            bundle_object
+                .get("metadata")
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get("compiled_at"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+    let provider_count = bundle_object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("stats"))
+        .and_then(Value::as_object)
+        .and_then(|stats| stats.get("provider_count"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            bundle_object
+                .get("providers")
+                .and_then(Value::as_object)
+                .map(|providers| providers.len() as u64)
+        })
+        .or_else(|| {
+            let llm_count = bundle_object
+                .get("llm_providers")
+                .and_then(Value::as_object)
+                .map(|providers| providers.len() as u64)
+                .unwrap_or(0);
+            let app_count = bundle_object
+                .get("applications")
+                .and_then(Value::as_object)
+                .map(|apps| apps.len() as u64)
+                .unwrap_or(0);
+            if llm_count == 0 && app_count == 0 {
+                None
+            } else {
+                Some(llm_count + app_count)
+            }
+        })
+        .unwrap_or(0);
+
+    let domain_count = bundle_object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("stats"))
+        .and_then(Value::as_object)
+        .and_then(|stats| stats.get("domain_count"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            bundle_object
+                .get("domain_index")
+                .and_then(Value::as_array)
+                .map(|domains| domains.len() as u64)
+        })
+        .unwrap_or(0);
+
+    let format_count = bundle_object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("stats"))
+        .and_then(Value::as_object)
+        .and_then(|stats| stats.get("format_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let bundle_type = bundle_object
+        .get("bundle_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "edge".to_string());
+
+    let manifest = Some(RegistryBundleManifest {
+        bundle_hash: bundle_hash.clone(),
+        bundle_version: Some(version.clone()),
+        published_at: Some(compiled_at.clone()),
+        diff_from: None,
+        components: Vec::new(),
+        changed_sections: std::collections::HashMap::new(),
+        integrity: None,
+    });
+
+    Ok(CachedRegistryBundleEnvelope {
+        schema_version: registry_cache_schema_version(),
+        fetched_at: Utc::now().to_rfc3339(),
+        etag: bundle_hash.clone().unwrap_or_else(|| sha256.clone()),
+        metadata: RegistryVersionResponse {
+            bundle_type,
+            version,
+            sha256,
+            bundle_hash: bundle_hash.clone(),
+            compiled_at,
+            provider_count,
+            domain_count,
+            format_count,
+            size_bytes: content.as_bytes().len() as u64,
+            manifest: manifest.clone(),
+            channel: None,
+        },
+        bundle_hash,
+        manifest,
+        validation_status: Some("ok".to_string()),
+        validation_failed_reason: None,
+        bundle,
+    })
 }
 
 fn load_registry_cache_validation_status(
@@ -768,19 +1015,18 @@ mod tests {
             "version": "v1",
             "compiled_at": "2026-02-13T00:00:00Z",
             "bundle_type": "cloud",
-            "core": {
-                "providers": {
-                    "openai": {
-                        "id": "openai",
-                        "name": "OpenAI",
-                        "type": "ai-inference",
-                        "domains": ["api.openai.com"]
-                    }
-                },
-                "domain_index": [
-                    { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" }
-                ]
+            "providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "type": "ai-inference",
+                    "domains": ["api.openai.com"]
+                }
             },
+            "domain_index": [
+                { "host": "api.openai.com", "provider_id": "openai", "entry_type": "ai-inference" }
+            ],
+            "pricing": {},
             "whitelistedDomains": ["api.openai.com"],
             "passthroughDomains": ["metrics.openai.com"],
             "blacklistedWords": ["telemetry"]
@@ -835,6 +1081,102 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("wrapped-v1")
         );
+    }
+
+    #[test]
+    fn save_registry_bundle_cache_accepts_edge_bundle_shape_without_legacy_filters() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache.json");
+        let metadata = sample_registry_metadata("edge-v4");
+        let bundle = serde_json::json!({
+            "schema_version": 4,
+            "metadata": {
+                "bundle_version": "edge-v4",
+                "compiled_at": "2026-02-22T00:00:00Z"
+            },
+            "llm_providers": {},
+            "applications": {},
+            "catalogs": {
+                "ai_catalog": []
+            },
+            "interception": {
+                "defaults": {
+                    "unknown_app_action": "skip"
+                },
+                "browser_policies": {
+                    "default_action": "intercept",
+                    "allowed_browsers": [],
+                    "allowed_apps": []
+                },
+                "app_policies": {}
+            },
+            "detection_index": {},
+            "formats": {},
+            "filters": {
+                "domain_patterns": [],
+                "path_patterns": [],
+                "keywords": []
+            }
+        });
+
+        save_registry_bundle_cache(&path, &metadata, "etag-edge", bundle.to_string().as_bytes())
+            .unwrap();
+
+        let loaded = load_registry_bundle_cache(&path).unwrap().unwrap();
+        assert_eq!(loaded.metadata.version, "edge-v4");
+        assert_eq!(
+            loaded
+                .bundle
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn load_registry_bundle_cache_accepts_legacy_raw_edge_bundle_shape() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry_bundle_cache_edge.json");
+        let raw = serde_json::json!({
+            "schema_version": 4,
+            "metadata": {
+                "bundle_version": "2026.02.21-190229-bf3c2d11",
+                "compiled_at": "2026-02-21T19:02:29.496270+00:00",
+                "stats": {
+                    "provider_count": 192,
+                    "domain_count": 190
+                }
+            },
+            "llm_providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI"
+                }
+            },
+            "applications": {
+                "chatgpt": {
+                    "id": "chatgpt",
+                    "name": "ChatGPT"
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let loaded = load_registry_bundle_cache(&path)
+            .unwrap()
+            .expect("legacy raw cache should parse");
+        assert_eq!(loaded.metadata.version, "2026.02.21-190229-bf3c2d11");
+        assert_eq!(loaded.metadata.bundle_type, "edge");
+        assert_eq!(loaded.metadata.provider_count, 192);
+        assert_eq!(loaded.metadata.domain_count, 190);
+        assert_eq!(
+            loaded
+                .bundle
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(loaded.validation_status.as_deref(), Some("ok"));
     }
 
     #[test]

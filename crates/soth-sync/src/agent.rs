@@ -15,11 +15,11 @@ use soth_core::api::{
     HeartbeatTelemetry,
 };
 use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
+use soth_core::storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
 use soth_core::types::exchange::{
     ExchangeBodyMode, ExchangeEvent, EXCHANGE_CLIENT_APP_TYPE_HOST,
     EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
 };
-use soth_storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +72,7 @@ pub struct SyncAgentConfig {
     pub api_key: String,
     pub event_db_path: PathBuf,
     pub cache_path: PathBuf,
+    pub registry_cache_path: Option<PathBuf>,
     pub agent_instance_id: String,
     pub proxy_version: String,
     pub retry_queue_dir: PathBuf,
@@ -540,7 +541,11 @@ impl SyncAgent {
     }
 
     fn collect_registry_heartbeat_details(&self) -> Option<HeartbeatRegistryDetails> {
-        let registry_cache_path = resolve_registry_cache_path(&self.config.cache_path);
+        let registry_cache_path = self
+            .config
+            .registry_cache_path
+            .clone()
+            .unwrap_or_else(|| resolve_registry_cache_path(&self.config.cache_path));
         let status = cache::registry_bundle_runtime_status(
             &registry_cache_path,
             Duration::from_secs(REGISTRY_BUNDLE_DEGRADED_AGE_SECS),
@@ -1564,6 +1569,7 @@ fn is_terminal_contract_rejection_code(code: &str) -> bool {
             | "invalid_schema_version"
             | "invalid_source_class"
             | "invalid_decision_contract"
+            | "detection_id_invalid"
             | "detection_id_required"
             | "detection_bundle_version_required"
             | "validation_failed"
@@ -1952,6 +1958,7 @@ mod tests {
             api_key: "test-key".to_string(),
             event_db_path: db_path,
             cache_path: dir.path().join("cache.json"),
+            registry_cache_path: None,
             agent_instance_id: "agent-test".to_string(),
             proxy_version: "test".to_string(),
             retry_queue_dir: retry_dir,
@@ -2193,6 +2200,10 @@ mod tests {
         ));
         assert!(matches!(
             classify_exchange_rejection("detection_id_required", None),
+            ExchangeRejectionDisposition::Drop
+        ));
+        assert!(matches!(
+            classify_exchange_rejection("detection_id_invalid", None),
             ExchangeRejectionDisposition::Drop
         ));
         assert!(matches!(

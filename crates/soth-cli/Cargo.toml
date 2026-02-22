@@ -20,7 +20,7 @@ required-features = ["ops"]
 default = ["sensor"]
 sensor = ["dep:reqwest"]
 ops = ["dep:reqwest"]
-monitoring = ["soth-proxy/monitoring"]
+monitoring = ["soth-helper/monitoring"]
 local-debug = [
     "ops",
     "dep:soth-dashboard",
@@ -36,10 +36,11 @@ soth-policy = { workspace = true }
 soth-observe = { workspace = true, features = ["sqlite"] }
 soth-budget = { workspace = true }
 soth-collector = { workspace = true }
-soth-proxy = { workspace = true }
+soth-helper = { workspace = true }
+soth-edge = { workspace = true }
 soth-dashboard = { workspace = true, optional = true }
-soth-oisp = { workspace = true }
 soth-sync = { workspace = true }
+soth-wrap = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

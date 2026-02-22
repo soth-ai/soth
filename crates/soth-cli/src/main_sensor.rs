@@ -36,7 +36,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Wrap an MCP server to intercept all traffic
-    Wrap(commands::wrap::WrapArgs),
+    Wrap(soth_wrap::WrapArgs),
 
     /// Store cloud API credentials locally (interactive prompt or flag/stdin)
     Login(commands::login::LoginArgs),
@@ -468,7 +468,7 @@ async fn async_main() -> anyhow::Result<()> {
             if args.config.is_none() {
                 args.config = cli.config.clone();
             }
-            commands::wrap::run(args).await?;
+            soth_wrap::run(args).await?;
         }
         Commands::Login(args) => {
             commands::login::run(args, cli.config.clone()).await?;

@@ -1,0 +1,31 @@
+[package]
+name = "soth-helper"
+description = "Shared helper primitives for wrap/edge runtime paths"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+monitoring = ["dep:metrics-exporter-prometheus", "dep:once_cell"]
+
+[dependencies]
+soth-budget = { workspace = true }
+soth-core = { workspace = true }
+soth-crypto = { workspace = true }
+soth-observe = { workspace = true }
+soth-oisp = { workspace = true }
+soth-policy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+once_cell = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

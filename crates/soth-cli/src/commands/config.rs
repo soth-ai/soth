@@ -515,10 +515,13 @@ fn resolve_config_cache_path(config: &SothConfig) -> PathBuf {
 }
 
 fn resolve_registry_cache_path(config: &SothConfig, config_cache_path: &Path) -> PathBuf {
+    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
     if config.cloud.cache_path.is_some() {
         if let Some(parent) = config_cache_path.parent() {
-            return parent.join("registry_bundle_cache.json");
+            return parent.join(cache_name);
         }
     }
-    soth_sync::cache::default_registry_cache_path()
+    dirs::home_dir()
+        .map(|home| home.join(".soth").join(cache_name))
+        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
 }

@@ -4,7 +4,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use parking_lot::RwLock;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use soth_storage::open_sqlite_read_write_with_timeout;
+use soth_core::storage::open_sqlite_read_write_with_timeout;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
