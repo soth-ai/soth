@@ -19,7 +19,7 @@ fn harden_windows_private_key_permissions(path: &std::path::Path) -> Result<()> 
             &path_str,
             "/inheritance:r",
             "/grant:r",
-            "%USERNAME%:(F)",
+            "\"%USERNAME%:(F)\"",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
