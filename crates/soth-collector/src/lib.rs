@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tracing::{info, warn};
 
+mod source_paths;
+
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_READ_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_LINE_BYTES: usize = 64 * 1024;
@@ -2013,222 +2015,23 @@ fn collect_source_events(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlobToken {
-    Literal(char),
-    Star,
-    DoubleStar,
-    Qmark,
-}
-
 fn resolve_collector_sources_for_scan(sources: &[CollectorSource]) -> Vec<CollectorSource> {
-    let mut resolved = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    for source in sources {
-        for path in expand_source_paths_for_scan(&source.path) {
-            if source_path_matches_skip_patterns(&path, &source.skip_patterns) {
-                continue;
-            }
-            let key = format!(
-                "{}|{}|{}",
-                source.name,
-                source.agent.clone().unwrap_or_default(),
-                path.to_string_lossy()
-            );
-            if !seen.insert(key) {
-                continue;
-            }
-            let mut resolved_source = source.clone();
-            resolved_source.path = path;
-            resolved.push(resolved_source);
-        }
-    }
-
-    resolved
+    source_paths::resolve_collector_sources_for_scan(sources)
 }
 
-fn expand_source_paths_for_scan(path: &Path) -> Vec<PathBuf> {
-    if !source_path_contains_glob(path) {
-        return vec![path.to_path_buf()];
-    }
-
-    let pattern = normalize_glob_path(path);
-    let root = glob_search_root(&pattern);
-    if !root.exists() {
-        return Vec::new();
-    }
-
-    let mut matches = if root.is_file() {
-        if glob_pattern_matches(&pattern, &normalize_glob_path(&root)) {
-            vec![root]
-        } else {
-            Vec::new()
-        }
-    } else {
-        discover_files_recursive(&root)
-            .into_iter()
-            .filter(|candidate| glob_pattern_matches(&pattern, &normalize_glob_path(candidate)))
-            .collect::<Vec<_>>()
-    };
-    matches.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-    matches.dedup();
-    matches
-}
-
-fn source_path_contains_glob(path: &Path) -> bool {
-    let raw = path.to_string_lossy();
-    raw.contains('*') || raw.contains('?')
-}
-
+#[cfg(test)]
 fn source_path_matches_skip_patterns(path: &Path, skip_patterns: &[String]) -> bool {
-    if skip_patterns.is_empty() {
-        return false;
-    }
-    let normalized_path = normalize_glob_path(path);
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-
-    skip_patterns.iter().any(|pattern| {
-        let normalized_pattern = normalize_skip_pattern(pattern);
-        glob_pattern_matches(&normalized_pattern, &normalized_path)
-            || glob_pattern_matches(&normalized_pattern, file_name)
-    })
+    source_paths::source_path_matches_skip_patterns(path, skip_patterns)
 }
 
-fn normalize_skip_pattern(pattern: &str) -> String {
-    if pattern.starts_with("~/") {
-        normalize_glob_path(&expand_home_path(Path::new(pattern)))
-    } else {
-        pattern.replace('\\', "/")
-    }
-}
-
+#[cfg(test)]
 fn normalize_glob_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    source_paths::normalize_glob_path(path)
 }
 
-fn glob_search_root(pattern: &str) -> PathBuf {
-    let first_meta = pattern.find(|ch| matches!(ch, '*' | '?'));
-    let Some(meta_index) = first_meta else {
-        return PathBuf::from(pattern);
-    };
-    let prefix = &pattern[..meta_index];
-    let last_sep = prefix.rfind(|ch| matches!(ch, '/' | '\\'));
-    match last_sep {
-        Some(0) if pattern.starts_with('/') => PathBuf::from("/"),
-        Some(index) if index > 0 => PathBuf::from(&pattern[..index]),
-        _ if pattern.starts_with('/') => PathBuf::from("/"),
-        _ => PathBuf::from("."),
-    }
-}
-
-fn discover_files_recursive(root: &Path) -> Vec<PathBuf> {
-    let mut discovered = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let read_dir = match std::fs::read_dir(&dir) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        for entry in read_dir.flatten() {
-            let file_type = match entry.file_type() {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            if file_type.is_dir() {
-                if !file_type.is_symlink() {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if file_type.is_file() {
-                discovered.push(path);
-            }
-        }
-    }
-    discovered
-}
-
+#[cfg(test)]
 fn glob_pattern_matches(pattern: &str, candidate: &str) -> bool {
-    let tokens = tokenize_glob_pattern(pattern);
-    let chars = candidate.chars().collect::<Vec<_>>();
-    let token_count = tokens.len();
-    let char_count = chars.len();
-    let mut dp = vec![vec![false; char_count + 1]; token_count + 1];
-    dp[0][0] = true;
-
-    for i in 1..=token_count {
-        match tokens[i - 1] {
-            GlobToken::Literal(ch) => {
-                for j in 1..=char_count {
-                    if dp[i - 1][j - 1] && chars[j - 1] == ch {
-                        dp[i][j] = true;
-                    }
-                }
-            }
-            GlobToken::Qmark => {
-                for j in 1..=char_count {
-                    if dp[i - 1][j - 1] && chars[j - 1] != '/' {
-                        dp[i][j] = true;
-                    }
-                }
-            }
-            GlobToken::Star => {
-                for j in 0..=char_count {
-                    if dp[i - 1][j] {
-                        dp[i][j] = true;
-                    }
-                    if j > 0 && chars[j - 1] != '/' && dp[i][j - 1] {
-                        dp[i][j] = true;
-                    }
-                }
-            }
-            GlobToken::DoubleStar => {
-                for j in 0..=char_count {
-                    if dp[i - 1][j] {
-                        dp[i][j] = true;
-                    }
-                    if j > 0 && dp[i][j - 1] {
-                        dp[i][j] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    dp[token_count][char_count]
-}
-
-fn tokenize_glob_pattern(pattern: &str) -> Vec<GlobToken> {
-    let chars = pattern.chars().collect::<Vec<_>>();
-    let mut tokens = Vec::new();
-    let mut index = 0usize;
-    while index < chars.len() {
-        match chars[index] {
-            '*' => {
-                if index + 1 < chars.len() && chars[index + 1] == '*' {
-                    tokens.push(GlobToken::DoubleStar);
-                    index += 2;
-                } else {
-                    tokens.push(GlobToken::Star);
-                    index += 1;
-                }
-            }
-            '?' => {
-                tokens.push(GlobToken::Qmark);
-                index += 1;
-            }
-            ch => {
-                tokens.push(GlobToken::Literal(ch));
-                index += 1;
-            }
-        }
-    }
-    tokens
+    source_paths::glob_pattern_matches(pattern, candidate)
 }
 
 fn metadata_mtime_seconds(metadata: &std::fs::Metadata) -> u64 {
