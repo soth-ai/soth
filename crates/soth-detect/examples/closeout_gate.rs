@@ -9,6 +9,7 @@ use std::env;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
 use std::time::Instant;
+use std::{thread, time::Duration};
 use uuid::Uuid;
 
 const AC01_CASES: usize = 50_000;
@@ -127,6 +128,14 @@ fn run_ac14() -> i32 {
 }
 
 fn run_ac15() -> i32 {
+    // Optional pre-loop delay to support attach-mode syscall tracing.
+    // Example: SOTH_AC15_PRELOOP_SLEEP_MS=3000 closeout_gate ac15
+    if let Some(delay_ms) = env_u64("SOTH_AC15_PRELOOP_SLEEP_MS") {
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+
     let bundle = build_bundle();
     let bundle_slice = bundle.as_slice();
     let registry = ParserRegistry::default();
@@ -147,6 +156,11 @@ fn run_ac15() -> i32 {
 
     std::hint::black_box(checksum);
     0
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    let value = env::var(name).ok()?;
+    value.parse::<u64>().ok()
 }
 
 fn parse_source_name(out: &DetectResult) -> String {
