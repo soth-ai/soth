@@ -32,7 +32,6 @@ pub async fn run_start(
                 config_path,
                 quiet,
                 true,
-                None,
                 false,
                 None,
                 false,
