@@ -13,6 +13,7 @@ members = [
     "crates/soth-sync",
     "crates/soth-edge",
     "crates/soth-wrap",
+    "crates/soth-detect",
 ]
 default-members = [
     "crates/soth-core",
