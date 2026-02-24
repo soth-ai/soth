@@ -28,6 +28,36 @@ soth stop
 soth logs -f
 ```
 
+## Universal macOS Build (Apple Silicon + Intel)
+
+Build a single Universal 2 artifact for both chip families:
+
+```bash
+make macos-universal
+```
+
+Artifacts:
+
+- `dist/soth-darwin-universal2`
+- `dist/soth-ops-darwin-universal2`
+- matching `.sha256` files
+
+## Split Linux Builds (amd64 + arm64)
+
+Build separate Linux binaries per architecture:
+
+```bash
+make linux-binaries
+```
+
+Artifacts:
+
+- `dist/soth-linux-amd64`
+- `dist/soth-linux-arm64`
+- `dist/soth-ops-linux-amd64`
+- `dist/soth-ops-linux-arm64`
+- matching `.sha256` files
+
 ## Quick Verification Flow
 
 ```bash
