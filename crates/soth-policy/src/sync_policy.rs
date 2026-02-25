@@ -2,148 +2,18 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use soth_core::artifacts::ArtifactKind;
+use soth_core::normalized::EndpointType;
+use soth_core::policy::{
+    DeploymentModel, MatchedRule, PolicyContext, PolicyDecision, PolicyDecisionKind, PolicyWarning,
+    RedactTarget, RerouteTarget, RuleKind,
+};
+use soth_core::{AppType, NormalizedRequest, SensitiveArtifact, TrafficClassification};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PolicyContext {
-    pub process_resolution: ProcessResolution,
-    pub capture_mode: CaptureMode,
-    pub traffic_classification: TrafficClassification,
-    pub deployment: DeploymentModel,
-    pub session: Option<SessionBudget>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProcessResolution {
-    pub bundle_id: Option<String>,
-    pub app_type: AppType,
-    pub process_name: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AppType {
-    Host,
-    NonHost,
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureMode {
-    MetadataOnly,
-    Full,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TrafficClassification {
-    ToolUsage,
-    UnknownAgent,
-    ApplicationUsage,
-    Other,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeploymentModel {
-    Proxy,
-    Sidecar {
-        service_name: String,
-        environment: String,
-    },
-    Sdk {
-        service_name: String,
-        environment: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SessionBudget {
-    pub session_id: String,
-    pub total_tokens_this_session: u64,
-    pub total_cost_usd_this_session: f64,
-    pub request_count_this_session: u32,
-    pub credential_alerts_this_session: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct NormalizedRequest {
-    pub provider: String,
-    pub model: Option<String>,
-    pub endpoint_type: String,
-    pub is_ai_call: bool,
-    pub stream: bool,
-    pub has_tool_definitions: bool,
-    pub estimated_input_tokens: u32,
-    pub estimated_cost_usd: f64,
-    pub conversation_turn: Option<u32>,
-    pub parse_confidence: String,
-    pub parse_source: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SensitiveArtifact {
-    pub artifact_type: String,
-    pub severity: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PolicyDecision {
-    pub kind: PolicyDecisionKind,
-    pub matched_rule: Option<MatchedRule>,
-    pub warnings: Vec<PolicyWarning>,
-    pub eval_latency_us: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PolicyDecisionKind {
-    Allow,
-    Block { status: u16, message: String },
-    Redact { targets: Vec<RedactTarget> },
-    Reroute { target: RerouteTarget },
-    Flag { reason: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuleKind {
-    System,
-    Org,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct MatchedRule {
-    pub rule_id: String,
-    pub rule_name: String,
-    pub rule_kind: RuleKind,
-    pub cel_expr: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RerouteTarget {
-    pub provider: String,
-    pub model: String,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RedactTarget {
-    pub field_path: String,
-    pub artifact_type: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PolicyWarning {
-    RuleError { rule_id: String, error: String },
-    BundleWarning(String),
-}
 
 #[derive(Clone, Debug)]
 pub struct PolicyBundle {
@@ -302,6 +172,10 @@ pub fn evaluate(
 
     if let Some(block) = evaluate_system_rules(normalized, artifacts) {
         return with_latency(block, started);
+    }
+
+    if ctx.skip_org_rules {
+        return with_latency(allow_decision(), started);
     }
 
     let (decision, warnings) = evaluate_org_rules(normalized, artifacts, ctx, bundle);
@@ -1033,7 +907,7 @@ fn build_eval_scope(
 
     scope.insert(
         "request.provider",
-        EvalValue::String(normalized.provider.clone()),
+        EvalValue::String(normalized.provider.canonical_name().to_string()),
     );
     scope.insert(
         "request.model",
@@ -1045,7 +919,7 @@ fn build_eval_scope(
     );
     scope.insert(
         "request.endpoint_type",
-        EvalValue::String(normalized.endpoint_type.clone()),
+        EvalValue::String(endpoint_type_label(normalized.endpoint_type).to_string()),
     );
     scope.insert("request.is_ai_call", EvalValue::Bool(normalized.is_ai_call));
     scope.insert("request.stream", EvalValue::Bool(normalized.stream));
@@ -1070,11 +944,11 @@ fn build_eval_scope(
     );
     scope.insert(
         "request.parse_confidence",
-        EvalValue::String(normalized.parse_confidence.clone()),
+        EvalValue::String(parse_confidence_label(normalized.parse_confidence).to_string()),
     );
     scope.insert(
         "request.parse_source",
-        EvalValue::String(normalized.parse_source.clone()),
+        EvalValue::String(parse_source_label(normalized.parse_source).to_string()),
     );
 
     let private_key_detected = has_private_key_artifact(artifacts);
@@ -1399,44 +1273,23 @@ fn decision_from_rule(rule_kind: RuleKind, rule: &CompiledRule) -> PolicyDecisio
 }
 
 fn has_credential_artifact(artifacts: &[SensitiveArtifact]) -> bool {
-    artifacts.iter().any(|artifact| {
-        let lowered = artifact.artifact_type.to_ascii_lowercase();
-        lowered.contains("credential")
-            || lowered.contains("token")
-            || lowered.contains("secret")
-            || lowered.contains("access_key")
-            || lowered.contains("openai_key")
-            || lowered.contains("anthropic_key")
-            || lowered.contains("private_key")
-            || lowered.contains("jwt")
-            || lowered.contains("connection_string")
-    })
+    artifacts.iter().any(SensitiveArtifact::is_credential)
 }
 
 fn has_code_artifact(artifacts: &[SensitiveArtifact]) -> bool {
-    artifacts.iter().any(|artifact| {
-        let lowered = artifact.artifact_type.to_ascii_lowercase();
-        lowered.starts_with("code")
-            || lowered.contains("code_block")
-            || lowered.contains("codeblock")
-    })
+    artifacts
+        .iter()
+        .any(|artifact| matches!(artifact.kind, ArtifactKind::CodeBlock { .. }))
 }
 
 fn extract_detected_languages(artifacts: &[SensitiveArtifact]) -> Vec<String> {
     let mut out = Vec::new();
     for artifact in artifacts {
-        let lowered = artifact.artifact_type.to_ascii_lowercase();
-        if let Some(language) = lowered.strip_prefix("code:") {
+        if let ArtifactKind::CodeBlock { language } = &artifact.kind {
+            let language = language.trim();
             if !language.is_empty() {
                 out.push(language.to_string());
             }
-            continue;
-        }
-        if let Some(language) = lowered.strip_prefix("code_block:") {
-            if !language.is_empty() {
-                out.push(language.to_string());
-            }
-            continue;
         }
     }
     out
@@ -1445,12 +1298,14 @@ fn extract_detected_languages(artifacts: &[SensitiveArtifact]) -> Vec<String> {
 fn max_artifact_severity(artifacts: &[SensitiveArtifact]) -> Option<String> {
     let mut best: Option<(String, u8)> = None;
     for artifact in artifacts {
-        let sev = artifact.severity.to_ascii_lowercase();
-        let rank = match sev.as_str() {
-            "critical" => 4,
-            "high" => 3,
-            "medium" => 2,
-            "low" => 1,
+        let (sev, rank) = match artifact.severity {
+            soth_core::artifacts::ArtifactSeverity::Critical => ("critical", 4),
+            soth_core::artifacts::ArtifactSeverity::High => ("high", 3),
+            soth_core::artifacts::ArtifactSeverity::Medium => ("medium", 2),
+            soth_core::artifacts::ArtifactSeverity::Low => ("low", 1),
+        };
+        let rank = match rank {
+            4 | 3 | 2 | 1 => rank,
             _ => 0,
         };
         if rank == 0 {
@@ -1461,7 +1316,7 @@ fn max_artifact_severity(artifacts: &[SensitiveArtifact]) -> Option<String> {
             None => true,
         };
         if should_replace {
-            best = Some((sev, rank));
+            best = Some((sev.to_string(), rank));
         }
     }
     best.map(|(label, _)| label)
@@ -1492,6 +1347,39 @@ fn deployment_model_label(value: &DeploymentModel) -> &'static str {
     }
 }
 
+fn endpoint_type_label(value: EndpointType) -> &'static str {
+    match value {
+        EndpointType::ChatCompletion => "chat_completion",
+        EndpointType::TextCompletion => "text_completion",
+        EndpointType::Embedding => "embedding",
+        EndpointType::ImageGeneration => "image_generation",
+        EndpointType::AudioTranscription => "audio_transcription",
+        EndpointType::FunctionCall => "function_call",
+        EndpointType::Streaming => "streaming",
+        EndpointType::Unknown => "unknown",
+    }
+}
+
+fn parse_confidence_label(value: soth_core::ParseConfidence) -> &'static str {
+    match value {
+        soth_core::ParseConfidence::Full => "full",
+        soth_core::ParseConfidence::Partial => "partial",
+        soth_core::ParseConfidence::Heuristic => "heuristic",
+    }
+}
+
+fn parse_source_label(value: soth_core::ParseSource) -> &'static str {
+    match value {
+        soth_core::ParseSource::Rest { .. } => "rest",
+        soth_core::ParseSource::GraphQl => "graphql",
+        soth_core::ParseSource::Grpc => "grpc",
+        soth_core::ParseSource::JsonRpc => "jsonrpc",
+        soth_core::ParseSource::AgentApp => "agent_app",
+        soth_core::ParseSource::Heuristic => "heuristic",
+        soth_core::ParseSource::Filtered => "filtered",
+    }
+}
+
 fn deployment_service_environment(value: &DeploymentModel) -> (Option<String>, Option<String>) {
     match value {
         DeploymentModel::Proxy => (None, None),
@@ -1507,14 +1395,7 @@ fn deployment_service_environment(value: &DeploymentModel) -> (Option<String>, O
 }
 
 fn has_private_key_artifact(artifacts: &[SensitiveArtifact]) -> bool {
-    artifacts.iter().any(|artifact| {
-        let lowered = artifact.artifact_type.to_ascii_lowercase();
-        lowered == "private_key"
-            || lowered == "private-key"
-            || lowered == "privatekey"
-            || lowered.contains("private_key")
-            || lowered.contains("private-key")
-    })
+    artifacts.iter().any(SensitiveArtifact::is_private_key)
 }
 
 fn allow_decision() -> PolicyDecision {
@@ -1561,6 +1442,11 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use soth_core::{
+        ArtifactKind, ArtifactLocation, ArtifactSeverity, CaptureMode, DetectedProvider,
+        EndpointType, FormatMetadata, ParseConfidence, ParseSource, ProcessMatchKind,
+        ProcessResolution, SessionSnapshot as SessionBudget,
+    };
 
     fn signed_bundle_bytes(payload: PolicyBundlePayload) -> Vec<u8> {
         let key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1620,31 +1506,59 @@ mod tests {
 
     fn fixture_request() -> NormalizedRequest {
         NormalizedRequest {
-            provider: "anthropic".to_string(),
-            model: Some("claude-3-5-sonnet-20241022".to_string()),
-            endpoint_type: "chat".to_string(),
+            parse_confidence: ParseConfidence::Full,
+            parser_id: "sync-policy-test".to_string(),
+            schema_version: "1".to_string(),
+            parse_warnings: Vec::new(),
             is_ai_call: true,
+            provider: DetectedProvider::Anthropic,
+            model: Some("claude-3-5-sonnet-20241022".to_string()),
+            endpoint_type: EndpointType::ChatCompletion,
+            api_version: None,
+            system_prompt_hash: None,
+            system_prompt_token_estimate: None,
+            user_content_hash: "user-hash".to_string(),
+            user_content_token_estimate: 64,
+            conversation_hash: "conv-hash".to_string(),
+            conversation_turn: Some(1),
             stream: false,
             has_tool_definitions: false,
+            tool_definition_hash: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop_sequences: Vec::new(),
             estimated_input_tokens: 128,
             estimated_cost_usd: 0.04,
-            conversation_turn: Some(1),
-            parse_confidence: "full".to_string(),
-            parse_source: "graphql".to_string(),
+            parse_source: ParseSource::GraphQl,
+            canonical_cache_key: String::new(),
+            format_metadata: FormatMetadata::Unknown,
         }
     }
 
     fn fixture_context(session: Option<SessionBudget>) -> PolicyContext {
         PolicyContext {
             process_resolution: ProcessResolution {
+                match_kind: ProcessMatchKind::Unknown,
                 bundle_id: None,
                 app_type: AppType::Unknown,
+                capture_mode: None,
                 process_name: None,
             },
             capture_mode: CaptureMode::MetadataOnly,
             traffic_classification: TrafficClassification::ToolUsage,
             deployment: DeploymentModel::Proxy,
+            skip_org_rules: false,
+            semantic: None,
             session,
+        }
+    }
+
+    fn artifact(kind: ArtifactKind, severity: ArtifactSeverity) -> SensitiveArtifact {
+        SensitiveArtifact {
+            kind,
+            severity,
+            location: ArtifactLocation::Unknown,
         }
     }
 
@@ -1720,6 +1634,7 @@ mod tests {
             total_cost_usd_this_session: 0.0,
             request_count_this_session: 1,
             credential_alerts_this_session: 0,
+            ..Default::default()
         }));
 
         let out = evaluate(&normalized, &[], &ctx, &bundle);
@@ -1741,6 +1656,7 @@ mod tests {
             total_cost_usd_this_session: 2.01,
             request_count_this_session: 1,
             credential_alerts_this_session: 0,
+            ..Default::default()
         }));
 
         let out = evaluate(&normalized, &[], &ctx, &bundle);
@@ -1762,6 +1678,7 @@ mod tests {
             total_cost_usd_this_session: 0.0,
             request_count_this_session: 51,
             credential_alerts_this_session: 0,
+            ..Default::default()
         }));
 
         let out = evaluate(&normalized, &[], &ctx, &bundle);
@@ -1777,10 +1694,10 @@ mod tests {
         };
         let normalized = fixture_request();
         let ctx = fixture_context(None);
-        let artifacts = vec![SensitiveArtifact {
-            artifact_type: "private_key".to_string(),
-            severity: "critical".to_string(),
-        }];
+        let artifacts = vec![artifact(
+            ArtifactKind::PrivateKey,
+            ArtifactSeverity::Critical,
+        )];
 
         let out = evaluate(&normalized, &artifacts, &ctx, &bundle);
         assert_block_rule(&out, "sys_private_key_detected");
@@ -1796,10 +1713,7 @@ mod tests {
         let normalized = fixture_request();
         let ctx = fixture_context(None);
         let artifacts = (0..51)
-            .map(|_| SensitiveArtifact {
-                artifact_type: "unknown_credential".to_string(),
-                severity: "low".to_string(),
-            })
+            .map(|_| artifact(ArtifactKind::UnknownCredential, ArtifactSeverity::Low))
             .collect::<Vec<_>>();
 
         let out = evaluate(&normalized, &artifacts, &ctx, &bundle);
@@ -1836,11 +1750,12 @@ mod tests {
             total_cost_usd_this_session: 0.0,
             request_count_this_session: 1,
             credential_alerts_this_session: 0,
+            ..Default::default()
         }));
-        let artifacts = vec![SensitiveArtifact {
-            artifact_type: "private_key".to_string(),
-            severity: "critical".to_string(),
-        }];
+        let artifacts = vec![artifact(
+            ArtifactKind::PrivateKey,
+            ArtifactSeverity::Critical,
+        )];
 
         let out = evaluate(&normalized, &artifacts, &ctx, &bundle);
         assert_block_rule(&out, "budget_session_tokens_exceeded");
@@ -1878,6 +1793,29 @@ mod tests {
             None => panic!("expected matched rule"),
         };
         assert_eq!(matched.rule_id, "org_flag_first");
+    }
+
+    #[test]
+    fn phase3_skip_org_rules_bypasses_org_loop() {
+        let payload = fixture_payload_with_org_rules(vec![org_rule(
+            "org_block",
+            "request.provider == \"anthropic\"",
+            RuleAction::Block {
+                status: 403,
+                message: "blocked".to_string(),
+            },
+        )]);
+        let bundle = match load_bundle_from_bytes(&signed_bundle_bytes(payload)) {
+            Ok(bundle) => bundle,
+            Err(error) => panic!("bundle should load: {error}"),
+        };
+
+        let mut ctx = fixture_context(None);
+        ctx.skip_org_rules = true;
+
+        let out = evaluate(&fixture_request(), &[], &ctx, &bundle);
+        assert!(matches!(out.kind, PolicyDecisionKind::Allow));
+        assert!(out.matched_rule.is_none());
     }
 
     #[test]
@@ -2036,10 +1974,10 @@ mod tests {
                 ctx.traffic_classification = TrafficClassification::UnknownAgent;
                 (
                     fixture_request(),
-                    vec![SensitiveArtifact {
-                        artifact_type: "unknown_credential".to_string(),
-                        severity: "high".to_string(),
-                    }],
+                    vec![artifact(
+                        ArtifactKind::UnknownCredential,
+                        ArtifactSeverity::High,
+                    )],
                     ctx,
                 )
             },
@@ -2051,7 +1989,7 @@ mod tests {
             },
             {
                 let mut req = fixture_request();
-                req.provider = "openai".to_string();
+                req.provider = DetectedProvider::OpenAi;
                 req.has_tool_definitions = false;
                 req.estimated_cost_usd = 0.02;
                 (req, Vec::new(), fixture_context(None))
@@ -2097,29 +2035,44 @@ mod tests {
         };
 
         let mut rng = StdRng::seed_from_u64(42);
-        let provider_pool = ["anthropic", "openai", "google", "cohere", "forbidden"];
-        let artifact_pool = [
-            "private_key",
-            "unknown_credential",
-            "code:rust",
-            "code:python",
-            "token",
-            "misc",
+        let provider_pool = [
+            DetectedProvider::Anthropic,
+            DetectedProvider::OpenAi,
+            DetectedProvider::Gemini,
+            DetectedProvider::Cohere,
+            DetectedProvider::Unknown,
         ];
-        let severity_pool = ["critical", "high", "medium", "low", "unknown"];
+        let artifact_pool = [
+            ArtifactKind::PrivateKey,
+            ArtifactKind::UnknownCredential,
+            ArtifactKind::CodeBlock {
+                language: "rust".to_string(),
+            },
+            ArtifactKind::CodeBlock {
+                language: "python".to_string(),
+            },
+            ArtifactKind::Jwt,
+            ArtifactKind::AuthLogic,
+        ];
+        let severity_pool = [
+            ArtifactSeverity::Critical,
+            ArtifactSeverity::High,
+            ArtifactSeverity::Medium,
+            ArtifactSeverity::Low,
+        ];
 
         for _ in 0..2000 {
             let mut request = fixture_request();
-            request.provider = provider_pool[rng.gen_range(0..provider_pool.len())].to_string();
+            request.provider = provider_pool[rng.gen_range(0..provider_pool.len())];
             request.model = if rng.gen_bool(0.3) {
                 None
             } else {
                 Some(format!("model-{}", rng.gen_range(0..100)))
             };
             request.endpoint_type = if rng.gen_bool(0.5) {
-                "chat".to_string()
+                EndpointType::ChatCompletion
             } else {
-                "completion".to_string()
+                EndpointType::TextCompletion
             };
             request.is_ai_call = rng.gen_bool(0.8);
             request.stream = rng.gen_bool(0.5);
@@ -2132,18 +2085,19 @@ mod tests {
                 Some(rng.gen_range(0..20))
             };
             request.parse_confidence = if rng.gen_bool(0.7) {
-                "full".to_string()
+                ParseConfidence::Full
             } else {
-                "heuristic".to_string()
+                ParseConfidence::Heuristic
             };
-            request.parse_source = "fuzz".to_string();
+            request.parse_source = ParseSource::Heuristic;
 
             let artifact_count = rng.gen_range(0..60);
             let mut artifacts = Vec::with_capacity(artifact_count);
             for _ in 0..artifact_count {
                 artifacts.push(SensitiveArtifact {
-                    artifact_type: artifact_pool[rng.gen_range(0..artifact_pool.len())].to_string(),
-                    severity: severity_pool[rng.gen_range(0..severity_pool.len())].to_string(),
+                    kind: artifact_pool[rng.gen_range(0..artifact_pool.len())].clone(),
+                    severity: severity_pool[rng.gen_range(0..severity_pool.len())],
+                    location: ArtifactLocation::Unknown,
                 });
             }
 
@@ -2154,6 +2108,7 @@ mod tests {
                     total_cost_usd_this_session: rng.gen_range(0.0..200.0),
                     request_count_this_session: rng.gen_range(0..500),
                     credential_alerts_this_session: rng.gen_range(0..50),
+                    ..Default::default()
                 })
             } else {
                 None

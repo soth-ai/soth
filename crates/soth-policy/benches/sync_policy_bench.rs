@@ -3,10 +3,13 @@ use base64::Engine;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use ed25519_dalek::{Signer, SigningKey};
 use soth_policy::sync_policy::{
-    evaluate, load_bundle_from_bytes, AppType, BudgetLimits, CaptureMode, DeploymentModel,
-    NormalizedRequest, OrgPatterns, PolicyBundleMetadata, PolicyBundlePayload, PolicyContext,
-    ProcessResolution, RuleAction, RuleDefinition, SessionBudget, SignedPolicyBundle,
-    TrafficClassification,
+    evaluate, load_bundle_from_bytes, BudgetLimits, OrgPatterns, PolicyBundleMetadata,
+    PolicyBundlePayload, RuleAction, RuleDefinition, SignedPolicyBundle,
+};
+use soth_core::{
+    AppType, CaptureMode, DeploymentModel, DetectedProvider, EndpointType, FormatMetadata,
+    NormalizedRequest, ParseConfidence, ParseSource, PolicyContext, ProcessMatchKind,
+    ProcessResolution, SessionSnapshot, TrafficClassification,
 };
 
 fn signed_bundle_bytes(payload: PolicyBundlePayload) -> Vec<u8> {
@@ -63,36 +66,57 @@ fn benchmark_bundle(rule_count: usize, matching_rule_index: usize) -> PolicyBund
 
 fn fixture_request() -> NormalizedRequest {
     NormalizedRequest {
-        provider: "anthropic".to_string(),
-        model: Some("claude-3-5-sonnet-20241022".to_string()),
-        endpoint_type: "chat".to_string(),
+        parse_confidence: ParseConfidence::Full,
+        parser_id: "sync-policy-bench".to_string(),
+        schema_version: "1".to_string(),
+        parse_warnings: Vec::new(),
         is_ai_call: true,
+        provider: DetectedProvider::Anthropic,
+        model: Some("claude-3-5-sonnet-20241022".to_string()),
+        endpoint_type: EndpointType::ChatCompletion,
+        api_version: None,
+        system_prompt_hash: None,
+        system_prompt_token_estimate: None,
+        user_content_hash: "bench-user-hash".to_string(),
+        user_content_token_estimate: 512,
+        conversation_hash: "bench-conv-hash".to_string(),
+        conversation_turn: Some(6),
         stream: false,
         has_tool_definitions: true,
+        tool_definition_hash: None,
+        temperature: None,
+        max_tokens: None,
+        top_p: None,
+        stop_sequences: Vec::new(),
         estimated_input_tokens: 2048,
         estimated_cost_usd: 0.21,
-        conversation_turn: Some(6),
-        parse_confidence: "full".to_string(),
-        parse_source: "graphql".to_string(),
+        parse_source: ParseSource::GraphQl,
+        canonical_cache_key: String::new(),
+        format_metadata: FormatMetadata::Unknown,
     }
 }
 
 fn fixture_context() -> PolicyContext {
     PolicyContext {
         process_resolution: ProcessResolution {
+            match_kind: ProcessMatchKind::Exact,
             bundle_id: Some("com.example.agent".to_string()),
             app_type: AppType::Host,
+            capture_mode: None,
             process_name: Some("agentd".to_string()),
         },
         capture_mode: CaptureMode::MetadataOnly,
         traffic_classification: TrafficClassification::ToolUsage,
         deployment: DeploymentModel::Proxy,
-        session: Some(SessionBudget {
+        skip_org_rules: false,
+        semantic: None,
+        session: Some(SessionSnapshot {
             session_id: "bench-session".to_string(),
             total_tokens_this_session: 100_000,
             total_cost_usd_this_session: 3.14,
             request_count_this_session: 42,
             credential_alerts_this_session: 0,
+            ..Default::default()
         }),
     }
 }
