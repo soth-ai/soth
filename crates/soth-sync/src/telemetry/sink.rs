@@ -32,6 +32,9 @@ impl SyncTelemetrySink {
 
 #[async_trait]
 impl TelemetrySink for SyncTelemetrySink {
+    /// Contract semantics:
+    /// - `Ok(())` means the batch is durably queued in local outbox storage.
+    /// - cloud acknowledgement is asynchronous and handled by replay worker.
     async fn send(&self, batch: TransmittedBatch) -> std::result::Result<(), SinkError> {
         self.enqueue_batch(batch)
             .map_err(|error| SinkError::rejected(error.to_string()))
