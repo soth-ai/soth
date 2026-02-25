@@ -73,6 +73,7 @@ pub enum FrameKind {
     GrpcMessage,
     WebSocketText,
     WebSocketBinary,
+    MultipartMixed,
     WebSocketClose,
 }
 
@@ -236,6 +237,10 @@ pub enum FormatMeta {
         method: String,
         proto_package: Option<String>,
     },
+    JsonRpc {
+        method: Option<String>,
+        is_batch: bool,
+    },
     WebSocket {
         frame_kind_hint: String,
     },
@@ -317,6 +322,7 @@ pub enum ParseSource {
     Bedrock,
     GraphQL { operation_name: Option<String> },
     Grpc { service: String, method: String },
+    JsonRpc { method: Option<String> },
     AgentApp { app_id: String },
     Heuristic,
     Filtered,
@@ -462,6 +468,7 @@ pub enum DetectedFormat {
     BedrockRest,
     GraphQL,
     GrpcProtobuf,
+    JsonRpc,
     Unknown,
 }
 

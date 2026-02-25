@@ -8,6 +8,7 @@ mod heuristic;
 mod identity;
 mod intelligence;
 mod intelligence_store;
+mod jsonrpc;
 mod replay;
 mod rest;
 mod sensitive;
@@ -158,6 +159,89 @@ mod tests {
         assert!(out.is_none());
         let summary = finalize_stream(session);
         assert!(!summary.response_hash.is_empty());
+    }
+
+    #[test]
+    fn websocket_text_chunk_extracts_jsonrpc_delta_content() {
+        let bundle = bundle_fixture();
+        let mut session = StreamSession::new(Uuid::new_v4(), CaptureMode::MetadataOnly);
+        let chunk = StreamChunk {
+            connection_id: session.connection_id,
+            sequence: 1,
+            payload: Bytes::from_static(
+                br#"{"jsonrpc":"2.0","method":"responses.delta","params":{"delta":{"content":"jsonrpc delta hello"}}}"#,
+            ),
+            frame_kind: FrameKind::WebSocketText,
+        };
+
+        let out = process_chunk(&chunk, &mut session, &bundle.as_slice());
+        assert!(out.is_none());
+        assert_eq!(session.delta_buffer.len(), 1);
+        assert_eq!(session.delta_buffer[0], "jsonrpc delta hello");
+    }
+
+    #[test]
+    fn multipart_chunk_extracts_json_delta_content() {
+        let bundle = bundle_fixture();
+        let mut session = StreamSession::new(Uuid::new_v4(), CaptureMode::MetadataOnly);
+        let chunk = StreamChunk {
+            connection_id: session.connection_id,
+            sequence: 1,
+            payload: Bytes::from_static(
+                b"--chunk-boundary\r\nContent-Type: application/json\r\n\r\n{\"choices\":[{\"delta\":{\"content\":\"multipart chunk hello\"}}]}\r\n--chunk-boundary--\r\n",
+            ),
+            frame_kind: FrameKind::MultipartMixed,
+        };
+
+        let out = process_chunk(&chunk, &mut session, &bundle.as_slice());
+        assert!(out.is_none());
+        assert_eq!(session.delta_buffer.len(), 1);
+        assert_eq!(session.delta_buffer[0], "multipart chunk hello");
+    }
+
+    #[test]
+    fn jsonrpc_request_parses_full() {
+        let bundle = bundle_fixture();
+
+        let request = RawRequest {
+            method: "POST".to_string(),
+            path: "/rpc".to_string(),
+            headers: {
+                let mut headers = BTreeMap::new();
+                headers.insert(
+                    "content-type".to_string(),
+                    "application/json-rpc".to_string(),
+                );
+                headers
+            },
+            body: Bytes::from_static(
+                br#"{
+                    "jsonrpc":"2.0",
+                    "id":"req-1",
+                    "method":"chat.completions",
+                    "params":{
+                        "model":"gpt-4o-mini",
+                        "messages":[{"role":"user","content":"hello from jsonrpc"}],
+                        "stream":true
+                    }
+                }"#,
+            ),
+            connection_meta: connection_meta_tcp(),
+        };
+
+        let out = process(&request, &bundle.as_slice());
+        assert_eq!(out.confidence, ParseConfidence::Full);
+        assert!(matches!(
+            out.parse_source,
+            ParseSource::JsonRpc { method: Some(_) }
+        ));
+        assert_eq!(out.normalized.model.as_deref(), Some("gpt-4o-mini"));
+        if let FormatMeta::JsonRpc { method, is_batch } = &out.normalized.format_meta {
+            assert_eq!(method.as_deref(), Some("chat.completions"));
+            assert!(!is_batch);
+        } else {
+            panic!("expected jsonrpc format meta");
+        }
     }
 
     #[test]

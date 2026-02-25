@@ -293,6 +293,9 @@ fn parse_source_label(value: &ParseSource) -> String {
             format!("graphql:{}", operation_name.clone().unwrap_or_default())
         }
         ParseSource::Grpc { service, method } => format!("grpc:{service}/{method}"),
+        ParseSource::JsonRpc { method } => {
+            format!("jsonrpc:{}", method.clone().unwrap_or_default())
+        }
         ParseSource::AgentApp { app_id } => format!("agent_app:{app_id}"),
         ParseSource::Heuristic => "heuristic".to_string(),
         ParseSource::Filtered => "filtered".to_string(),

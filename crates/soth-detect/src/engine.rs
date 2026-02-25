@@ -7,6 +7,7 @@ use crate::heuristic;
 use crate::intelligence::{
     build_parse_quality_record, extract_unknown_graphql_operation_record, IntelligenceSink,
 };
+use crate::jsonrpc::parse_jsonrpc;
 use crate::rest::parse_rest;
 use crate::sensitive::credential_scan;
 use crate::types::{
@@ -201,6 +202,10 @@ fn parse_by_format(
             warnings.extend(outcome.warnings);
             outcome.normalized
         }),
+        DetectedFormat::JsonRpc => parse_jsonrpc(req, &provider_name).map(|mut nr| {
+            nr.provider = Provider::new(provider_name.clone());
+            nr
+        }),
         DetectedFormat::Unknown => Ok(heuristic::parse(req)),
     };
 
@@ -242,6 +247,7 @@ fn provider_for_format(
         DetectedFormat::BedrockRest => "aws_bedrock".to_string(),
         DetectedFormat::GraphQL => "graphql".to_string(),
         DetectedFormat::GrpcProtobuf => "grpc".to_string(),
+        DetectedFormat::JsonRpc => "jsonrpc".to_string(),
         DetectedFormat::Unknown => "unknown".to_string(),
     }
 }
@@ -299,6 +305,15 @@ fn parse_source_for_format(format: &DetectedFormat, meta: &FormatMeta) -> ParseS
                     service: "unknown".to_string(),
                     method: "unknown".to_string(),
                 }
+            }
+        }
+        DetectedFormat::JsonRpc => {
+            if let FormatMeta::JsonRpc { method, .. } = meta {
+                ParseSource::JsonRpc {
+                    method: method.clone(),
+                }
+            } else {
+                ParseSource::JsonRpc { method: None }
             }
         }
         DetectedFormat::Unknown => ParseSource::Heuristic,

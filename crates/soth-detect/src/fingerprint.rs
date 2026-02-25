@@ -18,6 +18,9 @@ pub fn fingerprint(
         if ct.contains("application/graphql") {
             return DetectedFormat::GraphQL;
         }
+        if ct.contains("application/json-rpc") || ct.contains("application/jsonrpc") {
+            return DetectedFormat::JsonRpc;
+        }
     }
 
     if header_value(headers, "anthropic-version").is_some() {
@@ -29,6 +32,9 @@ pub fn fingerprint(
     }
 
     let path_lc = path.to_ascii_lowercase();
+    let body = String::from_utf8_lossy(body_prefix).to_ascii_lowercase();
+    let looks_jsonrpc = body.contains("\"jsonrpc\"") && body.contains("\"method\"");
+
     if path_lc.contains("/v1/chat/completions")
         || path_lc.contains("/v1/completions")
         || path_lc.contains("/v1/embeddings")
@@ -54,6 +60,12 @@ pub fn fingerprint(
         return DetectedFormat::BedrockRest;
     }
 
+    if path_lc.contains("jsonrpc")
+        || ((path_lc.ends_with("/rpc") || path_lc.contains("/rpc/")) && looks_jsonrpc)
+    {
+        return DetectedFormat::JsonRpc;
+    }
+
     if let Some(host) =
         header_value(headers, "host").or_else(|| header_value(headers, ":authority"))
     {
@@ -67,7 +79,6 @@ pub fn fingerprint(
         }
     }
 
-    let body = String::from_utf8_lossy(body_prefix).to_ascii_lowercase();
     let looks_graphql = (body.contains("query")
         && (body.contains("mutation ")
             || body.contains("query ")
@@ -77,6 +88,10 @@ pub fn fingerprint(
 
     if looks_graphql {
         return DetectedFormat::GraphQL;
+    }
+
+    if looks_jsonrpc {
+        return DetectedFormat::JsonRpc;
     }
 
     DetectedFormat::Unknown
@@ -107,6 +122,9 @@ fn provider_entry_to_format(provider_id: &str, entry: Option<&ProviderEntry>) ->
             if lower.contains("grpc") {
                 return DetectedFormat::GrpcProtobuf;
             }
+            if lower.contains("jsonrpc") || lower.contains("json-rpc") {
+                return DetectedFormat::JsonRpc;
+            }
         }
     }
 
@@ -125,6 +143,9 @@ fn provider_entry_to_format(provider_id: &str, entry: Option<&ProviderEntry>) ->
     }
     if fallback.contains("bedrock") {
         return DetectedFormat::BedrockRest;
+    }
+    if fallback.contains("jsonrpc") || fallback.contains("json-rpc") {
+        return DetectedFormat::JsonRpc;
     }
 
     DetectedFormat::Unknown

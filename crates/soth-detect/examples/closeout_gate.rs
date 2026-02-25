@@ -172,6 +172,7 @@ fn parse_source_name(out: &DetectResult) -> String {
         ParseSource::Bedrock => "bedrock".to_string(),
         ParseSource::GraphQL { .. } => "graphql".to_string(),
         ParseSource::Grpc { .. } => "grpc".to_string(),
+        ParseSource::JsonRpc { .. } => "jsonrpc".to_string(),
         ParseSource::AgentApp { .. } => "agent_app".to_string(),
         ParseSource::Heuristic => "heuristic".to_string(),
         ParseSource::Filtered => "filtered".to_string(),

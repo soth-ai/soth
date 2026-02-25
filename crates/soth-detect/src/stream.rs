@@ -1,6 +1,7 @@
 use crate::graphql::parse_graphql_payload_text;
 use crate::grpc::parse_grpc_chunk_payload;
 use crate::hash::hash_content;
+use crate::jsonrpc::parse_jsonrpc_payload_text;
 use crate::sensitive::credential_scan;
 use crate::types::{
     ArtifactLocation, CaptureMode, ChunkArtifact, DetectBundleSlice, FrameKind, StreamChunk,
@@ -16,12 +17,14 @@ pub fn process_chunk(
 
     match chunk.frame_kind {
         FrameKind::SseData | FrameKind::NdjsonLine => {
-            if let Some(delta) = parse_graphql_payload_text(&chunk.payload) {
+            if let Some(delta) = extract_structured_text(&chunk.payload) {
                 session.accumulate(delta);
             }
         }
         FrameKind::WebSocketText => {
-            if let Some(delta) = parse_graphql_payload_text(&chunk.payload) {
+            if let Some(delta) = extract_structured_text(&chunk.payload)
+                .or_else(|| parse_multipart_payload_text(&chunk.payload))
+            {
                 session.accumulate(delta);
             } else if let Ok(text) = std::str::from_utf8(&chunk.payload) {
                 if !text.trim().is_empty() {
@@ -50,9 +53,18 @@ pub fn process_chunk(
                     session.accumulate(delta);
                 }
             } else if let Ok(text) = std::str::from_utf8(&chunk.payload) {
-                if !text.trim().is_empty() {
+                if let Some(delta) = extract_structured_text(text.as_bytes())
+                    .or_else(|| parse_multipart_payload_text(text.as_bytes()))
+                {
+                    session.accumulate(delta);
+                } else if !text.trim().is_empty() {
                     session.accumulate(text.to_string());
                 }
+            }
+        }
+        FrameKind::MultipartMixed => {
+            if let Some(delta) = parse_multipart_payload_text(&chunk.payload) {
+                session.accumulate(delta);
             }
         }
         FrameKind::WebSocketClose => {}
@@ -189,4 +201,50 @@ fn looks_like_protobuf_payload(payload: &[u8]) -> bool {
     // Lower 3 bits are wire type and should typically be <= 5.
     let wire = first & 0x07;
     wire <= 5
+}
+
+fn extract_structured_text(payload: &[u8]) -> Option<String> {
+    parse_graphql_payload_text(payload).or_else(|| parse_jsonrpc_payload_text(payload))
+}
+
+fn parse_multipart_payload_text(payload: &[u8]) -> Option<String> {
+    if let Some(delta) = extract_structured_text(payload) {
+        return Some(delta);
+    }
+
+    let text = std::str::from_utf8(payload).ok()?;
+    let boundary = text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with("--") && trimmed.len() > 2 {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    })?;
+
+    for part in text.split(&boundary).skip(1) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() || trimmed == "--" {
+            continue;
+        }
+
+        let body = part
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .or_else(|| part.split_once("\n\n").map(|(_, body)| body));
+        let Some(body) = body else {
+            continue;
+        };
+
+        let body = body.trim().trim_end_matches("--").trim();
+        if body.is_empty() {
+            continue;
+        }
+
+        if let Some(delta) = extract_structured_text(body.as_bytes()) {
+            return Some(delta);
+        }
+    }
+
+    None
 }
