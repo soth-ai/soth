@@ -31,13 +31,18 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<(), rusqlite::Error> {
     let conn = pool.open()?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS transmitted_events (
-            event_id TEXT NOT NULL,
+            event_id TEXT PRIMARY KEY,
             transmitted_at INTEGER NOT NULL,
             batch_id TEXT NOT NULL,
             payload_hash TEXT NOT NULL,
             transmission_status TEXT NOT NULL,
             encrypted INTEGER NOT NULL DEFAULT 0
         )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_transmitted_events_event_id
+         ON transmitted_events(event_id)",
         [],
     )?;
 
@@ -90,18 +95,6 @@ pub async fn write_queued(
         )?;
     }
     tx.commit()?;
-    Ok(())
-}
-
-pub async fn mark_failed(pool: &SqlitePool, batch_id: Uuid) -> Result<(), rusqlite::Error> {
-    ensure_schema(pool).await?;
-    let conn = pool.open()?;
-    conn.execute(
-        "UPDATE transmitted_events
-         SET transmission_status = 'FAILED'
-         WHERE batch_id = ?1",
-        params![batch_id.to_string()],
-    )?;
     Ok(())
 }
 

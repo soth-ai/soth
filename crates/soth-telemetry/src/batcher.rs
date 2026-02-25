@@ -118,11 +118,10 @@ pub(crate) async fn flush_batch(
             // Leave rows in QUEUED. Cloud ack and final status transitions are owned by soth-sync.
         }
         Err(error) => {
-            db::mark_failed(db_pool, transmitted.batch_id()).await?;
             tracing::warn!(
                 batch_id = %transmitted.batch_id(),
                 error = %error,
-                "sink rejected telemetry batch"
+                "sink rejected telemetry batch; keeping rows QUEUED for sync replay"
             );
         }
     }

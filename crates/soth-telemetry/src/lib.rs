@@ -53,6 +53,8 @@ pub enum TelemetryError {
 
 #[async_trait]
 pub trait TelemetrySink: Send + Sync {
+    /// Returns `Ok` once the batch is durably queued for async delivery.
+    /// Final cloud-ack status transitions are owned by soth-sync replay workers.
     async fn send(&self, batch: TransmittedBatch) -> Result<(), SinkError>;
 }
 
@@ -362,7 +364,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sink_failure_marks_failed_and_pipeline_continues() {
+    async fn sink_failure_keeps_rows_queued_and_pipeline_continues() {
         let db = in_memory_db().await;
         let sink = MockSink::new(db.clone());
         sink.set_fail(true);
@@ -374,7 +376,9 @@ mod tests {
         assert_eq!(first_batches.len(), 1);
         let first_batch_id = first_batches[0].batch_id();
         let failed = count_status(db.as_ref(), first_batch_id, "FAILED").await;
-        assert_eq!(failed, 1);
+        assert_eq!(failed, 0);
+        let queued = count_status(db.as_ref(), first_batch_id, "QUEUED").await;
+        assert_eq!(queued, 1);
 
         sink.set_fail(false);
         pipeline.push(test_utils::sample_event(uuid::Uuid::new_v4()));
@@ -384,6 +388,11 @@ mod tests {
         let second_batch_id = all_batches[1].batch_id();
         let queued = count_status(db.as_ref(), second_batch_id, "QUEUED").await;
         assert_eq!(queued, 1);
+        let total_queued = db::count_total_by_status(db.as_ref(), "QUEUED").await;
+        match total_queued {
+            Ok(count) => assert_eq!(count, 2),
+            Err(error) => panic!("failed to query total queued rows: {error}"),
+        }
 
         let shutdown = pipeline.shutdown().await;
         assert!(shutdown.is_ok());
