@@ -3901,8 +3901,12 @@ dependencies = [
 name = "soth-policy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "criterion",
  "dashmap",
+ "ed25519-dalek",
  "parking_lot",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "serde_yaml",

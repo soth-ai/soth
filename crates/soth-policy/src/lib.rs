@@ -5,11 +5,13 @@
 //! - Two-tier decision caching
 //! - YAML policy definition compiler
 //! - Policy file loading and hot-reload support
+//! - `sync_policy` (Phase-1) standalone synchronous policy API scaffold
 
 pub mod cache;
 pub mod compiler;
 pub mod engine;
 pub mod loader;
+pub mod sync_policy;
 #[cfg(feature = "opa-wasm")]
 pub mod wasm;
 
