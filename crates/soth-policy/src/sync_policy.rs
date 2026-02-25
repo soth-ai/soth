@@ -8,7 +8,10 @@ use soth_core::policy::{
     DeploymentModel, MatchedRule, PolicyContext, PolicyDecision, PolicyDecisionKind, PolicyWarning,
     RedactTarget, RerouteTarget, RuleKind,
 };
-use soth_core::{AppType, NormalizedRequest, SensitiveArtifact, TrafficClassification};
+use soth_core::{
+    AnomalyFlag, AppType, NormalizedRequest, SensitiveArtifact, TrafficClassification,
+    UseCaseLabel, VolatilityClass,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -781,7 +784,7 @@ fn evaluate_budget_limits(ctx: &PolicyContext, bundle: &PolicyBundle) -> Option<
     }
 
     if let Some(limit) = bundle.budget_limits.max_cost_usd_per_session {
-        if session.total_cost_usd > limit {
+        if f64::from(session.total_cost_usd) > limit {
             return Some(block_decision(
                 "budget_session_cost_exceeded",
                 "SessionCostBudgetExceeded",
@@ -979,7 +982,15 @@ fn build_eval_scope(
         "detect.artifact_count",
         EvalValue::Number(artifacts.len() as f64),
     );
-    scope.insert("detect.org_pattern_matches", EvalValue::Array(Vec::new()));
+    scope.insert(
+        "detect.org_pattern_matches",
+        EvalValue::Array(
+            extract_org_pattern_matches(artifacts)
+                .into_iter()
+                .map(EvalValue::String)
+                .collect::<Vec<_>>(),
+        ),
+    );
     scope.insert(
         "detect.max_severity",
         max_severity
@@ -1038,7 +1049,10 @@ fn build_eval_scope(
         "session.total_tokens",
         EvalValue::Number(total_tokens as f64),
     );
-    scope.insert("session.total_cost_usd", EvalValue::Number(total_cost));
+    scope.insert(
+        "session.total_cost_usd",
+        EvalValue::Number(f64::from(total_cost)),
+    );
     scope.insert(
         "session.request_count",
         EvalValue::Number(request_count as f64),
@@ -1071,6 +1085,87 @@ fn build_eval_scope(
             .max_requests_per_session
             .map(|value| EvalValue::Number(value as f64))
             .unwrap_or(EvalValue::Null),
+    );
+
+    let semantic = ctx.semantic.as_ref();
+    let semantic_use_case_label = semantic
+        .map(|value| use_case_label(value.use_case_label).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let semantic_use_case_confidence = semantic
+        .map(|value| f64::from(value.use_case_confidence))
+        .unwrap_or(0.0);
+    let semantic_anomaly_score = semantic
+        .map(|value| f64::from(value.anomaly_score))
+        .unwrap_or(0.0);
+    let semantic_anomaly_flags = semantic
+        .map(|value| {
+            value
+                .anomaly_flags
+                .iter()
+                .map(|flag| EvalValue::String(anomaly_flag_label(flag).to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let semantic_complexity_score = semantic
+        .map(|value| value.complexity_score as f64)
+        .unwrap_or(0.0);
+    let semantic_volatility_class = semantic
+        .map(|value| volatility_class_label(value.volatility_class).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let semantic_topic_cluster_id = semantic
+        .map(|value| value.topic_cluster_id as f64)
+        .unwrap_or(0.0);
+
+    scope.insert("semantic.present", EvalValue::Bool(semantic.is_some()));
+    scope.insert(
+        "semantic.use_case_label",
+        EvalValue::String(semantic_use_case_label.clone()),
+    );
+    scope.insert(
+        "semantic.use_case_confidence",
+        EvalValue::Number(semantic_use_case_confidence),
+    );
+    scope.insert(
+        "semantic.anomaly_score",
+        EvalValue::Number(semantic_anomaly_score),
+    );
+    scope.insert(
+        "semantic.anomaly_flags",
+        EvalValue::Array(semantic_anomaly_flags.clone()),
+    );
+    scope.insert(
+        "semantic.complexity_score",
+        EvalValue::Number(semantic_complexity_score),
+    );
+    scope.insert(
+        "semantic.volatility_class",
+        EvalValue::String(semantic_volatility_class.clone()),
+    );
+    scope.insert(
+        "semantic.topic_cluster_id",
+        EvalValue::Number(semantic_topic_cluster_id),
+    );
+
+    // Backward-compatible aliases for existing rule sets that referenced semantic fields
+    // without a prefix.
+    scope.insert("use_case_label", EvalValue::String(semantic_use_case_label));
+    scope.insert(
+        "use_case_confidence",
+        EvalValue::Number(semantic_use_case_confidence),
+    );
+    scope.insert("anomaly_score", EvalValue::Number(semantic_anomaly_score));
+    scope.insert("anomaly_flags", EvalValue::Array(semantic_anomaly_flags));
+    scope.insert(
+        "complexity_score",
+        EvalValue::Number(semantic_complexity_score),
+    );
+    scope.insert(
+        "volatility_class",
+        EvalValue::String(semantic_volatility_class),
+    );
+    scope.insert(
+        "topic_cluster_id",
+        EvalValue::Number(semantic_topic_cluster_id),
     );
 
     scope
@@ -1288,6 +1383,22 @@ fn extract_detected_languages(artifacts: &[SensitiveArtifact]) -> Vec<String> {
     out
 }
 
+fn extract_org_pattern_matches(artifacts: &[SensitiveArtifact]) -> Vec<String> {
+    let mut matches = artifacts
+        .iter()
+        .filter_map(|artifact| {
+            if let ArtifactKind::OrgPattern { pattern_id } = &artifact.kind {
+                Some(pattern_id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
 fn max_artifact_severity(artifacts: &[SensitiveArtifact]) -> Option<String> {
     let mut best: Option<(String, u8)> = None;
     for artifact in artifacts {
@@ -1370,6 +1481,50 @@ fn parse_source_label(value: soth_core::ParseSource) -> &'static str {
         soth_core::ParseSource::AgentApp => "agent_app",
         soth_core::ParseSource::Heuristic => "heuristic",
         soth_core::ParseSource::Filtered => "filtered",
+    }
+}
+
+fn use_case_label(value: UseCaseLabel) -> &'static str {
+    match value {
+        UseCaseLabel::CodeGeneration => "code_generation",
+        UseCaseLabel::CodeReview => "code_review",
+        UseCaseLabel::CodeDebugging => "code_debugging",
+        UseCaseLabel::CodeRefactor => "code_refactor",
+        UseCaseLabel::TextSummarization => "text_summarization",
+        UseCaseLabel::TextGeneration => "text_generation",
+        UseCaseLabel::Translation => "translation",
+        UseCaseLabel::DataAnalysis => "data_analysis",
+        UseCaseLabel::DataExtraction => "data_extraction",
+        UseCaseLabel::QuestionAnswering => "question_answering",
+        UseCaseLabel::DocumentSearch => "document_search",
+        UseCaseLabel::AgentTask => "agent_task",
+        UseCaseLabel::ToolOrchestration => "tool_orchestration",
+        UseCaseLabel::ImageAnalysis => "image_analysis",
+        UseCaseLabel::AudioTranscription => "audio_transcription",
+        UseCaseLabel::SystemPromptOnly => "system_prompt_only",
+        UseCaseLabel::Unknown => "unknown",
+    }
+}
+
+fn anomaly_flag_label(value: &AnomalyFlag) -> &'static str {
+    match value {
+        AnomalyFlag::TopicDrift => "topic_drift",
+        AnomalyFlag::CredentialBurst => "credential_burst",
+        AnomalyFlag::TokenBurst => "token_burst",
+        AnomalyFlag::ModelSwitch => "model_switch",
+        AnomalyFlag::AgentLoopPattern => "agent_loop_pattern",
+        AnomalyFlag::RapidFireRequests => "rapid_fire_requests",
+        AnomalyFlag::UnusualSystemPromptChange => "unusual_system_prompt_change",
+        AnomalyFlag::ToolCallDepthSpike => "tool_call_depth_spike",
+    }
+}
+
+fn volatility_class_label(value: VolatilityClass) -> &'static str {
+    match value {
+        VolatilityClass::Static => "static",
+        VolatilityClass::LowVolatile => "low_volatile",
+        VolatilityClass::Dynamic => "dynamic",
+        VolatilityClass::HighlyDynamic => "highly_dynamic",
     }
 }
 
@@ -1544,6 +1699,18 @@ mod tests {
             skip_org_rules: false,
             semantic: None,
             session: session.unwrap_or_default(),
+        }
+    }
+
+    fn fixture_semantic_context() -> soth_core::SemanticPolicyContext {
+        soth_core::SemanticPolicyContext {
+            use_case_label: soth_core::UseCaseLabel::CodeGeneration,
+            use_case_confidence: 0.94,
+            anomaly_score: 0.87,
+            anomaly_flags: vec![soth_core::AnomalyFlag::TokenBurst],
+            complexity_score: 4,
+            volatility_class: soth_core::VolatilityClass::Dynamic,
+            topic_cluster_id: 42,
         }
     }
 
@@ -1914,6 +2081,84 @@ mod tests {
 
         let out = evaluate(&fixture_request(), &[], &fixture_context(None), &bundle);
         assert!(matches!(out.kind, PolicyDecisionKind::Allow));
+    }
+
+    #[test]
+    fn phase3_semantic_context_fields_are_available_to_org_rules() {
+        let payload = fixture_payload_with_org_rules(vec![org_rule(
+            "org_semantic_block",
+            "semantic.use_case_label == \"code_generation\" && semantic.anomaly_flags.contains(\"token_burst\") && semantic.topic_cluster_id == 42",
+            RuleAction::Block {
+                status: 403,
+                message: "semantic policy block".to_string(),
+            },
+        )]);
+
+        let bundle = match load_bundle_from_bytes(&signed_bundle_bytes(payload)) {
+            Ok(bundle) => bundle,
+            Err(error) => panic!("bundle should load: {error}"),
+        };
+
+        let mut ctx = fixture_context(None);
+        ctx.semantic = Some(fixture_semantic_context());
+
+        let out = evaluate(&fixture_request(), &[], &ctx, &bundle);
+        assert_block_rule(&out, "org_semantic_block");
+    }
+
+    #[test]
+    fn phase3_org_pattern_matches_are_exposed_from_artifacts() {
+        let payload = fixture_payload_with_org_rules(vec![org_rule(
+            "org_pattern_block",
+            "detect.org_pattern_matches.contains(\"7\")",
+            RuleAction::Block {
+                status: 403,
+                message: "org pattern matched".to_string(),
+            },
+        )]);
+        let bundle = match load_bundle_from_bytes(&signed_bundle_bytes(payload)) {
+            Ok(bundle) => bundle,
+            Err(error) => panic!("bundle should load: {error}"),
+        };
+
+        let artifacts = vec![artifact(
+            ArtifactKind::OrgPattern { pattern_id: 7 },
+            ArtifactSeverity::High,
+        )];
+        let out = evaluate(
+            &fixture_request(),
+            &artifacts,
+            &fixture_context(None),
+            &bundle,
+        );
+        assert_block_rule(&out, "org_pattern_block");
+    }
+
+    #[test]
+    fn phase3_semantic_alias_fields_remain_backward_compatible() {
+        let payload = fixture_payload_with_org_rules(vec![org_rule(
+            "org_semantic_alias_block",
+            "use_case_label == \"code_generation\" && anomaly_score > 0.8",
+            RuleAction::Block {
+                status: 403,
+                message: "semantic alias block".to_string(),
+            },
+        )]);
+
+        let bundle = match load_bundle_from_bytes(&signed_bundle_bytes(payload)) {
+            Ok(bundle) => bundle,
+            Err(error) => panic!("bundle should load: {error}"),
+        };
+
+        let mut ctx = fixture_context(None);
+        ctx.semantic = Some(fixture_semantic_context());
+        let blocked = evaluate(&fixture_request(), &[], &ctx, &bundle);
+        assert_block_rule(&blocked, "org_semantic_alias_block");
+
+        ctx.semantic = None;
+        let allowed = evaluate(&fixture_request(), &[], &ctx, &bundle);
+        assert!(matches!(allowed.kind, PolicyDecisionKind::Allow));
+        assert!(allowed.warnings.is_empty());
     }
 
     #[test]
