@@ -158,3 +158,87 @@ fn provider_entry_to_format(provider_id: &str, entry: Option<&ProviderEntry>) ->
 
     DetectedFormat::Unknown
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::OwnedDetectBundle;
+    use std::collections::BTreeMap;
+
+    fn bundle_fixture() -> OwnedDetectBundle {
+        let mut bundle = OwnedDetectBundle::default();
+        bundle.llm_providers.insert(
+            "hint-jsonrpc".to_string(),
+            ProviderEntry {
+                provider_id: Some("hint-jsonrpc".to_string()),
+                name: Some("hint-jsonrpc".to_string()),
+                api_format: Some("jsonrpc".to_string()),
+            },
+        );
+        bundle.llm_providers.insert(
+            "openai".to_string(),
+            ProviderEntry {
+                provider_id: Some("openai".to_string()),
+                name: Some("openai".to_string()),
+                api_format: Some("openai".to_string()),
+            },
+        );
+        bundle
+            .domain_index
+            .insert("api.openai.com".to_string(), "openai".to_string());
+        bundle
+    }
+
+    fn headers(items: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for (k, v) in items {
+            out.insert((*k).to_string(), (*v).to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn matched_provider_hint_overrides_ambiguous_request() {
+        let bundle = bundle_fixture();
+        let detected = fingerprint(
+            "POST",
+            "/internal/proxy",
+            &headers(&[("content-type", "text/plain")]),
+            br#"{"hello":"world"}"#,
+            Some("hint-jsonrpc"),
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::JsonRpc);
+    }
+
+    #[test]
+    fn grpc_content_type_takes_priority_over_hint() {
+        let bundle = bundle_fixture();
+        let detected = fingerprint(
+            "POST",
+            "/v1/chat/completions",
+            &headers(&[("content-type", "application/grpc+proto")]),
+            b"\x0a\x01a",
+            Some("openai"),
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::GrpcProtobuf);
+    }
+
+    #[test]
+    fn host_domain_index_maps_to_provider_format() {
+        let bundle = bundle_fixture();
+        let detected = fingerprint(
+            "POST",
+            "/anything",
+            &headers(&[
+                ("host", "api.openai.com"),
+                ("content-type", "application/octet-stream"),
+            ]),
+            br#"{}"#,
+            None,
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::OpenAIRest);
+    }
+}

@@ -299,3 +299,94 @@ fn parse_multipart_payload_text(payload: &[u8]) -> Option<String> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ArtifactType, OwnedDetectBundle};
+    use uuid::Uuid;
+
+    #[test]
+    fn full_capture_chunk_emits_credential_artifacts() {
+        let bundle = OwnedDetectBundle::default();
+        let mut session = StreamSession::new(Uuid::new_v4(), CaptureMode::Full);
+        let chunk = StreamChunk {
+            connection_id: session.connection_id,
+            sequence: 7,
+            payload: Bytes::from_static(
+                b"data: {\"delta\":{\"content\":\"token sk-abcdefghijklmnopqrstuvwxyz1234\"}}\n\n",
+            ),
+            frame_kind: FrameKind::SseData,
+        };
+
+        let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
+        let out = out.expect("full capture should emit artifact on credential pattern");
+        assert_eq!(out.sequence, 7);
+        assert!(out
+            .artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::OpenAIKey)));
+    }
+
+    #[test]
+    fn metadata_only_chunk_does_not_emit_credential_artifacts() {
+        let bundle = OwnedDetectBundle::default();
+        let mut session = StreamSession::new(Uuid::new_v4(), CaptureMode::MetadataOnly);
+        let chunk = StreamChunk {
+            connection_id: session.connection_id,
+            sequence: 1,
+            payload: Bytes::from_static(
+                b"data: {\"delta\":{\"content\":\"token sk-abcdefghijklmnopqrstuvwxyz1234\"}}\n\n",
+            ),
+            frame_kind: FrameKind::SseData,
+        };
+
+        let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn finalize_stream_detect_honors_capture_mode_and_content() {
+        let mut session = StreamSession::new(Uuid::new_v4(), CaptureMode::SensitiveArtifacts);
+        session.accumulate("hello ");
+        session.accumulate("sk-abcdefghijklmnopqrstuvwxyz1234");
+
+        let out = finalize_stream_detect(session);
+        assert_eq!(out.confidence, ParseConfidence::Heuristic);
+        assert!(matches!(out.parse_source, ParseSource::Heuristic));
+        assert_eq!(out.capture_mode, CaptureMode::SensitiveArtifacts);
+        assert!(!out.artifacts.is_empty());
+    }
+
+    #[test]
+    fn scan_proto_strings_extracts_length_delimited_fields() {
+        let payload = encode_proto_string_fields(&[(1, "abc"), (2, "hello grpc response")]);
+        let extracted = scan_proto_strings(payload.as_slice());
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].0, 2);
+        assert_eq!(extracted[0].1, "hello grpc response");
+    }
+
+    fn encode_proto_string_fields(entries: &[(u32, &str)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (field_number, text) in entries {
+            let tag = ((*field_number as u64) << 3) | 2;
+            encode_varint(tag, &mut out);
+            encode_varint(text.len() as u64, &mut out);
+            out.extend_from_slice(text.as_bytes());
+        }
+        out
+    }
+
+    fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            if value < 0x80 {
+                out.push(value as u8);
+                break;
+            }
+            out.push(((value & 0x7f) as u8) | 0x80);
+            value >>= 7;
+        }
+    }
+}

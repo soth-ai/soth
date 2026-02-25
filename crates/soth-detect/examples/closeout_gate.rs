@@ -1,8 +1,9 @@
 use bytes::Bytes;
+use soth_core::{DetectResult, ParseSource};
 use soth_detect::{
-    process_with_registry, CaptureMode, CaptureRules, ConnectionMeta, DetectResult,
-    GraphQLOperationRegistry, GrpcServiceRegistry, OwnedDetectBundle, ParseSource, ParserRegistry,
-    ProviderEntry, RawRequest, RestFormatDescriptor, RestRequestPaths, SocketFamily,
+    process_with_registry, CaptureMode, CaptureRules, ConnectionMeta, GraphQLOperationRegistry,
+    GrpcServiceRegistry, OwnedDetectBundle, ParserRegistry, ProviderEntry, RawRequest,
+    RestFormatDescriptor, RestRequestPaths, SocketFamily,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -167,15 +168,11 @@ fn env_u64(name: &str) -> Option<u64> {
 
 fn parse_source_name(out: &DetectResult) -> String {
     match &out.parse_source {
-        ParseSource::OpenAI => "openai".to_string(),
-        ParseSource::Anthropic => "anthropic".to_string(),
-        ParseSource::Cohere => "cohere".to_string(),
-        ParseSource::Google => "google".to_string(),
-        ParseSource::Bedrock => "bedrock".to_string(),
-        ParseSource::GraphQL { .. } => "graphql".to_string(),
-        ParseSource::Grpc { .. } => "grpc".to_string(),
-        ParseSource::JsonRpc { .. } => "jsonrpc".to_string(),
-        ParseSource::AgentApp { .. } => "agent_app".to_string(),
+        ParseSource::Rest { provider } => provider.canonical_name().to_string(),
+        ParseSource::GraphQl => "graphql".to_string(),
+        ParseSource::Grpc => "grpc".to_string(),
+        ParseSource::JsonRpc => "jsonrpc".to_string(),
+        ParseSource::AgentApp => "agent_app".to_string(),
         ParseSource::Heuristic => "heuristic".to_string(),
         ParseSource::Filtered => "filtered".to_string(),
     }

@@ -20,16 +20,19 @@ mod util;
 use once_cell::sync::Lazy;
 
 pub use core_output::to_core_detect_result;
-pub use engine::{
-    process, process_with_intelligence, process_with_registry,
-    process_with_registry_and_intelligence, ParserRegistry,
-};
+pub use engine::ParserRegistry;
 pub use identity::resolve_app_identity;
 pub use intelligence::*;
 pub use intelligence_store::IntelligenceStore;
 pub use replay::replay_heuristic_events;
 pub use stream::{finalize_stream_summary, process_chunk_with_bundle, scan_proto_strings};
 pub use types::*;
+
+#[cfg(test)]
+pub use engine::{
+    process, process_with_intelligence, process_with_registry,
+    process_with_registry_and_intelligence,
+};
 
 pub type StreamDetectState = StreamSession;
 pub type PartialDetectResult = ChunkArtifact;
@@ -55,8 +58,44 @@ impl std::fmt::Display for DetectError {
 
 impl std::error::Error for DetectError {}
 
-pub fn build_registry(_bundle: &DetectBundleSlice<'_>) -> Result<ParserRegistry, DetectError> {
-    Ok(ParserRegistry::default())
+pub fn build_registry(bundle: &DetectBundleSlice<'_>) -> Result<ParserRegistry, DetectError> {
+    let apq_cache_capacity = bundle.graphql_operations.operations.len().clamp(512, 4096);
+    Ok(ParserRegistry::new(apq_cache_capacity))
+}
+
+#[cfg(not(test))]
+pub fn process(req: &RawRequest, bundle: &DetectBundleSlice<'_>) -> soth_core::DetectResult {
+    to_core_detect_result(&engine::process(req, bundle))
+}
+
+#[cfg(not(test))]
+pub fn process_with_intelligence(
+    req: &RawRequest,
+    bundle: &DetectBundleSlice<'_>,
+    sink: &dyn IntelligenceSink,
+) -> soth_core::DetectResult {
+    to_core_detect_result(&engine::process_with_intelligence(req, bundle, sink))
+}
+
+#[cfg(not(test))]
+pub fn process_with_registry(
+    registry: &ParserRegistry,
+    req: &RawRequest,
+    bundle: &DetectBundleSlice<'_>,
+) -> soth_core::DetectResult {
+    to_core_detect_result(&engine::process_with_registry(registry, req, bundle))
+}
+
+#[cfg(not(test))]
+pub fn process_with_registry_and_intelligence(
+    registry: &ParserRegistry,
+    req: &RawRequest,
+    bundle: &DetectBundleSlice<'_>,
+    sink: &dyn IntelligenceSink,
+) -> soth_core::DetectResult {
+    to_core_detect_result(&engine::process_with_registry_and_intelligence(
+        registry, req, bundle, sink,
+    ))
 }
 
 pub fn process_chunk(
@@ -67,8 +106,8 @@ pub fn process_chunk(
     stream::process_chunk_with_bundle(chunk, state, &EMPTY_BUNDLE.as_slice())
 }
 
-pub fn finalize_stream(state: StreamDetectState) -> DetectResult {
-    stream::finalize_stream_detect(state)
+pub fn finalize_stream(state: StreamDetectState) -> soth_core::DetectResult {
+    to_core_detect_result(&stream::finalize_stream_detect(state))
 }
 
 #[cfg(test)]
@@ -571,6 +610,161 @@ mod tests {
 
         assert!(replay.total_candidates >= 1);
         assert!(replay.upgraded >= 1);
+    }
+
+    #[test]
+    fn capture_mode_from_connection_meta_overrides_bundle_default_to_full() {
+        let mut bundle = bundle_fixture();
+        bundle.capture_rules.default_mode = CaptureMode::MetadataOnly;
+
+        let mut request = RawRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            headers: {
+                let mut headers = BTreeMap::new();
+                headers.insert("content-type".to_string(), "application/json".to_string());
+                headers
+            },
+            body: Bytes::from_static(
+                br#"{"model":"gpt-4o","messages":[{"role":"user","content":"token sk-abcdefghijklmnopqrstuvwxyz1234"}]}"#,
+            ),
+            connection_meta: connection_meta_tcp(),
+        };
+        request.connection_meta.capture_mode = Some(CaptureMode::Full);
+
+        let out = process(&request, &bundle.as_slice());
+        assert_eq!(out.capture_mode, CaptureMode::Full);
+        assert!(out
+            .artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::OpenAIKey)));
+    }
+
+    #[test]
+    fn capture_mode_from_connection_meta_overrides_bundle_default_to_metadata_only() {
+        let mut bundle = bundle_fixture();
+        bundle.capture_rules.default_mode = CaptureMode::Full;
+
+        let mut request = RawRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            headers: {
+                let mut headers = BTreeMap::new();
+                headers.insert("content-type".to_string(), "application/json".to_string());
+                headers
+            },
+            body: Bytes::from_static(
+                br#"{"model":"gpt-4o","messages":[{"role":"user","content":"token sk-abcdefghijklmnopqrstuvwxyz1234"}]}"#,
+            ),
+            connection_meta: connection_meta_tcp(),
+        };
+        request.connection_meta.capture_mode = Some(CaptureMode::MetadataOnly);
+
+        let out = process(&request, &bundle.as_slice());
+        assert_eq!(out.capture_mode, CaptureMode::MetadataOnly);
+        assert!(out.artifacts.is_empty());
+    }
+
+    #[test]
+    fn malformed_rest_body_falls_back_to_heuristic_with_parser_warning() {
+        let bundle = bundle_fixture();
+
+        let request = RawRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            headers: {
+                let mut headers = BTreeMap::new();
+                headers.insert("content-type".to_string(), "application/json".to_string());
+                headers
+            },
+            body: Bytes::from_static(br#"{"model":"gpt-4o","messages":[{"role":"user"}"#),
+            connection_meta: connection_meta_tcp(),
+        };
+
+        let out = process(&request, &bundle.as_slice());
+        assert_eq!(out.confidence, ParseConfidence::Heuristic);
+        assert!(matches!(out.parse_source, ParseSource::Heuristic));
+        assert!(out.warnings.iter().any(|w| w.code == "parser_error"));
+        assert!(out
+            .normalized
+            .parse_warnings
+            .iter()
+            .any(|w| matches!(w, ParseWarning::ParserError(_))));
+    }
+
+    #[test]
+    fn matched_provider_hint_promotes_unknown_path_to_rest_parser() {
+        let bundle = bundle_fixture();
+
+        let base = RawRequest {
+            method: "POST".to_string(),
+            path: "/internal/proxy".to_string(),
+            headers: {
+                let mut headers = BTreeMap::new();
+                headers.insert("content-type".to_string(), "application/json".to_string());
+                headers
+            },
+            body: Bytes::from_static(
+                br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello hint"}]}"#,
+            ),
+            connection_meta: connection_meta_tcp(),
+        };
+
+        let without_hint = process(&base, &bundle.as_slice());
+        assert!(matches!(without_hint.parse_source, ParseSource::Heuristic));
+
+        let mut with_hint_req = base.clone();
+        with_hint_req.connection_meta.matched_provider = Some("openai".to_string());
+        let with_hint = process(&with_hint_req, &bundle.as_slice());
+        assert!(matches!(with_hint.parse_source, ParseSource::OpenAI));
+        assert_eq!(with_hint.confidence, ParseConfidence::Full);
+        assert_eq!(with_hint.normalized.model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn jsonrpc_batch_request_sets_format_meta_batch_true() {
+        let bundle = bundle_fixture();
+        let request = RawRequest {
+            method: "POST".to_string(),
+            path: "/rpc".to_string(),
+            headers: {
+                let mut headers = BTreeMap::new();
+                headers.insert(
+                    "content-type".to_string(),
+                    "application/json-rpc".to_string(),
+                );
+                headers
+            },
+            body: Bytes::from_static(
+                br#"[
+                    {
+                        "jsonrpc":"2.0",
+                        "id":"1",
+                        "method":"health.ping",
+                        "params":{"ping":"ok"}
+                    },
+                    {
+                        "jsonrpc":"2.0",
+                        "id":"2",
+                        "method":"chat.completions",
+                        "params":{
+                            "model":"gpt-4o-mini",
+                            "messages":[{"role":"user","content":"hello batch"}]
+                        }
+                    }
+                ]"#,
+            ),
+            connection_meta: connection_meta_tcp(),
+        };
+
+        let out = process(&request, &bundle.as_slice());
+        assert_eq!(out.confidence, ParseConfidence::Full);
+        if let FormatMeta::JsonRpc { method, is_batch } = &out.normalized.format_meta {
+            assert_eq!(method.as_deref(), Some("chat.completions"));
+            assert!(*is_batch);
+        } else {
+            panic!("expected jsonrpc format meta");
+        }
     }
 
     fn bundle_fixture() -> OwnedDetectBundle {

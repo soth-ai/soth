@@ -173,3 +173,73 @@ fn replace_all(input: &str, regex: &Option<Regex>, replacement: &str) -> String 
     };
     regex.replace_all(input, replacement).to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_scan_detects_multiple_artifact_types() {
+        let body = br#"
+openai=sk-abcdefghijklmnopqrstuvwxyz1234
+anthropic=sk-ant-abcdefghijklmnopqrstuvwx1234
+aws=AKIA1234567890ABCDEF
+github=ghp_abcdefghijklmnopqrstuvwxyz1234
+gitlab=glpat-abcdefghijklmnopqrstuvwx
+jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signaturetoken
+db=postgres://user:pass@db.local:5432/app
+-----BEGIN PRIVATE KEY-----
+"#;
+
+        let artifacts = credential_scan(body, ArtifactLocation::Unknown);
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::OpenAIKey)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::AnthropicKey)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::AwsAccessKey)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::GitHubPat)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::GitLabToken)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::JwtToken)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::ConnectionString)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.artifact_type, ArtifactType::PrivateKey)));
+    }
+
+    #[test]
+    fn redact_sensitive_text_masks_known_patterns() {
+        let input = concat!(
+            "token=sk-abcdefghijklmnopqrstuvwxyz1234 ",
+            "aws=AKIA1234567890ABCDEF ",
+            "db=postgres://user:pass@db.local:5432/app ",
+            "-----BEGIN PRIVATE KEY-----"
+        );
+
+        let redacted = redact_sensitive_text(input);
+        assert!(redacted.contains("<REDACTED_OPENAI_KEY>"));
+        assert!(redacted.contains("<REDACTED_AWS_ACCESS_KEY>"));
+        assert!(redacted.contains("<REDACTED_CONNECTION_STRING>"));
+        assert!(redacted.contains("<REDACTED_PRIVATE_KEY_HEADER>"));
+        assert!(!redacted.contains("sk-abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(!redacted.contains("AKIA1234567890ABCDEF"));
+        assert!(!redacted.contains("postgres://user:pass@db.local:5432/app"));
+    }
+
+    #[test]
+    fn credential_scan_empty_input_is_empty() {
+        let artifacts = credential_scan(b"", ArtifactLocation::Unknown);
+        assert!(artifacts.is_empty());
+    }
+}
