@@ -25,6 +25,7 @@ pub(crate) fn run(
     let (cluster, stage2_us) = if embed.vector.is_some() {
         stage2_cluster::run(
             embed.vector.as_deref(),
+            bundle.centroids.as_slice(),
             proxy_ctx.session_snapshot.as_ref(),
             config,
         )

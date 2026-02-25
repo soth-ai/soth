@@ -28,6 +28,7 @@ pub struct ClassifyBundle {
     pub(crate) classifier: Arc<dyn ClassificationProvider>,
     pub(crate) anomaly_scorer: Arc<dyn AnomalyScorer>,
     pub(crate) policy_bundle: Arc<soth_policy::PolicyBundle>,
+    pub(crate) centroids: Arc<Vec<Vec<f32>>>,
     pub bundle_version: String,
     pub has_real_models: bool,
 }
@@ -75,6 +76,7 @@ impl ClassifyBundle {
             classifier: Arc::new(KeywordClassifier),
             anomaly_scorer: Arc::new(StaticAnomalyScorer),
             policy_bundle,
+            centroids: Arc::new(Vec::new()),
             bundle_version,
             has_real_models: false,
         })
@@ -86,6 +88,7 @@ impl ClassifyBundle {
     ) -> Result<Arc<Self>, BundleLoadError> {
         verify_assets(&manifest, &assets)?;
         let policy_bundle = load_policy_bundle(&assets)?;
+        let centroids = load_centroids(&assets)?;
         let has_real_models = CLASSIFY_MODEL_ASSETS
             .iter()
             .all(|path| asset_bytes_for_path(&assets, path).is_some());
@@ -107,6 +110,7 @@ impl ClassifyBundle {
             classifier,
             anomaly_scorer,
             policy_bundle,
+            centroids: Arc::new(centroids),
             bundle_version: version,
             has_real_models,
         }))
@@ -261,6 +265,45 @@ fn load_policy_bundle(
     Ok(Arc::new(fallback_policy_bundle()))
 }
 
+fn load_centroids(assets: &HashMap<String, Vec<u8>>) -> Result<Vec<Vec<f32>>, BundleLoadError> {
+    let Some(bytes) = asset_bytes_for_path(assets, "classify/centroids.bin") else {
+        return Ok(Vec::new());
+    };
+
+    let row_bytes = 384 * std::mem::size_of::<f32>();
+    if bytes.len() % row_bytes != 0 {
+        let floats = bytes.len() / std::mem::size_of::<f32>();
+        let rows = if floats == 0 { 0 } else { 1 };
+        let cols = if rows == 0 { 0 } else { floats };
+        return Err(BundleLoadError::InvalidCentroidShape { rows, cols });
+    }
+
+    let rows = bytes.len() / row_bytes;
+    if rows == 0 {
+        return Err(BundleLoadError::InvalidCentroidShape { rows: 0, cols: 384 });
+    }
+
+    let mut centroids = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let start = row * row_bytes;
+        let mut centroid = Vec::with_capacity(384);
+        for col in 0..384 {
+            let offset = start + col * 4;
+            let value = f32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]);
+            centroid.push(value);
+        }
+        l2_normalize(&mut centroid);
+        centroids.push(centroid);
+    }
+
+    Ok(centroids)
+}
+
 fn asset_bytes_for_path<'a>(assets: &'a HashMap<String, Vec<u8>>, path: &str) -> Option<&'a [u8]> {
     if let Some(bytes) = assets.get(path) {
         return Some(bytes.as_slice());
@@ -287,6 +330,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+fn l2_normalize(values: &mut [f32]) {
+    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm <= 1e-9 {
+        return;
+    }
+    for value in values {
+        *value /= norm;
+    }
 }
 
 #[derive(Debug, Error)]
@@ -354,13 +407,30 @@ mod tests {
     fn model_assets() -> HashMap<String, Vec<u8>> {
         HashMap::from([
             ("classify/embedding.onnx".to_string(), b"onnx".to_vec()),
-            ("classify/centroids.bin".to_string(), b"centroids".to_vec()),
+            ("classify/centroids.bin".to_string(), centroid_asset_bytes()),
             (
                 "classify/lsh_projection.bin".to_string(),
                 b"lsh-projection".to_vec(),
             ),
             ("classify/use_case_mlp.bin".to_string(), b"mlp".to_vec()),
         ])
+    }
+
+    fn centroid_asset_bytes() -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in 0..2usize {
+            for col in 0..384usize {
+                let value = if row == 0 && col == 0 {
+                    1.0f32
+                } else if row == 1 && col == 1 {
+                    1.0f32
+                } else {
+                    0.0f32
+                };
+                out.extend_from_slice(value.to_le_bytes().as_slice());
+            }
+        }
+        out
     }
 
     fn manifest_bytes(version: &str, assets: &HashMap<String, Vec<u8>>) -> Vec<u8> {
@@ -406,6 +476,8 @@ mod tests {
 
         assert_eq!(bundle.bundle_version, "bundle-test-v1");
         assert!(bundle.has_real_models);
+        assert_eq!(bundle.centroids.len(), 2);
+        assert_eq!(bundle.centroids[0].len(), 384);
         assert_eq!(bundle.classifier.bundle_version(), "bundle-test-v1");
         let embedding = vec![1.0f32 / 384.0f32.sqrt(); 384];
         let classified = bundle.classifier.classify(embedding.as_slice());
@@ -455,6 +527,7 @@ mod tests {
         let bundle = ClassifyBundle::load(dir.path()).expect("bundle should load");
         assert_eq!(bundle.bundle_version, "bundle-disk-v1");
         assert!(bundle.has_real_models);
+        assert_eq!(bundle.centroids.len(), 2);
         assert_eq!(bundle.classifier.bundle_version(), "bundle-disk-v1");
         assert_eq!(
             bundle.policy_bundle.metadata.bundle_version,

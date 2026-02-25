@@ -127,11 +127,13 @@ fn heuristic_score(signals: &AnomalySignals) -> (f32, Vec<AnomalyFlag>) {
         flags.push(AnomalyFlag::ModelSwitch);
         score += 0.1;
     }
-    if signals.inter_request_ms.map(|ms| ms < 500).unwrap_or(false)
-        && signals.session_request_count > 3
-    {
-        flags.push(AnomalyFlag::AgentLoopPattern);
-        score += 0.15;
+    if signals.inter_request_ms.map(|ms| ms < 500).unwrap_or(false) {
+        flags.push(AnomalyFlag::RapidFireRequests);
+        score += 0.1;
+        if signals.session_request_count > 3 {
+            flags.push(AnomalyFlag::AgentLoopPattern);
+            score += 0.05;
+        }
     }
     if signals.tool_call_depth > 10 {
         flags.push(AnomalyFlag::ToolCallDepthSpike);
@@ -343,7 +345,35 @@ mod tests {
             &scorer,
         );
 
-        assert_eq!(out.flags, vec![AnomalyFlag::AgentLoopPattern]);
+        assert_eq!(
+            out.flags,
+            vec![
+                AnomalyFlag::RapidFireRequests,
+                AnomalyFlag::AgentLoopPattern
+            ]
+        );
+    }
+
+    #[test]
+    fn rapid_fire_requests_triggers_without_agent_loop_when_request_count_low() {
+        let mut session = baseline_session();
+        session.request_count = 2;
+        session.last_request_timestamp = Some(9_900);
+        let normalized = baseline_normalized();
+        let scorer = FixedScorer {
+            score: 0.0,
+            flags: Vec::new(),
+        };
+
+        let out = run_flags(
+            Some(vec![1.0, 0.0]),
+            normalized,
+            Vec::new(),
+            session,
+            &scorer,
+        );
+
+        assert_eq!(out.flags, vec![AnomalyFlag::RapidFireRequests]);
     }
 
     #[test]

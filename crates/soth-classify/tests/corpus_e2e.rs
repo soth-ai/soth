@@ -197,7 +197,7 @@ fn bundle_loader_contract_supports_bytes_and_directory() {
 
     let assets = HashMap::from([
         ("classify/embedding.onnx".to_string(), b"onnx".to_vec()),
-        ("classify/centroids.bin".to_string(), b"centroids".to_vec()),
+        ("classify/centroids.bin".to_string(), centroid_asset_bytes()),
         (
             "classify/lsh_projection.bin".to_string(),
             b"lsh_projection".to_vec(),
@@ -244,6 +244,23 @@ fn bundle_loader_contract_supports_bytes_and_directory() {
         err,
         soth_classify::BundleLoadError::AssetHashMismatch { .. }
     ));
+}
+
+fn centroid_asset_bytes() -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in 0..2usize {
+        for col in 0..384usize {
+            let value = if row == 0 && col == 0 {
+                1.0f32
+            } else if row == 1 && col == 1 {
+                1.0f32
+            } else {
+                0.0f32
+            };
+            out.extend_from_slice(value.to_le_bytes().as_slice());
+        }
+    }
+    out
 }
 
 fn assert_loader_policy_works(bundle: &soth_classify::ClassifyBundle) {

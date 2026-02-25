@@ -41,6 +41,23 @@ pub(crate) fn run(
         };
     };
 
+    let embedded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| embed_text(text)))
+        .ok()
+        .unwrap_or_default();
+    let (vector, norm) = embedded.unwrap_or((Vec::new(), 0.0));
+
+    EmbedOutput {
+        vector: if vector.is_empty() {
+            None
+        } else {
+            Some(vector)
+        },
+        norm,
+        latency_us: started.elapsed().as_micros() as u64,
+    }
+}
+
+fn embed_text(text: &str) -> Option<(Vec<f32>, f32)> {
     let mut vec = vec![0.0f32; 384];
     for (idx, byte) in text.as_bytes().iter().enumerate() {
         let pos = idx % 384;
@@ -49,15 +66,13 @@ pub(crate) fn run(
 
     let norm_sq = vec.iter().map(|value| value * value).sum::<f32>();
     let norm = norm_sq.sqrt();
-    if norm > 1e-9 {
-        for value in &mut vec {
-            *value /= norm;
-        }
+    if norm <= 1e-9 {
+        return None;
     }
 
-    EmbedOutput {
-        vector: Some(vec),
-        norm,
-        latency_us: started.elapsed().as_micros() as u64,
+    for value in &mut vec {
+        *value /= norm;
     }
+
+    Some((vec, norm))
 }
