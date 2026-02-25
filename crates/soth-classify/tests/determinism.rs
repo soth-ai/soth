@@ -46,6 +46,7 @@ fn heuristic_without_model_skips_embedding() {
     let config = soth_classify::ClassifyConfig::default();
     let mut detect = common::make_detect_result();
     detect.normalized.parse_confidence = soth_core::ParseConfidence::Heuristic;
+    detect.confidence = soth_core::ParseConfidence::Heuristic;
     detect.normalized.model = None;
 
     let proxy = common::make_proxy_ctx(None);

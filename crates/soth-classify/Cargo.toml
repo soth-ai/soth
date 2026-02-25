@@ -23,6 +23,7 @@ hex = "0.4"
 criterion = "0.5"
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "classify_bench"

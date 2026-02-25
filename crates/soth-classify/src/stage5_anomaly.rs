@@ -166,13 +166,11 @@ mod tests {
             total_cost_usd: 0.1,
             request_count: 10,
             credential_alerts: 0,
-            topic_cluster_ids_seen: Vec::new(),
             embedding_centroid: Some(vec![1.0, 0.0]),
             prior_semantic_hashes: Vec::new(),
             last_model: Some("gpt-4o-mini".to_string()),
             current_request_timestamp: 10_000,
             last_request_timestamp: Some(9_000),
-            session_start: Some(1_000),
         }
     }
 
