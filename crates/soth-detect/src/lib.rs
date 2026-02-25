@@ -635,6 +635,9 @@ mod tests {
             process_info: None,
             tls_info: None,
             app_identity: None,
+            capture_mode: None,
+            matched_provider: None,
+            matched_application: None,
         }
     }
 }

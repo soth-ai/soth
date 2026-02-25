@@ -412,6 +412,9 @@ fn connection_meta(socket: SocketKind, salt: usize) -> ConnectionMeta {
         process_info: None,
         tls_info: None,
         app_identity: None,
+        capture_mode: None,
+        matched_provider: None,
+        matched_application: None,
     }
 }
 

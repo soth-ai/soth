@@ -5,27 +5,13 @@ pub fn resolve_app_identity(
     bundle: &DetectBundleSlice<'_>,
 ) -> AppIdentity {
     if let Some(bundle_id) = process_info.bundle_id.as_deref() {
-        if let Some(policy) = bundle.app_policies.get(bundle_id) {
-            let mut app_kind = policy.app_kind.clone();
-            if app_kind == AppKind::Browser
-                && bundle
-                    .browser_policies
-                    .allowed_apps
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(bundle_id))
-            {
-                app_kind = AppKind::AgentApp;
-            }
-
+        if let Some((app_id, app)) = find_by_bundle_id(bundle_id, bundle) {
             return AppIdentity {
-                app_id: policy.app_id.clone(),
-                display_name: policy
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| policy.app_id.clone()),
-                app_kind,
+                app_id: app_id.to_string(),
+                display_name: app.name.clone().unwrap_or_else(|| app_id.to_string()),
+                app_kind: AppKind::AgentApp,
                 is_known: true,
-                confidence: 1.0,
+                confidence: 0.9,
             };
         }
     }
@@ -74,6 +60,17 @@ fn find_by_process_name<'a>(
                 .as_ref()
                 .map(|name| process_lc.contains(&name.to_ascii_lowercase()))
                 .unwrap_or(false)
+    })
+}
+
+fn find_by_bundle_id<'a>(
+    bundle_id: &str,
+    bundle: &'a DetectBundleSlice<'_>,
+) -> Option<(&'a String, &'a ApplicationEntry)> {
+    bundle.applications.iter().find(|(_, app)| {
+        app.bundle_ids
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(bundle_id))
     })
 }
 

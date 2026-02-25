@@ -24,6 +24,9 @@ pub struct ConnectionMeta {
     pub process_info: Option<ProcessInfo>,
     pub tls_info: Option<TlsInfo>,
     pub app_identity: Option<AppIdentity>,
+    pub capture_mode: Option<CaptureMode>,
+    pub matched_provider: Option<String>,
+    pub matched_application: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -522,8 +525,6 @@ impl OwnedDetectBundle {
             llm_providers: &self.llm_providers,
             applications: &self.applications,
             filters: &self.filters,
-            app_policies: &self.app_policies,
-            browser_policies: &self.browser_policies,
         }
     }
 }
@@ -539,8 +540,6 @@ pub struct DetectBundleSlice<'a> {
     pub llm_providers: &'a HashMap<String, ProviderEntry>,
     pub applications: &'a HashMap<String, ApplicationEntry>,
     pub filters: &'a Filters,
-    pub app_policies: &'a HashMap<String, AppPolicy>,
-    pub browser_policies: &'a BrowserPolicies,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]

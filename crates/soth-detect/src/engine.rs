@@ -121,6 +121,7 @@ fn process_inner(
         &req.path,
         &req.headers,
         &req.body[..req.body.len().min(512)],
+        req.connection_meta.matched_provider.as_deref(),
         bundle,
     );
 
@@ -131,7 +132,11 @@ fn process_inner(
         normalized.canonical_hash = canonical_hash(&normalized);
     }
 
-    let capture_mode = bundle.capture_rules.mode_for(&normalized.provider);
+    let capture_mode = req
+        .connection_meta
+        .capture_mode
+        .clone()
+        .unwrap_or_else(|| bundle.capture_rules.mode_for(&normalized.provider));
     let mut artifacts = match capture_mode {
         CaptureMode::Full => credential_scan(&req.body, ArtifactLocation::Unknown),
         CaptureMode::MetadataOnly => Vec::new(),
@@ -179,7 +184,7 @@ fn parse_by_format(
 ) {
     let mut warnings = Vec::new();
 
-    let provider_name = provider_for_format(&format, &req.headers, bundle);
+    let provider_name = provider_for_format(&format, req, bundle);
 
     let result = match format {
         DetectedFormat::OpenAIRest
@@ -232,9 +237,14 @@ fn parse_by_format(
 
 fn provider_for_format(
     format: &DetectedFormat,
-    headers: &crate::types::HeaderMap,
+    req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
 ) -> String {
+    if let Some(provider) = req.connection_meta.matched_provider.as_deref() {
+        return provider.to_string();
+    }
+
+    let headers = &req.headers;
     if let Some(host_provider) = host_provider_from_headers(headers, bundle) {
         return host_provider;
     }

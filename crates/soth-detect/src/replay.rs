@@ -107,5 +107,8 @@ fn build_replay_connection_meta(event_uuid: &str) -> ConnectionMeta {
         process_info: None,
         tls_info: None,
         app_identity: None,
+        capture_mode: None,
+        matched_provider: None,
+        matched_application: None,
     }
 }

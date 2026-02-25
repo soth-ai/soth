@@ -6,6 +6,7 @@ pub fn fingerprint(
     path: &str,
     headers: &HeaderMap,
     body_prefix: &[u8],
+    matched_provider: Option<&str>,
     bundle: &DetectBundleSlice<'_>,
 ) -> DetectedFormat {
     let _ = method;
@@ -20,6 +21,13 @@ pub fn fingerprint(
         }
         if ct.contains("application/json-rpc") || ct.contains("application/jsonrpc") {
             return DetectedFormat::JsonRpc;
+        }
+    }
+
+    if let Some(provider_id) = matched_provider {
+        let hinted = provider_entry_to_format(provider_id, bundle.llm_providers.get(provider_id));
+        if hinted != DetectedFormat::Unknown {
+            return hinted;
         }
     }
 
