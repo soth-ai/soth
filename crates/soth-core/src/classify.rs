@@ -63,15 +63,13 @@ pub struct ProcessResolution {
 pub struct SessionSnapshot {
     pub request_count: u32,
     pub total_tokens: u64,
-    pub total_cost_usd: f64,
+    pub total_cost_usd: f32,
     pub credential_alerts: u32,
-    pub topic_cluster_ids_seen: Vec<u32>,
     pub embedding_centroid: Option<Vec<f32>>,
     pub prior_semantic_hashes: Vec<String>,
     pub last_model: Option<String>,
     pub current_request_timestamp: i64,
     pub last_request_timestamp: Option<i64>,
-    pub session_start: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

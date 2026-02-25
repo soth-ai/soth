@@ -37,8 +37,8 @@ pub fn init(
     bundle_dir: &std::path::Path,
     vendor_pubkey: &[u8; 32],
     org_config: Arc<OrgSignedConfig>,
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: Arc<rusqlite::Connection>,
 ) -> Result<(BundleWatcher, BundleHandle), BundleError> {
     let initial = load_from_dir(bundle_dir, vendor_pubkey, &org_config)?;
-    Ok(BundleWatcher::new(initial, *vendor_pubkey, org_config, db))
+    BundleWatcher::new(initial, *vendor_pubkey, org_config, db)
 }

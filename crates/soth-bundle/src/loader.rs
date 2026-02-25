@@ -51,10 +51,9 @@ pub(crate) fn load_verified(
 
     let policy = load_policy_bundle(&assets)?;
     let detect = load_detect_bundle(&assets)?;
-    let classify = soth_classify::ClassifyBundle::fallback_with_policy_bundle(
-        policy.clone(),
-        manifest.version.clone(),
-    );
+    let manifest_bytes = serde_json::to_vec(&manifest)?;
+    let classify = soth_classify::load_bundle_from_bytes(manifest_bytes.as_slice(), assets)
+        .map_err(|error| BundleError::ClassifyLoadFailed(error.to_string()))?;
 
     Ok(LoadedBundle {
         version: manifest.version.clone(),
