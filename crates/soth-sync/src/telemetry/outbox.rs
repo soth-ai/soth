@@ -271,7 +271,7 @@ impl TelemetryOutbox {
     fn ensure_transmitted_events_schema(&self, conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS transmitted_events (
-                event_id TEXT NOT NULL,
+                event_id TEXT PRIMARY KEY,
                 transmitted_at INTEGER NOT NULL,
                 batch_id TEXT NOT NULL,
                 payload_hash TEXT NOT NULL,
@@ -281,6 +281,12 @@ impl TelemetryOutbox {
             [],
         )
         .context("create transmitted_events table")?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_transmitted_events_event_id
+             ON transmitted_events(event_id)",
+            [],
+        )
+        .context("create transmitted_events event_id index")?;
 
         if !column_exists(conn, "transmitted_events", "encrypted")
             .context("inspect transmitted_events columns")?

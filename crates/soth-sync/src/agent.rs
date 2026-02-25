@@ -20,7 +20,7 @@ use crate::heartbeat::HeartbeatSender;
 use crate::metadata_pusher::{
     estimate_gzip_exchange_batch_size, ExchangeBatchRoute, ExchangePushResult, MetadataPusher,
 };
-use crate::registry_puller::{BundleInstallHook, RegistryPuller};
+use crate::registry_puller::{BundleWatcher, RegistryPuller};
 use crate::retry_queue::BodyRetryQueue;
 use crate::telemetry::{SyncTelemetrySink, TelemetryRuntimeConfig, TelemetrySyncRuntime};
 use anyhow::Context;
@@ -394,7 +394,7 @@ impl SyncAgent {
 
     /// Injects a channel-2 bundle install hook without introducing a compile-time
     /// dependency on soth-bundle. The hook is forwarded into RegistryPuller.
-    pub fn set_bundle_install_hook(&self, hook: Arc<dyn BundleInstallHook>) {
+    pub fn set_bundle_install_hook(&self, watcher: Arc<dyn BundleWatcher>) {
         let registry_cache_path = self
             .config
             .registry_cache_path
@@ -405,7 +405,7 @@ impl SyncAgent {
             self.config.api_key.clone(),
             registry_cache_path,
         )
-        .with_bundle_install_hook(hook);
+        .with_bundle_watcher(watcher);
         let config_puller = ConfigPuller::new(
             self.config.endpoint.clone(),
             self.config.api_key.clone(),
@@ -416,8 +416,8 @@ impl SyncAgent {
     }
 
     /// Compatibility alias matching the proxy architecture naming.
-    pub fn set_bundle_watcher(&self, hook: Arc<dyn BundleInstallHook>) {
-        self.set_bundle_install_hook(hook);
+    pub fn set_bundle_watcher(&self, watcher: Arc<dyn BundleWatcher>) {
+        self.set_bundle_install_hook(watcher);
     }
 
     pub async fn tick(&self) -> anyhow::Result<SyncTickSummary> {

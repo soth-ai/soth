@@ -6,7 +6,7 @@
 //! - `SyncTickSummary`
 //! - `SyncTelemetrySink`
 //! - `TelemetrySyncConfig`
-//! - `BundleInstallHook`
+//! - `BundleWatcher`
 
 pub mod agent;
 pub mod api_types;
@@ -25,5 +25,5 @@ pub mod telemetry;
 
 pub use agent::{HeartbeatTelemetryProvider, SyncAgent, SyncAgentConfig, SyncTickSummary};
 pub use config::TelemetrySyncConfig;
-pub use registry_puller::BundleInstallHook;
+pub use registry_puller::BundleWatcher;
 pub use telemetry::SyncTelemetrySink;
