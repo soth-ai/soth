@@ -21,6 +21,7 @@ pub struct ProxyConfig {
     pub org_id: String,
     pub team_id: String,
     pub device_id_hash: String,
+    pub user_hmac_secret: String,
 }
 
 impl Default for ProxyConfig {
@@ -39,6 +40,7 @@ impl Default for ProxyConfig {
             org_id: "local-org".to_string(),
             team_id: "local-team".to_string(),
             device_id_hash: "local-device".to_string(),
+            user_hmac_secret: "local-dev-secret".to_string(),
         }
     }
 }

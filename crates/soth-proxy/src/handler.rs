@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot::error::TryRecvError;
 use tracing::warn;
@@ -24,6 +28,7 @@ use crate::streaming::StreamingStore;
 pub struct ProxyHandler {
     bundle_handle: soth_bundle::BundleHandle,
     parser_registry: Arc<ArcSwap<soth_detect::ParserRegistry>>,
+    registry: Arc<ArcSwap<Registry>>,
     process_lookup: Arc<ProcessLookup>,
     session_store: Arc<SessionStore>,
     pending: Arc<PendingStore>,
@@ -35,6 +40,7 @@ pub struct ProxyHandler {
     org_id: String,
     team_id: String,
     device_id_hash: String,
+    user_hmac_secret: Arc<String>,
 }
 
 impl ProxyHandler {
@@ -48,13 +54,16 @@ impl ProxyHandler {
         org_id: String,
         team_id: String,
         device_id_hash: String,
+        user_hmac_secret: String,
     ) -> Self {
         let ttl = Duration::from_secs(pipeline_config.session_ttl_secs.max(1));
         let initial_bundle = bundle_handle.current();
         let initial_parser_registry = build_parser_registry(initial_bundle.detect.as_ref());
+        let initial_registry = Registry::from_detect_bundle(initial_bundle.detect.as_ref());
         Self {
             bundle_handle,
             parser_registry: Arc::new(ArcSwap::from_pointee(initial_parser_registry)),
+            registry: Arc::new(ArcSwap::from_pointee(initial_registry)),
             process_lookup: Arc::new(ProcessLookup::new(Duration::from_secs(60))),
             session_store: Arc::new(SessionStore::new(ttl)),
             pending: Arc::new(PendingStore::new()),
@@ -66,6 +75,7 @@ impl ProxyHandler {
             org_id,
             team_id,
             device_id_hash,
+            user_hmac_secret: Arc::new(user_hmac_secret),
         }
     }
 
@@ -77,12 +87,14 @@ impl ProxyHandler {
     }
 
     pub fn on_bundle_updated(&self, bundle: &soth_bundle::LoadedBundle) {
+        let registry = Registry::from_detect_bundle(bundle.detect.as_ref());
         let parser_registry = build_parser_registry(bundle.detect.as_ref());
+        self.registry.store(Arc::new(registry));
         self.parser_registry.store(Arc::new(parser_registry));
         self.process_lookup.clear_all();
         tracing::info!(
             bundle_version = bundle.version,
-            "bundle hot-swap applied; parser registry rebuilt and process resolution cache cleared"
+            "bundle hot-swap applied; registries rebuilt and process resolution cache cleared"
         );
     }
 
@@ -95,11 +107,11 @@ impl ProxyHandler {
 
         let bundle = self.bundle_handle.current();
         let detect_bundle = bundle.detect_slice();
-        let registry = Registry::from_detect_bundle(bundle.detect.as_ref());
+        let registry = self.registry.load();
 
         let process_resolution = self
             .process_lookup
-            .resolve(req.connection_meta.process_info.as_ref(), &registry);
+            .resolve(req.connection_meta.process_info.as_ref(), registry.as_ref());
 
         let edge_request = EdgeRequest {
             method: req.method.clone(),
@@ -110,7 +122,7 @@ impl ProxyHandler {
             stage: EvalStage::HttpRequest,
         };
 
-        let outcome = gates::evaluate(&edge_request, &registry, &self.pipeline_config);
+        let outcome = gates::evaluate(&edge_request, registry.as_ref(), &self.pipeline_config);
 
         match &outcome.action {
             OutcomeAction::Skip => return soth_mitm::HandlerDecision::Allow,
@@ -131,21 +143,47 @@ impl ProxyHandler {
             outcome.matched_application.as_deref(),
         ));
 
-        if req.body.len() > self.pipeline_config.body_size_limit_bytes {
+        let body_size_limit = self.pipeline_config.body_size_limit_bytes;
+        let mut truncated_body_sizes = None;
+        if req.body.len() > body_size_limit {
+            truncated_body_sizes = Some((req.body.len(), body_size_limit));
             req.body = req.body.slice(..self.pipeline_config.body_size_limit_bytes);
         }
 
         let parser_registry = self.parser_registry.load();
-        let detect_result =
+        let mut detect_result =
             soth_detect::process_with_registry(parser_registry.as_ref(), &req, &detect_bundle);
-        let content_for_embedding = detect_result.normalized.content_sample.clone();
+        if let Some((actual_bytes, limit_bytes)) = truncated_body_sizes {
+            let warning = soth_core::ParseWarning::OversizeBody {
+                actual_bytes: actual_bytes as u64,
+                limit_bytes: limit_bytes as u64,
+            };
+            detect_result.warnings.push(warning.clone());
+            detect_result.normalized.parse_warnings.push(warning);
+            if matches!(detect_result.confidence, soth_core::ParseConfidence::Full) {
+                detect_result.confidence = soth_core::ParseConfidence::Partial;
+            }
+            if matches!(
+                detect_result.normalized.parse_confidence,
+                soth_core::ParseConfidence::Full
+            ) {
+                detect_result.normalized.parse_confidence = soth_core::ParseConfidence::Partial;
+            }
+        }
+        let content_for_embedding = extract_content_for_embedding(&req.body);
 
         let connection_id = req.connection_meta.connection_id;
+        let request_timestamp_ms = chrono::Utc::now().timestamp_millis();
+        self.session_store
+            .mark_request_started(connection_id, request_timestamp_ms);
         let session_snapshot = self.session_store.snapshot(connection_id);
 
         let proxy_ctx = soth_core::ProxyContext {
             org_id: self.org_id.clone(),
-            user_id_hmac: build_user_id_hmac(&req.connection_meta),
+            user_id_hmac: build_user_id_hmac(
+                &req.connection_meta,
+                self.user_hmac_secret.as_bytes(),
+            ),
             team_id: self.team_id.clone(),
             device_id_hash: self.device_id_hash.clone(),
             endpoint_hash: sha256_hex(format!("{}{}", host, req.path).as_bytes()),
@@ -162,6 +200,7 @@ impl ProxyHandler {
             soth_core::CaptureMode::MetadataOnly => None,
             _ => Some(req.body.clone()),
         };
+        let raw_body_for_db = raw_body_for_commitment.clone();
 
         self.pending.insert(PendingCapture {
             connection_id,
@@ -172,6 +211,7 @@ impl ProxyHandler {
             raw_body: raw_body_for_commitment,
         });
 
+        let policy_block_enforced = Arc::new(AtomicBool::new(false));
         let mut block_rx = classify_task::spawn_classify_task(
             connection_id,
             detect_result,
@@ -180,8 +220,11 @@ impl ProxyHandler {
             outcome.capture_mode,
             outcome.matched_provider.clone(),
             outcome.matched_application.clone(),
+            raw_body_for_db,
             bundle.classify.clone(),
+            bundle.policy.clone(),
             self.classify_config.clone(),
+            policy_block_enforced.clone(),
             self.session_store.clone(),
             self.telemetry.clone(),
             self.db.clone(),
@@ -192,6 +235,7 @@ impl ProxyHandler {
             match block_rx.try_recv() {
                 Ok(kind) => {
                     if let soth_core::PolicyDecisionKind::Block { status, message } = kind {
+                        policy_block_enforced.store(true, Ordering::Relaxed);
                         return soth_mitm::HandlerDecision::Block {
                             status,
                             body: Bytes::from(message),
@@ -206,6 +250,7 @@ impl ProxyHandler {
 
         match tokio::time::timeout(Duration::from_millis(timeout_ms), &mut block_rx).await {
             Ok(Ok(soth_core::PolicyDecisionKind::Block { status, message })) => {
+                policy_block_enforced.store(true, Ordering::Relaxed);
                 soth_mitm::HandlerDecision::Block {
                     status,
                     body: Bytes::from(message),
@@ -264,10 +309,34 @@ impl ProxyHandler {
 impl soth_mitm::InterceptHandler for ProxyHandler {
     fn should_intercept_tls(
         &self,
-        _host: &str,
-        _process_info: Option<&soth_mitm::ProcessInfo>,
+        host: &str,
+        process_info: Option<&soth_mitm::ProcessInfo>,
     ) -> bool {
-        true
+        let host = host
+            .split(':')
+            .next()
+            .unwrap_or(host)
+            .trim()
+            .to_ascii_lowercase();
+        let process_info = process_info.map(mitm_process_info_to_core);
+        let registry = self.registry.load();
+        let process_resolution = self
+            .process_lookup
+            .resolve(process_info.as_ref(), registry.as_ref());
+
+        let edge_request = EdgeRequest {
+            method: "CONNECT".to_string(),
+            host,
+            path: "/".to_string(),
+            headers: BTreeMap::new(),
+            process: process_resolution,
+            stage: EvalStage::Connect,
+        };
+
+        !matches!(
+            gates::evaluate(&edge_request, registry.as_ref(), &self.pipeline_config).action,
+            OutcomeAction::Skip
+        )
     }
 
     fn on_request(
@@ -310,20 +379,42 @@ fn extract_host(header_host: Option<&str>, path: &str) -> String {
     "unknown".to_string()
 }
 
+fn extract_content_for_embedding(body: &Bytes) -> Option<String> {
+    std::str::from_utf8(body.as_ref())
+        .ok()
+        .map(std::string::ToString::to_string)
+}
+
 fn sha256_hex(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
     hex::encode(hasher.finalize())
 }
 
-fn build_user_id_hmac(meta: &soth_core::ConnectionMeta) -> String {
+type HmacSha256 = Hmac<Sha256>;
+
+fn build_user_id_hmac(meta: &soth_core::ConnectionMeta, secret: &[u8]) -> String {
     let pid = meta
         .process_info
         .as_ref()
         .and_then(|info| info.pid)
         .unwrap_or_default();
-    let seed = format!("{}:{}", meta.connection_id, pid);
-    sha256_hex(seed.as_bytes())
+    let process_name = meta
+        .process_info
+        .as_ref()
+        .and_then(|info| info.process_name.as_deref())
+        .unwrap_or("unknown");
+    let bundle_id = meta
+        .process_info
+        .as_ref()
+        .and_then(|info| info.bundle_id.as_deref())
+        .unwrap_or("unknown");
+    let identity = format!("pid={pid}|process={process_name}|bundle={bundle_id}");
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
+        return sha256_hex(identity.as_bytes());
+    };
+    mac.update(identity.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 fn build_app_identity(
@@ -418,17 +509,7 @@ fn mitm_connection_meta_to_core(meta: &soth_mitm::ConnectionMeta) -> soth_core::
     soth_core::ConnectionMeta {
         connection_id: meta.connection_id,
         socket_family: mitm_socket_family_to_core(&meta.socket_family),
-        process_info: meta
-            .process_info
-            .as_ref()
-            .map(|info| soth_core::ProcessInfo {
-                pid: Some(info.pid),
-                process_name: info.exe_name.clone(),
-                bundle_id: info.bundle_id.clone(),
-                parent_pid: info.parent_pid,
-                parent_process_name: None,
-                parent_bundle_id: None,
-            }),
+        process_info: meta.process_info.as_ref().map(mitm_process_info_to_core),
         tls_info: meta.tls_info.as_ref().map(|info| soth_core::TlsInfo {
             sni: info.sni.clone(),
             alpn: info.negotiated_proto.clone(),
@@ -454,5 +535,16 @@ fn mitm_socket_family_to_core(family: &soth_mitm::SocketFamily) -> soth_core::So
         soth_mitm::SocketFamily::UnixDomain { path } => {
             soth_core::SocketFamily::UnixDomain { path: path.clone() }
         }
+    }
+}
+
+fn mitm_process_info_to_core(info: &soth_mitm::ProcessInfo) -> soth_core::ProcessInfo {
+    soth_core::ProcessInfo {
+        pid: Some(info.pid),
+        process_name: info.exe_name.clone(),
+        bundle_id: info.bundle_id.clone(),
+        parent_pid: info.parent_pid,
+        parent_process_name: None,
+        parent_bundle_id: None,
     }
 }

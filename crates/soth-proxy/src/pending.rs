@@ -11,7 +11,7 @@ pub struct PendingCapture {
     pub connection_id: Uuid,
     pub stored_at: Instant,
     pub outcome: DetectionOutcome,
-    pub detect_result: soth_detect::DetectResult,
+    pub detect_result: soth_core::DetectResult,
     pub proxy_ctx: soth_core::ProxyContext,
     pub raw_body: Option<Bytes>,
 }

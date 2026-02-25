@@ -31,7 +31,7 @@ impl BundleWatcherInstallHook {
     }
 }
 
-impl soth_sync::BundleInstallHook for BundleWatcherInstallHook {
+impl soth_sync::BundleWatcher for BundleWatcherInstallHook {
     fn install_bundle(
         &self,
         manifest_bytes: &[u8],
@@ -50,6 +50,10 @@ async fn main() -> Result<()> {
     let config = ProxyConfig::from_env_or_default().context("load proxy config")?;
     let db_conn = db::open(config.db_path.as_path())?;
     let db = Arc::new(Mutex::new(db_conn));
+    let bundle_db = Arc::new(
+        rusqlite::Connection::open(config.db_path.as_path())
+            .context("open bundle sqlite handle")?,
+    );
 
     let vendor_pubkey = config
         .bundle_vendor_pubkey()
@@ -60,7 +64,7 @@ async fn main() -> Result<()> {
         config.bundle.bundle_dir.as_path(),
         &vendor_pubkey,
         org_config,
-        db.clone(),
+        bundle_db,
     )
     .with_context(|| {
         format!(
@@ -114,6 +118,7 @@ async fn main() -> Result<()> {
         config.org_id.clone(),
         config.team_id.clone(),
         config.device_id_hash.clone(),
+        config.user_hmac_secret.clone(),
     );
 
     let handler_for_bundle_watch = handler.clone();
@@ -133,6 +138,15 @@ async fn main() -> Result<()> {
         sync_task = Some(tokio::spawn(async move { agent.run().await }));
     }
 
+    let maintenance_handler = handler.clone();
+    let maintenance_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            maintenance_handler.maintenance_tick();
+        }
+    });
+
     let mitm_config = config.mitm_config()?;
     let proxy = soth_mitm::MitmProxyBuilder::new(mitm_config, handler)
         .build()
@@ -151,6 +165,7 @@ async fn main() -> Result<()> {
     if let Some(task) = sync_task {
         task.abort();
     }
+    maintenance_task.abort();
     bundle_watch_task.abort();
 
     if let Some(agent) = sync_agent {

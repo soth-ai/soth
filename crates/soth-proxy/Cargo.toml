@@ -15,6 +15,7 @@ dashmap.workspace = true
 dirs.workspace = true
 ed25519-dalek.workspace = true
 hex = "0.4"
+hmac = "0.12"
 http = "1"
 rusqlite.workspace = true
 serde.workspace = true
@@ -32,6 +33,7 @@ soth-bundle = { workspace = true }
 soth-detect = { workspace = true }
 soth-classify = { workspace = true }
 soth-telemetry = { workspace = true }
+soth-policy = { workspace = true }
 soth-sync = { workspace = true }
 
 soth-mitm = { path = "../../../soth-mitm/crates/soth-mitm" }

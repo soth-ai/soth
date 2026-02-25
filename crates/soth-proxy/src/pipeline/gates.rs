@@ -125,12 +125,14 @@ pub fn evaluate(
         return outcome_skip(DecisionReason::NotInCatalog, registry);
     }
 
-    let method = req.method.to_ascii_uppercase();
-    if !matches!(
-        method.as_str(),
-        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
-    ) {
-        return outcome_skip(DecisionReason::MethodNotAllowed, registry);
+    if req.stage == EvalStage::HttpRequest {
+        let method = req.method.to_ascii_uppercase();
+        if !matches!(
+            method.as_str(),
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+        ) {
+            return outcome_skip(DecisionReason::MethodNotAllowed, registry);
+        }
     }
 
     let capture_mode = derive_capture_mode(
@@ -215,7 +217,7 @@ fn derive_traffic_classification(
         return match app_type {
             AppType::NonHost => TrafficClassification::ToolUsage,
             AppType::Host => TrafficClassification::UnknownAgent,
-            AppType::Unknown => TrafficClassification::Other,
+            AppType::Unknown => TrafficClassification::UnknownAgent,
         };
     }
 
