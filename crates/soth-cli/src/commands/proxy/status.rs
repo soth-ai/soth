@@ -289,12 +289,24 @@ fn collect_last_24h(conn: &rusqlite::Connection, now: DateTime<Utc>) -> Result<L
         });
     }
 
+    let Some(timestamp_column) = intercept_timestamp_column(conn)? else {
+        return Ok(Last24hJson {
+            total: 0,
+            blocked: 0,
+            flagged: 0,
+            cost_usd: 0.0,
+            credential_blocked: 0,
+            policy_blocked: 0,
+        });
+    };
+
     let cutoff = now.timestamp_millis() - DAY_MS;
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT policy_kind, telemetry_json
          FROM intercept_records
-         WHERE timestamp_epoch_ms >= ?1",
-    )?;
+         WHERE {timestamp_column} >= ?1"
+    );
+    let mut stmt = conn.prepare(sql.as_str())?;
     let mut rows = stmt.query([cutoff])?;
 
     let mut total = 0_u64;
@@ -369,6 +381,29 @@ fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
     )?;
     let mut rows = stmt.query([table])?;
     Ok(rows.next()?.is_some())
+}
+
+fn intercept_timestamp_column(conn: &rusqlite::Connection) -> Result<Option<&'static str>> {
+    if table_has_column(conn, "intercept_records", "timestamp_utc")? {
+        return Ok(Some("timestamp_utc"));
+    }
+    if table_has_column(conn, "intercept_records", "timestamp_epoch_ms")? {
+        return Ok(Some("timestamp_epoch_ms"));
+    }
+    Ok(None)
+}
+
+fn table_has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
+    let query = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(query.as_str())?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn count_transmission_status(conn: &rusqlite::Connection, status: &str) -> Result<u64> {
@@ -535,4 +570,81 @@ fn parse_sync_age(raw: &str, now: DateTime<Utc>) -> Option<i64> {
         numeric
     };
     Some(now.timestamp().saturating_sub(ts_secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_last_24h_uses_timestamp_utc_when_present() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "
+            CREATE TABLE intercept_records (
+                timestamp_utc INTEGER NOT NULL,
+                policy_kind TEXT,
+                telemetry_json TEXT
+            );
+            ",
+        )
+        .expect("create intercept_records");
+
+        let now = Utc::now();
+        let recent = now.timestamp_millis() - 1_000;
+        let old = now.timestamp_millis() - DAY_MS - 10_000;
+
+        conn.execute(
+            "INSERT INTO intercept_records (timestamp_utc, policy_kind, telemetry_json)
+             VALUES (?1, 'BLOCK', ?2)",
+            [
+                recent.to_string(),
+                r#"{"estimated_cost_usd":1.25,"sensitive_code_flags":{"credential_pattern_detected":true,"private_key_detected":false}}"#
+                    .to_string(),
+            ],
+        )
+        .expect("insert recent block");
+        conn.execute(
+            "INSERT INTO intercept_records (timestamp_utc, policy_kind, telemetry_json)
+             VALUES (?1, 'FLAG', ?2)",
+            [
+                recent.to_string(),
+                r#"{"estimated_cost_usd":0.50}"#.to_string(),
+            ],
+        )
+        .expect("insert recent flag");
+        conn.execute(
+            "INSERT INTO intercept_records (timestamp_utc, policy_kind, telemetry_json)
+             VALUES (?1, 'BLOCK', ?2)",
+            [
+                old.to_string(),
+                r#"{"estimated_cost_usd":9.99}"#.to_string(),
+            ],
+        )
+        .expect("insert old block");
+
+        let stats = collect_last_24h(&conn, now).expect("collect last 24h");
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.blocked, 1);
+        assert_eq!(stats.flagged, 1);
+        assert_eq!(stats.credential_blocked, 1);
+        assert_eq!(stats.policy_blocked, 0);
+        assert!((stats.cost_usd - 1.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn timestamp_column_falls_back_to_legacy_name() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "
+            CREATE TABLE intercept_records (
+                timestamp_epoch_ms INTEGER NOT NULL
+            );
+            ",
+        )
+        .expect("create intercept_records");
+
+        let column = intercept_timestamp_column(&conn).expect("resolve timestamp column");
+        assert_eq!(column, Some("timestamp_epoch_ms"));
+    }
 }

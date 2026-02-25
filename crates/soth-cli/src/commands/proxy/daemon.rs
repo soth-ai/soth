@@ -159,6 +159,12 @@ impl Drop for DaemonLifecycleLock {
 }
 
 fn soth_home_dir() -> PathBuf {
+    if let Ok(value) = env::var("SOTH_HOME_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     dirs::home_dir()
         .map(|home| home.join(".soth"))
         .unwrap_or_else(|| PathBuf::from(".soth"))
@@ -1281,9 +1287,12 @@ mod tests {
     fn with_temp_home<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> T {
         let guard = lock_env_mutex();
         let temp = tempfile::tempdir().expect("tempdir");
+        let soth_home_override = temp.path().join(".soth");
         let old_home = env::var_os("HOME");
+        let old_soth_home = env::var_os("SOTH_HOME_DIR");
         unsafe {
             env::set_var("HOME", temp.path());
+            env::set_var("SOTH_HOME_DIR", &soth_home_override);
         }
         let result = std::panic::catch_unwind(f);
         match old_home {
@@ -1292,6 +1301,14 @@ mod tests {
             },
             None => unsafe {
                 env::remove_var("HOME");
+            },
+        }
+        match old_soth_home {
+            Some(value) => unsafe {
+                env::set_var("SOTH_HOME_DIR", value);
+            },
+            None => unsafe {
+                env::remove_var("SOTH_HOME_DIR");
             },
         }
         drop(guard);

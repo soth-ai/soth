@@ -203,6 +203,10 @@ async fn run_stream(args: EventsStreamArgs, global_config: Option<PathBuf>) -> R
 }
 
 fn fetch_rows_for_list(conn: &Connection, args: &EventsListArgs) -> Result<Vec<EventView>> {
+    let Some(timestamp_column) = intercept_timestamp_column(conn)? else {
+        return Ok(Vec::new());
+    };
+    let timestamp_seconds_expr = format!("CAST({timestamp_column} / 1000 AS INTEGER)");
     let capped_limit = args.limit.clamp(1, 1_000);
     let fetch_limit = (capped_limit.saturating_mul(20)).clamp(100, 10_000);
 
@@ -219,7 +223,7 @@ fn fetch_rows_for_list(conn: &Connection, args: &EventsListArgs) -> Result<Vec<E
     }
     if let Some(since_raw) = args.since.as_ref() {
         let since_ms = parse_rfc3339_to_epoch_ms(since_raw)?;
-        where_clauses.push("timestamp_epoch_ms >= ?".to_string());
+        where_clauses.push(format!("{timestamp_column} >= ?"));
         params.push(SqlValue::Integer(since_ms));
     }
     if let Some(score) = args.anomaly_score_gt {
@@ -239,7 +243,7 @@ fn fetch_rows_for_list(conn: &Connection, args: &EventsListArgs) -> Result<Vec<E
     let sql = format!(
         "SELECT
             rowid,
-            CAST(timestamp_epoch_ms / 1000 AS INTEGER) AS timestamp_utc,
+            {timestamp_seconds_expr} AS timestamp_utc,
             COALESCE(provider, 'unknown') AS provider,
             model,
             LOWER(COALESCE(
@@ -266,7 +270,7 @@ fn fetch_rows_for_list(conn: &Connection, args: &EventsListArgs) -> Result<Vec<E
             END AS code_present
          FROM intercept_records
          {where_sql}
-         ORDER BY timestamp_epoch_ms DESC
+         ORDER BY {timestamp_column} DESC
          LIMIT ?"
     );
     params.push(SqlValue::Integer(fetch_limit as i64));
@@ -281,10 +285,15 @@ fn fetch_rows_for_list(conn: &Connection, args: &EventsListArgs) -> Result<Vec<E
 }
 
 fn fetch_rows_after(conn: &Connection, last_rowid: i64) -> Result<Vec<EventView>> {
+    let Some(timestamp_column) = intercept_timestamp_column(conn)? else {
+        return Ok(Vec::new());
+    };
+    let timestamp_seconds_expr = format!("CAST({timestamp_column} / 1000 AS INTEGER)");
     let mut stmt = conn.prepare(
-        "SELECT
+        format!(
+            "SELECT
             rowid,
-            CAST(timestamp_epoch_ms / 1000 AS INTEGER) AS timestamp_utc,
+            {timestamp_seconds_expr} AS timestamp_utc,
             COALESCE(provider, 'unknown') AS provider,
             model,
             LOWER(COALESCE(
@@ -312,7 +321,9 @@ fn fetch_rows_after(conn: &Connection, last_rowid: i64) -> Result<Vec<EventView>
          FROM intercept_records
          WHERE rowid > ?1
          ORDER BY rowid ASC
-         LIMIT 500",
+         LIMIT 500"
+        )
+        .as_str(),
     )?;
     let mut rows = stmt.query(params![last_rowid])?;
     let mut output = Vec::new();
@@ -516,6 +527,29 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(rows.next()?.is_some())
 }
 
+fn intercept_timestamp_column(conn: &Connection) -> Result<Option<&'static str>> {
+    if table_has_column(conn, "intercept_records", "timestamp_utc")? {
+        return Ok(Some("timestamp_utc"));
+    }
+    if table_has_column(conn, "intercept_records", "timestamp_epoch_ms")? {
+        return Ok(Some("timestamp_epoch_ms"));
+    }
+    Ok(None)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let query = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(query.as_str())?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn current_max_rowid(conn: &Connection) -> Result<i64> {
     let value = conn.query_row(
         "SELECT COALESCE(MAX(rowid), 0) FROM intercept_records",
@@ -523,4 +557,75 @@ fn current_max_rowid(conn: &Connection) -> Result<i64> {
         |row| row.get::<_, i64>(0),
     )?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_list_args() -> EventsListArgs {
+        EventsListArgs {
+            provider: None,
+            model: None,
+            use_case: None,
+            policy_decision: None,
+            credential_detected: false,
+            anomaly_score_gt: None,
+            since: None,
+            limit: 20,
+            format: EventsListFormat::Table,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn list_query_supports_timestamp_utc_schema() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "
+            CREATE TABLE intercept_records (
+                timestamp_utc INTEGER NOT NULL,
+                provider TEXT,
+                model TEXT,
+                telemetry_json TEXT,
+                policy_kind TEXT,
+                anomaly_score REAL
+            );
+            ",
+        )
+        .expect("create intercept_records");
+        let now_ms = Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO intercept_records
+             (timestamp_utc, provider, model, telemetry_json, policy_kind, anomaly_score)
+             VALUES (?1, 'openai', 'gpt-4o-mini', ?2, 'ALLOW', 0.12)",
+            [
+                now_ms.to_string(),
+                r#"{"use_case_label":"code_generation","estimated_cost_usd":0.42,"sensitive_code_flags":{"credential_pattern_detected":false,"private_key_detected":false},"code_present":1}"#
+                    .to_string(),
+            ],
+        )
+        .expect("insert row");
+
+        let rows = fetch_rows_for_list(&conn, &default_list_args()).expect("list rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "openai");
+        assert_eq!(rows[0].model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn timestamp_column_falls_back_to_legacy_name() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "
+            CREATE TABLE intercept_records (
+                timestamp_epoch_ms INTEGER NOT NULL
+            );
+            ",
+        )
+        .expect("create intercept_records");
+
+        let column = intercept_timestamp_column(&conn).expect("resolve timestamp column");
+        assert_eq!(column, Some("timestamp_epoch_ms"));
+    }
 }
