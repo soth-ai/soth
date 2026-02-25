@@ -3,10 +3,26 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::fallback::{KeywordClassifier, StaticAnomalyScorer};
+use crate::model::build_model_providers;
 use crate::traits::{AnomalyScorer, ClassificationProvider};
+
+const MANIFEST_CANDIDATES: [&str; 2] = ["manifest.json", "classify/manifest.json"];
+const POLICY_BUNDLE_CANDIDATES: [&str; 3] = [
+    "policy/policy_bundle.json",
+    "policy/bundle.json",
+    "policy_bundle.json",
+];
+const CLASSIFY_MODEL_ASSETS: [&str; 4] = [
+    "classify/embedding.onnx",
+    "classify/centroids.bin",
+    "classify/lsh_projection.bin",
+    "classify/use_case_mlp.bin",
+];
 
 pub struct ClassifyBundle {
     pub(crate) classifier: Arc<dyn ClassificationProvider>,
@@ -17,19 +33,31 @@ pub struct ClassifyBundle {
 }
 
 impl ClassifyBundle {
-    pub fn load(_bundle_dir: &Path) -> Result<Arc<Self>, BundleLoadError> {
-        Err(BundleLoadError::Unsupported(
-            "bundle file loading is not implemented yet".to_string(),
-        ))
+    pub fn load(bundle_dir: &Path) -> Result<Arc<Self>, BundleLoadError> {
+        let manifest_path = find_manifest_path(bundle_dir)?;
+        let manifest_bytes = std::fs::read(manifest_path.as_path())?;
+        let manifest = parse_manifest(manifest_bytes.as_slice())?;
+
+        let mut assets = HashMap::new();
+        if manifest.assets.is_empty() {
+            collect_known_assets(bundle_dir, &mut assets)?;
+        } else {
+            let manifest_dir = manifest_path.parent().unwrap_or(bundle_dir);
+            for entry in &manifest.assets {
+                let bytes = read_asset_bytes(bundle_dir, manifest_dir, entry.path.as_str())?;
+                assets.insert(entry.path.clone(), bytes);
+            }
+        }
+
+        Self::load_verified(manifest, assets)
     }
 
     pub fn load_from_bytes(
-        _manifest_bytes: &[u8],
-        _assets: HashMap<String, Vec<u8>>,
+        manifest_bytes: &[u8],
+        assets: HashMap<String, Vec<u8>>,
     ) -> Result<Arc<Self>, BundleLoadError> {
-        Err(BundleLoadError::Unsupported(
-            "bundle byte loading is not implemented yet".to_string(),
-        ))
+        let manifest = parse_manifest(manifest_bytes)?;
+        Self::load_verified(manifest, assets)
     }
 
     pub fn fallback() -> Arc<Self> {
@@ -50,6 +78,38 @@ impl ClassifyBundle {
             bundle_version,
             has_real_models: false,
         })
+    }
+
+    fn load_verified(
+        manifest: BundleManifest,
+        assets: HashMap<String, Vec<u8>>,
+    ) -> Result<Arc<Self>, BundleLoadError> {
+        verify_assets(&manifest, &assets)?;
+        let policy_bundle = load_policy_bundle(&assets)?;
+        let has_real_models = CLASSIFY_MODEL_ASSETS
+            .iter()
+            .all(|path| asset_bytes_for_path(&assets, path).is_some());
+        let version = if manifest.version.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            manifest.version
+        };
+        let (classifier, anomaly_scorer): (
+            Arc<dyn ClassificationProvider>,
+            Arc<dyn AnomalyScorer>,
+        ) = if has_real_models {
+            build_model_providers(version.clone(), &assets)
+        } else {
+            (Arc::new(KeywordClassifier), Arc::new(StaticAnomalyScorer))
+        };
+
+        Ok(Arc::new(Self {
+            classifier,
+            anomaly_scorer,
+            policy_bundle,
+            bundle_version: version,
+            has_real_models,
+        }))
     }
 }
 
@@ -73,6 +133,162 @@ fn fallback_policy_bundle() -> soth_policy::PolicyBundle {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BundleManifest {
+    #[serde(default, alias = "bundle_version")]
+    version: String,
+    #[serde(default)]
+    assets: Vec<ManifestAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestAsset {
+    path: String,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    size_bytes: u64,
+}
+
+fn parse_manifest(bytes: &[u8]) -> Result<BundleManifest, BundleLoadError> {
+    serde_json::from_slice(bytes)
+        .map_err(|error| BundleLoadError::InvalidManifest(error.to_string()))
+}
+
+fn find_manifest_path(bundle_dir: &Path) -> Result<std::path::PathBuf, BundleLoadError> {
+    for candidate in MANIFEST_CANDIDATES {
+        let path = bundle_dir.join(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(BundleLoadError::InvalidManifest(format!(
+        "no manifest found under {} (expected one of: {})",
+        bundle_dir.display(),
+        MANIFEST_CANDIDATES.join(", ")
+    )))
+}
+
+fn read_asset_bytes(
+    bundle_dir: &Path,
+    manifest_dir: &Path,
+    relative_path: &str,
+) -> Result<Vec<u8>, BundleLoadError> {
+    let direct = bundle_dir.join(relative_path);
+    if direct.exists() {
+        return std::fs::read(direct).map_err(BundleLoadError::from);
+    }
+
+    let from_manifest_dir = manifest_dir.join(relative_path);
+    if from_manifest_dir.exists() {
+        return std::fs::read(from_manifest_dir).map_err(BundleLoadError::from);
+    }
+
+    Err(BundleLoadError::InvalidManifest(format!(
+        "asset missing on disk: {relative_path}"
+    )))
+}
+
+fn collect_known_assets(
+    bundle_dir: &Path,
+    out: &mut HashMap<String, Vec<u8>>,
+) -> Result<(), BundleLoadError> {
+    for candidate in POLICY_BUNDLE_CANDIDATES {
+        let path = bundle_dir.join(candidate);
+        if path.exists() {
+            let bytes = std::fs::read(path)?;
+            out.insert(candidate.to_string(), bytes);
+            break;
+        }
+    }
+
+    for asset in CLASSIFY_MODEL_ASSETS {
+        let path = bundle_dir.join(asset);
+        if path.exists() {
+            out.insert(asset.to_string(), std::fs::read(path)?);
+        } else if let Some(stripped) = asset.strip_prefix("classify/") {
+            let stripped_path = bundle_dir.join(stripped);
+            if stripped_path.exists() {
+                out.insert(stripped.to_string(), std::fs::read(stripped_path)?);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_assets(
+    manifest: &BundleManifest,
+    assets: &HashMap<String, Vec<u8>>,
+) -> Result<(), BundleLoadError> {
+    for entry in &manifest.assets {
+        let Some(bytes) = asset_bytes_for_path(assets, entry.path.as_str()) else {
+            return Err(BundleLoadError::InvalidManifest(format!(
+                "missing asset in payload: {}",
+                entry.path
+            )));
+        };
+
+        if entry.size_bytes > 0 && bytes.len() as u64 != entry.size_bytes {
+            return Err(BundleLoadError::AssetHashMismatch {
+                asset: entry.path.clone(),
+            });
+        }
+
+        if !entry.sha256.is_empty() {
+            let actual = sha256_hex(bytes);
+            if !actual.eq_ignore_ascii_case(entry.sha256.as_str()) {
+                return Err(BundleLoadError::AssetHashMismatch {
+                    asset: entry.path.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn load_policy_bundle(
+    assets: &HashMap<String, Vec<u8>>,
+) -> Result<Arc<soth_policy::PolicyBundle>, BundleLoadError> {
+    for candidate in POLICY_BUNDLE_CANDIDATES {
+        if let Some(bytes) = asset_bytes_for_path(assets, candidate) {
+            let loaded = soth_policy::load_bundle_from_bytes(bytes)?;
+            return Ok(Arc::new(loaded));
+        }
+    }
+
+    Ok(Arc::new(fallback_policy_bundle()))
+}
+
+fn asset_bytes_for_path<'a>(assets: &'a HashMap<String, Vec<u8>>, path: &str) -> Option<&'a [u8]> {
+    if let Some(bytes) = assets.get(path) {
+        return Some(bytes.as_slice());
+    }
+    if let Some(stripped) = path.strip_prefix("./") {
+        if let Some(bytes) = assets.get(stripped) {
+            return Some(bytes.as_slice());
+        }
+    }
+    if let Some(stripped) = path.strip_prefix("classify/") {
+        if let Some(bytes) = assets.get(stripped) {
+            return Some(bytes.as_slice());
+        }
+    }
+    if let Some(stripped) = path.strip_prefix("policy/") {
+        if let Some(bytes) = assets.get(stripped) {
+            return Some(bytes.as_slice());
+        }
+    }
+    None
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Debug, Error)]
 pub enum BundleLoadError {
     #[error("io error: {0}")]
@@ -91,4 +307,172 @@ pub enum BundleLoadError {
     PolicyBundle(#[from] soth_policy::PolicyError),
     #[error("unsupported: {0}")]
     Unsupported(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use soth_policy::sync_policy::{
+        BudgetLimits, OrgPatterns, PolicyBundleMetadata, PolicyBundlePayload, RuleAction,
+        RuleDefinition, SignedPolicyBundle,
+    };
+
+    fn signed_policy_bundle_bytes() -> Vec<u8> {
+        let payload = PolicyBundlePayload {
+            metadata: PolicyBundleMetadata {
+                bundle_version: "policy-test-v1".to_string(),
+                schema_version: "1".to_string(),
+                org_id: "test-org".to_string(),
+                signed_at: 1_772_300_000,
+            },
+            system_rules: vec![RuleDefinition {
+                rule_id: "sys_test".to_string(),
+                rule_name: "sys_test".to_string(),
+                cel_expr: "false".to_string(),
+                action: RuleAction::Flag {
+                    reason: "test".to_string(),
+                },
+            }],
+            org_rules: Vec::new(),
+            org_patterns: OrgPatterns::default(),
+            budget_limits: BudgetLimits::default(),
+        };
+        let key = SigningKey::from_bytes(&[17u8; 32]);
+        let payload_bytes = serde_json::to_vec(&payload).expect("serialize payload");
+        let signature = key.sign(payload_bytes.as_slice());
+        let envelope = SignedPolicyBundle {
+            payload,
+            signature: B64.encode(signature.to_bytes()),
+            public_key: B64.encode(key.verifying_key().to_bytes()),
+        };
+        serde_json::to_vec(&envelope).expect("serialize signed policy")
+    }
+
+    fn model_assets() -> HashMap<String, Vec<u8>> {
+        HashMap::from([
+            ("classify/embedding.onnx".to_string(), b"onnx".to_vec()),
+            ("classify/centroids.bin".to_string(), b"centroids".to_vec()),
+            (
+                "classify/lsh_projection.bin".to_string(),
+                b"lsh-projection".to_vec(),
+            ),
+            ("classify/use_case_mlp.bin".to_string(), b"mlp".to_vec()),
+        ])
+    }
+
+    fn manifest_bytes(version: &str, assets: &HashMap<String, Vec<u8>>) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Manifest<'a> {
+            version: &'a str,
+            assets: Vec<Entry<'a>>,
+        }
+        #[derive(serde::Serialize)]
+        struct Entry<'a> {
+            path: &'a str,
+            sha256: String,
+            size_bytes: u64,
+        }
+
+        let mut entries = assets
+            .iter()
+            .map(|(path, bytes)| Entry {
+                path: path.as_str(),
+                sha256: sha256_hex(bytes.as_slice()),
+                size_bytes: bytes.len() as u64,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.path.cmp(right.path));
+        serde_json::to_vec(&Manifest {
+            version,
+            assets: entries,
+        })
+        .expect("serialize manifest")
+    }
+
+    #[test]
+    fn load_from_bytes_with_manifest_and_assets() {
+        let mut assets = model_assets();
+        assets.insert(
+            "policy/policy_bundle.json".to_string(),
+            signed_policy_bundle_bytes(),
+        );
+        let manifest = manifest_bytes("bundle-test-v1", &assets);
+
+        let bundle = ClassifyBundle::load_from_bytes(manifest.as_slice(), assets)
+            .expect("bundle should load");
+
+        assert_eq!(bundle.bundle_version, "bundle-test-v1");
+        assert!(bundle.has_real_models);
+        assert_eq!(bundle.classifier.bundle_version(), "bundle-test-v1");
+        let embedding = vec![1.0f32 / 384.0f32.sqrt(); 384];
+        let classified = bundle.classifier.classify(embedding.as_slice());
+        assert!((0.0..=1.0).contains(&classified.confidence));
+        assert_eq!(
+            bundle.policy_bundle.metadata.bundle_version,
+            "policy-test-v1"
+        );
+    }
+
+    #[test]
+    fn load_from_bytes_detects_hash_mismatch() {
+        let mut assets = model_assets();
+        assets.insert(
+            "policy/policy_bundle.json".to_string(),
+            signed_policy_bundle_bytes(),
+        );
+        let manifest = manifest_bytes("bundle-test-v1", &assets);
+        assets.insert("classify/embedding.onnx".to_string(), b"tampered".to_vec());
+
+        let err = match ClassifyBundle::load_from_bytes(manifest.as_slice(), assets) {
+            Ok(_) => panic!("mismatch should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(err, BundleLoadError::AssetHashMismatch { .. }));
+    }
+
+    #[test]
+    fn load_from_dir_reads_manifest_and_assets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut assets = model_assets();
+        assets.insert(
+            "policy/policy_bundle.json".to_string(),
+            signed_policy_bundle_bytes(),
+        );
+        let manifest = manifest_bytes("bundle-disk-v1", &assets);
+
+        for (path, bytes) in &assets {
+            let disk_path = dir.path().join(path);
+            if let Some(parent) = disk_path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent");
+            }
+            std::fs::write(disk_path, bytes).expect("write asset");
+        }
+        std::fs::write(dir.path().join("manifest.json"), manifest).expect("write manifest");
+
+        let bundle = ClassifyBundle::load(dir.path()).expect("bundle should load");
+        assert_eq!(bundle.bundle_version, "bundle-disk-v1");
+        assert!(bundle.has_real_models);
+        assert_eq!(bundle.classifier.bundle_version(), "bundle-disk-v1");
+        assert_eq!(
+            bundle.policy_bundle.metadata.bundle_version,
+            "policy-test-v1"
+        );
+    }
+
+    #[test]
+    fn load_without_policy_falls_back_to_empty_policy_bundle() {
+        let assets = model_assets();
+        let manifest = manifest_bytes("bundle-no-policy-v1", &assets);
+
+        let bundle = ClassifyBundle::load_from_bytes(manifest.as_slice(), assets)
+            .expect("bundle should load");
+        assert_eq!(bundle.classifier.bundle_version(), "bundle-no-policy-v1");
+        assert_eq!(
+            bundle.policy_bundle.metadata.bundle_version,
+            "fallback-0.0.0"
+        );
+    }
 }

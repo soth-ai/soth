@@ -3,6 +3,7 @@
 mod bundle;
 mod config;
 mod fallback;
+mod model;
 mod pipeline;
 mod stage1_embed;
 mod stage2_cluster;
