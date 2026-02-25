@@ -3,10 +3,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use soth_core::api::{ConfigResponse, RegistryBundleManifest, RegistryVersionResponse};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::api_types::{ConfigResponse, RegistryBundleManifest, RegistryVersionResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedConfigEnvelope {

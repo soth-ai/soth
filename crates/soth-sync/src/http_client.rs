@@ -1,6 +1,8 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::api_types::{version::API_VERSION_HEADER, API_VERSION};
+
 fn should_bypass_proxy(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
@@ -34,9 +36,59 @@ pub fn build_cloud_client(endpoint: &str) -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
+#[derive(Clone)]
+pub struct SothHttpClient {
+    client: reqwest::Client,
+    endpoint: String,
+    api_key: String,
+}
+
+impl SothHttpClient {
+    pub fn new(endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let endpoint = endpoint.into().trim_end_matches('/').to_string();
+        Self {
+            client: build_cloud_client(endpoint.as_str()),
+            endpoint,
+            api_key: api_key.into(),
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn url(&self, path_or_url: &str) -> String {
+        compose_url(self.endpoint.as_str(), path_or_url)
+    }
+
+    pub fn get(&self, path_or_url: &str) -> reqwest::RequestBuilder {
+        self.client
+            .get(self.url(path_or_url))
+            .header(API_VERSION_HEADER, API_VERSION)
+            .bearer_auth(&self.api_key)
+    }
+
+    pub fn post(&self, path_or_url: &str) -> reqwest::RequestBuilder {
+        self.client
+            .post(self.url(path_or_url))
+            .header(API_VERSION_HEADER, API_VERSION)
+            .bearer_auth(&self.api_key)
+    }
+}
+
+fn compose_url(endpoint: &str, path_or_url: &str) -> String {
+    if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+        return path_or_url.to_string();
+    }
+    if path_or_url.starts_with('/') {
+        return format!("{endpoint}{path_or_url}");
+    }
+    format!("{endpoint}/{path_or_url}")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_bypass_proxy;
+    use super::{compose_url, should_bypass_proxy, SothHttpClient};
 
     #[test]
     fn bypasses_proxy_for_loopback_endpoints() {
@@ -48,5 +100,35 @@ mod tests {
     #[test]
     fn keeps_proxy_for_non_loopback_endpoints() {
         assert!(!should_bypass_proxy("https://api.soth.example"));
+    }
+
+    #[test]
+    fn compose_url_preserves_absolute_url() {
+        assert_eq!(
+            compose_url("https://api.soth.example", "https://other.example/path"),
+            "https://other.example/path"
+        );
+    }
+
+    #[test]
+    fn compose_url_handles_relative_path() {
+        assert_eq!(
+            compose_url("https://api.soth.example", "/api/v1/heartbeat"),
+            "https://api.soth.example/api/v1/heartbeat"
+        );
+        assert_eq!(
+            compose_url("https://api.soth.example", "api/v1/heartbeat"),
+            "https://api.soth.example/api/v1/heartbeat"
+        );
+    }
+
+    #[test]
+    fn soth_http_client_normalizes_endpoint() {
+        let client = SothHttpClient::new("https://api.soth.example/", "test-key");
+        assert_eq!(client.endpoint(), "https://api.soth.example");
+        assert_eq!(
+            client.url("/api/v1/heartbeat"),
+            "https://api.soth.example/api/v1/heartbeat"
+        );
     }
 }

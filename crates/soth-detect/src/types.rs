@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 pub use soth_core::{
     AppIdentity, AppKind, CaptureMode, ConnectionMeta, FrameKind, ParseConfidence, ProcessInfo,
@@ -177,6 +178,7 @@ pub struct DetectResult {
     pub confidence: ParseConfidence,
     pub detect_latency_us: u64,
     pub warnings: Vec<DetectWarning>,
+    pub raw_body_bytes: Option<Bytes>,
 }
 
 impl DetectResult {
@@ -221,6 +223,7 @@ impl DetectResult {
             parse_source: ParseSource::Filtered,
             detect_latency_us: 0,
             warnings: Vec::new(),
+            raw_body_bytes: None,
         }
     }
 
@@ -383,7 +386,7 @@ pub trait AIRequestParser: Send + Sync {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct OwnedDetectBundle {
     pub rest_formats: HashMap<String, RestFormatDescriptor>,
     pub graphql_operations: GraphQLOperationRegistry,

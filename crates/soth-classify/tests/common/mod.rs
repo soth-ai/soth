@@ -1,0 +1,68 @@
+pub fn make_detect_result() -> soth_core::DetectResult {
+    soth_core::DetectResult {
+        normalized: soth_core::NormalizedRequest {
+            parse_confidence: soth_core::ParseConfidence::Full,
+            parser_id: "test-parser".to_string(),
+            schema_version: "1".to_string(),
+            parse_warnings: Vec::new(),
+            is_ai_call: true,
+            provider: soth_core::DetectedProvider::OpenAi,
+            model: Some("gpt-4o-mini".to_string()),
+            endpoint_type: soth_core::EndpointType::ChatCompletion,
+            api_version: None,
+            system_prompt_hash: None,
+            system_prompt_token_estimate: None,
+            user_content_hash: "u-hash".to_string(),
+            user_content_token_estimate: 0,
+            conversation_hash: "c-hash".to_string(),
+            conversation_turn: Some(1),
+            has_tool_definitions: false,
+            tool_definition_hash: None,
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            top_p: None,
+            stop_sequences: Vec::new(),
+            estimated_input_tokens: 0,
+            estimated_cost_usd: 0.0,
+            parse_source: soth_core::ParseSource::Rest {
+                provider: soth_core::DetectedProvider::OpenAi,
+            },
+            canonical_cache_key: "cache-key".to_string(),
+            format_metadata: soth_core::FormatMetadata::Unknown,
+        },
+        artifacts: Vec::new(),
+        capture_mode: soth_core::CaptureMode::MetadataOnly,
+        parse_source: soth_core::ParseSource::Rest {
+            provider: soth_core::DetectedProvider::OpenAi,
+        },
+        confidence: soth_core::ParseConfidence::Full,
+        detect_latency_us: 0,
+        warnings: Vec::new(),
+    }
+}
+
+pub fn make_proxy_ctx(
+    session_snapshot: Option<soth_core::SessionSnapshot>,
+) -> soth_core::ProxyContext {
+    soth_core::ProxyContext {
+        org_id: "org-test".to_string(),
+        user_id_hmac: "user-test".to_string(),
+        team_id: "team-test".to_string(),
+        device_id_hash: "device-test".to_string(),
+        endpoint_hash: "endpoint-test".to_string(),
+        process_resolution: soth_core::ProcessResolution {
+            match_kind: soth_core::ProcessMatchKind::Unknown,
+            app_type: soth_core::AppType::Unknown,
+            capture_mode: Some(soth_core::CaptureMode::MetadataOnly),
+            process_name: None,
+            bundle_id: None,
+        },
+        capture_mode: soth_core::CaptureMode::MetadataOnly,
+        matched_provider: Some("openai".to_string()),
+        matched_application: None,
+        traffic_classification: soth_core::TrafficClassification::Other,
+        classification_source: soth_core::ClassificationSource::Proxy,
+        session_snapshot,
+    }
+}

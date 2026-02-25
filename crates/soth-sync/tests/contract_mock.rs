@@ -12,19 +12,19 @@ use flate2::read::GzDecoder;
 use rusqlite::Connection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use soth_core::api::{
+use soth_sync::agent::{SyncAgent, SyncAgentConfig};
+use soth_sync::api_types::{
     version::{API_VERSION, API_VERSION_HEADER},
     BlobUploadRequest, BlobUploadResponse, ConfigBudget, ConfigBudgetLimit, ConfigOrg,
-    ConfigPolicy, ConfigResponse, ConfigTeam, ConfigUser, ExchangeBatchRequest,
+    ConfigPolicy, ConfigResponse, ConfigTeam, ConfigUser, EventError, ExchangeBatchRequest,
     ExchangeBatchResponse, HeartbeatRequest, HeartbeatResponse, RegistryVersionResponse,
 };
-use soth_core::types::{
-    exchange::{ExchangeBodyMode, ExchangeEvent, ExchangeSourceClass, ExchangeTransport},
-    AgentInfo, DetectionSource, EventSource, WrapDirection, WrapEvent,
-};
-use soth_sync::agent::{SyncAgent, SyncAgentConfig};
 use soth_sync::config_puller::ConfigPuller;
+use soth_sync::exchange::types::{
+    ExchangeBodyMode, ExchangeEvent, ExchangeSourceClass, ExchangeTransport,
+};
 use soth_sync::registry_puller::RegistryPuller;
+use soth_sync::TelemetrySyncConfig;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -128,8 +128,9 @@ async fn contract_sync_endpoints_and_cursors() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
         heartbeat_telemetry: None,
+        telemetry: TelemetrySyncConfig::default(),
     };
-    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+    let agent = SyncAgent::new_with_config_puller(config, Some(puller)).unwrap();
 
     let summary = agent.tick().await.unwrap();
     assert_eq!(summary.exchange_sent, 1);
@@ -308,8 +309,9 @@ async fn contract_retry_queue_on_body_upload_failure() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
+        telemetry: TelemetrySyncConfig::default(),
     };
-    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+    let agent = SyncAgent::new_with_config_puller(config, Some(puller)).unwrap();
 
     let first = agent.tick().await.unwrap();
     assert_eq!(first.exchange_sent, 0);
@@ -398,8 +400,9 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
+        telemetry: TelemetrySyncConfig::default(),
     };
-    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+    let agent = SyncAgent::new_with_config_puller(config, Some(puller)).unwrap();
 
     let summary = agent.flush_for_shutdown(5).await.unwrap();
     assert_eq!(summary.exchange_sent, 2);
@@ -455,8 +458,9 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
+        telemetry: TelemetrySyncConfig::default(),
     };
-    let agent = SyncAgent::new(config, None).unwrap();
+    let agent = SyncAgent::new_with_config_puller(config, None).unwrap();
     let error = agent.flush_for_shutdown(2).await.unwrap_err();
     assert!(
         !error.to_string().is_empty(),
@@ -536,9 +540,10 @@ async fn contract_frontload_and_live_batches_are_separated() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
+        telemetry: TelemetrySyncConfig::default(),
     };
 
-    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+    let agent = SyncAgent::new_with_config_puller(config, Some(puller)).unwrap();
     let summary = agent.tick().await.unwrap();
     assert_eq!(summary.exchange_sent, 2);
 
@@ -629,9 +634,10 @@ async fn contract_frontload_batch_endpoint_falls_back_to_default_exchange_batch(
         body_upload_max_bytes: 15 * 1024 * 1024,
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
+        telemetry: TelemetrySyncConfig::default(),
     };
 
-    let agent = SyncAgent::new(config, Some(puller)).unwrap();
+    let agent = SyncAgent::new_with_config_puller(config, Some(puller)).unwrap();
     let summary = agent.tick().await.unwrap();
     assert_eq!(summary.exchange_sent, 1);
 
@@ -704,7 +710,7 @@ async fn exchange_batch_handler_at_path(
                 Json(ExchangeBatchResponse {
                     accepted: 0,
                     rejected: 1,
-                    errors: vec![soth_core::api::EventError {
+                    errors: vec![EventError {
                         event_id: "decode".to_string(),
                         reason: error,
                         code: Some("validation_failed".to_string()),
@@ -918,25 +924,11 @@ fn record_headers(state: &SharedState, headers: &HeaderMap) {
     );
 }
 
-fn create_test_db(path: &Path, with_second_event: bool) {
+fn create_test_db(path: &Path, _with_second_event: bool) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
         r#"
         PRAGMA journal_mode=WAL;
-        CREATE TABLE wrap_events (
-            seq INTEGER PRIMARY KEY AUTOINCREMENT,
-            id TEXT NOT NULL UNIQUE,
-            session_id TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            event_json TEXT NOT NULL
-        );
-        CREATE TABLE wrap_event_payloads (
-            event_id TEXT NOT NULL,
-            payload_kind TEXT NOT NULL,
-            payload BLOB NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (event_id, payload_kind)
-        );
         CREATE TABLE sync_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -945,47 +937,6 @@ fn create_test_db(path: &Path, with_second_event: bool) {
         "#,
     )
     .unwrap();
-
-    let event = make_event("evt-1");
-    conn.execute(
-        "INSERT INTO wrap_events (id, session_id, timestamp, event_json) VALUES (?1, ?2, ?3, ?4)",
-        (
-            &event.id,
-            &event.session_id,
-            event.timestamp.to_rfc3339(),
-            serde_json::to_string(&event).unwrap(),
-        ),
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO wrap_event_payloads (event_id, payload_kind, payload, created_at) VALUES (?1, 'request', ?2, ?3)",
-        (
-            &event.id,
-            json!({
-                "input":"hello",
-                "email":"alice@example.com",
-                "ssn":"123-45-6789"
-            })
-            .to_string()
-            .into_bytes(),
-            Utc::now().to_rfc3339(),
-        ),
-    )
-    .unwrap();
-
-    if with_second_event {
-        let second = make_event("evt-2");
-        conn.execute(
-            "INSERT INTO wrap_events (id, session_id, timestamp, event_json) VALUES (?1, ?2, ?3, ?4)",
-            (
-                &second.id,
-                &second.session_id,
-                second.timestamp.to_rfc3339(),
-                serde_json::to_string(&second).unwrap(),
-            ),
-        )
-        .unwrap();
-    }
 }
 
 fn seed_exchange_upload_queue(path: &Path, exchange_id: &str) {
@@ -1064,32 +1015,6 @@ fn test_blob_payload_items() -> String {
         "payload_gzip_b64": "H4sIAAAAAAAA/0tMTEwEAEXLMt0EAAAA"
     })])
     .unwrap()
-}
-
-fn make_event(id: &str) -> WrapEvent {
-    let mut event = WrapEvent::new(
-        "session-1",
-        "api.openai.com",
-        WrapDirection::Out,
-        AgentInfo::new("codex", DetectionSource::CommandLine),
-    )
-    .with_source(EventSource::AiProxy)
-    .with_provider("openai")
-    .with_model("gpt-5")
-    .with_method("POST /v1/responses")
-    .with_usage_tokens(10, 20)
-    .with_payload_sizes(Some(128), Some(512))
-    .with_latency(42)
-    .with_cost(0.1234);
-    event.id = id.to_string();
-    event.request_content_ref = Some(format!("sqlite://wrap_event_payloads/{id}/request"));
-    event.content_preview = Some("{\"input\":\"hello\"}".to_string());
-    event.tags = Some(BTreeMap::from([("source".to_string(), "test".to_string())]));
-    event.headers = Some(BTreeMap::from([(
-        "x-request-id".to_string(),
-        "req_123".to_string(),
-    )]));
-    event
 }
 
 fn make_exchange_event(exchange_id: &str) -> ExchangeEvent {

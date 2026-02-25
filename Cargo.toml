@@ -1,32 +1,24 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/soth-core",
-    "crates/soth-helper",
-    "crates/soth-crypto",
-    "crates/soth-policy",
-    "crates/soth-observe",
-    "crates/soth-budget",
-    "crates/soth-collector",
-    "crates/soth-dashboard",
     "crates/soth-cli",
+    "crates/soth-core",
+    "crates/soth-bundle",
+    "crates/soth-classify",
+    "crates/soth-proxy",
+    "crates/soth-telemetry",
+    "crates/soth-policy",
     "crates/soth-sync",
-    "crates/soth-edge",
-    "crates/soth-wrap",
     "crates/soth-detect",
 ]
 default-members = [
     "crates/soth-core",
-    "crates/soth-helper",
-    "crates/soth-crypto",
+    "crates/soth-bundle",
+    "crates/soth-classify",
+    "crates/soth-proxy",
+    "crates/soth-telemetry",
     "crates/soth-policy",
-    "crates/soth-observe",
-    "crates/soth-budget",
-    "crates/soth-collector",
-    "crates/soth-cli",
     "crates/soth-sync",
-    "crates/soth-edge",
-    "crates/soth-wrap",
 ]
 exclude = [
     "tests/tools/mock_mcp_server",
@@ -43,16 +35,13 @@ authors = ["Labterminal"]
 [workspace.dependencies]
 # Internal crates
 soth-core = { path = "crates/soth-core" }
-soth-helper = { path = "crates/soth-helper" }
-soth-crypto = { path = "crates/soth-crypto" }
+soth-bundle = { path = "crates/soth-bundle" }
+soth-classify = { path = "crates/soth-classify" }
+soth-proxy = { path = "crates/soth-proxy" }
+soth-telemetry = { path = "crates/soth-telemetry" }
 soth-policy = { path = "crates/soth-policy" }
-soth-observe = { path = "crates/soth-observe" }
-soth-budget = { path = "crates/soth-budget" }
-soth-collector = { path = "crates/soth-collector" }
-soth-dashboard = { path = "crates/soth-dashboard" }
 soth-sync = { path = "crates/soth-sync" }
-soth-edge = { path = "crates/soth-edge" }
-soth-wrap = { path = "crates/soth-wrap" }
+soth-detect = { path = "crates/soth-detect" }
 
 # Async runtime
 tokio = { version = "1", features = [

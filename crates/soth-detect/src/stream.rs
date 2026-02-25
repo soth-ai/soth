@@ -4,11 +4,12 @@ use crate::hash::hash_content;
 use crate::jsonrpc::parse_jsonrpc_payload_text;
 use crate::sensitive::credential_scan;
 use crate::types::{
-    ArtifactLocation, CaptureMode, ChunkArtifact, DetectBundleSlice, FrameKind, StreamChunk,
-    StreamSession, StreamSummary,
+    ArtifactLocation, CaptureMode, ChunkArtifact, DetectBundleSlice, DetectResult, DetectWarning,
+    FrameKind, ParseConfidence, ParseSource, StreamChunk, StreamSession, StreamSummary,
 };
+use bytes::Bytes;
 
-pub fn process_chunk(
+pub fn process_chunk_with_bundle(
     chunk: &StreamChunk,
     session: &mut StreamSession,
     bundle: &DetectBundleSlice<'_>,
@@ -91,12 +92,59 @@ pub fn process_chunk(
     None
 }
 
-pub fn finalize_stream(session: StreamSession) -> StreamSummary {
+pub fn finalize_stream_summary(session: StreamSession) -> StreamSummary {
     let assembled = session.finalize_response_content();
     StreamSummary {
         response_hash: hash_content(&assembled),
         chunk_count: session.chunk_count,
         elapsed_ms: session.start_time.elapsed().as_millis(),
+    }
+}
+
+pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
+    let summary = finalize_stream_summary(session.clone());
+    let assembled = session.finalize_response_content();
+
+    let mut normalized = crate::types::NormalizedRequest::empty_heuristic("STREAM", "/stream");
+    let token_estimate = ((assembled.len() as f32) / 4.0).ceil() as u32;
+    normalized.is_ai_call = !assembled.is_empty();
+    normalized.user_content_hash = summary.response_hash.clone();
+    normalized.user_content_token_estimate = token_estimate;
+    normalized.conversation_hash = summary.response_hash.clone();
+    normalized.estimated_input_tokens = token_estimate;
+    normalized.canonical_hash = summary.response_hash.clone();
+    normalized.content_sample = if assembled.is_empty() {
+        None
+    } else {
+        Some(assembled.clone())
+    };
+
+    let capture_mode = session.capture_mode;
+    let full_like = matches!(
+        capture_mode,
+        CaptureMode::Full | CaptureMode::SensitiveArtifacts | CaptureMode::FullContent
+    );
+    let artifacts = if full_like {
+        credential_scan(assembled.as_bytes(), ArtifactLocation::Unknown)
+    } else {
+        Vec::new()
+    };
+
+    let mut warnings = Vec::new();
+    warnings.push(DetectWarning {
+        code: "stream_finalize_heuristic",
+        detail: "stream finalized using heuristic normalization".to_string(),
+    });
+
+    DetectResult {
+        normalized,
+        artifacts,
+        capture_mode,
+        parse_source: ParseSource::Heuristic,
+        confidence: ParseConfidence::Heuristic,
+        detect_latency_us: session.start_time.elapsed().as_micros() as u64,
+        warnings,
+        raw_body_bytes: Some(Bytes::from(assembled)),
     }
 }
 

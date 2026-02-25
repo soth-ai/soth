@@ -100,6 +100,16 @@ pub enum ClassificationFlag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TelemetryPolicyKind {
+    Allow,
+    Block,
+    Redact,
+    Reroute,
+    Flag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RequestMethod {
     Get,
     Post,
@@ -163,5 +173,7 @@ pub struct TelemetryEvent {
     pub import_categories: Vec<ImportCategory>,
     pub classification_flags: Vec<ClassificationFlag>,
     pub anomaly_flags: Vec<AnomalyFlag>,
+    pub anomaly_score: Option<f32>,
+    pub policy_kind: Option<TelemetryPolicyKind>,
     pub sensitive_code_flags: SensitiveCodeFlags,
 }

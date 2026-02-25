@@ -1,13 +1,15 @@
+use crate::api_types::{RegistryBundleFetchQuery, RegistryVersionResponse};
 use anyhow::Context;
+use base64::Engine;
 use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use soth_core::api::{
-    version::API_VERSION_HEADER, RegistryBundleFetchQuery, RegistryVersionResponse, API_VERSION,
-};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::cache;
-use crate::http_client::build_cloud_client;
+use crate::http_client::SothHttpClient;
 
 #[derive(Debug, Clone)]
 pub struct RegistryPullOutcome {
@@ -23,6 +25,15 @@ pub struct RegistryPuller {
     api_key: String,
     cache_path: PathBuf,
     bundle_type: String,
+    bundle_install_hook: Option<Arc<dyn BundleInstallHook>>,
+}
+
+pub trait BundleInstallHook: Send + Sync {
+    fn install_bundle(
+        &self,
+        manifest_bytes: &[u8],
+        assets: HashMap<String, Vec<u8>>,
+    ) -> anyhow::Result<String>;
 }
 
 impl RegistryPuller {
@@ -38,11 +49,17 @@ impl RegistryPuller {
             api_key: api_key.into(),
             cache_path,
             bundle_type: "local".to_string(),
+            bundle_install_hook: None,
         }
     }
 
     pub fn with_bundle_type(mut self, bundle_type: impl Into<String>) -> Self {
         self.bundle_type = bundle_type.into();
+        self
+    }
+
+    pub fn with_bundle_install_hook(mut self, hook: Arc<dyn BundleInstallHook>) -> Self {
+        self.bundle_install_hook = Some(hook);
         self
     }
 
@@ -73,6 +90,10 @@ impl RegistryPuller {
             }
         }
         endpoints
+    }
+
+    fn cloud_client_for_endpoint(&self, endpoint: &str) -> SothHttpClient {
+        SothHttpClient::new(endpoint.to_string(), self.api_key.clone())
     }
 
     pub async fn sync_from_hint(
@@ -246,6 +267,20 @@ impl RegistryPuller {
                             );
                         }
                     })?;
+                if let Some(installed_version) = self.maybe_install_channel2_bundle(&bytes)? {
+                    if endpoint != self.endpoint {
+                        tracing::warn!(
+                            endpoint = endpoint,
+                            bundle_version = installed_version.as_str(),
+                            "Channel 2 bundle install succeeded via fallback endpoint"
+                        );
+                    }
+                    return Ok(Some(RegistryPullOutcome {
+                        checked: true,
+                        downloaded: true,
+                        version: Some(installed_version),
+                    }));
+                }
                 cache::save_registry_bundle_cache(
                     &self.cache_path,
                     &verified_metadata,
@@ -284,14 +319,13 @@ impl RegistryPuller {
         endpoint: &str,
         fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<Option<RegistryVersionResponse>> {
-        let url = format!("{endpoint}/api/v1/registry/version");
+        let cloud = self.cloud_client_for_endpoint(endpoint);
+        let url = cloud.url("/api/v1/registry/version");
         let mut query_params = vec![("type", self.bundle_type.clone())];
         query_params.extend(build_bundle_query_pairs(fetch_query));
-        let response = build_cloud_client(endpoint)
-            .get(&url)
+        let response = cloud
+            .get("/api/v1/registry/version")
             .query(&query_params)
-            .header(API_VERSION_HEADER, API_VERSION)
-            .bearer_auth(&self.api_key)
             .send()
             .await
             .with_context(|| format!("cloud registry version pull failed for {url}"))?;
@@ -323,14 +357,11 @@ impl RegistryPuller {
         fetch_query: &RegistryBundleFetchQuery,
         bundle_hash: Option<&str>,
     ) -> anyhow::Result<BundleFetchResult> {
-        let url = format!("{endpoint}/api/v1/registry/bundle");
+        let cloud = self.cloud_client_for_endpoint(endpoint);
+        let url = cloud.url("/api/v1/registry/bundle");
         let mut query_params = vec![("type", self.bundle_type.clone())];
         query_params.extend(build_bundle_request_query_pairs(fetch_query, bundle_hash));
-        let mut request = build_cloud_client(endpoint)
-            .get(&url)
-            .query(&query_params)
-            .header(API_VERSION_HEADER, API_VERSION)
-            .bearer_auth(&self.api_key);
+        let mut request = cloud.get("/api/v1/registry/bundle").query(&query_params);
 
         if let Some(if_none_match) = if_none_match {
             request = request.header(IF_NONE_MATCH, if_none_match);
@@ -363,6 +394,19 @@ impl RegistryPuller {
             bytes: bytes.to_vec(),
             etag,
         })
+    }
+
+    fn maybe_install_channel2_bundle(&self, bytes: &[u8]) -> anyhow::Result<Option<String>> {
+        let Some(hook) = self.bundle_install_hook.as_ref() else {
+            return Ok(None);
+        };
+        let Some((manifest_bytes, assets)) = parse_channel2_bundle_payload(bytes) else {
+            return Ok(None);
+        };
+        let version = hook
+            .install_bundle(manifest_bytes.as_slice(), assets)
+            .context("installing channel 2 intelligence bundle")?;
+        Ok(Some(version))
     }
 }
 
@@ -537,16 +581,85 @@ fn normalize_hash_candidate(value: Option<&str>) -> Option<String> {
     }
 }
 
+fn parse_channel2_bundle_payload(bytes: &[u8]) -> Option<(Vec<u8>, HashMap<String, Vec<u8>>)> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object()?;
+
+    let manifest_bytes = if let Some(manifest_value) = object.get("manifest") {
+        if manifest_value.is_object() {
+            serde_json::to_vec(manifest_value).ok()?
+        } else if let Some(manifest_raw) = manifest_value.as_str() {
+            decode_bytes_like(manifest_raw.as_bytes(), manifest_raw)?
+        } else {
+            return None;
+        }
+    } else if let Some(manifest_b64) = object.get("manifest_bytes").and_then(|v| v.as_str()) {
+        decode_bytes_like(manifest_b64.as_bytes(), manifest_b64)?
+    } else {
+        return None;
+    };
+
+    let assets_value = object.get("assets")?.as_object()?;
+    let mut assets = HashMap::with_capacity(assets_value.len());
+    for (path, raw) in assets_value {
+        let bytes = decode_asset_value(raw)?;
+        assets.insert(path.clone(), bytes);
+    }
+
+    Some((manifest_bytes, assets))
+}
+
+fn decode_asset_value(value: &Value) -> Option<Vec<u8>> {
+    if let Some(raw) = value.as_str() {
+        return decode_bytes_like(raw.as_bytes(), raw);
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(raw) = object.get("base64").and_then(|v| v.as_str()) {
+            return decode_bytes_like(raw.as_bytes(), raw);
+        }
+        if let Some(raw) = object.get("bytes").and_then(|v| v.as_str()) {
+            return decode_bytes_like(raw.as_bytes(), raw);
+        }
+        if let Some(json_payload) = object.get("json") {
+            return serde_json::to_vec(json_payload).ok();
+        }
+    }
+    if let Some(array) = value.as_array() {
+        let mut bytes = Vec::with_capacity(array.len());
+        for item in array {
+            let value = item.as_u64()?;
+            bytes.push(value as u8);
+        }
+        return Some(bytes);
+    }
+    None
+}
+
+fn decode_bytes_like(raw_bytes: &[u8], raw: &str) -> Option<Vec<u8>> {
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(raw_bytes) {
+        return Some(decoded);
+    }
+    if raw.trim_start().starts_with('{') || raw.trim_start().starts_with('[') {
+        return Some(raw.as_bytes().to_vec());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_bundle_query_pairs, build_bundle_request_query_pairs, extract_required_etag,
-        normalize_etag, should_skip_pull, verify_bundle_integrity,
+        normalize_etag, parse_channel2_bundle_payload, should_skip_pull, verify_bundle_integrity,
+        BundleInstallHook, RegistryPuller,
     };
+    use crate::api_types::{RegistryBundleFetchQuery, RegistryVersionResponse};
+    use base64::Engine;
     use reqwest::header::HeaderMap;
     use reqwest::header::{HeaderValue, ETAG};
     use sha2::{Digest, Sha256};
-    use soth_core::api::{RegistryBundleFetchQuery, RegistryVersionResponse};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     fn sample_metadata(sha256: &str, size_bytes: u64) -> RegistryVersionResponse {
         RegistryVersionResponse {
@@ -679,5 +792,91 @@ mod tests {
                 ("bundle_hash", "abc123".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn parse_channel2_bundle_payload_accepts_manifest_object_and_base64_assets() {
+        let manifest = serde_json::json!({
+            "version": "bundle-v1",
+            "created_at": 1,
+            "vendor_sig": "deadbeef",
+            "org_approval_sig": null,
+            "assets": [],
+            "scope": {
+                "intercept_https": false,
+                "intercept_http": false,
+                "process_filter": null,
+                "capture_modes": []
+            }
+        });
+        let payload = serde_json::json!({
+            "manifest": manifest,
+            "assets": {
+                "policy/policy_bundle.json": base64::engine::general_purpose::STANDARD.encode(br#"{"ok":true}"#)
+            }
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let parsed = parse_channel2_bundle_payload(bytes.as_slice()).expect("payload should parse");
+        assert!(!parsed.0.is_empty());
+        assert_eq!(
+            parsed.1.get("policy/policy_bundle.json").unwrap(),
+            br#"{"ok":true}"#
+        );
+    }
+
+    #[derive(Default)]
+    struct MockHookState {
+        called: bool,
+    }
+
+    struct MockInstallHook {
+        state: Arc<Mutex<MockHookState>>,
+    }
+
+    impl BundleInstallHook for MockInstallHook {
+        fn install_bundle(
+            &self,
+            _manifest_bytes: &[u8],
+            _assets: HashMap<String, Vec<u8>>,
+        ) -> anyhow::Result<String> {
+            let mut guard = self.state.lock().unwrap();
+            guard.called = true;
+            Ok("bundle-installed-v1".to_string())
+        }
+    }
+
+    #[test]
+    fn maybe_install_channel2_bundle_invokes_hook_when_payload_matches_shape() {
+        let state = Arc::new(Mutex::new(MockHookState::default()));
+        let hook = Arc::new(MockInstallHook {
+            state: state.clone(),
+        });
+        let puller = RegistryPuller::new("https://example.com", "key", PathBuf::from("/tmp/cache"))
+            .with_bundle_install_hook(hook);
+
+        let payload = serde_json::json!({
+            "manifest": {
+                "version": "bundle-v1",
+                "created_at": 1,
+                "vendor_sig": "deadbeef",
+                "org_approval_sig": null,
+                "assets": [],
+                "scope": {
+                    "intercept_https": false,
+                    "intercept_http": false,
+                    "process_filter": null,
+                    "capture_modes": []
+                }
+            },
+            "assets": {
+                "policy/policy_bundle.json": base64::engine::general_purpose::STANDARD.encode(br#"{"ok":true}"#)
+            }
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let installed = puller
+            .maybe_install_channel2_bundle(bytes.as_slice())
+            .expect("install invocation should succeed");
+        assert_eq!(installed.as_deref(), Some("bundle-installed-v1"));
+        assert!(state.lock().unwrap().called);
     }
 }

@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyContext {
+    pub org_id: String,
+    pub user_id_hmac: String,
+    pub team_id: String,
+    pub device_id_hash: String,
+    pub endpoint_hash: String,
     pub process_resolution: ProcessResolution,
     pub capture_mode: CaptureMode,
     pub matched_provider: Option<String>,
@@ -56,16 +61,15 @@ pub struct ProcessResolution {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionSnapshot {
-    pub session_id: String,
-    pub total_tokens_this_session: u64,
-    pub total_cost_usd_this_session: f64,
-    pub request_count_this_session: u32,
-    pub credential_alerts_this_session: u32,
+    pub request_count: u32,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+    pub credential_alerts: u32,
     pub topic_cluster_ids_seen: Vec<u32>,
     pub embedding_centroid: Option<Vec<f32>>,
     pub prior_semantic_hashes: Vec<String>,
     pub last_model: Option<String>,
-    pub current_request_timestamp: Option<i64>,
+    pub current_request_timestamp: i64,
     pub last_request_timestamp: Option<i64>,
     pub session_start: Option<i64>,
 }

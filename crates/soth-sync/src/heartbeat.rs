@@ -1,23 +1,16 @@
-use crate::http_client::build_cloud_client;
+use crate::api_types::{HeartbeatRequest, HeartbeatResponse};
+use crate::http_client::SothHttpClient;
 use anyhow::Context;
-use soth_core::api::{
-    version::API_VERSION_HEADER, HeartbeatRequest, HeartbeatResponse, API_VERSION,
-};
 
 #[derive(Clone)]
 pub struct HeartbeatSender {
-    endpoint: String,
-    api_key: String,
-    client: reqwest::Client,
+    cloud: SothHttpClient,
 }
 
 impl HeartbeatSender {
     pub fn new(endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
-        let endpoint = endpoint.into().trim_end_matches('/').to_string();
         Self {
-            client: build_cloud_client(&endpoint),
-            endpoint,
-            api_key: api_key.into(),
+            cloud: SothHttpClient::new(endpoint, api_key),
         }
     }
 
@@ -25,12 +18,10 @@ impl HeartbeatSender {
         &self,
         request: &HeartbeatRequest,
     ) -> anyhow::Result<Option<HeartbeatResponse>> {
-        let url = format!("{}/api/v1/heartbeat", self.endpoint);
+        let url = self.cloud.url("/api/v1/heartbeat");
         let response = self
-            .client
-            .post(&url)
-            .header(API_VERSION_HEADER, API_VERSION)
-            .bearer_auth(&self.api_key)
+            .cloud
+            .post("/api/v1/heartbeat")
             .json(request)
             .send()
             .await

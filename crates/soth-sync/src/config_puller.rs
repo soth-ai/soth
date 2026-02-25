@@ -1,20 +1,18 @@
 use anyhow::Context;
-use soth_core::api::{version::API_VERSION_HEADER, ConfigResponse, API_VERSION};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
+use crate::api_types::ConfigResponse;
 use crate::cache;
-use crate::http_client::build_cloud_client;
+use crate::http_client::SothHttpClient;
 use crate::registry_puller::RegistryPuller;
 
 #[derive(Clone)]
 pub struct ConfigPuller {
-    endpoint: String,
-    api_key: String,
     cache_path: PathBuf,
-    client: reqwest::Client,
+    cloud: SothHttpClient,
     debounce_window: Duration,
     debounce_state: Arc<Mutex<DebounceState>>,
     registry_puller: Option<RegistryPuller>,
@@ -33,11 +31,8 @@ impl ConfigPuller {
         api_key: impl Into<String>,
         cache_path: PathBuf,
     ) -> Self {
-        let endpoint = endpoint.into().trim_end_matches('/').to_string();
         Self {
-            client: build_cloud_client(&endpoint),
-            endpoint,
-            api_key: api_key.into(),
+            cloud: SothHttpClient::new(endpoint, api_key),
             cache_path,
             debounce_window: Duration::from_secs(6),
             debounce_state: Arc::new(Mutex::new(DebounceState::default())),
@@ -56,12 +51,10 @@ impl ConfigPuller {
     }
 
     pub async fn pull_once(&self) -> anyhow::Result<Option<ConfigResponse>> {
-        let url = format!("{}/api/v1/config", self.endpoint);
+        let url = self.cloud.url("/api/v1/config");
         let response = self
-            .client
-            .get(&url)
-            .header(API_VERSION_HEADER, API_VERSION)
-            .bearer_auth(&self.api_key)
+            .cloud
+            .get("/api/v1/config")
             .send()
             .await
             .with_context(|| format!("cloud config pull failed for {url}"))?;

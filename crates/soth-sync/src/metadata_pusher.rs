@@ -1,9 +1,7 @@
-use crate::http_client::build_cloud_client;
+use crate::api_types::{ExchangeBatchRequest, ExchangeBatchResponse};
+use crate::http_client::SothHttpClient;
 use anyhow::Context;
 use flate2::{write::GzEncoder, Compression};
-use soth_core::api::{
-    version::API_VERSION_HEADER, ExchangeBatchRequest, ExchangeBatchResponse, API_VERSION,
-};
 use std::io::Write;
 use tracing::warn;
 
@@ -23,9 +21,7 @@ pub enum ExchangeBatchRoute {
 
 #[derive(Clone)]
 pub struct MetadataPusher {
-    endpoint: String,
-    api_key: String,
-    client: reqwest::Client,
+    cloud: SothHttpClient,
     frontload_upload_path: Option<String>,
 }
 
@@ -35,11 +31,8 @@ impl MetadataPusher {
         api_key: impl Into<String>,
         frontload_upload_path: Option<String>,
     ) -> Self {
-        let endpoint = endpoint.into().trim_end_matches('/').to_string();
         Self {
-            client: build_cloud_client(&endpoint),
-            endpoint,
-            api_key: api_key.into(),
+            cloud: SothHttpClient::new(endpoint, api_key),
             frontload_upload_path: frontload_upload_path
                 .as_deref()
                 .and_then(normalize_upload_path),
@@ -102,21 +95,19 @@ impl MetadataPusher {
 
     fn exchange_upload_url(&self, route: ExchangeBatchRoute) -> String {
         match route {
-            ExchangeBatchRoute::Live => {
-                compose_upload_url(self.endpoint.as_str(), EXCHANGE_BATCH_UPLOAD_PATH)
-            }
+            ExchangeBatchRoute::Live => self.cloud.url(EXCHANGE_BATCH_UPLOAD_PATH),
             ExchangeBatchRoute::Frontload => {
                 if let Some(path) = self.frontload_upload_path.as_deref() {
-                    compose_upload_url(self.endpoint.as_str(), path)
+                    self.cloud.url(path)
                 } else {
-                    compose_upload_url(self.endpoint.as_str(), EXCHANGE_BATCH_UPLOAD_PATH)
+                    self.cloud.url(EXCHANGE_BATCH_UPLOAD_PATH)
                 }
             }
         }
     }
 
     fn frontload_fallback_url(&self, primary_url: &str) -> Option<String> {
-        let live_url = compose_upload_url(self.endpoint.as_str(), EXCHANGE_BATCH_UPLOAD_PATH);
+        let live_url = self.cloud.url(EXCHANGE_BATCH_UPLOAD_PATH);
         if live_url.eq_ignore_ascii_case(primary_url) {
             None
         } else {
@@ -130,12 +121,10 @@ impl MetadataPusher {
         request_gzip: &[u8],
     ) -> anyhow::Result<ExchangePushResult> {
         let response = self
-            .client
+            .cloud
             .post(url)
-            .header(API_VERSION_HEADER, API_VERSION)
             .header("content-type", "application/json")
             .header("content-encoding", "gzip")
-            .bearer_auth(&self.api_key)
             .body(request_gzip.to_vec())
             .send()
             .await
@@ -171,13 +160,6 @@ fn normalize_upload_path(path: &str) -> Option<String> {
     } else {
         Some(normalized)
     }
-}
-
-fn compose_upload_url(endpoint: &str, path_or_url: &str) -> String {
-    if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-        return path_or_url.to_string();
-    }
-    format!("{endpoint}{path_or_url}")
 }
 
 fn should_fallback_frontload_route(status: reqwest::StatusCode) -> bool {

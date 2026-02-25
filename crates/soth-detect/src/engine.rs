@@ -174,6 +174,7 @@ fn process_inner(
         confidence,
         detect_latency_us: started.elapsed().as_micros() as u64,
         warnings,
+        raw_body_bytes: Some(req.body.clone()),
     }
 }
 

@@ -1,0 +1,24 @@
+IMPORTANT NOTE - SQLite stack compatibility
+Date: 2026-02-25
+
+Context:
+- The original telemetry plan used `sqlx::SqlitePool`.
+- In this workspace, that caused a native linking conflict with existing `rusqlite`.
+
+Conflict details:
+- `sqlx-sqlite` pulled `libsqlite3-sys` (0.26.x).
+- Workspace `rusqlite` (0.31.x) pulled `libsqlite3-sys` (0.28.x).
+- Cargo allows only one crate with `links = "sqlite3"` in a final dependency graph.
+- Result: build failure when both stacks were present.
+
+Current implementation decision:
+- `soth-telemetry` uses a crate-local `SqlitePool` wrapper backed by `rusqlite`.
+- This keeps telemetry functional and compile-compatible with the current workspace.
+
+Future resolution options:
+1) Standardize the workspace on a single SQLite stack (preferred long-term).
+2) Revisit `sqlx` adoption only after dependency versions align to a single `libsqlite3-sys`.
+3) If needed, isolate telemetry into a separately-built binary/process so link graphs are independent.
+
+Action item when revisiting:
+- Verify `cargo tree -i libsqlite3-sys` first, then choose one unified SQLite dependency path.

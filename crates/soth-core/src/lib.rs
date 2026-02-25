@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod classify;
 pub mod crypto;
+pub mod detect;
 pub mod error;
 pub mod identity;
 pub mod normalized;
@@ -14,6 +15,7 @@ pub mod telemetry;
 pub use artifacts::*;
 pub use classify::*;
 pub use crypto::*;
+pub use detect::*;
 pub use error::{Result, SothError};
 pub use identity::*;
 pub use normalized::*;

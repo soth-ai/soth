@@ -765,10 +765,10 @@ fn is_ident_continue(ch: char) -> bool {
 }
 
 fn evaluate_budget_limits(ctx: &PolicyContext, bundle: &PolicyBundle) -> Option<PolicyDecision> {
-    let session = ctx.session.as_ref()?;
+    let session = &ctx.session;
 
     if let Some(limit) = bundle.budget_limits.max_tokens_per_session {
-        if session.total_tokens_this_session > limit {
+        if session.total_tokens > limit {
             return Some(block_decision(
                 "budget_session_tokens_exceeded",
                 "SessionTokenBudgetExceeded",
@@ -781,7 +781,7 @@ fn evaluate_budget_limits(ctx: &PolicyContext, bundle: &PolicyBundle) -> Option<
     }
 
     if let Some(limit) = bundle.budget_limits.max_cost_usd_per_session {
-        if session.total_cost_usd_this_session > limit {
+        if session.total_cost_usd > limit {
             return Some(block_decision(
                 "budget_session_cost_exceeded",
                 "SessionCostBudgetExceeded",
@@ -794,7 +794,7 @@ fn evaluate_budget_limits(ctx: &PolicyContext, bundle: &PolicyBundle) -> Option<
     }
 
     if let Some(limit) = bundle.budget_limits.max_requests_per_session {
-        if session.request_count_this_session > limit {
+        if session.request_count > limit {
             return Some(block_decision(
                 "budget_session_requests_exceeded",
                 "SessionRequestBudgetExceeded",
@@ -1030,17 +1030,10 @@ fn build_eval_scope(
             .unwrap_or(EvalValue::Null),
     );
 
-    let (total_tokens, total_cost, request_count, credential_alerts) =
-        if let Some(session) = ctx.session.as_ref() {
-            (
-                session.total_tokens_this_session,
-                session.total_cost_usd_this_session,
-                session.request_count_this_session,
-                session.credential_alerts_this_session,
-            )
-        } else {
-            (0, 0.0, 0, 0)
-        };
+    let total_tokens = ctx.session.total_tokens;
+    let total_cost = ctx.session.total_cost_usd;
+    let request_count = ctx.session.request_count;
+    let credential_alerts = ctx.session.credential_alerts;
     scope.insert(
         "session.total_tokens",
         EvalValue::Number(total_tokens as f64),
@@ -1550,7 +1543,7 @@ mod tests {
             deployment: DeploymentModel::Proxy,
             skip_org_rules: false,
             semantic: None,
-            session,
+            session: session.unwrap_or_default(),
         }
     }
 
@@ -1629,11 +1622,10 @@ mod tests {
         };
         let normalized = fixture_request();
         let ctx = fixture_context(Some(SessionBudget {
-            session_id: "s-1".to_string(),
-            total_tokens_this_session: 1001,
-            total_cost_usd_this_session: 0.0,
-            request_count_this_session: 1,
-            credential_alerts_this_session: 0,
+            total_tokens: 1001,
+            total_cost_usd: 0.0,
+            request_count: 1,
+            credential_alerts: 0,
             ..Default::default()
         }));
 
@@ -1651,11 +1643,10 @@ mod tests {
         };
         let normalized = fixture_request();
         let ctx = fixture_context(Some(SessionBudget {
-            session_id: "s-2".to_string(),
-            total_tokens_this_session: 0,
-            total_cost_usd_this_session: 2.01,
-            request_count_this_session: 1,
-            credential_alerts_this_session: 0,
+            total_tokens: 0,
+            total_cost_usd: 2.01,
+            request_count: 1,
+            credential_alerts: 0,
             ..Default::default()
         }));
 
@@ -1673,11 +1664,10 @@ mod tests {
         };
         let normalized = fixture_request();
         let ctx = fixture_context(Some(SessionBudget {
-            session_id: "s-3".to_string(),
-            total_tokens_this_session: 0,
-            total_cost_usd_this_session: 0.0,
-            request_count_this_session: 51,
-            credential_alerts_this_session: 0,
+            total_tokens: 0,
+            total_cost_usd: 0.0,
+            request_count: 51,
+            credential_alerts: 0,
             ..Default::default()
         }));
 
@@ -1745,11 +1735,10 @@ mod tests {
         };
         let normalized = fixture_request();
         let ctx = fixture_context(Some(SessionBudget {
-            session_id: "s-4".to_string(),
-            total_tokens_this_session: 1001,
-            total_cost_usd_this_session: 0.0,
-            request_count_this_session: 1,
-            credential_alerts_this_session: 0,
+            total_tokens: 1001,
+            total_cost_usd: 0.0,
+            request_count: 1,
+            credential_alerts: 0,
             ..Default::default()
         }));
         let artifacts = vec![artifact(
@@ -2103,11 +2092,10 @@ mod tests {
 
             let mut ctx = fixture_context(if rng.gen_bool(0.7) {
                 Some(SessionBudget {
-                    session_id: format!("s-{}", rng.gen_range(0..1000)),
-                    total_tokens_this_session: rng.gen_range(0..600_000),
-                    total_cost_usd_this_session: rng.gen_range(0.0..200.0),
-                    request_count_this_session: rng.gen_range(0..500),
-                    credential_alerts_this_session: rng.gen_range(0..50),
+                    total_tokens: rng.gen_range(0..600_000),
+                    total_cost_usd: rng.gen_range(0.0..200.0),
+                    request_count: rng.gen_range(0..500),
+                    credential_alerts: rng.gen_range(0..50),
                     ..Default::default()
                 })
             } else {

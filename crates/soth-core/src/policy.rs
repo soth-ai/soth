@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::CaptureMode;
-use crate::classify::{ProcessResolution, SessionSnapshot, TrafficClassification};
+use crate::classify::{AnomalyFlag, ProcessResolution, SessionSnapshot, TrafficClassification};
+use crate::telemetry::{UseCaseLabel, VolatilityClass};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyDecision {
@@ -75,15 +76,18 @@ pub struct PolicyContext {
     pub deployment: DeploymentModel,
     pub skip_org_rules: bool,
     pub semantic: Option<SemanticPolicyContext>,
-    pub session: Option<SessionSnapshot>,
+    pub session: SessionSnapshot,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticPolicyContext {
-    pub semantic_hash: Option<String>,
-    pub previous_semantic_hash: Option<String>,
-    pub semantic_drift_score: Option<f32>,
-    pub use_case_label: Option<String>,
+    pub use_case_label: UseCaseLabel,
+    pub use_case_confidence: f32,
+    pub anomaly_score: f32,
+    pub anomaly_flags: Vec<AnomalyFlag>,
+    pub complexity_score: u8,
+    pub volatility_class: VolatilityClass,
+    pub topic_cluster_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

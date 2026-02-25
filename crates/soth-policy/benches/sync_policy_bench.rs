@@ -2,14 +2,14 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use ed25519_dalek::{Signer, SigningKey};
-use soth_policy::sync_policy::{
-    evaluate, load_bundle_from_bytes, BudgetLimits, OrgPatterns, PolicyBundleMetadata,
-    PolicyBundlePayload, RuleAction, RuleDefinition, SignedPolicyBundle,
-};
 use soth_core::{
     AppType, CaptureMode, DeploymentModel, DetectedProvider, EndpointType, FormatMetadata,
     NormalizedRequest, ParseConfidence, ParseSource, PolicyContext, ProcessMatchKind,
     ProcessResolution, SessionSnapshot, TrafficClassification,
+};
+use soth_policy::sync_policy::{
+    evaluate, load_bundle_from_bytes, BudgetLimits, OrgPatterns, PolicyBundleMetadata,
+    PolicyBundlePayload, RuleAction, RuleDefinition, SignedPolicyBundle,
 };
 
 fn signed_bundle_bytes(payload: PolicyBundlePayload) -> Vec<u8> {
@@ -110,14 +110,13 @@ fn fixture_context() -> PolicyContext {
         deployment: DeploymentModel::Proxy,
         skip_org_rules: false,
         semantic: None,
-        session: Some(SessionSnapshot {
-            session_id: "bench-session".to_string(),
-            total_tokens_this_session: 100_000,
-            total_cost_usd_this_session: 3.14,
-            request_count_this_session: 42,
-            credential_alerts_this_session: 0,
+        session: SessionSnapshot {
+            total_tokens: 100_000,
+            total_cost_usd: 3.14,
+            request_count: 42,
+            credential_alerts: 0,
             ..Default::default()
-        }),
+        },
     }
 }
 

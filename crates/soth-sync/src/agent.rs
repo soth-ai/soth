@@ -1,28 +1,34 @@
-use crate::body_uploader::BodyUploader;
-use crate::cache;
-use crate::config_puller::ConfigPuller;
-use crate::heartbeat::HeartbeatSender;
-use crate::metadata_pusher::{
-    estimate_gzip_exchange_batch_size, ExchangeBatchRoute, ExchangePushResult, MetadataPusher,
-};
-use crate::retry_queue::BodyRetryQueue;
-use anyhow::Context;
-use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
-use soth_core::api::{
+use crate::api_types::{
     BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
     ExchangeMetadata, HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest,
     HeartbeatTelemetry,
 };
-use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
-use soth_core::storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
-use soth_core::types::exchange::{
-    ExchangeBodyMode, ExchangeEvent, EXCHANGE_CLIENT_APP_TYPE_HOST,
-    EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
+use crate::body_uploader::BodyUploader;
+use crate::cache;
+use crate::config::TelemetrySyncConfig;
+use crate::config_puller::ConfigPuller;
+use crate::db::{
+    open_sqlite_read_only, open_sqlite_read_write, write_sync_state, SYNC_KEY_LAST_SYNC_TIMESTAMP,
+    SYNC_KEY_SYNC_ERRORS,
 };
+use crate::exchange::types::{
+    ExchangeBodyMode, ExchangeEvent, ExchangeSourceClass, ExchangeTransport,
+    EXCHANGE_CLIENT_APP_TYPE_HOST, EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
+};
+use crate::heartbeat::HeartbeatSender;
+use crate::metadata_pusher::{
+    estimate_gzip_exchange_batch_size, ExchangeBatchRoute, ExchangePushResult, MetadataPusher,
+};
+use crate::registry_puller::{BundleInstallHook, RegistryPuller};
+use crate::retry_queue::BodyRetryQueue;
+use crate::telemetry::{SyncTelemetrySink, TelemetryRuntimeConfig, TelemetrySyncRuntime};
+use anyhow::Context;
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -92,6 +98,7 @@ pub struct SyncAgentConfig {
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
+    pub telemetry: TelemetrySyncConfig,
 }
 
 pub struct SyncAgent {
@@ -100,7 +107,7 @@ pub struct SyncAgent {
     pub body_uploader: BodyUploader,
     pub heartbeat_sender: HeartbeatSender,
     pub retry_queue: BodyRetryQueue,
-    pub config_puller: Option<ConfigPuller>,
+    pub config_puller: Mutex<Option<ConfigPuller>>,
     sync_exchange_sent_total: AtomicU64,
     sync_exchange_blob_uploaded_total: AtomicU64,
     sync_exchange_retry_deferred_total: AtomicU64,
@@ -112,6 +119,8 @@ pub struct SyncAgent {
     sync_exchange_frontload_sent_total: AtomicU64,
     sync_exchange_live_sent_total: AtomicU64,
     adaptive_batch_state: Mutex<AdaptiveBatchState>,
+    telemetry_runtime: tokio::sync::Mutex<Option<TelemetrySyncRuntime>>,
+    shutdown_requested: AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -234,7 +243,43 @@ struct ExchangeQueueStats {
 }
 
 impl SyncAgent {
+    /// Contract constructor used by soth-proxy wiring.
+    ///
+    /// The db handle is part of the public contract surface; current sync internals
+    /// continue to use path-based sqlite access and do not retain this handle.
     pub fn new(
+        config: SyncAgentConfig,
+        _db: Arc<Connection>,
+    ) -> anyhow::Result<(Self, SyncTelemetrySink)> {
+        let agent = Self::build(config, None)?;
+        let sink = if agent.config.telemetry.enabled {
+            let runtime = TelemetrySyncRuntime::start(
+                TelemetryRuntimeConfig::from_sync_agent_config(&agent.config),
+            )
+            .context("start telemetry sync runtime")?;
+            let sink = runtime.sink();
+            let mut guard = agent
+                .telemetry_runtime
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("telemetry runtime mutex unexpectedly busy"))?;
+            *guard = Some(runtime);
+            (*sink).clone()
+        } else {
+            SyncTelemetrySink::disabled()
+        };
+        Ok((agent, sink))
+    }
+
+    /// Compatibility constructor retained for existing callers that inject
+    /// a pre-built ConfigPuller.
+    pub fn new_with_config_puller(
+        config: SyncAgentConfig,
+        config_puller: Option<ConfigPuller>,
+    ) -> anyhow::Result<Self> {
+        Self::build(config, config_puller)
+    }
+
+    fn build(
         mut config: SyncAgentConfig,
         config_puller: Option<ConfigPuller>,
     ) -> anyhow::Result<Self> {
@@ -275,6 +320,7 @@ impl SyncAgent {
                     .max(1)
                     .min(MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP),
             );
+        config.telemetry = config.telemetry.sanitize();
         let metadata_pusher = MetadataPusher::new(
             &config.endpoint,
             &config.api_key,
@@ -316,7 +362,7 @@ impl SyncAgent {
             body_uploader,
             heartbeat_sender,
             retry_queue,
-            config_puller,
+            config_puller: Mutex::new(config_puller),
             sync_exchange_sent_total: AtomicU64::new(0),
             sync_exchange_blob_uploaded_total: AtomicU64::new(0),
             sync_exchange_retry_deferred_total: AtomicU64::new(0),
@@ -328,10 +374,58 @@ impl SyncAgent {
             sync_exchange_frontload_sent_total: AtomicU64::new(0),
             sync_exchange_live_sent_total: AtomicU64::new(0),
             adaptive_batch_state,
+            telemetry_runtime: tokio::sync::Mutex::new(None),
+            shutdown_requested: AtomicBool::new(false),
         })
     }
 
+    pub fn set_config_puller(&self, config_puller: Option<ConfigPuller>) {
+        match self.config_puller.lock() {
+            Ok(mut guard) => {
+                *guard = config_puller;
+            }
+            Err(poisoned) => {
+                warn!("sync agent config_puller lock poisoned; recovering state");
+                let mut guard = poisoned.into_inner();
+                *guard = config_puller;
+            }
+        }
+    }
+
+    /// Injects a channel-2 bundle install hook without introducing a compile-time
+    /// dependency on soth-bundle. The hook is forwarded into RegistryPuller.
+    pub fn set_bundle_install_hook(&self, hook: Arc<dyn BundleInstallHook>) {
+        let registry_cache_path = self
+            .config
+            .registry_cache_path
+            .clone()
+            .unwrap_or_else(|| resolve_registry_cache_path(&self.config.cache_path));
+        let registry_puller = RegistryPuller::new(
+            self.config.endpoint.clone(),
+            self.config.api_key.clone(),
+            registry_cache_path,
+        )
+        .with_bundle_install_hook(hook);
+        let config_puller = ConfigPuller::new(
+            self.config.endpoint.clone(),
+            self.config.api_key.clone(),
+            self.config.cache_path.clone(),
+        )
+        .with_registry_puller(registry_puller);
+        self.set_config_puller(Some(config_puller));
+    }
+
+    /// Compatibility alias matching the proxy architecture naming.
+    pub fn set_bundle_watcher(&self, hook: Arc<dyn BundleInstallHook>) {
+        self.set_bundle_install_hook(hook);
+    }
+
     pub async fn tick(&self) -> anyhow::Result<SyncTickSummary> {
+        if self.config.telemetry.enabled {
+            if let Err(error) = self.ensure_telemetry_runtime().await {
+                warn!(error = %error, "Failed to start telemetry sync runtime; continuing");
+            }
+        }
         let stats = self.sync_exchange_queue_once().await?;
         self.sync_exchange_sent_total
             .fetch_add(stats.exchange_sent as u64, Ordering::Relaxed);
@@ -364,6 +458,35 @@ impl SyncAgent {
         })
     }
 
+    /// Background loop for heartbeat + exchange sync.
+    pub async fn run(&self) {
+        self.shutdown_requested.store(false, Ordering::Relaxed);
+        let mut interval = tokio::time::interval(self.config.sync_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            if self.shutdown_requested.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if let Err(error) = self.send_heartbeat().await {
+                warn!(error = %error, "sync heartbeat failed");
+            }
+            if let Err(error) = self.tick().await {
+                warn!(error = %error, "sync tick failed");
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.shutdown_requested.store(true, Ordering::Relaxed);
+        if self.config.telemetry.enabled {
+            self.shutdown_telemetry_runtime().await?;
+        }
+        Ok(())
+    }
+
     /// Run a bounded best-effort sync drain during shutdown.
     ///
     /// This repeatedly runs normal sync ticks and exits early once a round
@@ -388,7 +511,23 @@ impl SyncAgent {
             }
         }
 
+        if self.config.telemetry.enabled {
+            self.shutdown_telemetry_runtime().await?;
+        }
+
         Ok(total)
+    }
+
+    /// Returns the telemetry sink used by `soth-telemetry::TelemetryPipeline`.
+    ///
+    /// The runtime is started lazily when this method is first called.
+    pub async fn telemetry_sink(&self) -> anyhow::Result<Option<Arc<SyncTelemetrySink>>> {
+        if !self.config.telemetry.enabled {
+            return Ok(None);
+        }
+        self.ensure_telemetry_runtime().await?;
+        let guard = self.telemetry_runtime.lock().await;
+        Ok(guard.as_ref().map(|runtime| runtime.sink()))
     }
 
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
@@ -416,7 +555,14 @@ impl SyncAgent {
         match self.heartbeat_sender.send(&request).await {
             Ok(Some(response)) => {
                 if response.config_changed {
-                    if let Some(puller) = &self.config_puller {
+                    let puller = match self.config_puller.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(poisoned) => {
+                            warn!("sync agent config_puller lock poisoned; recovering state");
+                            poisoned.into_inner().clone()
+                        }
+                    };
+                    if let Some(puller) = puller {
                         if let Err(error) = puller.pull_once().await {
                             warn!(
                                 "Cloud config refresh after heartbeat hint failed: {}",
@@ -539,6 +685,33 @@ impl SyncAgent {
         } else {
             Some(telemetry)
         }
+    }
+
+    async fn ensure_telemetry_runtime(&self) -> anyhow::Result<()> {
+        if !self.config.telemetry.enabled {
+            return Ok(());
+        }
+
+        let mut guard = self.telemetry_runtime.lock().await;
+        if guard.is_none() {
+            let runtime = TelemetrySyncRuntime::start(
+                TelemetryRuntimeConfig::from_sync_agent_config(&self.config),
+            )
+            .context("start telemetry sync runtime")?;
+            *guard = Some(runtime);
+        }
+        Ok(())
+    }
+
+    async fn shutdown_telemetry_runtime(&self) -> anyhow::Result<()> {
+        let mut guard = self.telemetry_runtime.lock().await;
+        if let Some(runtime) = guard.take() {
+            runtime
+                .shutdown()
+                .await
+                .context("shutdown telemetry sync runtime")?;
+        }
+        Ok(())
     }
 
     fn collect_registry_heartbeat_details(&self) -> Option<HeartbeatRegistryDetails> {
@@ -1670,7 +1843,7 @@ fn build_exchange_event_envelope_metadata(event: &ExchangeEvent) -> Option<Event
         envelope_id: None,
         request_id: event.trace_id.clone(),
         capture_source: Some(match event.source_class {
-            soth_core::types::exchange::ExchangeSourceClass::Mcp => "wrap".to_string(),
+            ExchangeSourceClass::Mcp => "wrap".to_string(),
             _ => "proxy".to_string(),
         }),
         source: Some(exchange_transport_to_str(event.transport).to_string()),
@@ -1750,29 +1923,25 @@ fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<S
     (Some(endpoint.to_string()), None)
 }
 
-fn exchange_source_class_to_str(
-    source: soth_core::types::exchange::ExchangeSourceClass,
-) -> &'static str {
+fn exchange_source_class_to_str(source: ExchangeSourceClass) -> &'static str {
     match source {
-        soth_core::types::exchange::ExchangeSourceClass::AiInference => "ai_inference",
-        soth_core::types::exchange::ExchangeSourceClass::AgentApp => "agent_app",
-        soth_core::types::exchange::ExchangeSourceClass::Mcp => "mcp",
-        soth_core::types::exchange::ExchangeSourceClass::Collector => "collector",
+        ExchangeSourceClass::AiInference => "ai_inference",
+        ExchangeSourceClass::AgentApp => "agent_app",
+        ExchangeSourceClass::Mcp => "mcp",
+        ExchangeSourceClass::Collector => "collector",
     }
 }
 
-fn exchange_transport_to_str(
-    transport: soth_core::types::exchange::ExchangeTransport,
-) -> &'static str {
+fn exchange_transport_to_str(transport: ExchangeTransport) -> &'static str {
     match transport {
-        soth_core::types::exchange::ExchangeTransport::Http => "http",
-        soth_core::types::exchange::ExchangeTransport::Https => "https",
-        soth_core::types::exchange::ExchangeTransport::Http2 => "http2",
-        soth_core::types::exchange::ExchangeTransport::Ws => "ws",
-        soth_core::types::exchange::ExchangeTransport::Sse => "sse",
-        soth_core::types::exchange::ExchangeTransport::Ndjson => "ndjson",
-        soth_core::types::exchange::ExchangeTransport::Stdio => "stdio",
-        soth_core::types::exchange::ExchangeTransport::Jsonrpc => "jsonrpc",
+        ExchangeTransport::Http => "http",
+        ExchangeTransport::Https => "https",
+        ExchangeTransport::Http2 => "http2",
+        ExchangeTransport::Ws => "ws",
+        ExchangeTransport::Sse => "sse",
+        ExchangeTransport::Ndjson => "ndjson",
+        ExchangeTransport::Stdio => "stdio",
+        ExchangeTransport::Jsonrpc => "jsonrpc",
     }
 }
 
@@ -2030,8 +2199,9 @@ mod tests {
             body_upload_max_bytes: 15 * 1024 * 1024,
             global_tags: BTreeMap::new(),
             heartbeat_telemetry: None,
+            telemetry: TelemetrySyncConfig::default(),
         };
-        let agent = SyncAgent::new(config, None).expect("sync agent");
+        let agent = SyncAgent::new_with_config_puller(config, None).expect("sync agent");
         (dir, agent)
     }
 
@@ -2065,8 +2235,8 @@ mod tests {
     fn build_prepared_row(exchange_id: &str, preview_len: usize) -> PreparedExchangeQueueRow {
         let mut event = ExchangeEvent::new(
             exchange_id,
-            soth_core::types::exchange::ExchangeSourceClass::Collector,
-            soth_core::types::exchange::ExchangeTransport::Https,
+            ExchangeSourceClass::Collector,
+            ExchangeTransport::Https,
             ExchangeBodyMode::MetadataOnly,
             ExchangeBodyMode::MetadataOnly,
         );
@@ -2179,8 +2349,8 @@ mod tests {
     fn exchange_event_to_metadata_normalizes_preview_only_body_mode() {
         let event = ExchangeEvent::new(
             "123e4567-e89b-42d3-a456-426614174000",
-            soth_core::types::exchange::ExchangeSourceClass::AgentApp,
-            soth_core::types::exchange::ExchangeTransport::Https,
+            ExchangeSourceClass::AgentApp,
+            ExchangeTransport::Https,
             ExchangeBodyMode::PreviewOnly,
             ExchangeBodyMode::PreviewOnly,
         );
@@ -2197,12 +2367,12 @@ mod tests {
     fn exchange_event_to_metadata_normalizes_legacy_client_app_type() {
         let mut event = ExchangeEvent::new(
             "123e4567-e89b-42d3-a456-426614174001",
-            soth_core::types::exchange::ExchangeSourceClass::AgentApp,
-            soth_core::types::exchange::ExchangeTransport::Https,
+            ExchangeSourceClass::AgentApp,
+            ExchangeTransport::Https,
             ExchangeBodyMode::Inline,
             ExchangeBodyMode::MetadataOnly,
         );
-        event.client = Some(soth_core::types::exchange::ExchangeClient {
+        event.client = Some(crate::exchange::types::ExchangeClient {
             pid: None,
             device_id: Some("device_local_01".to_string()),
             bundle_id: Some("agent.codex".to_string()),

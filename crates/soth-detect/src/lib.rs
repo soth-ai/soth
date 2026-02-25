@@ -1,4 +1,5 @@
 mod code;
+mod core_output;
 mod engine;
 mod fingerprint;
 mod graphql;
@@ -16,6 +17,9 @@ mod stream;
 mod types;
 mod util;
 
+use once_cell::sync::Lazy;
+
+pub use core_output::to_core_detect_result;
 pub use engine::{
     process, process_with_intelligence, process_with_registry,
     process_with_registry_and_intelligence, ParserRegistry,
@@ -24,8 +28,48 @@ pub use identity::resolve_app_identity;
 pub use intelligence::*;
 pub use intelligence_store::IntelligenceStore;
 pub use replay::replay_heuristic_events;
-pub use stream::{finalize_stream, process_chunk, scan_proto_strings};
+pub use stream::{finalize_stream_summary, process_chunk_with_bundle, scan_proto_strings};
 pub use types::*;
+
+pub type StreamDetectState = StreamSession;
+pub type PartialDetectResult = ChunkArtifact;
+
+#[derive(Debug, Clone)]
+pub struct DetectError {
+    detail: String,
+}
+
+impl DetectError {
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DetectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for DetectError {}
+
+pub fn build_registry(_bundle: &DetectBundleSlice<'_>) -> Result<ParserRegistry, DetectError> {
+    Ok(ParserRegistry::default())
+}
+
+pub fn process_chunk(
+    chunk: &StreamChunk,
+    state: &mut StreamDetectState,
+) -> Option<PartialDetectResult> {
+    static EMPTY_BUNDLE: Lazy<OwnedDetectBundle> = Lazy::new(OwnedDetectBundle::default);
+    stream::process_chunk_with_bundle(chunk, state, &EMPTY_BUNDLE.as_slice())
+}
+
+pub fn finalize_stream(state: StreamDetectState) -> DetectResult {
+    stream::finalize_stream_detect(state)
+}
 
 #[cfg(test)]
 mod tests {
@@ -136,8 +180,8 @@ mod tests {
         session.accumulate("hello ");
         session.accumulate("world");
 
-        let summary1 = finalize_stream(session.clone());
-        let summary2 = finalize_stream(session);
+        let summary1 = finalize_stream_summary(session.clone());
+        let summary2 = finalize_stream_summary(session);
 
         assert_eq!(summary1.response_hash, summary2.response_hash);
     }
@@ -155,9 +199,9 @@ mod tests {
             frame_kind: FrameKind::WebSocketText,
         };
 
-        let out = process_chunk(&chunk, &mut session, &bundle.as_slice());
+        let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         assert!(out.is_none());
-        let summary = finalize_stream(session);
+        let summary = finalize_stream_summary(session);
         assert!(!summary.response_hash.is_empty());
     }
 
@@ -174,7 +218,7 @@ mod tests {
             frame_kind: FrameKind::WebSocketText,
         };
 
-        let out = process_chunk(&chunk, &mut session, &bundle.as_slice());
+        let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         assert!(out.is_none());
         assert_eq!(session.delta_buffer.len(), 1);
         assert_eq!(session.delta_buffer[0], "jsonrpc delta hello");
@@ -193,7 +237,7 @@ mod tests {
             frame_kind: FrameKind::MultipartMixed,
         };
 
-        let out = process_chunk(&chunk, &mut session, &bundle.as_slice());
+        let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         assert!(out.is_none());
         assert_eq!(session.delta_buffer.len(), 1);
         assert_eq!(session.delta_buffer[0], "multipart chunk hello");
@@ -421,7 +465,7 @@ mod tests {
             frame_kind: FrameKind::GrpcMessage,
         };
 
-        let out = process_chunk(&chunk, &mut session, &bundle.as_slice());
+        let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         assert!(out.is_none());
         assert_eq!(session.delta_buffer.len(), 1);
         assert_eq!(session.delta_buffer[0], "chunk response from grpc");
