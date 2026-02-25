@@ -25,15 +25,23 @@ pub struct RegistryPuller {
     api_key: String,
     cache_path: PathBuf,
     bundle_type: String,
-    bundle_install_hook: Option<Arc<dyn BundleInstallHook>>,
+    bundle_watcher: Option<Arc<dyn BundleWatcher>>,
 }
 
-pub trait BundleInstallHook: Send + Sync {
+pub trait BundleWatcher: Send + Sync {
     fn install_bundle(
         &self,
         manifest_bytes: &[u8],
         assets: HashMap<String, Vec<u8>>,
     ) -> anyhow::Result<String>;
+
+    fn install(
+        &self,
+        manifest_bytes: &[u8],
+        assets: HashMap<String, Vec<u8>>,
+    ) -> anyhow::Result<String> {
+        self.install_bundle(manifest_bytes, assets)
+    }
 }
 
 impl RegistryPuller {
@@ -49,7 +57,7 @@ impl RegistryPuller {
             api_key: api_key.into(),
             cache_path,
             bundle_type: "local".to_string(),
-            bundle_install_hook: None,
+            bundle_watcher: None,
         }
     }
 
@@ -58,8 +66,8 @@ impl RegistryPuller {
         self
     }
 
-    pub fn with_bundle_install_hook(mut self, hook: Arc<dyn BundleInstallHook>) -> Self {
-        self.bundle_install_hook = Some(hook);
+    pub fn with_bundle_watcher(mut self, watcher: Arc<dyn BundleWatcher>) -> Self {
+        self.bundle_watcher = Some(watcher);
         self
     }
 
@@ -397,14 +405,14 @@ impl RegistryPuller {
     }
 
     fn maybe_install_channel2_bundle(&self, bytes: &[u8]) -> anyhow::Result<Option<String>> {
-        let Some(hook) = self.bundle_install_hook.as_ref() else {
+        let Some(hook) = self.bundle_watcher.as_ref() else {
             return Ok(None);
         };
         let Some((manifest_bytes, assets)) = parse_channel2_bundle_payload(bytes) else {
             return Ok(None);
         };
         let version = hook
-            .install_bundle(manifest_bytes.as_slice(), assets)
+            .install(manifest_bytes.as_slice(), assets)
             .context("installing channel 2 intelligence bundle")?;
         Ok(Some(version))
     }
@@ -650,7 +658,7 @@ mod tests {
     use super::{
         build_bundle_query_pairs, build_bundle_request_query_pairs, extract_required_etag,
         normalize_etag, parse_channel2_bundle_payload, should_skip_pull, verify_bundle_integrity,
-        BundleInstallHook, RegistryPuller,
+        BundleWatcher, RegistryPuller,
     };
     use crate::api_types::{RegistryBundleFetchQuery, RegistryVersionResponse};
     use base64::Engine;
@@ -833,7 +841,7 @@ mod tests {
         state: Arc<Mutex<MockHookState>>,
     }
 
-    impl BundleInstallHook for MockInstallHook {
+    impl BundleWatcher for MockInstallHook {
         fn install_bundle(
             &self,
             _manifest_bytes: &[u8],
@@ -852,7 +860,7 @@ mod tests {
             state: state.clone(),
         });
         let puller = RegistryPuller::new("https://example.com", "key", PathBuf::from("/tmp/cache"))
-            .with_bundle_install_hook(hook);
+            .with_bundle_watcher(hook);
 
         let payload = serde_json::json!({
             "manifest": {
