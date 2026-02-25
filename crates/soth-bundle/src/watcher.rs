@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use rusqlite::Connection;
 use tokio::sync::watch;
@@ -29,7 +30,7 @@ pub struct BundleWatcher {
     tx: watch::Sender<Arc<LoadedBundle>>,
     vendor_pubkey: [u8; 32],
     org_config: Arc<OrgSignedConfig>,
-    db: Arc<Mutex<Connection>>,
+    db_path: PathBuf,
 }
 
 impl BundleWatcher {
@@ -37,17 +38,18 @@ impl BundleWatcher {
         initial: LoadedBundle,
         vendor_pubkey: [u8; 32],
         org_config: Arc<OrgSignedConfig>,
-        db: Arc<Mutex<Connection>>,
-    ) -> (Self, BundleHandle) {
+        db: Arc<Connection>,
+    ) -> Result<(Self, BundleHandle), BundleError> {
         let (tx, rx) = watch::channel(Arc::new(initial));
+        let db_path = main_db_path(db.as_ref())?;
         let watcher = Self {
             tx,
             vendor_pubkey,
             org_config,
-            db,
+            db_path,
         };
         let handle = BundleHandle { rx };
-        (watcher, handle)
+        Ok((watcher, handle))
     }
 
     pub fn install(
@@ -64,7 +66,9 @@ impl BundleWatcher {
         let version = new_bundle.version.clone();
 
         {
-            let conn = self.db.lock().map_err(|_| BundleError::LockPoisoned)?;
+            let conn = Connection::open(&self.db_path)?;
+            // Persist installed bundle metadata before in-memory swap so restart
+            // recovery can still discover the new version if send() fails.
             db::record_bundle_installed(&conn, &new_bundle)?;
             db::record_policy_config(&conn, &new_bundle)?;
         }
@@ -77,19 +81,37 @@ impl BundleWatcher {
     }
 
     pub fn supersede_previous(&self, previous_version: &str) -> Result<(), BundleError> {
-        let conn = self.db.lock().map_err(|_| BundleError::LockPoisoned)?;
+        let conn = Connection::open(&self.db_path)?;
         db::mark_superseded(&conn, previous_version)?;
         Ok(())
     }
 }
 
+fn main_db_path(conn: &Connection) -> Result<PathBuf, BundleError> {
+    let mut stmt = conn.prepare("PRAGMA database_list")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name != "main" {
+            continue;
+        }
+        let file: String = row.get(2)?;
+        if !file.trim().is_empty() {
+            return Ok(PathBuf::from(file));
+        }
+    }
+    Err(BundleError::DbPathUnavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
+    use rusqlite::params;
+    use tempfile::NamedTempFile;
 
     use super::*;
     use crate::loader;
@@ -167,13 +189,15 @@ mod tests {
         )
         .expect("initial bundle");
 
-        let db = Arc::new(Mutex::new(Connection::open_in_memory().expect("db")));
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db = Arc::new(Connection::open(db_file.path()).expect("db"));
         let (watcher, mut handle) = BundleWatcher::new(
             initial,
             vendor.verifying_key().to_bytes(),
             Arc::new(org),
             db,
-        );
+        )
+        .expect("watcher");
 
         let next_assets = HashMap::from([(
             "policy/policy_bundle.json".to_string(),
@@ -206,13 +230,15 @@ mod tests {
         )
         .expect("initial bundle");
 
-        let db = Arc::new(Mutex::new(Connection::open_in_memory().expect("db")));
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db = Arc::new(Connection::open(db_file.path()).expect("db"));
         let (watcher, handle) = BundleWatcher::new(
             initial,
             vendor.verifying_key().to_bytes(),
             Arc::new(org),
             db,
-        );
+        )
+        .expect("watcher");
 
         let bad_assets = HashMap::from([(
             "policy/policy_bundle.json".to_string(),
@@ -222,5 +248,58 @@ mod tests {
         let err = watcher.install(bad_manifest.as_slice(), bad_assets);
         assert!(err.is_err());
         assert_eq!(handle.current().version, "bundle-v1");
+    }
+
+    #[tokio::test]
+    async fn persists_bundle_install_before_watch_send() {
+        let vendor = SigningKey::from_bytes(&[43u8; 32]);
+        let org = OrgSignedConfig::default();
+
+        let initial_assets = HashMap::from([(
+            "policy/policy_bundle.json".to_string(),
+            signed_policy_bundle_bytes(),
+        )]);
+        let initial_manifest = signed_manifest_bytes("bundle-v1", &initial_assets, &vendor);
+        let initial = loader::load_from_bytes(
+            initial_manifest.as_slice(),
+            initial_assets,
+            &vendor.verifying_key().to_bytes(),
+            &org,
+        )
+        .expect("initial bundle");
+
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_path_buf();
+        let db = Arc::new(Connection::open(&db_path).expect("db"));
+        let (watcher, handle) = BundleWatcher::new(
+            initial,
+            vendor.verifying_key().to_bytes(),
+            Arc::new(org),
+            db,
+        )
+        .expect("watcher");
+
+        drop(handle);
+
+        let next_assets = HashMap::from([(
+            "policy/policy_bundle.json".to_string(),
+            signed_policy_bundle_bytes(),
+        )]);
+        let next_manifest = signed_manifest_bytes("bundle-v2", &next_assets, &vendor);
+
+        let result = watcher.install(next_manifest.as_slice(), next_assets);
+        assert!(matches!(result, Err(BundleError::WatcherChannelClosed)));
+
+        let conn = Connection::open(&db_path).expect("open db verify");
+        let status: String = conn
+            .query_row(
+                "SELECT status
+                 FROM intelligence_bundles
+                 WHERE bundle_version = ?1",
+                params!["bundle-v2"],
+                |row| row.get(0),
+            )
+            .expect("bundle row should be persisted before send");
+        assert_eq!(status, "ACTIVE");
     }
 }
