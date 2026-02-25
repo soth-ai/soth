@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+soth-core = { workspace = true }
 bytes = "1"
 lru = "0.12"
 graphql-parser = "0.4"

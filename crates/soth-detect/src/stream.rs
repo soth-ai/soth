@@ -70,7 +70,10 @@ pub fn process_chunk(
         FrameKind::WebSocketClose => {}
     }
 
-    if session.capture_mode == CaptureMode::Full {
+    if matches!(
+        session.capture_mode,
+        CaptureMode::Full | CaptureMode::SensitiveArtifacts | CaptureMode::FullContent
+    ) {
         let artifacts = credential_scan(
             &chunk.payload,
             ArtifactLocation::StreamChunk {

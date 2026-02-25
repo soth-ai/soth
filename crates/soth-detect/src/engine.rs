@@ -137,12 +137,17 @@ fn process_inner(
         .capture_mode
         .clone()
         .unwrap_or_else(|| bundle.capture_rules.mode_for(&normalized.provider));
-    let mut artifacts = match capture_mode {
-        CaptureMode::Full => credential_scan(&req.body, ArtifactLocation::Unknown),
-        CaptureMode::MetadataOnly => Vec::new(),
+    let full_like = matches!(
+        capture_mode,
+        CaptureMode::Full | CaptureMode::SensitiveArtifacts | CaptureMode::FullContent
+    );
+    let mut artifacts = if full_like {
+        credential_scan(&req.body, ArtifactLocation::Unknown)
+    } else {
+        Vec::new()
     };
 
-    if capture_mode == CaptureMode::Full {
+    if full_like {
         if let Some(content_sample) = normalized.content_sample.as_deref() {
             let (code_artifacts, code_warnings) = detect_code_artifacts(
                 content_sample,

@@ -306,6 +306,8 @@ fn capture_mode_label(value: &crate::types::CaptureMode) -> &'static str {
     match value {
         crate::types::CaptureMode::MetadataOnly => "metadata_only",
         crate::types::CaptureMode::Full => "full",
+        crate::types::CaptureMode::SensitiveArtifacts => "sensitive_artifacts",
+        crate::types::CaptureMode::FullContent => "full_content",
     }
 }
 

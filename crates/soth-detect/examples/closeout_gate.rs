@@ -94,7 +94,9 @@ fn run_ac14() -> i32 {
         *counter += 1;
 
         match out.capture_mode {
-            CaptureMode::Full => full_capture_count += 1,
+            CaptureMode::Full | CaptureMode::SensitiveArtifacts | CaptureMode::FullContent => {
+                full_capture_count += 1
+            }
             CaptureMode::MetadataOnly => metadata_capture_count += 1,
         }
     }

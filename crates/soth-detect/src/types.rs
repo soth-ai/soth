@@ -1,98 +1,13 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::net::{SocketAddrV4, SocketAddrV6};
-use std::path::PathBuf;
+pub use soth_core::{
+    AppIdentity, AppKind, CaptureMode, ConnectionMeta, FrameKind, ParseConfidence, ProcessInfo,
+    RawRequest, RequestHeaders, SocketFamily, StreamChunk, TlsInfo,
+};
+use std::collections::HashMap;
 use std::time::Instant;
 use uuid::Uuid;
 
-pub type HeaderMap = BTreeMap<String, String>;
-
-#[derive(Clone, Debug)]
-pub struct RawRequest {
-    pub method: String,
-    pub path: String,
-    pub headers: HeaderMap,
-    pub body: Bytes,
-    pub connection_meta: ConnectionMeta,
-}
-
-#[derive(Clone, Debug)]
-pub struct ConnectionMeta {
-    pub connection_id: Uuid,
-    pub socket_family: SocketFamily,
-    pub process_info: Option<ProcessInfo>,
-    pub tls_info: Option<TlsInfo>,
-    pub app_identity: Option<AppIdentity>,
-    pub capture_mode: Option<CaptureMode>,
-    pub matched_provider: Option<String>,
-    pub matched_application: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub enum SocketFamily {
-    TcpV4 {
-        local: SocketAddrV4,
-        remote: SocketAddrV4,
-    },
-    TcpV6 {
-        local: SocketAddrV6,
-        remote: SocketAddrV6,
-    },
-    UnixDomain {
-        path: Option<PathBuf>,
-    },
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ProcessInfo {
-    pub pid: Option<u32>,
-    pub process_name: Option<String>,
-    pub bundle_id: Option<String>,
-    pub parent_pid: Option<u32>,
-    pub parent_process_name: Option<String>,
-    pub parent_bundle_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct TlsInfo {
-    pub sni: Option<String>,
-    pub alpn: Option<String>,
-    pub protocol: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct StreamChunk {
-    pub connection_id: Uuid,
-    pub sequence: u64,
-    pub payload: Bytes,
-    pub frame_kind: FrameKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FrameKind {
-    SseData,
-    NdjsonLine,
-    GrpcMessage,
-    WebSocketText,
-    WebSocketBinary,
-    MultipartMixed,
-    WebSocketClose,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub enum ParseConfidence {
-    Full,
-    Partial,
-    #[default]
-    Heuristic,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum CaptureMode {
-    MetadataOnly,
-    Full,
-}
+pub type HeaderMap = RequestHeaders;
 
 #[derive(Clone, Debug)]
 pub struct Provider {
@@ -430,36 +345,6 @@ pub enum ArtifactLocation {
     Header { header_name: String },
     StreamChunk { sequence: u64 },
     Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum AppKind {
-    Browser,
-    AgentApp,
-    Ide,
-    Cli,
-    Unknown,
-}
-
-#[derive(Clone, Debug)]
-pub struct AppIdentity {
-    pub app_id: String,
-    pub display_name: String,
-    pub app_kind: AppKind,
-    pub is_known: bool,
-    pub confidence: f32,
-}
-
-impl Default for AppIdentity {
-    fn default() -> Self {
-        Self {
-            app_id: "unknown".to_string(),
-            display_name: "unknown".to_string(),
-            app_kind: AppKind::Unknown,
-            is_known: false,
-            confidence: 0.0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
