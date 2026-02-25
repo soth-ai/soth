@@ -1758,12 +1758,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "humantime"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
-
-[[package]]
 name = "hyper"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3742,26 +3736,7 @@ dependencies = [
 name = "soth-core"
 version = "0.1.0"
 dependencies = [
- "bs58",
- "chrono",
- "dirs",
- "ed25519-dalek",
- "hex",
- "humantime",
- "notify",
- "rand 0.8.5",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tempfile",
  "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
