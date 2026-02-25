@@ -8,16 +8,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-const SERVICE_NAME: &str = "soth-edge";
+const SERVICE_NAME: &str = "soth-proxy";
 
 #[cfg(target_os = "macos")]
-const MACOS_SERVICE_LABEL: &str = "ai.soth.edge";
+const MACOS_SERVICE_LABEL: &str = "ai.soth.proxy";
 
 #[cfg(target_os = "linux")]
-const XDG_AUTOSTART_FILE: &str = "soth-edge.desktop";
+const XDG_AUTOSTART_FILE: &str = "soth-proxy.desktop";
 
 #[cfg(target_os = "windows")]
-const WINDOWS_RUN_KEY_VALUE: &str = "SothEdge";
+const WINDOWS_RUN_KEY_VALUE: &str = "SothProxy";
 
 fn resolve_abs_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
@@ -102,23 +102,6 @@ pub fn stop_managed_runtime_only() -> Result<Option<String>> {
     Ok(None)
 }
 
-pub fn disable_managed_autostart() -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
-    {
-        return stop_macos_launch_agent().map(Some);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return stop_linux_autostart().map(Some);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return stop_windows_autostart().map(Some);
-    }
-    #[allow(unreachable_code)]
-    Ok(None)
-}
-
 pub fn managed_status() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
@@ -192,30 +175,6 @@ pub fn managed_status() -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn stop_macos_launch_agent() -> Result<String> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
-    let label = MACOS_SERVICE_LABEL;
-    let plist_path = home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{label}.plist"));
-    let uid = unsafe { libc::geteuid() }.to_string();
-    let gui_target = format!("gui/{uid}/{label}");
-    let user_target = format!("user/{uid}/{label}");
-
-    let _ = launchctl_silent(["bootout", &gui_target]);
-    let _ = launchctl_silent(["bootout", &user_target]);
-    let _ = launchctl_silent(["disable", &gui_target]);
-    let _ = launchctl_silent(["disable", &user_target]);
-
-    if plist_path.exists() {
-        let _ = std::fs::remove_file(&plist_path);
-    }
-
-    Ok(format!("launchd disabled ({label})"))
-}
-
-#[cfg(target_os = "macos")]
 fn stop_macos_launch_agent_runtime_only() -> Result<String> {
     let label = MACOS_SERVICE_LABEL;
     let uid = unsafe { libc::geteuid() }.to_string();
@@ -252,36 +211,6 @@ fn launchctl_silent<const N: usize>(args: [&str; N]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn stop_linux_autostart() -> Result<String> {
-    if which::which("systemctl").is_ok() {
-        let _ = run_linux_cmd(&["systemctl", "--user", "disable", "--now", SERVICE_NAME]);
-        if let Some(home) = dirs::home_dir() {
-            let unit_path = home
-                .join(".config")
-                .join("systemd")
-                .join("user")
-                .join(format!("{SERVICE_NAME}.service"));
-            if unit_path.exists() {
-                let _ = std::fs::remove_file(&unit_path);
-            }
-            let _ = run_linux_cmd(&["systemctl", "--user", "daemon-reload"]);
-        }
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        let desktop_path = home
-            .join(".config")
-            .join("autostart")
-            .join(XDG_AUTOSTART_FILE);
-        if desktop_path.exists() {
-            let _ = std::fs::remove_file(&desktop_path);
-        }
-    }
-
-    Ok("linux autostart disabled".to_string())
-}
-
-#[cfg(target_os = "linux")]
 fn stop_linux_runtime_only() -> Result<String> {
     if which::which("systemctl").is_ok() {
         let _ = run_linux_cmd(&["systemctl", "--user", "stop", SERVICE_NAME]);
@@ -290,38 +219,6 @@ fn stop_linux_runtime_only() -> Result<String> {
         ));
     }
     Ok("linux runtime stop handled by pid lifecycle; autostart registration preserved".to_string())
-}
-
-#[cfg(target_os = "windows")]
-fn stop_windows_autostart() -> Result<String> {
-    use std::os::windows::process::CommandExt;
-
-    let output = Command::new("reg")
-        .args([
-            "delete",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            WINDOWS_RUN_KEY_VALUE,
-            "/f",
-        ])
-        .creation_flags(0x08000000)
-        .output()
-        .context("failed removing Windows startup Run key")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if !stderr.contains("unable to find the specified registry key")
-            && !stderr.contains("unable to find the specified value")
-        {
-            anyhow::bail!(
-                "failed deleting Windows startup Run key: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-    }
-    Ok(format!(
-        "windows Run key removed (HKCU\\...\\Run\\{})",
-        WINDOWS_RUN_KEY_VALUE
-    ))
 }
 
 #[cfg(target_os = "macos")]

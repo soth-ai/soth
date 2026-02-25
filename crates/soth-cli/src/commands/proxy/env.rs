@@ -1,6 +1,7 @@
 //! Environment variable output command
 
 use crate::cli_config;
+use std::path::Path;
 use std::path::PathBuf;
 
 const ENV_VARS: &[&str] = &[
@@ -26,7 +27,7 @@ pub async fn run(
     config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
-    let ca_path = cli_config::expand_tilde(&config.forward_proxy.ca.cert_path)
+    let ca_path = cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()))
         .display()
         .to_string();
     let proxy_addr = format!("http://{}", config.forward_proxy.socket_addr());
@@ -40,7 +41,7 @@ pub async fn run(
         "bash" | "zsh" | "sh" => {
             if unset {
                 println!("unset {}", ENV_VARS.join(" "));
-                println!("# Run: eval \"$(soth runtime env --unset)\"");
+                println!("# Run: eval \"$(soth env --unset)\"");
             } else {
                 println!("export HTTP_PROXY={}", proxy_addr);
                 println!("export HTTPS_PROXY={}", proxy_addr);
@@ -54,7 +55,7 @@ pub async fn run(
                 println!("export CURL_CA_BUNDLE={}", ca_path);
                 println!("export GIT_SSL_CAINFO={}", ca_path);
                 println!("export AWS_CA_BUNDLE={}", ca_path);
-                println!("# Run: eval \"$(soth runtime env)\"");
+                println!("# Run: eval \"$(soth env)\"");
             }
         }
         "fish" => {
@@ -64,7 +65,7 @@ pub async fn run(
                     println!("set -e -g {}", key);
                     println!("set -e -U {}", key);
                 }
-                println!("# Run: eval (soth runtime env --shell fish --unset)");
+                println!("# Run: eval (soth env --shell fish --unset)");
             } else {
                 println!("set -gx HTTP_PROXY {}", proxy_addr);
                 println!("set -gx HTTPS_PROXY {}", proxy_addr);
@@ -78,7 +79,7 @@ pub async fn run(
                 println!("set -gx CURL_CA_BUNDLE {}", ca_path);
                 println!("set -gx GIT_SSL_CAINFO {}", ca_path);
                 println!("set -gx AWS_CA_BUNDLE {}", ca_path);
-                println!("# Run: eval (soth runtime env --shell fish)");
+                println!("# Run: eval (soth env --shell fish)");
             }
         }
         "powershell" | "pwsh" => {

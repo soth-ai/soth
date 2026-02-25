@@ -113,11 +113,6 @@ pub async fn enable(port: Option<u16>) -> Result<()> {
     enable_internal(port, true).await
 }
 
-/// Enable system proxy settings without printing user-facing output.
-pub async fn enable_quiet(port: Option<u16>) -> Result<()> {
-    enable_internal(port, false).await
-}
-
 async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<()> {
     let proxy_port = port.unwrap_or(DEFAULT_PROXY_PORT);
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -182,7 +177,7 @@ async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<(
                 println!(
                     "\n{} CA certificate not found. Run: {}",
                     style::WARNING,
-                    style::highlight("soth runtime setup-ca")
+                    style::highlight("soth setup-ca")
                 );
             }
         } else {

@@ -2,13 +2,14 @@ use crate::cli_config;
 use anyhow::{Context, Result};
 use clap::Args;
 use serde_json::Value;
-use soth_core::api::version::{API_VERSION, API_VERSION_HEADER};
-use soth_core::config::SothConfig;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+const API_VERSION: &str = "v1";
+const API_VERSION_HEADER: &str = "X-Soth-Api-Version";
 
 #[derive(Debug, Clone, Args)]
 pub struct EnrollArgs {
@@ -44,12 +45,9 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     }
 
     let mut config = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("failed reading {}", config_path.display()))?;
-        serde_yaml::from_str::<SothConfig>(&content)
-            .with_context(|| format!("failed parsing {}", config_path.display()))?
+        cli_config::load_config(config_path.clone())?
     } else {
-        SothConfig::default()
+        cli_config::SothConfig::default()
     };
 
     let enroll_token = resolve_enroll_token(&args)?;
@@ -85,9 +83,7 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     }
     let device_id = cli_config::sync_client_device_id(&mut config, exchanged.device_id.as_deref())?;
 
-    let serialized = serde_yaml::to_string(&config).context("failed serializing config")?;
-    std::fs::write(&config_path, serialized)
-        .with_context(|| format!("failed writing {}", config_path.display()))?;
+    cli_config::write_config(&config_path, &config)?;
 
     println!("Enrollment completed.");
     println!("Saved cloud credentials to {}", config_path.display());
@@ -268,7 +264,7 @@ fn default_machine_name() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "soth-edge".to_string())
+        .unwrap_or_else(|| "soth-proxy".to_string())
 }
 
 fn resolve_config_path(explicit: Option<&PathBuf>, global: Option<&PathBuf>) -> PathBuf {

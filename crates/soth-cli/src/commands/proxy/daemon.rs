@@ -773,9 +773,9 @@ fn shell_unset_hint_command() -> &'static str {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if shell.contains("fish") {
-        "eval (soth runtime env --shell fish --unset)"
+        "eval (soth env --shell fish --unset)"
     } else {
-        "eval \"$(soth runtime env --unset)\""
+        "eval \"$(soth env --unset)\""
     }
 }
 
@@ -785,9 +785,9 @@ fn shell_set_hint_command() -> &'static str {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if shell.contains("fish") {
-        "eval (soth runtime env --shell fish)"
+        "eval (soth env --shell fish)"
     } else {
-        "eval \"$(soth runtime env)\""
+        "eval \"$(soth env)\""
     }
 }
 
@@ -863,8 +863,6 @@ pub async fn run_start_daemon(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     quiet: bool,
-    intercept_all: bool,
-    intercept_all_for: Option<u64>,
     no_autostart: bool,
 ) -> anyhow::Result<()> {
     ensure_runtime_dirs()?;
@@ -1013,13 +1011,6 @@ pub async fn run_start_daemon(
     if quiet {
         cmd.arg("--quiet");
     }
-    if intercept_all {
-        cmd.arg("--intercept-all");
-    }
-    if let Some(seconds) = intercept_all_for {
-        cmd.arg("--intercept-all-for").arg(seconds.to_string());
-    }
-
     if let Some(port) = port {
         cmd.arg("--port").arg(port.to_string());
     }
@@ -1280,17 +1271,21 @@ mod tests {
 
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
-    fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
-        let guard = ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env mutex poisoned");
+    fn lock_env_mutex() -> std::sync::MutexGuard<'static, ()> {
+        match ENV_MUTEX.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn with_temp_home<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> T {
+        let guard = lock_env_mutex();
         let temp = tempfile::tempdir().expect("tempdir");
         let old_home = env::var_os("HOME");
         unsafe {
             env::set_var("HOME", temp.path());
         }
-        let result = f();
+        let result = std::panic::catch_unwind(f);
         match old_home {
             Some(value) => unsafe {
                 env::set_var("HOME", value);
@@ -1300,7 +1295,10 @@ mod tests {
             },
         }
         drop(guard);
-        result
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     #[test]
@@ -1355,10 +1353,7 @@ mod tests {
 
     #[test]
     fn daemon_timeout_env_is_clamped() {
-        let _guard = ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env mutex poisoned");
+        let _guard = lock_env_mutex();
         unsafe {
             env::set_var("SOTH_DAEMON_STARTUP_TIMEOUT_SECS", "999");
         }
@@ -1379,11 +1374,12 @@ mod tests {
                 .build()
                 .expect("runtime");
             let err = runtime
-                .block_on(run_start_daemon(Some(18888), None, true, false, None, true))
+                .block_on(run_start_daemon(Some(18888), None, true, false))
                 .expect_err("daemon start should fail in unit test binary");
             let text = format!("{err:#}");
             assert!(
-                text.contains("proxy daemon exited early"),
+                text.contains("proxy daemon exited early")
+                    || text.contains("managed proxy startup did not open"),
                 "unexpected error: {text}"
             );
         });
