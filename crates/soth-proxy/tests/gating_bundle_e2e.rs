@@ -333,7 +333,7 @@ async fn wait_for_intercept_rows(db_path: &Path, min_rows: i64) {
 fn gating_bundle_e2e_stage0_passthrough_wins() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-gating-{}.db", Uuid::new_v4()));
     let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = GateAction::Intercept;
+    pipeline.unknown_app_action = Some(GateAction::Intercept);
 
     let handler = build_handler(
         db_path.as_path(),
@@ -352,7 +352,7 @@ fn gating_bundle_e2e_stage0_passthrough_wins() {
 async fn gating_bundle_e2e_http_stages() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-gating-{}.db", Uuid::new_v4()));
     let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = GateAction::Intercept;
+    pipeline.unknown_app_action = Some(GateAction::Intercept);
 
     let handler = build_handler(
         db_path.as_path(),

@@ -723,7 +723,7 @@ async fn gating_large_corpus_proxy_handler_subset_e2e() {
     let db_path =
         std::env::temp_dir().join(format!("soth-proxy-gating-corpus-{}.db", Uuid::new_v4()));
     let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = GateAction::Intercept;
+    pipeline.unknown_app_action = Some(GateAction::Intercept);
     let handler = build_handler(db_path.as_path(), pipeline, &bundles);
 
     use soth_mitm::InterceptHandler;

@@ -255,7 +255,7 @@ fn handler_contract_connect_gate_skips_non_catalog_tls() {
 fn handler_contract_connect_gate_intercepts_catalog_tls() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
     let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = GateAction::Intercept;
+    pipeline.unknown_app_action = Some(GateAction::Intercept);
 
     let handler = build_handler(
         db_path.as_path(),
@@ -273,7 +273,7 @@ fn handler_contract_connect_gate_intercepts_catalog_tls() {
 async fn handler_contract_intercepts_and_records_request_response_flow() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
     let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = GateAction::Intercept;
+    pipeline.unknown_app_action = Some(GateAction::Intercept);
 
     let handler = build_handler(
         db_path.as_path(),
@@ -308,7 +308,7 @@ async fn handler_contract_intercepts_and_records_request_response_flow() {
 async fn handler_contract_streaming_callbacks_complete() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
     let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = GateAction::Intercept;
+    pipeline.unknown_app_action = Some(GateAction::Intercept);
 
     let handler = build_handler(
         db_path.as_path(),
@@ -353,7 +353,7 @@ async fn handler_contract_streaming_callbacks_complete() {
 async fn handler_contract_stream_end_without_chunks_is_safe() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
     let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = GateAction::Intercept;
+    pipeline.unknown_app_action = Some(GateAction::Intercept);
 
     let handler = build_handler(
         db_path.as_path(),
@@ -456,7 +456,7 @@ fn handler_contract_intercept_schema_contains_reference_columns() {
 async fn handler_contract_intercept_row_persists_reference_fields() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
     let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = GateAction::Intercept;
+    pipeline.unknown_app_action = Some(GateAction::Intercept);
 
     let handler = build_handler(
         db_path.as_path(),

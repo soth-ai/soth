@@ -457,8 +457,8 @@ pub struct PipelineConfig {
     pub body_size_limit_bytes: usize,
     pub block_signal_timeout_ms: u64,
     pub session_ttl_secs: u64,
-    pub unknown_app_action: GateAction,
-    pub non_cataloged_host_action: GateAction,
+    pub unknown_app_action: Option<GateAction>,
+    pub non_cataloged_host_action: Option<GateAction>,
 }
 
 impl Default for PipelineConfig {
@@ -467,8 +467,8 @@ impl Default for PipelineConfig {
             body_size_limit_bytes: 10 * 1024 * 1024,
             block_signal_timeout_ms: 0,
             session_ttl_secs: 3_600,
-            unknown_app_action: GateAction::Skip,
-            non_cataloged_host_action: GateAction::Skip,
+            unknown_app_action: None,
+            non_cataloged_host_action: None,
         }
     }
 }

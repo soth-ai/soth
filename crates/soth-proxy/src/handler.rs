@@ -110,15 +110,17 @@ impl ProxyHandler {
             &req,
             &req.connection_meta.process_info,
             crate::gating::evaluator::GateOverrides {
-                unknown_app_action: Some(map_unknown_action(
-                    self.pipeline_config.unknown_app_action,
-                )),
-                non_cataloged_host_action: map_non_cataloged_action(
-                    self.pipeline_config.non_cataloged_host_action,
-                ),
+                unknown_app_action: self
+                    .pipeline_config
+                    .unknown_app_action
+                    .map(map_unknown_action),
+                non_cataloged_host_action: self
+                    .pipeline_config
+                    .non_cataloged_host_action
+                    .and_then(map_non_cataloged_action),
             },
         );
-        if self.pipeline_config.non_cataloged_host_action == crate::config::GateAction::Block
+        if self.pipeline_config.non_cataloged_host_action == Some(crate::config::GateAction::Block)
             && matches!(outcome.reason, soth_core::DecisionReason::NotInCatalog)
             && matches!(
                 outcome.decision,
