@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -275,7 +275,9 @@ async fn telemetry_replay_large_corpus_startup_drain_matrix() {
     let runtime = TelemetrySyncRuntime::start(TelemetryRuntimeConfig {
         endpoint,
         api_key: "test-key".to_string(),
-        event_db_path: db_path.clone(),
+        db: Arc::new(Mutex::new(
+            Connection::open(&db_path).expect("open runtime db"),
+        )),
         telemetry: TelemetrySyncConfig::default(),
     })
     .expect("start telemetry runtime");
@@ -365,7 +367,9 @@ async fn telemetry_replay_large_corpus_retry_deadletter_matrix() {
     let runtime = TelemetrySyncRuntime::start(TelemetryRuntimeConfig {
         endpoint,
         api_key: "test-key".to_string(),
-        event_db_path: db_path.clone(),
+        db: Arc::new(Mutex::new(
+            Connection::open(&db_path).expect("open runtime db"),
+        )),
         telemetry: TelemetrySyncConfig {
             enabled: true,
             endpoint_path: "/api/v1/telemetry/batch".to_string(),

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -244,7 +244,7 @@ fn bundle_watcher_e2e_hot_swap_and_db_contract() {
 
     let db_file = NamedTempFile::new().expect("temp sqlite file");
     let db_path = db_file.path().to_path_buf();
-    let db = Arc::new(Connection::open(&db_path).expect("open sqlite"));
+    let db = Arc::new(Mutex::new(Connection::open(&db_path).expect("open sqlite")));
 
     let (watcher, handle) = BundleWatcher::new(initial_loaded, vendor_pubkey, Arc::new(org), db)
         .expect("create watcher");

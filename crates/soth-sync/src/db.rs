@@ -5,6 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 
 pub const DEFAULT_SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
+pub const SQLITE_MMAP_SIZE_BYTES: i64 = 268_435_456; // 256 MB
+pub const SQLITE_CACHE_SIZE_KIB: i64 = -64_000; // 64 MB
 
 pub const SYNC_KEY_LAST_SYNC_TIMESTAMP: &str = "last_sync_timestamp";
 pub const SYNC_KEY_SYNC_ERRORS: &str = "sync_errors";
@@ -17,6 +19,20 @@ fn apply_busy_timeout(conn: &Connection, busy_timeout: Duration) -> std::io::Res
     conn.busy_timeout(busy_timeout).map_err(to_io_err)
 }
 
+fn apply_rw_pragmas(conn: &Connection) -> std::io::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(to_io_err)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(to_io_err)?;
+    conn.pragma_update(None, "mmap_size", SQLITE_MMAP_SIZE_BYTES)
+        .map_err(to_io_err)?;
+    conn.pragma_update(None, "page_size", 4096_i64)
+        .map_err(to_io_err)?;
+    conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)
+        .map_err(to_io_err)?;
+    Ok(())
+}
+
 pub fn open_sqlite_read_write(path: &Path) -> std::io::Result<Connection> {
     open_sqlite_read_write_with_timeout(path, Duration::from_millis(DEFAULT_SQLITE_BUSY_TIMEOUT_MS))
 }
@@ -27,6 +43,7 @@ pub fn open_sqlite_read_write_with_timeout(
 ) -> std::io::Result<Connection> {
     let conn = Connection::open(path).map_err(to_io_err)?;
     apply_busy_timeout(&conn, busy_timeout)?;
+    apply_rw_pragmas(&conn)?;
     Ok(conn)
 }
 

@@ -42,6 +42,6 @@ pub enum BundleError {
     ManifestParse(#[from] serde_json::Error),
     #[error("canonical manifest serialization failed: {0}")]
     CanonicalManifest(String),
-    #[error("sqlite main database path is unavailable (in-memory databases are unsupported)")]
-    DbPathUnavailable,
+    #[error("sqlite connection mutex poisoned")]
+    DbMutexPoisoned,
 }

@@ -8,8 +8,7 @@ use crate::cache;
 use crate::config::TelemetrySyncConfig;
 use crate::config_puller::ConfigPuller;
 use crate::db::{
-    open_sqlite_read_only, open_sqlite_read_write, write_sync_state, SYNC_KEY_LAST_SYNC_TIMESTAMP,
-    SYNC_KEY_SYNC_ERRORS,
+    open_sqlite_read_write, write_sync_state, SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS,
 };
 use crate::exchange::types::{
     ExchangeBodyMode, ExchangeEvent, ExchangeSourceClass, ExchangeTransport,
@@ -45,8 +44,6 @@ const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
 const SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1: &str = "migration_exchange_uuid_cleanup_v1";
 const EXCHANGE_SPOOL_STALE_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 const EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT: usize = 10_000;
-const EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX: u32 = 4;
-const EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_BASE_MS: u64 = 50;
 const SYNC_TELEMETRY_EXCHANGE_SENT: &str = "sync.exchange.sent";
 const SYNC_TELEMETRY_EXCHANGE_BLOB_UPLOADED: &str = "sync.exchange.blob_uploaded";
 const SYNC_TELEMETRY_EXCHANGE_RETRY_DEFERRED: &str = "sync.exchange.retry_deferred";
@@ -103,6 +100,7 @@ pub struct SyncAgentConfig {
 
 pub struct SyncAgent {
     pub config: SyncAgentConfig,
+    db: Arc<Mutex<Connection>>,
     pub metadata_pusher: MetadataPusher,
     pub body_uploader: BodyUploader,
     pub heartbeat_sender: HeartbeatSender,
@@ -245,16 +243,38 @@ struct ExchangeQueueStats {
 impl SyncAgent {
     /// Contract constructor used by soth-proxy wiring.
     ///
-    /// The db handle is part of the public contract surface; current sync internals
-    /// continue to use path-based sqlite access and do not retain this handle.
+    /// Sync internals run against the injected SQLite handle. The configured `event_db_path` is
+    /// normalized to the handle's main database path when available to keep reporting consistent.
     pub fn new(
-        config: SyncAgentConfig,
-        _db: Arc<Connection>,
+        mut config: SyncAgentConfig,
+        db: Arc<Mutex<Connection>>,
     ) -> anyhow::Result<(Self, SyncTelemetrySink)> {
-        let agent = Self::build(config, None)?;
+        let injected_path = {
+            let guard = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sync sqlite mutex poisoned"))?;
+            sqlite_main_db_path(&guard)?
+        };
+        if let Some(injected_path) = injected_path {
+            if injected_path != config.event_db_path {
+                warn!(
+                    configured = %config.event_db_path.display(),
+                    injected = %injected_path.display(),
+                    "sync event_db_path overridden to match injected sqlite handle"
+                );
+                config.event_db_path = injected_path;
+            }
+        } else {
+            warn!(
+                configured = %config.event_db_path.display(),
+                "injected sqlite handle has no on-disk main database path; using configured event_db_path"
+            );
+        }
+
+        let agent = Self::build(config, None, db.clone())?;
         let sink = if agent.config.telemetry.enabled {
             let runtime = TelemetrySyncRuntime::start(
-                TelemetryRuntimeConfig::from_sync_agent_config(&agent.config),
+                TelemetryRuntimeConfig::from_sync_agent_config(&agent.config, db),
             )
             .context("start telemetry sync runtime")?;
             let sink = runtime.sink();
@@ -276,12 +296,20 @@ impl SyncAgent {
         config: SyncAgentConfig,
         config_puller: Option<ConfigPuller>,
     ) -> anyhow::Result<Self> {
-        Self::build(config, config_puller)
+        let db_conn =
+            open_sqlite_read_write(config.event_db_path.as_path()).with_context(|| {
+                format!(
+                    "failed opening sqlite rw connection {}",
+                    config.event_db_path.display()
+                )
+            })?;
+        Self::build(config, config_puller, Arc::new(Mutex::new(db_conn)))
     }
 
     fn build(
         mut config: SyncAgentConfig,
         config_puller: Option<ConfigPuller>,
+        db: Arc<Mutex<Connection>>,
     ) -> anyhow::Result<Self> {
         config.batch_size = config.batch_size.max(1);
         config.body_batch_size = config.body_batch_size.max(1);
@@ -330,34 +358,41 @@ impl SyncAgent {
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
         let retry_queue =
             BodyRetryQueue::new(&config.retry_queue_dir, config.retry_queue_max_bytes)?;
-        ensure_exchange_sync_schema(config.event_db_path.as_path())?;
-        if let Err(error) = run_exchange_uuid_cleanup_migration(config.event_db_path.as_path()) {
-            warn!(
-                error = %error,
-                "Failed one-time exchange UUID cleanup migration; continuing"
-            );
-        }
-        if let Err(error) = run_exchange_spool_stale_cleanup(
-            config.event_db_path.as_path(),
-            Duration::from_secs(EXCHANGE_SPOOL_STALE_MAX_AGE_SECS),
-            EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT,
-        ) {
-            if is_sqlite_lock_anyhow(&error) {
-                debug!(
-                    error = %error,
-                    "Exchange spool stale cleanup skipped due to sqlite lock; continuing"
-                );
-            } else {
+        {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sync sqlite mutex poisoned"))?;
+            ensure_exchange_sync_schema(&conn)?;
+            if let Err(error) = run_exchange_uuid_cleanup_migration(&conn) {
                 warn!(
                     error = %error,
-                    "Failed exchange spool stale cleanup; continuing"
+                    "Failed one-time exchange UUID cleanup migration; continuing"
                 );
             }
+            if let Err(error) = run_exchange_spool_stale_cleanup(
+                &conn,
+                Duration::from_secs(EXCHANGE_SPOOL_STALE_MAX_AGE_SECS),
+                EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT,
+            ) {
+                if is_sqlite_lock_anyhow(&error) {
+                    debug!(
+                        error = %error,
+                        "Exchange spool stale cleanup skipped due to sqlite lock; continuing"
+                    );
+                } else {
+                    warn!(
+                        error = %error,
+                        "Failed exchange spool stale cleanup; continuing"
+                    );
+                }
+            }
         }
+
         let adaptive_batch_state = Mutex::new(AdaptiveBatchState::new(&config));
 
         Ok(Self {
             config,
+            db,
             metadata_pusher,
             body_uploader,
             heartbeat_sender,
@@ -695,7 +730,7 @@ impl SyncAgent {
         let mut guard = self.telemetry_runtime.lock().await;
         if guard.is_none() {
             let runtime = TelemetrySyncRuntime::start(
-                TelemetryRuntimeConfig::from_sync_agent_config(&self.config),
+                TelemetryRuntimeConfig::from_sync_agent_config(&self.config, self.db.clone()),
             )
             .context("start telemetry sync runtime")?;
             *guard = Some(runtime);
@@ -1222,7 +1257,7 @@ impl SyncAgent {
     }
 
     fn load_exchange_queue_ready(&self, limit: usize) -> anyhow::Result<Vec<ExchangeQueueRow>> {
-        let conn = open_read_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         let mut stmt = conn
             .prepare(
                 r#"
@@ -1256,7 +1291,7 @@ impl SyncAgent {
     }
 
     fn load_exchange_queue_depth(&self) -> anyhow::Result<u64> {
-        let conn = open_read_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         let depth = conn
             .query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
                 row.get::<_, i64>(0)
@@ -1275,7 +1310,7 @@ impl SyncAgent {
         exchange_id: &str,
         attempt_count: u32,
     ) -> anyhow::Result<()> {
-        let conn = open_rw_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         let shift = attempt_count.min(20);
         let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
         let retry_secs = EXCHANGE_RETRY_BASE_SECS
@@ -1304,7 +1339,7 @@ impl SyncAgent {
     }
 
     fn delete_exchange_queue_entry(&self, exchange_id: &str) -> anyhow::Result<()> {
-        let conn = open_rw_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         conn.execute(
             "DELETE FROM exchange_upload_queue WHERE exchange_id = ?1",
             [exchange_id],
@@ -1327,7 +1362,7 @@ impl SyncAgent {
     }
 
     fn write_sync_value(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let conn = open_rw_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         write_sync_state(&conn, key, value)?;
         Ok(())
     }
@@ -1341,10 +1376,15 @@ impl SyncAgent {
     fn set_sync_error(&self, error: &str) -> anyhow::Result<()> {
         self.write_sync_value(SYNC_KEY_SYNC_ERRORS, error)
     }
+
+    fn lock_db(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
+        self.db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sync sqlite mutex poisoned"))
+    }
 }
 
-fn ensure_exchange_sync_schema(path: &Path) -> anyhow::Result<()> {
-    let conn = open_rw_conn(path)?;
+fn ensure_exchange_sync_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS exchange_upload_queue (
@@ -1362,12 +1402,7 @@ fn ensure_exchange_sync_schema(path: &Path) -> anyhow::Result<()> {
             ON exchange_upload_queue(updated_at);
         "#,
     )
-    .with_context(|| {
-        format!(
-            "failed initializing exchange upload queue schema {}",
-            path.display()
-        )
-    })?;
+    .context("failed initializing exchange upload queue schema")?;
 
     if let Err(error) = conn.execute(
         "ALTER TABLE exchange_upload_queue ADD COLUMN blobs_json TEXT",
@@ -1375,20 +1410,15 @@ fn ensure_exchange_sync_schema(path: &Path) -> anyhow::Result<()> {
     ) {
         let message = error.to_string().to_ascii_lowercase();
         if !message.contains("duplicate column name") {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed applying exchange_upload_queue blobs_json migration {}",
-                    path.display()
-                )
-            });
+            return Err(error)
+                .context("failed applying exchange_upload_queue blobs_json migration");
         }
     }
 
     Ok(())
 }
 
-fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
-    let conn = open_rw_conn(path)?;
+fn run_exchange_uuid_cleanup_migration(conn: &Connection) -> anyhow::Result<()> {
     if !sqlite_table_exists(&conn, "sync_state")? {
         return Ok(());
     }
@@ -1426,33 +1456,18 @@ fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
 }
 
 fn run_exchange_spool_stale_cleanup(
-    path: &Path,
+    conn: &Connection,
     max_age: Duration,
     limit: usize,
 ) -> anyhow::Result<()> {
-    for retry in 0..=EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX {
-        match run_exchange_spool_stale_cleanup_once(path, max_age, limit) {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if retry < EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX
-                    && is_sqlite_lock_anyhow(&error) =>
-            {
-                std::thread::sleep(exchange_spool_cleanup_retry_backoff(retry));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(anyhow::anyhow!(
-        "exchange spool stale cleanup retry loop exited unexpectedly"
-    ))
+    run_exchange_spool_stale_cleanup_once(conn, max_age, limit)
 }
 
 fn run_exchange_spool_stale_cleanup_once(
-    path: &Path,
+    conn: &Connection,
     max_age: Duration,
     limit: usize,
 ) -> anyhow::Result<()> {
-    let conn = open_rw_conn(path)?;
     if !sqlite_table_exists(&conn, "exchange_spool")? {
         return Ok(());
     }
@@ -1482,16 +1497,6 @@ fn run_exchange_spool_stale_cleanup_once(
     Ok(())
 }
 
-fn exchange_spool_cleanup_retry_backoff(retry: u32) -> Duration {
-    let shift = retry.min(10);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    Duration::from_millis(
-        EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_BASE_MS
-            .saturating_mul(multiplier)
-            .min(1_000),
-    )
-}
-
 fn is_sqlite_lock_anyhow(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string().to_ascii_lowercase();
@@ -1513,6 +1518,23 @@ fn sqlite_table_exists(conn: &Connection, table_name: &str) -> anyhow::Result<bo
     Ok(exists)
 }
 
+fn sqlite_main_db_path(conn: &Connection) -> anyhow::Result<Option<PathBuf>> {
+    let mut stmt = conn.prepare("PRAGMA database_list")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name != "main" {
+            continue;
+        }
+        let file: String = row.get(2)?;
+        if file.trim().is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(PathBuf::from(file)));
+    }
+    Ok(None)
+}
+
 fn prune_non_uuid_exchange_ids(conn: &Connection, table: &str) -> anyhow::Result<usize> {
     let select_sql = format!("SELECT exchange_id FROM {table}");
     let mut stmt = conn.prepare(&select_sql)?;
@@ -1531,18 +1553,6 @@ fn prune_non_uuid_exchange_ids(conn: &Connection, table: &str) -> anyhow::Result
         deleted += conn.execute(&delete_sql, [exchange_id])?;
     }
     Ok(deleted)
-}
-
-fn open_read_conn(path: &Path) -> anyhow::Result<Connection> {
-    let conn = open_sqlite_read_only(path)
-        .with_context(|| format!("failed opening sqlite read connection {}", path.display()))?;
-    Ok(conn)
-}
-
-fn open_rw_conn(path: &Path) -> anyhow::Result<Connection> {
-    let conn = open_sqlite_read_write(path)
-        .with_context(|| format!("failed opening sqlite rw connection {}", path.display()))?;
-    Ok(conn)
 }
 
 fn merge_tags(
@@ -2165,6 +2175,7 @@ fn hostname_resolution_command() -> (&'static str, &'static [&'static str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::time::Duration;
     use tempfile::{tempdir, TempDir};
 
@@ -2219,6 +2230,25 @@ mod tests {
         agent.config.body_upload_enabled = true;
         agent.config.body_batch_size = 7;
         assert_eq!(agent.ready_queue_load_limit(), 7);
+    }
+
+    #[test]
+    fn sqlite_main_db_path_returns_file_path_for_file_backed_connection() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("events.db");
+        let conn = Connection::open(&db_path).expect("open sqlite file");
+        let resolved = sqlite_main_db_path(&conn).expect("resolve sqlite main path");
+        let resolved = resolved.expect("expected sqlite main file path");
+        let resolved_real = std::fs::canonicalize(&resolved).expect("canonical resolved path");
+        let expected_real = std::fs::canonicalize(&db_path).expect("canonical expected path");
+        assert_eq!(resolved_real, expected_real);
+    }
+
+    #[test]
+    fn sqlite_main_db_path_returns_none_for_in_memory_connection() {
+        let conn = Connection::open_in_memory().expect("open sqlite memory");
+        let resolved = sqlite_main_db_path(&conn).expect("resolve sqlite main path");
+        assert!(resolved.is_none());
     }
 
     fn noisy_text(len: usize, seed: u64) -> String {

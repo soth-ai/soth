@@ -1,12 +1,17 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::named_params;
 use soth_classify::ClassifiedResult;
 use soth_core::{CaptureMode, DetectResult, ProxyContext};
 use uuid::Uuid;
+
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 2_000;
+const SQLITE_MMAP_SIZE_BYTES: i64 = 268_435_456; // 256 MB
+const SQLITE_CACHE_SIZE_KIB: i64 = -64_000; // 64 MB
 
 const REQUIRED_INTERCEPT_COLUMNS: &[(&str, &str)] = &[
     ("connection_id", "connection_id TEXT NOT NULL DEFAULT ''"),
@@ -107,10 +112,18 @@ pub fn open(db_path: &Path) -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(db_path)
         .with_context(|| format!("failed to open sqlite database: {}", db_path.display()))?;
 
+    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+        .context("failed to configure sqlite busy timeout")?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .context("failed to enable WAL mode")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .context("failed to set sqlite synchronous mode")?;
+    conn.pragma_update(None, "mmap_size", SQLITE_MMAP_SIZE_BYTES)
+        .context("failed to set sqlite mmap_size")?;
+    conn.pragma_update(None, "page_size", 4096_i64)
+        .context("failed to set sqlite page_size")?;
+    conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)
+        .context("failed to set sqlite cache_size")?;
 
     run_migrations(&conn)?;
     Ok(conn)

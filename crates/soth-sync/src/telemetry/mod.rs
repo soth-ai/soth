@@ -3,10 +3,11 @@ mod replay_worker;
 mod sender;
 mod sink;
 
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use tokio::sync::{mpsc, watch};
 
 use crate::agent::SyncAgentConfig;
@@ -20,16 +21,16 @@ pub use sink::SyncTelemetrySink;
 pub struct TelemetryRuntimeConfig {
     pub endpoint: String,
     pub api_key: String,
-    pub event_db_path: PathBuf,
+    pub db: Arc<Mutex<Connection>>,
     pub telemetry: TelemetrySyncConfig,
 }
 
 impl TelemetryRuntimeConfig {
-    pub fn from_sync_agent_config(config: &SyncAgentConfig) -> Self {
+    pub fn from_sync_agent_config(config: &SyncAgentConfig, db: Arc<Mutex<Connection>>) -> Self {
         Self {
             endpoint: config.endpoint.clone(),
             api_key: config.api_key.clone(),
-            event_db_path: config.event_db_path.clone(),
+            db,
             telemetry: config.telemetry.clone().sanitize(),
         }
     }
@@ -45,7 +46,7 @@ impl TelemetrySyncRuntime {
     pub fn start(config: TelemetryRuntimeConfig) -> Result<Self> {
         let telemetry = config.telemetry.sanitize();
         let (tx, rx) = mpsc::unbounded_channel::<String>();
-        let outbox = Arc::new(TelemetryOutbox::new(config.event_db_path, tx.clone())?);
+        let outbox = Arc::new(TelemetryOutbox::new_with_connection(config.db, tx.clone())?);
         let sink = Arc::new(SyncTelemetrySink::new(outbox.clone()));
         let sender = TelemetrySender::new(
             config.endpoint,

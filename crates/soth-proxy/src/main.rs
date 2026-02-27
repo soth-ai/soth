@@ -50,10 +50,6 @@ async fn main() -> Result<()> {
     let config = ProxyConfig::from_env_or_default().context("load proxy config")?;
     let db_conn = db::open(config.db_path.as_path())?;
     let db = Arc::new(Mutex::new(db_conn));
-    let bundle_db = Arc::new(
-        rusqlite::Connection::open(config.db_path.as_path())
-            .context("open bundle sqlite handle")?,
-    );
 
     let vendor_pubkey = config
         .bundle_vendor_pubkey()
@@ -64,7 +60,7 @@ async fn main() -> Result<()> {
         config.bundle.bundle_dir.as_path(),
         &vendor_pubkey,
         org_config,
-        bundle_db,
+        db.clone(),
     )
     .with_context(|| {
         format!(
@@ -77,12 +73,8 @@ async fn main() -> Result<()> {
 
     let (sync_agent, sync_telemetry_sink) = if config.sync.enabled {
         let sync_config = config.sync_config();
-        let sync_db = Arc::new(
-            rusqlite::Connection::open(config.db_path.as_path())
-                .context("open sync sqlite handle")?,
-        );
         let (agent, telemetry_sink) =
-            soth_sync::SyncAgent::new(sync_config, sync_db).context("initialize sync agent")?;
+            soth_sync::SyncAgent::new(sync_config, db.clone()).context("initialize sync agent")?;
         let install_hook = Arc::new(BundleWatcherInstallHook::new(bundle_watcher.clone()));
         agent.set_bundle_watcher(install_hook);
         (Some(Arc::new(agent)), Some(Arc::new(telemetry_sink)))
@@ -102,7 +94,10 @@ async fn main() -> Result<()> {
 
         Some(Arc::new(soth_telemetry::TelemetryPipeline::new(
             telemetry_cfg,
-            Arc::new(soth_telemetry::SqlitePool::new(config.db_path.clone())),
+            Arc::new(soth_telemetry::SqlitePool::from_connection(
+                db.clone(),
+                config.db_path.clone(),
+            )),
             sink,
         )))
     } else {

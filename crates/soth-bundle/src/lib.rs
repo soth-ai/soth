@@ -9,6 +9,7 @@ mod verify;
 mod watcher;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 pub use crate::db::{mark_superseded, record_bundle_installed, record_policy_config};
 pub use crate::error::BundleError;
@@ -38,7 +39,7 @@ pub fn init(
     bundle_dir: &std::path::Path,
     vendor_pubkey: &[u8; 32],
     org_config: Arc<OrgSignedConfig>,
-    db: Arc<rusqlite::Connection>,
+    db: Arc<Mutex<rusqlite::Connection>>,
 ) -> Result<(BundleWatcher, BundleHandle), BundleError> {
     let initial = load_from_dir(bundle_dir, vendor_pubkey, &org_config)?;
     BundleWatcher::new(initial, *vendor_pubkey, org_config, db)

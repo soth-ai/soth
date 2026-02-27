@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use rusqlite::Connection;
 use tokio::sync::watch;
@@ -30,7 +30,7 @@ pub struct BundleWatcher {
     tx: watch::Sender<Arc<LoadedBundle>>,
     vendor_pubkey: [u8; 32],
     org_config: Arc<OrgSignedConfig>,
-    db_path: PathBuf,
+    db: Arc<Mutex<Connection>>,
 }
 
 impl BundleWatcher {
@@ -38,15 +38,14 @@ impl BundleWatcher {
         initial: LoadedBundle,
         vendor_pubkey: [u8; 32],
         org_config: Arc<OrgSignedConfig>,
-        db: Arc<Connection>,
+        db: Arc<Mutex<Connection>>,
     ) -> Result<(Self, BundleHandle), BundleError> {
         let (tx, rx) = watch::channel(Arc::new(initial));
-        let db_path = main_db_path(db.as_ref())?;
         let watcher = Self {
             tx,
             vendor_pubkey,
             org_config,
-            db_path,
+            db,
         };
         let handle = BundleHandle { rx };
         Ok((watcher, handle))
@@ -65,13 +64,12 @@ impl BundleWatcher {
         )?;
         let version = new_bundle.version.clone();
 
-        {
-            let conn = Connection::open(&self.db_path)?;
-            // Persist installed bundle metadata before in-memory swap so restart
-            // recovery can still discover the new version if send() fails.
-            db::record_bundle_installed(&conn, &new_bundle)?;
-            db::record_policy_config(&conn, &new_bundle)?;
-        }
+        let conn = self.db.lock().map_err(|_| BundleError::DbMutexPoisoned)?;
+        // Persist installed bundle metadata before in-memory swap so restart
+        // recovery can still discover the new version if send() fails.
+        db::record_bundle_installed(&conn, &new_bundle)?;
+        db::record_policy_config(&conn, &new_bundle)?;
+        drop(conn);
 
         self.tx
             .send(Arc::new(new_bundle))
@@ -81,32 +79,17 @@ impl BundleWatcher {
     }
 
     pub fn supersede_previous(&self, previous_version: &str) -> Result<(), BundleError> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = self.db.lock().map_err(|_| BundleError::DbMutexPoisoned)?;
         db::mark_superseded(&conn, previous_version)?;
+        drop(conn);
         Ok(())
     }
-}
-
-fn main_db_path(conn: &Connection) -> Result<PathBuf, BundleError> {
-    let mut stmt = conn.prepare("PRAGMA database_list")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name != "main" {
-            continue;
-        }
-        let file: String = row.get(2)?;
-        if !file.trim().is_empty() {
-            return Ok(PathBuf::from(file));
-        }
-    }
-    Err(BundleError::DbPathUnavailable)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
@@ -190,7 +173,7 @@ mod tests {
         .expect("initial bundle");
 
         let db_file = NamedTempFile::new().expect("temp db");
-        let db = Arc::new(Connection::open(db_file.path()).expect("db"));
+        let db = Arc::new(Mutex::new(Connection::open(db_file.path()).expect("db")));
         let (watcher, mut handle) = BundleWatcher::new(
             initial,
             vendor.verifying_key().to_bytes(),
@@ -231,7 +214,7 @@ mod tests {
         .expect("initial bundle");
 
         let db_file = NamedTempFile::new().expect("temp db");
-        let db = Arc::new(Connection::open(db_file.path()).expect("db"));
+        let db = Arc::new(Mutex::new(Connection::open(db_file.path()).expect("db")));
         let (watcher, handle) = BundleWatcher::new(
             initial,
             vendor.verifying_key().to_bytes(),
@@ -270,7 +253,7 @@ mod tests {
 
         let db_file = NamedTempFile::new().expect("temp db");
         let db_path = db_file.path().to_path_buf();
-        let db = Arc::new(Connection::open(&db_path).expect("db"));
+        let db = Arc::new(Mutex::new(Connection::open(&db_path).expect("db")));
         let (watcher, handle) = BundleWatcher::new(
             initial,
             vendor.verifying_key().to_bytes(),

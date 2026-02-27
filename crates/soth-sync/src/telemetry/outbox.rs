@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -6,11 +7,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use soth_telemetry::TransmittedBatch;
 use uuid::Uuid;
 
+use crate::db::open_sqlite_read_write;
+
 const OUTBOX_STATUS_QUEUED: &str = "QUEUED";
 const OUTBOX_STATUS_SENDING: &str = "SENDING";
 const OUTBOX_STATUS_FAILED: &str = "FAILED";
 const OUTBOX_STATUS_SENT: &str = "SENT";
 const OUTBOX_STATUS_DEAD: &str = "DEAD";
+const STALE_SENDING_RECOVERY_SECS: i64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct TelemetryOutboxRecord {
@@ -22,7 +26,7 @@ pub struct TelemetryOutboxRecord {
 
 #[derive(Clone)]
 pub struct TelemetryOutbox {
-    db_path: PathBuf,
+    db: Arc<Mutex<Connection>>,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
@@ -31,21 +35,28 @@ impl TelemetryOutbox {
         db_path: impl AsRef<Path>,
         tx: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<Self> {
-        let outbox = Self {
-            db_path: db_path.as_ref().to_path_buf(),
-            tx,
-        };
+        let conn = open_sqlite_read_write(db_path.as_ref())
+            .with_context(|| format!("open sqlite database {}", db_path.as_ref().display()))?;
+        Self::new_with_connection(Arc::new(Mutex::new(conn)), tx)
+    }
+
+    pub fn new_with_connection(
+        db: Arc<Mutex<Connection>>,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<Self> {
+        let outbox = Self { db, tx };
         outbox.ensure_schema()?;
         Ok(outbox)
     }
 
     pub fn enqueue(&self, batch: TransmittedBatch) -> Result<()> {
         self.ensure_schema()?;
-        let mut conn = self.open_rw()?;
         let now = Utc::now().timestamp();
         let batch_id = batch.batch_id().to_string();
         let payload = serde_json::to_string(&batch).context("serialize transmitted batch")?;
         let encrypted = if batch.is_encrypted() { 1i64 } else { 0i64 };
+
+        let mut conn = self.lock_db()?;
         let tx = conn
             .transaction()
             .context("start telemetry outbox transaction")?;
@@ -73,6 +84,7 @@ impl TelemetryOutbox {
         )
         .context("insert telemetry outbox row")?;
         tx.commit().context("commit telemetry outbox transaction")?;
+        drop(conn);
 
         self.tx
             .send(batch.batch_id().to_string())
@@ -82,9 +94,29 @@ impl TelemetryOutbox {
 
     pub fn drain_on_startup(&self) -> Result<usize> {
         self.ensure_schema()?;
-        let conn = self.open_ro()?;
         let now = Utc::now().timestamp();
-        let mut stmt = conn.prepare(
+        let stale_sending_before = now.saturating_sub(STALE_SENDING_RECOVERY_SECS);
+
+        let mut conn = self.lock_db()?;
+        let tx = conn
+            .transaction()
+            .context("start telemetry startup drain transaction")?;
+        tx.execute(
+            "UPDATE telemetry_outbox
+             SET status = ?1, next_attempt_at = ?2, last_error = COALESCE(last_error, ?3)
+             WHERE status = ?4
+               AND COALESCE(last_attempt_at, first_queued_at, 0) <= ?5",
+            params![
+                OUTBOX_STATUS_FAILED,
+                now,
+                "recovered stale telemetry outbox sending row",
+                OUTBOX_STATUS_SENDING,
+                stale_sending_before
+            ],
+        )
+        .context("recover stale telemetry outbox SENDING rows")?;
+
+        let mut stmt = tx.prepare(
             "SELECT batch_id
              FROM telemetry_outbox
              WHERE status IN (?1, ?2)
@@ -93,6 +125,7 @@ impl TelemetryOutbox {
              LIMIT 5000",
         )?;
         let mut rows = stmt.query(params![OUTBOX_STATUS_QUEUED, OUTBOX_STATUS_FAILED, now])?;
+
         let mut replayed = 0usize;
         while let Some(row) = rows.next().context("read telemetry outbox row")? {
             let batch_id: String = row.get(0).context("read telemetry outbox batch_id")?;
@@ -101,6 +134,10 @@ impl TelemetryOutbox {
                 .map_err(|_| anyhow::anyhow!("telemetry replay worker channel closed"))?;
             replayed = replayed.saturating_add(1);
         }
+        drop(rows);
+        drop(stmt);
+        tx.commit()
+            .context("commit telemetry startup drain transaction")?;
         Ok(replayed)
     }
 
@@ -110,7 +147,7 @@ impl TelemetryOutbox {
         now_ts: i64,
     ) -> Result<Option<TelemetryOutboxRecord>> {
         self.ensure_schema()?;
-        let mut conn = self.open_rw()?;
+        let mut conn = self.lock_db()?;
         let tx = conn
             .transaction()
             .context("start telemetry claim transaction")?;
@@ -169,7 +206,7 @@ impl TelemetryOutbox {
 
     pub fn mark_sent(&self, batch_id: Uuid) -> Result<()> {
         self.ensure_schema()?;
-        let mut conn = self.open_rw()?;
+        let mut conn = self.lock_db()?;
         let tx = conn
             .transaction()
             .context("start telemetry sent transaction")?;
@@ -193,7 +230,7 @@ impl TelemetryOutbox {
         error: &str,
     ) -> Result<()> {
         self.ensure_schema()?;
-        let mut conn = self.open_rw()?;
+        let mut conn = self.lock_db()?;
         let tx = conn
             .transaction()
             .context("start telemetry failed transaction")?;
@@ -217,7 +254,7 @@ impl TelemetryOutbox {
 
     pub fn mark_dead(&self, batch_id: Uuid, attempts: u8, reason: &str) -> Result<()> {
         self.ensure_schema()?;
-        let mut conn = self.open_rw()?;
+        let mut conn = self.lock_db()?;
         let tx = conn
             .transaction()
             .context("start telemetry dead transaction")?;
@@ -239,7 +276,7 @@ impl TelemetryOutbox {
     }
 
     fn ensure_schema(&self) -> Result<()> {
-        let conn = self.open_rw()?;
+        let conn = self.lock_db()?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS telemetry_outbox (
                 batch_id TEXT PRIMARY KEY,
@@ -317,21 +354,10 @@ impl TelemetryOutbox {
         Ok(())
     }
 
-    fn open_ro(&self) -> Result<Connection> {
-        Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .or_else(|_| {
-                Connection::open_with_flags(
-                    &self.db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-                )
-            })
-            .with_context(|| format!("open sqlite database {}", self.db_path.display()))
-    }
-
-    fn open_rw(&self) -> Result<Connection> {
-        Connection::open(&self.db_path)
-            .with_context(|| format!("open sqlite database {}", self.db_path.display()))
+    fn lock_db(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("telemetry outbox sqlite mutex poisoned"))
     }
 }
 

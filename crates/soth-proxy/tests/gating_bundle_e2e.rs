@@ -223,7 +223,9 @@ fn build_handler(
     )
     .expect("load bundle");
 
-    let bundle_db = Arc::new(Connection::open(db_path).expect("open bundle db"));
+    let bundle_db = Arc::new(Mutex::new(
+        Connection::open(db_path).expect("open bundle db"),
+    ));
     let (_watcher, handle) = soth_bundle::BundleWatcher::new(
         loaded,
         vendor_pubkey,
