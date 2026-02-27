@@ -176,6 +176,7 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
                 .display()
                 .to_string(),
             vendor_pubkey_hex: config.bundle.vendor_pubkey_hex.clone(),
+            verify_vendor_signature: config.bundle.verify_vendor_signature,
         },
         sync: GeneratedSyncConfig {
             enabled: sync_enabled,
@@ -246,6 +247,7 @@ struct GeneratedMitmConfig {
 struct GeneratedBundleConfig {
     bundle_dir: String,
     vendor_pubkey_hex: String,
+    verify_vendor_signature: bool,
 }
 
 #[derive(Debug, Serialize)]

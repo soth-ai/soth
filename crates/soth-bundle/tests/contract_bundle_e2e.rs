@@ -9,7 +9,7 @@ use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use soth_bundle::{
     load_from_bytes, AssetEntry, BundleError, BundleManifest, BundleScope, BundleWatcher,
-    OrgSignedConfig,
+    OrgSignedConfig, VerificationOptions,
 };
 use tempfile::NamedTempFile;
 
@@ -246,8 +246,14 @@ fn bundle_watcher_e2e_hot_swap_and_db_contract() {
     let db_path = db_file.path().to_path_buf();
     let db = Arc::new(Mutex::new(Connection::open(&db_path).expect("open sqlite")));
 
-    let (watcher, handle) = BundleWatcher::new(initial_loaded, vendor_pubkey, Arc::new(org), db)
-        .expect("create watcher");
+    let (watcher, handle) = BundleWatcher::new(
+        initial_loaded,
+        vendor_pubkey,
+        Arc::new(org),
+        db,
+        VerificationOptions::default(),
+    )
+    .expect("create watcher");
 
     let next_assets = bundle_assets(
         DETECT_FIXTURE_BYTES.to_vec(),

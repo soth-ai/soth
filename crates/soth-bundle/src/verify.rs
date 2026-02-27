@@ -6,25 +6,29 @@ use sha2::{Digest, Sha256};
 use crate::error::BundleError;
 use crate::manifest::{canonical_manifest_bytes, BundleManifest};
 
-pub fn verify_bundle(
+pub fn verify_bundle_with_options(
     manifest: &BundleManifest,
     asset_bytes: &HashMap<String, Vec<u8>>,
-    vendor_pubkey: &[u8; 32],
+    vendor_pubkey: Option<&[u8; 32]>,
+    verify_signature: bool,
 ) -> Result<(), BundleError> {
-    let canonical = canonical_manifest_bytes(manifest)?;
-    let signature_bytes = hex::decode(manifest.vendor_sig.as_str())
-        .map_err(|_| BundleError::InvalidSignatureEncoding)?;
-    let signature_array: [u8; 64] = signature_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| BundleError::InvalidSignatureLength)?;
-    let signature = Signature::from_bytes(&signature_array);
-    let verifying_key =
-        VerifyingKey::from_bytes(vendor_pubkey).map_err(|_| BundleError::InvalidVendorPublicKey)?;
+    if verify_signature {
+        let vendor_pubkey = vendor_pubkey.ok_or(BundleError::InvalidVendorPublicKey)?;
+        let canonical = canonical_manifest_bytes(manifest)?;
+        let signature_bytes = hex::decode(manifest.vendor_sig.as_str())
+            .map_err(|_| BundleError::InvalidSignatureEncoding)?;
+        let signature_array: [u8; 64] = signature_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| BundleError::InvalidSignatureLength)?;
+        let signature = Signature::from_bytes(&signature_array);
+        let verifying_key = VerifyingKey::from_bytes(vendor_pubkey)
+            .map_err(|_| BundleError::InvalidVendorPublicKey)?;
 
-    verifying_key
-        .verify_strict(canonical.as_slice(), &signature)
-        .map_err(|_| BundleError::SignatureVerificationFailed)?;
+        verifying_key
+            .verify_strict(canonical.as_slice(), &signature)
+            .map_err(|_| BundleError::SignatureVerificationFailed)?;
+    }
 
     for entry in &manifest.assets {
         let bytes = asset_bytes
@@ -97,7 +101,7 @@ mod tests {
     fn verify_success() {
         let (manifest, assets, key) = fixture_bundle();
         let pubkey = key.verifying_key().to_bytes();
-        verify_bundle(&manifest, &assets, &pubkey).expect("valid bundle");
+        verify_bundle_with_options(&manifest, &assets, Some(&pubkey), true).expect("valid bundle");
     }
 
     #[test]
@@ -108,7 +112,8 @@ mod tests {
             b"tampered".to_vec(),
         );
         let pubkey = key.verifying_key().to_bytes();
-        let err = verify_bundle(&manifest, &assets, &pubkey).expect_err("tampered should fail");
+        let err = verify_bundle_with_options(&manifest, &assets, Some(&pubkey), true)
+            .expect_err("tampered should fail");
         assert!(matches!(
             err,
             BundleError::AssetSizeMismatch { .. } | BundleError::AssetHashMismatch { .. }
@@ -121,7 +126,15 @@ mod tests {
         let wrong = SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()
             .to_bytes();
-        let err = verify_bundle(&manifest, &assets, &wrong).expect_err("wrong key should fail");
+        let err = verify_bundle_with_options(&manifest, &assets, Some(&wrong), true)
+            .expect_err("wrong key should fail");
         assert!(matches!(err, BundleError::SignatureVerificationFailed));
+    }
+
+    #[test]
+    fn verify_skips_signature_when_disabled() {
+        let (manifest, assets, _key) = fixture_bundle();
+        verify_bundle_with_options(&manifest, &assets, None, false)
+            .expect("signature skipped should still validate assets");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,12 +42,14 @@ async fn main() -> Result<()> {
         .bundle_vendor_pubkey()
         .context("parse bundle vendor pubkey")?;
     let org_config = Arc::new(config.org_signed_config());
+    let bundle_verification = config.bundle_verification_options();
 
-    let (bundle_watcher, bundle_handle) = soth_bundle::init(
+    let (bundle_watcher, bundle_handle) = soth_bundle::init_with_options(
         config.bundle.bundle_dir.as_path(),
         &vendor_pubkey,
         org_config,
         db.clone(),
+        bundle_verification,
     )
     .with_context(|| {
         format!(
@@ -131,7 +133,28 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mitm_config = config.mitm_config()?;
+    let mut mitm_config = config.mitm_config()?;
+    if mitm_config.interception.destinations.is_empty()
+        || mitm_config
+            .interception
+            .destinations
+            .iter()
+            .any(|destination| destination.trim() == "*")
+    {
+        let derived_destinations =
+            derive_interception_destinations_from_bundle(bundle_handle.current().as_ref());
+        if derived_destinations.is_empty() {
+            anyhow::bail!(
+                "mitm.interception.destinations is empty/wildcard and bundle-derived destinations are empty"
+            );
+        }
+        info!(
+            destination_count = derived_destinations.len(),
+            "using bundle-derived mitm interception destinations"
+        );
+        mitm_config.interception.destinations = derived_destinations;
+    }
+
     let proxy = soth_mitm::MitmProxyBuilder::new(mitm_config, handler)
         .build()
         .context("build mitm proxy")?;
@@ -173,4 +196,67 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+}
+
+fn derive_interception_destinations_from_bundle(bundle: &soth_bundle::LoadedBundle) -> Vec<String> {
+    let mut hosts = BTreeSet::new();
+
+    for host in bundle.detect.domain_index.keys() {
+        maybe_insert_exact_host(host.as_str(), &mut hosts);
+    }
+    for pattern in &bundle.gating.gates.stage0_tls.tls_intercept_hosts {
+        maybe_insert_exact_host(pattern.as_str(), &mut hosts);
+    }
+    for entity in bundle
+        .gating
+        .entities
+        .providers
+        .iter()
+        .chain(bundle.gating.entities.web_apps.iter())
+        .chain(bundle.gating.entities.native_apps.iter())
+    {
+        for rule in &entity.hosts {
+            maybe_insert_exact_host(rule.pattern.as_str(), &mut hosts);
+        }
+    }
+
+    let mut destinations = Vec::with_capacity(hosts.len() * 2);
+    for host in hosts {
+        destinations.push(format!("{host}:443"));
+        destinations.push(format!("{host}:80"));
+    }
+    destinations
+}
+
+fn maybe_insert_exact_host(candidate: &str, out: &mut BTreeSet<String>) {
+    let mut host = candidate.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return;
+    }
+    if let Some(stripped) = host.strip_prefix('=') {
+        host = stripped.to_string();
+    }
+
+    if host.contains('*')
+        || host.contains('/')
+        || host.contains('?')
+        || host.contains('#')
+        || host.contains(' ')
+        || host.contains('\t')
+    {
+        return;
+    }
+
+    if let Some((left, right)) = host.rsplit_once(':') {
+        let is_ipv6 = left.contains(':');
+        if !is_ipv6 && right.chars().all(|ch| ch.is_ascii_digit()) {
+            host = left.to_string();
+        }
+    }
+
+    host = host.trim_matches('.').to_string();
+    if host.is_empty() {
+        return;
+    }
+    out.insert(host);
 }

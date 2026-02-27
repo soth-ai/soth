@@ -15,12 +15,26 @@ use crate::error::BundleError;
 use crate::manifest::{BundleManifest, OrgSignedConfig};
 use crate::scope_check;
 use crate::verify;
-use crate::LoadedBundle;
+use crate::{LoadedBundle, VerificationOptions};
 
 pub fn load_from_dir(
     bundle_dir: &Path,
     vendor_pubkey: &[u8; 32],
     org_config: &OrgSignedConfig,
+) -> Result<LoadedBundle, BundleError> {
+    load_from_dir_with_options(
+        bundle_dir,
+        vendor_pubkey,
+        org_config,
+        VerificationOptions::default(),
+    )
+}
+
+pub fn load_from_dir_with_options(
+    bundle_dir: &Path,
+    vendor_pubkey: &[u8; 32],
+    org_config: &OrgSignedConfig,
+    verification: VerificationOptions,
 ) -> Result<LoadedBundle, BundleError> {
     let manifest_path = bundle_dir.join("manifest.json");
     let manifest_bytes = std::fs::read(&manifest_path)?;
@@ -33,7 +47,13 @@ pub fn load_from_dir(
         asset_bytes.insert(entry.path.clone(), bytes);
     }
 
-    load_verified(manifest, asset_bytes, vendor_pubkey, org_config)
+    load_verified(
+        manifest,
+        asset_bytes,
+        vendor_pubkey,
+        org_config,
+        verification,
+    )
 }
 
 pub fn load_from_bytes(
@@ -42,8 +62,24 @@ pub fn load_from_bytes(
     vendor_pubkey: &[u8; 32],
     org_config: &OrgSignedConfig,
 ) -> Result<LoadedBundle, BundleError> {
+    load_from_bytes_with_options(
+        manifest_bytes,
+        assets,
+        vendor_pubkey,
+        org_config,
+        VerificationOptions::default(),
+    )
+}
+
+pub fn load_from_bytes_with_options(
+    manifest_bytes: &[u8],
+    assets: HashMap<String, Vec<u8>>,
+    vendor_pubkey: &[u8; 32],
+    org_config: &OrgSignedConfig,
+    verification: VerificationOptions,
+) -> Result<LoadedBundle, BundleError> {
     let manifest: BundleManifest = serde_json::from_slice(manifest_bytes)?;
-    load_verified(manifest, assets, vendor_pubkey, org_config)
+    load_verified(manifest, assets, vendor_pubkey, org_config, verification)
 }
 
 pub(crate) fn load_verified(
@@ -51,8 +87,14 @@ pub(crate) fn load_verified(
     assets: HashMap<String, Vec<u8>>,
     vendor_pubkey: &[u8; 32],
     org_config: &OrgSignedConfig,
+    verification: VerificationOptions,
 ) -> Result<LoadedBundle, BundleError> {
-    verify::verify_bundle(&manifest, &assets, vendor_pubkey)?;
+    verify::verify_bundle_with_options(
+        &manifest,
+        &assets,
+        Some(vendor_pubkey),
+        verification.verify_vendor_signature,
+    )?;
     scope_check::check_scope(&manifest.scope, org_config)?;
 
     let policy = load_policy_bundle(&assets)?;

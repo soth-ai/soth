@@ -231,6 +231,7 @@ fn build_handler(
         vendor_pubkey,
         Arc::new(OrgSignedConfig::default()),
         bundle_db,
+        soth_bundle::VerificationOptions::default(),
     )
     .expect("create bundle watcher");
 

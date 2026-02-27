@@ -115,6 +115,7 @@ impl Default for ExchangeConfig {
 pub struct BundleConfig {
     pub bundle_dir: String,
     pub vendor_pubkey_hex: String,
+    pub verify_vendor_signature: bool,
 }
 
 impl Default for BundleConfig {
@@ -122,6 +123,7 @@ impl Default for BundleConfig {
         Self {
             bundle_dir: "~/.soth/bundle".to_string(),
             vendor_pubkey_hex: "00".repeat(32),
+            verify_vendor_signature: false,
         }
     }
 }

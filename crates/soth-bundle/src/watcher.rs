@@ -9,7 +9,7 @@ use crate::db;
 use crate::error::BundleError;
 use crate::loader;
 use crate::manifest::OrgSignedConfig;
-use crate::LoadedBundle;
+use crate::{LoadedBundle, VerificationOptions};
 
 #[derive(Clone)]
 pub struct BundleHandle {
@@ -31,6 +31,7 @@ pub struct BundleWatcher {
     vendor_pubkey: [u8; 32],
     org_config: Arc<OrgSignedConfig>,
     db: Arc<Mutex<Connection>>,
+    verification: VerificationOptions,
 }
 
 impl BundleWatcher {
@@ -39,6 +40,7 @@ impl BundleWatcher {
         vendor_pubkey: [u8; 32],
         org_config: Arc<OrgSignedConfig>,
         db: Arc<Mutex<Connection>>,
+        verification: VerificationOptions,
     ) -> Result<(Self, BundleHandle), BundleError> {
         let (tx, rx) = watch::channel(Arc::new(initial));
         let watcher = Self {
@@ -46,6 +48,7 @@ impl BundleWatcher {
             vendor_pubkey,
             org_config,
             db,
+            verification,
         };
         let handle = BundleHandle { rx };
         Ok((watcher, handle))
@@ -56,11 +59,12 @@ impl BundleWatcher {
         manifest_bytes: &[u8],
         assets: HashMap<String, Vec<u8>>,
     ) -> Result<String, BundleError> {
-        let new_bundle = loader::load_from_bytes(
+        let new_bundle = loader::load_from_bytes_with_options(
             manifest_bytes,
             assets,
             &self.vendor_pubkey,
             &self.org_config,
+            self.verification,
         )?;
         let version = new_bundle.version.clone();
 
@@ -179,6 +183,7 @@ mod tests {
             vendor.verifying_key().to_bytes(),
             Arc::new(org),
             db,
+            VerificationOptions::default(),
         )
         .expect("watcher");
 
@@ -220,6 +225,7 @@ mod tests {
             vendor.verifying_key().to_bytes(),
             Arc::new(org),
             db,
+            VerificationOptions::default(),
         )
         .expect("watcher");
 
@@ -259,6 +265,7 @@ mod tests {
             vendor.verifying_key().to_bytes(),
             Arc::new(org),
             db,
+            VerificationOptions::default(),
         )
         .expect("watcher");
 

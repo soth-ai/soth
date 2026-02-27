@@ -86,6 +86,12 @@ impl ProxyConfig {
         }
     }
 
+    pub fn bundle_verification_options(&self) -> soth_bundle::VerificationOptions {
+        soth_bundle::VerificationOptions {
+            verify_vendor_signature: self.bundle.verify_vendor_signature,
+        }
+    }
+
     pub fn classify_config(&self) -> soth_classify::ClassifyConfig {
         self.classify.to_classify_config()
     }
@@ -216,6 +222,7 @@ impl MitmRuntimeConfig {
 pub struct BundleConfig {
     pub bundle_dir: PathBuf,
     pub vendor_pubkey_hex: String,
+    pub verify_vendor_signature: bool,
     pub allows_https_intercept: bool,
     pub allows_http_intercept: bool,
     pub process_filter: Option<Vec<String>>,
@@ -228,6 +235,7 @@ impl Default for BundleConfig {
         Self {
             bundle_dir: home.join(".soth").join("bundle"),
             vendor_pubkey_hex: "00".repeat(32),
+            verify_vendor_signature: false,
             allows_https_intercept: true,
             allows_http_intercept: true,
             process_filter: None,
