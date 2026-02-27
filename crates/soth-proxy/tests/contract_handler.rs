@@ -346,6 +346,42 @@ async fn handler_contract_streaming_callbacks_complete() {
     let _ = std::fs::remove_file(db_path);
 }
 
+#[tokio::test]
+async fn handler_contract_stream_end_without_chunks_is_safe() {
+    let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
+    let mut pipeline = PipelineConfig::default();
+    pipeline.unknown_app_action = GateAction::Intercept;
+
+    let handler = build_handler(
+        db_path.as_path(),
+        pipeline,
+        detect_bundle_with_openai_catalog(),
+    );
+
+    let connection_id = Uuid::new_v4();
+    let request = sample_request(
+        connection_id,
+        "api.openai.com",
+        br#"{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"stream-no-chunk"}]}"#,
+    );
+
+    use soth_mitm::InterceptHandler;
+    let decision = handler.on_request(&request).await;
+    assert_eq!(decision, soth_mitm::HandlerDecision::Allow);
+
+    // Validate no-chunk stream shutdown path: flow can finalize without any stream data.
+    handler.on_stream_end(connection_id).await;
+    handler.on_connection_close(connection_id);
+
+    let response = sample_response(connection_id, br#"{}"#);
+    handler.on_response(&response).await;
+
+    wait_for_intercept_rows(db_path.as_path(), 1).await;
+    assert!(intercept_row_count(db_path.as_path()) >= 1);
+
+    let _ = std::fs::remove_file(db_path);
+}
+
 #[test]
 fn handler_contract_intercept_schema_contains_reference_columns() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));

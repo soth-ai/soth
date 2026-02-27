@@ -24,6 +24,7 @@ pub struct LoadedBundle {
     pub classify: Arc<soth_classify::ClassifyBundle>,
     pub policy: Arc<soth_policy::sync_policy::PolicyBundle>,
     pub detect: Arc<soth_detect::OwnedDetectBundle>,
+    pub gating: Arc<soth_core::GatingBundle>,
     pub manifest: BundleManifest,
 }
 

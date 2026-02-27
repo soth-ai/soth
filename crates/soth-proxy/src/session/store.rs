@@ -99,4 +99,8 @@ impl SessionStore {
         self.inner
             .retain(|_, value| value.last_active.elapsed() <= ttl);
     }
+
+    pub fn remove(&self, connection_id: &Uuid) -> bool {
+        self.inner.remove(connection_id).is_some()
+    }
 }

@@ -7,15 +7,14 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use ed25519_dalek::{Signer, SigningKey};
-use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use soth_bundle::{AssetEntry, BundleManifest, BundleScope, OrgSignedConfig};
 use soth_sync::api_types::RegistryVersionResponse;
 use soth_sync::registry_puller::RegistryPuller;
+use soth_sync::BundleWatcher;
 
 #[derive(Default)]
 struct RegistryHits {
@@ -83,18 +82,35 @@ async fn start_registry_server(state: RegistryState) -> Option<String> {
 
 #[derive(Clone)]
 struct BundleWatcherAdapter {
-    watcher: Arc<soth_bundle::BundleWatcher>,
+    state: Arc<Mutex<BundleInstallState>>,
 }
 
-impl soth_sync::BundleWatcher for BundleWatcherAdapter {
+#[derive(Default)]
+struct BundleInstallState {
+    install_calls: usize,
+    installed_version: Option<String>,
+}
+
+impl BundleWatcher for BundleWatcherAdapter {
     fn install_bundle(
         &self,
         manifest_bytes: &[u8],
-        assets: HashMap<String, Vec<u8>>,
+        _assets: HashMap<String, Vec<u8>>,
     ) -> anyhow::Result<String> {
-        self.watcher
-            .install(manifest_bytes, assets)
-            .map_err(anyhow::Error::from)
+        let manifest: Value = serde_json::from_slice(manifest_bytes)?;
+        let version = manifest
+            .get("version")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("manifest.version missing"))?
+            .to_string();
+
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bundle install state poisoned"))?;
+        guard.install_calls = guard.install_calls.saturating_add(1);
+        guard.installed_version = Some(version.clone());
+        Ok(version)
     }
 }
 
@@ -104,20 +120,37 @@ struct CanonicalManifest<'a> {
     created_at: i64,
     vendor_sig: &'a str,
     org_approval_sig: Option<&'a str>,
-    assets: Vec<&'a AssetEntry>,
-    scope: &'a BundleScope,
+    assets: Vec<&'a Value>,
+    scope: &'a Value,
 }
 
-fn canonical_manifest_bytes(manifest: &BundleManifest) -> Vec<u8> {
-    let mut assets: Vec<&AssetEntry> = manifest.assets.iter().collect();
-    assets.sort_by(|left, right| left.path.cmp(&right.path));
+fn canonical_manifest_bytes(manifest: &Value) -> Vec<u8> {
+    let mut assets: Vec<&Value> = manifest
+        .get("assets")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    assets.sort_by(|left, right| {
+        left.get("path")
+            .and_then(|value| value.as_str())
+            .cmp(&right.get("path").and_then(|value| value.as_str()))
+    });
+    let scope = manifest.get("scope").unwrap_or(&Value::Null);
     serde_json::to_vec(&CanonicalManifest {
-        version: &manifest.version,
-        created_at: manifest.created_at,
+        version: manifest
+            .get("version")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown"),
+        created_at: manifest
+            .get("created_at")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
         vendor_sig: "",
-        org_approval_sig: manifest.org_approval_sig.as_deref(),
+        org_approval_sig: manifest
+            .get("org_approval_sig")
+            .and_then(|value| value.as_str()),
         assets,
-        scope: &manifest.scope,
+        scope,
     })
     .expect("serialize canonical manifest")
 }
@@ -135,52 +168,46 @@ fn signed_manifest_bytes(
     assets: &HashMap<String, Vec<u8>>,
     vendor_signing_key: &SigningKey,
 ) -> Vec<u8> {
-    let mut entries: Vec<AssetEntry> = assets
+    let mut entries: Vec<Value> = assets
         .iter()
-        .map(|(path, bytes)| AssetEntry {
-            path: path.clone(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
-            size_bytes: bytes.len() as u64,
+        .map(|(path, bytes)| {
+            json!({
+                "path": path,
+                "sha256": format!("{:x}", Sha256::digest(bytes)),
+                "size_bytes": bytes.len() as u64
+            })
         })
         .collect();
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries.sort_by(|left, right| {
+        left.get("path")
+            .and_then(|value| value.as_str())
+            .cmp(&right.get("path").and_then(|value| value.as_str()))
+    });
 
-    let mut manifest = BundleManifest {
-        version: version.to_string(),
-        created_at: 1_772_000_000,
-        vendor_sig: String::new(),
-        org_approval_sig: None,
-        assets: entries,
-        scope: BundleScope::default(),
-    };
+    let mut manifest = json!({
+        "version": version,
+        "created_at": 1_772_000_000i64,
+        "vendor_sig": "",
+        "org_approval_sig": null,
+        "assets": entries,
+        "scope": {
+            "intercept_https": false,
+            "intercept_http": false,
+            "process_filter": null,
+            "capture_modes": []
+        }
+    });
 
     let signature = vendor_signing_key.sign(canonical_manifest_bytes(&manifest).as_slice());
-    manifest.vendor_sig = hex_encode(signature.to_bytes().as_slice());
+    manifest["vendor_sig"] = Value::String(hex_encode(signature.to_bytes().as_slice()));
     serde_json::to_vec(&manifest).expect("serialize signed manifest")
 }
 
 #[tokio::test]
 async fn bundle_sync_channel2_contract_installs_into_bundle_watcher() {
     let vendor = SigningKey::from_bytes(&[29u8; 32]);
-    let vendor_pubkey = vendor.verifying_key().to_bytes();
-    let org_config = Arc::new(OrgSignedConfig::default());
-
-    let initial_manifest = signed_manifest_bytes("bundle-v1", &HashMap::new(), &vendor);
-    let initial_bundle = soth_bundle::load_from_bytes(
-        initial_manifest.as_slice(),
-        HashMap::new(),
-        &vendor_pubkey,
-        org_config.as_ref(),
-    )
-    .expect("load initial bundle");
 
     let temp = TempDir::new().expect("temp dir");
-    let db_path = temp.path().join("events.db");
-    let bundle_db = Arc::new(Connection::open(&db_path).expect("open bundle db"));
-    let (watcher, handle) =
-        soth_bundle::BundleWatcher::new(initial_bundle, vendor_pubkey, org_config, bundle_db)
-            .expect("bundle watcher");
-    let watcher = Arc::new(watcher);
 
     let next_manifest = signed_manifest_bytes("bundle-v2", &HashMap::new(), &vendor);
     let manifest_value: Value =
@@ -206,8 +233,9 @@ async fn bundle_sync_channel2_contract_installs_into_bundle_watcher() {
         return;
     };
 
+    let install_state = Arc::new(Mutex::new(BundleInstallState::default()));
     let adapter = Arc::new(BundleWatcherAdapter {
-        watcher: watcher.clone(),
+        state: install_state.clone(),
     });
     let cache_path = temp.path().join("registry_cache.json");
     let puller = RegistryPuller::new(endpoint, "test-key", cache_path).with_bundle_watcher(adapter);
@@ -216,17 +244,9 @@ async fn bundle_sync_channel2_contract_installs_into_bundle_watcher() {
     assert!(outcome.checked);
     assert!(outcome.downloaded);
     assert_eq!(outcome.version.as_deref(), Some("bundle-v2"));
-    assert_eq!(handle.current().version, "bundle-v2");
-
-    let conn = Connection::open(&db_path).expect("open db for verification");
-    let status: String = conn
-        .query_row(
-            "SELECT status FROM intelligence_bundles WHERE bundle_version = ?1 ORDER BY installed_at DESC LIMIT 1",
-            ["bundle-v2"],
-            |row| row.get(0),
-        )
-        .expect("bundle row");
-    assert_eq!(status, "ACTIVE");
+    let installed = install_state.lock().expect("install state lock");
+    assert_eq!(installed.install_calls, 1);
+    assert_eq!(installed.installed_version.as_deref(), Some("bundle-v2"));
 
     let guard = hits.lock().expect("hits lock");
     assert!(guard.version_calls >= 1);

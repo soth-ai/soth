@@ -103,9 +103,17 @@ pub enum ParseSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParseWarning {
-    GraphQlUnknownOperation { operation_name: String },
-    PartialBodyParse { reason: String },
-    OversizeBody { actual_bytes: u64, limit_bytes: u64 },
+    GraphQlUnknownOperation {
+        operation_name: String,
+    },
+    PartialBodyParse {
+        reason: String,
+    },
+    #[serde(alias = "oversize_body")]
+    BodyTruncated {
+        actual_bytes: u64,
+        limit_bytes: u64,
+    },
     EncodingError,
     GrpcNoDescriptor,
 }

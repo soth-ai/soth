@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -16,10 +17,8 @@ use uuid::Uuid;
 
 use crate::classify_task;
 use crate::config::PipelineConfig;
+use crate::gating::GateEvaluator;
 use crate::pending::{PendingCapture, PendingStore};
-use crate::pipeline::gates::{self, EdgeRequest, EvalStage, OutcomeAction};
-use crate::pipeline::process::ProcessLookup;
-use crate::pipeline::registry::Registry;
 use crate::response;
 use crate::session::SessionStore;
 use crate::streaming::StreamingStore;
@@ -28,8 +27,7 @@ use crate::streaming::StreamingStore;
 pub struct ProxyHandler {
     bundle_handle: soth_bundle::BundleHandle,
     parser_registry: Arc<ArcSwap<soth_detect::ParserRegistry>>,
-    registry: Arc<ArcSwap<Registry>>,
-    process_lookup: Arc<ProcessLookup>,
+    gate_evaluator: Arc<ArcSwap<GateEvaluator>>,
     session_store: Arc<SessionStore>,
     pending: Arc<PendingStore>,
     streaming: Arc<StreamingStore>,
@@ -59,12 +57,13 @@ impl ProxyHandler {
         let ttl = Duration::from_secs(pipeline_config.session_ttl_secs.max(1));
         let initial_bundle = bundle_handle.current();
         let initial_parser_registry = build_parser_registry(initial_bundle.detect.as_ref());
-        let initial_registry = Registry::from_detect_bundle(initial_bundle.detect.as_ref());
+        let initial_gating_bundle =
+            load_local_gating_bundle().unwrap_or_else(|| initial_bundle.gating.clone());
+        let initial_gate_evaluator = GateEvaluator::new(initial_gating_bundle);
         Self {
             bundle_handle,
             parser_registry: Arc::new(ArcSwap::from_pointee(initial_parser_registry)),
-            registry: Arc::new(ArcSwap::from_pointee(initial_registry)),
-            process_lookup: Arc::new(ProcessLookup::new(Duration::from_secs(60))),
+            gate_evaluator: Arc::new(ArcSwap::from_pointee(initial_gate_evaluator)),
             session_store: Arc::new(SessionStore::new(ttl)),
             pending: Arc::new(PendingStore::new()),
             streaming: Arc::new(StreamingStore::new()),
@@ -80,21 +79,21 @@ impl ProxyHandler {
     }
 
     pub fn maintenance_tick(&self) {
-        self.process_lookup.clear_expired();
+        self.gate_evaluator.load().maintenance_tick();
         self.pending.evict_stale(Duration::from_secs(300));
         self.streaming.evict_stale(Duration::from_secs(300));
         self.session_store.evict_stale();
     }
 
     pub fn on_bundle_updated(&self, bundle: &soth_bundle::LoadedBundle) {
-        let registry = Registry::from_detect_bundle(bundle.detect.as_ref());
         let parser_registry = build_parser_registry(bundle.detect.as_ref());
-        self.registry.store(Arc::new(registry));
+        let gating_bundle = load_local_gating_bundle().unwrap_or_else(|| bundle.gating.clone());
+        let gate_evaluator = GateEvaluator::new(gating_bundle);
+        self.gate_evaluator.store(Arc::new(gate_evaluator));
         self.parser_registry.store(Arc::new(parser_registry));
-        self.process_lookup.clear_all();
         tracing::info!(
             bundle_version = bundle.version,
-            "bundle hot-swap applied; registries rebuilt and process resolution cache cleared"
+            "bundle hot-swap applied; parser and gate evaluators rebuilt"
         );
     }
 
@@ -107,34 +106,46 @@ impl ProxyHandler {
 
         let bundle = self.bundle_handle.current();
         let detect_bundle = bundle.detect_slice();
-        let registry = self.registry.load();
+        let outcome = self.gate_evaluator.load().evaluate_http(
+            &req,
+            &req.connection_meta.process_info,
+            crate::gating::evaluator::GateOverrides {
+                unknown_app_action: Some(map_unknown_action(
+                    self.pipeline_config.unknown_app_action,
+                )),
+                non_cataloged_host_action: map_non_cataloged_action(
+                    self.pipeline_config.non_cataloged_host_action,
+                ),
+            },
+        );
+        if self.pipeline_config.non_cataloged_host_action == crate::config::GateAction::Block
+            && matches!(outcome.reason, soth_core::DecisionReason::NotInCatalog)
+            && matches!(
+                outcome.decision,
+                soth_core::GateDecision::Skip | soth_core::GateDecision::Passthrough
+            )
+        {
+            return soth_mitm::HandlerDecision::Block {
+                status: 403,
+                body: Bytes::from("host not in AI catalog"),
+            };
+        }
 
-        let process_resolution = self
-            .process_lookup
-            .resolve(req.connection_meta.process_info.as_ref(), registry.as_ref());
-
-        let edge_request = EdgeRequest {
-            method: req.method.clone(),
-            host: host.clone(),
-            path: req.path.clone(),
-            headers: req.headers.clone(),
-            process: process_resolution.clone(),
-            stage: EvalStage::HttpRequest,
-        };
-
-        let outcome = gates::evaluate(&edge_request, registry.as_ref(), &self.pipeline_config);
-
-        match &outcome.action {
-            OutcomeAction::Skip => return soth_mitm::HandlerDecision::Allow,
-            OutcomeAction::Block { status, message } => {
+        match &outcome.decision {
+            soth_core::GateDecision::Skip | soth_core::GateDecision::Passthrough => {
+                return soth_mitm::HandlerDecision::Allow
+            }
+            soth_core::GateDecision::Block { status, message } => {
                 return soth_mitm::HandlerDecision::Block {
                     status: *status,
                     body: Bytes::from(message.clone()),
                 };
             }
-            OutcomeAction::Intercept => {}
+            soth_core::GateDecision::Intercept => {}
         }
 
+        let process_resolution =
+            process_resolution_from_outcome(&outcome, req.connection_meta.process_info.as_ref());
         req.connection_meta.capture_mode = Some(outcome.capture_mode);
         req.connection_meta.matched_provider = outcome.matched_provider.clone();
         req.connection_meta.matched_application = outcome.matched_application.clone();
@@ -154,7 +165,7 @@ impl ProxyHandler {
         let mut detect_result =
             soth_detect::process_with_registry(parser_registry.as_ref(), &req, &detect_bundle);
         if let Some((actual_bytes, limit_bytes)) = truncated_body_sizes {
-            let warning = soth_core::ParseWarning::OversizeBody {
+            let warning = soth_core::ParseWarning::BodyTruncated {
                 actual_bytes: actual_bytes as u64,
                 limit_bytes: limit_bytes as u64,
             };
@@ -292,6 +303,12 @@ impl ProxyHandler {
 
     async fn handle_stream_end(&self, connection_id: Uuid) {
         let Some(completed) = self.streaming.take(&connection_id) else {
+            if self.pending.remove(&connection_id) {
+                warn!(
+                    connection_id = %connection_id,
+                    "stream finalized without chunks; cleaned pending request state"
+                );
+            }
             return;
         };
 
@@ -310,32 +327,11 @@ impl soth_mitm::InterceptHandler for ProxyHandler {
     fn should_intercept_tls(
         &self,
         host: &str,
-        process_info: Option<&soth_mitm::ProcessInfo>,
+        _process_info: Option<&soth_mitm::ProcessInfo>,
     ) -> bool {
-        let host = host
-            .split(':')
-            .next()
-            .unwrap_or(host)
-            .trim()
-            .to_ascii_lowercase();
-        let process_info = process_info.map(mitm_process_info_to_core);
-        let registry = self.registry.load();
-        let process_resolution = self
-            .process_lookup
-            .resolve(process_info.as_ref(), registry.as_ref());
-
-        let edge_request = EdgeRequest {
-            method: "CONNECT".to_string(),
-            host,
-            path: "/".to_string(),
-            headers: BTreeMap::new(),
-            process: process_resolution,
-            stage: EvalStage::Connect,
-        };
-
-        !matches!(
-            gates::evaluate(&edge_request, registry.as_ref(), &self.pipeline_config).action,
-            OutcomeAction::Skip
+        matches!(
+            self.gate_evaluator.load().evaluate_tls(host),
+            soth_core::GateDecision::Intercept
         )
     }
 
@@ -345,6 +341,14 @@ impl soth_mitm::InterceptHandler for ProxyHandler {
     ) -> impl Future<Output = soth_mitm::HandlerDecision> + Send {
         let request = request.clone();
         async move { self.handle_request(request).await }
+    }
+
+    fn on_tls_failure(&self, host: &str, error: &str) {
+        warn!(
+            host = host,
+            error = error,
+            "tls interception failed; continuing without interception"
+        );
     }
 
     fn on_stream_chunk(&self, chunk: &soth_mitm::StreamChunk) -> impl Future<Output = ()> + Send {
@@ -359,6 +363,20 @@ impl soth_mitm::InterceptHandler for ProxyHandler {
     fn on_response(&self, response: &soth_mitm::RawResponse) -> impl Future<Output = ()> + Send {
         let response = response.clone();
         async move { self.handle_response(response).await }
+    }
+
+    fn on_connection_close(&self, connection_id: Uuid) {
+        let had_pending = self.pending.remove(&connection_id);
+        let had_streaming = self.streaming.remove(&connection_id);
+        let _ = self.session_store.remove(&connection_id);
+        if had_pending || had_streaming {
+            tracing::debug!(
+                connection_id = %connection_id,
+                had_pending,
+                had_streaming,
+                "connection closed with in-memory handler state; cleaned up"
+            );
+        }
     }
 }
 
@@ -417,6 +435,49 @@ fn build_user_id_hmac(meta: &soth_core::ConnectionMeta, secret: &[u8]) -> String
     hex::encode(mac.finalize().into_bytes())
 }
 
+fn process_resolution_from_outcome(
+    outcome: &soth_core::GateOutcome,
+    process_info: Option<&soth_core::ProcessInfo>,
+) -> soth_core::ProcessResolution {
+    let process_name = process_info.and_then(|info| info.process_name.clone());
+    let bundle_id = process_info.and_then(|info| info.bundle_id.clone());
+    let match_kind = if outcome.app_type == soth_core::AppType::Unknown {
+        soth_core::ProcessMatchKind::Unknown
+    } else if bundle_id.is_some() {
+        soth_core::ProcessMatchKind::Exact
+    } else if process_name.is_some() {
+        soth_core::ProcessMatchKind::Pattern
+    } else {
+        soth_core::ProcessMatchKind::Unknown
+    };
+
+    soth_core::ProcessResolution {
+        match_kind,
+        app_type: outcome.app_type,
+        capture_mode: Some(outcome.capture_mode),
+        process_name,
+        bundle_id,
+    }
+}
+
+fn map_unknown_action(action: crate::config::GateAction) -> soth_core::UnknownAppAction {
+    match action {
+        crate::config::GateAction::Skip => soth_core::UnknownAppAction::Skip,
+        crate::config::GateAction::Intercept => soth_core::UnknownAppAction::Intercept,
+        crate::config::GateAction::Block => soth_core::UnknownAppAction::Block,
+    }
+}
+
+fn map_non_cataloged_action(
+    action: crate::config::GateAction,
+) -> Option<soth_core::NonCatalogedAction> {
+    match action {
+        crate::config::GateAction::Skip => Some(soth_core::NonCatalogedAction::Skip),
+        crate::config::GateAction::Intercept => Some(soth_core::NonCatalogedAction::Passthrough),
+        crate::config::GateAction::Block => Some(soth_core::NonCatalogedAction::Skip),
+    }
+}
+
 fn build_app_identity(
     process_resolution: &soth_core::ProcessResolution,
     matched_application: Option<&str>,
@@ -444,6 +505,25 @@ fn build_app_identity(
             1.0
         },
     }
+}
+
+fn load_local_gating_bundle() -> Option<Arc<soth_core::GatingBundle>> {
+    let path = if let Ok(path) = std::env::var("SOTH_GATING_BUNDLE_PATH") {
+        PathBuf::from(path)
+    } else {
+        let enabled = std::env::var("SOTH_ENABLE_LOCAL_GATING_BUNDLE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        dirs::home_dir()?.join(".soth/registry_bundle_cache.gating_bundle.json")
+    };
+    let bytes = std::fs::read(path.as_path()).ok()?;
+    let mut bundle = serde_json::from_slice::<soth_core::GatingBundle>(bytes.as_slice()).ok()?;
+    bundle.normalize_host_patterns_in_place();
+    Some(Arc::new(bundle))
 }
 
 fn build_parser_registry(bundle: &soth_detect::OwnedDetectBundle) -> soth_detect::ParserRegistry {

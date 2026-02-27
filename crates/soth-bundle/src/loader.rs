@@ -1,8 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Utc;
+use soth_core::{
+    normalize_bundle_host_pattern, AppType, BlacklistMatchType, EntityCatalog, EntityTrafficRules,
+    GateConfig, GateDefaults, GatingBundle, HostRule, IdentityEntry, IdentityIndex,
+    NonCatalogedAction, PathRules, ProcessAction, Stage0Config, Stage1Config, Stage2Config,
+    Stage3Config, Stage4Config, Stage5Config, UnknownAppAction,
+};
 use soth_policy::sync_policy::{load_bundle_from_bytes, PolicyBundle, PolicyBundleMetadata};
 
 use crate::error::BundleError;
@@ -51,6 +57,7 @@ pub(crate) fn load_verified(
 
     let policy = load_policy_bundle(&assets)?;
     let detect = load_detect_bundle(&assets)?;
+    let gating = load_gating_bundle(&assets, detect.as_ref())?;
     let manifest_bytes = serde_json::to_vec(&manifest)?;
     let classify = soth_classify::load_bundle_from_bytes(manifest_bytes.as_slice(), assets)
         .map_err(|error| BundleError::ClassifyLoadFailed(error.to_string()))?;
@@ -61,6 +68,7 @@ pub(crate) fn load_verified(
         classify,
         policy,
         detect,
+        gating,
         manifest,
     })
 }
@@ -110,6 +118,171 @@ fn load_detect_bundle(
         return Ok(Arc::new(bundle));
     }
     Ok(Arc::new(soth_detect::OwnedDetectBundle::default()))
+}
+
+fn load_gating_bundle(
+    assets: &HashMap<String, Vec<u8>>,
+    detect: &soth_detect::OwnedDetectBundle,
+) -> Result<Arc<GatingBundle>, BundleError> {
+    let section = extract_section(assets, "gating/");
+    if let Some(bytes) = section.get("bundle.json") {
+        let mut bundle: GatingBundle = serde_json::from_slice(bytes.as_slice())
+            .map_err(|error| BundleError::DetectLoadFailed(error.to_string()))?;
+        bundle.normalize_host_patterns_in_place();
+        return Ok(Arc::new(bundle));
+    }
+    if let Some(bytes) = assets.get("gating_bundle.json") {
+        let mut bundle: GatingBundle = serde_json::from_slice(bytes.as_slice())
+            .map_err(|error| BundleError::DetectLoadFailed(error.to_string()))?;
+        bundle.normalize_host_patterns_in_place();
+        return Ok(Arc::new(bundle));
+    }
+
+    // Compatibility fallback until server emits signed gating/ section.
+    Ok(Arc::new(gating_from_detect(detect)))
+}
+
+fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
+    let mut providers_by_id = HashMap::<String, HashSet<String>>::new();
+    for (host, provider_key) in &detect.domain_index {
+        let provider_id = detect
+            .llm_providers
+            .get(provider_key)
+            .and_then(|entry| entry.provider_id.clone())
+            .unwrap_or_else(|| provider_key.to_string());
+        if let Some(pattern) = normalize_bundle_host_pattern(host) {
+            providers_by_id
+                .entry(provider_id)
+                .or_default()
+                .insert(pattern);
+        }
+    }
+
+    let providers = providers_by_id
+        .into_iter()
+        .map(|(entity_id, hosts)| EntityTrafficRules {
+            entity_id: entity_id.clone(),
+            capture_mode: detect
+                .capture_rules
+                .mode_for(&soth_detect::Provider::new(entity_id.as_str())),
+            hosts: hosts
+                .into_iter()
+                .filter(|pattern| !pattern.is_empty())
+                .map(|pattern| HostRule {
+                    pattern,
+                    methods: Vec::new(),
+                    paths: PathRules::default(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut hosts_index = HashMap::new();
+    let mut non_hosts_index = HashMap::new();
+    for (identity, policy) in &detect.app_policies {
+        let app_type = match policy.app_kind {
+            soth_core::AppKind::Browser => AppType::Host,
+            soth_core::AppKind::AgentApp | soth_core::AppKind::Ide | soth_core::AppKind::Cli => {
+                AppType::NonHost
+            }
+            soth_core::AppKind::Unknown => AppType::Unknown,
+        };
+        let entry = IdentityEntry {
+            entity_id: policy.app_id.clone(),
+            app_type,
+            capture_mode: soth_core::CaptureMode::MetadataOnly,
+            action: ProcessAction::Intercept,
+        };
+        if app_type == AppType::Host {
+            hosts_index.insert(identity.to_ascii_lowercase(), entry.clone());
+        } else {
+            non_hosts_index.insert(identity.to_ascii_lowercase(), entry.clone());
+        }
+    }
+    for identity in &detect.browser_policies.allowed_apps {
+        hosts_index
+            .entry(identity.to_ascii_lowercase())
+            .or_insert(IdentityEntry {
+                entity_id: identity.clone(),
+                app_type: AppType::Host,
+                capture_mode: soth_core::CaptureMode::MetadataOnly,
+                action: ProcessAction::Intercept,
+            });
+    }
+
+    let tls_intercept_hosts = detect
+        .domain_index
+        .keys()
+        .filter_map(|host| normalize_bundle_host_pattern(host))
+        .collect::<HashSet<_>>();
+    let passthrough_domains = detect
+        .passthrough_domains
+        .iter()
+        .filter_map(|host| normalize_bundle_host_pattern(host))
+        .collect::<HashSet<_>>();
+
+    let allowed_host_origins = detect
+        .domain_index
+        .keys()
+        .filter_map(|host| normalize_bundle_host_pattern(host))
+        .collect::<HashSet<_>>();
+
+    let mut bundle = GatingBundle {
+        identity_index: IdentityIndex {
+            hosts: hosts_index,
+            non_hosts: non_hosts_index,
+        },
+        gates: GateConfig {
+            order: vec![
+                soth_core::GateStage::Stage0Tls,
+                soth_core::GateStage::Stage1AppOrigin,
+                soth_core::GateStage::Stage2Whitelist,
+                soth_core::GateStage::Stage3Blacklist,
+                soth_core::GateStage::Stage4AppType,
+                soth_core::GateStage::Stage5HostOrigin,
+                soth_core::GateStage::Intercept,
+            ],
+            defaults: GateDefaults {
+                sensor_enabled: true,
+                fail_open_on_config_error: true,
+                unknown_app_action: UnknownAppAction::Skip,
+                non_cataloged_host_action: NonCatalogedAction::Skip,
+                discovery: soth_core::DiscoveryConfig::default(),
+            },
+            stage0_tls: Stage0Config {
+                tls_intercept_hosts,
+                passthrough_domains,
+                enable_discovery: false,
+            },
+            stage1_app_origin: Stage1Config {
+                skip_if_unresolved_process: true,
+            },
+            stage2_whitelist: Stage2Config {
+                allow_empty_means_allow_all_except_denied: true,
+            },
+            stage3_blacklist: Stage3Config {
+                blacklisted_keywords: detect.filters.path_keywords.clone(),
+                blacklisted_path_substrings: detect.filters.path_keywords.clone(),
+                graphql_operation_blacklist: Vec::new(),
+                graphql_operation_blacklist_enabled: false,
+                match_type: BlacklistMatchType::CaseInsensitiveSubstring,
+            },
+            stage4_app_type: Stage4Config {
+                derive_from_identity_index: true,
+            },
+            stage5_host_origin: Stage5Config {
+                allowed_host_origins,
+                skip_for_discovery_capture: true,
+            },
+        },
+        entities: EntityCatalog {
+            providers,
+            web_apps: Vec::new(),
+            native_apps: Vec::new(),
+        },
+    };
+    bundle.normalize_host_patterns_in_place();
+    bundle
 }
 
 fn empty_policy_bundle() -> PolicyBundle {
@@ -268,5 +441,21 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, BundleError::ScopeExpansionRefused { .. }));
+    }
+
+    #[test]
+    fn detect_fallback_normalizes_passthrough_patterns() {
+        let mut detect = soth_detect::OwnedDetectBundle::default();
+        detect
+            .passthrough_domains
+            .push("^.*\\.manus\\.computer$".to_string());
+        detect
+            .passthrough_domains
+            .push("api.apple-cloudkit.com:".to_string());
+
+        let bundle = gating_from_detect(&detect);
+        let passthrough = &bundle.gates.stage0_tls.passthrough_domains;
+        assert!(passthrough.contains("*.manus.computer"));
+        assert!(passthrough.contains("api.apple-cloudkit.com"));
     }
 }

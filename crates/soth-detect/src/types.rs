@@ -399,6 +399,8 @@ pub struct OwnedDetectBundle {
     pub filters: Filters,
     pub app_policies: HashMap<String, AppPolicy>,
     pub browser_policies: BrowserPolicies,
+    #[serde(default)]
+    pub passthrough_domains: Vec<String>,
 }
 
 impl OwnedDetectBundle {
@@ -413,6 +415,7 @@ impl OwnedDetectBundle {
             llm_providers: &self.llm_providers,
             applications: &self.applications,
             filters: &self.filters,
+            passthrough_domains: self.passthrough_domains.as_slice(),
         }
     }
 }
@@ -428,6 +431,7 @@ pub struct DetectBundleSlice<'a> {
     pub llm_providers: &'a HashMap<String, ProviderEntry>,
     pub applications: &'a HashMap<String, ApplicationEntry>,
     pub filters: &'a Filters,
+    pub passthrough_domains: &'a [String],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]

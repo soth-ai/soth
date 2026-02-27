@@ -59,6 +59,10 @@ impl StreamingStore {
         self.inner.contains_key(connection_id)
     }
 
+    pub fn remove(&self, connection_id: &Uuid) -> bool {
+        self.inner.remove(connection_id).is_some()
+    }
+
     pub fn take(&self, connection_id: &Uuid) -> Option<CompletedStream> {
         self.inner
             .remove(connection_id)
