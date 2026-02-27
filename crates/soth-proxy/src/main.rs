@@ -3,22 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use tracing::{info, warn};
 
 use soth_proxy::{config::ProxyConfig, db, ProxyHandler};
-
-struct NoopTelemetrySink;
-
-#[async_trait]
-impl soth_telemetry::TelemetrySink for NoopTelemetrySink {
-    async fn send(
-        &self,
-        _batch: soth_telemetry::TransmittedBatch,
-    ) -> Result<(), soth_telemetry::SinkError> {
-        Ok(())
-    }
-}
 
 #[derive(Clone)]
 struct BundleWatcherInstallHook {
@@ -89,7 +76,9 @@ async fn main() -> Result<()> {
 
         let sink: Arc<dyn soth_telemetry::TelemetrySink> = match &sync_telemetry_sink {
             Some(sink) => sink.clone(),
-            None => Arc::new(NoopTelemetrySink),
+            None => anyhow::bail!(
+                "telemetry.enabled=true requires sync.enabled=true for durable telemetry queueing"
+            ),
         };
 
         Some(Arc::new(soth_telemetry::TelemetryPipeline::new(
