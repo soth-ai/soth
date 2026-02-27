@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rustls::crypto::{self, CryptoProvider};
 use tracing::{info, warn};
 
 use soth_proxy::{config::ProxyConfig, db, ProxyHandler};
@@ -32,6 +33,7 @@ impl soth_sync::BundleWatcher for BundleWatcherInstallHook {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_rustls_provider();
     init_tracing();
 
     let config = ProxyConfig::from_env_or_default().context("load proxy config")?;
@@ -196,6 +198,12 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+}
+
+fn init_rustls_provider() {
+    if CryptoProvider::get_default().is_none() {
+        let _ = crypto::aws_lc_rs::default_provider().install_default();
+    }
 }
 
 fn derive_interception_destinations_from_bundle(bundle: &soth_bundle::LoadedBundle) -> Vec<String> {
