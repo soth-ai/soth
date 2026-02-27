@@ -97,6 +97,8 @@ fn load_policy_bundle(assets: &HashMap<String, Vec<u8>>) -> Result<Arc<PolicyBun
 
     let loaded = load_bundle_from_bytes(payload.as_slice())
         .map_err(|error| BundleError::PolicyLoadFailed(error.to_string()))?;
+    // Pre-compile policy rule set once at load/install time for request-path latency.
+    soth_policy::warm(&loaded);
     Ok(Arc::new(loaded))
 }
 
