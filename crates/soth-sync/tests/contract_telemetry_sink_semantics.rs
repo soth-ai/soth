@@ -116,10 +116,10 @@ fn insert_outbox_row(
     conn: &Connection,
     batch: &TransmittedBatch,
     status: &str,
+    first_queued_at: i64,
     next_attempt_at: i64,
 ) {
     let payload = serde_json::to_string(batch).expect("serialize transmitted batch");
-    let now = Utc::now().timestamp();
     conn.execute(
         "INSERT INTO telemetry_outbox
          (batch_id, org_id, payload_json, payload_hash, encrypted, status, attempts, first_queued_at, next_attempt_at, last_error)
@@ -131,7 +131,7 @@ fn insert_outbox_row(
             batch.payload_hash(),
             if batch.is_encrypted() { 1i64 } else { 0i64 },
             status,
-            now,
+            first_queued_at,
             next_attempt_at
         ],
     )
@@ -186,15 +186,55 @@ async fn telemetry_outbox_drain_on_startup_requeues_due_rows_only() {
         Uuid::from_u128(0x44444444444444444444444444444444),
         Uuid::from_u128(0xdddddddddddddddddddddddddddddddd),
     );
+    let sending_stale = sample_batch(
+        Uuid::from_u128(0x55555555555555555555555555555555),
+        Uuid::from_u128(0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee),
+    );
+    let sending_fresh = sample_batch(
+        Uuid::from_u128(0x66666666666666666666666666666666),
+        Uuid::from_u128(0xffffffffffffffffffffffffffffffff),
+    );
 
-    insert_outbox_row(&conn, &queued_due, "QUEUED", now.saturating_sub(1));
-    insert_outbox_row(&conn, &failed_due, "FAILED", now.saturating_sub(1));
-    insert_outbox_row(&conn, &failed_future, "FAILED", now.saturating_add(3_600));
+    insert_outbox_row(
+        &conn,
+        &queued_due,
+        "QUEUED",
+        now.saturating_sub(60),
+        now.saturating_sub(1),
+    );
+    insert_outbox_row(
+        &conn,
+        &failed_due,
+        "FAILED",
+        now.saturating_sub(120),
+        now.saturating_sub(1),
+    );
+    insert_outbox_row(
+        &conn,
+        &failed_future,
+        "FAILED",
+        now.saturating_sub(120),
+        now.saturating_add(3_600),
+    );
+    insert_outbox_row(
+        &conn,
+        &sending_stale,
+        "SENDING",
+        now.saturating_sub(600),
+        now.saturating_sub(1),
+    );
+    insert_outbox_row(
+        &conn,
+        &sending_fresh,
+        "SENDING",
+        now.saturating_sub(10),
+        now.saturating_sub(1),
+    );
 
     let replayed = outbox
         .drain_on_startup()
         .expect("drain on startup should succeed");
-    assert_eq!(replayed, 2);
+    assert_eq!(replayed, 3);
 
     let mut seen = HashSet::new();
     while let Ok(id) = rx.try_recv() {
@@ -203,5 +243,59 @@ async fn telemetry_outbox_drain_on_startup_requeues_due_rows_only() {
 
     assert!(seen.contains(queued_due.batch_id().to_string().as_str()));
     assert!(seen.contains(failed_due.batch_id().to_string().as_str()));
+    assert!(seen.contains(sending_stale.batch_id().to_string().as_str()));
     assert!(!seen.contains(failed_future.batch_id().to_string().as_str()));
+    assert!(!seen.contains(sending_fresh.batch_id().to_string().as_str()));
+}
+
+#[tokio::test]
+async fn telemetry_outbox_recovers_stale_sending_after_lock_failure() {
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("events.db");
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let outbox = TelemetryOutbox::new(&db_path, tx).expect("create outbox");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let now = Utc::now().timestamp();
+
+    let batch = sample_batch(
+        Uuid::from_u128(0x77777777777777777777777777777777),
+        Uuid::from_u128(0xabababababababababababababababab),
+    );
+    seed_transmitted_queued_row(&db_path, &batch);
+    insert_outbox_row(
+        &conn,
+        &batch,
+        "SENDING",
+        now.saturating_sub(600),
+        now.saturating_sub(1),
+    );
+    drop(conn);
+
+    let locker = Connection::open(&db_path).expect("open sqlite locker");
+    locker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("acquire sqlite exclusive lock");
+    let result = outbox.mark_sent(batch.batch_id());
+    assert!(
+        result.is_err(),
+        "mark_sent should fail under an exclusive external lock"
+    );
+    locker
+        .execute_batch("ROLLBACK")
+        .expect("release sqlite exclusive lock");
+
+    assert_eq!(
+        outbox_status(&db_path, batch.batch_id()).as_deref(),
+        Some("SENDING")
+    );
+
+    let replayed = outbox
+        .drain_on_startup()
+        .expect("drain on startup should recover stale SENDING rows");
+    assert_eq!(replayed, 1);
+
+    let recovered_batch_id = rx
+        .try_recv()
+        .expect("recovered stale SENDING row should be enqueued");
+    assert_eq!(recovered_batch_id, batch.batch_id().to_string());
 }
