@@ -26,6 +26,7 @@ impl Default for ClusterOutput {
 pub(crate) fn run(
     embedding: Option<&[f32]>,
     centroids: &[Vec<f32>],
+    lsh_projection: &[Vec<f32>],
     session: Option<&soth_core::SessionSnapshot>,
     config: &ClassifyConfig,
 ) -> (ClusterOutput, u64) {
@@ -38,7 +39,7 @@ pub(crate) fn run(
         );
     };
 
-    let semantic_hash = semantic_lsh_hex(embedding);
+    let semantic_hash = semantic_lsh_hex(embedding, lsh_projection);
     let topic_cluster_id = nearest_centroid_id(embedding, centroids)
         .unwrap_or_else(|| cluster_id_from_hash(&semantic_hash));
 
@@ -59,7 +60,14 @@ pub(crate) fn run(
     (output, started.elapsed().as_micros() as u64)
 }
 
-fn semantic_lsh_hex(embedding: &[f32]) -> String {
+fn semantic_lsh_hex(embedding: &[f32], lsh_projection: &[Vec<f32>]) -> String {
+    if is_valid_lsh_projection(lsh_projection, embedding.len()) {
+        return semantic_lsh_hex_from_matrix(embedding, lsh_projection);
+    }
+    semantic_lsh_hex_synthetic(embedding)
+}
+
+fn semantic_lsh_hex_synthetic(embedding: &[f32]) -> String {
     let mut bytes = [0u8; LSH_BITS / 8];
 
     for bit_idx in 0..LSH_BITS {
@@ -76,6 +84,34 @@ fn semantic_lsh_hex(embedding: &[f32]) -> String {
     }
 
     hex::encode(bytes)
+}
+
+fn semantic_lsh_hex_from_matrix(embedding: &[f32], lsh_projection: &[Vec<f32>]) -> String {
+    let mut bytes = [0u8; LSH_BITS / 8];
+
+    for (bit_idx, row) in lsh_projection.iter().take(LSH_BITS).enumerate() {
+        let projection = embedding
+            .iter()
+            .zip(row.iter())
+            .map(|(left, right)| left * right)
+            .sum::<f32>();
+
+        if projection >= 0.0 {
+            let byte_idx = bit_idx / 8;
+            let bit_in_byte = 7 - (bit_idx % 8);
+            bytes[byte_idx] |= 1 << bit_in_byte;
+        }
+    }
+
+    hex::encode(bytes)
+}
+
+fn is_valid_lsh_projection(lsh_projection: &[Vec<f32>], embedding_len: usize) -> bool {
+    lsh_projection.len() >= LSH_BITS
+        && lsh_projection
+            .iter()
+            .take(LSH_BITS)
+            .all(|row| row.len() == embedding_len)
 }
 
 fn cluster_id_from_hash(semantic_hash: &str) -> u32 {
@@ -165,7 +201,7 @@ mod tests {
     #[test]
     fn semantic_lsh_hash_is_128_bits_hex() {
         let vector = vector_with_seed(1);
-        let hash = semantic_lsh_hex(vector.as_slice());
+        let hash = semantic_lsh_hex(vector.as_slice(), &[]);
         assert_eq!(hash.len(), 32);
         assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
@@ -173,19 +209,19 @@ mod tests {
     #[test]
     fn run_marks_collision_when_prior_hash_matches() {
         let vector = vector_with_seed(7);
-        let hash = semantic_lsh_hex(vector.as_slice());
+        let hash = semantic_lsh_hex(vector.as_slice(), &[]);
         let mut session = soth_core::SessionSnapshot::default();
         session.prior_semantic_hashes = vec![hash];
 
         let config = crate::ClassifyConfig::default();
-        let (out, _) = run(Some(vector.as_slice()), &[], Some(&session), &config);
+        let (out, _) = run(Some(vector.as_slice()), &[], &[], Some(&session), &config);
         assert!(out.is_semantic_collision);
     }
 
     #[test]
     fn hash_changes_for_different_embeddings() {
-        let left = semantic_lsh_hex(vector_with_seed(41).as_slice());
-        let right = semantic_lsh_hex(vector_with_seed(42).as_slice());
+        let left = semantic_lsh_hex(vector_with_seed(41).as_slice(), &[]);
+        let right = semantic_lsh_hex(vector_with_seed(42).as_slice(), &[]);
         assert_ne!(left, right);
     }
 
@@ -199,5 +235,20 @@ mod tests {
         ];
         let id = nearest_centroid_id(embedding.as_slice(), &centroids);
         assert_eq!(id, Some(1));
+    }
+
+    #[test]
+    fn hash_uses_projection_matrix_when_available() {
+        let embedding = vec![1.0, 0.0, 0.0, 0.0];
+        let mut projection = vec![vec![0.0; 4]; LSH_BITS];
+        projection[0][0] = 1.0; // bit 0 -> 1
+        projection[1][0] = -1.0; // bit 1 -> 0
+        for row in projection.iter_mut().skip(2) {
+            row[0] = 1.0;
+        }
+
+        let hash = semantic_lsh_hex(embedding.as_slice(), &projection);
+        assert_eq!(hash.len(), 32);
+        assert!(hash.starts_with('b')); // first two bits: 10xxxxxx => 0b10 = hex b? wait, nibble contains 1011 due remaining ones
     }
 }

@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use soth_core::{AnomalyFlag, UseCaseLabel};
 
 use crate::traits::{AnomalyScorer, AnomalySignals, ClassificationProvider, ClassificationResult};
 
 const EMBEDDING_DIMS: usize = 384;
+const MLP_ASSET_CANDIDATES: [&str; 2] = ["classify/use_case_mlp.bin", "use_case_mlp.bin"];
 const LABEL_SPACE: [UseCaseLabel; 17] = [
     UseCaseLabel::CodeGeneration,
     UseCaseLabel::CodeReview,
@@ -32,8 +34,10 @@ pub(crate) fn build_model_providers(
     assets: &HashMap<String, Vec<u8>>,
 ) -> (Arc<dyn ClassificationProvider>, Arc<dyn AnomalyScorer>) {
     let seed = asset_seed(assets);
+    let classifier = parse_classifier_from_assets(bundle_version.clone(), assets)
+        .unwrap_or_else(|| BundleModelClassifier::from_seed(bundle_version, seed));
     (
-        Arc::new(BundleModelClassifier::from_seed(bundle_version, seed)),
+        Arc::new(classifier),
         Arc::new(BundleModelAnomalyScorer::from_seed(seed.rotate_left(17))),
     )
 }
@@ -76,45 +80,38 @@ impl ClassificationProvider for BundleModelClassifier {
             };
         }
 
-        let mut top_idx = 0usize;
-        let mut top_score = f32::NEG_INFINITY;
-        let mut second_idx = 0usize;
-        let mut second_score = f32::NEG_INFINITY;
+        let mut logits = Vec::with_capacity(self.weights.len());
 
         for (idx, weight) in self.weights.iter().enumerate() {
-            let dot = embedding
+            let score = embedding
                 .iter()
                 .zip(weight.iter())
                 .map(|(left, right)| left * right)
                 .sum::<f32>()
                 + self.biases[idx];
-            if dot > top_score {
-                second_idx = top_idx;
-                second_score = top_score;
-                top_idx = idx;
-                top_score = dot;
-            } else if dot > second_score {
-                second_idx = idx;
-                second_score = dot;
-            }
+            logits.push(score);
         }
 
-        let margin = (top_score - second_score).max(0.0);
-        let confidence = (0.5 + (margin * 2.0).tanh() * 0.5).clamp(0.05, 0.99);
-        let secondary = if (top_score - second_score).abs() <= 0.15 {
-            let label = LABEL_SPACE[second_idx];
-            if label != LABEL_SPACE[top_idx] {
-                Some(label)
-            } else {
-                None
-            }
+        let probs = softmax(logits.as_slice());
+        let (top_idx, top_prob) = top1(probs.as_slice());
+        let secondary = if top_prob < 0.40 {
+            top2(probs.as_slice())
+                .filter(|(_, prob)| *prob > 0.25)
+                .and_then(|(idx, _)| {
+                    let label = LABEL_SPACE[idx];
+                    if label != LABEL_SPACE[top_idx] {
+                        Some(label)
+                    } else {
+                        None
+                    }
+                })
         } else {
             None
         };
 
         ClassificationResult {
             label: LABEL_SPACE[top_idx],
-            confidence,
+            confidence: top_prob.clamp(0.0, 1.0),
             secondary_label: secondary,
         }
     }
@@ -201,6 +198,141 @@ fn signals_to_features(signals: &AnomalySignals) -> [f32; 7] {
     ]
 }
 
+#[derive(Debug, Deserialize)]
+struct JsonMlpAsset {
+    weights: Vec<Vec<f32>>,
+    #[serde(default)]
+    biases: Vec<f32>,
+}
+
+fn parse_classifier_from_assets(
+    bundle_version: String,
+    assets: &HashMap<String, Vec<u8>>,
+) -> Option<BundleModelClassifier> {
+    let bytes = MLP_ASSET_CANDIDATES
+        .iter()
+        .find_map(|candidate| asset_bytes_for_path(assets, candidate))?;
+
+    if let Some(parsed) = parse_classifier_json(bundle_version.clone(), bytes) {
+        return Some(parsed);
+    }
+    parse_classifier_raw(bundle_version, bytes)
+}
+
+fn parse_classifier_json(bundle_version: String, bytes: &[u8]) -> Option<BundleModelClassifier> {
+    let parsed: JsonMlpAsset = serde_json::from_slice(bytes).ok()?;
+    build_classifier_from_parts(bundle_version, parsed.weights, parsed.biases)
+}
+
+fn parse_classifier_raw(bundle_version: String, bytes: &[u8]) -> Option<BundleModelClassifier> {
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return None;
+    }
+    let floats = bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+
+    let label_count = LABEL_SPACE.len();
+    let weight_len = label_count * EMBEDDING_DIMS;
+    if floats.len() < weight_len {
+        return None;
+    }
+
+    let mut weights = Vec::with_capacity(label_count);
+    let mut offset = 0usize;
+    for _ in 0..label_count {
+        let end = offset + EMBEDDING_DIMS;
+        weights.push(floats[offset..end].to_vec());
+        offset = end;
+    }
+
+    let biases = if floats.len() >= weight_len + label_count {
+        floats[offset..(offset + label_count)].to_vec()
+    } else {
+        vec![0.0; label_count]
+    };
+
+    build_classifier_from_parts(bundle_version, weights, biases)
+}
+
+fn build_classifier_from_parts(
+    bundle_version: String,
+    mut weights: Vec<Vec<f32>>,
+    biases: Vec<f32>,
+) -> Option<BundleModelClassifier> {
+    let label_count = LABEL_SPACE.len();
+    if weights.len() != label_count || biases.len() != label_count {
+        return None;
+    }
+    if !weights.iter().all(|row| row.len() == EMBEDDING_DIMS) {
+        return None;
+    }
+
+    for row in &mut weights {
+        l2_normalize(row.as_mut_slice());
+    }
+
+    Some(BundleModelClassifier {
+        bundle_version,
+        weights,
+        biases,
+    })
+}
+
+fn top1(values: &[f32]) -> (usize, f32) {
+    let mut best_idx = 0usize;
+    let mut best = f32::NEG_INFINITY;
+    for (idx, value) in values.iter().enumerate() {
+        if *value > best {
+            best = *value;
+            best_idx = idx;
+        }
+    }
+    (best_idx, best)
+}
+
+fn top2(values: &[f32]) -> Option<(usize, f32)> {
+    if values.len() < 2 {
+        return None;
+    }
+    let mut top_idx = 0usize;
+    let mut top_val = f32::NEG_INFINITY;
+    let mut second_idx = 0usize;
+    let mut second_val = f32::NEG_INFINITY;
+    for (idx, value) in values.iter().enumerate() {
+        if *value > top_val {
+            second_idx = top_idx;
+            second_val = top_val;
+            top_idx = idx;
+            top_val = *value;
+        } else if *value > second_val {
+            second_idx = idx;
+            second_val = *value;
+        }
+    }
+    Some((second_idx, second_val))
+}
+
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
+    let max = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |left, right| left.max(right));
+    let exps = logits
+        .iter()
+        .map(|value| (value - max).exp())
+        .collect::<Vec<_>>();
+    let sum = exps.iter().sum::<f32>();
+    if sum <= 1e-9 {
+        return vec![0.0; logits.len()];
+    }
+    exps.into_iter().map(|value| value / sum).collect()
+}
+
 fn asset_seed(assets: &HashMap<String, Vec<u8>>) -> u64 {
     let mut paths: Vec<&str> = assets.keys().map(String::as_str).collect();
     paths.sort_unstable();
@@ -255,6 +387,23 @@ fn splitmix64(mut value: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+fn asset_bytes_for_path<'a>(assets: &'a HashMap<String, Vec<u8>>, path: &str) -> Option<&'a [u8]> {
+    if let Some(bytes) = assets.get(path) {
+        return Some(bytes.as_slice());
+    }
+    if let Some(stripped) = path.strip_prefix("./") {
+        if let Some(bytes) = assets.get(stripped) {
+            return Some(bytes.as_slice());
+        }
+    }
+    if let Some(stripped) = path.strip_prefix("classify/") {
+        if let Some(bytes) = assets.get(stripped) {
+            return Some(bytes.as_slice());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +447,24 @@ mod tests {
         assert_eq!(classifier.bundle_version(), "bundle-v7");
         let score = scorer.score(&AnomalySignals::default());
         assert!((0.0..=1.0).contains(&score));
+    }
+
+    #[test]
+    fn classifier_can_load_raw_mlp_asset() {
+        let mut floats = vec![0.0f32; LABEL_SPACE.len() * EMBEDDING_DIMS + LABEL_SPACE.len()];
+        floats[0] = 5.0;
+        floats[(EMBEDDING_DIMS) + 1] = 5.0;
+        let mut bytes = Vec::with_capacity(floats.len() * 4);
+        for value in floats {
+            bytes.extend_from_slice(value.to_le_bytes().as_slice());
+        }
+
+        let assets = HashMap::from([("classify/use_case_mlp.bin".to_string(), bytes)]);
+        let (classifier, _) = build_model_providers("bundle-v9".to_string(), &assets);
+
+        let mut embedding = vec![0.0f32; EMBEDDING_DIMS];
+        embedding[0] = 1.0;
+        let out = classifier.classify(embedding.as_slice());
+        assert_eq!(out.label, UseCaseLabel::CodeGeneration);
     }
 }

@@ -200,7 +200,7 @@ fn bundle_loader_contract_supports_bytes_and_directory() {
         ("classify/centroids.bin".to_string(), centroid_asset_bytes()),
         (
             "classify/lsh_projection.bin".to_string(),
-            b"lsh_projection".to_vec(),
+            lsh_projection_asset_bytes(),
         ),
         ("classify/use_case_mlp.bin".to_string(), b"mlp".to_vec()),
         (
@@ -257,6 +257,17 @@ fn centroid_asset_bytes() -> Vec<u8> {
             } else {
                 0.0f32
             };
+            out.extend_from_slice(value.to_le_bytes().as_slice());
+        }
+    }
+    out
+}
+
+fn lsh_projection_asset_bytes() -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in 0..128usize {
+        for col in 0..384usize {
+            let value = ((row + col) as f32 / 10_000.0) - 0.5;
             out.extend_from_slice(value.to_le_bytes().as_slice());
         }
     }

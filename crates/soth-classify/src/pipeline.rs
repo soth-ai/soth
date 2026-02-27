@@ -26,6 +26,7 @@ pub(crate) fn run(
         stage2_cluster::run(
             embed.vector.as_deref(),
             bundle.centroids.as_slice(),
+            bundle.lsh_projection.as_slice(),
             proxy_ctx.session_snapshot.as_ref(),
             config,
         )

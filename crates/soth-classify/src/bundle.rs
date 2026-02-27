@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::fallback::{KeywordClassifier, StaticAnomalyScorer};
 use crate::model::build_model_providers;
+use crate::onnx_embed::OnnxEmbeddingRuntime;
 use crate::traits::{AnomalyScorer, ClassificationProvider};
 
 const MANIFEST_CANDIDATES: [&str; 2] = ["manifest.json", "classify/manifest.json"];
@@ -17,20 +18,40 @@ const POLICY_BUNDLE_CANDIDATES: [&str; 3] = [
     "policy/bundle.json",
     "policy_bundle.json",
 ];
-const CLASSIFY_MODEL_ASSETS: [&str; 4] = [
+pub const CLASSIFY_REQUIRED_MODEL_ASSETS: [&str; 4] = [
     "classify/embedding.onnx",
     "classify/centroids.bin",
     "classify/lsh_projection.bin",
     "classify/use_case_mlp.bin",
 ];
+const CLASSIFY_OPTIONAL_MODEL_ASSETS: [&str; 2] =
+    ["classify/tokenizer.json", "classify/volatility_config.toml"];
+
+pub(crate) const EMBEDDING_DIM: usize = 384;
+pub(crate) const LSH_PROJECTION_ROWS: usize = 128;
 
 pub struct ClassifyBundle {
     pub(crate) classifier: Arc<dyn ClassificationProvider>,
     pub(crate) anomaly_scorer: Arc<dyn AnomalyScorer>,
     pub(crate) policy_bundle: Arc<soth_policy::PolicyBundle>,
+    pub(crate) embedding_onnx: Option<Arc<Vec<u8>>>,
+    pub(crate) tokenizer_json: Option<Arc<Vec<u8>>>,
+    pub(crate) use_case_mlp: Option<Arc<Vec<u8>>>,
     pub(crate) centroids: Arc<Vec<Vec<f32>>>,
+    pub(crate) lsh_projection: Arc<Vec<Vec<f32>>>,
+    pub(crate) volatility_config_toml: Option<Arc<Vec<u8>>>,
+    pub(crate) onnx_runtime: Option<Arc<OnnxEmbeddingRuntime>>,
     pub bundle_version: String,
     pub has_real_models: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelAssetStatus {
+    pub has_embedding_onnx: bool,
+    pub has_tokenizer_json: bool,
+    pub has_use_case_mlp: bool,
+    pub has_volatility_config_toml: bool,
+    pub has_onnx_runtime: bool,
 }
 
 impl ClassifyBundle {
@@ -76,10 +97,26 @@ impl ClassifyBundle {
             classifier: Arc::new(KeywordClassifier),
             anomaly_scorer: Arc::new(StaticAnomalyScorer),
             policy_bundle,
+            embedding_onnx: None,
+            tokenizer_json: None,
+            use_case_mlp: None,
             centroids: Arc::new(Vec::new()),
+            lsh_projection: Arc::new(Vec::new()),
+            volatility_config_toml: None,
+            onnx_runtime: None,
             bundle_version,
             has_real_models: false,
         })
+    }
+
+    pub fn model_asset_status(&self) -> ModelAssetStatus {
+        ModelAssetStatus {
+            has_embedding_onnx: self.embedding_onnx.is_some(),
+            has_tokenizer_json: self.tokenizer_json.is_some(),
+            has_use_case_mlp: self.use_case_mlp.is_some(),
+            has_volatility_config_toml: self.volatility_config_toml.is_some(),
+            has_onnx_runtime: self.onnx_runtime.is_some(),
+        }
     }
 
     fn load_verified(
@@ -88,8 +125,15 @@ impl ClassifyBundle {
     ) -> Result<Arc<Self>, BundleLoadError> {
         verify_assets(&manifest, &assets)?;
         let policy_bundle = load_policy_bundle(&assets)?;
+        let embedding_onnx = load_embedding_onnx(&assets)?;
         let centroids = load_centroids(&assets)?;
-        let has_real_models = CLASSIFY_MODEL_ASSETS
+        let lsh_projection = load_lsh_projection(&assets)?;
+        let use_case_mlp = load_use_case_mlp(&assets)?;
+        let tokenizer_json = load_optional_asset(&assets, "classify/tokenizer.json");
+        let volatility_config_toml =
+            load_optional_asset(&assets, "classify/volatility_config.toml");
+        let onnx_runtime = build_onnx_runtime(embedding_onnx.as_deref(), tokenizer_json.as_deref());
+        let has_real_models = CLASSIFY_REQUIRED_MODEL_ASSETS
             .iter()
             .all(|path| asset_bytes_for_path(&assets, path).is_some());
         let version = if manifest.version.trim().is_empty() {
@@ -110,7 +154,13 @@ impl ClassifyBundle {
             classifier,
             anomaly_scorer,
             policy_bundle,
+            embedding_onnx,
+            tokenizer_json,
+            use_case_mlp,
             centroids: Arc::new(centroids),
+            lsh_projection: Arc::new(lsh_projection),
+            volatility_config_toml,
+            onnx_runtime,
             bundle_version: version,
             has_real_models,
         }))
@@ -206,10 +256,13 @@ fn collect_known_assets(
         }
     }
 
-    for asset in CLASSIFY_MODEL_ASSETS {
+    for asset in CLASSIFY_REQUIRED_MODEL_ASSETS
+        .iter()
+        .chain(CLASSIFY_OPTIONAL_MODEL_ASSETS.iter())
+    {
         let path = bundle_dir.join(asset);
         if path.exists() {
-            out.insert(asset.to_string(), std::fs::read(path)?);
+            out.insert((*asset).to_string(), std::fs::read(path)?);
         } else if let Some(stripped) = asset.strip_prefix("classify/") {
             let stripped_path = bundle_dir.join(stripped);
             if stripped_path.exists() {
@@ -265,29 +318,125 @@ fn load_policy_bundle(
     Ok(Arc::new(fallback_policy_bundle()))
 }
 
+fn load_optional_asset(assets: &HashMap<String, Vec<u8>>, path: &str) -> Option<Arc<Vec<u8>>> {
+    asset_bytes_for_path(assets, path).map(|bytes| Arc::new(bytes.to_vec()))
+}
+
+fn build_onnx_runtime(
+    embedding_onnx: Option<&Vec<u8>>,
+    tokenizer_json: Option<&Vec<u8>>,
+) -> Option<Arc<OnnxEmbeddingRuntime>> {
+    let model = embedding_onnx?;
+    let tokenizer = tokenizer_json?;
+    match OnnxEmbeddingRuntime::new(model.as_slice(), tokenizer.as_slice()) {
+        Ok(runtime) => Some(Arc::new(runtime)),
+        Err(_) => None,
+    }
+}
+
+fn load_embedding_onnx(
+    assets: &HashMap<String, Vec<u8>>,
+) -> Result<Option<Arc<Vec<u8>>>, BundleLoadError> {
+    let Some(bytes) = asset_bytes_for_path(assets, "classify/embedding.onnx") else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Err(BundleLoadError::EmptyModelAsset {
+            asset: "classify/embedding.onnx".to_string(),
+        });
+    }
+    Ok(Some(Arc::new(bytes.to_vec())))
+}
+
+fn load_use_case_mlp(
+    assets: &HashMap<String, Vec<u8>>,
+) -> Result<Option<Arc<Vec<u8>>>, BundleLoadError> {
+    let Some(bytes) = asset_bytes_for_path(assets, "classify/use_case_mlp.bin") else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Err(BundleLoadError::EmptyModelAsset {
+            asset: "classify/use_case_mlp.bin".to_string(),
+        });
+    }
+    Ok(Some(Arc::new(bytes.to_vec())))
+}
+
 fn load_centroids(assets: &HashMap<String, Vec<u8>>) -> Result<Vec<Vec<f32>>, BundleLoadError> {
     let Some(bytes) = asset_bytes_for_path(assets, "classify/centroids.bin") else {
         return Ok(Vec::new());
     };
+    parse_f32_matrix(bytes, EMBEDDING_DIM, BundleLoadErrorKind::Centroids, true)
+}
 
-    let row_bytes = 384 * std::mem::size_of::<f32>();
+fn load_lsh_projection(
+    assets: &HashMap<String, Vec<u8>>,
+) -> Result<Vec<Vec<f32>>, BundleLoadError> {
+    let Some(bytes) = asset_bytes_for_path(assets, "classify/lsh_projection.bin") else {
+        return Ok(Vec::new());
+    };
+    let rows = parse_f32_matrix(
+        bytes,
+        EMBEDDING_DIM,
+        BundleLoadErrorKind::LshProjection,
+        false,
+    )?;
+    if rows.len() != LSH_PROJECTION_ROWS {
+        return Err(BundleLoadError::InvalidLshProjectionShape {
+            rows: rows.len(),
+            cols: EMBEDDING_DIM,
+        });
+    }
+    Ok(rows)
+}
+
+enum BundleLoadErrorKind {
+    Centroids,
+    LshProjection,
+}
+
+fn parse_f32_matrix(
+    bytes: &[u8],
+    cols: usize,
+    kind: BundleLoadErrorKind,
+    normalize_rows: bool,
+) -> Result<Vec<Vec<f32>>, BundleLoadError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let row_bytes = cols * std::mem::size_of::<f32>();
     if bytes.len() % row_bytes != 0 {
         let floats = bytes.len() / std::mem::size_of::<f32>();
         let rows = if floats == 0 { 0 } else { 1 };
         let cols = if rows == 0 { 0 } else { floats };
-        return Err(BundleLoadError::InvalidCentroidShape { rows, cols });
+        return match kind {
+            BundleLoadErrorKind::Centroids => {
+                Err(BundleLoadError::InvalidCentroidShape { rows, cols })
+            }
+            BundleLoadErrorKind::LshProjection => {
+                Err(BundleLoadError::InvalidLshProjectionShape { rows, cols })
+            }
+        };
     }
 
     let rows = bytes.len() / row_bytes;
     if rows == 0 {
-        return Err(BundleLoadError::InvalidCentroidShape { rows: 0, cols: 384 });
+        return match kind {
+            BundleLoadErrorKind::Centroids => {
+                Err(BundleLoadError::InvalidCentroidShape { rows: 0, cols })
+            }
+            BundleLoadErrorKind::LshProjection => {
+                Err(BundleLoadError::InvalidLshProjectionShape { rows: 0, cols })
+            }
+        };
     }
 
     let mut centroids = Vec::with_capacity(rows);
     for row in 0..rows {
         let start = row * row_bytes;
-        let mut centroid = Vec::with_capacity(384);
-        for col in 0..384 {
+        let mut centroid = Vec::with_capacity(cols);
+        for col in 0..cols {
             let offset = start + col * 4;
             let value = f32::from_le_bytes([
                 bytes[offset],
@@ -297,7 +446,9 @@ fn load_centroids(assets: &HashMap<String, Vec<u8>>) -> Result<Vec<Vec<f32>>, Bu
             ]);
             centroid.push(value);
         }
-        l2_normalize(&mut centroid);
+        if normalize_rows {
+            l2_normalize(&mut centroid);
+        }
         centroids.push(centroid);
     }
 
@@ -354,8 +505,12 @@ pub enum BundleLoadError {
     InvalidManifest(String),
     #[error("onnx session error: {0}")]
     OnnxSession(String),
+    #[error("empty model asset: {asset}")]
+    EmptyModelAsset { asset: String },
     #[error("invalid centroid shape: expected (K, 384), got ({rows}, {cols})")]
     InvalidCentroidShape { rows: usize, cols: usize },
+    #[error("invalid lsh projection shape: expected (128, 384), got ({rows}, {cols})")]
+    InvalidLshProjectionShape { rows: usize, cols: usize },
     #[error("policy bundle error: {0}")]
     PolicyBundle(#[from] soth_policy::PolicyError),
     #[error("unsupported: {0}")]
@@ -410,7 +565,7 @@ mod tests {
             ("classify/centroids.bin".to_string(), centroid_asset_bytes()),
             (
                 "classify/lsh_projection.bin".to_string(),
-                b"lsh-projection".to_vec(),
+                lsh_projection_asset_bytes(),
             ),
             ("classify/use_case_mlp.bin".to_string(), b"mlp".to_vec()),
         ])
@@ -419,7 +574,7 @@ mod tests {
     fn centroid_asset_bytes() -> Vec<u8> {
         let mut out = Vec::new();
         for row in 0..2usize {
-            for col in 0..384usize {
+            for col in 0..EMBEDDING_DIM {
                 let value = if row == 0 && col == 0 {
                     1.0f32
                 } else if row == 1 && col == 1 {
@@ -427,6 +582,17 @@ mod tests {
                 } else {
                     0.0f32
                 };
+                out.extend_from_slice(value.to_le_bytes().as_slice());
+            }
+        }
+        out
+    }
+
+    fn lsh_projection_asset_bytes() -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in 0..LSH_PROJECTION_ROWS {
+            for col in 0..EMBEDDING_DIM {
+                let value = ((row + col) as f32 / 10_000.0) - 0.5;
                 out.extend_from_slice(value.to_le_bytes().as_slice());
             }
         }
@@ -476,8 +642,15 @@ mod tests {
 
         assert_eq!(bundle.bundle_version, "bundle-test-v1");
         assert!(bundle.has_real_models);
+        assert!(bundle.embedding_onnx.is_some());
+        assert!(bundle.use_case_mlp.is_some());
+        let model_status = bundle.model_asset_status();
+        assert!(model_status.has_embedding_onnx);
+        assert!(model_status.has_use_case_mlp);
         assert_eq!(bundle.centroids.len(), 2);
         assert_eq!(bundle.centroids[0].len(), 384);
+        assert_eq!(bundle.lsh_projection.len(), LSH_PROJECTION_ROWS);
+        assert_eq!(bundle.lsh_projection[0].len(), EMBEDDING_DIM);
         assert_eq!(bundle.classifier.bundle_version(), "bundle-test-v1");
         let embedding = vec![1.0f32 / 384.0f32.sqrt(); 384];
         let classified = bundle.classifier.classify(embedding.as_slice());
@@ -528,6 +701,7 @@ mod tests {
         assert_eq!(bundle.bundle_version, "bundle-disk-v1");
         assert!(bundle.has_real_models);
         assert_eq!(bundle.centroids.len(), 2);
+        assert_eq!(bundle.lsh_projection.len(), LSH_PROJECTION_ROWS);
         assert_eq!(bundle.classifier.bundle_version(), "bundle-disk-v1");
         assert_eq!(
             bundle.policy_bundle.metadata.bundle_version,

@@ -4,6 +4,7 @@ mod bundle;
 mod config;
 mod fallback;
 mod model;
+mod onnx_embed;
 mod pipeline;
 mod stage1_embed;
 mod stage2_cluster;
@@ -16,8 +17,11 @@ mod traits;
 mod types;
 
 pub const INTERFACE_VERSION: &str = "1.0.0";
+pub const API_CONTRACT_VERSION: &str = "2026-02-26";
 
-pub use bundle::{BundleLoadError, ClassifyBundle};
+pub use bundle::{
+    BundleLoadError, ClassifyBundle, ModelAssetStatus, CLASSIFY_REQUIRED_MODEL_ASSETS,
+};
 pub use config::{ClassifyConfig, ComplexityWeights, VolatilityConfig};
 pub use traits::{AnomalyScorer, ClassificationProvider};
 pub use types::{ClassifiedResult, StageTiming};
