@@ -16,6 +16,7 @@ local-debug = []
 
 [dependencies]
 soth-core = { workspace = true }
+soth-proxy = { workspace = true }
 soth-sync = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "signal", "time", "process"] }

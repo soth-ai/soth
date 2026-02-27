@@ -12,6 +12,7 @@ members = [
     "crates/soth-detect",
 ]
 default-members = [
+    "crates/soth-cli",
     "crates/soth-core",
     "crates/soth-bundle",
     "crates/soth-classify",
