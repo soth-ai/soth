@@ -16,9 +16,17 @@ pub async fn run(
     foreground: bool,
     daemon_child: bool,
     no_autostart: bool,
+    allow_daemon_child_fallback: bool,
 ) -> Result<()> {
     if !foreground && !daemon_child {
-        return daemon::run_start_daemon(port, config_path, quiet, no_autostart).await;
+        return daemon::run_start_daemon(
+            port,
+            config_path,
+            quiet,
+            no_autostart,
+            allow_daemon_child_fallback,
+        )
+        .await;
     }
 
     let config = cli_config::load_effective_config(config_path.as_ref(), None)?;

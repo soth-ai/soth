@@ -881,6 +881,7 @@ pub async fn run_start_daemon(
     config_path: Option<PathBuf>,
     quiet: bool,
     no_autostart: bool,
+    allow_daemon_child_fallback: bool,
 ) -> anyhow::Result<()> {
     ensure_runtime_dirs()?;
     let _lifecycle_lock = acquire_lifecycle_lock()?;
@@ -950,45 +951,63 @@ pub async fn run_start_daemon(
         }
     }
 
-    if autostart_enabled && super::autostart::supports_managed_mode() {
-        match super::autostart::start_managed(expected_port, config_path.as_ref()) {
-            Ok(details) => {
-                let startup_timeout = daemon_startup_timeout();
-                let startup_deadline = std::time::Instant::now() + startup_timeout;
-                while !is_local_listener_ready(expected_port) {
-                    if std::time::Instant::now() >= startup_deadline {
+    if super::autostart::supports_managed_mode() {
+        if !autostart_enabled && !allow_daemon_child_fallback {
+            return Err(anyhow!(
+                "managed service mode is required by default on this OS, but startup autostart is disabled (--no-autostart). Remove --no-autostart or pass --allow-daemon-child-fallback."
+            ));
+        }
+
+        if autostart_enabled {
+            match super::autostart::start_managed(expected_port, config_path.as_ref()) {
+                Ok(details) => {
+                    let startup_timeout = daemon_startup_timeout();
+                    let startup_deadline = std::time::Instant::now() + startup_timeout;
+                    while !is_local_listener_ready(expected_port) {
+                        if std::time::Instant::now() >= startup_deadline {
+                            return Err(anyhow!(
+                                "managed proxy startup did not open 127.0.0.1:{} within {}s timeout; check {}",
+                                expected_port,
+                                startup_timeout.as_secs(),
+                                compact_path(&log_path())
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(120));
+                    }
+
+                    let _ = adopt_running_daemon_state(expected_port, true);
+                    if !quiet {
+                        let pid_text = read_pid()?
+                            .map(|pid| format!(" (pid {pid})"))
+                            .unwrap_or_default();
+                        style::success(&format!("Proxy managed service started{pid_text}."));
+                        style::kv("Logs", &compact_path(&log_path()));
+                        style::kv("Control", "soth stop");
+                        style::kv("Tail", "soth logs -f");
+                        style::info(&format!("Startup autostart ensured: {details}"));
+                        print_env_setup_hint_if_needed();
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    if !allow_daemon_child_fallback {
                         return Err(anyhow!(
-                            "managed proxy startup did not open 127.0.0.1:{} within {}s timeout; check {}",
-                            expected_port,
-                            startup_timeout.as_secs(),
-                            compact_path(&log_path())
+                            "managed startup unavailable and daemon-child fallback is disabled. Pass --allow-daemon-child-fallback to force legacy mode. Root cause: {}",
+                            error
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(120));
-                }
-
-                let _ = adopt_running_daemon_state(expected_port, true);
-                if !quiet {
-                    let pid_text = read_pid()?
-                        .map(|pid| format!(" (pid {pid})"))
-                        .unwrap_or_default();
-                    style::success(&format!("Proxy managed service started{pid_text}."));
-                    style::kv("Logs", &compact_path(&log_path()));
-                    style::kv("Control", "soth stop");
-                    style::kv("Tail", "soth logs -f");
-                    style::info(&format!("Startup autostart ensured: {details}"));
-                    print_env_setup_hint_if_needed();
-                }
-                return Ok(());
-            }
-            Err(error) => {
-                if !quiet {
-                    style::warning(&format!(
-                        "Managed startup unavailable (falling back to daemon-child): {}",
-                        error
-                    ));
+                    if !quiet {
+                        style::warning(&format!(
+                            "Managed startup unavailable (falling back to daemon-child): {}",
+                            error
+                        ));
+                    }
                 }
             }
+        } else if !quiet {
+            style::warning(
+                "Startup autostart disabled; using daemon-child fallback because --allow-daemon-child-fallback was provided.",
+            );
         }
     }
 
@@ -1392,12 +1411,33 @@ mod tests {
                 .build()
                 .expect("runtime");
             let err = runtime
-                .block_on(run_start_daemon(Some(18888), None, true, false))
+                .block_on(run_start_daemon(Some(18888), None, true, false, true))
                 .expect_err("daemon start should fail in unit test binary");
             let text = format!("{err:#}");
             assert!(
                 text.contains("proxy daemon exited early")
                     || text.contains("managed proxy startup did not open"),
+                "unexpected error: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn managed_only_rejects_no_autostart_without_fallback() {
+        with_temp_home(|| {
+            if !super::super::autostart::supports_managed_mode() {
+                return;
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime");
+            let err = runtime
+                .block_on(run_start_daemon(Some(18889), None, true, true, false))
+                .expect_err("managed-only should reject no-autostart without fallback");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("managed service mode is required"),
                 "unexpected error: {text}"
             );
         });

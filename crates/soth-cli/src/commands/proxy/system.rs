@@ -1535,4 +1535,29 @@ mod tests {
             assert!(result.is_err());
         });
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_windows_reg_value_dword() {
+        let sample = r#"
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
+    ProxyEnable    REG_DWORD    0x1
+"#;
+        let parsed = parse_windows_reg_value(sample, "ProxyEnable");
+        assert_eq!(parsed, Some(("REG_DWORD".to_string(), "0x1".to_string())));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_windows_reg_value_string() {
+        let sample = r#"
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
+    ProxyServer    REG_SZ    127.0.0.1:18881
+"#;
+        let parsed = parse_windows_reg_value(sample, "ProxyServer");
+        assert_eq!(
+            parsed,
+            Some(("REG_SZ".to_string(), "127.0.0.1:18881".to_string()))
+        );
+    }
 }

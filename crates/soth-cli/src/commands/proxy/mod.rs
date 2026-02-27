@@ -2,6 +2,7 @@
 
 mod autostart;
 mod daemon;
+mod doctor;
 mod env;
 mod setup_ca;
 mod start;
@@ -42,8 +43,18 @@ pub async fn run_start_internal(
     foreground: bool,
     daemon_child: bool,
     no_autostart: bool,
+    allow_daemon_child_fallback: bool,
 ) -> anyhow::Result<()> {
-    start::run(port, config, quiet, foreground, daemon_child, no_autostart).await
+    start::run(
+        port,
+        config,
+        quiet,
+        foreground,
+        daemon_child,
+        no_autostart,
+        allow_daemon_child_fallback,
+    )
+    .await
 }
 
 pub async fn run_stop() -> anyhow::Result<()> {
@@ -73,4 +84,8 @@ pub async fn run_env(
 
 pub async fn run_status(config: Option<PathBuf>, json: bool) -> anyhow::Result<bool> {
     status::run(config, json).await
+}
+
+pub async fn run_doctor(config: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
+    doctor::run(config, json).await
 }
