@@ -35,6 +35,9 @@ pub fn parse_rest(
             }
         }
     }
+    if messages.is_empty() {
+        messages = extract_messages_fallback(&json);
+    }
 
     let system_prompt = extract_system_prompt(&json, desc);
     let user_content = first_user_content(&messages).unwrap_or_default();
@@ -61,7 +64,12 @@ pub fn parse_rest(
         .as_ref()
         .and_then(|path| json_path(&json, path))
         .and_then(|value| value.as_f64())
-        .map(|value| value as f32);
+        .map(|value| value as f32)
+        .or_else(|| {
+            json_path(&json, "$.generationConfig.temperature")
+                .and_then(|value| value.as_f64())
+                .map(|value| value as f32)
+        });
 
     let max_tokens = desc
         .request
@@ -69,7 +77,14 @@ pub fn parse_rest(
         .as_ref()
         .and_then(|path| json_path(&json, path))
         .and_then(|value| value.as_u64())
-        .map(|value| value as u32);
+        .map(|value| value as u32)
+        .or_else(|| {
+            json_path(&json, "$.max_output_tokens")
+                .or_else(|| json_path(&json, "$.max_completion_tokens"))
+                .or_else(|| json_path(&json, "$.generationConfig.maxOutputTokens"))
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32)
+        });
 
     let top_p = desc
         .request
@@ -77,7 +92,12 @@ pub fn parse_rest(
         .as_ref()
         .and_then(|path| json_path(&json, path))
         .and_then(|value| value.as_f64())
-        .map(|value| value as f32);
+        .map(|value| value as f32)
+        .or_else(|| {
+            json_path(&json, "$.generationConfig.topP")
+                .and_then(|value| value.as_f64())
+                .map(|value| value as f32)
+        });
 
     let stream = desc
         .request
@@ -85,6 +105,7 @@ pub fn parse_rest(
         .as_ref()
         .and_then(|path| json_path(&json, path))
         .and_then(|value| value.as_bool())
+        .or_else(|| json_path(&json, "$.streaming").and_then(|value| value.as_bool()))
         .unwrap_or(false);
 
     let stop_sequences = desc
@@ -99,7 +120,17 @@ pub fn parse_rest(
                 .filter_map(extract_string)
                 .collect::<Vec<String>>()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            json_path(&json, "$.stop_sequences")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(extract_string)
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default()
+        });
 
     let system_prompt_hash = system_prompt.as_ref().map(|text| hash_content(text));
     let system_prompt_token_estimate = system_prompt.as_ref().map(|text| estimate_tokens(text));
@@ -215,6 +246,13 @@ fn extract_system_prompt(json: &Value, desc: &RestFormatDescriptor) -> Option<St
         .and_then(|path| json_path(json, path))
         .and_then(extract_string)
         .map(|value| normalize_unicodeish(&value))
+        .or_else(|| {
+            json_path(json, "$.instructions")
+                .or_else(|| json_path(json, "$.system_prompt"))
+                .or_else(|| json_path(json, "$.systemPrompt"))
+                .and_then(extract_string)
+                .map(|value| normalize_unicodeish(&value))
+        })
 }
 
 fn extract_messages(json: &Value, desc: &RestFormatDescriptor) -> Vec<(String, String)> {
@@ -306,16 +344,155 @@ fn first_user_content(messages: &[(String, String)]) -> Option<String> {
         .or_else(|| messages.first().map(|(_, content)| content.clone()))
 }
 
+fn extract_messages_fallback(json: &Value) -> Vec<(String, String)> {
+    if let Some(messages) = json_path(json, "$.messages").and_then(|value| value.as_array()) {
+        let extracted = messages
+            .iter()
+            .filter_map(|message| extract_message_entry(message, "content"))
+            .collect::<Vec<_>>();
+        if !extracted.is_empty() {
+            return extracted;
+        }
+    }
+
+    if let Some(input) = json_path(json, "$.input") {
+        let extracted = extract_input_messages(input);
+        if !extracted.is_empty() {
+            return extracted;
+        }
+    }
+
+    if let Some(contents) = json_path(json, "$.contents").and_then(|value| value.as_array()) {
+        let extracted = contents
+            .iter()
+            .filter_map(|entry| {
+                let role = entry
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("user")
+                    .to_string();
+                let value = entry
+                    .get("content")
+                    .or_else(|| entry.get("parts"))
+                    .or_else(|| entry.get("text"))
+                    .or_else(|| entry.get("input"))?;
+                extract_content_string(value).map(|content| (role, content))
+            })
+            .collect::<Vec<_>>();
+        if !extracted.is_empty() {
+            return extracted;
+        }
+    }
+
+    for path in [
+        "$.prompt",
+        "$.query",
+        "$.question",
+        "$.text",
+        "$.message",
+        "$.user_input",
+    ] {
+        if let Some(value) = json_path(json, path).and_then(extract_content_string) {
+            return vec![("user".to_string(), value)];
+        }
+    }
+
+    Vec::new()
+}
+
+fn extract_input_messages(input: &Value) -> Vec<(String, String)> {
+    match input {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                if let Some((role, content)) = extract_message_entry(item, "content") {
+                    return Some((role, content));
+                }
+                extract_content_string(item).map(|content| ("user".to_string(), content))
+            })
+            .collect(),
+        Value::Object(_) => {
+            if let Some((role, content)) = extract_message_entry(input, "content") {
+                return vec![(role, content)];
+            }
+            extract_content_string(input)
+                .map(|content| vec![("user".to_string(), content)])
+                .unwrap_or_default()
+        }
+        _ => extract_content_string(input)
+            .map(|content| vec![("user".to_string(), content)])
+            .unwrap_or_default(),
+    }
+}
+
+fn extract_message_entry(value: &Value, default_content_field: &str) -> Option<(String, String)> {
+    let role = value
+        .get("role")
+        .and_then(|raw| raw.as_str())
+        .unwrap_or("user")
+        .to_string();
+
+    let content_value = value
+        .get(default_content_field)
+        .or_else(|| value.get("input"))
+        .or_else(|| value.get("text"))
+        .or_else(|| value.get("message"))?;
+    let content = extract_content_string(content_value)?;
+
+    Some((role, content))
+}
+
+fn extract_content_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(raw) => Some(normalize_unicodeish(raw)),
+        Value::Array(items) => {
+            let joined = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .or_else(|| item.get("input_text"))
+                        .or_else(|| item.get("content"))
+                        .and_then(extract_content_string)
+                        .or_else(|| extract_string(item).map(|raw| normalize_unicodeish(&raw)))
+                })
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        Value::Object(map) => map
+            .get("text")
+            .or_else(|| map.get("input_text"))
+            .or_else(|| map.get("content"))
+            .or_else(|| map.get("message"))
+            .or_else(|| map.get("input"))
+            .and_then(extract_content_string),
+        Value::Bool(_) | Value::Number(_) => {
+            extract_string(value).map(|raw| normalize_unicodeish(&raw))
+        }
+        Value::Null => None,
+    }
+}
+
 fn infer_endpoint_type(path: &str) -> EndpointType {
     let lower = path.to_ascii_lowercase();
     if lower.contains("embeddings") {
         return EndpointType::Embedding;
     }
+    if lower.contains("chat")
+        || lower.contains("message")
+        || lower.contains("conversation")
+        || lower.contains("response")
+    {
+        return EndpointType::Chat;
+    }
     if lower.contains("completion") {
         return EndpointType::Completion;
-    }
-    if lower.contains("chat") || lower.contains("message") {
-        return EndpointType::Chat;
     }
     EndpointType::Unknown
 }

@@ -339,26 +339,32 @@ fn infer_endpoint_type(method: Option<&str>, path: &str) -> EndpointType {
     if lower.contains("embed") {
         return EndpointType::Embedding;
     }
-    if lower.contains("completion") {
-        return EndpointType::Completion;
-    }
     if lower.contains("chat")
         || lower.contains("message")
+        || lower.contains("response")
+        || lower.contains("conversation")
         || lower.contains("generate")
         || lower.contains("prompt")
     {
         return EndpointType::Chat;
+    }
+    if lower.contains("completion") {
+        return EndpointType::Completion;
     }
 
     let path_lc = path.to_ascii_lowercase();
     if path_lc.contains("embed") {
         return EndpointType::Embedding;
     }
+    if path_lc.contains("chat")
+        || path_lc.contains("message")
+        || path_lc.contains("response")
+        || path_lc.contains("conversation")
+    {
+        return EndpointType::Chat;
+    }
     if path_lc.contains("completion") {
         return EndpointType::Completion;
-    }
-    if path_lc.contains("chat") || path_lc.contains("message") {
-        return EndpointType::Chat;
     }
     EndpointType::Unknown
 }

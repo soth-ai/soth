@@ -1,5 +1,6 @@
 use crate::types::HeaderMap;
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
@@ -10,6 +11,39 @@ pub fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 pub fn host_without_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
+}
+
+pub fn lookup_domain_provider<'a>(
+    domain_index: &'a HashMap<String, String>,
+    host: &str,
+) -> Option<&'a str> {
+    let normalized_host = host_without_port(host)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+
+    if let Some(provider) = domain_index.get(&normalized_host) {
+        return Some(provider.as_str());
+    }
+
+    let mut best: Option<(&str, usize)> = None;
+    for (pattern, provider) in domain_index {
+        if !pattern.contains('*') {
+            continue;
+        }
+
+        let pattern_lc = pattern.to_ascii_lowercase();
+        if !glob_match(&pattern_lc, &normalized_host) {
+            continue;
+        }
+
+        let specificity = pattern_lc.chars().filter(|c| *c != '*').count();
+        match best {
+            Some((_, best_specificity)) if best_specificity >= specificity => {}
+            _ => best = Some((provider.as_str(), specificity)),
+        }
+    }
+
+    best.map(|(provider, _)| provider)
 }
 
 pub fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
@@ -106,4 +140,47 @@ fn parse_indexed_segment(segment: &str) -> Option<(&str, usize)> {
     let field = &segment[..start];
     let index = segment[start + 1..end].parse::<usize>().ok()?;
     Some((field, index))
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let starts_anchored = !pattern.starts_with('*');
+    let ends_anchored = !pattern.ends_with('*');
+
+    let mut index = 0usize;
+    let mut first_non_empty = true;
+    for part in parts.iter().copied().filter(|part| !part.is_empty()) {
+        if first_non_empty && starts_anchored {
+            if !text[index..].starts_with(part) {
+                return false;
+            }
+            index += part.len();
+            first_non_empty = false;
+            continue;
+        }
+
+        match text[index..].find(part) {
+            Some(pos) => index += pos + part.len(),
+            None => return false,
+        }
+        first_non_empty = false;
+    }
+
+    if ends_anchored {
+        let last_non_empty = pattern
+            .split('*')
+            .filter(|part| !part.is_empty())
+            .next_back()
+            .unwrap_or("");
+        text.ends_with(last_non_empty)
+    } else {
+        true
+    }
 }

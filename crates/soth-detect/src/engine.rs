@@ -247,25 +247,15 @@ fn provider_for_format(
     bundle: &DetectBundleSlice<'_>,
 ) -> String {
     if let Some(provider) = req.connection_meta.matched_provider.as_deref() {
-        return provider.to_string();
+        return canonical_provider_candidate(provider, format, bundle);
     }
 
     let headers = &req.headers;
     if let Some(host_provider) = host_provider_from_headers(headers, bundle) {
-        return host_provider;
+        return canonical_provider_candidate(&host_provider, format, bundle);
     }
 
-    match format {
-        DetectedFormat::OpenAIRest => "openai".to_string(),
-        DetectedFormat::AnthropicRest => "anthropic".to_string(),
-        DetectedFormat::CohereRest => "cohere".to_string(),
-        DetectedFormat::GeminiRest => "google".to_string(),
-        DetectedFormat::BedrockRest => "aws_bedrock".to_string(),
-        DetectedFormat::GraphQL => "graphql".to_string(),
-        DetectedFormat::GrpcProtobuf => "grpc".to_string(),
-        DetectedFormat::JsonRpc => "jsonrpc".to_string(),
-        DetectedFormat::Unknown => "unknown".to_string(),
-    }
+    default_provider_for_format(format).to_string()
 }
 
 fn host_provider_from_headers(
@@ -274,8 +264,51 @@ fn host_provider_from_headers(
 ) -> Option<String> {
     let host = crate::util::header_value(headers, "host")
         .or_else(|| crate::util::header_value(headers, ":authority"))?;
-    let normalized = crate::util::host_without_port(host).to_ascii_lowercase();
-    bundle.domain_index.get(&normalized).cloned()
+    crate::util::lookup_domain_provider(bundle.domain_index, host).map(str::to_string)
+}
+
+fn canonical_provider_candidate(
+    candidate: &str,
+    format: &DetectedFormat,
+    bundle: &DetectBundleSlice<'_>,
+) -> String {
+    let normalized = candidate.to_ascii_lowercase();
+
+    if bundle.llm_providers.contains_key(&normalized) {
+        return normalized;
+    }
+
+    if let Some((provider_id, _)) = bundle.llm_providers.iter().find(|(provider_id, entry)| {
+        provider_id.eq_ignore_ascii_case(&normalized)
+            || entry
+                .provider_id
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(&normalized))
+                .unwrap_or(false)
+            || entry
+                .name
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(&normalized))
+                .unwrap_or(false)
+    }) {
+        return provider_id.to_string();
+    }
+
+    default_provider_for_format(format).to_string()
+}
+
+fn default_provider_for_format(format: &DetectedFormat) -> &'static str {
+    match format {
+        DetectedFormat::OpenAIRest => "openai",
+        DetectedFormat::AnthropicRest => "anthropic",
+        DetectedFormat::CohereRest => "cohere",
+        DetectedFormat::GeminiRest => "google",
+        DetectedFormat::BedrockRest => "aws_bedrock",
+        DetectedFormat::GraphQL => "graphql",
+        DetectedFormat::GrpcProtobuf => "grpc",
+        DetectedFormat::JsonRpc => "jsonrpc",
+        DetectedFormat::Unknown => "unknown",
+    }
 }
 
 fn rest_key_for_format(format: &DetectedFormat) -> &'static str {

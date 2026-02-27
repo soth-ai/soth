@@ -1,5 +1,5 @@
 use crate::types::{DetectBundleSlice, DetectedFormat, HeaderMap, ProviderEntry};
-use crate::util::{header_value, host_without_port};
+use crate::util::{header_value, lookup_domain_provider};
 
 pub fn fingerprint(
     method: &str,
@@ -43,18 +43,15 @@ pub fn fingerprint(
     let body = String::from_utf8_lossy(body_prefix).to_ascii_lowercase();
     let looks_jsonrpc = body.contains("\"jsonrpc\"") && body.contains("\"method\"");
 
-    if path_lc.contains("/v1/chat/completions")
-        || path_lc.contains("/v1/completions")
-        || path_lc.contains("/v1/embeddings")
-    {
+    if is_openai_like_path(&path_lc) {
         return DetectedFormat::OpenAIRest;
     }
 
-    if path_lc.contains("/v1/messages") {
+    if is_anthropic_like_path(&path_lc) {
         return DetectedFormat::AnthropicRest;
     }
 
-    if path_lc.contains("/v2/generate") || path_lc.contains("/v2/chat") {
+    if is_cohere_like_path(&path_lc) {
         return DetectedFormat::CohereRest;
     }
 
@@ -77,12 +74,11 @@ pub fn fingerprint(
     if let Some(host) =
         header_value(headers, "host").or_else(|| header_value(headers, ":authority"))
     {
-        let host = host_without_port(host).to_ascii_lowercase();
-        if let Some(provider_id) = bundle.domain_index.get(&host) {
+        if let Some(provider_id) = lookup_domain_provider(bundle.domain_index, host) {
             return provider_entry_to_format(provider_id, bundle.llm_providers.get(provider_id));
         }
 
-        if host == "127.0.0.1" {
+        if host.eq_ignore_ascii_case("127.0.0.1") {
             return DetectedFormat::OpenAIRest;
         }
     }
@@ -103,6 +99,50 @@ pub fn fingerprint(
     }
 
     DetectedFormat::Unknown
+}
+
+fn is_openai_like_path(path: &str) -> bool {
+    if path.contains("/v1/chat/completions")
+        || path.contains("/v1/completions")
+        || path.contains("/v1/embeddings")
+        || path.contains("/v1/responses")
+        || path.contains("/api/v1/responses")
+        || path.contains("/api/v0/chat/completion")
+        || path.contains("/chat/api/v2/conversations")
+        || path.contains("/chat/conversation")
+        || path.contains("/chat/completion")
+        || path.contains("/v1/chat-with-documents")
+        || path.contains("/v1/llm-proxy")
+        || path.contains("/v1/llm-proxy-stream")
+    {
+        return true;
+    }
+
+    if (path.contains("/backend-api/") || path.contains("/backend-anon/"))
+        && path.contains("conversation")
+    {
+        return true;
+    }
+
+    path.contains("/openai/deployments/")
+        && (path.contains("/chat/completions")
+            || path.contains("/completions")
+            || path.contains("/embeddings")
+            || path.contains("/responses"))
+}
+
+fn is_anthropic_like_path(path: &str) -> bool {
+    path.contains("/v1/messages")
+        || path.contains("/v1/complete")
+        || (path.contains("/api/organizations/") && path.contains("/completion"))
+}
+
+fn is_cohere_like_path(path: &str) -> bool {
+    path.contains("/v2/generate")
+        || path.contains("/v2/chat")
+        || path.contains("/v1/chat")
+        || path.contains("/v1/generate")
+        || path.contains("/v1/embed")
 }
 
 fn provider_entry_to_format(provider_id: &str, entry: Option<&ProviderEntry>) -> DetectedFormat {
@@ -236,6 +276,61 @@ mod tests {
                 ("content-type", "application/octet-stream"),
             ]),
             br#"{}"#,
+            None,
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::OpenAIRest);
+    }
+
+    #[test]
+    fn wildcard_domain_index_maps_to_provider_format() {
+        let mut bundle = bundle_fixture();
+        bundle
+            .domain_index
+            .insert("*.openai.azure.com".to_string(), "openai".to_string());
+
+        let detected = fingerprint(
+            "POST",
+            "/openai/deployments/test/chat/completions",
+            &headers(&[
+                ("host", "my-resource.openai.azure.com"),
+                ("content-type", "application/json"),
+            ]),
+            br#"{}"#,
+            None,
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::OpenAIRest);
+    }
+
+    #[test]
+    fn backend_api_conversation_is_treated_as_openai_rest() {
+        let bundle = bundle_fixture();
+        let detected = fingerprint(
+            "POST",
+            "/backend-api/conversation",
+            &headers(&[
+                ("host", "chatgpt.com"),
+                ("content-type", "application/json"),
+            ]),
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            None,
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::OpenAIRest);
+    }
+
+    #[test]
+    fn responses_endpoint_is_treated_as_openai_rest() {
+        let bundle = bundle_fixture();
+        let detected = fingerprint(
+            "POST",
+            "/api/v1/responses",
+            &headers(&[
+                ("host", "openrouter.ai"),
+                ("content-type", "application/json"),
+            ]),
+            br#"{"model":"gpt-4.1-mini","input":"hello"}"#,
             None,
             &bundle.as_slice(),
         );

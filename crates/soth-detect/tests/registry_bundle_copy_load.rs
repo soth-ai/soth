@@ -27,6 +27,7 @@ fn converted_registry_bundle_copy_loads_and_processes_request() {
     assert!(bundle.rest_formats.contains_key("openai"));
     assert!(!bundle.domain_index.is_empty());
     assert!(!bundle.llm_providers.is_empty());
+    assert!(!bundle.passthrough_domains.is_empty());
 
     let registry = build_registry(&bundle.as_slice()).expect("build parser registry");
 
@@ -115,7 +116,7 @@ fn home_bundle_e2e_contract_cases() {
         parse_source_name(&out_anthropic.parse_source),
         "rest:anthropic"
     );
-    assert_eq!(out_anthropic.capture_mode, CaptureMode::MetadataOnly);
+    assert_eq!(out_anthropic.capture_mode, CaptureMode::Full);
     assert_eq!(
         out_anthropic.normalized.model.as_deref(),
         Some("claude-3-5-sonnet")
@@ -138,6 +139,46 @@ fn home_bundle_e2e_contract_cases() {
         !out_google.artifacts.is_empty(),
         "google full-capture path should scan and emit artifacts"
     );
+
+    let openrouter_responses = build_request(
+        "POST",
+        "/api/v1/responses",
+        vec![
+            ("host", "openrouter.ai"),
+            ("content-type", "application/json"),
+        ],
+        br#"{"model":"openai/gpt-4o-mini","input":[{"role":"user","content":[{"type":"input_text","text":"home bundle openrouter"}]}]}"#,
+    );
+    let out_openrouter =
+        process_with_registry(&registry, &openrouter_responses, &bundle.as_slice());
+    assert_eq!(
+        parse_source_name(&out_openrouter.parse_source),
+        "rest:openai"
+    );
+    assert_eq!(out_openrouter.capture_mode, CaptureMode::Full);
+    assert_eq!(
+        out_openrouter.normalized.model.as_deref(),
+        Some("openai/gpt-4o-mini")
+    );
+    assert!(matches!(out_openrouter.confidence, ParseConfidence::Full));
+
+    let chatgpt_web = build_request(
+        "POST",
+        "/backend-api/conversation",
+        vec![
+            ("host", "chatgpt.com"),
+            ("content-type", "application/json"),
+        ],
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"home bundle chatgpt web"}]}"#,
+    );
+    let out_chatgpt_web = process_with_registry(&registry, &chatgpt_web, &bundle.as_slice());
+    assert_eq!(
+        parse_source_name(&out_chatgpt_web.parse_source),
+        "rest:openai"
+    );
+    assert_eq!(out_chatgpt_web.capture_mode, CaptureMode::MetadataOnly);
+    assert_eq!(out_chatgpt_web.normalized.model.as_deref(), Some("gpt-4o"));
+    assert!(matches!(out_chatgpt_web.confidence, ParseConfidence::Full));
 
     let filtered = build_request("GET", "/health", vec![("host", "api.openai.com")], b"");
     let out_filtered = process_with_registry(&registry, &filtered, &bundle.as_slice());
