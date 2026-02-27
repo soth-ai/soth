@@ -118,9 +118,7 @@ async fn terminate_child(child: &mut Child) -> Result<()> {
 }
 
 fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result<PathBuf> {
-    let root = dirs::home_dir()
-        .map(|home| home.join(".soth").join("run"))
-        .unwrap_or_else(|| PathBuf::from(".soth/run"));
+    let root = soth_home_dir().join("run");
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed creating {}", root.display()))?;
 
@@ -132,6 +130,10 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
             .as_ref()
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false);
+    let ca_cert_path =
+        cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()));
+    let ca_key_path =
+        cli_config::expand_tilde(Path::new(config.forward_proxy.ca.key_path.as_str()));
     let generated = GeneratedProxyConfig {
         db_path: cli_config::resolved_db_path(config).display().to_string(),
         org_id: config
@@ -158,6 +160,8 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
                 config.forward_proxy.address,
                 port_override.unwrap_or(config.forward_proxy.port)
             ),
+            ca_cert_path: ca_cert_path.display().to_string(),
+            ca_key_path: ca_key_path.display().to_string(),
         },
         bundle: GeneratedBundleConfig {
             bundle_dir: cli_config::expand_tilde(Path::new(config.bundle.bundle_dir.as_str()))
@@ -179,6 +183,18 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
     let body = toml::to_string_pretty(&generated).context("serialize proxy TOML")?;
     std::fs::write(&path, body).with_context(|| format!("failed writing {}", path.display()))?;
     Ok(path)
+}
+
+fn soth_home_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("SOTH_HOME_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".soth"))
+        .unwrap_or_else(|| PathBuf::from(".soth"))
 }
 
 fn resolve_proxy_binary() -> Result<PathBuf> {
@@ -214,6 +230,8 @@ struct GeneratedProxyConfig {
 #[derive(Debug, Serialize)]
 struct GeneratedMitmConfig {
     bind: String,
+    ca_cert_path: String,
+    ca_key_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,4 +251,93 @@ struct GeneratedSyncConfig {
 #[derive(Debug, Serialize)]
 struct GeneratedTelemetryConfig {
     enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_temp_home<T>(f: impl FnOnce(std::path::PathBuf) -> T + std::panic::UnwindSafe) -> T {
+        let guard = crate::commands::proxy::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_home = std::env::var_os("HOME");
+        let old_soth_home = std::env::var_os("SOTH_HOME_DIR");
+        let soth_home = temp.path().join(".soth");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("SOTH_HOME_DIR", &soth_home);
+        }
+
+        let result = std::panic::catch_unwind(|| f(temp.path().to_path_buf()));
+
+        match old_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        match old_soth_home {
+            Some(value) => unsafe {
+                std::env::set_var("SOTH_HOME_DIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("SOTH_HOME_DIR");
+            },
+        }
+        drop(guard);
+
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[test]
+    fn generated_proxy_config_includes_ca_paths_and_port_override() {
+        with_temp_home(|home| {
+            let mut config = SothConfig::default();
+            config.forward_proxy.address = "127.0.0.1".to_string();
+            config.forward_proxy.port = 8080;
+            config.forward_proxy.ca.cert_path = home
+                .join("certs")
+                .join("custom-ca.pem")
+                .display()
+                .to_string();
+            config.forward_proxy.ca.key_path = home
+                .join("certs")
+                .join("custom-ca-key.pem")
+                .display()
+                .to_string();
+            config.bundle.bundle_dir = home.join("bundle").display().to_string();
+            config.bundle.vendor_pubkey_hex = "11".repeat(32);
+
+            let generated = write_proxy_config(&config, Some(9999)).expect("write proxy config");
+            let raw = std::fs::read_to_string(&generated).expect("read generated config");
+            let value: toml::Value = toml::from_str(raw.as_str()).expect("parse generated toml");
+
+            assert_eq!(
+                value
+                    .get("mitm")
+                    .and_then(|v| v.get("bind"))
+                    .and_then(toml::Value::as_str),
+                Some("127.0.0.1:9999")
+            );
+            assert_eq!(
+                value
+                    .get("mitm")
+                    .and_then(|v| v.get("ca_cert_path"))
+                    .and_then(toml::Value::as_str),
+                Some(config.forward_proxy.ca.cert_path.as_str())
+            );
+            assert_eq!(
+                value
+                    .get("mitm")
+                    .and_then(|v| v.get("ca_key_path"))
+                    .and_then(toml::Value::as_str),
+                Some(config.forward_proxy.ca.key_path.as_str())
+            );
+        });
+    }
 }

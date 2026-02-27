@@ -9,13 +9,24 @@ mod status;
 mod system;
 
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    match TEST_ENV_MUTEX.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 pub async fn run_on(port: Option<u16>, global_config: Option<PathBuf>) -> anyhow::Result<()> {
     let selected_port = if port.is_some() {
         port
     } else {
         let config = crate::cli_config::load_effective_config(None, global_config.as_ref())?;
-        Some(config.forward_proxy.port)
+        Some(daemon::active_daemon_port_hint().unwrap_or(config.forward_proxy.port))
     };
     system::enable(selected_port).await
 }

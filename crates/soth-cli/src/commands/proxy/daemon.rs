@@ -373,6 +373,17 @@ fn read_pid_metadata() -> anyhow::Result<Option<DaemonPidMetadata>> {
     Ok(Some(parsed))
 }
 
+pub(crate) fn active_daemon_port_hint() -> Option<u16> {
+    let metadata = read_pid_metadata().ok().flatten()?;
+    if !is_expected_daemon_process(metadata.pid) {
+        return None;
+    }
+    if !pid_matches_owned_artifacts(metadata.pid) {
+        return None;
+    }
+    Some(metadata.port)
+}
+
 fn write_pid_metadata(pid: u32, port: u16, owner_token: &str) -> anyhow::Result<()> {
     let path = pid_meta_path();
     let executable = std::env::current_exe()
@@ -1273,19 +1284,9 @@ fn print_last_lines(path: &Path, lines: usize) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn lock_env_mutex() -> std::sync::MutexGuard<'static, ()> {
-        match ENV_MUTEX.get_or_init(|| Mutex::new(())).lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
 
     fn with_temp_home<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> T {
-        let guard = lock_env_mutex();
+        let guard = crate::commands::proxy::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let soth_home_override = temp.path().join(".soth");
         let old_home = env::var_os("HOME");
@@ -1370,7 +1371,7 @@ mod tests {
 
     #[test]
     fn daemon_timeout_env_is_clamped() {
-        let _guard = lock_env_mutex();
+        let _guard = crate::commands::proxy::lock_test_env();
         unsafe {
             env::set_var("SOTH_DAEMON_STARTUP_TIMEOUT_SECS", "999");
         }

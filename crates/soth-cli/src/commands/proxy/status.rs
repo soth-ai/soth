@@ -204,11 +204,22 @@ fn collect_proxy_status(
     now: DateTime<Utc>,
 ) -> Result<ProxyStatusJson> {
     let pid = read_pid_file();
+    let pid_meta = read_pid_meta();
+    let active_port = pid_meta
+        .as_ref()
+        .and_then(|meta| meta.port)
+        .unwrap_or(config.forward_proxy.port);
     let running = pid
         .map(process_running)
-        .unwrap_or_else(|| is_port_open(config.forward_proxy.port));
-    let uptime_secs =
-        read_pid_meta_started_at().map(|started| now.timestamp().saturating_sub(started) as u64);
+        .unwrap_or_else(|| is_port_open(active_port));
+    let uptime_secs = pid_meta
+        .as_ref()
+        .filter(|meta| meta.started_at_unix_secs > 0)
+        .map(|meta| {
+            now.timestamp()
+                .saturating_sub(meta.started_at_unix_secs as i64)
+                .max(0) as u64
+        });
     let system_proxy_on = system_proxy_state_path().exists();
     let autostart = super::autostart::managed_status().unwrap_or_else(|_| "unknown".to_string());
     let cert_path = cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()));
@@ -217,7 +228,7 @@ fn collect_proxy_status(
     Ok(ProxyStatusJson {
         running,
         pid,
-        port: config.forward_proxy.port,
+        port: active_port,
         uptime_secs,
         system_proxy_on,
         autostart,
@@ -437,30 +448,39 @@ fn read_pid_file() -> Option<u32> {
 
 #[derive(serde::Deserialize)]
 struct DaemonPidMetadata {
+    #[serde(default)]
+    #[allow(dead_code)]
+    pid: Option<u32>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
     started_at_unix_secs: u64,
 }
 
-fn read_pid_meta_started_at() -> Option<i64> {
+fn read_pid_meta() -> Option<DaemonPidMetadata> {
     let path = run_dir().join("proxy.pid.meta.json");
     let content = std::fs::read_to_string(path).ok()?;
-    let parsed = serde_json::from_str::<DaemonPidMetadata>(&content).ok()?;
-    Some(parsed.started_at_unix_secs as i64)
+    serde_json::from_str::<DaemonPidMetadata>(&content).ok()
 }
 
 fn run_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|home| home.join(".soth").join("run"))
-        .unwrap_or_else(|| PathBuf::from(".soth/run"))
+    soth_home_dir().join("run")
 }
 
-fn runtime_dir() -> PathBuf {
+fn soth_home_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("SOTH_HOME_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     dirs::home_dir()
-        .map(|home| home.join(".soth").join("runtime"))
-        .unwrap_or_else(|| PathBuf::from(".soth/runtime"))
+        .map(|home| home.join(".soth"))
+        .unwrap_or_else(|| PathBuf::from(".soth"))
 }
 
 fn system_proxy_state_path() -> PathBuf {
-    runtime_dir().join("system_proxy_state.json")
+    run_dir().join("system_proxy_state.json")
 }
 
 #[cfg(unix)]
@@ -575,6 +595,39 @@ fn parse_sync_age(raw: &str, now: DateTime<Utc>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+
+    fn with_temp_soth_home<T>(
+        f: impl FnOnce(std::path::PathBuf) -> T + std::panic::UnwindSafe,
+    ) -> T {
+        let guard = crate::commands::proxy::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let soth_home = temp.path().join(".soth");
+        let old_home = env::var_os("HOME");
+        let old_soth_home = env::var_os("SOTH_HOME_DIR");
+
+        unsafe {
+            env::set_var("HOME", temp.path());
+            env::set_var("SOTH_HOME_DIR", &soth_home);
+        }
+
+        let result = std::panic::catch_unwind(|| f(soth_home));
+
+        match old_home {
+            Some(value) => unsafe { env::set_var("HOME", value) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+        match old_soth_home {
+            Some(value) => unsafe { env::set_var("SOTH_HOME_DIR", value) },
+            None => unsafe { env::remove_var("SOTH_HOME_DIR") },
+        }
+
+        drop(guard);
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
 
     #[test]
     fn collect_last_24h_uses_timestamp_utc_when_present() {
@@ -646,5 +699,37 @@ mod tests {
 
         let column = intercept_timestamp_column(&conn).expect("resolve timestamp column");
         assert_eq!(column, Some("timestamp_epoch_ms"));
+    }
+
+    #[test]
+    fn collect_proxy_status_prefers_daemon_metadata_port() {
+        with_temp_soth_home(|soth_home| {
+            let run = soth_home.join("run");
+            std::fs::create_dir_all(&run).expect("create run dir");
+
+            std::fs::write(run.join("proxy.pid"), format!("{}\n", std::process::id()))
+                .expect("write pid file");
+            std::fs::write(
+                run.join("proxy.pid.meta.json"),
+                r#"{"schema_version":2,"pid":1,"port":9191,"started_at_unix_secs":1700000000}"#,
+            )
+            .expect("write pid metadata");
+
+            let mut config = cli_config::SothConfig::default();
+            config.forward_proxy.port = 8080;
+            config.forward_proxy.ca.cert_path = "/non/existent/cert.pem".to_string();
+            let status = collect_proxy_status(&config, Utc::now()).expect("collect status");
+            assert_eq!(status.port, 9191);
+        });
+    }
+
+    #[test]
+    fn system_proxy_state_path_uses_soth_home_dir() {
+        with_temp_soth_home(|soth_home| {
+            assert_eq!(
+                system_proxy_state_path(),
+                soth_home.join("run").join("system_proxy_state.json")
+            );
+        });
     }
 }
