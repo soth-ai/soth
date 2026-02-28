@@ -210,10 +210,13 @@ fn derive_interception_destinations_from_bundle(bundle: &soth_bundle::LoadedBund
     let mut hosts = BTreeSet::new();
 
     for host in bundle.detect.domain_index.keys() {
-        maybe_insert_exact_host(host.as_str(), &mut hosts);
+        maybe_insert_destination_host_pattern(host.as_str(), &mut hosts);
     }
     for pattern in &bundle.gating.gates.stage0_tls.tls_intercept_hosts {
-        maybe_insert_exact_host(pattern.as_str(), &mut hosts);
+        maybe_insert_destination_host_pattern(pattern.as_str(), &mut hosts);
+    }
+    for pattern in &bundle.gating.gates.stage0_tls.passthrough_domains {
+        maybe_insert_destination_host_pattern(pattern.as_str(), &mut hosts);
     }
     for entity in bundle
         .gating
@@ -224,7 +227,7 @@ fn derive_interception_destinations_from_bundle(bundle: &soth_bundle::LoadedBund
         .chain(bundle.gating.entities.native_apps.iter())
     {
         for rule in &entity.hosts {
-            maybe_insert_exact_host(rule.pattern.as_str(), &mut hosts);
+            maybe_insert_destination_host_pattern(rule.pattern.as_str(), &mut hosts);
         }
     }
 
@@ -236,23 +239,13 @@ fn derive_interception_destinations_from_bundle(bundle: &soth_bundle::LoadedBund
     destinations
 }
 
-fn maybe_insert_exact_host(candidate: &str, out: &mut BTreeSet<String>) {
+fn maybe_insert_destination_host_pattern(candidate: &str, out: &mut BTreeSet<String>) {
     let mut host = candidate.trim().to_ascii_lowercase();
     if host.is_empty() {
         return;
     }
     if let Some(stripped) = host.strip_prefix('=') {
         host = stripped.to_string();
-    }
-
-    if host.contains('*')
-        || host.contains('/')
-        || host.contains('?')
-        || host.contains('#')
-        || host.contains(' ')
-        || host.contains('\t')
-    {
-        return;
     }
 
     if let Some((left, right)) = host.rsplit_once(':') {
@@ -266,5 +259,53 @@ fn maybe_insert_exact_host(candidate: &str, out: &mut BTreeSet<String>) {
     if host.is_empty() {
         return;
     }
+    if !is_supported_destination_host_pattern(host.as_str()) {
+        return;
+    }
+    if !host.chars().any(|ch| ch.is_ascii_alphanumeric()) {
+        return;
+    }
     out.insert(host);
+}
+
+fn is_supported_destination_host_pattern(host: &str) -> bool {
+    host.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '*'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maybe_insert_destination_host_pattern;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn destination_pattern_keeps_wildcard_hosts() {
+        let mut hosts = BTreeSet::new();
+        maybe_insert_destination_host_pattern("bedrock-runtime*.amazonaws.com", &mut hosts);
+        assert!(hosts.contains("bedrock-runtime*.amazonaws.com"));
+    }
+
+    #[test]
+    fn destination_pattern_keeps_exact_hosts_without_equals_prefix() {
+        let mut hosts = BTreeSet::new();
+        maybe_insert_destination_host_pattern("=accounts.google.com", &mut hosts);
+        assert!(hosts.contains("accounts.google.com"));
+    }
+
+    #[test]
+    fn destination_pattern_strips_numeric_port_suffix() {
+        let mut hosts = BTreeSet::new();
+        maybe_insert_destination_host_pattern("api.openai.com:443", &mut hosts);
+        assert!(hosts.contains("api.openai.com"));
+        assert!(!hosts.contains("api.openai.com:443"));
+    }
+
+    #[test]
+    fn destination_pattern_rejects_invalid_non_host_shapes() {
+        let mut hosts = BTreeSet::new();
+        maybe_insert_destination_host_pattern("/v1/chat/*", &mut hosts);
+        maybe_insert_destination_host_pattern("https://api.openai.com", &mut hosts);
+        maybe_insert_destination_host_pattern("*", &mut hosts);
+        assert!(hosts.is_empty());
+    }
 }
