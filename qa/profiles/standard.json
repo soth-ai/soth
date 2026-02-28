@@ -1,0 +1,46 @@
+{
+  "description": "Standard suite with full proxy corpus and corpus contract tests",
+  "steps": [
+    {
+      "id": "proxy_e2e_standard",
+      "target": "proxy_e2e",
+      "cwd": ".",
+      "cmd": ["./scripts/gating_trace_corpus.sh"],
+      "env": {
+        "SOTH_GATING_CORPUS_OUT": "/tmp/soth-corpus-suite-proxy-standard.ndjson",
+        "SOTH_GATING_CORPUS_CASE_CAP": "0"
+      },
+      "result_kind": "proxy_ndjson"
+    },
+    {
+      "id": "classify_corpus_contract",
+      "target": "classify",
+      "cwd": ".",
+      "cmd": [
+        "cargo",
+        "test",
+        "-p",
+        "soth-classify",
+        "--test",
+        "corpus_e2e",
+        "classify_output_corpus_matches_expected_contract"
+      ],
+      "result_kind": "cargo_test"
+    },
+    {
+      "id": "policy_corpus_contract",
+      "target": "policy",
+      "cwd": ".",
+      "cmd": [
+        "cargo",
+        "test",
+        "-p",
+        "soth-policy",
+        "--test",
+        "corpus_e2e",
+        "policy_output_corpus_matches_expected_contract"
+      ],
+      "result_kind": "cargo_test"
+    }
+  ]
+}

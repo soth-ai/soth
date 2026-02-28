@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://soth.local/qa/corpus/case.schema.json",
+  "title": "SOTH Corpus Case",
+  "type": "object",
+  "required": ["id", "tags", "input", "expect"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 3
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "input": {
+      "type": "object",
+      "properties": {
+        "method": {"type": "string"},
+        "url": {"type": "string"},
+        "headers": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "body": {"type": "string"}
+      },
+      "required": ["method", "url"]
+    },
+    "expect": {
+      "type": "object",
+      "properties": {
+        "gate": {
+          "type": "object",
+          "properties": {
+            "decision": {
+              "type": "string",
+              "enum": ["intercept", "skip", "tls_passthrough", "tls_intercept"]
+            }
+          }
+        },
+        "detect": {
+          "type": "object",
+          "properties": {
+            "parser_id": {"type": "string"},
+            "provider": {"type": ["string", "null"]}
+          }
+        },
+        "classify": {
+          "type": "object",
+          "properties": {
+            "required": {"type": "boolean"}
+          }
+        },
+        "telemetry": {
+          "type": "object",
+          "properties": {
+            "required": {"type": "boolean"}
+          }
+        }
+      }
+    }
+  }
+}
