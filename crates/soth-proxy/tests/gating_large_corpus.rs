@@ -188,6 +188,7 @@ fn build_handler(
         proxy_db,
         pipeline_config,
         soth_classify::ClassifyConfig::default(),
+        soth_proxy::classify_task::RuntimeConfig::default(),
         "org-test".to_string(),
         "team-test".to_string(),
         "device-test".to_string(),
@@ -300,20 +301,26 @@ fn choose_safe_path_for_allow(host_rule: &HostRule) -> Option<String> {
 }
 
 fn blacklisted(stage3: &Stage3Config, host: &str, path: &str) -> bool {
-    let url = format!("{host}{path}").to_ascii_lowercase();
+    let host_lc = host.to_ascii_lowercase();
     if stage3
-        .blacklisted_keywords
+        .blacklisted_host_substrings
         .iter()
-        .any(|needle| !needle.is_empty() && url.contains(needle.to_ascii_lowercase().as_str()))
+        .any(|needle| !needle.is_empty() && host_lc.contains(needle.to_ascii_lowercase().as_str()))
     {
         return true;
     }
-    stage3.blacklisted_path_substrings.iter().any(|needle| {
-        !needle.is_empty()
-            && path
-                .to_ascii_lowercase()
-                .contains(needle.to_ascii_lowercase().as_str())
-    })
+    let path_lc = path.to_ascii_lowercase();
+    if stage3
+        .blacklisted_keywords
+        .iter()
+        .any(|needle| !needle.is_empty() && path_lc.contains(needle.to_ascii_lowercase().as_str()))
+    {
+        return true;
+    }
+    stage3
+        .blacklisted_path_substrings
+        .iter()
+        .any(|needle| !needle.is_empty() && path_lc.contains(needle.to_ascii_lowercase().as_str()))
 }
 
 fn pick_identity(map: &BTreeMap<String, soth_core::IdentityEntry>) -> Option<String> {

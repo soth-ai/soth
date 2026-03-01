@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -94,6 +95,10 @@ impl ProxyConfig {
 
     pub fn classify_config(&self) -> soth_classify::ClassifyConfig {
         self.classify.to_classify_config()
+    }
+
+    pub fn classify_runtime_config(&self) -> crate::classify_task::RuntimeConfig {
+        self.classify.to_runtime_config()
     }
 
     pub fn telemetry_config(
@@ -254,14 +259,21 @@ pub struct ClassifyRuntimeConfig {
     pub embedding_enabled: bool,
     pub anomaly_enabled: bool,
     pub lsh_near_dupe_threshold: u32,
+    pub max_in_flight: usize,
+    pub slot_acquire_timeout_ms: u64,
+    pub db_write_queue_capacity: usize,
 }
 
 impl Default for ClassifyRuntimeConfig {
     fn default() -> Self {
+        let runtime_defaults = crate::classify_task::RuntimeConfig::default();
         Self {
             embedding_enabled: true,
             anomaly_enabled: true,
             lsh_near_dupe_threshold: 8,
+            max_in_flight: runtime_defaults.max_in_flight,
+            slot_acquire_timeout_ms: runtime_defaults.slot_acquire_timeout_ms,
+            db_write_queue_capacity: runtime_defaults.db_write_queue_capacity,
         }
     }
 }
@@ -273,6 +285,14 @@ impl ClassifyRuntimeConfig {
         cfg.anomaly_enabled = self.anomaly_enabled;
         cfg.lsh_near_dupe_threshold = self.lsh_near_dupe_threshold;
         cfg
+    }
+
+    fn to_runtime_config(&self) -> crate::classify_task::RuntimeConfig {
+        crate::classify_task::RuntimeConfig {
+            max_in_flight: self.max_in_flight,
+            slot_acquire_timeout_ms: self.slot_acquire_timeout_ms,
+            db_write_queue_capacity: self.db_write_queue_capacity,
+        }
     }
 }
 
@@ -415,15 +435,18 @@ impl SyncRuntimeConfig {
         db_path: PathBuf,
         bundle_dir: PathBuf,
     ) -> soth_sync::SyncAgentConfig {
+        let registry_cache_path = self
+            .registry_cache_path
+            .clone()
+            .or_else(|| Some(bundle_dir.join("registry_bundle_cache.json")));
+        let heartbeat_registry_cache_path = registry_cache_path.clone();
+
         soth_sync::SyncAgentConfig {
             endpoint: self.endpoint.clone(),
             api_key: self.api_key.clone(),
             event_db_path: db_path,
             cache_path: self.cache_path.clone(),
-            registry_cache_path: self
-                .registry_cache_path
-                .clone()
-                .or_else(|| Some(bundle_dir.join("registry_bundle_cache.json"))),
+            registry_cache_path,
             agent_instance_id: self.agent_instance_id.clone(),
             proxy_version: "soth-proxy-dev".to_string(),
             retry_queue_dir: self.retry_queue_dir.clone(),
@@ -442,7 +465,12 @@ impl SyncRuntimeConfig {
             frontload_exchange_upload_path: None,
             body_upload_max_bytes: self.body_upload_max_bytes.max(1),
             global_tags: BTreeMap::new(),
-            heartbeat_telemetry: None,
+            heartbeat_telemetry: Some(Arc::new(move || {
+                if let Some(path) = heartbeat_registry_cache_path.as_ref() {
+                    crate::heartbeat_telemetry::refresh_registry_runtime_metrics(path);
+                }
+                Some(crate::heartbeat_telemetry::heartbeat_telemetry_snapshot())
+            })),
             telemetry: soth_sync::TelemetrySyncConfig {
                 enabled: self.telemetry_enabled,
                 ..soth_sync::TelemetrySyncConfig::default()
@@ -500,4 +528,42 @@ fn parse_fixed_hex<const N: usize>(value: &str, field: &str) -> Result<[u8; N]> 
     let mut out = [0u8; N];
     out.copy_from_slice(bytes.as_slice());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyConfig;
+
+    #[test]
+    fn sync_config_wires_edge_heartbeat_telemetry_provider() {
+        let cfg = ProxyConfig::default();
+        let sync_cfg = cfg.sync_config();
+        let provider = sync_cfg
+            .heartbeat_telemetry
+            .as_ref()
+            .expect("heartbeat telemetry provider should be wired");
+        let telemetry = provider().expect("heartbeat telemetry should be present");
+        assert!(telemetry
+            .counters
+            .contains_key("edge.blacklist.keyword_dropped_total"));
+        assert!(telemetry
+            .counters
+            .contains_key("edge.registry.source_state"));
+        assert!(telemetry
+            .counters
+            .contains_key("edge.runtime.policy_enforced_false_total"));
+    }
+
+    #[test]
+    fn classify_runtime_knobs_map_from_config() {
+        let mut cfg = ProxyConfig::default();
+        cfg.classify.max_in_flight = 12;
+        cfg.classify.slot_acquire_timeout_ms = 750;
+        cfg.classify.db_write_queue_capacity = 8_192;
+
+        let runtime = cfg.classify_runtime_config();
+        assert_eq!(runtime.max_in_flight, 12);
+        assert_eq!(runtime.slot_acquire_timeout_ms, 750);
+        assert_eq!(runtime.db_write_queue_capacity, 8_192);
+    }
 }

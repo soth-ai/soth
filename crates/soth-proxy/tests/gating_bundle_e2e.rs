@@ -175,6 +175,7 @@ fn gating_bundle(include_openai_passthrough: bool) -> GatingBundle {
             stage3_blacklist: Stage3Config {
                 blacklisted_keywords: vec!["telemetry".to_string(), "sentry".to_string()],
                 blacklisted_path_substrings: vec!["/monitoring".to_string()],
+                blacklisted_host_substrings: Vec::new(),
                 graphql_operation_blacklist: Vec::new(),
                 graphql_operation_blacklist_enabled: false,
                 match_type: soth_core::BlacklistMatchType::CaseInsensitiveSubstring,
@@ -242,6 +243,7 @@ fn build_handler(
         proxy_db,
         pipeline_config,
         soth_classify::ClassifyConfig::default(),
+        soth_proxy::classify_task::RuntimeConfig::default(),
         "org-test".to_string(),
         "team-test".to_string(),
         "device-test".to_string(),

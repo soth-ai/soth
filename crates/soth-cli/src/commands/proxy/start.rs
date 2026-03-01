@@ -184,6 +184,11 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
             api_key: config.cloud.api_key.clone().unwrap_or_default(),
             sync_interval_secs: config.cloud.sync_interval_secs.max(5),
         },
+        classify: GeneratedClassifyConfig {
+            max_in_flight: config.proxy.classify_max_in_flight,
+            slot_acquire_timeout_ms: config.proxy.classify_slot_acquire_timeout_ms,
+            db_write_queue_capacity: config.proxy.db_write_queue_capacity,
+        },
         telemetry: GeneratedTelemetryConfig {
             enabled: sync_enabled && config.exchange.enabled,
         },
@@ -233,6 +238,7 @@ struct GeneratedProxyConfig {
     mitm: GeneratedMitmConfig,
     bundle: GeneratedBundleConfig,
     sync: GeneratedSyncConfig,
+    classify: GeneratedClassifyConfig,
     telemetry: GeneratedTelemetryConfig,
 }
 
@@ -256,6 +262,13 @@ struct GeneratedSyncConfig {
     endpoint: String,
     api_key: String,
     sync_interval_secs: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedClassifyConfig {
+    max_in_flight: usize,
+    slot_acquire_timeout_ms: u64,
+    db_write_queue_capacity: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +335,9 @@ mod tests {
                 .to_string();
             config.bundle.bundle_dir = home.join("bundle").display().to_string();
             config.bundle.vendor_pubkey_hex = "11".repeat(32);
+            config.proxy.classify_max_in_flight = 12;
+            config.proxy.classify_slot_acquire_timeout_ms = 750;
+            config.proxy.db_write_queue_capacity = 8_192;
 
             let generated = write_proxy_config(&config, Some(9999)).expect("write proxy config");
             let raw = std::fs::read_to_string(&generated).expect("read generated config");
@@ -347,6 +363,27 @@ mod tests {
                     .and_then(|v| v.get("ca_key_path"))
                     .and_then(toml::Value::as_str),
                 Some(config.forward_proxy.ca.key_path.as_str())
+            );
+            assert_eq!(
+                value
+                    .get("classify")
+                    .and_then(|v| v.get("max_in_flight"))
+                    .and_then(toml::Value::as_integer),
+                Some(12)
+            );
+            assert_eq!(
+                value
+                    .get("classify")
+                    .and_then(|v| v.get("slot_acquire_timeout_ms"))
+                    .and_then(toml::Value::as_integer),
+                Some(750)
+            );
+            assert_eq!(
+                value
+                    .get("classify")
+                    .and_then(|v| v.get("db_write_queue_capacity"))
+                    .and_then(toml::Value::as_integer),
+                Some(8_192)
             );
         });
     }

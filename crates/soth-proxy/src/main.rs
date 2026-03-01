@@ -8,6 +8,8 @@ use tracing::{info, warn};
 
 use soth_proxy::{config::ProxyConfig, db, ProxyHandler};
 
+const DISCOVERY_TLS_WILDCARD_DESTINATION: &str = "*:443";
+
 #[derive(Clone)]
 struct BundleWatcherInstallHook {
     watcher: Arc<soth_bundle::BundleWatcher>,
@@ -103,6 +105,7 @@ async fn main() -> Result<()> {
         db,
         config.pipeline.clone(),
         config.classify_config(),
+        config.classify_runtime_config(),
         config.org_id.clone(),
         config.team_id.clone(),
         config.device_id_hash.clone(),
@@ -231,12 +234,29 @@ fn derive_interception_destinations_from_bundle(bundle: &soth_bundle::LoadedBund
         }
     }
 
-    let mut destinations = Vec::with_capacity(hosts.len() * 2);
+    let mut destinations = Vec::with_capacity(hosts.len() * 2 + 1);
     for host in hosts {
         destinations.push(format!("{host}:443"));
         destinations.push(format!("{host}:80"));
     }
+    add_discovery_tls_wildcard_destination(
+        &mut destinations,
+        bundle.gating.gates.stage0_tls.enable_discovery,
+    );
     destinations
+}
+
+fn add_discovery_tls_wildcard_destination(destinations: &mut Vec<String>, discovery_enabled: bool) {
+    if !discovery_enabled {
+        return;
+    }
+    if destinations
+        .iter()
+        .any(|destination| destination == DISCOVERY_TLS_WILDCARD_DESTINATION)
+    {
+        return;
+    }
+    destinations.push(DISCOVERY_TLS_WILDCARD_DESTINATION.to_string());
 }
 
 fn maybe_insert_destination_host_pattern(candidate: &str, out: &mut BTreeSet<String>) {
@@ -275,7 +295,10 @@ fn is_supported_destination_host_pattern(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::maybe_insert_destination_host_pattern;
+    use super::{
+        add_discovery_tls_wildcard_destination, maybe_insert_destination_host_pattern,
+        DISCOVERY_TLS_WILDCARD_DESTINATION,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -307,5 +330,36 @@ mod tests {
         maybe_insert_destination_host_pattern("https://api.openai.com", &mut hosts);
         maybe_insert_destination_host_pattern("*", &mut hosts);
         assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn discovery_wildcard_added_when_enabled() {
+        let mut destinations = vec!["api.openai.com:443".to_string()];
+        add_discovery_tls_wildcard_destination(&mut destinations, true);
+        assert!(destinations
+            .iter()
+            .any(|destination| destination == DISCOVERY_TLS_WILDCARD_DESTINATION));
+    }
+
+    #[test]
+    fn discovery_wildcard_not_added_when_disabled() {
+        let mut destinations = vec!["api.openai.com:443".to_string()];
+        add_discovery_tls_wildcard_destination(&mut destinations, false);
+        assert!(!destinations
+            .iter()
+            .any(|destination| destination == DISCOVERY_TLS_WILDCARD_DESTINATION));
+    }
+
+    #[test]
+    fn discovery_wildcard_is_not_duplicated() {
+        let mut destinations = vec![DISCOVERY_TLS_WILDCARD_DESTINATION.to_string()];
+        add_discovery_tls_wildcard_destination(&mut destinations, true);
+        assert_eq!(
+            destinations
+                .iter()
+                .filter(|destination| *destination == DISCOVERY_TLS_WILDCARD_DESTINATION)
+                .count(),
+            1
+        );
     }
 }

@@ -132,12 +132,18 @@ impl Default for BundleConfig {
 #[serde(default)]
 pub struct ProxyConfig {
     pub db_path: String,
+    pub classify_max_in_flight: usize,
+    pub classify_slot_acquire_timeout_ms: u64,
+    pub db_write_queue_capacity: usize,
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             db_path: "~/.soth/logs/events.db".to_string(),
+            classify_max_in_flight: 8,
+            classify_slot_acquire_timeout_ms: 250,
+            db_write_queue_capacity: 4_096,
         }
     }
 }

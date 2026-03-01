@@ -135,6 +135,7 @@ fn build_handler(
         proxy_db,
         pipeline_config,
         soth_classify::ClassifyConfig::default(),
+        soth_proxy::classify_task::RuntimeConfig::default(),
         "org-test".to_string(),
         "team-test".to_string(),
         "device-test".to_string(),
