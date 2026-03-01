@@ -180,6 +180,8 @@ pub struct Stage3Config {
     #[serde(default)]
     pub blacklisted_path_substrings: Vec<String>,
     #[serde(default)]
+    pub blacklisted_host_substrings: Vec<String>,
+    #[serde(default)]
     pub graphql_operation_blacklist: Vec<String>,
     #[serde(default)]
     pub graphql_operation_blacklist_enabled: bool,
@@ -191,6 +193,7 @@ impl Default for Stage3Config {
         Self {
             blacklisted_keywords: Vec::new(),
             blacklisted_path_substrings: Vec::new(),
+            blacklisted_host_substrings: Vec::new(),
             graphql_operation_blacklist: Vec::new(),
             graphql_operation_blacklist_enabled: false,
             match_type: BlacklistMatchType::CaseInsensitiveSubstring,

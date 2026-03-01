@@ -40,7 +40,7 @@ def normalize_host_pattern:
       | gsub("^\\.+|\\.+$"; "")
     ) as $normalized
   | if $normalized == "" then ""
-    elif ($anchored_end and (not $had_wildcard)) then ("=" + $normalized)
+    elif ($anchored_end and ($had_wildcard | not)) then ("=" + $normalized)
     else $normalized
     end;
 
@@ -176,11 +176,11 @@ def entity_rule($entry):
         blacklisted_keywords: (
           (($b.catalogs.analytics_blocklist // [])
            + ($b.filters.keywords // [])
-           + ($b.filters.path_patterns // [])
-           + ($b.filters.domain_patterns // []))
+           + ($b.filters.path_patterns // []))
           | unique
         ),
         blacklisted_path_substrings: ($b.catalogs.analytics_blocklist // []),
+        blacklisted_host_substrings: ($b.filters.domain_patterns // []),
         graphql_operation_blacklist: [],
         graphql_operation_blacklist_enabled: false,
         match_type: "case_insensitive_substring"

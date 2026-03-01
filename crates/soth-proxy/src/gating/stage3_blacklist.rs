@@ -1,26 +1,28 @@
 use soth_core::{BlacklistMatchType, DecisionReason, Stage3Config};
 
-pub fn evaluate(
-    cfg: &Stage3Config,
-    full_url: &str,
-    path: &str,
-    body: &[u8],
-) -> Option<DecisionReason> {
+pub fn evaluate(cfg: &Stage3Config, host: &str, path: &str, body: &[u8]) -> Option<DecisionReason> {
     if matches!(cfg.match_type, BlacklistMatchType::CaseInsensitiveSubstring) {
-        let url = full_url.to_ascii_lowercase();
+        let host_lc = host.to_ascii_lowercase();
         if cfg
-            .blacklisted_keywords
+            .blacklisted_host_substrings
             .iter()
-            .any(|needle| !needle.is_empty() && url.contains(&needle.to_ascii_lowercase()))
+            .any(|needle| !needle.is_empty() && host_lc.contains(&needle.to_ascii_lowercase()))
         {
             return Some(DecisionReason::BlacklistedKeyword);
         }
-        if cfg.blacklisted_path_substrings.iter().any(|needle| {
-            !needle.is_empty()
-                && path
-                    .to_ascii_lowercase()
-                    .contains(&needle.to_ascii_lowercase())
-        }) {
+        let path_lc = path.to_ascii_lowercase();
+        if cfg
+            .blacklisted_keywords
+            .iter()
+            .any(|needle| !needle.is_empty() && path_lc.contains(&needle.to_ascii_lowercase()))
+        {
+            return Some(DecisionReason::BlacklistedKeyword);
+        }
+        if cfg
+            .blacklisted_path_substrings
+            .iter()
+            .any(|needle| !needle.is_empty() && path_lc.contains(&needle.to_ascii_lowercase()))
+        {
             return Some(DecisionReason::BlacklistedKeyword);
         }
     }
@@ -47,4 +49,40 @@ fn extract_graphql_operation_name(body: &[u8]) -> Option<String> {
     json.get("operationName")
         .and_then(serde_json::Value::as_str)
         .map(std::string::ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evaluate;
+    use soth_core::{BlacklistMatchType, DecisionReason, Stage3Config};
+
+    fn stage3() -> Stage3Config {
+        Stage3Config {
+            blacklisted_keywords: vec!["telemetry".to_string()],
+            blacklisted_path_substrings: vec!["/monitoring".to_string()],
+            blacklisted_host_substrings: vec!["cloudflare".to_string()],
+            graphql_operation_blacklist: Vec::new(),
+            graphql_operation_blacklist_enabled: false,
+            match_type: BlacklistMatchType::CaseInsensitiveSubstring,
+        }
+    }
+
+    #[test]
+    fn keywords_are_path_only_not_host() {
+        let cfg = stage3();
+        let got = evaluate(&cfg, "telemetry.example.com", "/v1/chat/completions", b"{}");
+        assert!(got.is_none(), "keyword should not match host");
+    }
+
+    #[test]
+    fn host_substrings_match_host_only() {
+        let cfg = stage3();
+        let got = evaluate(
+            &cfg,
+            "gateway.ai.cloudflare.com",
+            "/v1/chat/completions",
+            b"{}",
+        );
+        assert_eq!(got, Some(DecisionReason::BlacklistedKeyword));
+    }
 }

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [features]
 default = []
 local-debug = []
+dev-pipeline-trace = ["soth-proxy/dev-pipeline-trace"]
 
 [dependencies]
 soth-core = { workspace = true }

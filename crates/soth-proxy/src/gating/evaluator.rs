@@ -15,12 +15,20 @@ use crate::gating::stage2_whitelist::{
 use crate::gating::stage3_blacklist;
 use crate::gating::stage4_app_type;
 use crate::gating::stage5_host_origin::{extract_host_from_url, origin_allowed};
+use crate::heartbeat_telemetry;
 
 #[derive(Debug, Default)]
 struct DiscoveryCounters {
     date: String,
     app_hits: HashMap<String, u32>,
     domain_hits: HashMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryCounterOutcome {
+    InterceptFirstSeen,
+    InterceptAlreadySeen,
+    CapReached,
 }
 
 impl DiscoveryCounters {
@@ -33,24 +41,34 @@ impl DiscoveryCounters {
         }
     }
 
-    fn app_allowed(&mut self, key: &str, limit: u32) -> bool {
+    fn app_allowed(&mut self, key: &str, limit: u32) -> DiscoveryCounterOutcome {
         self.reset_if_new_day();
         let counter = self.app_hits.entry(key.to_string()).or_insert(0);
         if *counter >= limit {
-            return false;
+            return DiscoveryCounterOutcome::CapReached;
         }
+        let outcome = if *counter == 0 {
+            DiscoveryCounterOutcome::InterceptFirstSeen
+        } else {
+            DiscoveryCounterOutcome::InterceptAlreadySeen
+        };
         *counter += 1;
-        true
+        outcome
     }
 
-    fn domain_allowed(&mut self, key: &str, limit: u32) -> bool {
+    fn domain_allowed(&mut self, key: &str, limit: u32) -> DiscoveryCounterOutcome {
         self.reset_if_new_day();
         let counter = self.domain_hits.entry(key.to_string()).or_insert(0);
         if *counter >= limit {
-            return false;
+            return DiscoveryCounterOutcome::CapReached;
         }
+        let outcome = if *counter == 0 {
+            DiscoveryCounterOutcome::InterceptFirstSeen
+        } else {
+            DiscoveryCounterOutcome::InterceptAlreadySeen
+        };
         *counter += 1;
-        true
+        outcome
     }
 }
 
@@ -95,18 +113,42 @@ impl GateEvaluator {
     pub fn evaluate_tls(&self, sni: &str) -> GateDecision {
         let defaults = &self.bundle.gates.defaults;
         if !defaults.sensor_enabled {
+            crate::trace::tls_stage(
+                sni,
+                "passthrough",
+                DecisionReason::TlsDefaultPassthrough,
+                "sensor disabled",
+            );
             return GateDecision::Passthrough;
         }
 
         let host = normalize_sni(sni);
         if host.is_empty() {
+            crate::trace::tls_stage(
+                sni,
+                "passthrough",
+                DecisionReason::TlsDefaultPassthrough,
+                "empty host",
+            );
             return GateDecision::Passthrough;
         }
 
         if self.tls_passthrough_matcher.matches(host.as_str()) {
+            crate::trace::tls_stage(
+                host.as_str(),
+                "passthrough",
+                DecisionReason::TlsPassthroughDomain,
+                "matched passthrough list",
+            );
             return GateDecision::Passthrough;
         }
         if self.tls_intercept_matcher.matches(host.as_str()) {
+            crate::trace::tls_stage(
+                host.as_str(),
+                "intercept",
+                DecisionReason::TlsInterceptCatalog,
+                "matched tls intercept catalog",
+            );
             return GateDecision::Intercept;
         }
 
@@ -114,10 +156,22 @@ impl GateEvaluator {
         if cfg.enable_discovery {
             let limit = defaults.discovery.unknown_domain_daily_limit.max(1);
             if self.allow_domain_discovery(host.as_str(), limit) {
+                crate::trace::tls_stage(
+                    host.as_str(),
+                    "intercept",
+                    DecisionReason::TlsDiscovery,
+                    "domain discovery",
+                );
                 return GateDecision::Intercept;
             }
         }
 
+        crate::trace::tls_stage(
+            host.as_str(),
+            "passthrough",
+            DecisionReason::TlsDefaultPassthrough,
+            "default passthrough",
+        );
         GateDecision::Passthrough
     }
 
@@ -127,6 +181,7 @@ impl GateEvaluator {
         process_info: &Option<ProcessInfo>,
         overrides: GateOverrides,
     ) -> GateOutcome {
+        let connection_id = req.connection_meta.connection_id;
         let defaults = &self.bundle.gates.defaults;
         let unknown_app_action = overrides
             .unknown_app_action
@@ -142,20 +197,40 @@ impl GateEvaluator {
         if let Some(matched) = identity.as_ref() {
             match matched.entry.action {
                 soth_core::ProcessAction::Skip => {
+                    crate::trace::gate_stage(
+                        connection_id,
+                        GateStage::Stage1AppOrigin,
+                        "skip",
+                        Some(DecisionReason::ProcessAction),
+                        "process action skip",
+                    );
                     return outcome_skip(
                         DecisionReason::ProcessAction,
                         GateStage::Stage1AppOrigin,
                         false,
-                    )
+                    );
                 }
                 soth_core::ProcessAction::Block => {
+                    crate::trace::gate_stage(
+                        connection_id,
+                        GateStage::Stage1AppOrigin,
+                        "block",
+                        Some(DecisionReason::ProcessAction),
+                        "process action block",
+                    );
                     return outcome_block(
                         DecisionReason::ProcessAction,
                         GateStage::Stage1AppOrigin,
                         false,
-                    )
+                    );
                 }
-                soth_core::ProcessAction::Intercept => {}
+                soth_core::ProcessAction::Intercept => crate::trace::gate_stage(
+                    connection_id,
+                    GateStage::Stage1AppOrigin,
+                    "continue",
+                    None,
+                    "process action intercept",
+                ),
             }
         }
 
@@ -174,20 +249,41 @@ impl GateEvaluator {
         if apply_unknown_policy {
             match unknown_app_action {
                 UnknownAppAction::Skip => {
+                    crate::trace::gate_stage(
+                        connection_id,
+                        GateStage::Stage1AppOrigin,
+                        "skip",
+                        Some(DecisionReason::UnknownAppPolicy),
+                        "unknown app policy skip",
+                    );
                     return outcome_skip(
                         DecisionReason::UnknownAppPolicy,
                         GateStage::Stage1AppOrigin,
                         false,
-                    )
+                    );
                 }
                 UnknownAppAction::Block => {
+                    crate::trace::gate_stage(
+                        connection_id,
+                        GateStage::Stage1AppOrigin,
+                        "block",
+                        Some(DecisionReason::UnknownAppPolicy),
+                        "unknown app policy block",
+                    );
                     return outcome_block(
                         DecisionReason::UnknownAppPolicy,
                         GateStage::Stage1AppOrigin,
                         false,
-                    )
+                    );
                 }
                 UnknownAppAction::Intercept => {
+                    crate::trace::gate_stage(
+                        connection_id,
+                        GateStage::Stage1AppOrigin,
+                        "continue",
+                        None,
+                        "unknown app policy intercept",
+                    );
                     if let Some(info) = process_info.as_ref() {
                         let key = info
                             .bundle_id
@@ -201,6 +297,14 @@ impl GateEvaluator {
                     }
                 }
             }
+        } else {
+            crate::trace::gate_stage(
+                connection_id,
+                GateStage::Stage1AppOrigin,
+                "continue",
+                None,
+                "stage1 passed",
+            );
         }
 
         let host = request_host(req);
@@ -218,16 +322,34 @@ impl GateEvaluator {
 
         if entity_match.is_none() && !discovery_capture {
             return match non_cataloged_host_action {
-                NonCatalogedAction::Skip => outcome_skip(
-                    DecisionReason::NotInCatalog,
-                    GateStage::Stage2Whitelist,
-                    false,
-                ),
-                NonCatalogedAction::Passthrough => outcome_passthrough(
-                    DecisionReason::NotInCatalog,
-                    GateStage::Stage2Whitelist,
-                    false,
-                ),
+                NonCatalogedAction::Skip => {
+                    crate::trace::gate_stage(
+                        connection_id,
+                        GateStage::Stage2Whitelist,
+                        "skip",
+                        Some(DecisionReason::NotInCatalog),
+                        "not in catalog",
+                    );
+                    outcome_skip(
+                        DecisionReason::NotInCatalog,
+                        GateStage::Stage2Whitelist,
+                        false,
+                    )
+                }
+                NonCatalogedAction::Passthrough => {
+                    crate::trace::gate_stage(
+                        connection_id,
+                        GateStage::Stage2Whitelist,
+                        "passthrough",
+                        Some(DecisionReason::NotInCatalog),
+                        "not in catalog",
+                    );
+                    outcome_passthrough(
+                        DecisionReason::NotInCatalog,
+                        GateStage::Stage2Whitelist,
+                        false,
+                    )
+                }
             };
         }
 
@@ -241,19 +363,74 @@ impl GateEvaluator {
                     .stage2_whitelist
                     .allow_empty_means_allow_all_except_denied,
             ) {
+                crate::trace::gate_stage(
+                    connection_id,
+                    GateStage::Stage2Whitelist,
+                    "skip",
+                    Some(reason),
+                    "path/method rule rejected",
+                );
                 return outcome_skip(reason, GateStage::Stage2Whitelist, discovery_capture);
             }
         }
+        let stage2_note = if discovery_capture {
+            "discovery capture"
+        } else if entity_match.is_some() {
+            "entity match accepted"
+        } else {
+            "whitelist allowed by override"
+        };
+        crate::trace::gate_stage(
+            connection_id,
+            GateStage::Stage2Whitelist,
+            "continue",
+            None,
+            stage2_note,
+        );
 
-        let full_url = format!("{}{}", host, req.path);
         if let Some(reason) = stage3_blacklist::evaluate(
             &self.bundle.gates.stage3_blacklist,
-            full_url.as_str(),
+            host.as_str(),
             req.path.as_str(),
             req.body.as_ref(),
         ) {
+            match reason {
+                DecisionReason::BlacklistedKeyword => {
+                    heartbeat_telemetry::record_blacklist_keyword_dropped();
+                }
+                DecisionReason::BlacklistedGraphQLOperation => {
+                    heartbeat_telemetry::record_blacklist_graphql_dropped();
+                }
+                _ => {}
+            }
+            crate::trace::gate_stage(
+                connection_id,
+                GateStage::Stage3Blacklist,
+                "skip",
+                Some(reason),
+                "blacklist matched",
+            );
             return outcome_skip(reason, GateStage::Stage3Blacklist, discovery_capture);
         }
+        crate::trace::gate_stage(
+            connection_id,
+            GateStage::Stage3Blacklist,
+            "continue",
+            None,
+            "blacklist clear",
+        );
+
+        crate::trace::gate_stage(
+            connection_id,
+            GateStage::Stage4AppType,
+            "continue",
+            None,
+            match app_type {
+                AppType::Host => "app_type host",
+                AppType::NonHost => "app_type non_host",
+                AppType::Unknown => "app_type unknown",
+            },
+        );
 
         if app_type == AppType::Host
             && !(self
@@ -267,12 +444,30 @@ impl GateEvaluator {
                 &self.bundle.gates.stage5_host_origin.allowed_host_origins,
             )
         {
+            crate::trace::gate_stage(
+                connection_id,
+                GateStage::Stage5HostOrigin,
+                "skip",
+                Some(DecisionReason::HostOriginNotAllowed),
+                "origin gate rejected",
+            );
             return outcome_skip(
                 DecisionReason::HostOriginNotAllowed,
                 GateStage::Stage5HostOrigin,
                 discovery_capture,
             );
         }
+        crate::trace::gate_stage(
+            connection_id,
+            GateStage::Stage5HostOrigin,
+            "continue",
+            None,
+            if app_type == AppType::Host {
+                "origin gate passed"
+            } else {
+                "origin gate skipped for non-host"
+            },
+        );
 
         let capture_mode =
             derive_capture_mode(identity.as_ref(), entity_match.as_ref(), discovery_capture);
@@ -281,6 +476,13 @@ impl GateEvaluator {
             matched_provider.is_some(),
             matched_application.is_some(),
             app_type,
+        );
+        crate::trace::gate_stage(
+            connection_id,
+            GateStage::Intercept,
+            "intercept",
+            Some(DecisionReason::Intercept),
+            "all gates passed",
         );
 
         GateOutcome {
@@ -298,14 +500,40 @@ impl GateEvaluator {
 
     fn allow_app_discovery(&self, app_key: &str, limit: u32) -> bool {
         if let Ok(mut counters) = self.discovery_counters.lock() {
-            return counters.app_allowed(app_key, limit);
+            return match counters.app_allowed(app_key, limit) {
+                DiscoveryCounterOutcome::InterceptFirstSeen => {
+                    heartbeat_telemetry::record_discovery_catalog_intercept();
+                    true
+                }
+                DiscoveryCounterOutcome::InterceptAlreadySeen => {
+                    heartbeat_telemetry::record_discovery_catalog_seen_skip();
+                    true
+                }
+                DiscoveryCounterOutcome::CapReached => {
+                    heartbeat_telemetry::record_discovery_catalog_cap_skip();
+                    false
+                }
+            };
         }
         false
     }
 
     fn allow_domain_discovery(&self, host: &str, limit: u32) -> bool {
         if let Ok(mut counters) = self.discovery_counters.lock() {
-            return counters.domain_allowed(host, limit);
+            return match counters.domain_allowed(host, limit) {
+                DiscoveryCounterOutcome::InterceptFirstSeen => {
+                    heartbeat_telemetry::record_discovery_catalog_intercept();
+                    true
+                }
+                DiscoveryCounterOutcome::InterceptAlreadySeen => {
+                    heartbeat_telemetry::record_discovery_catalog_seen_skip();
+                    true
+                }
+                DiscoveryCounterOutcome::CapReached => {
+                    heartbeat_telemetry::record_discovery_catalog_cap_skip();
+                    false
+                }
+            };
         }
         false
     }
@@ -438,6 +666,7 @@ fn outcome_block(reason: DecisionReason, stage: GateStage, discovery_capture: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heartbeat_telemetry;
     use std::collections::{HashMap, HashSet};
 
     fn bundle_with_defaults(skip_if_unresolved_process: bool) -> Arc<GatingBundle> {
@@ -544,5 +773,52 @@ mod tests {
         assert!(matches!(outcome.decision, GateDecision::Intercept));
         assert_eq!(outcome.reason, DecisionReason::Intercept);
         assert_eq!(outcome.terminal_stage, GateStage::Intercept);
+    }
+
+    fn counter_value(key: &str) -> u64 {
+        heartbeat_telemetry::heartbeat_telemetry_snapshot()
+            .counters
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn blacklist_match_updates_heartbeat_counter() {
+        let mut bundle = (*bundle_with_defaults(false)).clone();
+        bundle.gates.stage3_blacklist.blacklisted_keywords = vec!["chat".to_string()];
+        let evaluator = GateEvaluator::new(Arc::new(bundle));
+        let mut req = request_for("api.openai.com");
+        req.body = bytes::Bytes::from_static(b"contains token marker");
+
+        let before = counter_value("edge.blacklist.keyword_dropped_total");
+        let outcome = evaluator.evaluate_http(&req, &None, GateOverrides::default());
+        let after = counter_value("edge.blacklist.keyword_dropped_total");
+
+        assert!(matches!(outcome.decision, GateDecision::Skip));
+        assert_eq!(outcome.reason, DecisionReason::BlacklistedKeyword);
+        assert!(after >= before + 1);
+    }
+
+    #[test]
+    fn repeated_discovery_updates_seen_skip_counter() {
+        let mut bundle = (*bundle_with_defaults(false)).clone();
+        bundle.gates.stage0_tls.tls_intercept_hosts.clear();
+        bundle.gates.stage0_tls.enable_discovery = true;
+        bundle.gates.defaults.discovery.unknown_domain_daily_limit = 2;
+        let evaluator = GateEvaluator::new(Arc::new(bundle));
+
+        let host = "unknown-discovery.example.com";
+        let before_intercept = counter_value("edge.discovery.catalog.intercept_total");
+        let before_seen_skip = counter_value("edge.discovery.catalog.already_seen_skip_total");
+        let first = evaluator.evaluate_tls(host);
+        let second = evaluator.evaluate_tls(host);
+        let after_intercept = counter_value("edge.discovery.catalog.intercept_total");
+        let after_seen_skip = counter_value("edge.discovery.catalog.already_seen_skip_total");
+
+        assert!(matches!(first, GateDecision::Intercept));
+        assert!(matches!(second, GateDecision::Intercept));
+        assert!(after_intercept >= before_intercept + 1);
+        assert!(after_seen_skip >= before_seen_skip + 1);
     }
 }

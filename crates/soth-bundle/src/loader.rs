@@ -307,6 +307,7 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
             stage3_blacklist: Stage3Config {
                 blacklisted_keywords: detect.filters.path_keywords.clone(),
                 blacklisted_path_substrings: detect.filters.path_keywords.clone(),
+                blacklisted_host_substrings: Vec::new(),
                 graphql_operation_blacklist: Vec::new(),
                 graphql_operation_blacklist_enabled: false,
                 match_type: BlacklistMatchType::CaseInsensitiveSubstring,

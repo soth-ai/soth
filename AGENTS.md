@@ -48,6 +48,24 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
 - Cloud sync uploads Exchange V2 batches to `/api/v1/exchanges/batch`.
 - Registry bundle cache is read from local cache path and hot-reloaded by runtime components.
 
+## Debug Notes (2026-02-27)
+- Gating Stage 3 blacklist scope:
+  Current proxy evaluator applies blacklist keyword matching against the full URL string (host + path) and path/body checks.
+  This can cause host-level false positives when broad keywords are present in hostnames (for example `cloudflare` or `googleapis`).
+  When editing bundle/compiler behavior, decide explicitly whether blacklist keywords are path-only or host+path; if host matching is required, keep a separate host blacklist list to avoid accidental drops.
+- Transport failure investigation (`api.tbox.cn`):
+  Reproduced that proxy-intercepted HTTPS over HTTP/2 can fail with `connection reset by peer`, while the same endpoint over HTTP/1.1 succeeds end-to-end.
+  Evidence:
+  - `curl -x http://127.0.0.1:5074 --http1.1 https://api.tbox.cn/` -> `200`
+  - `curl -x http://127.0.0.1:5074 --http2 https://api.tbox.cn/` -> reset / `code=000`
+  - `curl --noproxy '*' --http2 https://api.tbox.cn/` negotiates `ALPN: http/1.1` (upstream does not support h2)
+  - TLS gate trace still shows `tls_intercept_catalog`, but no HTTP gate event is emitted on failed HTTP/2 requests.
+  Root cause:
+  - In `soth-mitm` (`mitm-sidecar/src/flow_intercept.rs`), when downstream negotiates h2 but upstream negotiates non-h2, the flow exits with `MitmHttpError` instead of protocol downgrading.
+  Current guidance:
+  - For gating corpus/debug traffic, force HTTP/1.1 for h2-incompatible hosts to avoid transport false negatives.
+  - Fix direction: add host-level `disable_h2` override (or h2->h1 downgrade path) so downstream ALPN does not advertise/commit h2 for those hosts.
+
 ## Practical Checklist for New Provider/Agent
 1. Add/update provider + domain + detection rules in cloud bundle seed/compiler.
 2. Ensure `detection_id` values are present and stable in compiled bundle/providers.
