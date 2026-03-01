@@ -1,0 +1,10 @@
+[package]
+name = "soth-sqlite-vec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+sqlite-vec = "0.1"

@@ -218,6 +218,15 @@ async fn contract_sync_endpoints_and_cursors() {
         host_details.cpu_logical_cores.is_some(),
         "heartbeat host_details.cpu_logical_cores should be populated"
     );
+    if let Some(memory_total_mb) = host_details.memory_total_mb {
+        assert!(memory_total_mb > 0);
+    }
+    if let Some(cpu_model) = host_details.cpu_model.as_deref() {
+        assert!(
+            !cpu_model.trim().is_empty(),
+            "heartbeat host_details.cpu_model should be non-empty when present"
+        );
+    }
 
     let metadata = &captured.metadata_requests[0];
     assert_eq!(metadata.batch.len(), 1);

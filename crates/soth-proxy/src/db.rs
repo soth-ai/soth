@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::named_params;
+use chrono::Utc;
+use rusqlite::{named_params, params};
 use soth_classify::ClassifiedResult;
 use soth_core::{CaptureMode, DetectResult, ProxyContext};
 use uuid::Uuid;
@@ -104,6 +105,8 @@ const REQUIRED_INTERCEPT_COLUMNS: &[(&str, &str)] = &[
 ];
 
 pub fn open(db_path: &Path) -> Result<rusqlite::Connection> {
+    soth_sqlite_vec::register_auto_extension();
+
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create DB directory: {}", parent.display()))?;
@@ -198,10 +201,10 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
 
     ensure_intercept_columns(conn)?;
 
-    // sqlite-vec is optional in local builds; keep schema creation best-effort.
-    let _ = conn.execute_batch(
+    conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS embedding_index USING vec0(event_id TEXT, embedding FLOAT[384]);",
-    );
+    )
+    .context("failed to create sqlite-vec embedding_index table")?;
 
     Ok(())
 }
@@ -210,6 +213,7 @@ pub fn write_intercept_record(
     db: &Arc<Mutex<rusqlite::Connection>>,
     connection_id: Uuid,
     result: &ClassifiedResult,
+    embedding: Option<&[f32]>,
     detect_result: &DetectResult,
     proxy_ctx: &ProxyContext,
     raw_body_for_commitment: Option<&[u8]>,
@@ -290,9 +294,13 @@ pub fn write_intercept_record(
     } else {
         None
     };
+    let embedding_json = embedding
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to serialize embedding for sqlite storage")?;
 
     let conn = db.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
-    conn.execute(
+    let inserted_rows = conn.execute(
         "
         INSERT OR IGNORE INTO intercept_records (
             event_id,
@@ -424,7 +432,7 @@ pub fn write_intercept_record(
             ":redaction_count": redaction_count,
             ":commitment_hash": commitment_hash,
             ":commitment_nonce": result.commitment_nonce.to_vec(),
-            ":embedding": Option::<Vec<u8>>::None,
+            ":embedding": embedding_json.clone(),
             ":topic_cluster_id": i64::from(result.topic_cluster_id),
             ":semantic_hash": result.semantic_hash.clone(),
             ":use_case_label": format!("{:?}", result.use_case_label),
@@ -458,7 +466,62 @@ pub fn write_intercept_record(
     )
     .context("failed to insert intercept record")?;
 
+    if inserted_rows == 0 {
+        return Ok(());
+    }
+
+    if let Some(embedding_json) = embedding_json {
+        if let Err(error) = conn.execute(
+            "
+            INSERT OR IGNORE INTO embedding_index (event_id, embedding)
+            VALUES (?1, ?2)
+            ",
+            params![result.telemetry_event.event_id.to_string(), embedding_json],
+        ) {
+            if !is_missing_table_error(&error, "embedding_index") {
+                return Err(error).context("failed to insert embedding into sqlite-vec index");
+            }
+        }
+    }
+
     Ok(())
+}
+
+pub fn expire_embeddings(db: &Arc<Mutex<rusqlite::Connection>>, days: u32) -> Result<usize> {
+    let cutoff_epoch_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_sub(i64::from(days).saturating_mul(86_400_000));
+
+    let conn = db.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+    if let Err(error) = conn.execute(
+        "
+        DELETE FROM embedding_index
+        WHERE event_id IN (
+            SELECT event_id
+            FROM intercept_records
+            WHERE timestamp_utc < ?1
+        )
+        ",
+        params![cutoff_epoch_ms],
+    ) {
+        if !is_missing_table_error(&error, "embedding_index") {
+            return Err(error).context("failed to delete expired sqlite-vec rows");
+        }
+    }
+
+    let nulled_rows = conn
+        .execute(
+            "
+            UPDATE intercept_records
+            SET embedding = NULL
+            WHERE timestamp_utc < ?1
+              AND embedding IS NOT NULL
+            ",
+            params![cutoff_epoch_ms],
+        )
+        .context("failed to clear expired embedding blobs")?;
+
+    Ok(nulled_rows)
 }
 
 fn ensure_intercept_columns(conn: &rusqlite::Connection) -> Result<()> {
@@ -486,6 +549,16 @@ fn table_columns(conn: &rusqlite::Connection, table: &str) -> Result<HashSet<Str
         out.insert(row?);
     }
     Ok(out)
+}
+
+fn is_missing_table_error(error: &rusqlite::Error, table: &str) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(_, Some(message)) => {
+            message.contains("no such table")
+                && (message.contains(table) || message.contains(&format!("\"{table}\"")))
+        }
+        _ => false,
+    }
 }
 
 fn as_sql_bool(value: bool) -> i64 {

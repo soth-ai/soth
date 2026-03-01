@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -23,6 +23,9 @@ use crate::response;
 use crate::session::SessionStore;
 use crate::streaming::StreamingStore;
 
+const EMBEDDING_RETENTION_DAYS: u32 = 90;
+const EMBEDDING_CLEANUP_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
 #[derive(Clone)]
 pub struct ProxyHandler {
     bundle_handle: soth_bundle::BundleHandle,
@@ -33,8 +36,10 @@ pub struct ProxyHandler {
     streaming: Arc<StreamingStore>,
     telemetry: Option<Arc<soth_telemetry::TelemetryPipeline>>,
     db: Arc<Mutex<rusqlite::Connection>>,
+    classify_runtime: Arc<crate::classify_task::Runtime>,
     pipeline_config: Arc<PipelineConfig>,
     classify_config: Arc<soth_classify::ClassifyConfig>,
+    last_embedding_cleanup_epoch: Arc<AtomicI64>,
     org_id: String,
     team_id: String,
     device_id_hash: String,
@@ -49,6 +54,7 @@ impl ProxyHandler {
         db: Arc<Mutex<rusqlite::Connection>>,
         pipeline_config: PipelineConfig,
         classify_config: soth_classify::ClassifyConfig,
+        classify_runtime_config: crate::classify_task::RuntimeConfig,
         org_id: String,
         team_id: String,
         device_id_hash: String,
@@ -60,6 +66,8 @@ impl ProxyHandler {
         let initial_gating_bundle =
             load_local_gating_bundle().unwrap_or_else(|| initial_bundle.gating.clone());
         let initial_gate_evaluator = GateEvaluator::new(initial_gating_bundle);
+        let classify_runtime =
+            crate::classify_task::Runtime::new(db.clone(), classify_runtime_config);
         Self {
             bundle_handle,
             parser_registry: Arc::new(ArcSwap::from_pointee(initial_parser_registry)),
@@ -69,8 +77,10 @@ impl ProxyHandler {
             streaming: Arc::new(StreamingStore::new()),
             telemetry,
             db,
+            classify_runtime,
             pipeline_config: Arc::new(pipeline_config),
             classify_config: Arc::new(classify_config),
+            last_embedding_cleanup_epoch: Arc::new(AtomicI64::new(0)),
             org_id,
             team_id,
             device_id_hash,
@@ -83,6 +93,44 @@ impl ProxyHandler {
         self.pending.evict_stale(Duration::from_secs(300));
         self.streaming.evict_stale(Duration::from_secs(300));
         self.session_store.evict_stale();
+        self.expire_embeddings_if_due();
+    }
+
+    fn expire_embeddings_if_due(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let last = self.last_embedding_cleanup_epoch.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < EMBEDDING_CLEANUP_INTERVAL_SECS {
+            return;
+        }
+
+        if self
+            .last_embedding_cleanup_epoch
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        match crate::db::expire_embeddings(&self.db, EMBEDDING_RETENTION_DAYS) {
+            Ok(expired_rows) => {
+                if expired_rows > 0 {
+                    tracing::debug!(
+                        expired_rows,
+                        retention_days = EMBEDDING_RETENTION_DAYS,
+                        "expired old embeddings from local sqlite storage"
+                    );
+                }
+            }
+            Err(error) => {
+                self.last_embedding_cleanup_epoch
+                    .store(last, Ordering::Relaxed);
+                warn!(
+                    error = %error,
+                    retention_days = EMBEDDING_RETENTION_DAYS,
+                    "failed to run embedding retention cleanup"
+                );
+            }
+        }
     }
 
     pub fn on_bundle_updated(&self, bundle: &soth_bundle::LoadedBundle) {
@@ -99,6 +147,7 @@ impl ProxyHandler {
 
     async fn handle_request(&self, request: soth_mitm::RawRequest) -> soth_mitm::HandlerDecision {
         let mut req = mitm_request_to_core(&request);
+        let connection_id = req.connection_meta.connection_id;
         let host = extract_host(
             req.headers.get("host").map(String::as_str),
             req.path.as_str(),
@@ -120,6 +169,13 @@ impl ProxyHandler {
                     .and_then(map_non_cataloged_action),
             },
         );
+        crate::trace::http_gate(
+            connection_id,
+            req.method.as_str(),
+            host.as_str(),
+            req.path.as_str(),
+            &outcome,
+        );
         if self.pipeline_config.non_cataloged_host_action == Some(crate::config::GateAction::Block)
             && matches!(outcome.reason, soth_core::DecisionReason::NotInCatalog)
             && matches!(
@@ -127,6 +183,11 @@ impl ProxyHandler {
                 soth_core::GateDecision::Skip | soth_core::GateDecision::Passthrough
             )
         {
+            crate::trace::handler_decision(
+                connection_id,
+                "block",
+                "non_cataloged_host_action override",
+            );
             return soth_mitm::HandlerDecision::Block {
                 status: 403,
                 body: Bytes::from("host not in AI catalog"),
@@ -135,9 +196,11 @@ impl ProxyHandler {
 
         match &outcome.decision {
             soth_core::GateDecision::Skip | soth_core::GateDecision::Passthrough => {
-                return soth_mitm::HandlerDecision::Allow
+                crate::trace::handler_decision(connection_id, "allow", "gate skip/passthrough");
+                return soth_mitm::HandlerDecision::Allow;
             }
             soth_core::GateDecision::Block { status, message } => {
+                crate::trace::handler_decision(connection_id, "block", "gate block");
                 return soth_mitm::HandlerDecision::Block {
                     status: *status,
                     body: Bytes::from(message.clone()),
@@ -156,6 +219,7 @@ impl ProxyHandler {
             outcome.matched_application.as_deref(),
         ));
 
+        let original_body_len = req.body.len();
         let body_size_limit = self.pipeline_config.body_size_limit_bytes;
         let mut truncated_body_sizes = None;
         if req.body.len() > body_size_limit {
@@ -183,9 +247,14 @@ impl ProxyHandler {
                 detect_result.normalized.parse_confidence = soth_core::ParseConfidence::Partial;
             }
         }
+        crate::trace::detect_summary(
+            connection_id,
+            original_body_len,
+            truncated_body_sizes,
+            &detect_result,
+        );
         let content_for_embedding = extract_content_for_embedding(&req.body);
 
-        let connection_id = req.connection_meta.connection_id;
         let request_timestamp_ms = chrono::Utc::now().timestamp_millis();
         self.session_store
             .mark_request_started(connection_id, request_timestamp_ms);
@@ -240,7 +309,7 @@ impl ProxyHandler {
             policy_block_enforced.clone(),
             self.session_store.clone(),
             self.telemetry.clone(),
-            self.db.clone(),
+            self.classify_runtime.clone(),
         );
 
         let timeout_ms = self.pipeline_config.block_signal_timeout_ms;
@@ -249,6 +318,11 @@ impl ProxyHandler {
                 Ok(kind) => {
                     if let soth_core::PolicyDecisionKind::Block { status, message } = kind {
                         policy_block_enforced.store(true, Ordering::Relaxed);
+                        crate::trace::handler_decision(
+                            connection_id,
+                            "block",
+                            "policy block signal immediate",
+                        );
                         return soth_mitm::HandlerDecision::Block {
                             status,
                             body: Bytes::from(message),
@@ -258,20 +332,35 @@ impl ProxyHandler {
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Closed) => {}
             }
+            crate::trace::handler_decision(connection_id, "allow", "policy signal not ready");
             return soth_mitm::HandlerDecision::Allow;
         }
 
         match tokio::time::timeout(Duration::from_millis(timeout_ms), &mut block_rx).await {
             Ok(Ok(soth_core::PolicyDecisionKind::Block { status, message })) => {
                 policy_block_enforced.store(true, Ordering::Relaxed);
+                crate::trace::handler_decision(connection_id, "block", "policy block signal");
                 soth_mitm::HandlerDecision::Block {
                     status,
                     body: Bytes::from(message),
                 }
             }
-            Ok(Ok(_)) => soth_mitm::HandlerDecision::Allow,
-            Ok(Err(_)) => soth_mitm::HandlerDecision::Allow,
-            Err(_) => soth_mitm::HandlerDecision::Allow,
+            Ok(Ok(_)) => {
+                crate::trace::handler_decision(connection_id, "allow", "policy non-block signal");
+                soth_mitm::HandlerDecision::Allow
+            }
+            Ok(Err(_)) => {
+                crate::trace::handler_decision(
+                    connection_id,
+                    "allow",
+                    "policy signal channel closed",
+                );
+                soth_mitm::HandlerDecision::Allow
+            }
+            Err(_) => {
+                crate::trace::handler_decision(connection_id, "allow", "policy signal timeout");
+                soth_mitm::HandlerDecision::Allow
+            }
         }
     }
 
@@ -287,7 +376,9 @@ impl ProxyHandler {
             return;
         };
 
-        if let Some(usage) = response::extract_usage(response.body.as_ref()) {
+        let usage = response::extract_usage(response.body.as_ref());
+        crate::trace::response_usage(connection_id, usage.as_ref());
+        if let Some(usage) = usage {
             self.session_store
                 .apply_response_usage(connection_id, &usage);
         }
@@ -331,10 +422,9 @@ impl soth_mitm::InterceptHandler for ProxyHandler {
         host: &str,
         _process_info: Option<&soth_mitm::ProcessInfo>,
     ) -> bool {
-        matches!(
-            self.gate_evaluator.load().evaluate_tls(host),
-            soth_core::GateDecision::Intercept
-        )
+        let decision = self.gate_evaluator.load().evaluate_tls(host);
+        crate::trace::tls_gate(host, &decision);
+        matches!(decision, soth_core::GateDecision::Intercept)
     }
 
     fn on_request(

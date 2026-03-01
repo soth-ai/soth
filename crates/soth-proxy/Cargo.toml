@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+dev-pipeline-trace = []
+
 [dependencies]
 anyhow.workspace = true
 arc-swap = "1"
@@ -33,6 +37,7 @@ soth-core = { workspace = true }
 soth-bundle = { workspace = true }
 soth-detect = { workspace = true }
 soth-classify = { workspace = true }
+soth-sqlite-vec = { workspace = true }
 soth-telemetry = { workspace = true }
 soth-policy = { workspace = true }
 soth-sync = { workspace = true }

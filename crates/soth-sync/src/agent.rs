@@ -2022,8 +2022,15 @@ struct HostOsIdentity {
     version: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct HostHardwareDetails {
+    cpu_model: Option<String>,
+    memory_total_mb: Option<u64>,
+}
+
 fn collect_heartbeat_host_details() -> HeartbeatHostDetails {
     let identity = detect_host_os_identity();
+    let hardware = detect_host_hardware_details();
     HeartbeatHostDetails {
         platform: Some(identity.platform),
         os_family: Some(identity.family),
@@ -2033,6 +2040,8 @@ fn collect_heartbeat_host_details() -> HeartbeatHostDetails {
         cpu_logical_cores: std::thread::available_parallelism()
             .ok()
             .map(|value| value.get() as u64),
+        cpu_model: hardware.cpu_model,
+        memory_total_mb: hardware.memory_total_mb,
     }
 }
 
@@ -2069,6 +2078,62 @@ fn detect_host_os_identity() -> HostOsIdentity {
         family: std::env::consts::FAMILY.to_string(),
         version: None,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_host_hardware_details() -> HostHardwareDetails {
+    let cpu_model = run_trimmed_command_output(("sysctl", &["-n", "machdep.cpu.brand_string"]));
+    let memory_total_mb = run_trimmed_command_output(("sysctl", &["-n", "hw.memsize"]))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(bytes_to_mb);
+    HostHardwareDetails {
+        cpu_model,
+        memory_total_mb,
+    }
+}
+
+#[cfg(windows)]
+fn detect_host_hardware_details() -> HostHardwareDetails {
+    let cpu_model =
+        run_trimmed_command_output(("cmd", &["/C", "wmic", "cpu", "get", "Name", "/value"]))
+            .and_then(|value| parse_command_key_value(&value, "Name"));
+    let memory_total_mb = run_trimmed_command_output((
+        "cmd",
+        &[
+            "/C",
+            "wmic",
+            "computersystem",
+            "get",
+            "TotalPhysicalMemory",
+            "/value",
+        ],
+    ))
+    .and_then(|value| parse_command_key_value(&value, "TotalPhysicalMemory"))
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .map(bytes_to_mb);
+    HostHardwareDetails {
+        cpu_model,
+        memory_total_mb,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_host_hardware_details() -> HostHardwareDetails {
+    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|contents| parse_linux_cpu_model(&contents));
+    let memory_total_mb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_linux_mem_total_mb(&contents));
+    HostHardwareDetails {
+        cpu_model,
+        memory_total_mb,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn detect_host_hardware_details() -> HostHardwareDetails {
+    HostHardwareDetails::default()
 }
 
 fn normalize_os_text(raw: &str) -> Option<String> {
@@ -2149,6 +2214,45 @@ fn parse_os_release_key(contents: &str, key: &str) -> Option<String> {
         let raw = line.strip_prefix(&prefix)?;
         normalize_os_text(raw.trim_matches(|ch: char| ch == '"' || ch.is_whitespace()))
     })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_cpu_model(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let value = line
+            .strip_prefix("model name")
+            .or_else(|| line.strip_prefix("Hardware"))?
+            .split_once(':')
+            .map(|(_, value)| value.trim())?;
+        normalize_os_text(value)
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_mem_total_mb(contents: &str) -> Option<u64> {
+    let line = contents
+        .lines()
+        .find(|line| line.trim_start().starts_with("MemTotal:"))?;
+    let mut parts = line.split_whitespace();
+    let _ = parts.next();
+    let value_kb = parts.next()?.parse::<u64>().ok()?;
+    Some(value_kb / 1024)
+}
+
+#[cfg(any(windows, test))]
+fn parse_command_key_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (raw_key, raw_value) = line.split_once('=')?;
+        if !raw_key.trim().eq_ignore_ascii_case(key) {
+            return None;
+        }
+        normalize_os_text(raw_value)
+    })
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn bytes_to_mb(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
 }
 
 fn run_trimmed_command_output(command: (&'static str, &'static [&'static str])) -> Option<String> {
@@ -2293,6 +2397,12 @@ mod tests {
         assert!(!details.os_family.unwrap_or_default().is_empty());
         assert!(!details.arch.unwrap_or_default().is_empty());
         assert!(details.cpu_logical_cores.unwrap_or(0) > 0);
+        if let Some(memory_total_mb) = details.memory_total_mb {
+            assert!(memory_total_mb > 0);
+        }
+        if let Some(cpu_model) = details.cpu_model {
+            assert!(!cpu_model.trim().is_empty());
+        }
     }
 
     #[test]
@@ -2323,6 +2433,30 @@ mod tests {
         assert_eq!(
             parse_os_release_key(os_release, "VERSION_ID").as_deref(),
             Some("24.04")
+        );
+    }
+
+    #[test]
+    fn parse_linux_cpu_model_extracts_first_match() {
+        let cpuinfo = "processor\t: 0\nmodel name\t: Example CPU 3.20GHz\n";
+        assert_eq!(
+            parse_linux_cpu_model(cpuinfo).as_deref(),
+            Some("Example CPU 3.20GHz")
+        );
+    }
+
+    #[test]
+    fn parse_linux_mem_total_mb_extracts_kb_value() {
+        let meminfo = "MemTotal:       32768000 kB\nMemFree:         1024000 kB\n";
+        assert_eq!(parse_linux_mem_total_mb(meminfo), Some(32_000));
+    }
+
+    #[test]
+    fn parse_command_key_value_extracts_case_insensitive_values() {
+        let value = "Name=Example Processor\nOther=ignored\n";
+        assert_eq!(
+            parse_command_key_value(value, "name").as_deref(),
+            Some("Example Processor")
         );
     }
 

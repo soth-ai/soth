@@ -45,7 +45,33 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user libc6-arm64-cross
+
+      - name: Install Rosetta for x86_64 macOS smoke
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          if pgrep oahd >/dev/null 2>&1; then
+            echo "Rosetta already installed"
+          else
+            softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: sqlite-vec smoke test (native targets)
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'x86_64-apple-darwin'
+        run: cargo test -p soth-proxy --test sqlite_vec_smoke --release --target "${{ matrix.target }}"
+
+      - name: sqlite-vec smoke test (x86_64 macOS via Rosetta)
+        if: matrix.target == 'x86_64-apple-darwin'
+        env:
+          CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER: arch -x86_64
+        run: cargo test -p soth-proxy --test sqlite_vec_smoke --release --target "${{ matrix.target }}"
+
+      - name: sqlite-vec smoke test (aarch64 Linux via qemu)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+        run: cargo test -p soth-proxy --test sqlite_vec_smoke --release --target "${{ matrix.target }}"
 
       - name: Build sensor binary (native + non-aarch64-linux targets)
         if: matrix.target != 'aarch64-unknown-linux-gnu'

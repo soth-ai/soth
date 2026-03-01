@@ -382,6 +382,10 @@ pub struct HeartbeatHostDetails {
     pub arch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_logical_cores: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
