@@ -26,11 +26,14 @@ pub(crate) fn run(
     normalized: &soth_core::NormalizedRequest,
     content_for_embedding: Option<&str>,
     config: &VolatilityConfig,
+    bundle_override: Option<&VolatilityConfig>,
 ) -> (VolatilityOutput, u64) {
     let started = Instant::now();
+    let effective_config = bundle_override.unwrap_or(config);
 
-    let dynamic_fraction = compute_dynamic_fraction(normalized, content_for_embedding, config);
-    let class = classify_dynamic_fraction(dynamic_fraction, config);
+    let dynamic_fraction =
+        compute_dynamic_fraction(normalized, content_for_embedding, effective_config);
+    let class = classify_dynamic_fraction(dynamic_fraction, effective_config);
 
     (
         VolatilityOutput {
@@ -106,5 +109,72 @@ fn prefix_signature(normalized: &soth_core::NormalizedRequest) -> Option<String>
             let digest = hasher.finalize();
             Some(hex::encode(digest)[..16].to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soth_core::{DetectedProvider, EndpointType, FormatMetadata, ParseConfidence, ParseSource};
+
+    fn sample_normalized() -> soth_core::NormalizedRequest {
+        soth_core::NormalizedRequest {
+            parse_confidence: ParseConfidence::Full,
+            parser_id: "unit".to_string(),
+            schema_version: "1".to_string(),
+            parse_warnings: Vec::new(),
+            is_ai_call: true,
+            provider: DetectedProvider::OpenAi,
+            model: Some("gpt-4o-mini".to_string()),
+            endpoint_type: EndpointType::ChatCompletion,
+            api_version: None,
+            system_prompt_hash: Some("sys".to_string()),
+            system_prompt_token_estimate: Some(12),
+            user_content_hash: "u".to_string(),
+            user_content_token_estimate: 200,
+            conversation_hash: "c".to_string(),
+            conversation_turn: Some(2),
+            has_tool_definitions: false,
+            tool_definition_hash: Some("tools".to_string()),
+            temperature: None,
+            max_tokens: Some(256),
+            stream: false,
+            top_p: None,
+            stop_sequences: Vec::new(),
+            estimated_input_tokens: 200,
+            estimated_cost_usd: 0.02,
+            parse_source: ParseSource::Rest {
+                provider: DetectedProvider::OpenAi,
+            },
+            canonical_cache_key: "key".to_string(),
+            format_metadata: FormatMetadata::Unknown,
+        }
+    }
+
+    #[test]
+    fn run_uses_bundle_override_thresholds() {
+        let normalized = sample_normalized();
+        let base = VolatilityConfig::default();
+        let mut override_cfg = VolatilityConfig::default();
+        override_cfg.static_threshold = 0.0;
+        override_cfg.low_volatile_threshold = 0.1;
+        override_cfg.dynamic_threshold = 0.2;
+        override_cfg.temporal_keywords = vec!["today".to_string()];
+        override_cfg.pronoun_keywords = vec!["my ".to_string()];
+
+        let content = Some("today my project status");
+        let (base_out, _) = run(&normalized, content, &base, None);
+        let (override_out, _) = run(&normalized, content, &base, Some(&override_cfg));
+
+        assert_ne!(base_out.class, override_out.class);
+        assert!(override_out.dynamic_fraction >= base_out.dynamic_fraction);
+    }
+
+    #[test]
+    fn run_emits_prefix_signature_when_prompt_or_tools_exist() {
+        let normalized = sample_normalized();
+        let cfg = VolatilityConfig::default();
+        let (out, _) = run(&normalized, None, &cfg, None);
+        assert!(out.prefix_repeat_signature.is_some());
     }
 }

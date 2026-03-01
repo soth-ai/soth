@@ -446,6 +446,7 @@ fn session_for_case(idx: usize) -> SessionSnapshot {
         last_model: Some("gpt-4o-mini".to_string()),
         current_request_timestamp: 1_700_000_000_000 + idx as i64,
         last_request_timestamp: Some(1_699_999_999_000 + idx as i64),
+        ..Default::default()
     }
 }
 

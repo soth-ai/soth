@@ -3,7 +3,6 @@ use std::time::Instant;
 use crate::config::ClassifyConfig;
 
 const LSH_BITS: usize = 128;
-const CLUSTER_SPACE: u32 = 1000;
 const LSH_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 #[derive(Debug, Clone)]
@@ -40,8 +39,7 @@ pub(crate) fn run(
     };
 
     let semantic_hash = semantic_lsh_hex(embedding, lsh_projection);
-    let topic_cluster_id = nearest_centroid_id(embedding, centroids)
-        .unwrap_or_else(|| cluster_id_from_hash(&semantic_hash));
+    let topic_cluster_id = nearest_centroid_id(embedding, centroids).unwrap_or_default();
 
     let is_semantic_collision = session
         .map(|snapshot| {
@@ -112,17 +110,6 @@ fn is_valid_lsh_projection(lsh_projection: &[Vec<f32>], embedding_len: usize) ->
             .iter()
             .take(LSH_BITS)
             .all(|row| row.len() == embedding_len)
-}
-
-fn cluster_id_from_hash(semantic_hash: &str) -> u32 {
-    let Ok(bytes) = hex::decode(semantic_hash) else {
-        return 0;
-    };
-    if bytes.len() < 4 {
-        return 0;
-    }
-    let prefix = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    prefix % CLUSTER_SPACE
 }
 
 fn nearest_centroid_id(embedding: &[f32], centroids: &[Vec<f32>]) -> Option<u32> {
@@ -250,5 +237,13 @@ mod tests {
         let hash = semantic_lsh_hex(embedding.as_slice(), &projection);
         assert_eq!(hash.len(), 32);
         assert!(hash.starts_with('b')); // first two bits: 10xxxxxx => 0b10 = hex b? wait, nibble contains 1011 due remaining ones
+    }
+
+    #[test]
+    fn run_uses_unknown_cluster_when_centroids_unavailable() {
+        let vector = vector_with_seed(11);
+        let config = crate::ClassifyConfig::default();
+        let (out, _) = run(Some(vector.as_slice()), &[], &[], None, &config);
+        assert_eq!(out.topic_cluster_id, 0);
     }
 }

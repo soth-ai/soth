@@ -5,7 +5,13 @@ use soth_core::{
 };
 
 fn main() {
-    let bundle_path = std::path::Path::new("/tmp/soth-classify-sample-bundle");
+    let bundle_dir = std::env::var("SOTH_CLASSIFY_BUNDLE_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.soth-local/bundle",
+            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+        )
+    });
+    let bundle_path = std::path::Path::new(bundle_dir.as_str());
     let bundle = soth_classify::load_bundle(bundle_path).expect("load sample bundle");
     let model_status = bundle.model_asset_status();
 

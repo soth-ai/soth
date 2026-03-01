@@ -67,17 +67,23 @@ fn classify_end_to_end_high_anomaly_sets_high_anomaly_flag() {
     let config = soth_classify::ClassifyConfig::default();
 
     let mut detect = common::make_detect_result();
+    detect.normalized.estimated_input_tokens = 700;
     detect.normalized.user_content_token_estimate = 100;
+    detect.normalized.conversation_turn = Some(7);
     detect.artifacts = vec![credential_artifact()];
 
     let mut session = soth_core::SessionSnapshot::default();
+    session.session_token_p14d_avg = 100.0;
     session.total_tokens = 100;
     session.request_count = 10;
+    session.request_count_this_hour = 30;
     session.credential_alerts = 2;
+    session.credential_alerts_24h = 2;
     session.embedding_centroid = Some(vec![-1.0; 384]);
     session.last_model = Some("gpt-4o-mini".to_string());
+    session.max_tool_depth_seen = 2;
     session.current_request_timestamp = 1_700_000_000_600;
-    session.last_request_timestamp = Some(1_700_000_000_000);
+    session.last_request_timestamp = Some(1_700_000_000_300);
 
     let proxy = common::make_proxy_ctx(Some(session));
     let out = soth_classify::classify(

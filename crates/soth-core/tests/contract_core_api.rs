@@ -87,6 +87,14 @@ fn connection_meta_transport_and_enrichment_contract() {
 #[test]
 fn session_snapshot_defaults_include_required_fields() {
     let snapshot = SessionSnapshot::default();
+    assert_eq!(snapshot.session_token_total, 0);
+    assert_eq!(snapshot.session_token_p14d_avg, 0.0);
+    assert_eq!(snapshot.request_count_this_hour, 0);
+    assert_eq!(snapshot.credential_alerts_24h, 0);
+    assert!(snapshot.topic_cluster_ids_seen.is_empty());
+    assert!(snapshot.models_used_this_session.is_empty());
+    assert!(snapshot.last_system_prompt_hash.is_none());
+    assert_eq!(snapshot.max_tool_depth_seen, 0);
     assert_eq!(snapshot.request_count, 0);
     assert_eq!(snapshot.total_tokens, 0);
     assert_eq!(snapshot.total_cost_usd, 0.0);

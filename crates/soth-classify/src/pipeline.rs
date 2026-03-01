@@ -45,6 +45,7 @@ pub(crate) fn run(
         &detect_result.normalized,
         content_for_embedding,
         &config.volatility,
+        bundle.bundle_volatility_config.as_ref(),
     );
 
     let (anomaly, stage5_us) = if config.anomaly_enabled {
@@ -54,7 +55,6 @@ pub(crate) fn run(
             &detect_result.normalized,
             &detect_result.artifacts,
             proxy_ctx.session_snapshot.as_ref(),
-            bundle.anomaly_scorer.as_ref(),
         )
     } else {
         (AnomalyOutput::default(), 0)
@@ -115,15 +115,23 @@ fn assemble_result(
     telemetry: crate::stage7_telemetry::TelemetryOutput,
     stage_latencies: StageTiming,
 ) -> ClassifiedResult {
+    let stage1_embed::EmbedOutput {
+        vector: embedding,
+        norm: embedding_norm,
+        ..
+    } = embed;
+    let embedding_skipped = embedding.is_none();
+
     ClassifiedResult {
         use_case_label: usecase.label,
         use_case_confidence: usecase.confidence,
         secondary_label: usecase.secondary_label,
         topic_cluster_id: cluster.topic_cluster_id,
         semantic_hash: cluster.semantic_hash,
-        embedding_norm: embed.norm,
+        embedding,
+        embedding_norm,
         complexity_score: usecase.complexity_score,
-        embedding_skipped: embed.vector.is_none(),
+        embedding_skipped,
         volatility_class: volatility.class,
         dynamic_fraction: volatility.dynamic_fraction,
         is_semantic_collision: cluster.is_semantic_collision,

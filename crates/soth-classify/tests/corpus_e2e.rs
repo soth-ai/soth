@@ -47,6 +47,8 @@ struct RequestInput {
     stream: Option<bool>,
     has_tool_definitions: Option<bool>,
     conversation_turn: Option<u32>,
+    system_prompt_hash: Option<String>,
+    max_tokens: Option<u32>,
     user_content_token_estimate: Option<u32>,
     estimated_input_tokens: Option<u32>,
     estimated_cost_usd: Option<f64>,
@@ -74,6 +76,14 @@ struct ContextInput {
 
 #[derive(Debug, Deserialize, Default)]
 struct SessionInput {
+    session_token_total: Option<u32>,
+    session_token_p14d_avg: Option<f32>,
+    request_count_this_hour: Option<u32>,
+    credential_alerts_24h: Option<u8>,
+    topic_cluster_ids_seen: Option<Vec<u32>>,
+    models_used_this_session: Option<Vec<String>>,
+    last_system_prompt_hash: Option<String>,
+    max_tool_depth_seen: Option<u8>,
     request_count: Option<u32>,
     total_tokens: Option<u64>,
     total_cost_usd: Option<f32>,
@@ -287,6 +297,8 @@ fn assert_loader_policy_works(bundle: &soth_classify::ClassifyBundle) {
             stream: Some(false),
             has_tool_definitions: Some(false),
             conversation_turn: Some(1),
+            system_prompt_hash: None,
+            max_tokens: None,
             user_content_token_estimate: Some(100),
             estimated_input_tokens: Some(100),
             estimated_cost_usd: Some(0.31),
@@ -482,6 +494,12 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
     if let Some(conversation_turn) = request.conversation_turn {
         normalized.conversation_turn = Some(conversation_turn);
     }
+    if let Some(system_prompt_hash) = request.system_prompt_hash.as_ref() {
+        normalized.system_prompt_hash = Some(system_prompt_hash.clone());
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        normalized.max_tokens = Some(max_tokens);
+    }
     if let Some(user_content_token_estimate) = request.user_content_token_estimate {
         normalized.user_content_token_estimate = user_content_token_estimate;
     }
@@ -590,6 +608,30 @@ fn apply_seeded_collision_if_requested(
 
 fn build_session_snapshot(input: &SessionInput) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot::default();
+    if let Some(session_token_total) = input.session_token_total {
+        snapshot.session_token_total = session_token_total;
+    }
+    if let Some(session_token_p14d_avg) = input.session_token_p14d_avg {
+        snapshot.session_token_p14d_avg = session_token_p14d_avg;
+    }
+    if let Some(request_count_this_hour) = input.request_count_this_hour {
+        snapshot.request_count_this_hour = request_count_this_hour;
+    }
+    if let Some(credential_alerts_24h) = input.credential_alerts_24h {
+        snapshot.credential_alerts_24h = credential_alerts_24h;
+    }
+    if let Some(topic_cluster_ids_seen) = input.topic_cluster_ids_seen.as_ref() {
+        snapshot.topic_cluster_ids_seen = topic_cluster_ids_seen.clone();
+    }
+    if let Some(models_used_this_session) = input.models_used_this_session.as_ref() {
+        snapshot.models_used_this_session = models_used_this_session.clone();
+    }
+    if let Some(last_system_prompt_hash) = input.last_system_prompt_hash.as_ref() {
+        snapshot.last_system_prompt_hash = Some(last_system_prompt_hash.clone());
+    }
+    if let Some(max_tool_depth_seen) = input.max_tool_depth_seen {
+        snapshot.max_tool_depth_seen = max_tool_depth_seen;
+    }
     if let Some(request_count) = input.request_count {
         snapshot.request_count = request_count;
     }

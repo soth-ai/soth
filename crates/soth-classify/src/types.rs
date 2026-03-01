@@ -7,6 +7,9 @@ pub struct ClassifiedResult {
     pub secondary_label: Option<UseCaseLabel>,
     pub topic_cluster_id: u32,
     pub semantic_hash: String,
+    /// Raw embedding for local SQLite storage only.
+    /// Never included in TelemetryEvent.
+    pub embedding: Option<Vec<f32>>,
     pub embedding_norm: f32,
     pub complexity_score: u8,
     pub embedding_skipped: bool,

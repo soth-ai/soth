@@ -61,6 +61,17 @@ pub struct ProcessResolution {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionSnapshot {
+    // New Stage-5 deterministic anomaly inputs.
+    pub session_token_total: u32,
+    pub session_token_p14d_avg: f32,
+    pub request_count_this_hour: u32,
+    pub credential_alerts_24h: u8,
+    pub topic_cluster_ids_seen: Vec<u32>,
+    pub models_used_this_session: Vec<String>,
+    pub last_system_prompt_hash: Option<String>,
+    pub max_tool_depth_seen: u8,
+
+    // Backward-compatible fields used by policy/runtime paths.
     pub request_count: u32,
     pub total_tokens: u64,
     pub total_cost_usd: f32,

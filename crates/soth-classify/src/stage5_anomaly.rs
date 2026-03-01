@@ -1,14 +1,24 @@
+use std::collections::HashSet;
 use std::time::Instant;
 
 use soth_core::{AnomalyFlag, SessionSnapshot};
 
 use crate::stage2_cluster::ClusterOutput;
-use crate::traits::{AnomalyScorer, AnomalySignals};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnomalyOutput {
     pub score: f32,
     pub flags: Vec<AnomalyFlag>,
+}
+
+#[derive(Debug, Clone)]
+struct PreEmitEvent<'a> {
+    timestamp_utc: i64,
+    input_tokens: u32,
+    output_tokens: u32,
+    system_prompt_hash: Option<&'a str>,
+    tool_call_depth: u8,
+    embedding: Option<&'a [f32]>,
 }
 
 pub(crate) fn run(
@@ -17,156 +27,198 @@ pub(crate) fn run(
     normalized: &soth_core::NormalizedRequest,
     artifacts: &[soth_core::SensitiveArtifact],
     session: Option<&SessionSnapshot>,
-    scorer: &dyn AnomalyScorer,
 ) -> (AnomalyOutput, u64) {
     let started = Instant::now();
 
-    let Some(session) = session else {
+    let Some(snapshot) = session else {
         return (
             AnomalyOutput::default(),
             started.elapsed().as_micros() as u64,
         );
     };
 
-    let signals = derive_signals(embedding, normalized, artifacts, session);
-    let model_score = scorer.score(&signals).clamp(0.0, 1.0);
-    let model_flags = scorer.flags(&signals);
-
-    let (heuristic_score, heuristic_flags) = heuristic_score(&signals);
-
-    let mut flags = Vec::new();
-    for flag in model_flags.into_iter().chain(heuristic_flags.into_iter()) {
-        if !flags.contains(&flag) {
-            flags.push(flag);
-        }
-    }
-
-    (
-        AnomalyOutput {
-            score: model_score.max(heuristic_score).clamp(0.0, 1.0),
-            flags,
-        },
-        started.elapsed().as_micros() as u64,
-    )
-}
-
-fn derive_signals(
-    embedding: Option<&[f32]>,
-    normalized: &soth_core::NormalizedRequest,
-    artifacts: &[soth_core::SensitiveArtifact],
-    session: &SessionSnapshot,
-) -> AnomalySignals {
-    let topic_drift_score = match (embedding, session.embedding_centroid.as_ref()) {
-        (Some(vec), Some(centroid)) if vec.len() == centroid.len() => {
-            let dot = vec
-                .iter()
-                .zip(centroid.iter())
-                .map(|(left, right)| left * right)
-                .sum::<f32>();
-            (1.0 - dot).clamp(0.0, 1.0)
-        }
-        _ => 0.0,
+    let pre_emit = PreEmitEvent {
+        timestamp_utc: snapshot.current_request_timestamp,
+        input_tokens: normalized.estimated_input_tokens,
+        // Current normalized schema has no true output token estimate yet.
+        output_tokens: normalized.max_tokens.unwrap_or(0),
+        system_prompt_hash: normalized.system_prompt_hash.as_deref(),
+        tool_call_depth: normalized
+            .conversation_turn
+            .unwrap_or(0)
+            .min(u32::from(u8::MAX)) as u8,
+        embedding,
     };
 
     let credential_hits = artifacts
         .iter()
         .filter(|artifact| artifact.is_credential())
-        .count() as u32;
-    let credential_burst = session.credential_alerts + credential_hits >= 3;
+        .count()
+        .min(usize::from(u8::MAX)) as u8;
 
-    let avg_tokens = if session.request_count > 5 {
-        session.total_tokens as f32 / session.request_count as f32
+    let output = score_rule_based(snapshot, &pre_emit, credential_hits);
+    (output, started.elapsed().as_micros() as u64)
+}
+
+fn score_rule_based(
+    snapshot: &SessionSnapshot,
+    current: &PreEmitEvent,
+    credential_hits_current_request: u8,
+) -> AnomalyOutput {
+    let mut flags = Vec::new();
+    let mut score = 0.0f32;
+
+    let token_baseline = if snapshot.session_token_p14d_avg > 0.0 {
+        snapshot.session_token_p14d_avg
+    } else if snapshot.request_count > 0 {
+        snapshot.total_tokens as f32 / snapshot.request_count as f32
     } else {
         0.0
     };
-    let token_burst_ratio = if avg_tokens > 0.0 {
-        normalized.user_content_token_estimate as f32 / avg_tokens
-    } else {
-        1.0
-    };
 
-    let model_switched = normalized
-        .model
-        .as_deref()
-        .zip(session.last_model.as_deref())
-        .map(|(current, last)| current != last)
-        .unwrap_or(false);
+    // 1) Token burst
+    if token_baseline > 0.0 {
+        let burst_ratio = current.input_tokens as f32 / token_baseline;
+        if burst_ratio > 5.0 {
+            flags.push(AnomalyFlag::TokenBurst);
+            score += 0.30;
+        } else if burst_ratio > 3.0 {
+            flags.push(AnomalyFlag::TokenBurst);
+            score += 0.15;
+        }
+    }
 
-    let inter_request_ms = session
-        .last_request_timestamp
-        .map(|last| (session.current_request_timestamp - last).unsigned_abs());
+    // 2) Credential burst
+    let historical_credential_alerts = u32::max(
+        u32::from(snapshot.credential_alerts_24h),
+        snapshot.credential_alerts,
+    );
+    let credential_alerts_24h =
+        historical_credential_alerts.saturating_add(u32::from(credential_hits_current_request));
 
-    AnomalySignals {
-        topic_drift_score,
-        credential_burst,
-        token_burst_ratio,
-        model_switched,
-        inter_request_ms,
-        tool_call_depth: normalized.conversation_turn.unwrap_or(0),
-        session_request_count: session.request_count,
+    if credential_alerts_24h >= 3 {
+        flags.push(AnomalyFlag::CredentialBurst);
+        score += 0.40;
+    } else if credential_alerts_24h >= 1 {
+        score += 0.10;
+    }
+
+    // 3) Rapid-fire requests
+    let request_count_this_hour =
+        u32::max(snapshot.request_count_this_hour, snapshot.request_count);
+    if let Some(last_request_ts) = snapshot.last_request_timestamp {
+        let ms_since_last = (current.timestamp_utc - last_request_ts).unsigned_abs();
+        if ms_since_last < 500 && request_count_this_hour > 20 {
+            flags.push(AnomalyFlag::RapidFireRequests);
+            score += 0.20;
+        }
+    }
+
+    // 4) Topic drift
+    if let (Some(centroid), Some(embedding)) =
+        (snapshot.embedding_centroid.as_ref(), current.embedding)
+    {
+        let drift = cosine_distance(centroid.as_slice(), embedding);
+        if drift > 0.6 {
+            flags.push(AnomalyFlag::TopicDrift);
+            score += drift * 0.25;
+        }
+    }
+
+    // 5) Model switching within session
+    if snapshot.models_used_this_session.len() >= 3 {
+        let unique_models = snapshot
+            .models_used_this_session
+            .iter()
+            .collect::<HashSet<_>>();
+        if unique_models.len() >= 3 {
+            flags.push(AnomalyFlag::ModelSwitch);
+            score += 0.15;
+        }
+    }
+
+    // 6) System prompt change mid-session
+    if let (Some(prev_hash), Some(curr_hash)) = (
+        snapshot.last_system_prompt_hash.as_deref(),
+        current.system_prompt_hash,
+    ) {
+        if prev_hash != curr_hash && request_count_this_hour > 3 {
+            flags.push(AnomalyFlag::UnusualSystemPromptChange);
+            score += 0.20;
+        }
+    }
+
+    // 7) Exfiltration-like shape (scoring only for now)
+    if current.input_tokens < 50 && current.output_tokens > 2_000 {
+        score += 0.25;
+    }
+
+    // 8) Tool depth spike
+    if current.tool_call_depth > snapshot.max_tool_depth_seen.saturating_add(3) {
+        flags.push(AnomalyFlag::ToolCallDepthSpike);
+        score += 0.15;
+    }
+
+    dedupe_flags(&mut flags);
+
+    AnomalyOutput {
+        score: score.min(1.0),
+        flags,
     }
 }
 
-fn heuristic_score(signals: &AnomalySignals) -> (f32, Vec<AnomalyFlag>) {
-    let mut score = 0.0f32;
-    let mut flags = Vec::new();
+fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
+    if left.is_empty() || left.len() != right.len() {
+        return 0.0;
+    }
 
-    if signals.topic_drift_score > 0.6 {
-        flags.push(AnomalyFlag::TopicDrift);
-        score += signals.topic_drift_score * 0.3;
+    let mut dot = 0.0f32;
+    let mut left_norm = 0.0f32;
+    let mut right_norm = 0.0f32;
+
+    for (l, r) in left.iter().zip(right.iter()) {
+        dot += l * r;
+        left_norm += l * l;
+        right_norm += r * r;
     }
-    if signals.credential_burst {
-        flags.push(AnomalyFlag::CredentialBurst);
-        score += 0.4;
+
+    if left_norm <= 1e-9 || right_norm <= 1e-9 {
+        return 0.0;
     }
-    if signals.token_burst_ratio > 3.0 {
-        flags.push(AnomalyFlag::TokenBurst);
-        score += 0.2;
-    }
-    if signals.model_switched && signals.session_request_count > 0 {
-        flags.push(AnomalyFlag::ModelSwitch);
-        score += 0.1;
-    }
-    if signals.inter_request_ms.map(|ms| ms < 500).unwrap_or(false) {
-        flags.push(AnomalyFlag::RapidFireRequests);
-        score += 0.1;
-        if signals.session_request_count > 3 {
-            flags.push(AnomalyFlag::AgentLoopPattern);
-            score += 0.05;
+
+    let cosine = dot / (left_norm.sqrt() * right_norm.sqrt());
+    (1.0 - cosine).clamp(0.0, 1.0)
+}
+
+fn dedupe_flags(flags: &mut Vec<AnomalyFlag>) {
+    let mut unique = Vec::new();
+    flags.retain(|flag| {
+        if unique.contains(flag) {
+            false
+        } else {
+            unique.push(*flag);
+            true
         }
-    }
-    if signals.tool_call_depth > 10 {
-        flags.push(AnomalyFlag::ToolCallDepthSpike);
-        score += 0.1;
-    }
-
-    (score.clamp(0.0, 1.0), flags)
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct FixedScorer {
-        score: f32,
-        flags: Vec<AnomalyFlag>,
-    }
-
-    impl AnomalyScorer for FixedScorer {
-        fn score(&self, _signals: &AnomalySignals) -> f32 {
-            self.score
-        }
-
-        fn flags(&self, _signals: &AnomalySignals) -> Vec<AnomalyFlag> {
-            self.flags.clone()
-        }
-    }
-
     fn baseline_session() -> SessionSnapshot {
         SessionSnapshot {
-            total_tokens: 1_000,
-            total_cost_usd: 0.1,
-            request_count: 10,
+            session_token_total: 10_000,
+            session_token_p14d_avg: 100.0,
+            request_count_this_hour: 8,
+            credential_alerts_24h: 0,
+            topic_cluster_ids_seen: vec![1, 2],
+            models_used_this_session: vec!["gpt-4o-mini".to_string()],
+            last_system_prompt_hash: Some("sys-prev".to_string()),
+            max_tool_depth_seen: 2,
+            request_count: 8,
+            total_tokens: 10_000,
+            total_cost_usd: 0.5,
             credential_alerts: 0,
             embedding_centroid: Some(vec![1.0, 0.0]),
             prior_semantic_hashes: Vec::new(),
@@ -187,16 +239,16 @@ mod tests {
             model: Some("gpt-4o-mini".to_string()),
             endpoint_type: soth_core::EndpointType::ChatCompletion,
             api_version: None,
-            system_prompt_hash: None,
+            system_prompt_hash: Some("sys-prev".to_string()),
             system_prompt_token_estimate: None,
             user_content_hash: "u-hash".to_string(),
             user_content_token_estimate: 100,
             conversation_hash: "c-hash".to_string(),
-            conversation_turn: Some(1),
+            conversation_turn: Some(2),
             has_tool_definitions: false,
             tool_definition_hash: None,
             temperature: None,
-            max_tokens: None,
+            max_tokens: Some(128),
             stream: false,
             top_p: None,
             stop_sequences: Vec::new(),
@@ -223,12 +275,11 @@ mod tests {
         }
     }
 
-    fn run_flags(
+    fn run_stage(
         embedding: Option<Vec<f32>>,
         normalized: soth_core::NormalizedRequest,
         artifacts: Vec<soth_core::SensitiveArtifact>,
-        session: SessionSnapshot,
-        scorer: &dyn AnomalyScorer,
+        session: Option<SessionSnapshot>,
     ) -> AnomalyOutput {
         let cluster = ClusterOutput::default();
         let (output, _) = run(
@@ -236,186 +287,177 @@ mod tests {
             &cluster,
             &normalized,
             &artifacts,
-            Some(&session),
-            scorer,
+            session.as_ref(),
         );
         output
     }
 
     #[test]
-    fn topic_drift_triggers_in_isolation() {
-        let session = baseline_session();
-        let normalized = baseline_normalized();
-        let scorer = FixedScorer {
-            score: 0.0,
-            flags: Vec::new(),
-        };
+    fn no_session_returns_default_output() {
+        let output = run_stage(
+            Some(vec![1.0, 0.0]),
+            baseline_normalized(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(output.score, 0.0);
+        assert!(output.flags.is_empty());
+    }
 
-        let out = run_flags(
+    #[test]
+    fn token_burst_high_ratio_scores_and_flags() {
+        let mut normalized = baseline_normalized();
+        normalized.estimated_input_tokens = 700;
+
+        let output = run_stage(
+            Some(vec![1.0, 0.0]),
+            normalized,
+            Vec::new(),
+            Some(baseline_session()),
+        );
+
+        assert!(output.flags.contains(&AnomalyFlag::TokenBurst));
+        assert!(output.score >= 0.30);
+    }
+
+    #[test]
+    fn credential_burst_scores_and_flags() {
+        let mut session = baseline_session();
+        session.credential_alerts_24h = 2;
+
+        let output = run_stage(
+            Some(vec![1.0, 0.0]),
+            baseline_normalized(),
+            vec![credential_artifact()],
+            Some(session),
+        );
+
+        assert!(output.flags.contains(&AnomalyFlag::CredentialBurst));
+        assert!(output.score >= 0.40);
+    }
+
+    #[test]
+    fn rapid_fire_scores_and_flags() {
+        let mut session = baseline_session();
+        session.request_count_this_hour = 42;
+        session.last_request_timestamp = Some(9_700);
+        session.current_request_timestamp = 10_000;
+
+        let output = run_stage(
+            Some(vec![1.0, 0.0]),
+            baseline_normalized(),
+            Vec::new(),
+            Some(session),
+        );
+
+        assert!(output.flags.contains(&AnomalyFlag::RapidFireRequests));
+        assert!(output.score >= 0.20);
+    }
+
+    #[test]
+    fn topic_drift_scores_and_flags() {
+        let session = baseline_session();
+        let output = run_stage(
+            Some(vec![0.0, 1.0]),
+            baseline_normalized(),
+            Vec::new(),
+            Some(session),
+        );
+
+        assert!(output.flags.contains(&AnomalyFlag::TopicDrift));
+        assert!(output.score > 0.0);
+    }
+
+    #[test]
+    fn model_switch_scores_and_flags() {
+        let mut session = baseline_session();
+        session.models_used_this_session = vec![
+            "gpt-4o-mini".to_string(),
+            "claude-3-haiku-20240307".to_string(),
+            "gemini-1.5-pro".to_string(),
+        ];
+
+        let output = run_stage(
+            Some(vec![1.0, 0.0]),
+            baseline_normalized(),
+            Vec::new(),
+            Some(session),
+        );
+
+        assert!(output.flags.contains(&AnomalyFlag::ModelSwitch));
+        assert!(output.score >= 0.15);
+    }
+
+    #[test]
+    fn unusual_system_prompt_change_scores_and_flags() {
+        let mut session = baseline_session();
+        session.request_count_this_hour = 10;
+        session.last_system_prompt_hash = Some("sys-old".to_string());
+
+        let mut normalized = baseline_normalized();
+        normalized.system_prompt_hash = Some("sys-new".to_string());
+
+        let output = run_stage(Some(vec![1.0, 0.0]), normalized, Vec::new(), Some(session));
+
+        assert!(output
+            .flags
+            .contains(&AnomalyFlag::UnusualSystemPromptChange));
+        assert!(output.score >= 0.20);
+    }
+
+    #[test]
+    fn exfiltration_shape_adds_score_without_new_flag() {
+        let mut normalized = baseline_normalized();
+        normalized.estimated_input_tokens = 30;
+        normalized.max_tokens = Some(3_500);
+
+        let output = run_stage(
+            Some(vec![1.0, 0.0]),
+            normalized,
+            Vec::new(),
+            Some(baseline_session()),
+        );
+
+        assert_eq!(output.flags.len(), 0);
+        assert!(output.score >= 0.25);
+    }
+
+    #[test]
+    fn tool_depth_spike_scores_and_flags() {
+        let mut session = baseline_session();
+        session.max_tool_depth_seen = 2;
+
+        let mut normalized = baseline_normalized();
+        normalized.conversation_turn = Some(7);
+
+        let output = run_stage(Some(vec![1.0, 0.0]), normalized, Vec::new(), Some(session));
+
+        assert!(output.flags.contains(&AnomalyFlag::ToolCallDepthSpike));
+        assert!(output.score >= 0.15);
+    }
+
+    #[test]
+    fn score_clamps_to_one() {
+        let mut session = baseline_session();
+        session.credential_alerts_24h = 5;
+        session.request_count_this_hour = 99;
+        session.last_request_timestamp = Some(9_900);
+        session.current_request_timestamp = 10_000;
+        session.models_used_this_session = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        let mut normalized = baseline_normalized();
+        normalized.estimated_input_tokens = 2_000;
+        normalized.conversation_turn = Some(20);
+        normalized.max_tokens = Some(5_000);
+        normalized.system_prompt_hash = Some("other".to_string());
+
+        let output = run_stage(
             Some(vec![0.0, 1.0]),
             normalized,
-            Vec::new(),
-            session,
-            &scorer,
-        );
-
-        assert_eq!(out.flags, vec![AnomalyFlag::TopicDrift]);
-    }
-
-    #[test]
-    fn credential_burst_triggers_in_isolation() {
-        let mut session = baseline_session();
-        session.credential_alerts = 2;
-        let normalized = baseline_normalized();
-        let scorer = FixedScorer {
-            score: 0.0,
-            flags: Vec::new(),
-        };
-
-        let out = run_flags(
-            Some(vec![1.0, 0.0]),
-            normalized,
             vec![credential_artifact()],
-            session,
-            &scorer,
+            Some(session),
         );
 
-        assert_eq!(out.flags, vec![AnomalyFlag::CredentialBurst]);
-    }
-
-    #[test]
-    fn token_burst_triggers_in_isolation() {
-        let session = baseline_session();
-        let mut normalized = baseline_normalized();
-        normalized.user_content_token_estimate = 400;
-        let scorer = FixedScorer {
-            score: 0.0,
-            flags: Vec::new(),
-        };
-
-        let out = run_flags(
-            Some(vec![1.0, 0.0]),
-            normalized,
-            Vec::new(),
-            session,
-            &scorer,
-        );
-
-        assert_eq!(out.flags, vec![AnomalyFlag::TokenBurst]);
-    }
-
-    #[test]
-    fn model_switch_triggers_in_isolation() {
-        let session = baseline_session();
-        let mut normalized = baseline_normalized();
-        normalized.model = Some("claude-3-5-sonnet".to_string());
-        let scorer = FixedScorer {
-            score: 0.0,
-            flags: Vec::new(),
-        };
-
-        let out = run_flags(
-            Some(vec![1.0, 0.0]),
-            normalized,
-            Vec::new(),
-            session,
-            &scorer,
-        );
-
-        assert_eq!(out.flags, vec![AnomalyFlag::ModelSwitch]);
-    }
-
-    #[test]
-    fn agent_loop_pattern_triggers_in_isolation() {
-        let mut session = baseline_session();
-        session.request_count = 4;
-        session.total_tokens = 400;
-        session.last_request_timestamp = Some(9_900);
-        let normalized = baseline_normalized();
-        let scorer = FixedScorer {
-            score: 0.0,
-            flags: Vec::new(),
-        };
-
-        let out = run_flags(
-            Some(vec![1.0, 0.0]),
-            normalized,
-            Vec::new(),
-            session,
-            &scorer,
-        );
-
-        assert_eq!(
-            out.flags,
-            vec![
-                AnomalyFlag::RapidFireRequests,
-                AnomalyFlag::AgentLoopPattern
-            ]
-        );
-    }
-
-    #[test]
-    fn rapid_fire_requests_triggers_without_agent_loop_when_request_count_low() {
-        let mut session = baseline_session();
-        session.request_count = 2;
-        session.last_request_timestamp = Some(9_900);
-        let normalized = baseline_normalized();
-        let scorer = FixedScorer {
-            score: 0.0,
-            flags: Vec::new(),
-        };
-
-        let out = run_flags(
-            Some(vec![1.0, 0.0]),
-            normalized,
-            Vec::new(),
-            session,
-            &scorer,
-        );
-
-        assert_eq!(out.flags, vec![AnomalyFlag::RapidFireRequests]);
-    }
-
-    #[test]
-    fn tool_call_depth_spike_triggers_in_isolation() {
-        let session = baseline_session();
-        let mut normalized = baseline_normalized();
-        normalized.conversation_turn = Some(11);
-        let scorer = FixedScorer {
-            score: 0.0,
-            flags: Vec::new(),
-        };
-
-        let out = run_flags(
-            Some(vec![1.0, 0.0]),
-            normalized,
-            Vec::new(),
-            session,
-            &scorer,
-        );
-
-        assert_eq!(out.flags, vec![AnomalyFlag::ToolCallDepthSpike]);
-    }
-
-    #[test]
-    fn score_is_clamped_and_flags_are_deduplicated() {
-        let session = baseline_session();
-        let mut normalized = baseline_normalized();
-        normalized.user_content_token_estimate = 400;
-        let scorer = FixedScorer {
-            score: 10.0,
-            flags: vec![AnomalyFlag::TokenBurst],
-        };
-
-        let out = run_flags(
-            Some(vec![1.0, 0.0]),
-            normalized,
-            Vec::new(),
-            session,
-            &scorer,
-        );
-
-        assert_eq!(out.score, 1.0);
-        assert_eq!(out.flags, vec![AnomalyFlag::TokenBurst]);
+        assert!((output.score - 1.0).abs() < f32::EPSILON);
     }
 }

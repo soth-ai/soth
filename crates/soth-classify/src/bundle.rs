@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::io;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::config::VolatilityConfig;
 use crate::fallback::{KeywordClassifier, StaticAnomalyScorer};
 use crate::model::build_model_providers;
 use crate::onnx_embed::OnnxEmbeddingRuntime;
@@ -26,12 +28,14 @@ pub const CLASSIFY_REQUIRED_MODEL_ASSETS: [&str; 4] = [
 ];
 const CLASSIFY_OPTIONAL_MODEL_ASSETS: [&str; 2] =
     ["classify/tokenizer.json", "classify/volatility_config.toml"];
+const LOCAL_UNVERIFIED_BUNDLE_VERSION: &str = "local-unverified";
 
 pub(crate) const EMBEDDING_DIM: usize = 384;
 pub(crate) const LSH_PROJECTION_ROWS: usize = 128;
 
 pub struct ClassifyBundle {
     pub(crate) classifier: Arc<dyn ClassificationProvider>,
+    #[allow(dead_code)]
     pub(crate) anomaly_scorer: Arc<dyn AnomalyScorer>,
     pub(crate) policy_bundle: Arc<soth_policy::PolicyBundle>,
     pub(crate) embedding_onnx: Option<Arc<Vec<u8>>>,
@@ -40,6 +44,7 @@ pub struct ClassifyBundle {
     pub(crate) centroids: Arc<Vec<Vec<f32>>>,
     pub(crate) lsh_projection: Arc<Vec<Vec<f32>>>,
     pub(crate) volatility_config_toml: Option<Arc<Vec<u8>>>,
+    pub(crate) bundle_volatility_config: Option<VolatilityConfig>,
     pub(crate) onnx_runtime: Option<Arc<OnnxEmbeddingRuntime>>,
     pub bundle_version: String,
     pub has_real_models: bool,
@@ -56,21 +61,38 @@ pub struct ModelAssetStatus {
 
 impl ClassifyBundle {
     pub fn load(bundle_dir: &Path) -> Result<Arc<Self>, BundleLoadError> {
-        let manifest_path = find_manifest_path(bundle_dir)?;
-        let manifest_bytes = std::fs::read(manifest_path.as_path())?;
-        let manifest = parse_manifest(manifest_bytes.as_slice())?;
+        if let Ok(manifest_path) = find_manifest_path(bundle_dir) {
+            let manifest_bytes = std::fs::read(manifest_path.as_path())?;
+            let manifest = parse_manifest(manifest_bytes.as_slice())?;
 
-        let mut assets = HashMap::new();
-        if manifest.assets.is_empty() {
-            collect_known_assets(bundle_dir, &mut assets)?;
-        } else {
-            let manifest_dir = manifest_path.parent().unwrap_or(bundle_dir);
-            for entry in &manifest.assets {
-                let bytes = read_asset_bytes(bundle_dir, manifest_dir, entry.path.as_str())?;
-                assets.insert(entry.path.clone(), bytes);
+            let mut assets = HashMap::new();
+            if manifest.assets.is_empty() {
+                collect_known_assets(bundle_dir, &mut assets)?;
+            } else {
+                let manifest_dir = manifest_path.parent().unwrap_or(bundle_dir);
+                for entry in &manifest.assets {
+                    let bytes = read_asset_bytes(bundle_dir, manifest_dir, entry.path.as_str())?;
+                    assets.insert(entry.path.clone(), bytes);
+                }
             }
+
+            return Self::load_verified(manifest, assets);
         }
 
+        // Local dev fallback for raw model folders (for example ./ml) without manifest files.
+        let mut assets = HashMap::new();
+        collect_known_assets(bundle_dir, &mut assets)?;
+        if assets.is_empty() {
+            return Err(BundleLoadError::InvalidManifest(format!(
+                "no manifest found and no known classify assets under {}",
+                bundle_dir.display()
+            )));
+        }
+
+        let manifest = BundleManifest {
+            version: LOCAL_UNVERIFIED_BUNDLE_VERSION.to_string(),
+            assets: Vec::new(),
+        };
         Self::load_verified(manifest, assets)
     }
 
@@ -103,6 +125,7 @@ impl ClassifyBundle {
             centroids: Arc::new(Vec::new()),
             lsh_projection: Arc::new(Vec::new()),
             volatility_config_toml: None,
+            bundle_volatility_config: None,
             onnx_runtime: None,
             bundle_version,
             has_real_models: false,
@@ -132,6 +155,9 @@ impl ClassifyBundle {
         let tokenizer_json = load_optional_asset(&assets, "classify/tokenizer.json");
         let volatility_config_toml =
             load_optional_asset(&assets, "classify/volatility_config.toml");
+        let bundle_volatility_config = volatility_config_toml
+            .as_deref()
+            .and_then(|bytes| parse_bundle_volatility_config(bytes.as_slice()));
         let onnx_runtime = build_onnx_runtime(embedding_onnx.as_deref(), tokenizer_json.as_deref());
         let has_real_models = CLASSIFY_REQUIRED_MODEL_ASSETS
             .iter()
@@ -160,6 +186,7 @@ impl ClassifyBundle {
             centroids: Arc::new(centroids),
             lsh_projection: Arc::new(lsh_projection),
             volatility_config_toml,
+            bundle_volatility_config,
             onnx_runtime,
             bundle_version: version,
             has_real_models,
@@ -322,14 +349,90 @@ fn load_optional_asset(assets: &HashMap<String, Vec<u8>>, path: &str) -> Option<
     asset_bytes_for_path(assets, path).map(|bytes| Arc::new(bytes.to_vec()))
 }
 
+fn parse_bundle_volatility_config(bytes: &[u8]) -> Option<VolatilityConfig> {
+    let source = std::str::from_utf8(bytes).ok()?;
+    let parsed: toml::Value = toml::from_str(source).ok()?;
+    let table = parsed
+        .get("volatility")
+        .and_then(toml::Value::as_table)
+        .or_else(|| parsed.as_table())?;
+
+    let mut config = VolatilityConfig::default();
+
+    if let Some(keywords) = table
+        .get("temporal_keywords")
+        .and_then(toml::Value::as_array)
+        .and_then(|values| toml_array_to_strings(values.as_slice()))
+    {
+        if !keywords.is_empty() {
+            config.temporal_keywords = keywords;
+        }
+    }
+
+    if let Some(keywords) = table
+        .get("pronoun_keywords")
+        .and_then(toml::Value::as_array)
+        .and_then(|values| toml_array_to_strings(values.as_slice()))
+    {
+        if !keywords.is_empty() {
+            config.pronoun_keywords = keywords;
+        }
+    }
+
+    if let Some(value) = table
+        .get("static_threshold")
+        .and_then(toml::Value::as_float)
+    {
+        config.static_threshold = value as f32;
+    }
+    if let Some(value) = table
+        .get("low_volatile_threshold")
+        .and_then(toml::Value::as_float)
+    {
+        config.low_volatile_threshold = value as f32;
+    }
+    if let Some(value) = table
+        .get("dynamic_threshold")
+        .and_then(toml::Value::as_float)
+    {
+        config.dynamic_threshold = value as f32;
+    }
+
+    Some(config)
+}
+
+fn toml_array_to_strings(values: &[toml::Value]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        out.push(value.as_str()?.to_string());
+    }
+    Some(out)
+}
+
 fn build_onnx_runtime(
     embedding_onnx: Option<&Vec<u8>>,
     tokenizer_json: Option<&Vec<u8>>,
 ) -> Option<Arc<OnnxEmbeddingRuntime>> {
     let model = embedding_onnx?;
     let tokenizer = tokenizer_json?;
-    match OnnxEmbeddingRuntime::new(model.as_slice(), tokenizer.as_slice()) {
-        Ok(runtime) => Some(Arc::new(runtime)),
+    init_onnx_runtime_quiet(model.as_slice(), tokenizer.as_slice()).map(Arc::new)
+}
+
+fn init_onnx_runtime_quiet(model: &[u8], tokenizer: &[u8]) -> Option<OnnxEmbeddingRuntime> {
+    static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let hook_lock = PANIC_HOOK_LOCK.get_or_init(|| Mutex::new(())).lock().ok()?;
+
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let init = catch_unwind(AssertUnwindSafe(|| {
+        OnnxEmbeddingRuntime::new(model, tokenizer)
+    }));
+    std::panic::set_hook(previous_hook);
+    drop(hook_lock);
+
+    match init {
+        Ok(Ok(runtime)) => Some(runtime),
+        Ok(Err(_)) => None,
         Err(_) => None,
     }
 }
@@ -710,6 +813,28 @@ mod tests {
     }
 
     #[test]
+    fn load_from_dir_without_manifest_supports_ml_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assets = model_assets();
+        for (path, bytes) in assets {
+            let local_name = path
+                .strip_prefix("classify/")
+                .expect("classify asset prefix expected");
+            std::fs::write(dir.path().join(local_name), bytes).expect("write local model asset");
+        }
+
+        let bundle = ClassifyBundle::load(dir.path()).expect("bundle should load from ml layout");
+        assert_eq!(bundle.bundle_version, LOCAL_UNVERIFIED_BUNDLE_VERSION);
+        assert!(bundle.has_real_models);
+        assert_eq!(
+            bundle.classifier.bundle_version(),
+            LOCAL_UNVERIFIED_BUNDLE_VERSION
+        );
+        assert_eq!(bundle.centroids.len(), 2);
+        assert_eq!(bundle.lsh_projection.len(), LSH_PROJECTION_ROWS);
+    }
+
+    #[test]
     fn load_without_policy_falls_back_to_empty_policy_bundle() {
         let assets = model_assets();
         let manifest = manifest_bytes("bundle-no-policy-v1", &assets);
@@ -721,5 +846,32 @@ mod tests {
             bundle.policy_bundle.metadata.bundle_version,
             "fallback-0.0.0"
         );
+    }
+
+    #[test]
+    fn parse_bundle_volatility_config_accepts_root_or_nested_table() {
+        let root = br#"
+temporal_keywords = ["today", "latest"]
+pronoun_keywords = ["my ", "our "]
+static_threshold = 0.2
+low_volatile_threshold = 0.4
+dynamic_threshold = 0.8
+"#;
+        let parsed_root = parse_bundle_volatility_config(root).expect("root config should parse");
+        assert_eq!(parsed_root.temporal_keywords, vec!["today", "latest"]);
+        assert_eq!(parsed_root.pronoun_keywords, vec!["my ", "our "]);
+        assert!((parsed_root.static_threshold - 0.2).abs() < f32::EPSILON);
+        assert!((parsed_root.low_volatile_threshold - 0.4).abs() < f32::EPSILON);
+        assert!((parsed_root.dynamic_threshold - 0.8).abs() < f32::EPSILON);
+
+        let nested = br#"
+[volatility]
+temporal_keywords = ["recently"]
+dynamic_threshold = 0.75
+"#;
+        let parsed_nested =
+            parse_bundle_volatility_config(nested).expect("nested config should parse");
+        assert_eq!(parsed_nested.temporal_keywords, vec!["recently"]);
+        assert!((parsed_nested.dynamic_threshold - 0.75).abs() < f32::EPSILON);
     }
 }

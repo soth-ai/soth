@@ -9,6 +9,7 @@ use crate::traits::{AnomalyScorer, AnomalySignals, ClassificationProvider, Class
 
 const EMBEDDING_DIMS: usize = 384;
 const MLP_ASSET_CANDIDATES: [&str; 2] = ["classify/use_case_mlp.bin", "use_case_mlp.bin"];
+const SOTH_MLP_MAGIC: u32 = 0x534F_5448;
 const LABEL_SPACE: [UseCaseLabel; 17] = [
     UseCaseLabel::CodeGeneration,
     UseCaseLabel::CodeReview,
@@ -44,8 +45,35 @@ pub(crate) fn build_model_providers(
 
 struct BundleModelClassifier {
     bundle_version: String,
+    model: ClassifierModel,
+}
+
+enum ClassifierModel {
+    Linear(LinearClassifier),
+    SothBinary(SothBinaryClassifier),
+}
+
+struct LinearClassifier {
+    labels: Vec<UseCaseLabel>,
     weights: Vec<Vec<f32>>,
     biases: Vec<f32>,
+}
+
+struct LayerNormParams {
+    gamma: Vec<f32>,
+    beta: Vec<f32>,
+}
+
+struct SothBinaryClassifier {
+    hidden1_weights: Vec<Vec<f32>>,
+    hidden1_biases: Vec<f32>,
+    hidden2_weights: Vec<Vec<f32>>,
+    hidden2_biases: Vec<f32>,
+    norm1: LayerNormParams,
+    norm2: LayerNormParams,
+    usecase_weights: Vec<Vec<f32>>,
+    usecase_biases: Vec<f32>,
+    usecase_labels: Vec<UseCaseLabel>,
 }
 
 impl BundleModelClassifier {
@@ -62,62 +90,212 @@ impl BundleModelClassifier {
             weights.push(weight);
             biases.push(sample_signed(seed, label_idx as u64, 9_001) * 0.10);
         }
+
         Self {
             bundle_version,
-            weights,
-            biases,
+            model: ClassifierModel::Linear(LinearClassifier {
+                labels: LABEL_SPACE.to_vec(),
+                weights,
+                biases,
+            }),
         }
     }
 }
 
 impl ClassificationProvider for BundleModelClassifier {
     fn classify(&self, embedding: &[f32]) -> ClassificationResult {
-        if embedding.len() != EMBEDDING_DIMS {
-            return ClassificationResult {
-                label: UseCaseLabel::Unknown,
-                confidence: 0.0,
-                secondary_label: None,
-            };
-        }
-
-        let mut logits = Vec::with_capacity(self.weights.len());
-
-        for (idx, weight) in self.weights.iter().enumerate() {
-            let score = embedding
-                .iter()
-                .zip(weight.iter())
-                .map(|(left, right)| left * right)
-                .sum::<f32>()
-                + self.biases[idx];
-            logits.push(score);
-        }
-
-        let probs = softmax(logits.as_slice());
-        let (top_idx, top_prob) = top1(probs.as_slice());
-        let secondary = if top_prob < 0.40 {
-            top2(probs.as_slice())
-                .filter(|(_, prob)| *prob > 0.25)
-                .and_then(|(idx, _)| {
-                    let label = LABEL_SPACE[idx];
-                    if label != LABEL_SPACE[top_idx] {
-                        Some(label)
-                    } else {
-                        None
-                    }
-                })
-        } else {
-            None
-        };
-
-        ClassificationResult {
-            label: LABEL_SPACE[top_idx],
-            confidence: top_prob.clamp(0.0, 1.0),
-            secondary_label: secondary,
+        match &self.model {
+            ClassifierModel::Linear(model) => classify_linear(model, embedding),
+            ClassifierModel::SothBinary(model) => classify_soth_binary(model, embedding),
         }
     }
 
     fn bundle_version(&self) -> &str {
         self.bundle_version.as_str()
+    }
+}
+
+fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> ClassificationResult {
+    if embedding.len() != EMBEDDING_DIMS {
+        return ClassificationResult {
+            label: UseCaseLabel::Unknown,
+            confidence: 0.0,
+            secondary_label: None,
+        };
+    }
+
+    let logits = affine_logits(embedding, &model.weights, &model.biases);
+    if logits.is_empty() || logits.len() != model.labels.len() {
+        return ClassificationResult {
+            label: UseCaseLabel::Unknown,
+            confidence: 0.0,
+            secondary_label: None,
+        };
+    }
+
+    classify_from_probs(
+        model.labels.as_slice(),
+        softmax(logits.as_slice()).as_slice(),
+    )
+}
+
+fn classify_soth_binary(model: &SothBinaryClassifier, embedding: &[f32]) -> ClassificationResult {
+    if embedding.len() != EMBEDDING_DIMS {
+        return ClassificationResult {
+            label: UseCaseLabel::Unknown,
+            confidence: 0.0,
+            secondary_label: None,
+        };
+    }
+
+    let mut hidden1 = affine_logits(embedding, &model.hidden1_weights, &model.hidden1_biases);
+    relu_in_place(hidden1.as_mut_slice());
+    layer_norm_in_place(hidden1.as_mut_slice(), &model.norm1);
+
+    let mut hidden2 = affine_logits(
+        hidden1.as_slice(),
+        &model.hidden2_weights,
+        &model.hidden2_biases,
+    );
+    relu_in_place(hidden2.as_mut_slice());
+    layer_norm_in_place(hidden2.as_mut_slice(), &model.norm2);
+
+    let logits = affine_logits(
+        hidden2.as_slice(),
+        &model.usecase_weights,
+        &model.usecase_biases,
+    );
+    if logits.is_empty() || logits.len() != model.usecase_labels.len() {
+        return ClassificationResult {
+            label: UseCaseLabel::Unknown,
+            confidence: 0.0,
+            secondary_label: None,
+        };
+    }
+
+    let probs = softmax(logits.as_slice());
+    let aggregated =
+        aggregate_probs_to_public_labels(model.usecase_labels.as_slice(), probs.as_slice());
+    classify_from_probs(LABEL_SPACE.as_slice(), aggregated.as_slice())
+}
+
+fn classify_from_probs(labels: &[UseCaseLabel], probs: &[f32]) -> ClassificationResult {
+    if labels.is_empty() || labels.len() != probs.len() {
+        return ClassificationResult {
+            label: UseCaseLabel::Unknown,
+            confidence: 0.0,
+            secondary_label: None,
+        };
+    }
+
+    let (top_idx, top_prob) = top1(probs);
+    let secondary = if top_prob < 0.40 {
+        top2(probs)
+            .filter(|(_, prob)| *prob > 0.25)
+            .and_then(|(idx, _)| {
+                let label = labels[idx];
+                if label != labels[top_idx] {
+                    Some(label)
+                } else {
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
+    ClassificationResult {
+        label: labels[top_idx],
+        confidence: top_prob.clamp(0.0, 1.0),
+        secondary_label: secondary,
+    }
+}
+
+fn aggregate_probs_to_public_labels(source_labels: &[UseCaseLabel], probs: &[f32]) -> Vec<f32> {
+    let mut buckets = vec![0.0f32; LABEL_SPACE.len()];
+    for (idx, prob) in probs.iter().copied().enumerate() {
+        let label = source_labels
+            .get(idx)
+            .copied()
+            .unwrap_or(UseCaseLabel::Unknown);
+        let target_idx = public_label_index(label);
+        buckets[target_idx] += prob.max(0.0);
+    }
+    buckets
+}
+
+fn public_label_index(label: UseCaseLabel) -> usize {
+    match label {
+        UseCaseLabel::CodeGeneration => 0,
+        UseCaseLabel::CodeReview => 1,
+        UseCaseLabel::CodeDebugging => 2,
+        UseCaseLabel::CodeRefactor => 3,
+        UseCaseLabel::TextSummarization => 4,
+        UseCaseLabel::TextGeneration => 5,
+        UseCaseLabel::Translation => 6,
+        UseCaseLabel::DataAnalysis => 7,
+        UseCaseLabel::DataExtraction => 8,
+        UseCaseLabel::QuestionAnswering => 9,
+        UseCaseLabel::DocumentSearch => 10,
+        UseCaseLabel::AgentTask => 11,
+        UseCaseLabel::ToolOrchestration => 12,
+        UseCaseLabel::ImageAnalysis => 13,
+        UseCaseLabel::AudioTranscription => 14,
+        UseCaseLabel::SystemPromptOnly => 15,
+        UseCaseLabel::Unknown => 16,
+    }
+}
+
+fn affine_logits(input: &[f32], weights: &[Vec<f32>], biases: &[f32]) -> Vec<f32> {
+    if weights.is_empty() || biases.len() != weights.len() {
+        return Vec::new();
+    }
+
+    let mut logits = Vec::with_capacity(weights.len());
+    for (idx, weight) in weights.iter().enumerate() {
+        if weight.len() != input.len() {
+            return Vec::new();
+        }
+        let score = input
+            .iter()
+            .zip(weight.iter())
+            .map(|(left, right)| left * right)
+            .sum::<f32>()
+            + biases[idx];
+        logits.push(score);
+    }
+    logits
+}
+
+fn relu_in_place(values: &mut [f32]) {
+    for value in values {
+        if *value < 0.0 {
+            *value = 0.0;
+        }
+    }
+}
+
+fn layer_norm_in_place(values: &mut [f32], params: &LayerNormParams) {
+    if values.is_empty() || params.gamma.len() != values.len() || params.beta.len() != values.len()
+    {
+        return;
+    }
+
+    let mean = values.iter().copied().sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let centered = *value - mean;
+            centered * centered
+        })
+        .sum::<f32>()
+        / values.len() as f32;
+
+    let inv_std = (variance + 1e-5).sqrt().recip();
+
+    for (idx, value) in values.iter_mut().enumerate() {
+        let normalized = (*value - mean) * inv_std;
+        *value = normalized * params.gamma[idx] + params.beta[idx];
     }
 }
 
@@ -216,12 +394,96 @@ fn parse_classifier_from_assets(
     if let Some(parsed) = parse_classifier_json(bundle_version.clone(), bytes) {
         return Some(parsed);
     }
+    if let Some(parsed) = parse_classifier_soth_binary(bundle_version.clone(), bytes) {
+        return Some(parsed);
+    }
     parse_classifier_raw(bundle_version, bytes)
 }
 
 fn parse_classifier_json(bundle_version: String, bytes: &[u8]) -> Option<BundleModelClassifier> {
     let parsed: JsonMlpAsset = serde_json::from_slice(bytes).ok()?;
     build_classifier_from_parts(bundle_version, parsed.weights, parsed.biases)
+}
+
+fn parse_classifier_soth_binary(
+    bundle_version: String,
+    bytes: &[u8],
+) -> Option<BundleModelClassifier> {
+    let mut cursor = ByteCursor::new(bytes);
+
+    if cursor.read_u32()? != SOTH_MLP_MAGIC {
+        return None;
+    }
+
+    let _format_major = cursor.read_u32()?;
+    let _format_minor = cursor.read_u32()?;
+    let _format_patch = cursor.read_u32()?;
+
+    let usecase_count = usize::try_from(cursor.read_u32()?).ok()?;
+    let auxiliary_count = usize::try_from(cursor.read_u32()?).ok()?;
+    let hidden1_dim = usize::try_from(cursor.read_u32()?).ok()?;
+    let input_dim = usize::try_from(cursor.read_u32()?).ok()?;
+
+    if input_dim != EMBEDDING_DIMS || usecase_count == 0 || hidden1_dim == 0 {
+        return None;
+    }
+
+    let hidden1_weights = cursor.read_matrix(hidden1_dim, input_dim)?;
+    let hidden1_biases = cursor.read_len_prefixed_vector(hidden1_dim)?;
+
+    let hidden2_dim = usize::try_from(cursor.read_u32()?).ok()?;
+    let hidden2_input_dim = usize::try_from(cursor.read_u32()?).ok()?;
+    if hidden2_dim == 0 || hidden2_input_dim != hidden1_dim {
+        return None;
+    }
+
+    let hidden2_weights = cursor.read_matrix(hidden2_dim, hidden1_dim)?;
+    let hidden2_biases = cursor.read_len_prefixed_vector(hidden2_dim)?;
+
+    let norm1 = cursor.read_layer_norm(hidden1_dim)?;
+    let norm2 = cursor.read_layer_norm(hidden2_dim)?;
+
+    let usecase_rows = usize::try_from(cursor.read_u32()?).ok()?;
+    let usecase_cols = usize::try_from(cursor.read_u32()?).ok()?;
+    if usecase_rows != usecase_count || usecase_cols != hidden2_dim {
+        return None;
+    }
+    let usecase_weights = cursor.read_matrix(usecase_rows, usecase_cols)?;
+    let usecase_biases = cursor.read_len_prefixed_vector(usecase_count)?;
+
+    let auxiliary_rows = usize::try_from(cursor.read_u32()?).ok()?;
+    let auxiliary_cols = usize::try_from(cursor.read_u32()?).ok()?;
+    if auxiliary_rows != auxiliary_count || auxiliary_cols != hidden2_dim {
+        return None;
+    }
+    let _auxiliary_weights = cursor.read_matrix(auxiliary_rows, auxiliary_cols)?;
+    let _auxiliary_biases = cursor.read_len_prefixed_vector(auxiliary_rows)?;
+
+    let usecase_labels = cursor
+        .read_label_block(usecase_count)?
+        .into_iter()
+        .map(|label| map_bundle_label(label.as_str()))
+        .collect::<Vec<_>>();
+    let _auxiliary_labels = cursor.read_label_block(auxiliary_count)?;
+
+    if usecase_labels.is_empty() {
+        return None;
+    }
+
+    Some(BundleModelClassifier {
+        bundle_version,
+        model: ClassifierModel::SothBinary(SothBinaryClassifier {
+            hidden1_weights,
+            hidden1_biases,
+            hidden2_weights,
+            hidden2_biases,
+            norm1,
+            norm2,
+            usecase_weights,
+            usecase_biases,
+            usecase_labels,
+        }),
+    })
 }
 
 fn parse_classifier_raw(bundle_version: String, bytes: &[u8]) -> Option<BundleModelClassifier> {
@@ -275,9 +537,135 @@ fn build_classifier_from_parts(
 
     Some(BundleModelClassifier {
         bundle_version,
-        weights,
-        biases,
+        model: ClassifierModel::Linear(LinearClassifier {
+            labels: LABEL_SPACE.to_vec(),
+            weights,
+            biases,
+        }),
     })
+}
+
+struct ByteCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ByteCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_u32(&mut self) -> Option<u32> {
+        if self.offset + 4 > self.bytes.len() {
+            return None;
+        }
+        let value = u32::from_le_bytes([
+            self.bytes[self.offset],
+            self.bytes[self.offset + 1],
+            self.bytes[self.offset + 2],
+            self.bytes[self.offset + 3],
+        ]);
+        self.offset += 4;
+        Some(value)
+    }
+
+    fn read_f32_vec(&mut self, len: usize) -> Option<Vec<f32>> {
+        let bytes_len = len.checked_mul(std::mem::size_of::<f32>())?;
+        if self.offset + bytes_len > self.bytes.len() {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            let value = f32::from_le_bytes([
+                self.bytes[self.offset],
+                self.bytes[self.offset + 1],
+                self.bytes[self.offset + 2],
+                self.bytes[self.offset + 3],
+            ]);
+            out.push(value);
+            self.offset += 4;
+        }
+        Some(out)
+    }
+
+    fn read_matrix(&mut self, rows: usize, cols: usize) -> Option<Vec<Vec<f32>>> {
+        let total = rows.checked_mul(cols)?;
+        let data = self.read_f32_vec(total)?;
+        let mut matrix = Vec::with_capacity(rows);
+        for row_idx in 0..rows {
+            let start = row_idx.checked_mul(cols)?;
+            let end = start + cols;
+            matrix.push(data[start..end].to_vec());
+        }
+        Some(matrix)
+    }
+
+    fn read_len_prefixed_vector(&mut self, expected_len: usize) -> Option<Vec<f32>> {
+        let len = usize::try_from(self.read_u32()?).ok()?;
+        if len != expected_len {
+            return None;
+        }
+        self.read_f32_vec(len)
+    }
+
+    fn read_layer_norm(&mut self, expected_len: usize) -> Option<LayerNormParams> {
+        let len = usize::try_from(self.read_u32()?).ok()?;
+        if len != expected_len {
+            return None;
+        }
+        let gamma = self.read_f32_vec(len)?;
+        let beta = self.read_f32_vec(len)?;
+        Some(LayerNormParams { gamma, beta })
+    }
+
+    fn read_label_block(&mut self, expected_count: usize) -> Option<Vec<String>> {
+        let count = usize::try_from(self.read_u32()?).ok()?;
+        if count != expected_count {
+            return None;
+        }
+
+        let mut labels = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = usize::try_from(self.read_u32()?).ok()?;
+            if self.offset + len > self.bytes.len() {
+                return None;
+            }
+            let raw = std::str::from_utf8(&self.bytes[self.offset..self.offset + len]).ok()?;
+            labels.push(raw.to_string());
+            self.offset += len;
+        }
+
+        Some(labels)
+    }
+}
+
+fn map_bundle_label(label: &str) -> UseCaseLabel {
+    let normalized = label.trim().to_ascii_uppercase().replace(['-', ' '], "_");
+
+    match normalized.as_str() {
+        "CODE_GENERATION" | "TEST_GENERATION" => UseCaseLabel::CodeGeneration,
+        "CODE_REVIEW" | "SECURITY_ANALYSIS" => UseCaseLabel::CodeReview,
+        "CODE_DEBUGGING" => UseCaseLabel::CodeDebugging,
+        "CODE_REFACTOR" => UseCaseLabel::CodeRefactor,
+        "TEXT_SUMMARIZATION" | "DOCUMENT_SUMMARISATION" => UseCaseLabel::TextSummarization,
+        "TEXT_GENERATION" | "CONTENT_DRAFTING" | "CONTENT_EDITING" | "LEGAL_CONTRACT" => {
+            UseCaseLabel::TextGeneration
+        }
+        "TRANSLATION" => UseCaseLabel::Translation,
+        "DATA_ANALYSIS" | "RESEARCH_SYNTHESIS" | "REGULATORY_COMPLIANCE" => {
+            UseCaseLabel::DataAnalysis
+        }
+        "DATA_EXTRACTION" | "SQL_DATA_QUERY" => UseCaseLabel::DataExtraction,
+        "QUESTION_ANSWERING" | "DOCUMENT_QA" | "FACT_QA" => UseCaseLabel::QuestionAnswering,
+        "DOCUMENT_SEARCH" => UseCaseLabel::DocumentSearch,
+        "AGENT_TASK" => UseCaseLabel::AgentTask,
+        "TOOL_ORCHESTRATION" | "INFRA_DEVOPS" => UseCaseLabel::ToolOrchestration,
+        "IMAGE_ANALYSIS" => UseCaseLabel::ImageAnalysis,
+        "AUDIO_TRANSCRIPTION" => UseCaseLabel::AudioTranscription,
+        "SYSTEM_PROMPT_ONLY" => UseCaseLabel::SystemPromptOnly,
+        _ => UseCaseLabel::Unknown,
+    }
 }
 
 fn top1(values: &[f32]) -> (usize, f32) {
@@ -466,5 +854,140 @@ mod tests {
         embedding[0] = 1.0;
         let out = classifier.classify(embedding.as_slice());
         assert_eq!(out.label, UseCaseLabel::CodeGeneration);
+    }
+
+    #[test]
+    fn classifier_can_load_soth_binary_mlp_asset() {
+        let bytes = synthetic_soth_binary_mlp();
+        let assets = HashMap::from([("classify/use_case_mlp.bin".to_string(), bytes)]);
+        let (classifier, _) = build_model_providers("bundle-v10".to_string(), &assets);
+
+        let embedding = vec![0.0f32; EMBEDDING_DIMS];
+        let out = classifier.classify(embedding.as_slice());
+        assert_eq!(out.label, UseCaseLabel::CodeGeneration);
+        assert!(out.confidence > 0.7);
+    }
+
+    #[test]
+    fn bundle_label_mapping_maps_vendor_taxonomy() {
+        assert_eq!(
+            map_bundle_label("TEST_GENERATION"),
+            UseCaseLabel::CodeGeneration
+        );
+        assert_eq!(
+            map_bundle_label("SQL_DATA_QUERY"),
+            UseCaseLabel::DataExtraction
+        );
+        assert_eq!(
+            map_bundle_label("CONTENT_DRAFTING"),
+            UseCaseLabel::TextGeneration
+        );
+        assert_eq!(
+            map_bundle_label("DOCUMENT_QA"),
+            UseCaseLabel::QuestionAnswering
+        );
+        assert_eq!(
+            map_bundle_label("INFRA_DEVOPS"),
+            UseCaseLabel::ToolOrchestration
+        );
+    }
+
+    fn synthetic_soth_binary_mlp() -> Vec<u8> {
+        let usecase_count = 3u32;
+        let aux_count = 2u32;
+        let hidden1_dim = 4u32;
+        let hidden2_dim = 3u32;
+
+        let mut out = Vec::new();
+
+        push_u32(&mut out, SOTH_MLP_MAGIC);
+        push_u32(&mut out, 2);
+        push_u32(&mut out, 2);
+        push_u32(&mut out, 2);
+        push_u32(&mut out, usecase_count);
+        push_u32(&mut out, aux_count);
+        push_u32(&mut out, hidden1_dim);
+        push_u32(&mut out, EMBEDDING_DIMS as u32);
+
+        for _ in 0..(hidden1_dim as usize * EMBEDDING_DIMS) {
+            push_f32(&mut out, 0.0);
+        }
+
+        push_u32(&mut out, hidden1_dim);
+        for _ in 0..hidden1_dim {
+            push_f32(&mut out, 0.0);
+        }
+
+        push_u32(&mut out, hidden2_dim);
+        push_u32(&mut out, hidden1_dim);
+        for _ in 0..(hidden2_dim as usize * hidden1_dim as usize) {
+            push_f32(&mut out, 0.0);
+        }
+
+        push_u32(&mut out, hidden2_dim);
+        for _ in 0..hidden2_dim {
+            push_f32(&mut out, 0.0);
+        }
+
+        push_u32(&mut out, hidden1_dim);
+        for _ in 0..hidden1_dim {
+            push_f32(&mut out, 1.0);
+        }
+        for _ in 0..hidden1_dim {
+            push_f32(&mut out, 0.0);
+        }
+
+        push_u32(&mut out, hidden2_dim);
+        for _ in 0..hidden2_dim {
+            push_f32(&mut out, 1.0);
+        }
+        for _ in 0..hidden2_dim {
+            push_f32(&mut out, 0.0);
+        }
+
+        push_u32(&mut out, usecase_count);
+        push_u32(&mut out, hidden2_dim);
+        for _ in 0..(usecase_count as usize * hidden2_dim as usize) {
+            push_f32(&mut out, 0.0);
+        }
+
+        push_u32(&mut out, usecase_count);
+        push_f32(&mut out, 2.0);
+        push_f32(&mut out, 0.0);
+        push_f32(&mut out, -1.0);
+
+        push_u32(&mut out, aux_count);
+        push_u32(&mut out, hidden2_dim);
+        for _ in 0..(aux_count as usize * hidden2_dim as usize) {
+            push_f32(&mut out, 0.0);
+        }
+
+        push_u32(&mut out, aux_count);
+        push_f32(&mut out, 0.0);
+        push_f32(&mut out, 0.0);
+
+        push_u32(&mut out, usecase_count);
+        push_string(&mut out, "CODE_GENERATION");
+        push_string(&mut out, "FACT_QA");
+        push_string(&mut out, "AGENT_TASK");
+
+        push_u32(&mut out, aux_count);
+        push_string(&mut out, "AUGMENTATIVE");
+        push_string(&mut out, "DIRECTIVE");
+
+        out
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(value.to_le_bytes().as_slice());
+    }
+
+    fn push_f32(out: &mut Vec<u8>, value: f32) {
+        out.extend_from_slice(value.to_le_bytes().as_slice());
+    }
+
+    fn push_string(out: &mut Vec<u8>, value: &str) {
+        push_u32(out, value.len() as u32);
+        out.extend_from_slice(value.as_bytes());
     }
 }
