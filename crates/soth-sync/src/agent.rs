@@ -19,7 +19,7 @@ use crate::heartbeat::HeartbeatSender;
 use crate::metadata_pusher::{
     estimate_gzip_exchange_batch_size, ExchangeBatchRoute, ExchangePushResult, MetadataPusher,
 };
-use crate::registry_puller::{BundleWatcher, RegistryPuller};
+use crate::registry_puller::{BundleWatcher, RegistryPullOutcome, RegistryPuller};
 use crate::retry_queue::BodyRetryQueue;
 use crate::telemetry::{SyncTelemetrySink, TelemetryRuntimeConfig, TelemetrySyncRuntime};
 use anyhow::Context;
@@ -55,6 +55,7 @@ const SYNC_TELEMETRY_EXCHANGE_BATCH_COMPRESSED_BYTES: &str = "sync.exchange.batc
 const SYNC_TELEMETRY_EXCHANGE_BATCH_SPLIT_COUNT: &str = "sync.exchange.batch.split_count";
 const SYNC_TELEMETRY_EXCHANGE_FRONTLOAD_SENT: &str = "sync.exchange.frontload.sent";
 const SYNC_TELEMETRY_EXCHANGE_LIVE_SENT: &str = "sync.exchange.live.sent";
+const SYNC_TELEMETRY_EXCHANGE_LEGACY_UPLOAD_ENABLED: &str = "sync.exchange.legacy_upload_enabled";
 const SYNC_TELEMETRY_REGISTRY_CACHE_PRESENT: &str = "sync.registry.cache_present";
 const SYNC_TELEMETRY_REGISTRY_BUNDLE_AGE_SECS: &str = "sync.registry.bundle_age_seconds";
 const SYNC_TELEMETRY_REGISTRY_DEGRADED_STALE: &str = "sync.registry.degraded_stale";
@@ -92,10 +93,13 @@ pub struct SyncAgentConfig {
     pub frontload_hard_events_cap: usize,
     pub frontload_hard_compressed_cap_bytes: usize,
     pub frontload_exchange_upload_path: Option<String>,
+    pub legacy_exchange_upload_enabled: bool,
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
+    pub device_id_hash: String,
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
     pub telemetry: TelemetrySyncConfig,
+    pub telemetry_signing_key_hex: Option<String>,
 }
 
 pub struct SyncAgent {
@@ -335,6 +339,14 @@ impl SyncAgent {
             config.frontload_hard_compressed_cap_bytes =
                 MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP;
         }
+        if config.device_id_hash.trim().is_empty() {
+            config.device_id_hash = "local-device".to_string();
+        }
+        config.telemetry_signing_key_hex = config
+            .telemetry_signing_key_hex
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         config.frontload_max_events_per_batch = config.frontload_max_events_per_batch.max(1).min(
             config
                 .frontload_hard_events_cap
@@ -440,6 +452,7 @@ impl SyncAgent {
             self.config.api_key.clone(),
             registry_cache_path,
         )
+        .with_device_id_hash(self.config.device_id_hash.clone())
         .with_bundle_watcher(watcher);
         let config_puller = ConfigPuller::new(
             self.config.endpoint.clone(),
@@ -455,13 +468,40 @@ impl SyncAgent {
         self.set_bundle_install_hook(watcher);
     }
 
+    /// Performs a startup-time hard check against the cloud bundle endpoint.
+    ///
+    /// This is used by the proxy to fail fast when `/v1/bundle/current` is
+    /// unavailable, rather than silently running in degraded mode.
+    pub async fn verify_bundle_source_ready(&self) -> anyhow::Result<RegistryPullOutcome> {
+        let registry_cache_path = self
+            .config
+            .registry_cache_path
+            .clone()
+            .unwrap_or_else(|| resolve_registry_cache_path(&self.config.cache_path));
+        let registry_puller = RegistryPuller::new(
+            self.config.endpoint.clone(),
+            self.config.api_key.clone(),
+            registry_cache_path,
+        )
+        .with_device_id_hash(self.config.device_id_hash.clone());
+        registry_puller
+            .refresh_now()
+            .await
+            .context("startup bundle source readiness check failed")
+    }
+
     pub async fn tick(&self) -> anyhow::Result<SyncTickSummary> {
         if self.config.telemetry.enabled {
             if let Err(error) = self.ensure_telemetry_runtime().await {
                 warn!(error = %error, "Failed to start telemetry sync runtime; continuing");
             }
         }
-        let stats = self.sync_exchange_queue_once().await?;
+        let stats = if self.config.legacy_exchange_upload_enabled {
+            self.sync_exchange_queue_once().await?
+        } else {
+            debug!("Legacy exchange upload disabled; skipping exchange queue sync");
+            ExchangeQueueStats::default()
+        };
         self.sync_exchange_sent_total
             .fetch_add(stats.exchange_sent as u64, Ordering::Relaxed);
         self.sync_exchange_blob_uploaded_total
@@ -674,6 +714,14 @@ impl SyncAgent {
         telemetry.counters.insert(
             SYNC_TELEMETRY_EXCHANGE_LIVE_SENT.to_string(),
             self.sync_exchange_live_sent_total.load(Ordering::Relaxed),
+        );
+        telemetry.counters.insert(
+            SYNC_TELEMETRY_EXCHANGE_LEGACY_UPLOAD_ENABLED.to_string(),
+            if self.config.legacy_exchange_upload_enabled {
+                1
+            } else {
+                0
+            },
         );
         if let Some(registry) = registry {
             telemetry
@@ -2311,10 +2359,13 @@ mod tests {
             frontload_hard_events_cap: 5000,
             frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
             frontload_exchange_upload_path: None,
+            legacy_exchange_upload_enabled: true,
             body_upload_max_bytes: 15 * 1024 * 1024,
             global_tags: BTreeMap::new(),
+            device_id_hash: "device-test".to_string(),
             heartbeat_telemetry: None,
             telemetry: TelemetrySyncConfig::default(),
+            telemetry_signing_key_hex: None,
         };
         let agent = SyncAgent::new_with_config_puller(config, None).expect("sync agent");
         (dir, agent)

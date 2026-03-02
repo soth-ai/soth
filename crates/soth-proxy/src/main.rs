@@ -46,7 +46,9 @@ async fn main() -> Result<()> {
         .bundle_vendor_pubkey()
         .context("parse bundle vendor pubkey")?;
     let org_config = Arc::new(config.org_signed_config());
-    let bundle_verification = config.bundle_verification_options();
+    let bundle_verification = config
+        .bundle_verification_options()
+        .context("parse bundle verification options")?;
 
     let (bundle_watcher, bundle_handle) = soth_bundle::init_with_options(
         config.bundle.bundle_dir.as_path(),
@@ -126,6 +128,10 @@ async fn main() -> Result<()> {
 
     let mut sync_task = None;
     if let Some(agent) = sync_agent.clone() {
+        agent
+            .verify_bundle_source_ready()
+            .await
+            .context("sync startup bundle source readiness check failed")?;
         sync_task = Some(tokio::spawn(async move { agent.run().await }));
     }
 

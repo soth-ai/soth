@@ -68,6 +68,8 @@ struct CapturedState {
     heartbeat_requests: Vec<HeartbeatRequest>,
     registry_version_requests: usize,
     registry_bundle_requests: usize,
+    bundle_current_requests: usize,
+    bundle_ack_requests: usize,
     saw_version_headers: Vec<String>,
     saw_authorization_headers: Vec<String>,
     body_failures_remaining: usize,
@@ -125,7 +127,11 @@ async fn contract_sync_endpoints_and_cursors() {
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         frontload_exchange_upload_path: None,
+        legacy_exchange_upload_enabled: true,
         body_upload_max_bytes: 15 * 1024 * 1024,
+        device_id_hash: "device-test".to_string(),
+        telemetry_signing_key_hex: None,
+
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
         heartbeat_telemetry: None,
         telemetry: TelemetrySyncConfig::default(),
@@ -153,8 +159,9 @@ async fn contract_sync_endpoints_and_cursors() {
     assert_eq!(captured.metadata_requests.len(), 1);
     assert_eq!(captured.heartbeat_requests.len(), 1);
     assert_eq!(captured.body_upload_payloads.len(), 1);
-    assert_eq!(captured.registry_version_requests, 1);
-    assert_eq!(captured.registry_bundle_requests, 1);
+    assert_eq!(captured.bundle_current_requests, 1);
+    assert_eq!(captured.registry_version_requests, 0);
+    assert_eq!(captured.registry_bundle_requests, 0);
     assert!(
         registry_cache_path.exists(),
         "registry bundle cache should be materialized"
@@ -315,7 +322,11 @@ async fn contract_retry_queue_on_body_upload_failure() {
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         frontload_exchange_upload_path: None,
+        legacy_exchange_upload_enabled: true,
         body_upload_max_bytes: 15 * 1024 * 1024,
+        device_id_hash: "device-test".to_string(),
+        telemetry_signing_key_hex: None,
+
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
         telemetry: TelemetrySyncConfig::default(),
@@ -406,7 +417,11 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         frontload_exchange_upload_path: None,
+        legacy_exchange_upload_enabled: true,
         body_upload_max_bytes: 15 * 1024 * 1024,
+        device_id_hash: "device-test".to_string(),
+        telemetry_signing_key_hex: None,
+
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
         telemetry: TelemetrySyncConfig::default(),
@@ -464,7 +479,11 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         frontload_exchange_upload_path: None,
+        legacy_exchange_upload_enabled: true,
         body_upload_max_bytes: 15 * 1024 * 1024,
+        device_id_hash: "device-test".to_string(),
+        telemetry_signing_key_hex: None,
+
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
         telemetry: TelemetrySyncConfig::default(),
@@ -546,7 +565,11 @@ async fn contract_frontload_and_live_batches_are_separated() {
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         frontload_exchange_upload_path: Some("/api/v1/exchanges/frontload/batch".to_string()),
+        legacy_exchange_upload_enabled: true,
         body_upload_max_bytes: 15 * 1024 * 1024,
+        device_id_hash: "device-test".to_string(),
+        telemetry_signing_key_hex: None,
+
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
         telemetry: TelemetrySyncConfig::default(),
@@ -640,7 +663,11 @@ async fn contract_frontload_batch_endpoint_falls_back_to_default_exchange_batch(
         frontload_hard_events_cap: 5000,
         frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
         frontload_exchange_upload_path: Some("/api/v1/exchanges/missing/batch".to_string()),
+        legacy_exchange_upload_enabled: true,
         body_upload_max_bytes: 15 * 1024 * 1024,
+        device_id_hash: "device-test".to_string(),
+        telemetry_signing_key_hex: None,
+
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
         telemetry: TelemetrySyncConfig::default(),
@@ -658,6 +685,82 @@ async fn contract_frontload_batch_endpoint_falls_back_to_default_exchange_batch(
     );
 }
 
+#[tokio::test]
+async fn contract_legacy_exchange_upload_can_be_disabled() {
+    let state = Arc::new(Mutex::new(CapturedState::default()));
+    let Some(server_url) = start_mock_server(state.clone()).await else {
+        eprintln!("Skipping contract_legacy_exchange_upload_can_be_disabled: cannot bind localhost listener");
+        return;
+    };
+
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("events.db");
+    create_test_db(&db_path, false);
+    seed_exchange_upload_queue_event(
+        &db_path,
+        &make_exchange_event("11111111-2222-3333-4444-555555555554"),
+    );
+    let cache_path = temp.path().join("cloud_cache.json");
+    let registry_cache_path = temp.path().join("registry_cache.json");
+    let retry_queue_dir = temp.path().join("retry");
+
+    let registry_puller =
+        RegistryPuller::new(server_url.clone(), "test-key", registry_cache_path.clone());
+    let puller = ConfigPuller::new(server_url.clone(), "test-key", cache_path.clone())
+        .with_registry_puller(registry_puller);
+    let _ = puller.pull_once().await.unwrap();
+
+    let config = SyncAgentConfig {
+        endpoint: server_url,
+        api_key: "test-key".to_string(),
+        event_db_path: db_path.clone(),
+        cache_path,
+        registry_cache_path: None,
+        agent_instance_id: "agent-instance-legacy-disabled".to_string(),
+        proxy_version: "0.1.0-test".to_string(),
+        retry_queue_dir,
+        retry_queue_max_bytes: 10 * 1024 * 1024,
+        sync_interval: Duration::from_secs(1),
+        batch_size: 200,
+        body_batch_size: 200,
+        body_upload_enabled: true,
+        metadata_max_events_per_batch: 200,
+        metadata_max_compressed_batch_bytes: 5 * 1024 * 1024,
+        frontload_enabled: true,
+        frontload_max_events_per_batch: 1500,
+        frontload_max_compressed_batch_bytes: 8 * 1024 * 1024,
+        frontload_hard_events_cap: 5000,
+        frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
+        frontload_exchange_upload_path: Some("/api/v1/exchanges/frontload/batch".to_string()),
+        legacy_exchange_upload_enabled: false,
+        body_upload_max_bytes: 15 * 1024 * 1024,
+        device_id_hash: "device-test".to_string(),
+        telemetry_signing_key_hex: None,
+        global_tags: BTreeMap::new(),
+        heartbeat_telemetry: None,
+        telemetry: TelemetrySyncConfig {
+            enabled: false,
+            ..TelemetrySyncConfig::default()
+        },
+    };
+
+    let agent = SyncAgent::new_with_config_puller(config, Some(puller)).unwrap();
+    let summary = agent.tick().await.unwrap();
+    assert_eq!(summary.exchange_sent, 0);
+
+    let captured = state.lock().unwrap().clone();
+    assert!(captured.metadata_requests.is_empty());
+    assert!(captured.metadata_request_paths.is_empty());
+
+    let conn = Connection::open(&db_path).unwrap();
+    let queue_depth: i64 = conn
+        .query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(queue_depth, 1);
+}
+
 async fn start_mock_server(state: SharedState) -> Option<String> {
     let app = Router::new()
         .route("/api/v1/exchanges/batch", post(exchange_batch_handler))
@@ -668,6 +771,8 @@ async fn start_mock_server(state: SharedState) -> Option<String> {
         .route("/api/v1/blobs", post(blob_upload_handler))
         .route("/api/v1/config", get(config_handler))
         .route("/api/v1/heartbeat", post(heartbeat_handler))
+        .route("/v1/bundle/current", get(bundle_current_handler))
+        .route("/v1/bundle/ack", post(bundle_ack_handler))
         .route("/api/v1/registry/version", get(registry_version_handler))
         .route("/api/v1/registry/bundle", get(registry_bundle_handler))
         .with_state(state);
@@ -867,6 +972,50 @@ async fn heartbeat_handler(
             config_changed: false,
             server_time: Utc::now().to_rfc3339(),
         }),
+    )
+}
+
+async fn bundle_current_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    record_headers(&state, &headers);
+    state.lock().unwrap().bundle_current_requests += 1;
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response_headers.insert(
+        ETAG,
+        HeaderValue::from_str(test_bundle_sha().as_str()).unwrap(),
+    );
+    response_headers.insert(
+        "x-soth-bundle-version",
+        HeaderValue::from_static(TEST_BUNDLE_VERSION),
+    );
+    response_headers.insert(
+        "x-soth-bundle-hash",
+        HeaderValue::from_str(test_bundle_sha().as_str()).unwrap(),
+    );
+    response_headers.insert("x-soth-bundle-channel", HeaderValue::from_static("stable"));
+
+    (StatusCode::OK, response_headers, TEST_BUNDLE_JSON)
+}
+
+async fn bundle_ack_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    _body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    record_headers(&state, &headers);
+    state.lock().unwrap().bundle_ack_requests += 1;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "accepted_bundle_type": "local",
+            "accepted_bundle_version": TEST_BUNDLE_VERSION,
+            "server_time": Utc::now().to_rfc3339(),
+        })),
     )
 }
 

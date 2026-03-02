@@ -12,14 +12,15 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use soth_sync::api_types::RegistryVersionResponse;
 use soth_sync::registry_puller::RegistryPuller;
 use soth_sync::BundleWatcher;
 
 #[derive(Default)]
 struct RegistryHits {
-    version_calls: usize,
-    bundle_calls: usize,
+    bundle_current_calls: usize,
+    legacy_version_calls: usize,
+    legacy_bundle_calls: usize,
+    bundle_ack_calls: usize,
 }
 
 #[derive(Clone)]
@@ -30,47 +31,66 @@ struct RegistryState {
     hits: Arc<Mutex<RegistryHits>>,
 }
 
-async fn version_handler(State(state): State<RegistryState>) -> impl IntoResponse {
+async fn bundle_current_handler(State(state): State<RegistryState>) -> impl IntoResponse {
     if let Ok(mut hits) = state.hits.lock() {
-        hits.version_calls = hits.version_calls.saturating_add(1);
+        hits.bundle_current_calls = hits.bundle_current_calls.saturating_add(1);
     }
-
-    Json(RegistryVersionResponse {
-        bundle_type: "local".to_string(),
-        version: state.bundle_version.clone(),
-        sha256: state.payload_sha256.clone(),
-        bundle_hash: Some(state.payload_sha256.clone()),
-        compiled_at: "2026-02-25T00:00:00Z".to_string(),
-        provider_count: 0,
-        domain_count: 0,
-        format_count: 0,
-        size_bytes: state.payload.len() as u64,
-        manifest: None,
-        channel: Some("channel2".to_string()),
-    })
-}
-
-async fn bundle_handler(State(state): State<RegistryState>) -> impl IntoResponse {
-    if let Ok(mut hits) = state.hits.lock() {
-        hits.bundle_calls = hits.bundle_calls.saturating_add(1);
-    }
-
     let mut headers = HeaderMap::new();
     headers.insert(
         "etag",
         HeaderValue::from_str(format!("\"{}\"", state.payload_sha256).as_str())
             .unwrap_or_else(|_| HeaderValue::from_static("\"invalid\"")),
     );
+    headers.insert(
+        "x-soth-bundle-version",
+        HeaderValue::from_str(state.bundle_version.as_str())
+            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+    );
+    headers.insert(
+        "x-soth-bundle-hash",
+        HeaderValue::from_str(state.payload_sha256.as_str())
+            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+    );
 
     (StatusCode::OK, headers, state.payload.as_ref().clone())
+}
+
+async fn legacy_version_handler(State(state): State<RegistryState>) -> impl IntoResponse {
+    if let Ok(mut hits) = state.hits.lock() {
+        hits.legacy_version_calls = hits.legacy_version_calls.saturating_add(1);
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "not_found"
+        })),
+    )
+}
+
+async fn legacy_bundle_handler(State(state): State<RegistryState>) -> impl IntoResponse {
+    if let Ok(mut hits) = state.hits.lock() {
+        hits.legacy_bundle_calls = hits.legacy_bundle_calls.saturating_add(1);
+    }
+    (StatusCode::NOT_FOUND, Vec::<u8>::new())
+}
+
+async fn bundle_ack_handler(State(state): State<RegistryState>) -> impl IntoResponse {
+    if let Ok(mut hits) = state.hits.lock() {
+        hits.bundle_ack_calls = hits.bundle_ack_calls.saturating_add(1);
+    }
+    Json(json!({
+        "ok": true
+    }))
 }
 
 async fn start_registry_server(state: RegistryState) -> Option<String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let addr = listener.local_addr().ok()?;
     let app = Router::new()
-        .route("/api/v1/registry/version", get(version_handler))
-        .route("/api/v1/registry/bundle", get(bundle_handler))
+        .route("/v1/bundle/current", get(bundle_current_handler))
+        .route("/v1/bundle/ack", axum::routing::post(bundle_ack_handler))
+        .route("/api/v1/registry/version", get(legacy_version_handler))
+        .route("/api/v1/registry/bundle", get(legacy_bundle_handler))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -249,6 +269,7 @@ async fn bundle_sync_channel2_contract_installs_into_bundle_watcher() {
     assert_eq!(installed.installed_version.as_deref(), Some("bundle-v2"));
 
     let guard = hits.lock().expect("hits lock");
-    assert!(guard.version_calls >= 1);
-    assert!(guard.bundle_calls >= 1);
+    assert!(guard.bundle_current_calls >= 1);
+    assert_eq!(guard.legacy_version_calls, 0);
+    assert_eq!(guard.legacy_bundle_calls, 0);
 }

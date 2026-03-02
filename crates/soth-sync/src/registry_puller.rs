@@ -1,7 +1,9 @@
 use crate::api_types::{RegistryBundleFetchQuery, RegistryVersionResponse};
 use anyhow::Context;
 use base64::Engine;
+use chrono::Utc;
 use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ pub struct RegistryPuller {
     endpoint: String,
     fallback_endpoints: Vec<String>,
     api_key: String,
+    device_id_hash: Option<String>,
     cache_path: PathBuf,
     bundle_type: String,
     bundle_watcher: Option<Arc<dyn BundleWatcher>>,
@@ -55,6 +58,7 @@ impl RegistryPuller {
             endpoint,
             fallback_endpoints: Vec::new(),
             api_key: api_key.into(),
+            device_id_hash: None,
             cache_path,
             bundle_type: "local".to_string(),
             bundle_watcher: None,
@@ -68,6 +72,12 @@ impl RegistryPuller {
 
     pub fn with_bundle_watcher(mut self, watcher: Arc<dyn BundleWatcher>) -> Self {
         self.bundle_watcher = Some(watcher);
+        self
+    }
+
+    pub fn with_device_id_hash(mut self, device_id_hash: impl Into<String>) -> Self {
+        let normalized = device_id_hash.into();
+        self.device_id_hash = normalize_optional(Some(normalized.as_str()));
         self
     }
 
@@ -149,7 +159,7 @@ impl RegistryPuller {
 
     /// Force a registry refresh attempt against cloud.
     ///
-    /// Unlike `sync_from_hint`, this always checks cloud version/bundle endpoints
+    /// Unlike `sync_from_hint`, this always checks `/v1/bundle/current`
     /// and uses ETag revalidation to avoid unnecessary downloads.
     pub async fn refresh_now(&self) -> anyhow::Result<RegistryPullOutcome> {
         let cached = match cache::load_registry_bundle_cache(&self.cache_path) {
@@ -234,142 +244,144 @@ impl RegistryPuller {
         if_none_match: Option<&str>,
         fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<Option<RegistryPullOutcome>> {
-        let Some(version) = self.fetch_version(endpoint, fetch_query).await? else {
-            return Ok(None);
-        };
-        let version_bundle_hash = normalize_optional(version.bundle_hash.as_deref());
-        match self
-            .fetch_bundle(
-                endpoint,
-                if_none_match,
-                fetch_query,
-                version_bundle_hash.as_deref(),
-            )
-            .await?
-        {
-            BundleFetchResult::NotModified => {
+        let result = self
+            .fetch_bundle_current(endpoint, if_none_match, fetch_query)
+            .await?;
+        self.handle_bundle_fetch_result(endpoint, result, Some("v1_bundle_current"))
+            .await
+            .map(Some)
+    }
+
+    async fn handle_bundle_fetch_result(
+        &self,
+        endpoint: &str,
+        result: BundleFetchResultWithMetadata,
+        source: Option<&str>,
+    ) -> anyhow::Result<RegistryPullOutcome> {
+        match result {
+            BundleFetchResultWithMetadata::NotModified { version } => {
                 if let Err(error) = cache::mark_registry_validation_success(&self.cache_path) {
                     tracing::warn!(
                         error = %error,
                         "Failed updating registry cache validation status after 304 revalidation"
                     );
                 }
-                Ok(Some(RegistryPullOutcome {
+                Ok(RegistryPullOutcome {
                     checked: true,
                     downloaded: false,
-                    version: Some(version.version),
-                }))
+                    version,
+                })
             }
-            BundleFetchResult::Downloaded { bytes, etag } => {
-                let verified_metadata = verify_bundle_integrity(&version, &bytes, Some(&etag))
+            BundleFetchResultWithMetadata::Downloaded {
+                bytes,
+                etag,
+                metadata,
+            } => {
+                let verified_metadata = verify_bundle_integrity(&metadata, &bytes, Some(&etag))
                     .inspect_err(|error| {
-                        if let Err(status_error) =
-                            cache::mark_registry_validation_failed(
-                                &self.cache_path,
-                                &format!("integrity_verification_failed:{error}"),
-                            )
-                        {
+                        if let Err(status_error) = cache::mark_registry_validation_failed(
+                            &self.cache_path,
+                            &format!("integrity_verification_failed:{error}"),
+                        ) {
                             tracing::warn!(
                                 error = %status_error,
                                 "Failed persisting registry validation status after integrity failure"
                             );
                         }
                     })?;
-                if let Some(installed_version) = self.maybe_install_channel2_bundle(&bytes)? {
-                    if endpoint != self.endpoint {
-                        tracing::warn!(
-                            endpoint = endpoint,
-                            bundle_version = installed_version.as_str(),
-                            "Channel 2 bundle install succeeded via fallback endpoint"
-                        );
+
+                let bundle_hash = normalize_optional(verified_metadata.bundle_hash.as_deref())
+                    .or_else(|| normalize_optional(Some(verified_metadata.sha256.as_str())));
+
+                match self.maybe_install_channel2_bundle(&bytes) {
+                    Ok(Some(installed_version)) => {
+                        self.send_bundle_install_ack(
+                            endpoint,
+                            installed_version.as_str(),
+                            bundle_hash.as_deref(),
+                            "installed",
+                            source,
+                        )
+                        .await;
+                        if endpoint != self.endpoint {
+                            tracing::warn!(
+                                endpoint = endpoint,
+                                bundle_version = installed_version.as_str(),
+                                "Channel 2 bundle install succeeded via fallback endpoint"
+                            );
+                        }
+                        Ok(RegistryPullOutcome {
+                            checked: true,
+                            downloaded: true,
+                            version: Some(installed_version),
+                        })
                     }
-                    return Ok(Some(RegistryPullOutcome {
-                        checked: true,
-                        downloaded: true,
-                        version: Some(installed_version),
-                    }));
-                }
-                cache::save_registry_bundle_cache(
-                    &self.cache_path,
-                    &verified_metadata,
-                    &etag,
-                    &bytes,
-                )
-                .inspect_err(|error| {
-                    if let Err(status_error) = cache::mark_registry_validation_failed(
-                        &self.cache_path,
-                        &format!("cache_write_failed:{error}"),
-                    ) {
-                        tracing::warn!(
-                            error = %status_error,
-                            "Failed persisting registry validation status after cache write failure"
-                        );
+                    Ok(None) => {
+                        cache::save_registry_bundle_cache(
+                            &self.cache_path,
+                            &verified_metadata,
+                            &etag,
+                            &bytes,
+                        )
+                        .inspect_err(|error| {
+                            if let Err(status_error) = cache::mark_registry_validation_failed(
+                                &self.cache_path,
+                                &format!("cache_write_failed:{error}"),
+                            ) {
+                                tracing::warn!(
+                                    error = %status_error,
+                                    "Failed persisting registry validation status after cache write failure"
+                                );
+                            }
+                        })?;
+                        self.send_bundle_install_ack(
+                            endpoint,
+                            verified_metadata.version.as_str(),
+                            bundle_hash.as_deref(),
+                            "installed",
+                            source,
+                        )
+                        .await;
+                        if endpoint != self.endpoint {
+                            tracing::warn!(
+                                endpoint = endpoint,
+                                bundle_version = verified_metadata.version.as_str(),
+                                "Registry bundle refresh succeeded via fallback endpoint"
+                            );
+                        }
+                        Ok(RegistryPullOutcome {
+                            checked: true,
+                            downloaded: true,
+                            version: Some(verified_metadata.version),
+                        })
                     }
-                })?;
-                if endpoint != self.endpoint {
-                    tracing::warn!(
-                        endpoint = endpoint,
-                        bundle_version = verified_metadata.version.as_str(),
-                        "Registry bundle refresh succeeded via fallback endpoint"
-                    );
+                    Err(error) => {
+                        self.send_bundle_install_ack(
+                            endpoint,
+                            verified_metadata.version.as_str(),
+                            bundle_hash.as_deref(),
+                            "failed",
+                            source,
+                        )
+                        .await;
+                        Err(error.context("installing channel 2 intelligence bundle"))
+                    }
                 }
-                Ok(Some(RegistryPullOutcome {
-                    checked: true,
-                    downloaded: true,
-                    version: Some(verified_metadata.version),
-                }))
             }
         }
     }
 
-    async fn fetch_version(
-        &self,
-        endpoint: &str,
-        fetch_query: &RegistryBundleFetchQuery,
-    ) -> anyhow::Result<Option<RegistryVersionResponse>> {
-        let cloud = self.cloud_client_for_endpoint(endpoint);
-        let url = cloud.url("/api/v1/registry/version");
-        let mut query_params = vec![("type", self.bundle_type.clone())];
-        query_params.extend(build_bundle_query_pairs(fetch_query));
-        let response = cloud
-            .get("/api/v1/registry/version")
-            .query(&query_params)
-            .send()
-            .await
-            .with_context(|| format!("cloud registry version pull failed for {url}"))?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND
-            || response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
-        {
-            return Ok(None);
-        }
-
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "cloud registry version pull failed for {url} with status {}",
-                response.status()
-            );
-        }
-
-        let parsed = response
-            .json::<RegistryVersionResponse>()
-            .await
-            .context("failed decoding cloud registry version response")?;
-        Ok(Some(parsed))
-    }
-
-    async fn fetch_bundle(
+    async fn fetch_bundle_current(
         &self,
         endpoint: &str,
         if_none_match: Option<&str>,
         fetch_query: &RegistryBundleFetchQuery,
-        bundle_hash: Option<&str>,
-    ) -> anyhow::Result<BundleFetchResult> {
+    ) -> anyhow::Result<BundleFetchResultWithMetadata> {
         let cloud = self.cloud_client_for_endpoint(endpoint);
-        let url = cloud.url("/api/v1/registry/bundle");
+        let url = cloud.url("/v1/bundle/current");
         let mut query_params = vec![("type", self.bundle_type.clone())];
-        query_params.extend(build_bundle_request_query_pairs(fetch_query, bundle_hash));
-        let mut request = cloud.get("/api/v1/registry/bundle").query(&query_params);
+        query_params.extend(build_bundle_query_pairs(fetch_query));
+        let mut request = cloud.get("/v1/bundle/current").query(&query_params);
 
         if let Some(if_none_match) = if_none_match {
             request = request.header(IF_NONE_MATCH, if_none_match);
@@ -378,30 +390,113 @@ impl RegistryPuller {
         let response = request
             .send()
             .await
-            .with_context(|| format!("cloud registry bundle pull failed for {url}"))?;
+            .with_context(|| format!("cloud v1 bundle current pull failed for {url}"))?;
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            return Ok(BundleFetchResult::NotModified);
+            let version = response
+                .headers()
+                .get("x-soth-bundle-version")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| normalize_optional(Some(value)));
+            return Ok(BundleFetchResultWithMetadata::NotModified { version });
         }
 
         if !response.status().is_success() {
             anyhow::bail!(
-                "cloud registry bundle pull failed for {url} with status {}",
+                "cloud v1 bundle current pull failed for {url} with status {}",
                 response.status()
             );
         }
 
-        let etag = extract_required_etag(response.headers())?;
+        let headers = response.headers().clone();
+        let etag = extract_required_etag(&headers)?;
 
         let bytes = response
             .bytes()
             .await
-            .context("failed reading cloud registry bundle bytes")?;
+            .context("failed reading cloud v1 bundle current response bytes")?
+            .to_vec();
 
-        Ok(BundleFetchResult::Downloaded {
-            bytes: bytes.to_vec(),
+        let metadata = build_current_bundle_metadata(
+            headers.clone(),
+            bytes.as_slice(),
+            self.bundle_type.as_str(),
+        );
+
+        Ok(BundleFetchResultWithMetadata::Downloaded {
+            bytes,
             etag,
+            metadata,
         })
+    }
+
+    async fn send_bundle_install_ack(
+        &self,
+        endpoint: &str,
+        bundle_version: &str,
+        bundle_hash: Option<&str>,
+        install_status: &str,
+        source: Option<&str>,
+    ) {
+        let Some(device_id_hash) = self.device_id_hash.as_deref() else {
+            return;
+        };
+        let payload = RegistryBundleAckRequest {
+            device_id_hash: device_id_hash.to_string(),
+            bundle_type: Some(self.bundle_type.clone()),
+            bundle_version: bundle_version.to_string(),
+            bundle_hash: normalize_optional(bundle_hash),
+            install_status: Some(install_status.to_string()),
+            installed_at: Some(Utc::now().to_rfc3339()),
+            metadata: source
+                .map(|value| {
+                    let mut metadata = HashMap::new();
+                    metadata.insert("source".to_string(), value.to_string());
+                    metadata
+                })
+                .unwrap_or_default(),
+        };
+
+        let ack_result = self
+            .post_bundle_ack(endpoint, "/v1/bundle/ack", &payload)
+            .await;
+
+        match ack_result {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    endpoint = endpoint,
+                    bundle_version = bundle_version,
+                    install_status = install_status,
+                    "Failed to acknowledge bundle install"
+                );
+            }
+        }
+    }
+
+    async fn post_bundle_ack(
+        &self,
+        endpoint: &str,
+        path: &str,
+        payload: &RegistryBundleAckRequest,
+    ) -> anyhow::Result<()> {
+        let cloud = self.cloud_client_for_endpoint(endpoint);
+        let url = cloud.url(path);
+        let response = cloud
+            .post(path)
+            .json(payload)
+            .send()
+            .await
+            .with_context(|| format!("bundle ack request failed for {url}"))?;
+
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "bundle ack request failed for {url} with status {}",
+                response.status()
+            );
+        }
+        Ok(())
     }
 
     fn maybe_install_channel2_bundle(&self, bytes: &[u8]) -> anyhow::Result<Option<String>> {
@@ -418,9 +513,31 @@ impl RegistryPuller {
     }
 }
 
-enum BundleFetchResult {
-    NotModified,
-    Downloaded { bytes: Vec<u8>, etag: String },
+enum BundleFetchResultWithMetadata {
+    NotModified {
+        version: Option<String>,
+    },
+    Downloaded {
+        bytes: Vec<u8>,
+        etag: String,
+        metadata: RegistryVersionResponse,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct RegistryBundleAckRequest {
+    device_id_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle_type: Option<String>,
+    bundle_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    metadata: HashMap<String, String>,
 }
 
 fn normalize_optional(value: Option<&str>) -> Option<String> {
@@ -496,17 +613,6 @@ fn build_bundle_query_pairs(fetch_query: &RegistryBundleFetchQuery) -> Vec<(&'st
             }
         }
     }
-}
-
-fn build_bundle_request_query_pairs(
-    fetch_query: &RegistryBundleFetchQuery,
-    bundle_hash: Option<&str>,
-) -> Vec<(&'static str, String)> {
-    let mut pairs = build_bundle_query_pairs(fetch_query);
-    if let Some(bundle_hash) = normalize_optional(bundle_hash) {
-        pairs.push(("bundle_hash", bundle_hash));
-    }
-    pairs
 }
 
 fn verify_bundle_integrity(
@@ -589,6 +695,85 @@ fn normalize_hash_candidate(value: Option<&str>) -> Option<String> {
     }
 }
 
+fn build_current_bundle_metadata(
+    headers: HeaderMap,
+    bytes: &[u8],
+    bundle_type: &str,
+) -> RegistryVersionResponse {
+    let actual_hash = format!("{:x}", Sha256::digest(bytes));
+    let sha256 = normalize_optional(
+        headers
+            .get("x-soth-bundle-sha256")
+            .and_then(|value| value.to_str().ok()),
+    )
+    .or_else(|| {
+        normalize_optional(
+            headers
+                .get("x-soth-bundle-hash")
+                .and_then(|value| value.to_str().ok()),
+        )
+    })
+    .or_else(|| normalize_hash_candidate(headers.get(ETAG).and_then(|value| value.to_str().ok())))
+    .unwrap_or_else(|| actual_hash.clone());
+
+    let compiled_at = normalize_optional(
+        headers
+            .get("x-soth-bundle-compiled-at")
+            .and_then(|value| value.to_str().ok()),
+    )
+    .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+    let version = normalize_optional(
+        headers
+            .get("x-soth-bundle-version")
+            .and_then(|value| value.to_str().ok()),
+    )
+    .or_else(|| infer_bundle_version_from_payload(bytes))
+    .unwrap_or_else(|| "unknown".to_string());
+
+    let channel = normalize_optional(
+        headers
+            .get("x-soth-bundle-channel")
+            .and_then(|value| value.to_str().ok()),
+    );
+
+    RegistryVersionResponse {
+        bundle_type: bundle_type.to_string(),
+        version,
+        sha256: sha256.clone(),
+        bundle_hash: Some(sha256),
+        compiled_at,
+        provider_count: 0,
+        domain_count: 0,
+        format_count: 0,
+        size_bytes: bytes.len() as u64,
+        manifest: None,
+        channel,
+    }
+}
+
+fn infer_bundle_version_from_payload(bytes: &[u8]) -> Option<String> {
+    let parsed: Value = serde_json::from_slice(bytes).ok()?;
+    let object = parsed.as_object()?;
+    normalize_optional(
+        object
+            .get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("bundle_version"))
+            .and_then(Value::as_str),
+    )
+    .or_else(|| normalize_optional(object.get("version").and_then(Value::as_str)))
+    .or_else(|| {
+        normalize_optional(
+            object
+                .get("manifest")
+                .and_then(Value::as_object)
+                .and_then(|manifest| manifest.get("version"))
+                .and_then(Value::as_str),
+        )
+    })
+}
+
 fn parse_channel2_bundle_payload(bytes: &[u8]) -> Option<(Vec<u8>, HashMap<String, Vec<u8>>)> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
     let object = value.as_object()?;
@@ -656,9 +841,9 @@ fn decode_bytes_like(raw_bytes: &[u8], raw: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_bundle_query_pairs, build_bundle_request_query_pairs, extract_required_etag,
-        normalize_etag, parse_channel2_bundle_payload, should_skip_pull, verify_bundle_integrity,
-        BundleWatcher, RegistryPuller,
+        build_bundle_query_pairs, extract_required_etag, normalize_etag,
+        parse_channel2_bundle_payload, should_skip_pull, verify_bundle_integrity, BundleWatcher,
+        RegistryPuller,
     };
     use crate::api_types::{RegistryBundleFetchQuery, RegistryVersionResponse};
     use base64::Engine;
@@ -781,23 +966,6 @@ mod tests {
                 ("query", "diff".to_string()),
                 ("from_hash", "abc123".to_string()),
                 ("section", "tools".to_string())
-            ]
-        );
-    }
-
-    #[test]
-    fn build_bundle_request_query_pairs_appends_bundle_hash() {
-        let pairs = build_bundle_request_query_pairs(
-            &RegistryBundleFetchQuery::Section {
-                section: "rules".to_string(),
-            },
-            Some("abc123"),
-        );
-        assert_eq!(
-            pairs,
-            vec![
-                ("query", "section:rules".to_string()),
-                ("bundle_hash", "abc123".to_string())
             ]
         );
     }
