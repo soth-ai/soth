@@ -31,16 +31,11 @@ has_edge() {
 
 blocked_edges=(
   "soth-core->soth-proxy"
-  "soth-core->soth-dashboard"
   "soth-core->soth-cli"
   "soth-core->soth-collector"
   "soth-proxy->soth-cli"
-  "soth-dashboard->soth-proxy"
-  "soth-dashboard->soth-cli"
   "soth-collector->soth-proxy"
-  "soth-collector->soth-dashboard"
   "soth-sync->soth-proxy"
-  "soth-sync->soth-dashboard"
 )
 
 echo "crate dependency edges:"

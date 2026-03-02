@@ -25,8 +25,8 @@ echo "==> check (release + local-debug)"
 cargo check -p soth-cli --release --features local-debug
 
 echo "==> tests (critical crates)"
-cargo test -p soth-budget --lib
-cargo test -p soth-oisp --lib
+cargo test -p soth-proxy --lib
+cargo test -p soth-sync --lib
 cargo test -p soth-proxy usage_enrichment -- --nocapture
 
 if [[ "${STRICT_CLIPPY:-0}" == "1" ]]; then
