@@ -34,9 +34,11 @@ pub fn fingerprint(
         if bundle.rest_formats.contains_key(provider_id) {
             return DetectedFormat::CustomRest(provider_id.to_string());
         }
-    }
-
-    if let Some(provider_id) = match_provider_by_detection_hints(path, headers, bundle) {
+        // matched_provider is set but not a known LLM provider or rest format
+        // (likely an app entity like "chatgpt" or "claude"). Skip detection
+        // hints scan to avoid catch-all patterns stealing the match, and fall
+        // through directly to header/path heuristics.
+    } else if let Some(provider_id) = match_provider_by_detection_hints(path, headers, bundle) {
         let hinted = provider_entry_to_format(provider_id, bundle.llm_providers.get(provider_id));
         if hinted != DetectedFormat::Unknown {
             return hinted;
@@ -71,8 +73,8 @@ pub fn fingerprint(
         return DetectedFormat::GeminiRest;
     }
 
-    if path_lc.contains("/model/") && path_lc.contains("/invoke")
-        || path_lc.contains("bedrock-runtime")
+    if path_lc.contains("/model/")
+        && (path_lc.contains("/invoke") || path_lc.contains("bedrock-runtime"))
     {
         return DetectedFormat::BedrockRest;
     }
@@ -629,5 +631,86 @@ mod tests {
             &bundle.as_slice(),
         );
         assert_eq!(detected, DetectedFormat::AnthropicRest);
+    }
+
+    #[test]
+    fn app_entity_matched_provider_does_not_trigger_bedrock_catchall() {
+        let mut bundle = bundle_fixture();
+        // Simulate bedrock provider with catch-all path pattern (like real bundle)
+        bundle.llm_providers.insert(
+            "aws_bedrock".to_string(),
+            ProviderEntry {
+                provider_id: Some("aws_bedrock".to_string()),
+                name: Some("AWS Bedrock".to_string()),
+                api_format: Some("bedrock".to_string()),
+                detection: Some(serde_json::json!({
+                    "hosts": [{"pattern": "bedrock-runtime.*.amazonaws.com", "paths": {}}],
+                    "path_patterns": ["**"]
+                })),
+                ..ProviderEntry::default()
+            },
+        );
+
+        // chatgpt is an app entity (matched_provider from gating), not in llm_providers.
+        // Should fall through to path heuristics, NOT match bedrock's ** catch-all.
+        let detected = fingerprint(
+            "POST",
+            "/backend-api/conversation",
+            &headers(&[
+                ("host", "chatgpt.com"),
+                ("content-type", "application/json"),
+            ]),
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            Some("chatgpt"),
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::OpenAIRest);
+    }
+
+    #[test]
+    fn app_entity_claude_uses_header_heuristic() {
+        let mut bundle = bundle_fixture();
+        bundle.llm_providers.insert(
+            "aws_bedrock".to_string(),
+            ProviderEntry {
+                provider_id: Some("aws_bedrock".to_string()),
+                name: Some("AWS Bedrock".to_string()),
+                api_format: Some("bedrock".to_string()),
+                detection: Some(serde_json::json!({
+                    "hosts": [{"pattern": "bedrock-runtime.*.amazonaws.com", "paths": {}}],
+                    "path_patterns": ["**"]
+                })),
+                ..ProviderEntry::default()
+            },
+        );
+
+        let detected = fingerprint(
+            "POST",
+            "/v1/messages",
+            &headers(&[
+                ("host", "api.anthropic.com"),
+                ("content-type", "application/json"),
+                ("anthropic-version", "2024-01-01"),
+            ]),
+            br#"{"model":"claude-sonnet"}"#,
+            Some("claude"),
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::AnthropicRest);
+    }
+
+    #[test]
+    fn bedrock_path_requires_model_segment() {
+        let bundle = bundle_fixture();
+        // bedrock-runtime in path but without /model/ should NOT match bedrock
+        let detected = fingerprint(
+            "POST",
+            "/some/bedrock-runtime/path",
+            &headers(&[("content-type", "application/json")]),
+            br#"{"hello":"world"}"#,
+            None,
+            &bundle.as_slice(),
+        );
+        assert_ne!(detected, DetectedFormat::BedrockRest);
     }
 }

@@ -277,7 +277,78 @@ fn looks_like_protobuf_payload(payload: &[u8]) -> bool {
 }
 
 fn extract_structured_text(payload: &[u8]) -> Option<String> {
-    parse_graphql_payload_text(payload).or_else(|| parse_jsonrpc_payload_text(payload))
+    parse_graphql_payload_text(payload)
+        .or_else(|| parse_jsonrpc_payload_text(payload))
+        .or_else(|| extract_sse_rest_delta(payload))
+}
+
+/// Extract text content from REST SSE streaming payloads.
+///
+/// Handles `data: {...}` lines from OpenAI and Anthropic streaming responses:
+/// - OpenAI: `data: {"choices":[{"delta":{"content":"..."}}]}`
+/// - Anthropic: `data: {"type":"content_block_delta","delta":{"text":"..."}}`
+fn extract_sse_rest_delta(payload: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let mut collected = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let json_str = if let Some(rest) = trimmed.strip_prefix("data:") {
+            rest.trim()
+        } else if trimmed.starts_with('{') {
+            trimmed
+        } else {
+            continue;
+        };
+
+        if json_str.is_empty() || json_str == "[DONE]" {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            continue;
+        };
+
+        // OpenAI: choices[0].delta.content
+        if let Some(delta) = value
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("delta"))
+            .and_then(|d| d.get("content"))
+            .and_then(|v| v.as_str())
+        {
+            collected.push_str(delta);
+            continue;
+        }
+
+        // Anthropic: delta.text (content_block_delta)
+        if let Some(delta) = value
+            .get("delta")
+            .and_then(|d| d.get("text"))
+            .and_then(|v| v.as_str())
+        {
+            collected.push_str(delta);
+            continue;
+        }
+
+        // Anthropic: content_block_start with text block
+        if let Some(text_val) = value
+            .get("content_block")
+            .and_then(|b| b.get("text"))
+            .and_then(|v| v.as_str())
+        {
+            if !text_val.is_empty() {
+                collected.push_str(text_val);
+            }
+            continue;
+        }
+    }
+
+    if collected.is_empty() {
+        None
+    } else {
+        Some(collected)
+    }
 }
 
 fn parse_multipart_payload_text(payload: &[u8]) -> Option<String> {
@@ -410,5 +481,52 @@ mod tests {
             out.push(((value & 0x7f) as u8) | 0x80);
             value >>= 7;
         }
+    }
+
+    #[test]
+    fn extract_sse_rest_delta_openai_format() {
+        let payload = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n";
+        let result = super::extract_sse_rest_delta(payload);
+        assert_eq!(result.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn extract_sse_rest_delta_anthropic_format() {
+        let payload = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Hello\"}}\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\" world\"}}\n";
+        let result = super::extract_sse_rest_delta(payload);
+        assert_eq!(result.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn extract_sse_rest_delta_skips_done() {
+        let payload = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\ndata: [DONE]\n";
+        let result = super::extract_sse_rest_delta(payload);
+        assert_eq!(result.as_deref(), Some("Hi"));
+    }
+
+    #[test]
+    fn extract_structured_text_handles_bare_json_delta() {
+        // A bare JSON object without data: prefix should still be extracted
+        let payload = br#"{"choices":[{"delta":{"content":"bare json"}}]}"#;
+        let result = super::extract_structured_text(payload);
+        assert!(result.is_some(), "bare JSON delta should be extracted");
+    }
+
+    #[test]
+    fn sse_chunk_accumulates_in_session() {
+        let bundle = OwnedDetectBundle::default();
+        let mut session = StreamSession::new(Uuid::new_v4(), CaptureMode::MetadataOnly);
+        let chunk = StreamChunk {
+            connection_id: session.connection_id,
+            sequence: 1,
+            payload: Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"streaming content\"}}]}\n\n",
+            ),
+            frame_kind: FrameKind::SseData,
+        };
+
+        process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
+        let content = session.finalize_response_content();
+        assert!(content.contains("streaming content"), "SSE content should be accumulated, got: {content}");
     }
 }
