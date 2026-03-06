@@ -9,9 +9,8 @@ use soth_historian::backfill::BackfillEngine;
 use soth_historian::db;
 use soth_historian::dedup::DedupChecker;
 use soth_historian::discovery::ToolDiscovery;
-use soth_historian::readers::claude_code::ClaudeCodeReader;
-use soth_historian::readers::codex::CodexReader;
-use soth_historian::readers::gemini::GeminiReader;
+use soth_historian::engine::PlaybookReader;
+use soth_historian::playbooks::default_playbooks;
 use soth_historian::watch::WatchEngine;
 
 #[derive(Parser)]
@@ -46,11 +45,10 @@ fn default_db_path() -> PathBuf {
 }
 
 fn build_readers() -> Vec<Box<dyn soth_historian::reader::FormatReader>> {
-    vec![
-        Box::new(ClaudeCodeReader::new()),
-        Box::new(GeminiReader::new()),
-        Box::new(CodexReader::new()),
-    ]
+    default_playbooks()
+        .into_iter()
+        .map(|pb| Box::new(PlaybookReader::new(pb)) as Box<dyn soth_historian::reader::FormatReader>)
+        .collect()
 }
 
 #[tokio::main]

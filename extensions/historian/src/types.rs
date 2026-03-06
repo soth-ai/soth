@@ -11,11 +11,28 @@ pub enum AiTool {
     GeminiCli,
     OpenAiCodex,
     GithubCopilot,
+    Cursor,
     Continue,
+    OpenClaw,
     Unknown(String),
 }
 
 impl AiTool {
+    /// Construct an `AiTool` from its canonical key string.
+    /// Unknown keys produce `AiTool::Unknown(key)`.
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "claude_code" => Self::ClaudeCode,
+            "gemini_cli" => Self::GeminiCli,
+            "openai_codex" => Self::OpenAiCodex,
+            "github_copilot" => Self::GithubCopilot,
+            "cursor" => Self::Cursor,
+            "continue" => Self::Continue,
+            "openclaw" => Self::OpenClaw,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
     /// Canonical string key used in DB rows and metadata maps.
     pub fn key(&self) -> &str {
         match self {
@@ -23,7 +40,9 @@ impl AiTool {
             Self::GeminiCli => "gemini_cli",
             Self::OpenAiCodex => "openai_codex",
             Self::GithubCopilot => "github_copilot",
+            Self::Cursor => "cursor",
             Self::Continue => "continue",
+            Self::OpenClaw => "openclaw",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -35,7 +54,11 @@ impl AiTool {
             Self::GeminiCli => DataSource::HistorianGemini,
             Self::OpenAiCodex => DataSource::HistorianCodex,
             // All others map to the closest variant; extend DataSource as needed.
-            _ => DataSource::HistorianClaudeCode,
+            Self::Cursor
+            | Self::GithubCopilot
+            | Self::Continue
+            | Self::OpenClaw
+            | Self::Unknown(_) => DataSource::HistorianClaudeCode,
         }
     }
 }

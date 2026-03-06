@@ -3,6 +3,9 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
+use crate::engine::expand_home;
+use crate::playbook::Playbook;
+use crate::playbooks::load_playbooks;
 use crate::types::{AiTool, DiscoveredTool, DiscoveryReport, StorageFormat};
 
 /// Discovers locally-installed AI tools and their history locations.
@@ -12,19 +15,24 @@ pub struct ToolDiscovery {
 }
 
 impl ToolDiscovery {
-    /// Create a discovery instance with hard-coded default roots for known tools.
+    /// Create a discovery instance with roots derived from playbooks.
+    ///
+    /// Loads built-in defaults merged with any on-disk overrides, then
+    /// expands and registers each playbook's discovery roots.
     pub fn with_defaults() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let roots = vec![
-            (AiTool::ClaudeCode, home.join(".claude").join("projects")),
-            (AiTool::GeminiCli, home.join(".gemini").join("antigravity")),
-            (AiTool::OpenAiCodex, home.join(".codex").join("history")),
-            (
-                AiTool::GithubCopilot,
-                home.join(".config").join("github-copilot"),
-            ),
-            (AiTool::Continue, home.join(".continue")),
-        ];
+        Self::from_playbooks(&load_playbooks())
+    }
+
+    /// Build discovery roots from a set of playbook configurations.
+    pub fn from_playbooks(playbooks: &[Playbook]) -> Self {
+        let mut roots = Vec::new();
+        for pb in playbooks {
+            let tool = AiTool::from_key(&pb.tool);
+            for root_str in &pb.discovery.roots {
+                let path = expand_home(root_str);
+                roots.push((tool.clone(), path));
+            }
+        }
         Self {
             roots,
             exclude_patterns: Vec::new(),
@@ -111,32 +119,61 @@ impl ToolDiscovery {
                 (StorageFormat::JsonLines, estimate)
             }
             AiTool::GeminiCli => {
-                // The root IS the SQLite database file
-                if root.is_file()
-                    || root.join("db.sqlite").exists()
-                    || root.join("data.db").exists()
-                {
-                    let db_path = if root.is_file() {
-                        root.to_path_buf()
-                    } else if root.join("db.sqlite").exists() {
-                        root.join("db.sqlite")
-                    } else {
-                        root.join("data.db")
-                    };
+                // Gemini CLI stores JSON at ~/.gemini/tmp/*/chats/session-*.json
+                // Gemini Desktop App stores encrypted .pb at ~/.gemini/antigravity/conversations/
+                let mut json_count = 0u64;
+                let tmp_dir = root.join("tmp");
+                if tmp_dir.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&tmp_dir) {
+                        for entry in entries.flatten() {
+                            let chats = entry.path().join("chats");
+                            if chats.is_dir() {
+                                json_count += walkdir(&chats, "json");
+                            }
+                        }
+                    }
+                }
+                let has_pb = root.join("antigravity").join("conversations").is_dir();
+                let estimate = if json_count > 0 { Some(json_count) } else { None };
+                let format = if json_count > 0 {
+                    StorageFormat::JsonFiles
+                } else if has_pb {
+                    StorageFormat::Mixed // encrypted, but detected
+                } else {
+                    return Err("no Gemini CLI chat files or antigravity data found".into());
+                };
+                (format, estimate)
+            }
+            AiTool::OpenAiCodex => {
+                // Codex stores JSONL at ~/.codex/sessions/**/*.jsonl + ~/.codex/history.jsonl
+                let mut estimate = count_jsonl_sessions(&root.join("sessions"));
+                if root.join("history.jsonl").is_file() {
+                    estimate = Some(estimate.unwrap_or(0) + 1);
+                }
+                (StorageFormat::JsonLines, estimate)
+            }
+            AiTool::Cursor => {
+                // Cursor stores history in a single state.vscdb file.
+                let db_path = if root.is_file() {
+                    root.to_path_buf()
+                } else {
+                    root.join("state.vscdb")
+                };
+                if db_path.exists() {
                     (
                         StorageFormat::SqliteDb {
                             db_path,
-                            schema_hint: None,
+                            schema_hint: Some("cursorDiskKV".into()),
                         },
                         None,
                     )
                 } else {
-                    return Err("no SQLite database found in Gemini root".into());
+                    return Err("state.vscdb not found in Cursor root".into());
                 }
             }
-            AiTool::OpenAiCodex => {
-                let estimate = count_json_files(root);
-                (StorageFormat::JsonFiles, estimate)
+            AiTool::OpenClaw => {
+                let estimate = count_jsonl_sessions(root);
+                (StorageFormat::JsonLines, estimate)
             }
             AiTool::GithubCopilot | AiTool::Continue => {
                 // These need schema investigation; report as mixed for now
@@ -167,6 +204,8 @@ fn detect_tool_from_path(path: &Path) -> AiTool {
         AiTool::GithubCopilot
     } else if s.contains("continue") {
         AiTool::Continue
+    } else if s.contains("openclaw") {
+        AiTool::OpenClaw
     } else {
         AiTool::Unknown(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
     }

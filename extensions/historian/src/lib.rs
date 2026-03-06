@@ -2,7 +2,10 @@ pub mod backfill;
 pub mod db;
 pub mod dedup;
 pub mod discovery;
+pub mod engine;
 pub mod error;
+pub mod playbook;
+pub mod playbooks;
 pub mod reader;
 pub mod readers;
 pub mod session;
@@ -26,9 +29,8 @@ use soth_extensions::traits::{Extension, ExtensionHealth};
 use crate::backfill::BackfillEngine;
 use crate::dedup::DedupChecker;
 use crate::discovery::ToolDiscovery;
-use crate::readers::claude_code::ClaudeCodeReader;
-use crate::readers::codex::CodexReader;
-use crate::readers::gemini::GeminiReader;
+use crate::engine::PlaybookReader;
+use crate::playbooks::load_playbooks;
 use crate::types::DiscoveredTool;
 use crate::watch::WatchEngine;
 
@@ -67,12 +69,16 @@ impl HistorianExtension {
         Self::new(db_path, ToolDiscovery::with_defaults())
     }
 
+    /// Build readers from playbook configurations.
+    ///
+    /// Uses built-in default playbooks. In the future, this will also load
+    /// playbooks from disk (`~/.soth/historian/playbooks/`) and server-pushed
+    /// configs, allowing new tools to be supported without code changes.
     fn build_readers() -> Vec<Box<dyn crate::reader::FormatReader>> {
-        vec![
-            Box::new(ClaudeCodeReader::new()),
-            Box::new(GeminiReader::new()),
-            Box::new(CodexReader::new()),
-        ]
+        load_playbooks()
+            .into_iter()
+            .map(|pb| Box::new(PlaybookReader::new(pb)) as Box<dyn crate::reader::FormatReader>)
+            .collect()
     }
 }
 

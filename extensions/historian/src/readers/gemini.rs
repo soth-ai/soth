@@ -3,19 +3,34 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use rusqlite::{Connection, OpenFlags};
+use serde::Deserialize;
 use tokio_stream::Stream;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::error::ReaderError;
 use crate::reader::FormatReader;
 use crate::session::estimate_tokens;
 use crate::types::{AiTool, Cursor, HistoricalMessage, HistoricalSession};
 
-/// Reads Gemini CLI conversation history from `~/.gemini/antigravity` (SQLite).
+/// Reads Gemini conversation history from local storage.
 ///
-/// Opens the database read-only. If the database is WAL-locked by the Gemini
-/// process we skip and retry on the next cycle rather than blocking.
+/// Two Gemini products store data locally:
+///
+/// 1. **Gemini CLI** (open-source, `google-gemini/gemini-cli`):
+///    Stores conversations as JSON files at:
+///    `~/.gemini/tmp/<project_hash>/chats/session-<timestamp>-<id>.json`
+///
+///    Each file is a `ConversationRecord` JSON object containing a messages
+///    array with typed entries (user, gemini, info, etc.).
+///
+/// 2. **Gemini Desktop App** (codename "antigravity"):
+///    Stores conversations as **encrypted binary** `.pb` files at:
+///    `~/.gemini/antigravity/conversations/<uuid>.pb`
+///
+///    These files have near-maximum entropy and are NOT decodable without
+///    the app's decryption keys. They are **unsupported** by this reader.
+///
+/// This reader supports the Gemini CLI JSON format only.
 pub struct GeminiReader {
     cursor: Mutex<Option<Cursor>>,
 }
@@ -32,207 +47,307 @@ impl GeminiReader {
             cursor: Mutex::new(Some(cursor)),
         }
     }
+}
 
-    /// Resolve the actual SQLite file within the root path.
-    fn resolve_db_path(root: &Path) -> Option<PathBuf> {
-        if root.is_file() {
-            return Some(root.to_path_buf());
+// ---------------------------------------------------------------------------
+// Deserialization types for Gemini CLI JSON format
+// ---------------------------------------------------------------------------
+
+/// Top-level conversation record written by the Gemini CLI.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationRecord {
+    session_id: String,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    last_updated: Option<String>,
+    #[serde(default)]
+    messages: Vec<MessageRecord>,
+}
+
+/// A single message within a Gemini CLI conversation.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageRecord {
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
+    /// Content can be a plain string, an object, or an array of parts.
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    /// Human-readable display content (preferred over raw content when present).
+    #[serde(default)]
+    display_content: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tokens: Option<TokenUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsage {
+    #[serde(default)]
+    input: Option<u32>,
+    #[serde(default)]
+    output: Option<u32>,
+    #[serde(default)]
+    total: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn parse_iso_timestamp(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.fZ")
+                .ok()
+                .map(|dt| dt.and_utc().timestamp_millis())
+        })
+}
+
+/// Extract text from Gemini CLI message content.
+///
+/// Content can be:
+/// - A plain string
+/// - An array of part objects with `{ text: "..." }` fields
+/// - An object with a `text` field
+fn extract_content_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|item| {
+                if let Some(obj) = item.as_object() {
+                    obj.get("text").and_then(|v| v.as_str()).map(String::from)
+                } else if let Some(s) = item.as_str() {
+                    Some(s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(obj) => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn file_mtime_millis(path: &Path) -> Option<i64> {
+    path.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+}
+
+// ---------------------------------------------------------------------------
+// JSON conversation parser
+// ---------------------------------------------------------------------------
+
+fn parse_conversation_json(
+    path: &Path,
+    since: Option<i64>,
+) -> Result<Option<HistoricalSession>, ReaderError> {
+    let content = std::fs::read_to_string(path).map_err(|e| ReaderError::Reader {
+        tool: "gemini_cli".into(),
+        message: format!("read {}: {e}", path.display()),
+    })?;
+
+    let record: ConversationRecord = serde_json::from_str(&content).map_err(|e| {
+        ReaderError::Reader {
+            tool: "gemini_cli".into(),
+            message: format!("parse {}: {e}", path.display()),
         }
-        for name in &["db.sqlite", "data.db", "antigravity.db"] {
-            let candidate = root.join(name);
-            if candidate.exists() {
-                return Some(candidate);
+    })?;
+
+    let mut messages = Vec::new();
+    let mut min_ts: Option<i64> = None;
+    let mut max_ts: Option<i64> = None;
+
+    for msg in &record.messages {
+        let msg_type = msg.r#type.as_deref().unwrap_or("");
+
+        // Map Gemini CLI message types to standard roles.
+        let role = match msg_type {
+            "user" => "user",
+            "gemini" => "assistant",
+            // Skip system/info/error/warning messages.
+            _ => continue,
+        };
+
+        // Prefer display_content, fall back to content.
+        let text = if let Some(ref dc) = msg.display_content {
+            if dc.is_empty() {
+                continue;
+            }
+            dc.clone()
+        } else if let Some(ref content_val) = msg.content {
+            let t = extract_content_text(content_val);
+            if t.is_empty() {
+                continue;
+            }
+            t
+        } else {
+            continue;
+        };
+
+        let ts = msg.timestamp.as_deref().and_then(parse_iso_timestamp);
+
+        // Apply `since` filter.
+        if let (Some(since_ms), Some(msg_ts)) = (since, ts) {
+            if msg_ts < since_ms {
+                continue;
             }
         }
-        None
-    }
-
-    fn open_readonly(db_path: &Path) -> Result<Connection, ReaderError> {
-        let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| ReaderError::Reader {
-            tool: "gemini_cli".into(),
-            message: format!("open {}: {e}", db_path.display()),
-        })?;
-
-        // Set a short busy timeout — if WAL locked, we'd rather skip than block.
-        conn.busy_timeout(std::time::Duration::from_millis(500))
-            .ok();
-
-        Ok(conn)
-    }
-}
-
-/// Probe for a messages-like table. Gemini CLI's schema may vary.
-fn find_messages_table(conn: &Connection) -> Option<String> {
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .ok()?;
-    let names: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for candidate in &["messages", "conversation_messages", "turns"] {
-        if names.iter().any(|n| n == *candidate) {
-            return Some((*candidate).to_string());
-        }
-    }
-    None
-}
-
-fn get_column_names(conn: &Connection, table: &str) -> Vec<String> {
-    let sql = format!("PRAGMA table_info({table})");
-    let Ok(mut stmt) = conn.prepare(&sql) else {
-        return Vec::new();
-    };
-    stmt.query_map([], |row| row.get::<_, String>(1))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-}
-
-/// Read sessions from the Gemini SQLite database.
-fn read_gemini_sessions(
-    db_path: &Path,
-    since: Option<i64>,
-    since_rowid: Option<i64>,
-) -> Result<(Vec<HistoricalSession>, Option<i64>), ReaderError> {
-    let conn = GeminiReader::open_readonly(db_path)?;
-
-    let table = find_messages_table(&conn).ok_or_else(|| ReaderError::Reader {
-        tool: "gemini_cli".into(),
-        message: "no recognized messages table in Gemini DB".into(),
-    })?;
-
-    let columns = get_column_names(&conn, &table);
-
-    let session_col = if columns.contains(&"session_id".to_string()) {
-        "session_id"
-    } else if columns.contains(&"conversation_id".to_string()) {
-        "conversation_id"
-    } else {
-        "rowid"
-    };
-
-    let role_col = if columns.contains(&"role".to_string()) {
-        "role"
-    } else {
-        "'unknown'"
-    };
-
-    let content_col = if columns.contains(&"content".to_string()) {
-        "content"
-    } else if columns.contains(&"text".to_string()) {
-        "text"
-    } else if columns.contains(&"body".to_string()) {
-        "body"
-    } else {
-        return Err(ReaderError::Reader {
-            tool: "gemini_cli".into(),
-            message: format!("no content column found in table {table}"),
-        });
-    };
-
-    let ts_col = if columns.contains(&"created_at".to_string()) {
-        Some("created_at")
-    } else if columns.contains(&"timestamp".to_string()) {
-        Some("timestamp")
-    } else {
-        None
-    };
-
-    let order_col = ts_col.unwrap_or("rowid");
-
-    // Build WHERE clause from since timestamp and/or rowid cursor
-    let mut where_parts = Vec::new();
-    if let (Some(ts), Some(col)) = (since, ts_col) {
-        where_parts.push(format!("{col} > {ts}"));
-    }
-    if let Some(rowid) = since_rowid {
-        where_parts.push(format!("rowid > {rowid}"));
-    }
-    let where_clause = if where_parts.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", where_parts.join(" AND "))
-    };
-
-    let sql = format!(
-        "SELECT {session_col}, {role_col}, {content_col}{ts_select}, rowid FROM {table} {where_clause} ORDER BY {order_col} ASC",
-        ts_select = ts_col.map(|c| format!(", {c}")).unwrap_or_default(),
-    );
-
-    let mut stmt = conn.prepare(&sql).map_err(|e| ReaderError::Reader {
-        tool: "gemini_cli".into(),
-        message: format!("prepare query: {e}"),
-    })?;
-
-    let mut sessions: std::collections::HashMap<String, HistoricalSession> =
-        std::collections::HashMap::new();
-    let mut max_rowid: Option<i64> = None;
-
-    let col_offset = if ts_col.is_some() { 4 } else { 3 };
-
-    let rows = stmt
-        .query_map([], |row| {
-            let sid: String = row.get(0)?;
-            let role: String = row.get(1)?;
-            let content: String = row.get(2)?;
-            let ts: Option<i64> = if ts_col.is_some() {
-                row.get(3).ok()
-            } else {
-                None
-            };
-            let rowid: i64 = row.get(col_offset)?;
-            Ok((sid, role, content, ts, rowid))
-        })
-        .map_err(|e| ReaderError::Reader {
-            tool: "gemini_cli".into(),
-            message: format!("query: {e}"),
-        })?;
-
-    for row in rows {
-        let (sid, role, content, ts, rowid) = row.map_err(|e| ReaderError::Reader {
-            tool: "gemini_cli".into(),
-            message: format!("row: {e}"),
-        })?;
-
-        if content.is_empty() {
-            continue;
-        }
-
-        max_rowid = Some(max_rowid.map_or(rowid, |prev: i64| prev.max(rowid)));
-
-        let token_estimate = estimate_tokens(&content);
-
-        let session = sessions.entry(sid.clone()).or_insert_with(|| HistoricalSession {
-            tool: AiTool::GeminiCli,
-            session_id: sid,
-            messages: Vec::new(),
-            started_at: None,
-            ended_at: None,
-        });
 
         if let Some(t) = ts {
-            session.started_at = Some(session.started_at.map_or(t, |s: i64| s.min(t)));
-            session.ended_at = Some(session.ended_at.map_or(t, |e: i64| e.max(t)));
+            min_ts = Some(min_ts.map_or(t, |m: i64| m.min(t)));
+            max_ts = Some(max_ts.map_or(t, |m: i64| m.max(t)));
         }
 
-        session.messages.push(HistoricalMessage {
-            role,
-            content,
+        let token_estimate = msg
+            .tokens
+            .as_ref()
+            .and_then(|t| t.total)
+            .unwrap_or_else(|| estimate_tokens(&text));
+
+        messages.push(HistoricalMessage {
+            role: role.to_string(),
+            content: text,
             timestamp: ts,
             token_estimate,
         });
     }
 
-    let mut result: Vec<_> = sessions.into_values().collect();
-    result.sort_by_key(|s| s.started_at.unwrap_or(0));
-    Ok((result, max_rowid))
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
+    // Use session start_time for session-level timestamps if per-message
+    // timestamps weren't available.
+    if min_ts.is_none() {
+        min_ts = record.start_time.as_deref().and_then(parse_iso_timestamp);
+    }
+    if max_ts.is_none() {
+        max_ts = record
+            .last_updated
+            .as_deref()
+            .and_then(parse_iso_timestamp);
+    }
+
+    Ok(Some(HistoricalSession {
+        tool: AiTool::GeminiCli,
+        session_id: record.session_id,
+        messages,
+        started_at: min_ts,
+        ended_at: max_ts,
+    }))
 }
+
+// ---------------------------------------------------------------------------
+// File collection
+// ---------------------------------------------------------------------------
+
+/// Collect all Gemini CLI JSON conversation files.
+///
+/// Searches for: `<root>/tmp/*/chats/session-*.json`
+/// Also checks: `<root>/chats/session-*.json` (in case root IS a project dir)
+fn collect_gemini_json_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    // Primary path: ~/.gemini/tmp/<project_hash>/chats/session-*.json
+    let tmp_dir = root.join("tmp");
+    if tmp_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&tmp_dir) {
+            for entry in entries.flatten() {
+                let chats_dir = entry.path().join("chats");
+                if chats_dir.is_dir() {
+                    collect_json_in_dir(&chats_dir, &mut files);
+                }
+            }
+        }
+    }
+
+    // Fallback: root itself contains chats/ (e.g. test fixtures or direct project root)
+    let direct_chats = root.join("chats");
+    if direct_chats.is_dir() {
+        collect_json_in_dir(&direct_chats, &mut files);
+    }
+
+    // Also check for any .json files directly in root that match the pattern
+    // (some Gemini CLI versions may store differently)
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("session-") {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by mtime ascending (oldest first).
+    files.sort_by(|a, b| {
+        let ma = a.metadata().and_then(|m| m.modified()).ok();
+        let mb = b.metadata().and_then(|m| m.modified()).ok();
+        ma.cmp(&mb)
+    });
+
+    files
+}
+
+fn collect_json_in_dir(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+}
+
+/// Check if a directory contains encrypted antigravity .pb files.
+fn has_encrypted_antigravity(root: &Path) -> bool {
+    let conversations = root.join("antigravity").join("conversations");
+    if !conversations.is_dir() {
+        // Also check if root IS the antigravity dir
+        let direct = root.join("conversations");
+        if direct.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&direct) {
+                return entries
+                    .flatten()
+                    .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pb"));
+            }
+        }
+        return false;
+    }
+    if let Ok(entries) = std::fs::read_dir(&conversations) {
+        return entries
+            .flatten()
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pb"));
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// FormatReader impl
+// ---------------------------------------------------------------------------
 
 #[async_trait]
 impl FormatReader for GeminiReader {
@@ -240,8 +355,30 @@ impl FormatReader for GeminiReader {
         AiTool::GeminiCli
     }
 
+    /// Detects Gemini CLI data (JSON chat files) or Gemini Desktop App data
+    /// (encrypted .pb files — detected but unsupported).
     fn detect(&self, root: &Path) -> bool {
-        GeminiReader::resolve_db_path(root).is_some()
+        if !root.is_dir() {
+            return false;
+        }
+
+        // Check for Gemini CLI JSON files.
+        let json_files = collect_gemini_json_files(root);
+        if !json_files.is_empty() {
+            return true;
+        }
+
+        // Check for encrypted antigravity data (detected but unreadable).
+        if has_encrypted_antigravity(root) {
+            info!(
+                root = %root.display(),
+                "detected Gemini Desktop App (antigravity) encrypted conversations; \
+                 these are not readable by the historian"
+            );
+            return true;
+        }
+
+        false
     }
 
     fn read_sessions(
@@ -250,46 +387,52 @@ impl FormatReader for GeminiReader {
         since: Option<i64>,
     ) -> Pin<Box<dyn Stream<Item = Result<HistoricalSession, ReaderError>> + Send + '_>> {
         let root = root.to_path_buf();
-        let since_rowid = self
-            .cursor
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|c| match c {
-                Cursor::SqliteRowId { last_rowid, .. } => Some(*last_rowid),
-                _ => None,
-            });
 
         Box::pin(async_stream::try_stream! {
-            let db_path = GeminiReader::resolve_db_path(&root).ok_or_else(|| ReaderError::Reader {
-                tool: "gemini_cli".into(),
-                message: "no SQLite database found".into(),
-            })?;
+            // Warn about encrypted antigravity data if present.
+            if has_encrypted_antigravity(&root) {
+                warn!(
+                    "Gemini Desktop App (antigravity) conversations are encrypted \
+                     and cannot be read by the historian. Only Gemini CLI JSON \
+                     conversations are supported."
+                );
+            }
 
-            match read_gemini_sessions(&db_path, since, since_rowid) {
-                Ok((sessions, max_rowid)) => {
-                    for session in sessions {
+            let json_files = collect_gemini_json_files(&root);
+
+            if json_files.is_empty() {
+                debug!(root = %root.display(), "no Gemini CLI JSON files found");
+                return;
+            }
+
+            let mut latest_mtime: Option<i64> = None;
+
+            for path in json_files {
+                let file_mtime = file_mtime_millis(&path);
+
+                match parse_conversation_json(&path, since) {
+                    Ok(Some(session)) => {
+                        if let Some(mt) = file_mtime {
+                            latest_mtime = Some(latest_mtime.map_or(mt, |prev: i64| prev.max(mt)));
+                        }
                         yield session;
                     }
-                    // Update cursor with the last rowid we processed
-                    if let Some(rowid) = max_rowid {
-                        let mut cursor = self.cursor.lock().unwrap();
-                        *cursor = Some(Cursor::SqliteRowId {
-                            db_path: db_path.clone(),
-                            last_rowid: rowid,
-                        });
+                    Ok(None) => {
+                        debug!(path = %path.display(), "no usable messages, skipping");
+                    }
+                    Err(e) => {
+                        warn!(path = %path.display(), err = %e, "reader error, skipping file");
                     }
                 }
-                Err(e) => {
-                    // If it's a DB lock error, warn and skip (WAL contention)
-                    let msg = e.to_string();
-                    if msg.contains("locked") || msg.contains("busy") {
-                        warn!(err = %e, "Gemini DB locked (WAL contention), will retry next cycle");
-                    } else {
-                        warn!(err = %e, "failed to read Gemini sessions");
-                        Err(e)?;
-                    }
-                }
+            }
+
+            // Update cursor to latest file mtime.
+            if let Some(mtime) = latest_mtime {
+                let mut cursor = self.cursor.lock().unwrap();
+                *cursor = Some(Cursor::FileMtime {
+                    path: root,
+                    mtime,
+                });
             }
         })
     }
@@ -305,68 +448,55 @@ mod tests {
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
 
-    fn create_gemini_db(dir: &Path) -> PathBuf {
-        let db_path = dir.join("db.sqlite");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE messages (
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at INTEGER
-            )",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES ('s1', 'user', 'hello gemini', 1700000000000)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES ('s1', 'model', 'hello!', 1700000001000)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES ('s2', 'user', 'second session', 1700000010000)",
-            [],
-        )
-        .unwrap();
-        db_path
+    fn write_file(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, content).unwrap();
     }
 
-    fn create_gemini_db_alt_schema(dir: &Path) -> PathBuf {
-        // Simulate a different Gemini CLI version with different column names
-        let db_path = dir.join("db.sqlite");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE messages (
-                conversation_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                text TEXT NOT NULL,
-                timestamp INTEGER
-            )",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES ('c1', 'user', 'alt schema', 1700000000000)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES ('c1', 'model', 'alt reply', 1700000001000)",
-            [],
-        )
-        .unwrap();
-        db_path
-    }
-
-    #[test]
-    fn detect_finds_sqlite() {
-        let tmp = TempDir::new().unwrap();
-        create_gemini_db(tmp.path());
-        let reader = GeminiReader::new();
-        assert!(reader.detect(tmp.path()));
+    /// Realistic Gemini CLI ConversationRecord JSON.
+    fn sample_conversation_json(session_id: &str) -> String {
+        serde_json::json!({
+            "sessionId": session_id,
+            "projectHash": "abc123def",
+            "startTime": "2026-01-15T10:30:00.000Z",
+            "lastUpdated": "2026-01-15T10:35:00.000Z",
+            "messages": [
+                {
+                    "type": "user",
+                    "timestamp": "2026-01-15T10:30:00.000Z",
+                    "content": "explain how async works in rust"
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-01-15T10:30:05.000Z",
+                    "content": "Async in Rust uses a poll-based model with futures.",
+                    "model": "gemini-2.5-pro",
+                    "tokens": { "input": 12, "output": 45, "total": 57 }
+                },
+                {
+                    "type": "info",
+                    "timestamp": "2026-01-15T10:30:06.000Z",
+                    "content": "Context updated"
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-01-15T10:32:00.000Z",
+                    "content": "show me an example"
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-01-15T10:32:10.000Z",
+                    "displayContent": "Here is an example:\n```rust\nasync fn fetch() { }\n```",
+                    "content": [{ "text": "Here is an example:\n```rust\nasync fn fetch() { }\n```" }],
+                    "model": "gemini-2.5-pro",
+                    "tokens": { "input": 20, "output": 30, "total": 50 }
+                }
+            ]
+        })
+        .to_string()
     }
 
     #[test]
@@ -376,60 +506,208 @@ mod tests {
         assert!(!reader.detect(tmp.path()));
     }
 
-    #[tokio::test]
-    async fn reads_sessions_from_sqlite() {
+    #[test]
+    fn detect_finds_json_in_chats_dir() {
         let tmp = TempDir::new().unwrap();
-        create_gemini_db(tmp.path());
+        write_file(
+            tmp.path(),
+            "chats/session-2026-01-15T10-30-00abc.json",
+            &sample_conversation_json("s1"),
+        );
+        let reader = GeminiReader::new();
+        assert!(reader.detect(tmp.path()));
+    }
+
+    #[test]
+    fn detect_finds_json_in_tmp_project_chats() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "tmp/abc123/chats/session-s1.json",
+            &sample_conversation_json("s1"),
+        );
+        let reader = GeminiReader::new();
+        assert!(reader.detect(tmp.path()));
+    }
+
+    #[test]
+    fn detect_finds_encrypted_antigravity_pb() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "antigravity/conversations/uuid-1.pb",
+            "encrypted binary data",
+        );
+        let reader = GeminiReader::new();
+        assert!(reader.detect(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn reads_gemini_cli_json_conversation() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "chats/session-s1.json",
+            &sample_conversation_json("gemini-session-1"),
+        );
+
         let reader = GeminiReader::new();
         let mut stream = reader.read_sessions(tmp.path(), None);
+        let session = stream.next().await.unwrap().unwrap();
 
+        assert_eq!(session.session_id, "gemini-session-1");
+        assert_eq!(session.tool, AiTool::GeminiCli);
+        assert_eq!(session.messages.len(), 4);
+
+        assert_eq!(session.messages[0].role, "user");
+        assert_eq!(
+            session.messages[0].content,
+            "explain how async works in rust"
+        );
+
+        assert_eq!(session.messages[1].role, "assistant");
+        assert!(session.messages[1]
+            .content
+            .contains("poll-based model"));
+
+        // Info messages should be skipped
+        assert_eq!(session.messages[2].role, "user");
+        assert_eq!(session.messages[2].content, "show me an example");
+
+        // displayContent should be preferred
+        assert_eq!(session.messages[3].role, "assistant");
+        assert!(session.messages[3].content.contains("async fn fetch()"));
+
+        // Token counts from JSON should be used
+        assert_eq!(session.messages[1].token_estimate, 57);
+        assert_eq!(session.messages[3].token_estimate, 50);
+
+        assert!(session.started_at.is_some());
+        assert!(session.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn reads_from_tmp_project_chats() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "tmp/project1/chats/session-a.json",
+            &sample_conversation_json("proj1-session"),
+        );
+        write_file(
+            tmp.path(),
+            "tmp/project2/chats/session-b.json",
+            &sample_conversation_json("proj2-session"),
+        );
+
+        let reader = GeminiReader::new();
+        let mut stream = reader.read_sessions(tmp.path(), None);
         let mut sessions = Vec::new();
         while let Some(result) = stream.next().await {
             sessions.push(result.unwrap());
         }
+
         assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].messages.len(), 2);
-        assert_eq!(sessions[0].messages[0].role, "user");
-        assert_eq!(sessions[0].messages[1].role, "model");
-        assert_eq!(sessions[1].messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn skips_info_and_error_messages() {
+        let tmp = TempDir::new().unwrap();
+        let json = serde_json::json!({
+            "sessionId": "info-only",
+            "messages": [
+                { "type": "info", "content": "session started" },
+                { "type": "error", "content": "something failed" },
+                { "type": "warning", "content": "watch out" }
+            ]
+        })
+        .to_string();
+        write_file(tmp.path(), "chats/session-info.json", &json);
+
+        let reader = GeminiReader::new();
+        let mut stream = reader.read_sessions(tmp.path(), None);
+        assert!(
+            stream.next().await.is_none(),
+            "should yield no sessions when only info/error/warning"
+        );
     }
 
     #[tokio::test]
     async fn respects_since_filter() {
         let tmp = TempDir::new().unwrap();
-        create_gemini_db(tmp.path());
-        let reader = GeminiReader::new();
-        let mut stream = reader.read_sessions(tmp.path(), Some(1700000005000));
+        let json = serde_json::json!({
+            "sessionId": "filtered",
+            "messages": [
+                {
+                    "type": "user",
+                    "timestamp": "2025-01-01T00:00:00.000Z",
+                    "content": "old message"
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2025-01-01T00:00:01.000Z",
+                    "content": "old reply"
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-06-01T00:00:00.000Z",
+                    "content": "new message"
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-06-01T00:00:01.000Z",
+                    "content": "new reply"
+                }
+            ]
+        })
+        .to_string();
+        write_file(tmp.path(), "chats/session-f.json", &json);
 
-        let mut sessions = Vec::new();
-        while let Some(result) = stream.next().await {
-            sessions.push(result.unwrap());
-        }
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "s2");
+        let since = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z")
+            .unwrap()
+            .timestamp_millis();
+
+        let reader = GeminiReader::new();
+        let mut stream = reader.read_sessions(tmp.path(), Some(since));
+        let session = stream.next().await.unwrap().unwrap();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "new message");
     }
 
     #[tokio::test]
-    async fn adapts_to_alternative_schema() {
+    async fn handles_content_as_array_of_parts() {
         let tmp = TempDir::new().unwrap();
-        create_gemini_db_alt_schema(tmp.path());
+        let json = serde_json::json!({
+            "sessionId": "parts",
+            "messages": [
+                {
+                    "type": "user",
+                    "content": [
+                        { "text": "first part" },
+                        { "text": "second part" }
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        write_file(tmp.path(), "chats/session-parts.json", &json);
+
         let reader = GeminiReader::new();
         let mut stream = reader.read_sessions(tmp.path(), None);
-
-        let mut sessions = Vec::new();
-        while let Some(result) = stream.next().await {
-            sessions.push(result.unwrap());
-        }
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "c1");
-        assert_eq!(sessions[0].messages.len(), 2);
-        assert_eq!(sessions[0].messages[0].content, "alt schema");
+        let session = stream.next().await.unwrap().unwrap();
+        assert!(session.messages[0].content.contains("first part"));
+        assert!(session.messages[0].content.contains("second part"));
     }
 
     #[tokio::test]
     async fn cursor_is_updated_after_read() {
         let tmp = TempDir::new().unwrap();
-        create_gemini_db(tmp.path());
+        write_file(
+            tmp.path(),
+            "chats/session-c.json",
+            &sample_conversation_json("cursor-test"),
+        );
+
         let reader = GeminiReader::new();
         assert!(reader.last_cursor().is_none());
 
@@ -438,43 +716,50 @@ mod tests {
 
         let cursor = reader.last_cursor();
         assert!(cursor.is_some());
-        match cursor.unwrap() {
-            Cursor::SqliteRowId { last_rowid, .. } => {
-                assert!(last_rowid >= 3, "should track the last rowid processed");
-            }
-            other => panic!("expected SqliteRowId cursor, got {:?}", other),
-        }
+        assert!(matches!(cursor.unwrap(), Cursor::FileMtime { .. }));
     }
 
     #[tokio::test]
-    async fn cursor_enables_incremental_reads() {
+    async fn encrypted_pb_produces_no_sessions() {
         let tmp = TempDir::new().unwrap();
-        let db_path = create_gemini_db(tmp.path());
+        // Only encrypted .pb files, no JSON — should detect but yield nothing.
+        write_file(
+            tmp.path(),
+            "antigravity/conversations/uuid-1.pb",
+            "encrypted data here",
+        );
 
-        // First read: get all 3 rows
+        let reader = GeminiReader::new();
+        assert!(reader.detect(tmp.path()));
+
+        let mut stream = reader.read_sessions(tmp.path(), None);
+        assert!(
+            stream.next().await.is_none(),
+            "encrypted .pb files should not produce sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn uses_session_timestamps_when_messages_lack_them() {
+        let tmp = TempDir::new().unwrap();
+        let json = serde_json::json!({
+            "sessionId": "no-msg-ts",
+            "startTime": "2026-01-15T10:00:00.000Z",
+            "lastUpdated": "2026-01-15T10:05:00.000Z",
+            "messages": [
+                { "type": "user", "content": "no timestamp message" },
+                { "type": "gemini", "content": "no timestamp reply" }
+            ]
+        })
+        .to_string();
+        write_file(tmp.path(), "chats/session-nots.json", &json);
+
         let reader = GeminiReader::new();
         let mut stream = reader.read_sessions(tmp.path(), None);
-        let mut count = 0;
-        while let Some(Ok(s)) = stream.next().await {
-            count += s.messages.len();
-        }
-        assert_eq!(count, 3);
+        let session = stream.next().await.unwrap().unwrap();
 
-        // Add a new row
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES ('s3', 'user', 'new message', 1700000020000)",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        // Second read with cursor: should only get the new row
-        let mut stream = reader.read_sessions(tmp.path(), None);
-        let mut new_count = 0;
-        while let Some(Ok(s)) = stream.next().await {
-            new_count += s.messages.len();
-        }
-        assert_eq!(new_count, 1, "should only read rows after the cursor");
+        assert!(session.started_at.is_some());
+        assert!(session.ended_at.is_some());
+        assert_eq!(session.messages.len(), 2);
     }
 }
