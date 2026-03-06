@@ -13,16 +13,18 @@ Policy, budget, identity/crypto, and observability apply across all paths and no
 
 ## Workspace Map
 - `crates/soth-cli`: CLI surface and runtime lifecycle (`start/up/down/stop/logs/on/off`, `wrap`, `runtime`, `dev`).
-- `crates/soth-edge`: MITM transport + bundle-driven classification + exchange assembly.
+- `crates/soth-proxy`: MITM transport + bundle-driven gating/classification + exchange assembly.
 - `crates/soth-sync`: cloud sync, exchange upload queue, registry bundle cache refresh.
-- `crates/soth-dashboard`: API + WS backend for local dashboard/TUI data.
+- `crates/soth-telemetry`: local SQLite telemetry storage and query helpers.
 - `crates/soth-collector`: local session collectors and incremental scans.
+- `crates/soth-wrap`: MCP stdio runtime path (planned near-term expansion).
 - `crates/soth-core`: shared config, event/exchange schemas, sqlite logger/storage primitives.
 - `crates/soth-crypto`: key management, signatures, TLS helpers.
+- `crates/soth-bundle`: bundle loader/cache/watcher for classify/policy/detect artifacts.
+- `crates/soth-classify`: 7-stage classification pipeline and anomaly scoring.
+- `crates/soth-detect`: deterministic detection helpers and host/domain attribution.
 - `crates/soth-policy`: policy engine/wrappers.
-- `crates/soth-budget`: spend tracking and budget enforcement primitives.
-- `crates/soth-observe`: enrichment/parsing helpers (PII, JSONL, storage adapters).
-- `crates/soth-storage`: shared storage helpers.
+- `crates/soth-sqlite-vec`: sqlite-vec lifecycle/loading adapter.
 
 ## Canonical Host Classes
 Bundle classification splits traffic into:
@@ -45,7 +47,7 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
 
 ## Operational Notes
 - Primary local DB path defaults to `~/.soth/logs/events.db`.
-- Cloud sync uploads Exchange V2 batches to `/api/v1/exchanges/batch`.
+- Cloud sync uploads Exchange V2 batches to `/v1/edge/enroll/exchange`.
 - Registry bundle cache is read from local cache path and hot-reloaded by runtime components.
 
 ## Debug Notes (2026-02-27)
@@ -66,8 +68,29 @@ Host lists can still be configured under `forward_proxy.hosts`, but runtime inte
   - For gating corpus/debug traffic, force HTTP/1.1 for h2-incompatible hosts to avoid transport false negatives.
   - Fix direction: add host-level `disable_h2` override (or h2->h1 downgrade path) so downstream ALPN does not advertise/commit h2 for those hosts.
 
+## Backlog — Metadata-Only Implementation Gaps
+
+Gaps identified during plan audit (2026-03-06). Pick up when available.
+
+### Phase 2 — Dedup & Fingerprinting
+- [ ] `conversation_fingerprint.rs` module: `fingerprint_conversation`, `resolve_effective_capture_mode`, `normalize_message_content`, `novel_tail_slice`
+- [ ] `DetectBundleSlice` threshold config fields: `force_metadata_only_above_bytes`, `min_dedup_payload_bytes`, `seen_code_hash_capacity`, `seen_prefix_hash_capacity`
+
+### Phase 3 — Session/Pipeline
+- [ ] `classify_slice()` function in soth-classify
+- [ ] `reaper_loop()` background tokio task for session TTL cleanup
+- [ ] `sqlite.upsert_code_blob()` implementation
+
+### Phase 4 — Schema
+- [ ] Schema version bump confirmation
+
+### Phase 5 — Extensions
+- [ ] Per-extension `SessionManager` (`HashMap<ExtensionType, SessionManager>`) in extension manager
+- [ ] `build_extension_manager()` wired into soth-proxy main.rs
+- [ ] `ExtensionManager` wired into `ProxyHandler` startup
+
 ## Practical Checklist for New Provider/Agent
 1. Add/update provider + domain + detection rules in cloud bundle seed/compiler.
 2. Ensure `detection_id` values are present and stable in compiled bundle/providers.
 3. Validate local classification with edge registry tests and proxy integration tests.
-4. Verify detection metadata appears in local DB and dashboard/TUI views.
+4. Verify detection metadata appears in local DB rows, sync payloads, and heartbeat/runtime traces.
