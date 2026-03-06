@@ -211,6 +211,7 @@ fn parse_with_descriptor(
             method: method.to_string(),
             proto_package: spec.proto_package.clone(),
         },
+        api_version: None,
         content_sample: Some(content),
     };
     normalized.canonical_hash = canonical_hash(&normalized);
@@ -267,6 +268,7 @@ fn parse_with_string_scan(
             method: method.to_string(),
             proto_package: descriptor.and_then(|spec| spec.proto_package.clone()),
         },
+        api_version: None,
         content_sample: Some(content),
     };
     normalized.canonical_hash = canonical_hash(&normalized);

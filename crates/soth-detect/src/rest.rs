@@ -152,6 +152,8 @@ pub fn parse_rest(
         .join("\n"),
     );
 
+    let api_version = extract_api_version(&req.headers, &req.path, &format);
+
     let mut normalized = NormalizedRequest {
         parse_confidence: if warnings.is_empty() {
             ParseConfidence::Full
@@ -184,6 +186,7 @@ pub fn parse_rest(
         format_meta: FormatMeta::Rest {
             path: req.path.clone(),
         },
+        api_version,
         content_sample: if user_content.is_empty() {
             None
         } else {
@@ -495,6 +498,36 @@ fn infer_endpoint_type(path: &str) -> EndpointType {
         return EndpointType::Completion;
     }
     EndpointType::Unknown
+}
+
+fn extract_api_version(
+    headers: &crate::types::HeaderMap,
+    path: &str,
+    format: &DetectedFormat,
+) -> Option<String> {
+    match format {
+        DetectedFormat::AnthropicRest => {
+            crate::util::header_value(headers, "anthropic-version").map(str::to_string)
+        }
+        DetectedFormat::GeminiRest => extract_path_version(path),
+        DetectedFormat::BedrockRest => crate::util::header_value(headers, "x-amz-api-version")
+            .map(str::to_string)
+            .or_else(|| extract_path_version(path)),
+        _ => extract_path_version(path),
+    }
+}
+
+fn extract_path_version(path: &str) -> Option<String> {
+    let path_lc = path.to_ascii_lowercase();
+    for segment in path_lc.split('/') {
+        if segment.starts_with('v') && segment.len() > 1 {
+            let rest = &segment[1..];
+            if rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                return Some(segment.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn parser_id_for_format(format: &DetectedFormat) -> &'static str {

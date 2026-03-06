@@ -155,6 +155,7 @@ pub fn parse_jsonrpc(req: &RawRequest, provider_id: &str) -> ParseResult<Normali
             method: method.clone(),
             is_batch: matches!(json, Value::Array(_)),
         },
+        api_version: None,
         content_sample: if content_value == "[CONTENT_NOT_EXTRACTED]" {
             None
         } else {

@@ -1,4 +1,4 @@
-use crate::code::detect_code_artifacts;
+use crate::code::{self, detect_code_artifacts};
 use crate::fingerprint::fingerprint;
 use crate::graphql::{parse_graphql, ApqStore, NoopApqStore};
 use crate::grpc::parse_grpc;
@@ -9,10 +9,10 @@ use crate::intelligence::{
 };
 use crate::jsonrpc::parse_jsonrpc;
 use crate::rest::parse_rest;
-use crate::sensitive::credential_scan;
+use crate::sensitive::{credential_scan, org_pattern_scan, structural_scan};
 use crate::types::{
     ArtifactLocation, CaptureMode, DetectBundleSlice, DetectResult, DetectWarning, DetectedFormat,
-    FormatMeta, ParseSource, ParseWarning, Provider, ProviderEntry, RawRequest,
+    FormatMeta, NormalizedRequest, ParseSource, ParseWarning, Provider, ProviderEntry, RawRequest,
 };
 use lru::LruCache;
 use serde_json::Value as JsonValue;
@@ -120,7 +120,7 @@ fn process_inner(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
     apq_store: &dyn ApqStore,
-    _snapshot: &soth_core::SessionSnapshot,
+    snapshot: &soth_core::SessionSnapshot,
 ) -> DetectResult {
     let started = Instant::now();
 
@@ -170,22 +170,99 @@ fn process_inner(
         capture_mode,
         CaptureMode::Full | CaptureMode::SensitiveArtifacts | CaptureMode::FullContent
     );
-    let mut artifacts = if full_like {
-        credential_scan(&req.body, ArtifactLocation::Unknown)
-    } else {
-        Vec::new()
-    };
+    let mut artifacts = Vec::new();
+    let mut ast_normalized_hash: Option<String> = None;
 
     if full_like {
-        if let Some(content_sample) = normalized.content_sample.as_deref() {
-            let (code_artifacts, code_warnings) = detect_code_artifacts(
-                content_sample,
-                ArtifactLocation::UserMessage { turn_index: 0 },
-            );
-            artifacts.extend(code_artifacts);
-            warnings.extend(code_warnings);
+        // Body-level scans
+        artifacts.extend(credential_scan(&req.body, ArtifactLocation::Unknown));
+        artifacts.extend(structural_scan(&req.body, ArtifactLocation::Unknown));
+        artifacts.extend(org_pattern_scan(
+            &req.body,
+            bundle.org_patterns,
+            ArtifactLocation::Unknown,
+        ));
+
+        // Per-location scans (multi-turn aware)
+        let scannable = extract_scannable_locations(&req.body, &normalized);
+
+        if scannable.is_empty() {
+            // Fallback: use content_sample
+            if let Some(content_sample) = normalized.content_sample.as_deref() {
+                let code_result = detect_code_artifacts(
+                    content_sample,
+                    ArtifactLocation::UserMessage { turn_index: 0 },
+                );
+                artifacts.extend(code_result.artifacts);
+                warnings.extend(code_result.warnings);
+                if ast_normalized_hash.is_none() {
+                    let lang = code_result
+                        .detected_language
+                        .as_deref()
+                        .or_else(|| {
+                            code_result
+                                .tree_sitter
+                                .as_ref()
+                                .and_then(|ts| ts.confirmed_language.as_deref())
+                        });
+                    if let Some(lang) = lang {
+                        ast_normalized_hash = code::ast_normalized_hash(content_sample, lang);
+                    }
+                }
+            }
+        } else {
+            for (location, text) in &scannable {
+                artifacts.extend(credential_scan(text.as_bytes(), location.clone()));
+
+                if matches!(location, ArtifactLocation::UserMessage { .. }) {
+                    let code_result = detect_code_artifacts(text, location.clone());
+                    artifacts.extend(code_result.artifacts);
+                    warnings.extend(code_result.warnings);
+
+                    if ast_normalized_hash.is_none() {
+                        let lang = code_result
+                            .detected_language
+                            .as_deref()
+                            .or_else(|| {
+                                code_result
+                                    .tree_sitter
+                                    .as_ref()
+                                    .and_then(|ts| ts.confirmed_language.as_deref())
+                            });
+                        if let Some(lang) = lang {
+                            ast_normalized_hash = code::ast_normalized_hash(text, lang);
+                        }
+                    }
+                }
+            }
         }
     }
+
+    // Prefix repeat detection
+    let (is_prefix_repeat, novel_token_count, repeated_token_count, novel_tail_start_idx, prefix_hash) =
+        compute_prefix_repeat(&normalized, snapshot);
+
+    // Code context repeat detection
+    let is_repeated_code_context = ast_normalized_hash
+        .as_deref()
+        .map(|hash| snapshot.seen_code_hashes.iter().any(|h| h == hash))
+        .unwrap_or(false);
+
+    // Session mutations
+    let session_mutations = soth_core::SessionMutations {
+        new_prefix_hash: Some(normalized.conversation_hash.clone()),
+        new_code_hashes: ast_normalized_hash
+            .as_ref()
+            .map(|hash| {
+                vec![soth_core::CodeBlob {
+                    ast_normalized_hash: hash.clone(),
+                    language: String::new(),
+                    first_event_id: uuid::Uuid::nil(),
+                }]
+            })
+            .unwrap_or_default(),
+        ..soth_core::SessionMutations::default()
+    };
 
     let confidence = normalized.parse_confidence.clone();
     warnings.extend(
@@ -194,8 +271,6 @@ fn process_inner(
             .iter()
             .map(parse_warning_to_detect_warning),
     );
-
-    let novel_token_count = normalized.estimated_input_tokens;
 
     DetectResult {
         normalized,
@@ -206,16 +281,114 @@ fn process_inner(
         detect_latency_us: started.elapsed().as_micros() as u64,
         warnings,
         raw_body_bytes: Some(req.body.clone()),
-        session_mutations: soth_core::SessionMutations::default(),
-        is_prefix_repeat: false,
+        session_mutations,
+        is_prefix_repeat,
         novel_token_count,
-        repeated_token_count: 0,
-        novel_tail_start_idx: None,
-        prefix_hash: None,
-        is_repeated_code_context: false,
-        ast_normalized_hash: None,
+        repeated_token_count,
+        novel_tail_start_idx,
+        prefix_hash,
+        is_repeated_code_context,
+        ast_normalized_hash,
         first_blob_event_id: None,
     }
+}
+
+fn compute_prefix_repeat(
+    normalized: &NormalizedRequest,
+    snapshot: &soth_core::SessionSnapshot,
+) -> (bool, u32, u32, Option<usize>, Option<String>) {
+    let current_hash = &normalized.conversation_hash;
+
+    // Exact repeat
+    if snapshot
+        .seen_prefix_hashes
+        .iter()
+        .any(|h| h == current_hash)
+    {
+        let repeated = normalized.estimated_input_tokens;
+        return (true, 0, repeated, Some(0), Some(current_hash.clone()));
+    }
+
+    (false, normalized.estimated_input_tokens, 0, None, None)
+}
+
+fn extract_scannable_locations(
+    body: &[u8],
+    normalized: &NormalizedRequest,
+) -> Vec<(ArtifactLocation, String)> {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+
+    let mut locations = Vec::new();
+
+    // System prompt
+    if let Some(system) = json
+        .get("system")
+        .or_else(|| json.get("systemPrompt"))
+        .or_else(|| json.get("system_prompt"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        locations.push((ArtifactLocation::SystemPrompt, system.to_string()));
+    }
+
+    // Messages array
+    if let Some(messages) = json.get("messages").and_then(|v| v.as_array()) {
+        for (idx, msg) in messages.iter().enumerate() {
+            let role = msg
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("user");
+            let content = msg
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    msg.get("content")
+                        .and_then(|v| v.as_array())
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                });
+
+            if let Some(text) = content.filter(|s| !s.is_empty()) {
+                let location = match role {
+                    "assistant" => ArtifactLocation::AssistantMessage {
+                        turn_index: idx as u32,
+                    },
+                    _ => ArtifactLocation::UserMessage {
+                        turn_index: idx as u32,
+                    },
+                };
+                locations.push((location, text));
+            }
+        }
+    }
+
+    // Tool definitions
+    if normalized.has_tool_definitions {
+        if let Some(tools) = json.get("tools").and_then(|v| v.as_array()) {
+            for tool in tools {
+                let tool_name = tool
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown_tool")
+                    .to_string();
+                let tool_text = tool.to_string();
+                locations.push((
+                    ArtifactLocation::ToolDefinition { tool_name },
+                    tool_text,
+                ));
+            }
+        }
+    }
+
+    locations
 }
 
 fn parse_by_format(

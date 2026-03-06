@@ -192,6 +192,7 @@ pub fn parse_graphql(
             operation_type,
             mutation_field,
         },
+        api_version: None,
         content_sample: Some(content),
     };
     normalized.canonical_hash = canonical_hash(&normalized);
@@ -455,6 +456,7 @@ fn heuristic_graphql_parse(env: &GraphQLEnvelope) -> NormalizedRequest {
             operation_type: GqlOpType::Unknown,
             mutation_field: None,
         },
+        api_version: None,
         content_sample: if content == "[CONTENT_NOT_EXTRACTED]" {
             None
         } else {

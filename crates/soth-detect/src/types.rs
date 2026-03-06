@@ -102,6 +102,8 @@ pub struct NormalizedRequest {
 
     pub format_meta: FormatMeta,
 
+    pub api_version: Option<String>,
+
     // Internal helper field for optional post-parse scans without raw content retention.
     pub content_sample: Option<String>,
 }
@@ -137,6 +139,7 @@ impl NormalizedRequest {
                 method: method.to_string(),
                 path: path.to_string(),
             },
+            api_version: None,
             content_sample: None,
         }
     }
@@ -222,6 +225,7 @@ impl DetectResult {
                 method: String::new(),
                 path: String::new(),
             },
+            api_version: None,
             content_sample: None,
         };
 
@@ -283,6 +287,10 @@ pub struct StreamSession {
     pub start_time: Instant,
     pub grpc_service: Option<String>,
     pub grpc_method: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub request_format: Option<FormatMeta>,
+    pub estimated_input_tokens: u32,
 }
 
 impl StreamSession {
@@ -295,11 +303,29 @@ impl StreamSession {
             start_time: Instant::now(),
             grpc_service: None,
             grpc_method: None,
+            provider: None,
+            model: None,
+            request_format: None,
+            estimated_input_tokens: 0,
         }
     }
 
     pub fn accumulate(&mut self, value: impl Into<String>) {
         self.delta_buffer.push(value.into());
+    }
+
+    /// Called by soth-proxy after parsing the request to populate context.
+    pub fn set_request_context(
+        &mut self,
+        provider: String,
+        model: Option<String>,
+        format: FormatMeta,
+        estimated_input_tokens: u32,
+    ) {
+        self.provider = Some(provider);
+        self.model = model;
+        self.request_format = Some(format);
+        self.estimated_input_tokens = estimated_input_tokens;
     }
 
     pub fn set_grpc_context(&mut self, service: impl Into<String>, method: impl Into<String>) {
@@ -348,6 +374,9 @@ pub enum ArtifactType {
     ConnectionString,
     CodeBlock { language: String },
     UnknownCredential,
+    AuthLogicFlag,
+    CryptoFlag,
+    OrgPatternMatch { pattern_id: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -425,6 +454,8 @@ pub struct OwnedDetectBundle {
     pub collectors: HashMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_metadata: Option<JsonValue>,
+    #[serde(default)]
+    pub org_patterns: Vec<String>,
 }
 
 impl OwnedDetectBundle {
@@ -444,6 +475,7 @@ impl OwnedDetectBundle {
             passthrough_domains: self.passthrough_domains.as_slice(),
             collectors: &self.collectors,
             source_metadata: self.source_metadata.as_ref(),
+            org_patterns: &self.org_patterns,
         }
     }
 }
@@ -464,6 +496,7 @@ pub struct DetectBundleSlice<'a> {
     pub passthrough_domains: &'a [String],
     pub collectors: &'a HashMap<String, JsonValue>,
     pub source_metadata: Option<&'a JsonValue>,
+    pub org_patterns: &'a [String],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]

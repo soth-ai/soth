@@ -51,7 +51,7 @@ fn to_core_normalized(value: &DetectResult) -> NormalizedRequest {
         provider: map_provider(normalized.provider.canonical_name()),
         model: normalized.model.clone(),
         endpoint_type: map_endpoint_type(&normalized.endpoint_type),
-        api_version: None,
+        api_version: normalized.api_version.clone(),
         system_prompt_hash: normalized.system_prompt_hash.clone(),
         system_prompt_token_estimate: normalized.system_prompt_token_estimate,
         user_content_hash: normalized.user_content_hash.clone(),
@@ -210,6 +210,11 @@ fn map_artifact_kind(value: &ArtifactType) -> ArtifactKind {
         | ArtifactType::SlackToken
         | ArtifactType::StripeSecretKey => ArtifactKind::ApiKey { provider: None },
         ArtifactType::UnknownCredential => ArtifactKind::UnknownCredential,
+        ArtifactType::AuthLogicFlag => ArtifactKind::AuthLogic,
+        ArtifactType::CryptoFlag => ArtifactKind::CryptoOperation,
+        ArtifactType::OrgPatternMatch { pattern_id } => ArtifactKind::OrgPattern {
+            pattern_id: *pattern_id,
+        },
     }
 }
 

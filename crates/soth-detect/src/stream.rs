@@ -106,12 +106,24 @@ pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
     let assembled = session.finalize_response_content();
 
     let mut normalized = crate::types::NormalizedRequest::empty_heuristic("STREAM", "/stream");
+
+    // Carry through request context if available
+    if let Some(provider) = &session.provider {
+        normalized.provider = crate::types::Provider::new(provider.clone());
+    }
+    if session.model.is_some() {
+        normalized.model = session.model.clone();
+    }
+    if let Some(format) = &session.request_format {
+        normalized.format_meta = format.clone();
+    }
+    normalized.estimated_input_tokens = session.estimated_input_tokens;
+
     let token_estimate = ((assembled.len() as f32) / 4.0).ceil() as u32;
     normalized.is_ai_call = !assembled.is_empty();
     normalized.user_content_hash = summary.response_hash.clone();
     normalized.user_content_token_estimate = token_estimate;
     normalized.conversation_hash = summary.response_hash.clone();
-    normalized.estimated_input_tokens = token_estimate;
     normalized.canonical_hash = summary.response_hash.clone();
     normalized.content_sample = if assembled.is_empty() {
         None
