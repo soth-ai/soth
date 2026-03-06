@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::db;
-use crate::session::SessionStore;
+use crate::session::{Lane, SessionManager};
 
 const DEFAULT_CLASSIFY_MAX_IN_FLIGHT: usize = 8;
 const DEFAULT_DB_WRITE_QUEUE_CAPACITY: usize = 4_096;
@@ -183,9 +183,10 @@ pub fn spawn_classify_task(
     bundle_trust_level: soth_core::BundleTrustLevel,
     classify_config: Arc<soth_classify::ClassifyConfig>,
     policy_block_enforced: Arc<AtomicBool>,
-    session_store: Arc<SessionStore>,
+    session_store: Arc<SessionManager>,
     telemetry: Option<Arc<soth_telemetry::TelemetryPipeline>>,
     runtime: Arc<Runtime>,
+    lane: Lane,
 ) -> oneshot::Receiver<soth_core::PolicyDecisionKind> {
     let (tx, rx) = oneshot::channel();
 
@@ -202,6 +203,63 @@ pub fn spawn_classify_task(
         {
             crate::trace::classify_fast_block(connection_id, &kind);
             emit_block_signal(&mut block_signal_tx, kind);
+        }
+
+        // CodeContextRepeat lane: skip full classification (no embedding, no classify).
+        // Fast policy already ran above; just emit telemetry and write DB record.
+        if lane == Lane::CodeContextRepeat {
+            let mut result = {
+                let detect_for_classify = detect_result.clone();
+                let proxy_ctx_for_classify = proxy_ctx.clone();
+                let classify_bundle_for_classify = classify_bundle.clone();
+                let classify_config_for_classify = classify_config.clone();
+
+                match tokio::task::spawn_blocking(move || {
+                    soth_classify::classify(
+                        &detect_for_classify,
+                        None, // no embedding for code context repeats
+                        &proxy_ctx_for_classify,
+                        classify_bundle_for_classify.as_ref(),
+                        classify_config_for_classify.as_ref(),
+                    )
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(
+                            connection_id = %connection_id,
+                            error = %error,
+                            "code-context-repeat classification worker failed"
+                        );
+                        return;
+                    }
+                }
+            };
+
+            result.telemetry_event.bundle_trust_level = Some(bundle_trust_level);
+            result.telemetry_event.connection_id = Some(connection_id);
+            session_store.apply_classification_by_connection(
+                connection_id,
+                &result,
+                &detect_result.normalized,
+            );
+
+            if let Some(pipeline) = telemetry {
+                pipeline.push(result.telemetry_event.clone());
+            }
+
+            runtime.enqueue_db_write(DbWriteJob {
+                connection_id,
+                result,
+                detect_result,
+                proxy_ctx,
+                raw_body_for_commitment,
+                capture_mode,
+                matched_provider,
+                matched_application,
+            });
+            return;
         }
 
         let mut result = {
@@ -244,6 +302,7 @@ pub fn spawn_classify_task(
         };
 
         result.telemetry_event.bundle_trust_level = Some(bundle_trust_level);
+        result.telemetry_event.connection_id = Some(connection_id);
 
         if let soth_core::PolicyDecisionKind::Block { .. } = &result.policy_decision.kind {
             emit_block_signal(&mut block_signal_tx, result.policy_decision.kind.clone());
@@ -254,7 +313,11 @@ pub fn spawn_classify_task(
         }
         crate::trace::classify_result(connection_id, &result);
 
-        session_store.apply_classification(connection_id, &result, &detect_result.normalized);
+        session_store.apply_classification_by_connection(
+            connection_id,
+            &result,
+            &detect_result.normalized,
+        );
 
         if let Some(pipeline) = telemetry {
             pipeline.push(result.telemetry_event.clone());

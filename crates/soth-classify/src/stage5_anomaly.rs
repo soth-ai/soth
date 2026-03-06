@@ -225,6 +225,7 @@ mod tests {
             last_model: Some("gpt-4o-mini".to_string()),
             current_request_timestamp: 10_000,
             last_request_timestamp: Some(9_000),
+            ..SessionSnapshot::default()
         }
     }
 

@@ -68,9 +68,9 @@
   9. Sync worker upload to cloud
 
   - Sync loop reads ready queue rows in crates/soth-sync/src/agent.rs:564.
-  - It parses payload, validates UUID, uploads blobs first, and patches body references in crates/soth-sync/src/agent.rs:632.
+  - It parses payload and validates UUID in crates/soth-sync/src/agent.rs.
   - Converts ExchangeEvent -> ExchangeMetadata in crates/soth-sync/src/agent.rs:1329.
-  - Sends gzip batch to /api/v1/exchanges/batch via metadata pusher in crates/soth-sync/src/metadata_pusher.rs:10 and crates/soth-sync/src/metadata_pusher.rs:49.
+  - Sends gzip batch to `/v1/edge/enroll/exchange` via metadata pusher in crates/soth-sync/src/metadata_pusher.rs.
   - Rejections are classified terminal vs retry; terminal ones are dropped and logged as malformed in crates/soth-sync/src/agent.rs:1546 and crates/soth-sync/src/agent.rs:1026.
 
   10. Cloud ingest and validation

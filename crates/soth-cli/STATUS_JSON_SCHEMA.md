@@ -7,7 +7,9 @@ Stable public interface for machine health checks and MDM compliance scripts.
   "proxy": {
     "running": true,
     "pid": 12345,
-    "port": 8080
+    "port": 8080,
+    "bundle_runtime_source": "primary",
+    "bundle_runtime_warning": null
   },
   "bundle": {
     "version": "bundle-v18",
@@ -31,7 +33,7 @@ Stable public interface for machine health checks and MDM compliance scripts.
 ## Stability
 
 - Existing fields are stable and must not be renamed or removed without a major version bump.
-- Minor versions may add optional fields.
+- Minor versions may add optional fields (for example `proxy.bundle_runtime_source` and `proxy.bundle_runtime_warning`).
 - Exit code semantics:
   - `0`: healthy
   - `1`: degraded

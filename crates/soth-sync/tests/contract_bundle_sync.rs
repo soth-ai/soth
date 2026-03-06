@@ -87,8 +87,11 @@ async fn start_registry_server(state: RegistryState) -> Option<String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let addr = listener.local_addr().ok()?;
     let app = Router::new()
-        .route("/v1/bundle/current", get(bundle_current_handler))
-        .route("/v1/bundle/ack", axum::routing::post(bundle_ack_handler))
+        .route("/v1/edge/bundle/current", get(bundle_current_handler))
+        .route(
+            "/v1/edge/bundle/ack",
+            axum::routing::post(bundle_ack_handler),
+        )
         .route("/api/v1/registry/version", get(legacy_version_handler))
         .route("/api/v1/registry/bundle", get(legacy_bundle_handler))
         .with_state(state);

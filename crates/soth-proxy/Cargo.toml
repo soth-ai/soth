@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 dev-pipeline-trace = []
+extensions = ["dep:soth-extensions"]
 
 [dependencies]
 anyhow.workspace = true
@@ -42,4 +43,5 @@ soth-telemetry = { workspace = true }
 soth-policy = { workspace = true }
 soth-sync = { workspace = true }
 
+soth-extensions = { workspace = true, optional = true }
 soth-mitm = { path = "../../../soth-mitm/crates/soth-mitm" }

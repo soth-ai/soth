@@ -19,7 +19,7 @@ use crate::config::PipelineConfig;
 use crate::gating::GateEvaluator;
 use crate::pending::{PendingCapture, PendingStore};
 use crate::response;
-use crate::session::SessionStore;
+use crate::session::SessionManager;
 use crate::streaming::StreamingStore;
 
 const EMBEDDING_RETENTION_DAYS: u32 = 90;
@@ -30,7 +30,7 @@ pub struct ProxyHandler {
     bundle_handle: soth_bundle::BundleHandle,
     parser_registry: Arc<ArcSwap<soth_detect::ParserRegistry>>,
     gate_evaluator: Arc<ArcSwap<GateEvaluator>>,
-    session_store: Arc<SessionStore>,
+    session_store: Arc<SessionManager>,
     pending: Arc<PendingStore>,
     streaming: Arc<StreamingStore>,
     telemetry: Option<Arc<soth_telemetry::TelemetryPipeline>>,
@@ -59,7 +59,6 @@ impl ProxyHandler {
         device_id_hash: String,
         user_hmac_secret: String,
     ) -> Self {
-        let ttl = Duration::from_secs(pipeline_config.session_ttl_secs.max(1));
         let initial_bundle = bundle_handle.current();
         crate::heartbeat_telemetry::record_bundle_trust_level(initial_bundle.trust_level);
         let initial_parser_registry = build_parser_registry(initial_bundle.detect.as_ref());
@@ -70,7 +69,7 @@ impl ProxyHandler {
             bundle_handle,
             parser_registry: Arc::new(ArcSwap::from_pointee(initial_parser_registry)),
             gate_evaluator: Arc::new(ArcSwap::from_pointee(initial_gate_evaluator)),
-            session_store: Arc::new(SessionStore::new(ttl)),
+            session_store: Arc::new(SessionManager::new(pipeline_config.session.clone())),
             pending: Arc::new(PendingStore::new()),
             streaming: Arc::new(StreamingStore::new()),
             telemetry,
@@ -217,6 +216,15 @@ impl ProxyHandler {
             outcome.matched_application.as_deref(),
         ));
 
+        // Derive session key and bind this connection
+        let session_key = self.session_store.derive_key(
+            &process_resolution,
+            outcome.matched_application.as_deref(),
+        );
+        self.session_store.get_or_create(&session_key);
+        self.session_store
+            .bind_connection(connection_id, session_key.clone());
+
         let original_body_len = req.body.len();
         let body_size_limit = self.pipeline_config.body_size_limit_bytes;
         let mut truncated_body_sizes = None;
@@ -226,8 +234,9 @@ impl ProxyHandler {
         }
 
         let parser_registry = self.parser_registry.load();
+        let pre_detect_snapshot = self.session_store.snapshot(&session_key);
         let mut detect_result =
-            soth_detect::process_with_registry(parser_registry.as_ref(), &req, &detect_bundle);
+            soth_detect::process_with_registry(parser_registry.as_ref(), &req, &detect_bundle, &pre_detect_snapshot);
         if let Some((actual_bytes, limit_bytes)) = truncated_body_sizes {
             let warning = soth_core::ParseWarning::BodyTruncated {
                 actual_bytes: actual_bytes as u64,
@@ -251,12 +260,20 @@ impl ProxyHandler {
             truncated_body_sizes,
             &detect_result,
         );
-        let content_for_embedding = extract_content_for_embedding(&req.body);
+        // Apply detect mutations to session and determine pipeline lane
+        self.session_store
+            .apply_detect_mutations(&session_key, &detect_result.session_mutations);
+        let lane = crate::session::lane::determine_lane(&detect_result);
+
+        let content_for_embedding = match lane {
+            crate::session::Lane::CodeContextRepeat => None,
+            _ => extract_content_for_embedding(&req.body),
+        };
 
         let request_timestamp_ms = chrono::Utc::now().timestamp_millis();
         self.session_store
-            .mark_request_started(connection_id, request_timestamp_ms);
-        let session_snapshot = self.session_store.snapshot(connection_id);
+            .mark_request_started(&session_key, request_timestamp_ms);
+        let session_snapshot = self.session_store.snapshot(&session_key);
 
         let proxy_ctx = soth_core::ProxyContext {
             org_id: self.org_id.clone(),
@@ -274,6 +291,7 @@ impl ProxyHandler {
             traffic_classification: outcome.traffic_classification,
             classification_source: soth_core::ClassificationSource::Proxy,
             session_snapshot: Some(session_snapshot),
+            request_method: Some(map_request_method(req.method.as_str())),
         };
 
         let raw_body_for_commitment = match outcome.capture_mode {
@@ -313,6 +331,7 @@ impl ProxyHandler {
             self.session_store.clone(),
             self.telemetry.clone(),
             self.classify_runtime.clone(),
+            lane,
         );
 
         let timeout_ms = self.pipeline_config.block_signal_timeout_ms;
@@ -509,7 +528,7 @@ impl soth_mitm::InterceptHandler for ProxyHandler {
     fn on_connection_close(&self, connection_id: Uuid) {
         let had_pending = self.pending.remove(&connection_id);
         let had_streaming = self.streaming.remove(&connection_id);
-        let _ = self.session_store.remove(&connection_id);
+        let _ = self.session_store.unbind_connection(&connection_id);
         if had_pending || had_streaming {
             tracing::debug!(
                 connection_id = %connection_id,
@@ -645,6 +664,19 @@ fn build_app_identity(
         } else {
             1.0
         },
+    }
+}
+
+fn map_request_method(method: &str) -> soth_core::RequestMethod {
+    match method.to_ascii_uppercase().as_str() {
+        "GET" => soth_core::RequestMethod::Get,
+        "POST" => soth_core::RequestMethod::Post,
+        "PUT" => soth_core::RequestMethod::Put,
+        "PATCH" => soth_core::RequestMethod::Patch,
+        "DELETE" => soth_core::RequestMethod::Delete,
+        "HEAD" => soth_core::RequestMethod::Head,
+        "OPTIONS" => soth_core::RequestMethod::Options,
+        _ => soth_core::RequestMethod::Unknown,
     }
 }
 

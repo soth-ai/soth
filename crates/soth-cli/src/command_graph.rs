@@ -1,7 +1,10 @@
 use crate::{cli_config, commands, logging, style};
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*};
 
 #[derive(Args, Clone)]
@@ -71,6 +74,12 @@ pub enum Commands {
     Events {
         #[command(subcommand)]
         action: commands::events::EventsCommands,
+    },
+
+    /// Bundle diagnostics and verification
+    Bundle {
+        #[command(subcommand)]
+        action: commands::bundle::BundleCommands,
     },
 }
 
@@ -212,6 +221,10 @@ pub struct EnvArgs {
     #[arg(long)]
     pub ca_only: bool,
 
+    /// Print shell wrapper hook that auto-applies env changes on `soth` commands
+    #[arg(long)]
+    pub hook: bool,
+
     /// Config file path
     #[arg(short, long)]
     pub config: Option<PathBuf>,
@@ -267,12 +280,24 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
         }
         Commands::Stop => {
             proxy_run_stop().await?;
+            if let Err(error) = commands::proxy::emit_shell_env_deactivate() {
+                tracing::warn!(
+                    error = %error,
+                    "Proxy stopped but failed to emit shell env deactivation patch"
+                );
+            }
         }
         Commands::Up(args) => {
             run_up_command(args, global_config).await?;
         }
         Commands::Down => {
             proxy_run_stop().await?;
+            if let Err(error) = commands::proxy::emit_shell_env_deactivate() {
+                tracing::warn!(
+                    error = %error,
+                    "Proxy down stop phase completed but failed to emit shell env deactivation patch"
+                );
+            }
             proxy_run_off().await?;
         }
         Commands::On(args) => {
@@ -309,12 +334,16 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
                 args.shell.as_str(),
                 args.ca_only,
                 args.unset,
+                args.hook,
                 args.config.or(global_config),
             )
             .await?;
         }
         Commands::Events { action } => {
             commands::events::run(action, global_config).await?;
+        }
+        Commands::Bundle { action } => {
+            commands::bundle::run(action, global_config).await?;
         }
     }
 
@@ -450,6 +479,10 @@ mod proxy_test_hooks {
         state().lock().expect("proxy test hook lock").calls.clone()
     }
 
+    pub(super) fn is_active() -> bool {
+        state().lock().expect("proxy test hook lock").active
+    }
+
     pub(super) fn maybe_start(
         port: Option<u16>,
         config: Option<PathBuf>,
@@ -510,20 +543,34 @@ mod proxy_test_hooks {
 }
 
 async fn run_start_command(args: StartArgs, global_config: Option<PathBuf>) -> anyhow::Result<()> {
+    let effective_config = args.config.clone().or(global_config.clone());
+    ensure_bundle_for_bootstrap(effective_config.clone(), args.quiet).await?;
     proxy_run_start_internal(
         args.port,
-        args.config.or(global_config),
+        effective_config.clone(),
         args.quiet,
         args.foreground,
         args.daemon_child,
         args.no_autostart,
         args.allow_daemon_child_fallback,
     )
-    .await
+    .await?;
+
+    if !args.daemon_child && !args.foreground {
+        if let Err(error) = commands::proxy::emit_shell_env_activate(effective_config.as_ref()) {
+            tracing::warn!(
+                error = %error,
+                "Proxy started but failed to emit shell env activation patch"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow::Result<()> {
     let effective_config = ensure_config_for_up(args.config, global_config, args.quiet).await?;
+    let mut enrollment_error: Option<anyhow::Error> = None;
 
     if args.token.is_some() {
         if !args.quiet {
@@ -542,19 +589,40 @@ async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow:
         )
         .await
         {
-            tracing::warn!(
-                error = %error,
-                "Enrollment failed during `up`; continuing fail-open with local runtime"
-            );
+            enrollment_error = Some(error);
         }
     }
 
-    ensure_ca_for_up(effective_config.clone(), args.quiet).await?;
+    if let Some(error) = enrollment_error {
+        let config = cli_config::load_effective_config(effective_config.as_ref(), None)?;
+        let bundle_dir = cli_config::expand_tilde(Path::new(config.bundle.bundle_dir.as_str()));
+        if !bundle_dir.join("manifest.json").exists() {
+            return Err(anyhow::anyhow!(
+                "Enrollment failed and no local bundle exists at {}. Cannot continue startup.\nEnrollment error: {:#}",
+                bundle_dir.display(),
+                error
+            ));
+        }
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            "Enrollment failed during `up`; continuing fail-open with local runtime bundle"
+        );
+    }
+
+    #[cfg(test)]
+    let skip_infra_checks = proxy_test_hooks::is_active();
+    #[cfg(not(test))]
+    let skip_infra_checks = false;
+
+    if !skip_infra_checks {
+        ensure_ca_for_up(effective_config.clone(), args.quiet).await?;
+        ensure_bundle_for_bootstrap(effective_config.clone(), args.quiet).await?;
+    }
 
     if args.foreground {
         proxy_run_start_internal(
             args.port,
-            effective_config,
+            effective_config.clone(),
             args.quiet,
             true,
             false,
@@ -576,19 +644,28 @@ async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow:
     )
     .await?;
 
-    if let Err(error) = proxy_run_on(args.port, effective_config).await {
+    if let Err(error) = proxy_run_on(args.port, effective_config.clone()).await {
         tracing::warn!(
             error = %error,
             "Post-start proxy enable failed during `up`; attempting rollback stop"
         );
         if let Err(stop_error) = proxy_run_stop().await {
+            let _ = commands::proxy::emit_shell_env_deactivate();
             return Err(anyhow::anyhow!(
                 "`soth up` failed enabling system proxy ({error}) and rollback stop failed ({stop_error})"
             ));
         }
+        let _ = commands::proxy::emit_shell_env_deactivate();
         return Err(anyhow::anyhow!(
             "`soth up` failed enabling system proxy: {error}. Daemon was stopped as rollback."
         ));
+    }
+
+    if let Err(error) = commands::proxy::emit_shell_env_activate(effective_config.as_ref()) {
+        tracing::warn!(
+            error = %error,
+            "Proxy up completed but failed to emit shell env activation patch"
+        );
     }
     Ok(())
 }
@@ -621,15 +698,282 @@ async fn ensure_config_for_up(
 
 async fn ensure_ca_for_up(config_path: Option<PathBuf>, quiet: bool) -> anyhow::Result<()> {
     let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
-    let cert_path = cli_config::expand_tilde(config.forward_proxy.ca.cert_path.as_ref());
-    let key_path = cli_config::expand_tilde(config.forward_proxy.ca.key_path.as_ref());
-    if cert_path.exists() && key_path.exists() {
-        return Ok(());
+    let ca_paths = commands::proxy::ca_health::resolve_ca_paths(&config);
+    if ca_paths.runtime_cert_path.exists() && ca_paths.runtime_key_path.exists() {
+        if !ca_paths.trust_cert_path.exists() {
+            anyhow::bail!(
+                "Configured trust cert path is missing: {}. Fix forward_proxy.ca.trust_cert_path or run `soth setup-ca`.",
+                ca_paths.trust_cert_path.display()
+            );
+        }
+
+        let runtime_fp = commands::proxy::ca_health::cert_fingerprint_sha256(
+            ca_paths.runtime_cert_path.as_path(),
+        )
+        .context("compute runtime CA fingerprint")?;
+        let trust_fp =
+            commands::proxy::ca_health::cert_fingerprint_sha256(ca_paths.trust_cert_path.as_path())
+                .context("compute trust CA fingerprint")?;
+        if runtime_fp != trust_fp {
+            anyhow::bail!(
+                "CA fingerprint mismatch between runtime cert and trust cert.\nruntime={} ({})\ntrust={} ({})",
+                runtime_fp,
+                ca_paths.runtime_cert_path.display(),
+                trust_fp,
+                ca_paths.trust_cert_path.display()
+            );
+        }
+
+        match commands::proxy::ca_health::check_os_trust(ca_paths.trust_cert_path.as_path()) {
+            Ok(check) if check.status == commands::proxy::ca_health::OsTrustStatus::Untrusted => {
+                if ca_paths.external_trust_path {
+                    anyhow::bail!(
+                        "External trust cert is not trusted by OS (source={}): {}. Install trust via MDM/profile and retry.",
+                        ca_paths.trust_source,
+                        check.detail
+                    );
+                }
+                if !quiet {
+                    style::info("CA exists but OS trust is missing. Repairing trust now.");
+                }
+                commands::proxy::run_setup_ca(false, None, config_path).await?;
+                return Ok(());
+            }
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if !quiet {
+                    style::warning(&format!(
+                        "Unable to verify OS trust state for CA (continuing): {}",
+                        error
+                    ));
+                }
+                return Ok(());
+            }
+        }
     }
+
     if !quiet {
         style::info("CA certificate not found. Generating now.");
     }
     commands::proxy::run_setup_ca(false, None, config_path).await
+}
+
+#[derive(Clone)]
+struct BootstrapBundleInstallHook {
+    bundle_dir: PathBuf,
+    vendor_pubkey: [u8; 32],
+    org_config: soth_bundle::OrgSignedConfig,
+    verification: soth_bundle::VerificationOptions,
+}
+
+impl soth_sync::BundleWatcher for BootstrapBundleInstallHook {
+    fn install_bundle(
+        &self,
+        manifest_bytes: &[u8],
+        assets: HashMap<String, Vec<u8>>,
+    ) -> anyhow::Result<String> {
+        let loaded = soth_bundle::load_from_bytes_with_options(
+            manifest_bytes,
+            assets.clone(),
+            &self.vendor_pubkey,
+            &self.org_config,
+            self.verification,
+        )
+        .map_err(|error| anyhow::anyhow!("bundle payload failed validation: {error}"))?;
+
+        install_runtime_bundle_files(self.bundle_dir.as_path(), manifest_bytes, assets)?;
+        Ok(loaded.version)
+    }
+
+    fn allow_registry_projection_install(&self) -> bool {
+        false
+    }
+}
+
+async fn ensure_bundle_for_bootstrap(
+    config_path: Option<PathBuf>,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    let bundle_dir = cli_config::expand_tilde(Path::new(config.bundle.bundle_dir.as_str()));
+    if bundle_dir.join("manifest.json").exists() {
+        return Ok(());
+    }
+
+    let endpoint = config.cloud.endpoint.trim().to_string();
+    let api_key = config
+        .cloud
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let api_key = match api_key {
+        Some(value) => value,
+        None => {
+            anyhow::bail!(
+                "Bundle directory {} is missing. Cloud credentials are not configured, so bootstrap cannot fetch bundle. Run `soth enroll <token>` first.",
+                bundle_dir.display()
+            );
+        }
+    };
+
+    if endpoint.is_empty() {
+        anyhow::bail!(
+            "Bundle directory {} is missing and cloud.endpoint is empty; bootstrap cannot fetch bundle.",
+            bundle_dir.display()
+        );
+    }
+
+    if !quiet {
+        style::info(&format!(
+            "Bundle not found at {}. Fetching from cloud bootstrap endpoint.",
+            bundle_dir.display()
+        ));
+    }
+
+    let vendor_pubkey = parse_fixed_hex_32(
+        config.bundle.vendor_pubkey_hex.as_str(),
+        "bundle.vendor_pubkey_hex",
+    )?;
+    let org_approval_pubkey = parse_optional_fixed_hex_32(
+        config.bundle.org_approval_pubkey_hex.as_deref(),
+        "bundle.org_approval_pubkey_hex",
+    )?;
+
+    let verification = soth_bundle::VerificationOptions {
+        verify_vendor_signature: config.bundle.verify_vendor_signature,
+        require_verified_bundle: config.bundle.require_verified_bundle,
+        org_approval_pubkey,
+    };
+    let org_config = soth_bundle::OrgSignedConfig {
+        allows_https_intercept: true,
+        allows_http_intercept: true,
+        process_filter: None,
+        allowed_capture_modes: vec![
+            "metadata_only".to_string(),
+            "sensitive_artifacts".to_string(),
+            "full".to_string(),
+        ],
+    };
+
+    let install_hook = Arc::new(BootstrapBundleInstallHook {
+        bundle_dir: bundle_dir.clone(),
+        vendor_pubkey,
+        org_config,
+        verification,
+    });
+
+    let mut puller = soth_sync::registry_puller::RegistryPuller::new(
+        endpoint,
+        api_key,
+        bundle_dir.join("registry_bundle_cache.json"),
+    )
+    .with_bundle_watcher(install_hook);
+
+    if let Some(device_id_hash) = config
+        .cloud
+        .tags
+        .get("device_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        puller = puller.with_device_id_hash(device_id_hash.to_string());
+    } else if let Some(device_id_hash) = cli_config::read_client_device_id() {
+        puller = puller.with_device_id_hash(device_id_hash);
+    }
+
+    let outcome = puller
+        .refresh_now()
+        .await
+        .context("bootstrap bundle fetch failed")?;
+    if !bundle_dir.join("manifest.json").exists() {
+        let cache_path = bundle_dir.join("registry_bundle_cache.json");
+        anyhow::bail!(
+            "Cloud bootstrap check completed (checked={}, downloaded={}) but no runtime bundle was installed at {}.\n\
+             The cloud endpoint likely returned a registry cache payload (cache-only) instead of an installable channel-2 bundle.\n\
+             For first-time bootstrap, /v1/edge/bundle/current must return a payload with `manifest` + `assets` so edge can materialize {}/manifest.json.\n\
+             Registry cache path: {}",
+            outcome.checked,
+            outcome.downloaded,
+            bundle_dir.display(),
+            bundle_dir.display(),
+            cache_path.display()
+        );
+    }
+
+    if !quiet {
+        if let Some(version) = outcome.version.as_deref() {
+            style::success(&format!("Bootstrap bundle ready: {}", version));
+        } else {
+            style::success("Bootstrap bundle ready.");
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_fixed_hex_32(value: &str, field: &str) -> anyhow::Result<[u8; 32]> {
+    let trimmed = value.trim();
+    let bytes = hex::decode(trimmed).map_err(|_| anyhow::anyhow!("{field} must be hex-encoded"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "{field} must decode to exactly 32 bytes, got {} bytes",
+            bytes.len()
+        );
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(bytes.as_slice());
+    Ok(out)
+}
+
+fn parse_optional_fixed_hex_32(
+    value: Option<&str>,
+    field: &str,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    let Some(raw) = value.map(str::trim) else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    parse_fixed_hex_32(raw, field).map(Some)
+}
+
+fn install_runtime_bundle_files(
+    bundle_dir: &Path,
+    manifest_bytes: &[u8],
+    assets: HashMap<String, Vec<u8>>,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(bundle_dir)
+        .with_context(|| format!("failed creating {}", bundle_dir.display()))?;
+
+    for (relative_path, bytes) in assets {
+        let rel = Path::new(relative_path.as_str());
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            anyhow::bail!("bundle asset path is not safe: {}", relative_path);
+        }
+
+        let full_path = bundle_dir.join(rel);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
+        std::fs::write(&full_path, bytes)
+            .with_context(|| format!("failed writing {}", full_path.display()))?;
+    }
+
+    let manifest_path = bundle_dir.join("manifest.json");
+    std::fs::write(&manifest_path, manifest_bytes)
+        .with_context(|| format!("failed writing {}", manifest_path.display()))?;
+
+    Ok(())
 }
 
 fn parse_env_usize(key: &str) -> Option<usize> {
@@ -702,6 +1046,9 @@ mod tests {
         let guard = crate::commands::proxy::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let soth_home = temp.path().join(".soth");
+        let bundle_dir = soth_home.join("bundle");
+        std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        std::fs::write(bundle_dir.join("manifest.json"), "{}").expect("write bundle marker");
         let old_home = env::var_os("HOME");
         let old_soth_home = env::var_os("SOTH_HOME_DIR");
         unsafe {
@@ -736,8 +1083,23 @@ mod tests {
         std::fs::create_dir_all(&cert_dir).expect("cert dir");
         let cert_path = cert_dir.join("soth-mitm-ca.pem");
         let key_path = cert_dir.join("soth-mitm-ca-key.pem");
-        std::fs::write(&cert_path, "test-cert").expect("write cert");
-        std::fs::write(&key_path, "test-key").expect("write key");
+
+        // Generate a real self-signed CA cert so fingerprint checks work.
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "-nodes", "-days", "1",
+                "-subj", "/CN=soth-test-ca",
+                "-keyout",
+            ])
+            .arg(&key_path)
+            .arg("-out")
+            .arg(&cert_path)
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("openssl must be available");
+        assert!(status.success(), "openssl cert generation failed");
 
         let mut cfg = crate::cli_config::SothConfig::default();
         cfg.forward_proxy.ca.cert_path = cert_path.display().to_string();
@@ -907,6 +1269,36 @@ mod tests {
 
             let calls = proxy_test_hooks::calls();
             assert_eq!(calls, vec![ProxyCall::Stop, ProxyCall::Off]);
+        });
+    }
+
+    #[test]
+    fn start_fails_fast_when_bundle_missing_and_cloud_not_configured() {
+        with_temp_home(|temp| {
+            let _hooks = install_hooks(ProxyBehavior::default());
+            let soth_home = temp.path().join(".soth");
+            std::fs::remove_file(soth_home.join("bundle").join("manifest.json"))
+                .expect("remove test bundle marker");
+            let config_path = write_config_with_ca(temp);
+
+            let rt = build_runtime();
+            let error = rt
+                .block_on(run_start_command(
+                    StartArgs {
+                        port: Some(18084),
+                        config: Some(config_path),
+                        quiet: true,
+                        foreground: false,
+                        daemon_child: false,
+                        no_autostart: true,
+                        allow_daemon_child_fallback: false,
+                    },
+                    None,
+                ))
+                .expect_err("missing bundle should fail before proxy start");
+
+            assert!(format!("{error:#}").contains("bootstrap cannot fetch bundle"));
+            assert!(proxy_test_hooks::calls().is_empty());
         });
     }
 }

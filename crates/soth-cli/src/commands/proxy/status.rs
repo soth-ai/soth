@@ -9,12 +9,17 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+const BUNDLE_RUNTIME_STATE_FILE: &str = "proxy.bundle_runtime.json";
 
 #[derive(Debug, Serialize)]
 struct ProxyStatusJson {
     running: bool,
     pid: Option<u32>,
     port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_runtime_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_runtime_warning: Option<String>,
     #[serde(skip_serializing)]
     uptime_secs: Option<u64>,
     #[serde(skip_serializing)]
@@ -63,6 +68,16 @@ struct StatusJson {
     healthy: bool,
 }
 
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(default)]
+struct RuntimeBundleStateJson {
+    startup_bundle_source: String,
+    startup_error: Option<String>,
+    last_reload_error: Option<String>,
+    #[allow(dead_code)]
+    active_bundle_version: Option<String>,
+}
+
 pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<bool> {
     let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
     let db_path = cli_config::resolved_db_path(&config);
@@ -73,9 +88,11 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<bool> {
     let bundle = collect_bundle_status(&conn)?;
     let sync = collect_sync_status(&config, &conn, now)?;
     let last_24h = collect_last_24h(&conn, now)?;
+    let runtime_degraded = proxy_runtime_degraded(&proxy);
 
     let healthy = proxy.running
         && proxy.ca_valid_until.is_some()
+        && !runtime_degraded
         && (!config.cloud.enabled || sync.failed == 0);
 
     let payload = StatusJson {
@@ -142,6 +159,12 @@ fn render_human(status: &StatusJson) {
             .map(|value| format!("valid until {value}"))
             .unwrap_or_else(|| "missing/invalid".to_string())
     );
+    if let Some(source) = status.proxy.bundle_runtime_source.as_deref() {
+        println!("Bundle mode:   {}", runtime_source_label(source));
+    }
+    if let Some(message) = status.proxy.bundle_runtime_warning.as_deref() {
+        println!("Bundle alert:  {}", summarize_status_line(message, 160));
+    }
     println!();
     println!("BUNDLE");
     println!("----------------------------------------");
@@ -203,15 +226,13 @@ fn collect_proxy_status(
     config: &cli_config::SothConfig,
     now: DateTime<Utc>,
 ) -> Result<ProxyStatusJson> {
-    let pid = read_pid_file();
+    let pid = read_pid_file().filter(|value| process_running(*value));
     let pid_meta = read_pid_meta();
     let active_port = pid_meta
         .as_ref()
         .and_then(|meta| meta.port)
         .unwrap_or(config.forward_proxy.port);
-    let running = pid
-        .map(process_running)
-        .unwrap_or_else(|| is_port_open(active_port));
+    let running = pid.is_some() || is_port_open(active_port);
     let uptime_secs = pid_meta
         .as_ref()
         .filter(|meta| meta.started_at_unix_secs > 0)
@@ -224,11 +245,18 @@ fn collect_proxy_status(
     let autostart = super::autostart::managed_status().unwrap_or_else(|_| "unknown".to_string());
     let cert_path = cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()));
     let ca_valid_until = parse_cert_not_after(cert_path.as_path()).ok();
+    let runtime_state = read_runtime_bundle_state();
+    let bundle_runtime_source = runtime_state
+        .as_ref()
+        .and_then(|state| normalize_runtime_source(state.startup_bundle_source.as_str()));
+    let bundle_runtime_warning = runtime_state.as_ref().and_then(extract_runtime_warning);
 
     Ok(ProxyStatusJson {
         running,
         pid,
         port: active_port,
+        bundle_runtime_source,
+        bundle_runtime_warning,
         uptime_secs,
         system_proxy_on,
         autostart,
@@ -461,6 +489,57 @@ fn read_pid_meta() -> Option<DaemonPidMetadata> {
     let path = run_dir().join("proxy.pid.meta.json");
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<DaemonPidMetadata>(&content).ok()
+}
+
+fn read_runtime_bundle_state() -> Option<RuntimeBundleStateJson> {
+    let path = run_dir().join(BUNDLE_RUNTIME_STATE_FILE);
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RuntimeBundleStateJson>(&content).ok()
+}
+
+fn extract_runtime_warning(state: &RuntimeBundleStateJson) -> Option<String> {
+    state
+        .last_reload_error
+        .clone()
+        .or_else(|| state.startup_error.clone())
+}
+
+fn normalize_runtime_source(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "primary" | "fallback_last_known_good" | "startup_failed" => Some(normalized),
+        _ => None,
+    }
+}
+
+fn runtime_source_label(source: &str) -> &str {
+    match source {
+        "primary" => "primary",
+        "fallback_last_known_good" => "fallback (last-known-good)",
+        "startup_failed" => "startup failed",
+        _ => "unknown",
+    }
+}
+
+fn summarize_status_line(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() <= max_chars {
+        return compact;
+    }
+    let keep = max_chars.saturating_sub(3);
+    if keep == 0 {
+        return "...".to_string();
+    }
+    format!("{}...", compact.chars().take(keep).collect::<String>())
+}
+
+fn proxy_runtime_degraded(proxy: &ProxyStatusJson) -> bool {
+    let source_degraded = proxy
+        .bundle_runtime_source
+        .as_deref()
+        .map(|value| value != "primary")
+        .unwrap_or(false);
+    source_degraded || proxy.bundle_runtime_warning.is_some()
 }
 
 fn run_dir() -> PathBuf {
@@ -730,6 +809,59 @@ mod tests {
                 system_proxy_state_path(),
                 soth_home.join("run").join("system_proxy_state.json")
             );
+        });
+    }
+
+    #[test]
+    fn collect_proxy_status_uses_listener_when_pid_file_is_stale() {
+        with_temp_soth_home(|soth_home| {
+            let run = soth_home.join("run");
+            std::fs::create_dir_all(&run).expect("create run dir");
+            std::fs::write(run.join("proxy.pid"), "999999\n").expect("write stale pid");
+
+            let listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral listener");
+            let port = listener.local_addr().expect("listener addr").port();
+
+            let mut config = cli_config::SothConfig::default();
+            config.forward_proxy.port = port;
+            config.forward_proxy.ca.cert_path = "/non/existent/cert.pem".to_string();
+            let status = collect_proxy_status(&config, Utc::now()).expect("collect status");
+            assert!(
+                status.running,
+                "status should treat open listener as running"
+            );
+        });
+    }
+
+    #[test]
+    fn collect_proxy_status_reports_bundle_runtime_degraded_state() {
+        with_temp_soth_home(|soth_home| {
+            let run = soth_home.join("run");
+            std::fs::create_dir_all(&run).expect("create run dir");
+            std::fs::write(
+                run.join(BUNDLE_RUNTIME_STATE_FILE),
+                r#"{
+                    "startup_bundle_source":"fallback_last_known_good",
+                    "startup_error":"primary bundle load failed",
+                    "updated_at_epoch_ms":1
+                }"#,
+            )
+            .expect("write runtime state");
+
+            let mut config = cli_config::SothConfig::default();
+            config.forward_proxy.ca.cert_path = "/non/existent/cert.pem".to_string();
+            let status = collect_proxy_status(&config, Utc::now()).expect("collect status");
+            assert_eq!(
+                status.bundle_runtime_source.as_deref(),
+                Some("fallback_last_known_good")
+            );
+            assert!(status
+                .bundle_runtime_warning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("primary bundle load failed"));
+            assert!(proxy_runtime_degraded(&status));
         });
     }
 }

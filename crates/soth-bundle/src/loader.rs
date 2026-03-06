@@ -15,7 +15,7 @@ use crate::error::BundleError;
 use crate::manifest::{BundleManifest, OrgSignedConfig};
 use crate::scope_check;
 use crate::verify;
-use crate::{LoadedBundle, VerificationOptions};
+use crate::{BundleMeta, LoadedBundle, VerificationOptions};
 
 pub fn load_from_dir(
     bundle_dir: &Path,
@@ -89,12 +89,8 @@ pub(crate) fn load_verified(
     org_config: &OrgSignedConfig,
     verification: VerificationOptions,
 ) -> Result<LoadedBundle, BundleError> {
-    verify::verify_bundle_with_options(
-        &manifest,
-        &assets,
-        Some(vendor_pubkey),
-        verification.verify_vendor_signature,
-    )?;
+    let trust_level =
+        verify::verify_bundle_with_options(&manifest, &assets, Some(vendor_pubkey), verification)?;
     scope_check::check_scope(&manifest.scope, org_config)?;
 
     let policy = load_policy_bundle(&assets)?;
@@ -103,10 +99,42 @@ pub(crate) fn load_verified(
     let manifest_bytes = serde_json::to_vec(&manifest)?;
     let classify = soth_classify::load_bundle_from_bytes(manifest_bytes.as_slice(), assets)
         .map_err(|error| BundleError::ClassifyLoadFailed(error.to_string()))?;
+    let issued_at = manifest
+        .issued_at
+        .or_else(|| u64::try_from(manifest.created_at).ok())
+        .unwrap_or_else(|| Utc::now().timestamp().max(0) as u64);
+    let meta = BundleMeta {
+        bundle_id: manifest
+            .bundle_id
+            .clone()
+            .unwrap_or_else(|| manifest.version.clone()),
+        model_version: manifest
+            .model_version
+            .clone()
+            .unwrap_or_else(|| classify.bundle_version.clone()),
+        policy_version: manifest
+            .policy_version
+            .clone()
+            .unwrap_or_else(|| policy.metadata.bundle_version.clone()),
+        org_id: manifest
+            .org_id
+            .clone()
+            .unwrap_or_else(|| policy.metadata.org_id.clone()),
+        issued_at,
+        expires_at: manifest.expires_at,
+        vendor_sig: if manifest.vendor_sig.trim().is_empty() {
+            None
+        } else {
+            Some(manifest.vendor_sig.clone())
+        },
+        org_approval_sig: manifest.org_approval_sig.clone(),
+    };
 
     Ok(LoadedBundle {
         version: manifest.version.clone(),
         installed_at: Utc::now().timestamp(),
+        meta,
+        trust_level,
         classify,
         policy,
         detect,
@@ -216,8 +244,14 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
                     pattern,
                     methods: Vec::new(),
                     paths: PathRules::default(),
+                    priority: None,
                 })
                 .collect(),
+            api_format: None,
+            entity_type: None,
+            pricing: None,
+            capture: None,
+            detection: None,
         })
         .collect::<Vec<_>>();
 
@@ -234,8 +268,19 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
         let entry = IdentityEntry {
             entity_id: policy.app_id.clone(),
             app_type,
-            capture_mode: soth_core::CaptureMode::MetadataOnly,
-            action: ProcessAction::Intercept,
+            capture_mode: policy
+                .capture_mode
+                .as_deref()
+                .and_then(parse_capture_mode)
+                .unwrap_or(soth_core::CaptureMode::MetadataOnly),
+            action: policy
+                .action
+                .as_deref()
+                .and_then(parse_process_action)
+                .unwrap_or(ProcessAction::Intercept),
+            enabled: policy.enabled,
+            host_filter: policy.host_filter.clone(),
+            host_list_ref: policy.host_list_ref.clone(),
         };
         if app_type == AppType::Host {
             hosts_index.insert(identity.to_ascii_lowercase(), entry.clone());
@@ -251,6 +296,9 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
                 app_type: AppType::Host,
                 capture_mode: soth_core::CaptureMode::MetadataOnly,
                 action: ProcessAction::Intercept,
+                enabled: None,
+                host_filter: None,
+                host_list_ref: None,
             });
     }
 
@@ -292,6 +340,10 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
                 unknown_app_action: UnknownAppAction::Skip,
                 non_cataloged_host_action: NonCatalogedAction::Skip,
                 discovery: soth_core::DiscoveryConfig::default(),
+                source_unknown_app_action: None,
+                source_whitelisted_unknown_app_action: None,
+                source_non_whitelisted_host_action: None,
+                source_browser_default_action: None,
             },
             stage0_tls: Stage0Config {
                 tls_intercept_hosts,
@@ -328,6 +380,25 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
     };
     bundle.normalize_host_patterns_in_place();
     bundle
+}
+
+fn parse_capture_mode(raw: &str) -> Option<soth_core::CaptureMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" => Some(soth_core::CaptureMode::Full),
+        "sensitive_artifacts" => Some(soth_core::CaptureMode::SensitiveArtifacts),
+        "full_content" => Some(soth_core::CaptureMode::FullContent),
+        "metadata_only" => Some(soth_core::CaptureMode::MetadataOnly),
+        _ => None,
+    }
+}
+
+fn parse_process_action(raw: &str) -> Option<ProcessAction> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "intercept" => Some(ProcessAction::Intercept),
+        "skip" | "passthrough" => Some(ProcessAction::Skip),
+        "block" => Some(ProcessAction::Block),
+        _ => None,
+    }
 }
 
 fn empty_policy_bundle() -> PolicyBundle {
@@ -411,6 +482,12 @@ mod tests {
         let mut manifest = BundleManifest {
             version: "bundle-v1".to_string(),
             created_at: 1_772_000_100,
+            bundle_id: None,
+            model_version: None,
+            policy_version: None,
+            org_id: None,
+            issued_at: None,
+            expires_at: None,
             vendor_sig: String::new(),
             org_approval_sig: None,
             assets: entries,
@@ -502,5 +579,115 @@ mod tests {
         let passthrough = &bundle.gates.stage0_tls.passthrough_domains;
         assert!(passthrough.contains("*.manus.computer"));
         assert!(passthrough.contains("api.apple-cloudkit.com"));
+    }
+
+    #[test]
+    fn detect_fallback_uses_app_policy_action_and_capture_fields() {
+        let mut detect = soth_detect::OwnedDetectBundle::default();
+        detect.app_policies.insert(
+            "cursor".to_string(),
+            soth_detect::AppPolicy {
+                app_id: "cursor".to_string(),
+                display_name: Some("Cursor".to_string()),
+                app_kind: soth_core::AppKind::Ide,
+                action: Some("block".to_string()),
+                capture_mode: Some("full".to_string()),
+                enabled: Some(true),
+                host_filter: Some("api.openai.com".to_string()),
+                host_list_ref: Some("ai_catalog".to_string()),
+            },
+        );
+
+        let bundle = gating_from_detect(&detect);
+        let entry = bundle
+            .identity_index
+            .non_hosts
+            .get("cursor")
+            .expect("cursor identity should exist");
+
+        assert_eq!(entry.action, ProcessAction::Block);
+        assert_eq!(entry.capture_mode, soth_core::CaptureMode::Full);
+        assert_eq!(entry.enabled, Some(true));
+        assert_eq!(entry.host_filter.as_deref(), Some("api.openai.com"));
+        assert_eq!(entry.host_list_ref.as_deref(), Some("ai_catalog"));
+    }
+
+    #[test]
+    fn load_from_bytes_normalizes_identity_index_keys_in_gating_bundle() {
+        let vendor = SigningKey::from_bytes(&[33u8; 32]);
+        let mut gating = GatingBundle::default();
+        gating.identity_index.hosts.insert(
+            "com.google.Chrome".to_string(),
+            IdentityEntry {
+                entity_id: "chrome".to_string(),
+                app_type: AppType::Host,
+                capture_mode: soth_core::CaptureMode::MetadataOnly,
+                action: ProcessAction::Intercept,
+                enabled: None,
+                host_filter: None,
+                host_list_ref: None,
+            },
+        );
+        gating.identity_index.non_hosts.insert(
+            " Cursor ".to_string(),
+            IdentityEntry {
+                entity_id: "cursor".to_string(),
+                app_type: AppType::NonHost,
+                capture_mode: soth_core::CaptureMode::MetadataOnly,
+                action: ProcessAction::Intercept,
+                enabled: None,
+                host_filter: None,
+                host_list_ref: None,
+            },
+        );
+        let gating_bytes = serde_json::to_vec(&gating).expect("gating json");
+
+        let assets = HashMap::from([
+            (
+                "policy/policy_bundle.json".to_string(),
+                signed_policy_bundle_bytes(),
+            ),
+            ("gating/bundle.json".to_string(), gating_bytes),
+            (
+                "classify/embedding.onnx".to_string(),
+                b"stub-model".to_vec(),
+            ),
+        ]);
+        let manifest_bytes = signed_manifest_bytes(&assets, BundleScope::default(), &vendor);
+        let org = OrgSignedConfig {
+            allows_https_intercept: false,
+            allows_http_intercept: false,
+            process_filter: None,
+            allowed_capture_modes: Vec::new(),
+        };
+
+        let loaded = load_from_bytes(
+            manifest_bytes.as_slice(),
+            assets,
+            &vendor.verifying_key().to_bytes(),
+            &org,
+        )
+        .expect("bundle should load");
+
+        assert!(loaded
+            .gating
+            .identity_index
+            .hosts
+            .contains_key("com.google.chrome"));
+        assert!(!loaded
+            .gating
+            .identity_index
+            .hosts
+            .contains_key("com.google.Chrome"));
+        assert!(loaded
+            .gating
+            .identity_index
+            .non_hosts
+            .contains_key("cursor"));
+        assert!(!loaded
+            .gating
+            .identity_index
+            .non_hosts
+            .contains_key(" Cursor "));
     }
 }

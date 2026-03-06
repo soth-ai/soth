@@ -42,7 +42,7 @@ fn realworld_provider_matrix_bundle_corpus() {
 
     for case in cases {
         let request = build_request(&case.host, &case.path, &case.body);
-        let out = process_with_registry(&registry, &request, &bundle.as_slice());
+        let out = process_with_registry(&registry, &request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_parse_source_matches(&case, &out.parse_source);
         assert!(
             !out.normalized.canonical_cache_key.is_empty(),
@@ -76,7 +76,7 @@ fn realworld_gating_allow_path_bundle_corpus() {
 
     for case in cases {
         let request = build_request(&case.host, &case.path, &case.body);
-        let out = process_with_registry(&registry, &request, &bundle.as_slice());
+        let out = process_with_registry(&registry, &request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_parse_source_matches(&case, &out.parse_source);
     }
 }

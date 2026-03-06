@@ -33,6 +33,9 @@ pub use engine::{
     process, process_with_intelligence, process_with_registry,
     process_with_registry_and_intelligence,
 };
+// Re-export soth_core::SessionSnapshot so callers can reference it without
+// directly depending on soth_core for this type.
+pub use soth_core::SessionSnapshot;
 
 pub type StreamDetectState = StreamSession;
 pub type PartialDetectResult = ChunkArtifact;
@@ -64,17 +67,22 @@ pub fn build_registry(bundle: &DetectBundleSlice<'_>) -> Result<ParserRegistry, 
 }
 
 #[cfg(not(test))]
-pub fn process(req: &RawRequest, bundle: &DetectBundleSlice<'_>) -> soth_core::DetectResult {
-    to_core_detect_result(&engine::process(req, bundle))
+pub fn process(
+    req: &RawRequest,
+    bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
+) -> soth_core::DetectResult {
+    to_core_detect_result(&engine::process(req, bundle, snapshot))
 }
 
 #[cfg(not(test))]
 pub fn process_with_intelligence(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
     sink: &dyn IntelligenceSink,
 ) -> soth_core::DetectResult {
-    to_core_detect_result(&engine::process_with_intelligence(req, bundle, sink))
+    to_core_detect_result(&engine::process_with_intelligence(req, bundle, snapshot, sink))
 }
 
 #[cfg(not(test))]
@@ -82,8 +90,9 @@ pub fn process_with_registry(
     registry: &ParserRegistry,
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
 ) -> soth_core::DetectResult {
-    to_core_detect_result(&engine::process_with_registry(registry, req, bundle))
+    to_core_detect_result(&engine::process_with_registry(registry, req, bundle, snapshot))
 }
 
 #[cfg(not(test))]
@@ -91,10 +100,11 @@ pub fn process_with_registry_and_intelligence(
     registry: &ParserRegistry,
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
     sink: &dyn IntelligenceSink,
 ) -> soth_core::DetectResult {
     to_core_detect_result(&engine::process_with_registry_and_intelligence(
-        registry, req, bundle, sink,
+        registry, req, bundle, snapshot, sink,
     ))
 }
 
@@ -131,7 +141,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert!(matches!(out.parse_source, ParseSource::Filtered));
         assert!(!out.normalized.is_ai_call);
     }
@@ -157,8 +167,8 @@ mod tests {
         let mut request_uds = request_tcp.clone();
         request_uds.connection_meta.socket_family = SocketFamily::UnixDomain { path: None };
 
-        let left = process(&request_tcp, &bundle.as_slice());
-        let right = process(&request_uds, &bundle.as_slice());
+        let left = process(&request_tcp, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let right = process(&request_uds, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
 
         assert_eq!(
             left.normalized.canonical_hash,
@@ -184,7 +194,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert!(out.artifacts.is_empty());
     }
 
@@ -207,7 +217,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert!(!out.artifacts.is_empty());
     }
 
@@ -312,7 +322,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Full);
         assert!(matches!(
             out.parse_source,
@@ -350,7 +360,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert!(matches!(out.parse_source, ParseSource::GraphQL { .. }));
         assert_eq!(out.confidence, ParseConfidence::Full);
     }
@@ -398,8 +408,8 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let first = process_with_registry(&registry, &full, &bundle.as_slice());
-        let second = process_with_registry(&registry, &hash_only, &bundle.as_slice());
+        let first = process_with_registry(&registry, &full, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let second = process_with_registry(&registry, &hash_only, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(first.confidence, ParseConfidence::Full);
         assert_eq!(second.confidence, ParseConfidence::Full);
         assert_eq!(
@@ -437,7 +447,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Full);
         assert!(matches!(out.parse_source, ParseSource::Grpc { .. }));
         assert_eq!(
@@ -477,7 +487,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Heuristic);
         if let FormatMeta::Grpc {
             service, method, ..
@@ -534,8 +544,13 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let _ =
-            process_with_registry_and_intelligence(&registry, &request, &bundle.as_slice(), &store);
+        let _ = process_with_registry_and_intelligence(
+            &registry,
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+            &store,
+        );
 
         let coverage = match store.parse_coverage_since(0) {
             Ok(coverage) => coverage,
@@ -579,6 +594,7 @@ mod tests {
             &registry,
             &unknown_request,
             &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
             &store,
         );
         assert_eq!(first.confidence, ParseConfidence::Heuristic);
@@ -632,7 +648,7 @@ mod tests {
         };
         request.connection_meta.capture_mode = Some(CaptureMode::Full);
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.capture_mode, CaptureMode::Full);
         assert!(out
             .artifacts
@@ -660,7 +676,7 @@ mod tests {
         };
         request.connection_meta.capture_mode = Some(CaptureMode::MetadataOnly);
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.capture_mode, CaptureMode::MetadataOnly);
         assert!(out.artifacts.is_empty());
     }
@@ -681,7 +697,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Heuristic);
         assert!(matches!(out.parse_source, ParseSource::Heuristic));
         assert!(out.warnings.iter().any(|w| w.code == "parser_error"));
@@ -710,12 +726,12 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let without_hint = process(&base, &bundle.as_slice());
+        let without_hint = process(&base, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert!(matches!(without_hint.parse_source, ParseSource::Heuristic));
 
         let mut with_hint_req = base.clone();
         with_hint_req.connection_meta.matched_provider = Some("openai".to_string());
-        let with_hint = process(&with_hint_req, &bundle.as_slice());
+        let with_hint = process(&with_hint_req, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert!(matches!(with_hint.parse_source, ParseSource::OpenAI));
         assert_eq!(with_hint.confidence, ParseConfidence::Full);
         assert_eq!(with_hint.normalized.model.as_deref(), Some("gpt-4o-mini"));
@@ -757,7 +773,7 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice());
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Full);
         if let FormatMeta::JsonRpc { method, is_batch } = &out.normalized.format_meta {
             assert_eq!(method.as_deref(), Some("chat.completions"));
@@ -765,6 +781,26 @@ mod tests {
         } else {
             panic!("expected jsonrpc format meta");
         }
+    }
+
+    #[test]
+    fn empty_snapshot_never_reports_prefix_repeat() {
+        let bundle = bundle_fixture();
+        let mut headers = BTreeMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let request = RawRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            headers,
+            body: Bytes::from_static(
+                br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello world"}]}"#,
+            ),
+            connection_meta: connection_meta_tcp(),
+        };
+        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        assert!(!out.is_prefix_repeat);
+        assert!(!out.is_repeated_code_context);
+        assert_eq!(out.repeated_token_count, 0);
     }
 
     fn bundle_fixture() -> OwnedDetectBundle {
@@ -811,6 +847,7 @@ mod tests {
                 provider_id: Some("openai".to_string()),
                 name: Some("OpenAI".to_string()),
                 api_format: Some("openai".to_string()),
+                ..ProviderEntry::default()
             },
         );
         providers.insert(
@@ -819,6 +856,7 @@ mod tests {
                 provider_id: Some("anthropic".to_string()),
                 name: Some("Anthropic".to_string()),
                 api_format: Some("anthropic".to_string()),
+                ..ProviderEntry::default()
             },
         );
         providers.insert(
@@ -827,6 +865,7 @@ mod tests {
                 provider_id: Some("google_vertex".to_string()),
                 name: Some("Google Vertex".to_string()),
                 api_format: Some("grpc".to_string()),
+                ..ProviderEntry::default()
             },
         );
 

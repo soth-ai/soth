@@ -1,4 +1,5 @@
 use crate::artifacts::CaptureMode;
+use crate::telemetry::RequestMethod;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +16,8 @@ pub struct ProxyContext {
     pub traffic_classification: TrafficClassification,
     pub classification_source: ClassificationSource,
     pub session_snapshot: Option<SessionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_method: Option<RequestMethod>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +84,15 @@ pub struct SessionSnapshot {
     pub last_model: Option<String>,
     pub current_request_timestamp: i64,
     pub last_request_timestamp: Option<i64>,
+
+    // Dedup-aware fields (Phase 1). All default to empty/zero so existing
+    // consumers that construct `SessionSnapshot::default()` are unaffected.
+    #[serde(default)]
+    pub seen_prefix_hashes: Vec<String>,
+    #[serde(default)]
+    pub seen_code_hashes: Vec<String>,
+    #[serde(default)]
+    pub session_key_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

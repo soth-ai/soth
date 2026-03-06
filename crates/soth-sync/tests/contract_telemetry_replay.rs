@@ -40,7 +40,7 @@ async fn start_telemetry_server(state: TelemetryServerState) -> Option<String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let addr = listener.local_addr().ok()?;
     let app = Router::new()
-        .route("/api/v1/telemetry/batch", post(telemetry_batch_handler))
+        .route("/v1/edge/telemetry/batch", post(telemetry_batch_handler))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -79,7 +79,25 @@ fn sample_event(event_id: Uuid) -> TelemetryEvent {
         anomaly_flags: Vec::new(),
         anomaly_score: Some(0.1),
         policy_kind: Some(TelemetryPolicyKind::Allow),
+        bundle_trust_level: Some(soth_core::BundleTrustLevel::Verified),
         sensitive_code_flags: SensitiveCodeFlags::default(),
+        session_key_hash: String::new(),
+        is_prefix_repeat: false,
+        is_code_context_repeat: false,
+        novel_token_count: 0,
+        repeated_token_count: 0,
+        first_step_event_id: None,
+        original_event_id: None,
+        prefix_hash: None,
+        agent_step_number: None,
+        is_historical: false,
+        data_source: soth_core::DataSource::LiveProxy,
+        original_timestamp: None,
+        topic_cluster_id: 0,
+        semantic_hash: String::new(),
+        is_semantic_collision: false,
+        endpoint_hash: String::new(),
+        policy_rule_id: None,
     }
 }
 
@@ -181,8 +199,14 @@ async fn telemetry_replay_contract_transitions_to_sent() {
     seed_transmitted_rows(&db_path, &batch);
     outbox.enqueue(batch).expect("enqueue batch");
 
-    let sender =
-        TelemetrySender::new(endpoint, "test-key", "/api/v1/telemetry/batch").expect("sender");
+    let sender = TelemetrySender::new(
+        endpoint,
+        "test-key",
+        "/v1/edge/telemetry/batch",
+        "device-hash-test",
+        None,
+    )
+    .expect("sender");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let worker = TelemetryReplayWorker::new(
         outbox,
@@ -228,11 +252,17 @@ async fn telemetry_replay_contract_transitions_to_dead_after_retry_cap() {
     seed_transmitted_rows(&db_path, &batch);
     outbox.enqueue(batch).expect("enqueue batch");
 
-    let sender =
-        TelemetrySender::new(endpoint, "test-key", "/api/v1/telemetry/batch").expect("sender");
+    let sender = TelemetrySender::new(
+        endpoint,
+        "test-key",
+        "/v1/edge/telemetry/batch",
+        "device-hash-test",
+        None,
+    )
+    .expect("sender");
     let cfg = TelemetrySyncConfig {
         enabled: true,
-        endpoint_path: "/api/v1/telemetry/batch".to_string(),
+        endpoint_path: "/v1/edge/telemetry/batch".to_string(),
         max_retry_attempts: 1,
         backoff_base_ms: 10,
         backoff_max_ms: 10,

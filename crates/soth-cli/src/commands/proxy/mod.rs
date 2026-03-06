@@ -1,10 +1,12 @@
 //! Runtime command handlers used by the CLI command graph.
 
 mod autostart;
+pub(crate) mod ca_health;
 mod daemon;
 mod doctor;
 mod env;
 mod setup_ca;
+pub(crate) mod shell_env;
 mod start;
 mod status;
 mod system;
@@ -77,9 +79,18 @@ pub async fn run_env(
     shell: &str,
     ca_only: bool,
     unset: bool,
+    hook: bool,
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    env::run(shell, ca_only, unset, config).await
+    env::run(shell, ca_only, unset, hook, config).await
+}
+
+pub(crate) fn emit_shell_env_activate(config_path: Option<&PathBuf>) -> anyhow::Result<()> {
+    shell_env::emit_activate_patch(config_path)
+}
+
+pub(crate) fn emit_shell_env_deactivate() -> anyhow::Result<()> {
+    shell_env::emit_deactivate_patch()
 }
 
 pub async fn run_status(config: Option<PathBuf>, json: bool) -> anyhow::Result<bool> {

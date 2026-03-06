@@ -1,9 +1,7 @@
 use crate::api_types::{
-    BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
-    ExchangeMetadata, HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest,
-    HeartbeatTelemetry,
+    EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest, ExchangeMetadata,
+    HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest, HeartbeatTelemetry,
 };
-use crate::body_uploader::BodyUploader;
 use crate::cache;
 use crate::config::TelemetrySyncConfig;
 use crate::config_puller::ConfigPuller;
@@ -55,7 +53,6 @@ const SYNC_TELEMETRY_EXCHANGE_BATCH_COMPRESSED_BYTES: &str = "sync.exchange.batc
 const SYNC_TELEMETRY_EXCHANGE_BATCH_SPLIT_COUNT: &str = "sync.exchange.batch.split_count";
 const SYNC_TELEMETRY_EXCHANGE_FRONTLOAD_SENT: &str = "sync.exchange.frontload.sent";
 const SYNC_TELEMETRY_EXCHANGE_LIVE_SENT: &str = "sync.exchange.live.sent";
-const SYNC_TELEMETRY_EXCHANGE_LEGACY_UPLOAD_ENABLED: &str = "sync.exchange.legacy_upload_enabled";
 const SYNC_TELEMETRY_REGISTRY_CACHE_PRESENT: &str = "sync.registry.cache_present";
 const SYNC_TELEMETRY_REGISTRY_BUNDLE_AGE_SECS: &str = "sync.registry.bundle_age_seconds";
 const SYNC_TELEMETRY_REGISTRY_DEGRADED_STALE: &str = "sync.registry.degraded_stale";
@@ -106,7 +103,6 @@ pub struct SyncAgent {
     pub config: SyncAgentConfig,
     db: Arc<Mutex<Connection>>,
     pub metadata_pusher: MetadataPusher,
-    pub body_uploader: BodyUploader,
     pub heartbeat_sender: HeartbeatSender,
     pub retry_queue: BodyRetryQueue,
     pub config_puller: Mutex<Option<ConfigPuller>>,
@@ -211,22 +207,9 @@ impl AdaptiveBatchState {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ExchangeBlobQueueItem {
-    side: String,
-    reference: String,
-    content_encoding: String,
-    content_type: Option<String>,
-    sha256: String,
-    bytes_raw: u64,
-    bytes_gzip: u64,
-    payload_gzip_b64: String,
-}
-
 #[derive(Debug, Clone)]
 enum PreparedRowResult {
     Prepared(PreparedExchangeQueueRow),
-    Retry { reason: String },
     Drop { reason: String },
 }
 
@@ -366,7 +349,6 @@ impl SyncAgent {
             &config.api_key,
             config.frontload_exchange_upload_path.clone(),
         );
-        let body_uploader = BodyUploader::new(&config.endpoint, &config.api_key);
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
         let retry_queue =
             BodyRetryQueue::new(&config.retry_queue_dir, config.retry_queue_max_bytes)?;
@@ -406,7 +388,6 @@ impl SyncAgent {
             config,
             db,
             metadata_pusher,
-            body_uploader,
             heartbeat_sender,
             retry_queue,
             config_puller: Mutex::new(config_puller),
@@ -470,9 +451,26 @@ impl SyncAgent {
 
     /// Performs a startup-time hard check against the cloud bundle endpoint.
     ///
-    /// This is used by the proxy to fail fast when `/v1/bundle/current` is
+    /// This is used by the proxy to fail fast when `/v1/edge/bundle/current` is
     /// unavailable, rather than silently running in degraded mode.
     pub async fn verify_bundle_source_ready(&self) -> anyhow::Result<RegistryPullOutcome> {
+        let puller = match self.config_puller.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                warn!("sync agent config_puller lock poisoned; recovering state");
+                poisoned.into_inner().clone()
+            }
+        };
+        if let Some(puller) = puller {
+            if let Some(outcome) = puller
+                .refresh_registry_now()
+                .await
+                .context("startup bundle source readiness check failed")?
+            {
+                return Ok(outcome);
+            }
+        }
+
         let registry_cache_path = self
             .config
             .registry_cache_path
@@ -496,12 +494,7 @@ impl SyncAgent {
                 warn!(error = %error, "Failed to start telemetry sync runtime; continuing");
             }
         }
-        let stats = if self.config.legacy_exchange_upload_enabled {
-            self.sync_exchange_queue_once().await?
-        } else {
-            debug!("Legacy exchange upload disabled; skipping exchange queue sync");
-            ExchangeQueueStats::default()
-        };
+        let stats = self.sync_exchange_queue_once().await?;
         self.sync_exchange_sent_total
             .fetch_add(stats.exchange_sent as u64, Ordering::Relaxed);
         self.sync_exchange_blob_uploaded_total
@@ -715,14 +708,6 @@ impl SyncAgent {
             SYNC_TELEMETRY_EXCHANGE_LIVE_SENT.to_string(),
             self.sync_exchange_live_sent_total.load(Ordering::Relaxed),
         );
-        telemetry.counters.insert(
-            SYNC_TELEMETRY_EXCHANGE_LEGACY_UPLOAD_ENABLED.to_string(),
-            if self.config.legacy_exchange_upload_enabled {
-                1
-            } else {
-                0
-            },
-        );
         if let Some(registry) = registry {
             telemetry
                 .counters
@@ -840,9 +825,6 @@ impl SyncAgent {
                     ExchangeSyncMode::Live => live_rows.push(prepared),
                     ExchangeSyncMode::Frontload => frontload_rows.push(prepared),
                 },
-                Ok(PreparedRowResult::Retry { reason }) => {
-                    self.defer_exchange_row_with_retry(&row, &reason, &mut stats)?;
-                }
                 Ok(PreparedRowResult::Drop { reason }) => {
                     self.drop_exchange_row(&row, &reason, &mut stats)?;
                 }
@@ -914,59 +896,11 @@ impl SyncAgent {
             });
         }
         event.exchange_id = exchange_id.clone();
-
-        let blobs = match row.blobs_json.as_deref() {
-            Some(raw) if !raw.trim().is_empty() => {
-                match serde_json::from_str::<Vec<ExchangeBlobQueueItem>>(raw) {
-                    Ok(items) => items,
-                    Err(error) => {
-                        return Ok(PreparedRowResult::Drop {
-                            reason: format!("invalid_blob_payload:{error}"),
-                        });
-                    }
-                }
-            }
-            _ => Vec::new(),
-        };
-
-        let mut blob_uploaded = 0usize;
-        for blob in blobs {
-            let request = BlobUploadRequest {
-                exchange_id: exchange_id.clone(),
-                side: blob.side.clone(),
-                reference: Some(blob.reference.clone()),
-                content_encoding: Some(blob.content_encoding.clone()),
-                content_type: blob.content_type.clone(),
-                sha256: Some(blob.sha256.clone()),
-                bytes_raw: Some(blob.bytes_raw),
-                bytes_gzip: Some(blob.bytes_gzip),
-                payload_gzip_b64: Some(blob.payload_gzip_b64.clone()),
-            };
-            match self.body_uploader.upload_blob(&request).await? {
-                Some(response) if response.stored => {
-                    blob_uploaded += 1;
-                    let resolved_reference = response
-                        .key
-                        .or(response.blob_key)
-                        .unwrap_or(blob.reference.clone());
-                    match blob.side.to_ascii_lowercase().as_str() {
-                        "request" => event.request.body.reference = Some(resolved_reference),
-                        "response" => event.response.body.reference = Some(resolved_reference),
-                        _ => {}
-                    }
-                }
-                Some(_) => {
-                    return Ok(PreparedRowResult::Retry {
-                        reason: "blob_upload_rejected".to_string(),
-                    });
-                }
-                None => {
-                    return Ok(PreparedRowResult::Retry {
-                        reason: "blob_upload_non_success_status".to_string(),
-                    });
-                }
-            }
-        }
+        let _contains_legacy_blob_payloads = row
+            .blobs_json
+            .as_deref()
+            .map(|raw| !raw.trim().is_empty())
+            .unwrap_or(false);
 
         let global_device_id = normalized_global_device_id(&self.config.global_tags);
         let mut metadata = exchange_event_to_metadata(&event, global_device_id.as_deref());
@@ -976,7 +910,7 @@ impl SyncAgent {
             row,
             metadata,
             mode,
-            blob_uploaded,
+            blob_uploaded: 0,
         }))
     }
 
@@ -2327,7 +2261,16 @@ fn hostname_resolution_command() -> (&'static str, &'static [&'static str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::Router;
+    use ed25519_dalek::{Signer, SigningKey};
     use rusqlite::Connection;
+    use serde::Serialize;
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
     use std::time::Duration;
     use tempfile::{tempdir, TempDir};
 
@@ -2374,6 +2317,196 @@ mod tests {
     fn create_test_agent() -> SyncAgent {
         let (_dir, agent) = create_test_agent_with_tempdir();
         agent
+    }
+
+    #[derive(Clone)]
+    struct StartupBundleServerState {
+        payload: Arc<Vec<u8>>,
+        payload_sha256: String,
+        bundle_version: String,
+    }
+
+    async fn startup_bundle_current_handler(
+        State(state): State<StartupBundleServerState>,
+    ) -> impl IntoResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "etag",
+            HeaderValue::from_str(format!("\"{}\"", state.payload_sha256).as_str())
+                .unwrap_or_else(|_| HeaderValue::from_static("\"invalid\"")),
+        );
+        headers.insert(
+            "x-soth-bundle-version",
+            HeaderValue::from_str(state.bundle_version.as_str())
+                .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+        );
+        headers.insert(
+            "x-soth-bundle-hash",
+            HeaderValue::from_str(state.payload_sha256.as_str())
+                .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+        );
+        (StatusCode::OK, headers, state.payload.as_ref().clone())
+    }
+
+    async fn start_startup_bundle_server(state: StartupBundleServerState) -> Option<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let addr = listener.local_addr().ok()?;
+        let app = Router::new()
+            .route(
+                "/v1/edge/bundle/current",
+                get(startup_bundle_current_handler),
+            )
+            .with_state(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Some(format!("http://{}", addr))
+    }
+
+    #[derive(Serialize)]
+    struct StartupCanonicalManifest<'a> {
+        version: &'a str,
+        created_at: i64,
+        vendor_sig: &'a str,
+        org_approval_sig: Option<&'a str>,
+        assets: Vec<&'a Value>,
+        scope: &'a Value,
+    }
+
+    fn startup_canonical_manifest_bytes(manifest: &Value) -> Vec<u8> {
+        let mut assets: Vec<&Value> = manifest
+            .get("assets")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assets.sort_by(|left, right| {
+            left.get("path")
+                .and_then(Value::as_str)
+                .cmp(&right.get("path").and_then(Value::as_str))
+        });
+        let scope = manifest.get("scope").unwrap_or(&Value::Null);
+        serde_json::to_vec(&StartupCanonicalManifest {
+            version: manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            created_at: manifest
+                .get("created_at")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            vendor_sig: "",
+            org_approval_sig: manifest.get("org_approval_sig").and_then(Value::as_str),
+            assets,
+            scope,
+        })
+        .expect("serialize startup canonical manifest")
+    }
+
+    fn startup_hex_encode(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push_str(format!("{:02x}", byte).as_str());
+        }
+        out
+    }
+
+    fn startup_signed_manifest_value(version: &str, vendor_signing_key: &SigningKey) -> Value {
+        let mut manifest = json!({
+            "version": version,
+            "created_at": 1_772_000_000i64,
+            "vendor_sig": "",
+            "org_approval_sig": null,
+            "assets": [],
+            "scope": {
+                "intercept_https": false,
+                "intercept_http": false,
+                "process_filter": null,
+                "capture_modes": []
+            }
+        });
+        let signature =
+            vendor_signing_key.sign(startup_canonical_manifest_bytes(&manifest).as_slice());
+        manifest["vendor_sig"] = Value::String(startup_hex_encode(signature.to_bytes().as_slice()));
+        manifest
+    }
+
+    #[derive(Default)]
+    struct StartupInstallState {
+        install_calls: usize,
+        installed_version: Option<String>,
+    }
+
+    #[derive(Clone)]
+    struct StartupBundleWatcherAdapter {
+        state: Arc<Mutex<StartupInstallState>>,
+    }
+
+    impl BundleWatcher for StartupBundleWatcherAdapter {
+        fn install_bundle(
+            &self,
+            manifest_bytes: &[u8],
+            _assets: HashMap<String, Vec<u8>>,
+        ) -> anyhow::Result<String> {
+            let manifest: Value = serde_json::from_slice(manifest_bytes)?;
+            let version = manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("manifest.version missing"))?
+                .to_string();
+
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("startup install state poisoned"))?;
+            guard.install_calls = guard.install_calls.saturating_add(1);
+            guard.installed_version = Some(version.clone());
+            Ok(version)
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_bundle_readiness_uses_watcher_install_path() {
+        let vendor = SigningKey::from_bytes(&[71u8; 32]);
+        let manifest = startup_signed_manifest_value("bundle-v2", &vendor);
+        let payload = serde_json::to_vec(&json!({
+            "manifest": manifest,
+            "assets": {}
+        }))
+        .expect("serialize channel2 payload");
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload.as_slice()));
+        let state = StartupBundleServerState {
+            payload: Arc::new(payload),
+            payload_sha256: payload_sha256.clone(),
+            bundle_version: "bundle-v2".to_string(),
+        };
+        let Some(endpoint) = start_startup_bundle_server(state).await else {
+            eprintln!(
+                "Skipping startup_bundle_readiness_uses_watcher_install_path: cannot bind localhost listener"
+            );
+            return;
+        };
+
+        let (dir, mut agent) = create_test_agent_with_tempdir();
+        agent.config.endpoint = endpoint;
+        agent.config.registry_cache_path = Some(dir.path().join("registry_cache.json"));
+
+        let install_state = Arc::new(Mutex::new(StartupInstallState::default()));
+        let watcher = Arc::new(StartupBundleWatcherAdapter {
+            state: install_state.clone(),
+        });
+        agent.set_bundle_watcher(watcher);
+
+        let outcome = agent
+            .verify_bundle_source_ready()
+            .await
+            .expect("startup bundle source should be reachable");
+        assert!(outcome.checked);
+        assert!(outcome.downloaded);
+        assert_eq!(outcome.version.as_deref(), Some("bundle-v2"));
+
+        let guard = install_state.lock().expect("install state lock");
+        assert_eq!(guard.install_calls, 1);
+        assert_eq!(guard.installed_version.as_deref(), Some("bundle-v2"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ dev-pipeline-trace = ["soth-proxy/dev-pipeline-trace"]
 
 [dependencies]
 soth-core = { workspace = true }
+soth-bundle = { workspace = true }
 soth-proxy = { workspace = true }
 soth-sync = { workspace = true }
 clap = { workspace = true }
@@ -32,7 +33,10 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
 rcgen = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
 toml = "0.8"
+hex = "0.4"
 dirs = "5.0"
 which = "6.0"
 libc = "0.2"

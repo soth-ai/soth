@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::BundleTrustLevel;
+
 #[derive(Debug, Error)]
 pub enum BundleError {
     #[error("invalid vendor public key")]
@@ -24,6 +26,10 @@ pub enum BundleError {
         expected: String,
         actual: String,
     },
+    #[error("bundle expired at {expires_at} (current epoch: {now})")]
+    BundleExpired { expires_at: u64, now: u64 },
+    #[error("bundle verification required but trust level is {trust_level:?}")]
+    VerificationRequired { trust_level: BundleTrustLevel },
     #[error("bundle scope expansion refused: {reason}")]
     ScopeExpansionRefused { reason: String },
     #[error("classify bundle load failed: {0}")]

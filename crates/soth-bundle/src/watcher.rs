@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use arc_swap::ArcSwap;
 use rusqlite::Connection;
 use tokio::sync::watch;
 
@@ -13,12 +15,25 @@ use crate::{LoadedBundle, VerificationOptions};
 
 #[derive(Clone)]
 pub struct BundleHandle {
-    rx: watch::Receiver<Arc<LoadedBundle>>,
+    inner: Arc<ArcSwap<LoadedBundle>>,
+    tx: watch::Sender<u64>,
+    rx: watch::Receiver<u64>,
+    generation: Arc<AtomicU64>,
 }
 
 impl BundleHandle {
+    pub fn load(&self) -> Arc<LoadedBundle> {
+        self.inner.load_full()
+    }
+
     pub fn current(&self) -> Arc<LoadedBundle> {
-        self.rx.borrow().clone()
+        self.load()
+    }
+
+    pub fn swap(&self, new: LoadedBundle) {
+        self.inner.store(Arc::new(new));
+        let next = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.tx.send(next);
     }
 
     pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
@@ -27,7 +42,9 @@ impl BundleHandle {
 }
 
 pub struct BundleWatcher {
-    tx: watch::Sender<Arc<LoadedBundle>>,
+    inner: Arc<ArcSwap<LoadedBundle>>,
+    tx: watch::Sender<u64>,
+    generation: Arc<AtomicU64>,
     vendor_pubkey: [u8; 32],
     org_config: Arc<OrgSignedConfig>,
     db: Arc<Mutex<Connection>>,
@@ -42,15 +59,25 @@ impl BundleWatcher {
         db: Arc<Mutex<Connection>>,
         verification: VerificationOptions,
     ) -> Result<(Self, BundleHandle), BundleError> {
-        let (tx, rx) = watch::channel(Arc::new(initial));
+        let inner = Arc::new(ArcSwap::from_pointee(initial));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = watch::channel(0u64);
+
         let watcher = Self {
-            tx,
+            inner: inner.clone(),
+            tx: tx.clone(),
+            generation: generation.clone(),
             vendor_pubkey,
             org_config,
             db,
             verification,
         };
-        let handle = BundleHandle { rx };
+        let handle = BundleHandle {
+            inner,
+            tx,
+            rx,
+            generation,
+        };
         Ok((watcher, handle))
     }
 
@@ -75,8 +102,10 @@ impl BundleWatcher {
         db::record_policy_config(&conn, &new_bundle)?;
         drop(conn);
 
+        self.inner.store(Arc::new(new_bundle));
+        let next = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.tx
-            .send(Arc::new(new_bundle))
+            .send(next)
             .map_err(|_| BundleError::WatcherChannelClosed)?;
 
         Ok(version)
@@ -148,6 +177,12 @@ mod tests {
         let mut manifest = BundleManifest {
             version: version.to_string(),
             created_at: 1_772_000_100,
+            bundle_id: None,
+            model_version: None,
+            policy_version: None,
+            org_id: None,
+            issued_at: None,
+            expires_at: None,
             vendor_sig: String::new(),
             org_approval_sig: None,
             assets: entries,

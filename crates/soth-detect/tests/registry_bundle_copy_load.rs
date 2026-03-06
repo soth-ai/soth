@@ -53,7 +53,7 @@ fn converted_registry_bundle_copy_loads_and_processes_request() {
         ),
     };
 
-    let out = process_with_registry(&registry, &request, &bundle.as_slice());
+    let out = process_with_registry(&registry, &request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
     assert!(matches!(
         out.parse_source,
         ParseSource::Rest {
@@ -96,7 +96,7 @@ fn home_bundle_e2e_contract_cases() {
         ],
         br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"home bundle openai"}]}"#,
     );
-    let out_openai = process_with_registry(&registry, &openai, &bundle.as_slice());
+    let out_openai = process_with_registry(&registry, &openai, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
     assert_eq!(parse_source_name(&out_openai.parse_source), "rest:openai");
     assert_eq!(out_openai.capture_mode, CaptureMode::MetadataOnly);
     assert_eq!(out_openai.normalized.model.as_deref(), Some("gpt-4o-mini"));
@@ -111,7 +111,7 @@ fn home_bundle_e2e_contract_cases() {
         ],
         br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"home bundle anthropic"}]}"#,
     );
-    let out_anthropic = process_with_registry(&registry, &anthropic, &bundle.as_slice());
+    let out_anthropic = process_with_registry(&registry, &anthropic, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
     assert_eq!(
         parse_source_name(&out_anthropic.parse_source),
         "rest:anthropic"
@@ -132,7 +132,7 @@ fn home_bundle_e2e_contract_cases() {
         ],
         br#"{"contents":[{"parts":[{"text":"leak sk-abcdefghijklmnopqrstuvwxyz1234"}]}]}"#,
     );
-    let out_google = process_with_registry(&registry, &google, &bundle.as_slice());
+    let out_google = process_with_registry(&registry, &google, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
     assert_eq!(parse_source_name(&out_google.parse_source), "rest:gemini");
     assert_eq!(out_google.capture_mode, CaptureMode::Full);
     assert!(
@@ -150,7 +150,7 @@ fn home_bundle_e2e_contract_cases() {
         br#"{"model":"openai/gpt-4o-mini","input":[{"role":"user","content":[{"type":"input_text","text":"home bundle openrouter"}]}]}"#,
     );
     let out_openrouter =
-        process_with_registry(&registry, &openrouter_responses, &bundle.as_slice());
+        process_with_registry(&registry, &openrouter_responses, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
     assert_eq!(
         parse_source_name(&out_openrouter.parse_source),
         "rest:openai"
@@ -171,7 +171,7 @@ fn home_bundle_e2e_contract_cases() {
         ],
         br#"{"model":"gpt-4o","messages":[{"role":"user","content":"home bundle chatgpt web"}]}"#,
     );
-    let out_chatgpt_web = process_with_registry(&registry, &chatgpt_web, &bundle.as_slice());
+    let out_chatgpt_web = process_with_registry(&registry, &chatgpt_web, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
     assert_eq!(
         parse_source_name(&out_chatgpt_web.parse_source),
         "rest:openai"
@@ -181,7 +181,7 @@ fn home_bundle_e2e_contract_cases() {
     assert!(matches!(out_chatgpt_web.confidence, ParseConfidence::Full));
 
     let filtered = build_request("GET", "/health", vec![("host", "api.openai.com")], b"");
-    let out_filtered = process_with_registry(&registry, &filtered, &bundle.as_slice());
+    let out_filtered = process_with_registry(&registry, &filtered, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
     assert_eq!(parse_source_name(&out_filtered.parse_source), "filtered");
 }
 

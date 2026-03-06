@@ -110,7 +110,13 @@ fn sample_gating_bundle_bytes(primary_host: &str) -> Vec<u8> {
                     deny_exact: vec!["/v1/models".to_string()],
                     deny_glob: vec!["/v1/internal/**".to_string()],
                 },
+                priority: None,
             }],
+            api_format: None,
+            entity_type: None,
+            pricing: None,
+            capture: None,
+            detection: None,
         });
     serde_json::to_vec(&gating).expect("serialize gating bundle")
 }
@@ -152,6 +158,12 @@ fn signed_manifest_bytes(
     let mut manifest = BundleManifest {
         version: version.to_string(),
         created_at: 1_772_000_001,
+        bundle_id: None,
+        model_version: None,
+        policy_version: None,
+        org_id: None,
+        issued_at: None,
+        expires_at: None,
         vendor_sig: String::new(),
         org_approval_sig: None,
         assets: entries,

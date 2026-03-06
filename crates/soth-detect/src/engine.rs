@@ -12,9 +12,10 @@ use crate::rest::parse_rest;
 use crate::sensitive::credential_scan;
 use crate::types::{
     ArtifactLocation, CaptureMode, DetectBundleSlice, DetectResult, DetectWarning, DetectedFormat,
-    FormatMeta, ParseSource, ParseWarning, Provider, RawRequest,
+    FormatMeta, ParseSource, ParseWarning, Provider, ProviderEntry, RawRequest,
 };
 use lru::LruCache;
+use serde_json::Value as JsonValue;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -43,8 +44,13 @@ impl ParserRegistry {
         }
     }
 
-    pub fn process(&self, req: &RawRequest, bundle: &DetectBundleSlice<'_>) -> DetectResult {
-        process_inner(req, bundle, self)
+    pub fn process(
+        &self,
+        req: &RawRequest,
+        bundle: &DetectBundleSlice<'_>,
+        snapshot: &soth_core::SessionSnapshot,
+    ) -> DetectResult {
+        process_inner(req, bundle, self, snapshot)
     }
 }
 
@@ -68,18 +74,23 @@ impl ApqStore for ParserRegistry {
     }
 }
 
-pub fn process(req: &RawRequest, bundle: &DetectBundleSlice<'_>) -> DetectResult {
+pub fn process(
+    req: &RawRequest,
+    bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
+) -> DetectResult {
     let apq = NoopApqStore;
-    process_inner(req, bundle, &apq)
+    process_inner(req, bundle, &apq, snapshot)
 }
 
 pub fn process_with_intelligence(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
     sink: &dyn IntelligenceSink,
 ) -> DetectResult {
     let apq = NoopApqStore;
-    let result = process_inner(req, bundle, &apq);
+    let result = process_inner(req, bundle, &apq, snapshot);
     emit_intelligence(req, &result, sink);
     result
 }
@@ -88,17 +99,19 @@ pub fn process_with_registry(
     registry: &ParserRegistry,
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
 ) -> DetectResult {
-    registry.process(req, bundle)
+    registry.process(req, bundle, snapshot)
 }
 
 pub fn process_with_registry_and_intelligence(
     registry: &ParserRegistry,
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
     sink: &dyn IntelligenceSink,
 ) -> DetectResult {
-    let result = registry.process(req, bundle);
+    let result = registry.process(req, bundle, snapshot);
     emit_intelligence(req, &result, sink);
     result
 }
@@ -107,6 +120,7 @@ fn process_inner(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
     apq_store: &dyn ApqStore,
+    _snapshot: &soth_core::SessionSnapshot,
 ) -> DetectResult {
     let started = Instant::now();
 
@@ -132,11 +146,26 @@ fn process_inner(
         normalized.canonical_hash = canonical_hash(&normalized);
     }
 
-    let capture_mode = req
-        .connection_meta
-        .capture_mode
-        .clone()
-        .unwrap_or_else(|| bundle.capture_rules.mode_for(&normalized.provider));
+    let provider_entry = provider_entry_for(bundle, &normalized.provider);
+
+    let capture_mode = req.connection_meta.capture_mode.clone().unwrap_or_else(|| {
+        bundle
+            .capture_rules
+            .mode_for_with_entry(&normalized.provider, provider_entry)
+    });
+
+    if normalized.estimated_cost_usd <= 0.0 {
+        if let Some(estimated_cost) = provider_entry.and_then(|entry| {
+            estimate_input_cost_usd(
+                entry,
+                normalized.model.as_deref(),
+                normalized.estimated_input_tokens,
+            )
+        }) {
+            normalized.estimated_cost_usd = estimated_cost;
+        }
+    }
+
     let full_like = matches!(
         capture_mode,
         CaptureMode::Full | CaptureMode::SensitiveArtifacts | CaptureMode::FullContent
@@ -166,6 +195,8 @@ fn process_inner(
             .map(parse_warning_to_detect_warning),
     );
 
+    let novel_token_count = normalized.estimated_input_tokens;
+
     DetectResult {
         normalized,
         artifacts,
@@ -175,6 +206,15 @@ fn process_inner(
         detect_latency_us: started.elapsed().as_micros() as u64,
         warnings,
         raw_body_bytes: Some(req.body.clone()),
+        session_mutations: soth_core::SessionMutations::default(),
+        is_prefix_repeat: false,
+        novel_token_count,
+        repeated_token_count: 0,
+        novel_tail_start_idx: None,
+        prefix_hash: None,
+        is_repeated_code_context: false,
+        ast_normalized_hash: None,
+        first_blob_event_id: None,
     }
 }
 
@@ -200,6 +240,13 @@ fn parse_by_format(
         | DetectedFormat::BedrockRest => {
             let key = rest_key_for_format(&format);
             let descriptor = bundle.rest_formats.get(key);
+            parse_rest(req, &provider_name, format.clone(), descriptor).map(|mut nr| {
+                nr.provider = Provider::new(provider_name.clone());
+                nr
+            })
+        }
+        DetectedFormat::CustomRest(ref key) => {
+            let descriptor = bundle.rest_formats.get(key.as_str());
             parse_rest(req, &provider_name, format.clone(), descriptor).map(|mut nr| {
                 nr.provider = Provider::new(provider_name.clone());
                 nr
@@ -297,6 +344,112 @@ fn canonical_provider_candidate(
     default_provider_for_format(format).to_string()
 }
 
+fn provider_entry_for<'a>(
+    bundle: &'a DetectBundleSlice<'_>,
+    provider: &Provider,
+) -> Option<&'a ProviderEntry> {
+    let canonical = provider.canonical_name();
+    bundle.llm_providers.get(canonical).or_else(|| {
+        bundle.llm_providers.values().find(|entry| {
+            entry
+                .provider_id
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(canonical))
+                .unwrap_or(false)
+                || entry
+                    .name
+                    .as_deref()
+                    .map(|value| value.eq_ignore_ascii_case(canonical))
+                    .unwrap_or(false)
+        })
+    })
+}
+
+fn estimate_input_cost_usd(
+    provider_entry: &ProviderEntry,
+    model: Option<&str>,
+    estimated_input_tokens: u32,
+) -> Option<f32> {
+    if estimated_input_tokens == 0 {
+        return Some(0.0);
+    }
+
+    let pricing = provider_entry.pricing.as_ref()?;
+    let usd_per_input_token = model
+        .and_then(|model_id| extract_model_rate(pricing, model_id))
+        .or_else(|| extract_model_rate(pricing, "default"))
+        .or_else(|| extract_input_rate(pricing))?;
+
+    Some((estimated_input_tokens as f64 * usd_per_input_token) as f32)
+}
+
+fn extract_model_rate(pricing: &JsonValue, model_id: &str) -> Option<f64> {
+    let model_value = lookup_case_insensitive(pricing, model_id).or_else(|| {
+        pricing
+            .get("models")
+            .and_then(|models| lookup_case_insensitive(models, model_id))
+    })?;
+    extract_input_rate(model_value)
+}
+
+fn lookup_case_insensitive<'a>(node: &'a JsonValue, key: &str) -> Option<&'a JsonValue> {
+    let object = node.as_object()?;
+    let key_lc = key.to_ascii_lowercase();
+    object.iter().find_map(|(candidate, value)| {
+        if candidate.eq_ignore_ascii_case(&key_lc) || candidate.eq_ignore_ascii_case(key) {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn extract_input_rate(node: &JsonValue) -> Option<f64> {
+    const PER_MILLION_KEYS: [&str; 4] = [
+        "input_per_million_usd",
+        "prompt_per_million_usd",
+        "input_usd_per_million",
+        "prompt_usd_per_million",
+    ];
+    const PER_K_KEYS: [&str; 4] = [
+        "input_per_1k_usd",
+        "prompt_per_1k_usd",
+        "input_usd_per_1k",
+        "prompt_usd_per_1k",
+    ];
+    const PER_TOKEN_KEYS: [&str; 2] = ["input_per_token_usd", "prompt_per_token_usd"];
+
+    for key in PER_MILLION_KEYS {
+        if let Some(value) = node.get(key).and_then(JsonValue::as_f64) {
+            return Some(value / 1_000_000.0);
+        }
+    }
+    for key in PER_K_KEYS {
+        if let Some(value) = node.get(key).and_then(JsonValue::as_f64) {
+            return Some(value / 1_000.0);
+        }
+    }
+    for key in PER_TOKEN_KEYS {
+        if let Some(value) = node.get(key).and_then(JsonValue::as_f64) {
+            return Some(value);
+        }
+    }
+
+    if let Some(input) = node.get("input") {
+        if let Some(value) = input.get("per_million_usd").and_then(JsonValue::as_f64) {
+            return Some(value / 1_000_000.0);
+        }
+        if let Some(value) = input.get("per_1k_usd").and_then(JsonValue::as_f64) {
+            return Some(value / 1_000.0);
+        }
+        if let Some(value) = input.get("per_token_usd").and_then(JsonValue::as_f64) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
 fn default_provider_for_format(format: &DetectedFormat) -> &'static str {
     match format {
         DetectedFormat::OpenAIRest => "openai",
@@ -304,6 +457,7 @@ fn default_provider_for_format(format: &DetectedFormat) -> &'static str {
         DetectedFormat::CohereRest => "cohere",
         DetectedFormat::GeminiRest => "google",
         DetectedFormat::BedrockRest => "aws_bedrock",
+        DetectedFormat::CustomRest(_) => "custom",
         DetectedFormat::GraphQL => "graphql",
         DetectedFormat::GrpcProtobuf => "grpc",
         DetectedFormat::JsonRpc => "jsonrpc",
@@ -329,6 +483,9 @@ fn parse_source_for_format(format: &DetectedFormat, meta: &FormatMeta) -> ParseS
         DetectedFormat::CohereRest => ParseSource::Cohere,
         DetectedFormat::GeminiRest => ParseSource::Google,
         DetectedFormat::BedrockRest => ParseSource::Bedrock,
+        DetectedFormat::CustomRest(ref key) => ParseSource::AgentApp {
+            app_id: key.clone(),
+        },
         DetectedFormat::GraphQL => {
             if let FormatMeta::GraphQL { operation_name, .. } = meta {
                 ParseSource::GraphQL {

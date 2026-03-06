@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 pub use soth_core::{
     AppIdentity, AppKind, CaptureMode, ConnectionMeta, FrameKind, ParseConfidence, ProcessInfo,
     RawRequest, RequestHeaders, SocketFamily, StreamChunk, TlsInfo,
@@ -179,6 +180,15 @@ pub struct DetectResult {
     pub detect_latency_us: u64,
     pub warnings: Vec<DetectWarning>,
     pub raw_body_bytes: Option<Bytes>,
+    pub session_mutations: soth_core::SessionMutations,
+    pub is_prefix_repeat: bool,
+    pub novel_token_count: u32,
+    pub repeated_token_count: u32,
+    pub novel_tail_start_idx: Option<usize>,
+    pub prefix_hash: Option<String>,
+    pub is_repeated_code_context: bool,
+    pub ast_normalized_hash: Option<String>,
+    pub first_blob_event_id: Option<uuid::Uuid>,
 }
 
 impl DetectResult {
@@ -224,6 +234,15 @@ impl DetectResult {
             detect_latency_us: 0,
             warnings: Vec::new(),
             raw_body_bytes: None,
+            session_mutations: soth_core::SessionMutations::default(),
+            is_prefix_repeat: false,
+            novel_token_count: 0,
+            repeated_token_count: 0,
+            novel_tail_start_idx: None,
+            prefix_hash: None,
+            is_repeated_code_context: false,
+            ast_normalized_hash: None,
+            first_blob_event_id: None,
         }
     }
 
@@ -357,6 +376,7 @@ pub enum DetectedFormat {
     CohereRest,
     GeminiRest,
     BedrockRest,
+    CustomRest(String),
     GraphQL,
     GrpcProtobuf,
     JsonRpc,
@@ -401,6 +421,10 @@ pub struct OwnedDetectBundle {
     pub browser_policies: BrowserPolicies,
     #[serde(default)]
     pub passthrough_domains: Vec<String>,
+    #[serde(default)]
+    pub collectors: HashMap<String, JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_metadata: Option<JsonValue>,
 }
 
 impl OwnedDetectBundle {
@@ -415,7 +439,11 @@ impl OwnedDetectBundle {
             llm_providers: &self.llm_providers,
             applications: &self.applications,
             filters: &self.filters,
+            app_policies: &self.app_policies,
+            browser_policies: &self.browser_policies,
             passthrough_domains: self.passthrough_domains.as_slice(),
+            collectors: &self.collectors,
+            source_metadata: self.source_metadata.as_ref(),
         }
     }
 }
@@ -431,7 +459,11 @@ pub struct DetectBundleSlice<'a> {
     pub llm_providers: &'a HashMap<String, ProviderEntry>,
     pub applications: &'a HashMap<String, ApplicationEntry>,
     pub filters: &'a Filters,
+    pub app_policies: &'a HashMap<String, AppPolicy>,
+    pub browser_policies: &'a BrowserPolicies,
     pub passthrough_domains: &'a [String],
+    pub collectors: &'a HashMap<String, JsonValue>,
+    pub source_metadata: Option<&'a JsonValue>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -655,6 +687,18 @@ impl Default for CaptureRules {
 
 impl CaptureRules {
     pub fn mode_for(&self, provider: &Provider) -> CaptureMode {
+        self.mode_for_with_entry(provider, None)
+    }
+
+    pub fn mode_for_with_entry(
+        &self,
+        provider: &Provider,
+        provider_entry: Option<&ProviderEntry>,
+    ) -> CaptureMode {
+        if let Some(mode) = provider_entry.and_then(provider_capture_mode) {
+            return mode;
+        }
+
         let name = provider.canonical_name();
 
         if self
@@ -683,6 +727,34 @@ impl CaptureRules {
     }
 }
 
+fn provider_capture_mode(entry: &ProviderEntry) -> Option<CaptureMode> {
+    entry
+        .capture
+        .as_ref()
+        .and_then(parse_capture_mode_from_value)
+}
+
+fn parse_capture_mode_from_value(value: &JsonValue) -> Option<CaptureMode> {
+    if let Some(raw) = value.as_str() {
+        return parse_capture_mode(raw);
+    }
+
+    value
+        .get("mode")
+        .and_then(JsonValue::as_str)
+        .and_then(parse_capture_mode)
+}
+
+fn parse_capture_mode(raw: &str) -> Option<CaptureMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" => Some(CaptureMode::Full),
+        "sensitive_artifacts" => Some(CaptureMode::SensitiveArtifacts),
+        "full_content" => Some(CaptureMode::FullContent),
+        "metadata_only" => Some(CaptureMode::MetadataOnly),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct CaptureOverrides {
     #[serde(default)]
@@ -696,6 +768,14 @@ pub struct ProviderEntry {
     pub provider_id: Option<String>,
     pub name: Option<String>,
     pub api_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<JsonValue>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -706,6 +786,14 @@ pub struct ApplicationEntry {
     pub bundle_ids: Vec<String>,
     #[serde(default)]
     pub process_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<JsonValue>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -714,6 +802,12 @@ pub struct Filters {
     pub path_keywords: Vec<String>,
     #[serde(default)]
     pub header_keywords: Vec<String>,
+    #[serde(default)]
+    pub domain_patterns: Vec<String>,
+    #[serde(default)]
+    pub path_patterns: Vec<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
 }
 
 impl Filters {
@@ -727,18 +821,102 @@ impl Filters {
             return true;
         }
 
-        if self.header_keywords.is_empty() {
+        if self
+            .keywords
+            .iter()
+            .any(|k| !k.is_empty() && path_lc.contains(&k.to_ascii_lowercase()))
+        {
+            return true;
+        }
+
+        if self.path_patterns.iter().any(|pattern| {
+            !pattern.is_empty() && glob_match(&pattern.to_ascii_lowercase(), &path_lc)
+        }) {
+            return true;
+        }
+
+        if let Some(host) = host_header(headers) {
+            let host_lc = host_without_port(host)
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if self.domain_patterns.iter().any(|pattern| {
+                !pattern.is_empty() && glob_match(&pattern.to_ascii_lowercase(), &host_lc)
+            }) {
+                return true;
+            }
+        }
+
+        let has_header_needles = !self.header_keywords.is_empty() || !self.keywords.is_empty();
+        if !has_header_needles {
             return false;
         }
 
         headers.iter().any(|(key, value)| {
             let key_lc = key.to_ascii_lowercase();
             let val_lc = value.to_ascii_lowercase();
-            self.header_keywords.iter().any(|needle| {
-                let needle_lc = needle.to_ascii_lowercase();
-                key_lc.contains(&needle_lc) || val_lc.contains(&needle_lc)
-            })
+            self.header_keywords
+                .iter()
+                .chain(self.keywords.iter())
+                .any(|needle| {
+                    let needle_lc = needle.to_ascii_lowercase();
+                    !needle_lc.is_empty()
+                        && (key_lc.contains(&needle_lc) || val_lc.contains(&needle_lc))
+                })
         })
+    }
+}
+
+fn host_header<'a>(headers: &'a HeaderMap) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case(":authority"))
+        .map(|(_, value)| value.as_str())
+}
+
+fn host_without_port(host: &str) -> &str {
+    host.split(':').next().unwrap_or(host)
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let starts_anchored = !pattern.starts_with('*');
+    let ends_anchored = !pattern.ends_with('*');
+
+    let mut index = 0usize;
+    let mut first_non_empty = true;
+    for part in parts.iter().copied().filter(|part| !part.is_empty()) {
+        if first_non_empty && starts_anchored {
+            if !text[index..].starts_with(part) {
+                return false;
+            }
+            index += part.len();
+            first_non_empty = false;
+            continue;
+        }
+
+        match text[index..].find(part) {
+            Some(pos) => index += pos + part.len(),
+            None => return false,
+        }
+        first_non_empty = false;
+    }
+
+    if ends_anchored {
+        let last_non_empty = pattern
+            .split('*')
+            .filter(|part| !part.is_empty())
+            .next_back()
+            .unwrap_or("");
+        text.ends_with(last_non_empty)
+    } else {
+        true
     }
 }
 
@@ -747,10 +925,69 @@ pub struct AppPolicy {
     pub app_id: String,
     pub display_name: Option<String>,
     pub app_kind: AppKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_list_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct BrowserPolicies {
     #[serde(default)]
     pub allowed_apps: Vec<String>,
+    #[serde(default)]
+    pub allowed_browsers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_action: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn filters_match_domain_path_and_keywords() {
+        let filters = Filters {
+            path_keywords: vec!["blocked".to_string()],
+            header_keywords: vec!["x-secret".to_string()],
+            domain_patterns: vec!["*.example.com".to_string()],
+            path_patterns: vec!["/v1/**".to_string()],
+            keywords: vec!["token".to_string()],
+        };
+
+        let mut headers = BTreeMap::new();
+        headers.insert("host".to_string(), "api.example.com:443".to_string());
+        assert!(filters.matches("/anything", &headers));
+
+        assert!(filters.matches("/v1/chat/completions", &BTreeMap::new()));
+
+        let mut headers = BTreeMap::new();
+        headers.insert("x-secret-key".to_string(), "present".to_string());
+        assert!(filters.matches("/clean", &headers));
+
+        assert!(filters.matches("/contains-token", &BTreeMap::new()));
+    }
+
+    #[test]
+    fn capture_rules_support_provider_capture_override() {
+        let rules = CaptureRules::default();
+        let provider = Provider::new("openai");
+        let provider_entry = ProviderEntry {
+            capture: Some(serde_json::json!({"mode":"full"})),
+            ..ProviderEntry::default()
+        };
+
+        assert_eq!(rules.mode_for(&provider), CaptureMode::MetadataOnly);
+        assert_eq!(
+            rules.mode_for_with_entry(&provider, Some(&provider_entry)),
+            CaptureMode::Full
+        );
+    }
 }

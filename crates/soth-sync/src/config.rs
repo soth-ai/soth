@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-pub const DEFAULT_TELEMETRY_ENDPOINT_PATH: &str = "/api/v1/telemetry/batch";
+pub const DEFAULT_TELEMETRY_ENDPOINT_PATH: &str = "/v1/edge/telemetry/batch";
 pub const DEFAULT_TELEMETRY_MAX_RETRY_ATTEMPTS: u8 = 5;
 pub const DEFAULT_TELEMETRY_BACKOFF_BASE_MS: u64 = 2_000;
 pub const DEFAULT_TELEMETRY_BACKOFF_MAX_MS: u64 = 300_000;
@@ -96,7 +96,7 @@ mod tests {
     fn sanitize_normalizes_endpoint_path_and_backoff_bounds() {
         let cfg = TelemetrySyncConfig {
             enabled: true,
-            endpoint_path: "api/v1/telemetry/custom".to_string(),
+            endpoint_path: "v1/edge/telemetry/custom".to_string(),
             max_retry_attempts: 5,
             backoff_base_ms: 5000,
             backoff_max_ms: 1000,
@@ -104,7 +104,7 @@ mod tests {
         }
         .sanitize();
 
-        assert_eq!(cfg.endpoint_path, "/api/v1/telemetry/custom");
+        assert_eq!(cfg.endpoint_path, "/v1/edge/telemetry/custom");
         assert_eq!(cfg.backoff_max_ms, cfg.backoff_base_ms);
     }
 }

@@ -148,6 +148,29 @@ impl Default for SensitiveCodeFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleTrustLevel {
+    Verified,
+    Unverified,
+    SignatureDisabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataSource {
+    LiveProxy,
+    HistorianClaudeCode,
+    HistorianGemini,
+    HistorianCodex,
+}
+
+impl Default for DataSource {
+    fn default() -> Self {
+        Self::LiveProxy
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryEvent {
     pub event_id: Uuid,
@@ -175,5 +198,92 @@ pub struct TelemetryEvent {
     pub anomaly_flags: Vec<AnomalyFlag>,
     pub anomaly_score: Option<f32>,
     pub policy_kind: Option<TelemetryPolicyKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_trust_level: Option<BundleTrustLevel>,
     pub sensitive_code_flags: SensitiveCodeFlags,
+    #[serde(default)]
+    pub session_key_hash: String,
+    #[serde(default)]
+    pub is_prefix_repeat: bool,
+    #[serde(default)]
+    pub is_code_context_repeat: bool,
+    #[serde(default)]
+    pub novel_token_count: u32,
+    #[serde(default)]
+    pub repeated_token_count: u32,
+    #[serde(default)]
+    pub first_step_event_id: Option<String>,
+    #[serde(default)]
+    pub original_event_id: Option<String>,
+    #[serde(default)]
+    pub prefix_hash: Option<String>,
+    #[serde(default)]
+    pub agent_step_number: Option<u32>,
+    #[serde(default)]
+    pub is_historical: bool,
+    #[serde(default)]
+    pub data_source: DataSource,
+    #[serde(default)]
+    pub original_timestamp: Option<i64>,
+    #[serde(default)]
+    pub topic_cluster_id: u32,
+    #[serde(default)]
+    pub semantic_hash: String,
+    #[serde(default)]
+    pub is_semantic_collision: bool,
+    #[serde(default)]
+    pub endpoint_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_rule_id: Option<String>,
+}
+
+impl Default for TelemetryEvent {
+    fn default() -> Self {
+        Self {
+            event_id: Uuid::nil(),
+            timestamp_epoch_ms: 0,
+            connection_id: None,
+            provider: DetectedProvider::Unknown,
+            model: None,
+            endpoint_type: EndpointType::Unknown,
+            parse_confidence: ParseConfidence::Heuristic,
+            parse_source: ParseSource::Heuristic,
+            capture_mode: CaptureMode::MetadataOnly,
+            use_case: UseCaseLabel::Unknown,
+            volatility_class: VolatilityClass::Static,
+            cache_level: None,
+            routing_reason: None,
+            request_method: RequestMethod::Unknown,
+            estimated_input_tokens: None,
+            estimated_output_tokens: None,
+            estimated_cost_usd: None,
+            process_resolution: None,
+            traffic_classification: None,
+            languages: Vec::new(),
+            import_categories: Vec::new(),
+            classification_flags: Vec::new(),
+            anomaly_flags: Vec::new(),
+            anomaly_score: None,
+            policy_kind: None,
+            bundle_trust_level: None,
+            sensitive_code_flags: SensitiveCodeFlags::default(),
+            session_key_hash: String::new(),
+            is_prefix_repeat: false,
+            is_code_context_repeat: false,
+            novel_token_count: 0,
+            repeated_token_count: 0,
+            first_step_event_id: None,
+            original_event_id: None,
+            prefix_hash: None,
+            agent_step_number: None,
+            is_historical: false,
+            data_source: DataSource::LiveProxy,
+            original_timestamp: None,
+            topic_cluster_id: 0,
+            semantic_hash: String::new(),
+            is_semantic_collision: false,
+            endpoint_hash: String::new(),
+            policy_rule_id: None,
+        }
+    }
 }

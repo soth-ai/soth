@@ -11,6 +11,8 @@ mod watcher;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 pub use crate::db::{mark_superseded, record_bundle_installed, record_policy_config};
 pub use crate::error::BundleError;
 pub use crate::loader::{
@@ -23,20 +25,46 @@ pub use crate::watcher::{BundleHandle, BundleWatcher};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerificationOptions {
     pub verify_vendor_signature: bool,
+    pub require_verified_bundle: bool,
+    pub org_approval_pubkey: Option<[u8; 32]>,
 }
 
 impl Default for VerificationOptions {
     fn default() -> Self {
         Self {
             verify_vendor_signature: true,
+            require_verified_bundle: false,
+            org_approval_pubkey: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleTrustLevel {
+    Verified,
+    Unverified,
+    SignatureDisabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleMeta {
+    pub bundle_id: String,
+    pub model_version: String,
+    pub policy_version: String,
+    pub org_id: String,
+    pub issued_at: u64,
+    pub expires_at: Option<u64>,
+    pub vendor_sig: Option<String>,
+    pub org_approval_sig: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct LoadedBundle {
     pub version: String,
     pub installed_at: i64,
+    pub meta: BundleMeta,
+    pub trust_level: BundleTrustLevel,
     pub classify: Arc<soth_classify::ClassifyBundle>,
     pub policy: Arc<soth_policy::sync_policy::PolicyBundle>,
     pub detect: Arc<soth_detect::OwnedDetectBundle>,

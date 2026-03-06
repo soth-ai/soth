@@ -50,8 +50,16 @@ struct SystemProxyDiagnostics {
 struct CaDiagnostics {
     cert_path: PathDetails,
     key_path: PathDetails,
+    trust_cert_path: PathDetails,
+    trust_source: String,
     cert_not_after: Option<String>,
     cert_parse_error: Option<String>,
+    cert_fingerprint_sha256: Option<String>,
+    trust_fingerprint_sha256: Option<String>,
+    fingerprint_match: Option<bool>,
+    key_matches_cert: Option<bool>,
+    os_trust_status: Option<String>,
+    os_trust_detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -247,6 +255,16 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
         }
     );
     println!(
+        "Trust cert:     {} ({})",
+        report.ca.trust_cert_path.path,
+        if report.ca.trust_cert_path.exists {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!("Trust source:   {}", report.ca.trust_source);
+    println!(
         "Valid until:    {}",
         report
             .ca
@@ -254,6 +272,49 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .clone()
             .unwrap_or_else(|| "unknown".to_string())
     );
+    println!(
+        "Fingerprint:    {}",
+        report
+            .ca
+            .cert_fingerprint_sha256
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "Trust fp:       {}",
+        report
+            .ca
+            .trust_fingerprint_sha256
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "FP match:       {}",
+        report
+            .ca
+            .fingerprint_match
+            .map(|v| if v { "yes" } else { "no" }.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "Cert/key pair:  {}",
+        report
+            .ca
+            .key_matches_cert
+            .map(|v| if v { "match" } else { "mismatch" }.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "OS trust:       {}",
+        report
+            .ca
+            .os_trust_status
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    if let Some(detail) = &report.ca.os_trust_detail {
+        println!("Trust detail:   {}", detail);
+    }
     if let Some(err) = &report.ca.cert_parse_error {
         println!("Parse error:    {}", err);
     }
@@ -365,11 +426,41 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
         owner_matches_state,
     };
 
-    let cert_path = cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()));
-    let key_path = cli_config::expand_tilde(Path::new(config.forward_proxy.ca.key_path.as_str()));
+    let ca_paths = super::ca_health::resolve_ca_paths(&config);
+    let cert_path = ca_paths.runtime_cert_path.clone();
+    let key_path = ca_paths.runtime_key_path.clone();
+    let trust_cert_path = ca_paths.trust_cert_path.clone();
     let (cert_not_after, cert_parse_error) = match parse_cert_not_after(cert_path.as_path()) {
         Ok(v) => (Some(v), None),
         Err(err) => (None, Some(err.to_string())),
+    };
+    let cert_fingerprint_sha256 =
+        super::ca_health::cert_fingerprint_sha256(cert_path.as_path()).ok();
+    let trust_fingerprint_sha256 =
+        super::ca_health::cert_fingerprint_sha256(trust_cert_path.as_path()).ok();
+    let fingerprint_match = match (
+        cert_fingerprint_sha256.as_ref(),
+        trust_fingerprint_sha256.as_ref(),
+    ) {
+        (Some(cert), Some(trust)) => Some(cert == trust),
+        _ => None,
+    };
+    let key_matches_cert =
+        super::ca_health::cert_matches_key(cert_path.as_path(), key_path.as_path()).ok();
+    let (os_trust_status, os_trust_detail) = if trust_cert_path.exists() {
+        match super::ca_health::check_os_trust(trust_cert_path.as_path()) {
+            Ok(value) => (Some(value.status.as_str().to_string()), Some(value.detail)),
+            Err(error) => (
+                Some(
+                    super::ca_health::OsTrustStatus::Unknown
+                        .as_str()
+                        .to_string(),
+                ),
+                Some(error.to_string()),
+            ),
+        }
+    } else {
+        (None, None)
     };
     let ca = CaDiagnostics {
         cert_path: PathDetails {
@@ -380,8 +471,19 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
             path: key_path.display().to_string(),
             exists: key_path.exists(),
         },
+        trust_cert_path: PathDetails {
+            path: trust_cert_path.display().to_string(),
+            exists: trust_cert_path.exists(),
+        },
+        trust_source: ca_paths.trust_source.to_string(),
         cert_not_after,
         cert_parse_error,
+        cert_fingerprint_sha256,
+        trust_fingerprint_sha256,
+        fingerprint_match,
+        key_matches_cert,
+        os_trust_status,
+        os_trust_detail,
     };
 
     let expected_port = pid_meta
@@ -419,13 +521,69 @@ fn compute_findings(report: &DoctorReport) -> Vec<DoctorFinding> {
             message: "Proxy CA cert/key is missing.".to_string(),
             remediation: "Run `soth setup-ca` and retry `soth up`.".to_string(),
         });
-    } else if report.ca.cert_not_after.is_none() {
-        findings.push(DoctorFinding {
-            level: "warn".to_string(),
-            code: "ca_parse_failed".to_string(),
-            message: "Unable to parse CA certificate expiry.".to_string(),
-            remediation: "Ensure `openssl` is installed and CA cert is valid PEM.".to_string(),
-        });
+    } else {
+        if !report.ca.trust_cert_path.exists {
+            findings.push(DoctorFinding {
+                level: "error".to_string(),
+                code: "ca_trust_cert_missing".to_string(),
+                message: format!(
+                    "Configured trust cert path is missing: {}",
+                    report.ca.trust_cert_path.path
+                ),
+                remediation:
+                    "Fix `forward_proxy.ca.trust_cert_path` (or remove it) and rerun `soth setup-ca`."
+                        .to_string(),
+            });
+        }
+        if report.ca.cert_not_after.is_none() {
+            findings.push(DoctorFinding {
+                level: "warn".to_string(),
+                code: "ca_parse_failed".to_string(),
+                message: "Unable to parse CA certificate expiry.".to_string(),
+                remediation: "Ensure `openssl` is installed and CA cert is valid PEM.".to_string(),
+            });
+        }
+        if matches!(report.ca.key_matches_cert, Some(false)) {
+            findings.push(DoctorFinding {
+                level: "error".to_string(),
+                code: "ca_key_mismatch".to_string(),
+                message: "CA private key does not match CA certificate.".to_string(),
+                remediation:
+                    "Regenerate CA pair with `soth setup-ca` and reinstall trust before starting proxy."
+                        .to_string(),
+            });
+        }
+        if matches!(report.ca.fingerprint_match, Some(false)) {
+            findings.push(DoctorFinding {
+                level: "error".to_string(),
+                code: "ca_fingerprint_mismatch".to_string(),
+                message:
+                    "Runtime CA fingerprint does not match trust cert fingerprint (possible stale/MDM drift)."
+                        .to_string(),
+                remediation:
+                    "Install the runtime CA into MDM trust path or update forward_proxy.ca.trust_cert_path."
+                        .to_string(),
+            });
+        }
+        if matches!(report.ca.os_trust_status.as_deref(), Some("untrusted")) {
+            findings.push(DoctorFinding {
+                level: "error".to_string(),
+                code: "ca_not_trusted".to_string(),
+                message: "CA certificate is not trusted by OS trust store.".to_string(),
+                remediation:
+                    "Run `soth setup-ca` or deploy CA trust via MDM and ensure fingerprints match."
+                        .to_string(),
+            });
+        } else if matches!(report.ca.os_trust_status.as_deref(), Some("unknown")) {
+            findings.push(DoctorFinding {
+                level: "warn".to_string(),
+                code: "ca_trust_unknown".to_string(),
+                message: "Unable to verify OS trust status for configured CA cert.".to_string(),
+                remediation:
+                    "Validate trust manually or run `soth setup-ca`; ensure openssl/security tools are available."
+                        .to_string(),
+            });
+        }
     }
 
     if report.system_proxy.state_file.exists && !report.system_proxy.owner_file.exists {
@@ -884,8 +1042,19 @@ mod tests {
                     path: "g".to_string(),
                     exists: false,
                 },
+                trust_cert_path: PathDetails {
+                    path: "h".to_string(),
+                    exists: false,
+                },
+                trust_source: "runtime_cert".to_string(),
                 cert_not_after: None,
                 cert_parse_error: None,
+                cert_fingerprint_sha256: None,
+                trust_fingerprint_sha256: None,
+                fingerprint_match: None,
+                key_matches_cert: None,
+                os_trust_status: None,
+                os_trust_detail: None,
             },
             loopback_bindings: LoopbackBindings {
                 expected_port: 8080,

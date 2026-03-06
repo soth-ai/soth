@@ -1,15 +1,17 @@
 use crate::cli_config;
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Args;
+use ed25519_dalek::SigningKey;
 use serde_json::Value;
+use soth_core::derive_proxy_signing_seed;
+use soth_sync::api_types::{API_VERSION, API_VERSION_HEADER};
 use std::collections::BTreeMap;
+use std::env;
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-const API_VERSION: &str = "v1";
-const API_VERSION_HEADER: &str = "X-Soth-Api-Version";
 
 #[derive(Debug, Clone, Args)]
 pub struct EnrollArgs {
@@ -51,22 +53,37 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     };
 
     let enroll_token = resolve_enroll_token(&args)?;
-    let endpoint = args
-        .endpoint
+    let endpoint_override = args.endpoint.clone();
+    let endpoint = endpoint_override
         .clone()
         .unwrap_or_else(|| config.cloud.endpoint.clone());
     let machine_name = args
         .machine_name
         .clone()
         .unwrap_or_else(default_machine_name);
+    let enrollment_device_id = cli_config::sync_client_device_id(&mut config, None)?;
+    let enrollment_proxy_public_key = proxy_public_key_base64(enrollment_device_id.as_str());
 
-    let response_json = exchange_enroll_token(&endpoint, &enroll_token, &machine_name).await?;
+    let response_json = exchange_enroll_token(
+        &endpoint,
+        &enroll_token,
+        &machine_name,
+        enrollment_device_id.as_str(),
+        enrollment_proxy_public_key.as_str(),
+    )
+    .await?;
     let exchanged = parse_enrollment_exchange(&response_json)
         .context("enrollment response did not contain usable machine credentials")?;
 
     config.cloud.enabled = true;
     config.cloud.api_key = Some(exchanged.api_key);
-    config.cloud.endpoint = exchanged.endpoint.unwrap_or(endpoint);
+    // If user passed --endpoint, keep it authoritative for this enrollment.
+    // Otherwise accept server-provided endpoint override when available.
+    config.cloud.endpoint = if let Some(explicit) = endpoint_override {
+        explicit
+    } else {
+        exchanged.endpoint.unwrap_or(endpoint)
+    };
     // Cloud sync uses the unified Exchange pipeline (schema_version=1).
     config.exchange.enabled = true;
 
@@ -76,9 +93,20 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
             .tags
             .insert("workspace_id".to_string(), workspace_id);
     }
+    if let Some(org_id) = exchanged.org_id {
+        config.cloud.tags.insert("org_id".to_string(), org_id);
+    }
     if let Some(tags) = exchanged.tags {
         for (key, value) in tags {
             config.cloud.tags.insert(key, value);
+        }
+    }
+    if !config.cloud.tags.contains_key("team_id") {
+        if let Some(workspace_id) = config.cloud.tags.get("workspace_id").cloned() {
+            config
+                .cloud
+                .tags
+                .insert("team_id".to_string(), workspace_id);
         }
     }
     let device_id = cli_config::sync_client_device_id(&mut config, exchanged.device_id.as_deref())?;
@@ -103,6 +131,7 @@ struct EnrollmentExchange {
     api_key: String,
     endpoint: Option<String>,
     workspace_id: Option<String>,
+    org_id: Option<String>,
     tags: Option<BTreeMap<String, String>>,
     device_id: Option<String>,
 }
@@ -148,6 +177,10 @@ fn parse_enrollment_exchange(value: &Value) -> Result<EnrollmentExchange> {
             "/data/workspace/id",
         ],
     );
+    let org_id = first_string(
+        value,
+        &["/org_id", "/data/org_id", "/org/id", "/data/org/id"],
+    );
 
     let tags = first_object_map(value, &["/tags", "/data/tags"]);
     let device_id = first_string(value, &["/device_id", "/data/device_id"]);
@@ -156,6 +189,7 @@ fn parse_enrollment_exchange(value: &Value) -> Result<EnrollmentExchange> {
         api_key,
         endpoint,
         workspace_id,
+        org_id,
         tags,
         device_id,
     })
@@ -189,18 +223,27 @@ fn first_object_map(value: &Value, pointers: &[&str]) -> Option<BTreeMap<String,
     })
 }
 
-async fn exchange_enroll_token(endpoint: &str, token: &str, machine_name: &str) -> Result<Value> {
+async fn exchange_enroll_token(
+    endpoint: &str,
+    token: &str,
+    machine_name: &str,
+    device_id_hash: &str,
+    proxy_public_key: &str,
+) -> Result<Value> {
     let base = endpoint.trim_end_matches('/');
-    let url = format!("{base}/api/v1/enroll/exchange");
+    let url = format!("{base}/v1/edge/enroll/exchange");
     let client = build_cloud_client(base)?;
     let body = serde_json::json!({
         "enroll_token": token,
         "machine_name": machine_name,
+        "device_id_hash": device_id_hash,
+        "proxy_public_key": proxy_public_key,
         "client": {
             "hostname": machine_name,
             "platform": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "soth_version": env!("CARGO_PKG_VERSION"),
+            "device_id": device_id_hash,
         }
     });
 
@@ -233,12 +276,65 @@ fn build_cloud_client(endpoint: &str) -> Result<reqwest::Client> {
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .pool_max_idle_per_host(2)
         .pool_idle_timeout(Duration::from_secs(30));
-    if should_bypass_proxy(endpoint) {
+    if should_bypass_proxy(endpoint) || has_loopback_proxy_env() {
         builder = builder.no_proxy();
     }
     builder
         .build()
         .context("failed constructing cloud HTTP client")
+}
+
+fn has_loopback_proxy_env() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|key| {
+        env::var(key)
+            .ok()
+            .as_deref()
+            .map(proxy_target_is_loopback)
+            .unwrap_or(false)
+    })
+}
+
+fn proxy_target_is_loopback(raw: &str) -> bool {
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+
+    let parse_url = |value: &str| {
+        reqwest::Url::parse(value).ok().or_else(|| {
+            if value.contains("://") {
+                None
+            } else {
+                reqwest::Url::parse(format!("http://{value}").as_str()).ok()
+            }
+        })
+    };
+
+    let Some(url) = parse_url(candidate) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    let normalized = host.trim_matches('[').trim_matches(']');
+    match normalized.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
 }
 
 fn should_bypass_proxy(endpoint: &str) -> bool {
@@ -265,6 +361,12 @@ fn default_machine_name() -> String {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "soth-proxy".to_string())
+}
+
+fn proxy_public_key_base64(device_id_hash: &str) -> String {
+    let seed = derive_proxy_signing_seed(device_id_hash);
+    let signing_key = SigningKey::from_bytes(&seed);
+    BASE64_STANDARD.encode(signing_key.verifying_key().as_bytes())
 }
 
 fn resolve_config_path(explicit: Option<&PathBuf>, global: Option<&PathBuf>) -> PathBuf {

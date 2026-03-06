@@ -6,11 +6,12 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use soth_core::{
-    AppType, CaptureMode, ClassificationSource, ConnectionMeta, EndpointType, FrameKind,
-    NormalizedRequest, ParseConfidence, ParseSource, PolicyContext, PolicyDecisionKind,
-    ProcessMatchKind, ProcessResolution, ProxyContext, RequestMethod, SessionSnapshot,
-    SocketFamily, TelemetryEvent, TelemetryPolicyKind, TrafficClassification, UseCaseLabel,
-    VolatilityClass,
+    AppType, CaptureMode, ClassificationSource, ConnectionMeta, EndpointType, EventSource,
+    ExtensionContext, ExtensionType, FrameKind, GovernableEvent, NormalizedRequest,
+    ParseConfidence, ParseSource, PolicyContext, PolicyDecisionKind, ProcessMatchKind,
+    ProcessResolution, ProxyContext, RequestMethod, Session, SessionAppIdentity, SessionKey,
+    SessionMutations, SessionSnapshot, SocketFamily, TelemetryEvent, TelemetryPolicyKind,
+    TrafficClassification, UseCaseLabel, VolatilityClass,
 };
 
 fn sample_connection_meta() -> ConnectionMeta {
@@ -121,6 +122,7 @@ fn proxy_context_and_policy_context_semantic_extension_contract() {
         traffic_classification: TrafficClassification::ApplicationUsage,
         classification_source: ClassificationSource::Proxy,
         session_snapshot: Some(SessionSnapshot::default()),
+        request_method: None,
     };
     assert_eq!(proxy_ctx.org_id, "org-test");
     assert_eq!(proxy_ctx.capture_mode, CaptureMode::SensitiveArtifacts);
@@ -176,7 +178,25 @@ fn telemetry_event_surface_excludes_raw_content_fields() {
         anomaly_flags: Vec::new(),
         anomaly_score: Some(0.1),
         policy_kind: Some(TelemetryPolicyKind::Allow),
+        bundle_trust_level: Some(soth_core::BundleTrustLevel::Verified),
         sensitive_code_flags: soth_core::SensitiveCodeFlags::default(),
+        session_key_hash: String::new(),
+        is_prefix_repeat: false,
+        is_code_context_repeat: false,
+        novel_token_count: 0,
+        repeated_token_count: 0,
+        first_step_event_id: None,
+        original_event_id: None,
+        prefix_hash: None,
+        agent_step_number: None,
+        is_historical: false,
+        data_source: soth_core::DataSource::LiveProxy,
+        original_timestamp: None,
+        topic_cluster_id: 0,
+        semantic_hash: String::new(),
+        is_semantic_collision: false,
+        endpoint_hash: String::new(),
+        policy_rule_id: None,
     };
 
     let value = serde_json::to_value(event).expect("serialize telemetry event");
@@ -230,4 +250,305 @@ fn request_and_policy_helpers_contract() {
         message: "blocked".to_string()
     }
     .is_block());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Session types contract
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_key_hash_and_equality_contract() {
+    let key_a = SessionKey {
+        app_identity: SessionAppIdentity::NativeApp {
+            identity: "cursor".to_string(),
+        },
+        window_start: 1700000,
+    };
+    let key_b = key_a.clone();
+    assert_eq!(key_a, key_b);
+
+    let key_c = SessionKey {
+        app_identity: SessionAppIdentity::BrowserSession {
+            browser: "chrome".to_string(),
+            ai_origin: "claude.ai".to_string(),
+        },
+        window_start: 1700000,
+    };
+    assert_ne!(key_a, key_c);
+
+    // SessionKey must be usable as HashMap key (Hash + Eq).
+    let mut map = std::collections::HashMap::new();
+    map.insert(key_a.clone(), 1u32);
+    assert_eq!(map.get(&key_a), Some(&1));
+}
+
+#[test]
+fn session_mutations_is_plain_data_carrier() {
+    // SessionMutations::default() must compile — no required fields.
+    let mutations = SessionMutations::default();
+    assert!(mutations.new_prefix_hash.is_none());
+    assert!(mutations.new_code_hashes.is_empty());
+    assert_eq!(mutations.token_delta, 0);
+    assert_eq!(mutations.cost_delta, 0.0);
+    assert!(mutations.anomaly_update.is_none());
+    assert!(!mutations.credential_alert);
+}
+
+#[test]
+fn session_snapshot_dedup_fields_default_empty() {
+    let snapshot = SessionSnapshot::default();
+    // New dedup fields must default to empty/zero.
+    assert!(snapshot.seen_prefix_hashes.is_empty());
+    assert!(snapshot.seen_code_hashes.is_empty());
+    assert!(snapshot.session_key_hash.is_empty());
+}
+
+#[test]
+fn session_snapshot_serde_backward_compat() {
+    // An old serialized snapshot (without dedup fields) must deserialize
+    // into the new struct without error.
+    let old_json = serde_json::json!({
+        "session_token_total": 100,
+        "session_token_p14d_avg": 50.0,
+        "request_count_this_hour": 5,
+        "credential_alerts_24h": 0,
+        "topic_cluster_ids_seen": [],
+        "models_used_this_session": ["gpt-4o"],
+        "last_system_prompt_hash": null,
+        "max_tool_depth_seen": 2,
+        "request_count": 10,
+        "total_tokens": 5000,
+        "total_cost_usd": 0.5,
+        "credential_alerts": 0,
+        "embedding_centroid": null,
+        "prior_semantic_hashes": [],
+        "last_model": "gpt-4o",
+        "current_request_timestamp": 1700000000000_i64,
+        "last_request_timestamp": null
+    });
+    let snapshot: SessionSnapshot =
+        serde_json::from_value(old_json).expect("old format must deserialize");
+    assert_eq!(snapshot.session_token_total, 100);
+    // Dedup fields fall back to defaults.
+    assert!(snapshot.seen_prefix_hashes.is_empty());
+    assert!(snapshot.seen_code_hashes.is_empty());
+    assert!(snapshot.session_key_hash.is_empty());
+}
+
+#[test]
+fn session_snapshot_is_clone_no_arc() {
+    let snapshot = SessionSnapshot {
+        session_key_hash: "abc123".to_string(),
+        seen_prefix_hashes: vec!["h1".to_string(), "h2".to_string()],
+        seen_code_hashes: vec!["c1".to_string()],
+        ..SessionSnapshot::default()
+    };
+    let cloned = snapshot.clone();
+    assert_eq!(cloned.session_key_hash, "abc123");
+    assert_eq!(cloned.seen_prefix_hashes.len(), 2);
+}
+
+#[test]
+fn session_struct_constructs_with_defaults() {
+    use std::collections::VecDeque;
+    let session = Session {
+        key: SessionKey {
+            app_identity: SessionAppIdentity::NativeApp {
+                identity: "vscode".to_string(),
+            },
+            window_start: 1700000,
+        },
+        code_hash_ring: VecDeque::new(),
+        prefix_hash_ring: VecDeque::new(),
+        stats: soth_core::SessionStats::default(),
+        anomaly_baseline: soth_core::AnomalyBaseline::default(),
+        created_at: 1700000000000,
+        last_activity: 1700000000000,
+    };
+    assert_eq!(session.stats.request_count, 0);
+    assert_eq!(session.anomaly_baseline.avg_tokens_per_request, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Extension types contract
+// ---------------------------------------------------------------------------
+
+#[test]
+fn governable_event_embed_content_is_serde_skip() {
+    let event = GovernableEvent {
+        event_id: Uuid::new_v4(),
+        timestamp_epoch_ms: 1_700_000_000_000,
+        source: EventSource::Http,
+        provider: soth_core::DetectedProvider::Anthropic,
+        model: Some("claude-sonnet-4-6".to_string()),
+        endpoint_type: EndpointType::ChatCompletion,
+        normalized: None,
+        artifacts: vec![],
+        capture_mode: CaptureMode::MetadataOnly,
+        embed_content: Some("secret local content".to_string()),
+        context: ExtensionContext::default(),
+    };
+
+    let value = serde_json::to_value(&event).expect("serialize governable event");
+    let obj = value.as_object().expect("must be object");
+    // embed_content must NOT appear in serialized output.
+    assert!(
+        !obj.contains_key("embed_content"),
+        "embed_content must be skipped during serialization"
+    );
+
+    // Deserializing without embed_content yields None.
+    let deserialized: GovernableEvent =
+        serde_json::from_value(value).expect("deserialize governable event");
+    assert!(deserialized.embed_content.is_none());
+}
+
+#[test]
+fn event_source_variants_serialize_correctly() {
+    let http = serde_json::to_value(EventSource::Http).unwrap();
+    assert_eq!(http["kind"], "http");
+
+    let ext = serde_json::to_value(EventSource::Extension {
+        ext_type: ExtensionType::Historian,
+    })
+    .unwrap();
+    assert_eq!(ext["kind"], "extension");
+    assert_eq!(ext["ext_type"], "historian");
+
+    let custom = serde_json::to_value(EventSource::Extension {
+        ext_type: ExtensionType::Custom("my-ext".to_string()),
+    })
+    .unwrap();
+    assert_eq!(custom["ext_type"]["custom"], "my-ext");
+}
+
+#[test]
+fn session_mutations_serde_roundtrip() {
+    let mutations = SessionMutations {
+        new_prefix_hash: Some("prefix-abc".to_string()),
+        new_code_hashes: vec![soth_core::CodeBlob {
+            ast_normalized_hash: "hash123".to_string(),
+            language: "rust".to_string(),
+            first_event_id: Uuid::new_v4(),
+        }],
+        token_delta: 150,
+        cost_delta: 0.003,
+        anomaly_update: Some(soth_core::AnomalyDelta {
+            token_burst: true,
+            topic_drift: false,
+            model_switch: false,
+        }),
+        credential_alert: false,
+    };
+    let json = serde_json::to_string(&mutations).expect("serialize");
+    let back: SessionMutations = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.new_prefix_hash, Some("prefix-abc".to_string()));
+    assert_eq!(back.token_delta, 150);
+    assert!(back.anomaly_update.unwrap().token_burst);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: TelemetryEvent session/dedup fields backward-compat
+// ---------------------------------------------------------------------------
+
+#[test]
+fn telemetry_event_new_fields_deserialize_from_old_format() {
+    // Old format without the new session/dedup fields
+    let old_json = serde_json::json!({
+        "event_id": "00000000-0000-0000-0000-000000000001",
+        "timestamp_epoch_ms": 1700000000000_i64,
+        "provider": "open_ai",
+        "model": "gpt-4o",
+        "endpoint_type": "chat_completion",
+        "parse_confidence": "full",
+        "parse_source": {"kind": "heuristic"},
+        "capture_mode": "metadata_only",
+        "use_case": "unknown",
+        "volatility_class": "static",
+        "request_method": "post",
+        "languages": [],
+        "import_categories": [],
+        "classification_flags": [],
+        "anomaly_flags": [],
+        "sensitive_code_flags": {
+            "credential_pattern_detected": false,
+            "auth_logic_detected": false,
+            "crypto_operations_detected": false,
+            "network_calls_detected": false,
+            "file_io_detected": false,
+            "org_pattern_matches": [],
+            "private_key_detected": false,
+            "hardcoded_secret_detected": false
+        }
+    });
+
+    let event: soth_core::TelemetryEvent = serde_json::from_value(old_json)
+        .expect("old format should deserialize with new fields defaulting");
+
+    assert_eq!(event.session_key_hash, "");
+    assert!(!event.is_prefix_repeat);
+    assert!(!event.is_code_context_repeat);
+    assert_eq!(event.novel_token_count, 0);
+    assert_eq!(event.repeated_token_count, 0);
+    assert_eq!(event.data_source, soth_core::DataSource::LiveProxy);
+    assert!(!event.is_historical);
+}
+
+#[test]
+fn telemetry_event_new_fields_serde_roundtrip() {
+    let event = soth_core::TelemetryEvent {
+        session_key_hash: "abc123".to_string(),
+        is_prefix_repeat: true,
+        is_code_context_repeat: false,
+        novel_token_count: 50,
+        repeated_token_count: 150,
+        first_step_event_id: Some("step-1".to_string()),
+        original_event_id: None,
+        prefix_hash: Some("pfx-hash".to_string()),
+        agent_step_number: Some(3),
+        is_historical: false,
+        data_source: soth_core::DataSource::LiveProxy,
+        original_timestamp: None,
+        event_id: uuid::Uuid::nil(),
+        timestamp_epoch_ms: 0,
+        connection_id: None,
+        provider: soth_core::DetectedProvider::Unknown,
+        model: None,
+        endpoint_type: EndpointType::Unknown,
+        parse_confidence: ParseConfidence::Heuristic,
+        parse_source: ParseSource::Heuristic,
+        capture_mode: CaptureMode::MetadataOnly,
+        use_case: UseCaseLabel::Unknown,
+        volatility_class: VolatilityClass::Static,
+        cache_level: None,
+        routing_reason: None,
+        request_method: RequestMethod::Post,
+        estimated_input_tokens: None,
+        estimated_output_tokens: None,
+        estimated_cost_usd: None,
+        process_resolution: None,
+        traffic_classification: None,
+        languages: Vec::new(),
+        import_categories: Vec::new(),
+        classification_flags: Vec::new(),
+        anomaly_flags: Vec::new(),
+        anomaly_score: None,
+        policy_kind: None,
+        bundle_trust_level: None,
+        sensitive_code_flags: soth_core::SensitiveCodeFlags::default(),
+        topic_cluster_id: 0,
+        semantic_hash: String::new(),
+        is_semantic_collision: false,
+        endpoint_hash: String::new(),
+        policy_rule_id: None,
+    };
+
+    let json = serde_json::to_string(&event).expect("serialize");
+    let roundtrip: soth_core::TelemetryEvent = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(roundtrip.session_key_hash, "abc123");
+    assert!(roundtrip.is_prefix_repeat);
+    assert_eq!(roundtrip.novel_token_count, 50);
+    assert_eq!(roundtrip.repeated_token_count, 150);
+    assert_eq!(roundtrip.first_step_event_id.as_deref(), Some("step-1"));
+    assert_eq!(roundtrip.agent_step_number, Some(3));
 }

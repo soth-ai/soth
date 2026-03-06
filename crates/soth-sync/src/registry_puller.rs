@@ -4,14 +4,15 @@ use base64::Engine;
 use chrono::Utc;
 use reqwest::header::{HeaderMap, ETAG, IF_NONE_MATCH};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache;
 use crate::http_client::SothHttpClient;
+use soth_core::normalize_bundle_host_pattern;
 
 #[derive(Debug, Clone)]
 pub struct RegistryPullOutcome {
@@ -44,6 +45,10 @@ pub trait BundleWatcher: Send + Sync {
         assets: HashMap<String, Vec<u8>>,
     ) -> anyhow::Result<String> {
         self.install_bundle(manifest_bytes, assets)
+    }
+
+    fn allow_registry_projection_install(&self) -> bool {
+        false
     }
 }
 
@@ -159,7 +164,7 @@ impl RegistryPuller {
 
     /// Force a registry refresh attempt against cloud.
     ///
-    /// Unlike `sync_from_hint`, this always checks `/v1/bundle/current`
+    /// Unlike `sync_from_hint`, this always checks `/v1/edge/bundle/current`
     /// and uses ETag revalidation to avoid unnecessary downloads.
     pub async fn refresh_now(&self) -> anyhow::Result<RegistryPullOutcome> {
         let cached = match cache::load_registry_bundle_cache(&self.cache_path) {
@@ -334,25 +339,44 @@ impl RegistryPuller {
                                 );
                             }
                         })?;
+                        let projected_install = self
+                            .maybe_install_registry_projection_bundle(&verified_metadata, &bytes)
+                            .inspect_err(|error| {
+                                tracing::warn!(
+                                    error = %error,
+                                    "Registry bundle projection install failed"
+                                );
+                            })?;
+                        let (ack_bundle_version, install_status, outcome_version) =
+                            if let Some(installed_version) = projected_install {
+                                (installed_version.clone(), "installed", installed_version)
+                            } else {
+                                (
+                                    verified_metadata.version.clone(),
+                                    "unknown",
+                                    verified_metadata.version.clone(),
+                                )
+                            };
                         self.send_bundle_install_ack(
                             endpoint,
-                            verified_metadata.version.as_str(),
+                            ack_bundle_version.as_str(),
                             bundle_hash.as_deref(),
-                            "installed",
+                            install_status,
                             source,
                         )
                         .await;
                         if endpoint != self.endpoint {
                             tracing::warn!(
                                 endpoint = endpoint,
-                                bundle_version = verified_metadata.version.as_str(),
+                                bundle_version = outcome_version.as_str(),
+                                install_status = install_status,
                                 "Registry bundle refresh succeeded via fallback endpoint"
                             );
                         }
                         Ok(RegistryPullOutcome {
                             checked: true,
                             downloaded: true,
-                            version: Some(verified_metadata.version),
+                            version: Some(outcome_version),
                         })
                     }
                     Err(error) => {
@@ -378,10 +402,10 @@ impl RegistryPuller {
         fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<BundleFetchResultWithMetadata> {
         let cloud = self.cloud_client_for_endpoint(endpoint);
-        let url = cloud.url("/v1/bundle/current");
+        let url = cloud.url("/v1/edge/bundle/current");
         let mut query_params = vec![("type", self.bundle_type.clone())];
         query_params.extend(build_bundle_query_pairs(fetch_query));
-        let mut request = cloud.get("/v1/bundle/current").query(&query_params);
+        let mut request = cloud.get("/v1/edge/bundle/current").query(&query_params);
 
         if let Some(if_none_match) = if_none_match {
             request = request.header(IF_NONE_MATCH, if_none_match);
@@ -458,7 +482,7 @@ impl RegistryPuller {
         };
 
         let ack_result = self
-            .post_bundle_ack(endpoint, "/v1/bundle/ack", &payload)
+            .post_bundle_ack(endpoint, "/v1/edge/bundle/ack", &payload)
             .await;
 
         match ack_result {
@@ -511,6 +535,751 @@ impl RegistryPuller {
             .context("installing channel 2 intelligence bundle")?;
         Ok(Some(version))
     }
+
+    fn maybe_install_registry_projection_bundle(
+        &self,
+        metadata: &RegistryVersionResponse,
+        bytes: &[u8],
+    ) -> anyhow::Result<Option<String>> {
+        let Some(hook) = self.bundle_watcher.as_ref() else {
+            return Ok(None);
+        };
+        if !hook.allow_registry_projection_install() {
+            return Ok(None);
+        }
+
+        let bundle_dir = self
+            .cache_path
+            .parent()
+            .context("registry cache path has no parent directory for bundle projection")?;
+        let raw_payload: Value = serde_json::from_slice(bytes)
+            .context("failed parsing registry bundle projection payload as JSON")?;
+        let normalized_bundle = normalize_registry_bundle_payload(raw_payload);
+        let (manifest_bytes, assets) =
+            build_projected_runtime_bundle(bundle_dir, metadata, &normalized_bundle)?;
+        let version = hook
+            .install(manifest_bytes.as_slice(), assets)
+            .context("installing projected registry bundle")?;
+        Ok(Some(version))
+    }
+}
+
+fn normalize_registry_bundle_payload(bundle: Value) -> Value {
+    let Some(object) = bundle.as_object() else {
+        return bundle;
+    };
+    if let Some(inner) = object.get("bundle").cloned() {
+        return inner;
+    }
+    if let Some(inner) = object.get("compiled_bundle").cloned() {
+        return inner;
+    }
+    if let Some(data) = object.get("data").and_then(Value::as_object) {
+        if let Some(inner) = data.get("bundle").cloned() {
+            return inner;
+        }
+        if let Some(inner) = data.get("compiled_bundle").cloned() {
+            return inner;
+        }
+    }
+    bundle
+}
+
+fn build_projected_runtime_bundle(
+    bundle_dir: &Path,
+    metadata: &RegistryVersionResponse,
+    normalized_bundle: &Value,
+) -> anyhow::Result<(Vec<u8>, HashMap<String, Vec<u8>>)> {
+    let manifest_path = bundle_dir.join("manifest.json");
+    let manifest_bytes = std::fs::read(&manifest_path).with_context(|| {
+        format!(
+            "failed reading existing runtime bundle manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let mut manifest: Value = serde_json::from_slice(manifest_bytes.as_slice())
+        .context("failed parsing existing runtime bundle manifest JSON")?;
+    let manifest_obj = manifest
+        .as_object_mut()
+        .context("existing runtime bundle manifest must be a JSON object")?;
+
+    let mut assets = HashMap::new();
+    for path in manifest_asset_paths(manifest_obj)? {
+        if path == "detect/bundle.json"
+            || path == "gating/bundle.json"
+            || path == "registry/raw_bundle.json"
+        {
+            continue;
+        }
+        let asset_path = bundle_dir.join(path.as_str());
+        let bytes = std::fs::read(&asset_path).with_context(|| {
+            format!(
+                "failed reading existing bundle asset required for projection {}",
+                asset_path.display()
+            )
+        })?;
+        assets.insert(path, bytes);
+    }
+
+    let current_detect_path = bundle_dir.join("detect/bundle.json");
+    let current_detect = std::fs::read(&current_detect_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes.as_slice()).ok());
+    let passthrough_domains = current_detect
+        .as_ref()
+        .map(extract_passthrough_domains)
+        .unwrap_or_default();
+
+    let projected_detect = project_detect_bundle(normalized_bundle, passthrough_domains.as_slice());
+    let projected_gating = project_gating_bundle(normalized_bundle, &projected_detect);
+    let raw_registry_bundle =
+        serde_json::to_vec(normalized_bundle).context("failed serializing raw registry bundle")?;
+
+    let detect_bytes = serde_json::to_vec(&projected_detect)
+        .context("failed serializing projected detect bundle")?;
+    let gating_bytes = serde_json::to_vec(&projected_gating)
+        .context("failed serializing projected gating bundle")?;
+
+    assets.insert("detect/bundle.json".to_string(), detect_bytes);
+    assets.insert("gating/bundle.json".to_string(), gating_bytes);
+    assets.insert("registry/raw_bundle.json".to_string(), raw_registry_bundle);
+
+    let mut asset_entries = assets
+        .iter()
+        .map(|(path, bytes)| {
+            serde_json::json!({
+                "path": path,
+                "sha256": sha256_hex(bytes),
+                "size_bytes": bytes.len() as u64
+            })
+        })
+        .collect::<Vec<_>>();
+    asset_entries.sort_by(|left, right| {
+        left.get("path")
+            .and_then(Value::as_str)
+            .cmp(&right.get("path").and_then(Value::as_str))
+    });
+
+    let projected_version = normalize_optional(Some(metadata.version.as_str()))
+        .or_else(|| bundle_version_from_payload(normalized_bundle))
+        .unwrap_or_else(|| "registry-projected".to_string());
+    manifest_obj.insert("version".to_string(), Value::String(projected_version));
+    manifest_obj.insert(
+        "created_at".to_string(),
+        Value::Number(serde_json::Number::from(Utc::now().timestamp())),
+    );
+    manifest_obj.insert("vendor_sig".to_string(), Value::String(String::new()));
+    manifest_obj.insert("assets".to_string(), Value::Array(asset_entries));
+    ensure_manifest_scope(manifest_obj);
+
+    let projected_manifest_bytes =
+        serde_json::to_vec(&manifest).context("failed serializing projected manifest")?;
+    Ok((projected_manifest_bytes, assets))
+}
+
+fn bundle_version_from_payload(bundle: &Value) -> Option<String> {
+    bundle
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("bundle_version"))
+        .and_then(Value::as_str)
+        .and_then(|value| normalize_optional(Some(value)))
+}
+
+fn manifest_asset_paths(manifest: &Map<String, Value>) -> anyhow::Result<Vec<String>> {
+    let entries = manifest
+        .get("assets")
+        .and_then(Value::as_array)
+        .context("runtime manifest missing assets array")?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|value| normalize_optional(Some(value)))
+            .context("runtime manifest asset entry missing path")?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn ensure_manifest_scope(manifest: &mut Map<String, Value>) {
+    if manifest.get("scope").and_then(Value::as_object).is_some() {
+        return;
+    }
+    manifest.insert(
+        "scope".to_string(),
+        serde_json::json!({
+            "intercept_https": true,
+            "intercept_http": true,
+            "process_filter": null,
+            "capture_modes": ["metadata_only", "sensitive_artifacts", "full"]
+        }),
+    );
+}
+
+fn extract_passthrough_domains(detect_bundle: &Value) -> Vec<String> {
+    unique_strings(string_array(detect_bundle.get("passthrough_domains")))
+}
+
+fn project_detect_bundle(bundle: &Value, passthrough_domains: &[String]) -> Value {
+    let llm_providers = bundle
+        .get("llm_providers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let applications = bundle
+        .get("applications")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let formats = bundle
+        .get("formats")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let filters = bundle
+        .get("filters")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let interception = bundle
+        .get("interception")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let app_policies = interception
+        .get("app_policies")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let browser_policies = interception
+        .get("browser_policies")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut rest_formats = Map::new();
+    for (format_id, format_value) in formats {
+        let request = format_value
+            .get("request")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let response = format_value
+            .get("response")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        rest_formats.insert(
+            format_id,
+            serde_json::json!({
+                "tier": null,
+                "request": {
+                    "model": normalize_string(request.get("model")),
+                    "messages": normalize_string(request.get("messages")),
+                    "message": normalize_string(request.get("message")),
+                    "chat_history": normalize_string(request.get("chat_history")),
+                    "contents": normalize_string(request.get("contents")),
+                    "system": normalize_string(request.get("system")),
+                    "system_instruction": normalize_string(request.get("system_instruction")),
+                    "tools": normalize_string(request.get("tools")),
+                    "tool_choice": normalize_string(request.get("tool_choice")),
+                    "max_tokens": normalize_string(request.get("max_tokens"))
+                        .or_else(|| normalize_string(value_at_path(&format_value, &["request", "generation_config", "max_output_tokens"]))),
+                    "temperature": normalize_string(request.get("temperature"))
+                        .or_else(|| normalize_string(value_at_path(&format_value, &["request", "generation_config", "temperature"]))),
+                    "top_p": normalize_string(request.get("top_p"))
+                        .or_else(|| normalize_string(value_at_path(&format_value, &["request", "generation_config", "top_p"]))),
+                    "stream": normalize_string(request.get("stream")),
+                    "stop": normalize_string(request.get("stop"))
+                },
+                "response": {
+                    "content": normalize_string(value_at_path(&Value::Object(response.clone()), &["json", "extract", "content"])),
+                    "model": normalize_string(value_at_path(&Value::Object(response.clone()), &["json", "extract", "model"])),
+                    "finish_reason": normalize_string(value_at_path(&Value::Object(response.clone()), &["json", "extract", "finish_reason"])),
+                    "input_tokens": normalize_string(value_at_path(&Value::Object(response.clone()), &["json", "extract_usage", "input_tokens"]))
+                        .or_else(|| normalize_string(value_at_path(&Value::Object(response.clone()), &["json", "extract_usage", "prompt_tokens"]))),
+                    "output_tokens": normalize_string(value_at_path(&Value::Object(response.clone()), &["json", "extract_usage", "output_tokens"]))
+                        .or_else(|| normalize_string(value_at_path(&Value::Object(response.clone()), &["json", "extract_usage", "completion_tokens"]))),
+                    "stop_reason": normalize_string(value_at_path(&Value::Object(response.clone()), &["json", "extract", "stop_reason"]))
+                },
+                "system_in_messages": value_at_path(&format_value, &["request", "system"]).is_none(),
+                "content_blocks": false,
+                "chat_history_mode": value_at_path(&format_value, &["request", "chat_history"]).is_some(),
+                "model_from_url_segment": match normalize_string(request.get("model")).as_deref() {
+                    Some("{url_path}") => Some("/models/".to_string()),
+                    _ => None,
+                },
+                "role_map": {},
+                "model_id_parse": matches!(normalize_string(request.get("model")).as_deref(), Some("{url_path}")),
+                "ephemeral_request_fields": []
+            }),
+        );
+    }
+
+    let full_capture_providers = llm_providers
+        .iter()
+        .filter_map(|(provider_id, provider_value)| {
+            let mode = normalize_string(value_at_path(provider_value, &["capture", "mode"]))
+                .unwrap_or_else(|| "metadata_only".to_string());
+            if mode != "metadata_only" {
+                Some(provider_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut detect_providers = Map::new();
+    for (provider_id, provider_value) in &llm_providers {
+        detect_providers.insert(
+            provider_id.clone(),
+            serde_json::json!({
+                "provider_id": normalize_string(provider_value.get("id")).unwrap_or_else(|| provider_id.clone()),
+                "name": normalize_string(provider_value.get("name")).unwrap_or_else(|| provider_id.clone()),
+                "api_format": normalize_string(provider_value.get("api_format")),
+                "provider_type": normalize_string(provider_value.get("type")),
+                "pricing": provider_value.get("pricing").cloned(),
+                "capture": value_at_path(provider_value, &["capture"]).cloned(),
+                "detection": value_at_path(provider_value, &["detection"]).cloned()
+            }),
+        );
+    }
+
+    let mut detect_apps = Map::new();
+    for (app_id, app_value) in &applications {
+        let process_rules = value_at_path(app_value, &["detection", "process_rules"])
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let bundle_ids = unique_strings(
+            process_rules
+                .iter()
+                .filter_map(|rule| normalize_string(rule.get("bundle_id")))
+                .collect(),
+        );
+        let process_names = unique_strings(
+            process_rules
+                .iter()
+                .filter_map(|rule| normalize_string(rule.get("process_name")))
+                .collect(),
+        );
+        detect_apps.insert(
+            app_id.clone(),
+            serde_json::json!({
+                "app_id": normalize_string(app_value.get("id")).unwrap_or_else(|| app_id.clone()),
+                "name": normalize_string(app_value.get("name")).unwrap_or_else(|| app_id.clone()),
+                "bundle_ids": bundle_ids,
+                "process_names": process_names,
+                "app_type": normalize_string(app_value.get("type")),
+                "pricing": app_value.get("pricing").cloned(),
+                "capture": value_at_path(app_value, &["capture"]).cloned(),
+                "detection": value_at_path(app_value, &["detection"]).cloned()
+            }),
+        );
+    }
+
+    let filter_keywords = unique_strings(
+        string_array(filters.get("keywords"))
+            .into_iter()
+            .chain(string_array(filters.get("path_patterns")))
+            .chain(string_array(filters.get("domain_patterns")))
+            .collect(),
+    );
+    let mut projected_policies = Map::new();
+    for (app_id, policy_value) in &app_policies {
+        let display_name = applications
+            .get(app_id)
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str);
+        projected_policies.insert(
+            app_id.clone(),
+            serde_json::json!({
+                "app_id": app_id,
+                "display_name": display_name,
+                "app_kind": map_app_kind(normalize_string(policy_value.get("app_type")).as_deref()),
+                "action": normalize_string(policy_value.get("action")),
+                "capture_mode": normalize_string(policy_value.get("capture_mode")),
+                "enabled": policy_value.get("enabled").and_then(Value::as_bool),
+                "host_filter": normalize_string(policy_value.get("host_filter")),
+                "host_list_ref": normalize_string(policy_value.get("host_list_ref"))
+            }),
+        );
+    }
+
+    let allowed_apps = unique_strings(string_array(browser_policies.get("allowed_apps")));
+    let allowed_browsers = unique_strings(string_array(browser_policies.get("allowed_browsers")));
+    let collectors = bundle
+        .get("collectors")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "rest_formats": Value::Object(rest_formats),
+        "graphql_operations": {
+            "version": null,
+            "operations": [],
+            "heuristic_patterns": []
+        },
+        "grpc_services": {
+            "version": null,
+            "services": []
+        },
+        "capture_rules": {
+            "default_mode": "metadata_only",
+            "full_capture_providers": full_capture_providers,
+            "org_overrides": {
+                "full_capture_providers": [],
+                "metadata_only_providers": []
+            }
+        },
+        "domain_index": bundle.get("domain_index").cloned().unwrap_or_else(|| Value::Object(Map::new())),
+        "detection_index": bundle.get("detection_index").cloned().unwrap_or_else(|| Value::Object(Map::new())),
+        "llm_providers": Value::Object(detect_providers),
+        "applications": Value::Object(detect_apps),
+        "filters": {
+            "path_keywords": filter_keywords,
+            "header_keywords": [],
+            "domain_patterns": string_array(filters.get("domain_patterns")),
+            "path_patterns": string_array(filters.get("path_patterns")),
+            "keywords": string_array(filters.get("keywords"))
+        },
+        "app_policies": Value::Object(projected_policies),
+        "browser_policies": {
+            "allowed_apps": allowed_apps,
+            "allowed_browsers": allowed_browsers,
+            "default_action": normalize_string(browser_policies.get("default_action"))
+        },
+        "passthrough_domains": passthrough_domains,
+        "collectors": Value::Object(collectors),
+        "source_metadata": bundle.get("metadata").cloned()
+    })
+}
+
+fn project_gating_bundle(bundle: &Value, detect_bundle: &Value) -> Value {
+    let llm_providers = bundle
+        .get("llm_providers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let applications = bundle
+        .get("applications")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let interception = bundle
+        .get("interception")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let app_policies = interception
+        .get("app_policies")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let browser_policies = interception
+        .get("browser_policies")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let defaults = interception
+        .get("defaults")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut identity_hosts = Map::new();
+    let mut identity_non_hosts = Map::new();
+    for (entity_id, policy_value) in &app_policies {
+        let app_type = normalize_string(policy_value.get("app_type"))
+            .unwrap_or_else(|| "non_host".to_string());
+        let target = if app_type == "host" {
+            &mut identity_hosts
+        } else {
+            &mut identity_non_hosts
+        };
+        target.insert(
+            entity_id.clone(),
+            serde_json::json!({
+                "entity_id": entity_id,
+                "app_type": if app_type == "host" { "host" } else { "non_host" },
+                "capture_mode": map_capture_mode(normalize_string(policy_value.get("capture_mode")).as_deref()),
+                "action": map_process_action(normalize_string(policy_value.get("action")).as_deref()),
+                "enabled": policy_value.get("enabled").and_then(Value::as_bool),
+                "host_filter": normalize_string(policy_value.get("host_filter")),
+                "host_list_ref": normalize_string(policy_value.get("host_list_ref"))
+            }),
+        );
+    }
+    for browser_id in unique_strings(
+        string_array(browser_policies.get("allowed_apps"))
+            .into_iter()
+            .chain(string_array(browser_policies.get("allowed_browsers")))
+            .collect(),
+    ) {
+        identity_hosts.insert(
+            browser_id.clone(),
+            serde_json::json!({
+                "entity_id": browser_id,
+                "app_type": "host",
+                "capture_mode": "metadata_only",
+                "action": "intercept",
+                "enabled": true,
+                "host_filter": null,
+                "host_list_ref": null
+            }),
+        );
+    }
+
+    let tls_intercept_hosts = unique_strings(
+        llm_providers
+            .values()
+            .chain(applications.values())
+            .flat_map(extract_detection_host_patterns)
+            .collect(),
+    );
+    let passthrough_domains = unique_strings(
+        string_array(detect_bundle.get("passthrough_domains"))
+            .into_iter()
+            .filter_map(|value| normalize_bundle_host_pattern(value.as_str()))
+            .collect(),
+    );
+
+    let catalogs = bundle
+        .get("catalogs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let filters = bundle
+        .get("filters")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let blacklisted_keywords = unique_strings(
+        string_array(catalogs.get("analytics_blocklist"))
+            .into_iter()
+            .chain(string_array(filters.get("keywords")))
+            .chain(string_array(filters.get("path_patterns")))
+            .collect(),
+    );
+    let allowed_host_origins = unique_strings(
+        string_array(catalogs.get("ai_catalog"))
+            .into_iter()
+            .filter_map(|value| normalize_bundle_host_pattern(value.as_str()))
+            .collect(),
+    );
+
+    let providers = llm_providers
+        .iter()
+        .map(|(entity_id, entry)| project_entity_rule(entity_id, entry))
+        .collect::<Vec<_>>();
+    let web_apps = applications
+        .iter()
+        .map(|(entity_id, entry)| project_entity_rule(entity_id, entry))
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "schema_version": 2,
+        "identity_index": {
+            "hosts": Value::Object(identity_hosts),
+            "non_hosts": Value::Object(identity_non_hosts)
+        },
+        "gates": {
+            "order": [
+                "stage0_tls",
+                "stage1_app_origin",
+                "stage2_whitelist",
+                "stage3_blacklist",
+                "stage4_app_type",
+                "stage5_host_origin",
+                "intercept"
+            ],
+            "defaults": {
+                "sensor_enabled": true,
+                "fail_open_on_config_error": true,
+                "unknown_app_action": map_unknown_app_action(
+                    normalize_string(defaults.get("whitelisted_unknown_app_action")).as_deref()
+                ),
+                "non_cataloged_host_action": map_non_cataloged_action(
+                    normalize_string(defaults.get("non_whitelisted_host_action")).as_deref()
+                ),
+                "source_unknown_app_action": normalize_string(defaults.get("unknown_app_action")),
+                "source_whitelisted_unknown_app_action": normalize_string(defaults.get("whitelisted_unknown_app_action")),
+                "source_non_whitelisted_host_action": normalize_string(defaults.get("non_whitelisted_host_action")),
+                "source_browser_default_action": normalize_string(browser_policies.get("default_action")),
+                "discovery": {
+                    "unknown_app_daily_limit": 1,
+                    "unknown_domain_daily_limit": 1
+                }
+            },
+            "stage0_tls": {
+                "tls_intercept_hosts": tls_intercept_hosts,
+                "passthrough_domains": passthrough_domains,
+                "enable_discovery": true
+            },
+            "stage1_app_origin": {
+                "skip_if_unresolved_process": true
+            },
+            "stage2_whitelist": {
+                "allow_empty_means_allow_all_except_denied": true
+            },
+            "stage3_blacklist": {
+                "blacklisted_keywords": blacklisted_keywords,
+                "blacklisted_path_substrings": string_array(catalogs.get("analytics_blocklist")),
+                "blacklisted_host_substrings": string_array(filters.get("domain_patterns")),
+                "graphql_operation_blacklist": [],
+                "graphql_operation_blacklist_enabled": false,
+                "match_type": "case_insensitive_substring"
+            },
+            "stage4_app_type": {
+                "derive_from_identity_index": true
+            },
+            "stage5_host_origin": {
+                "allowed_host_origins": allowed_host_origins,
+                "skip_for_discovery_capture": true
+            }
+        },
+        "entities": {
+            "providers": providers,
+            "web_apps": web_apps,
+            "native_apps": []
+        }
+    })
+}
+
+fn extract_detection_host_patterns(entry: &Value) -> Vec<String> {
+    value_at_path(entry, &["detection", "hosts"])
+        .and_then(Value::as_array)
+        .map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(|host| normalize_string(host.get("pattern")))
+                .filter_map(|pattern| normalize_bundle_host_pattern(pattern.as_str()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn project_entity_rule(entity_key: &str, entry: &Value) -> Value {
+    let entity_id = normalize_string(entry.get("id")).unwrap_or_else(|| entity_key.to_string());
+    let capture_mode =
+        map_capture_mode(normalize_string(value_at_path(entry, &["capture", "mode"])).as_deref());
+    let methods = string_array(value_at_path(entry, &["capture", "methods"]));
+
+    let hosts = value_at_path(entry, &["detection", "hosts"])
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|host| {
+                    let pattern = normalize_string(host.get("pattern"))
+                        .and_then(|value| normalize_bundle_host_pattern(value.as_str()))?;
+                    Some(serde_json::json!({
+                        "pattern": pattern,
+                        "methods": methods.clone(),
+                        "paths": {
+                            "deny_exact": string_array(value_at_path(host, &["paths", "deny_exact"])),
+                            "deny_glob": string_array(value_at_path(host, &["paths", "deny_glob"])),
+                            "allow": string_array(value_at_path(host, &["paths", "allow"]))
+                        },
+                        "priority": host.get("priority").and_then(Value::as_u64).map(|value| value as u32)
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "entity_id": entity_id,
+        "capture_mode": capture_mode,
+        "hosts": hosts,
+        "api_format": normalize_string(entry.get("api_format")),
+        "entity_type": normalize_string(entry.get("type")),
+        "pricing": entry.get("pricing").cloned(),
+        "capture": value_at_path(entry, &["capture"]).cloned(),
+        "detection": value_at_path(entry, &["detection"]).cloned()
+    })
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |current, segment| {
+        current.as_object().and_then(|object| object.get(*segment))
+    })
+}
+
+fn normalize_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|raw| normalize_optional(Some(raw)))
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|raw| normalize_optional(Some(raw)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn unique_strings(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn map_app_kind(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("unknown") {
+        "host" => "browser",
+        "non_host" => "agent_app",
+        "ide" => "ide",
+        "cli" => "cli",
+        _ => "unknown",
+    }
+}
+
+fn map_capture_mode(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("metadata_only") {
+        "full" => "full",
+        "sensitive_artifacts" => "sensitive_artifacts",
+        "full_content" => "full_content",
+        _ => "metadata_only",
+    }
+}
+
+fn map_process_action(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("intercept") {
+        "block" => "block",
+        "skip" | "passthrough" => "skip",
+        _ => "intercept",
+    }
+}
+
+fn map_unknown_app_action(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("skip") {
+        "block" => "block",
+        "intercept" | "host_only" => "intercept",
+        _ => "skip",
+    }
+}
+
+fn map_non_cataloged_action(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("skip") {
+        "tunnel" | "passthrough" => "passthrough",
+        _ => "skip",
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 enum BundleFetchResultWithMetadata {
@@ -842,13 +1611,14 @@ fn decode_bytes_like(raw_bytes: &[u8], raw: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::{
         build_bundle_query_pairs, extract_required_etag, normalize_etag,
-        parse_channel2_bundle_payload, should_skip_pull, verify_bundle_integrity, BundleWatcher,
-        RegistryPuller,
+        parse_channel2_bundle_payload, project_detect_bundle, should_skip_pull,
+        verify_bundle_integrity, BundleWatcher, RegistryPuller,
     };
     use crate::api_types::{RegistryBundleFetchQuery, RegistryVersionResponse};
     use base64::Engine;
     use reqwest::header::HeaderMap;
     use reqwest::header::{HeaderValue, ETAG};
+    use serde_json::Value;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1002,22 +1772,39 @@ mod tests {
 
     #[derive(Default)]
     struct MockHookState {
-        called: bool,
+        install_calls: usize,
+        last_manifest_version: Option<String>,
+        last_asset_paths: Vec<String>,
     }
 
     struct MockInstallHook {
         state: Arc<Mutex<MockHookState>>,
+        allow_projection: bool,
     }
 
     impl BundleWatcher for MockInstallHook {
         fn install_bundle(
             &self,
-            _manifest_bytes: &[u8],
-            _assets: HashMap<String, Vec<u8>>,
+            manifest_bytes: &[u8],
+            assets: HashMap<String, Vec<u8>>,
         ) -> anyhow::Result<String> {
+            let manifest: Value = serde_json::from_slice(manifest_bytes)?;
+            let version = manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("manifest.version missing"))?
+                .to_string();
             let mut guard = self.state.lock().unwrap();
-            guard.called = true;
-            Ok("bundle-installed-v1".to_string())
+            guard.install_calls = guard.install_calls.saturating_add(1);
+            guard.last_manifest_version = Some(version.clone());
+            let mut paths = assets.keys().cloned().collect::<Vec<_>>();
+            paths.sort();
+            guard.last_asset_paths = paths;
+            Ok(version)
+        }
+
+        fn allow_registry_projection_install(&self) -> bool {
+            self.allow_projection
         }
     }
 
@@ -1026,6 +1813,7 @@ mod tests {
         let state = Arc::new(Mutex::new(MockHookState::default()));
         let hook = Arc::new(MockInstallHook {
             state: state.clone(),
+            allow_projection: false,
         });
         let puller = RegistryPuller::new("https://example.com", "key", PathBuf::from("/tmp/cache"))
             .with_bundle_watcher(hook);
@@ -1052,7 +1840,291 @@ mod tests {
         let installed = puller
             .maybe_install_channel2_bundle(bytes.as_slice())
             .expect("install invocation should succeed");
-        assert_eq!(installed.as_deref(), Some("bundle-installed-v1"));
-        assert!(state.lock().unwrap().called);
+        assert_eq!(installed.as_deref(), Some("bundle-v1"));
+        assert_eq!(state.lock().unwrap().install_calls, 1);
+    }
+
+    #[test]
+    fn projected_registry_bundle_install_uses_existing_bundle_assets_when_allowed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bundle_dir = temp.path();
+        std::fs::create_dir_all(bundle_dir.join("detect")).expect("create detect dir");
+        std::fs::create_dir_all(bundle_dir.join("gating")).expect("create gating dir");
+
+        std::fs::write(
+            bundle_dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "local-v1",
+                "created_at": 1,
+                "vendor_sig": "",
+                "org_approval_sig": null,
+                "assets": [
+                    {"path":"detect/bundle.json","sha256":"", "size_bytes":2},
+                    {"path":"gating/bundle.json","sha256":"", "size_bytes":2}
+                ],
+                "scope": {
+                    "intercept_https": true,
+                    "intercept_http": true,
+                    "process_filter": null,
+                    "capture_modes": ["metadata_only"]
+                }
+            }))
+            .expect("manifest bytes"),
+        )
+        .expect("write manifest");
+        std::fs::write(
+            bundle_dir.join("detect/bundle.json"),
+            br#"{"passthrough_domains":["example.com"]}"#,
+        )
+        .expect("write detect");
+        std::fs::write(bundle_dir.join("gating/bundle.json"), br#"{}"#).expect("write gating");
+
+        let state = Arc::new(Mutex::new(MockHookState::default()));
+        let hook = Arc::new(MockInstallHook {
+            state: state.clone(),
+            allow_projection: true,
+        });
+        let cache_path = bundle_dir.join("registry_bundle_cache.json");
+        let puller =
+            RegistryPuller::new("https://example.com", "key", cache_path).with_bundle_watcher(hook);
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "bundle": {
+                "schema_version": 4,
+                "metadata": {
+                    "bundle_version": "bundle-v3",
+                    "compiled_at": "2026-03-03T00:00:00Z"
+                },
+                "llm_providers": {},
+                "applications": {},
+                "catalogs": {"ai_catalog": [], "analytics_blocklist": []},
+                "interception": {
+                    "app_policies": {},
+                    "browser_policies": {
+                        "allowed_apps": [],
+                        "allowed_browsers": [],
+                        "default_action": "intercept"
+                    },
+                    "defaults": {
+                        "non_whitelisted_host_action": "tunnel",
+                        "unknown_app_action": "host_only",
+                        "whitelisted_unknown_app_action": "intercept"
+                    }
+                },
+                "detection_index": {},
+                "domain_index": {},
+                "formats": {},
+                "filters": {"domain_patterns": [], "path_patterns": [], "keywords": []},
+                "collectors": {}
+            }
+        }))
+        .expect("payload bytes");
+        let metadata = RegistryVersionResponse {
+            bundle_type: "local".to_string(),
+            version: "bundle-v3".to_string(),
+            sha256: format!("{:x}", Sha256::digest(payload.as_slice())),
+            bundle_hash: None,
+            compiled_at: "2026-03-03T00:00:00Z".to_string(),
+            provider_count: 0,
+            domain_count: 0,
+            format_count: 0,
+            size_bytes: payload.len() as u64,
+            manifest: None,
+            channel: Some("stable".to_string()),
+        };
+
+        let installed = puller
+            .maybe_install_registry_projection_bundle(&metadata, payload.as_slice())
+            .expect("projection install should succeed");
+        assert_eq!(installed.as_deref(), Some("bundle-v3"));
+
+        let guard = state.lock().expect("mock state");
+        assert_eq!(guard.install_calls, 1);
+        assert_eq!(guard.last_manifest_version.as_deref(), Some("bundle-v3"));
+        assert!(guard
+            .last_asset_paths
+            .contains(&"detect/bundle.json".to_string()));
+        assert!(guard
+            .last_asset_paths
+            .contains(&"gating/bundle.json".to_string()));
+        assert!(guard
+            .last_asset_paths
+            .contains(&"registry/raw_bundle.json".to_string()));
+    }
+
+    #[test]
+    fn project_detect_bundle_preserves_rich_provider_and_policy_fields() {
+        let bundle = serde_json::json!({
+            "llm_providers": {
+                "openai": {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "type": "ai-inference",
+                    "api_format": "openai",
+                    "pricing": {"default": {"input_per_million_usd": 5.0}},
+                    "capture": {"mode": "full", "methods": ["POST"]},
+                    "detection": {
+                        "hosts": [{"pattern": "api.openai.com", "paths": {"allow": ["/v1/*"], "deny_exact": [], "deny_glob": []}}],
+                        "path_patterns": ["**/v1/**"],
+                        "header_hints": {"x-openai-client": "openai"}
+                    }
+                }
+            },
+            "applications": {
+                "chrome": {
+                    "id": "chrome",
+                    "name": "Google Chrome",
+                    "type": "browser",
+                    "pricing": {},
+                    "capture": {"mode": "metadata_only"},
+                    "detection": {
+                        "process_rules": [{"bundle_id": "com.google.Chrome", "process_name": "chrome"}],
+                        "hosts": [{"pattern": "chatgpt.com", "paths": {"allow": [], "deny_exact": [], "deny_glob": []}}]
+                    }
+                }
+            },
+            "formats": {},
+            "filters": {
+                "domain_patterns": ["*.openai.com"],
+                "path_patterns": ["/v1/**"],
+                "keywords": ["telemetry"]
+            },
+            "interception": {
+                "app_policies": {
+                    "chrome": {
+                        "app_type": "host",
+                        "action": "intercept",
+                        "capture_mode": "metadata_only",
+                        "enabled": true,
+                        "host_filter": "*.openai.com",
+                        "host_list_ref": "ai_catalog"
+                    }
+                },
+                "browser_policies": {
+                    "allowed_apps": ["chrome"],
+                    "allowed_browsers": [],
+                    "default_action": "intercept"
+                }
+            },
+            "domain_index": {"api.openai.com": "openai"},
+            "detection_index": {},
+            "collectors": {"collector_a": {"enabled": true}},
+            "metadata": {"bundle_version": "bundle-v-rich"}
+        });
+
+        let projected = project_detect_bundle(&bundle, &[]);
+
+        assert_eq!(
+            projected["llm_providers"]["openai"]["provider_type"],
+            serde_json::json!("ai-inference")
+        );
+        assert_eq!(
+            projected["llm_providers"]["openai"]["pricing"],
+            serde_json::json!({"default": {"input_per_million_usd": 5.0}})
+        );
+        assert_eq!(
+            projected["llm_providers"]["openai"]["capture"]["mode"],
+            serde_json::json!("full")
+        );
+        assert_eq!(
+            projected["llm_providers"]["openai"]["detection"]["hosts"][0]["pattern"],
+            serde_json::json!("api.openai.com")
+        );
+        assert_eq!(
+            projected["applications"]["chrome"]["app_type"],
+            serde_json::json!("browser")
+        );
+        assert_eq!(
+            projected["applications"]["chrome"]["capture"]["mode"],
+            serde_json::json!("metadata_only")
+        );
+        assert_eq!(
+            projected["app_policies"]["chrome"]["host_filter"],
+            serde_json::json!("*.openai.com")
+        );
+        assert_eq!(
+            projected["collectors"]["collector_a"]["enabled"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            projected["source_metadata"]["bundle_version"],
+            serde_json::json!("bundle-v-rich")
+        );
+    }
+
+    #[test]
+    fn projected_registry_bundle_install_skips_when_not_allowed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bundle_dir = temp.path();
+        std::fs::create_dir_all(bundle_dir.join("detect")).expect("create detect dir");
+        std::fs::create_dir_all(bundle_dir.join("gating")).expect("create gating dir");
+        std::fs::write(
+            bundle_dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "local-v1",
+                "created_at": 1,
+                "vendor_sig": "",
+                "org_approval_sig": null,
+                "assets": [
+                    {"path":"detect/bundle.json","sha256":"", "size_bytes":2},
+                    {"path":"gating/bundle.json","sha256":"", "size_bytes":2}
+                ],
+                "scope": {
+                    "intercept_https": true,
+                    "intercept_http": true,
+                    "process_filter": null,
+                    "capture_modes": ["metadata_only"]
+                }
+            }))
+            .expect("manifest bytes"),
+        )
+        .expect("write manifest");
+        std::fs::write(bundle_dir.join("detect/bundle.json"), br#"{}"#).expect("write detect");
+        std::fs::write(bundle_dir.join("gating/bundle.json"), br#"{}"#).expect("write gating");
+
+        let state = Arc::new(Mutex::new(MockHookState::default()));
+        let hook = Arc::new(MockInstallHook {
+            state: state.clone(),
+            allow_projection: false,
+        });
+        let cache_path = bundle_dir.join("registry_bundle_cache.json");
+        let puller =
+            RegistryPuller::new("https://example.com", "key", cache_path).with_bundle_watcher(hook);
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "bundle": {
+                "schema_version": 4,
+                "metadata": {"bundle_version": "bundle-v3", "compiled_at": "2026-03-03T00:00:00Z"},
+                "llm_providers": {},
+                "applications": {},
+                "catalogs": {"ai_catalog": [], "analytics_blocklist": []},
+                "interception": {"app_policies": {}, "browser_policies": {"allowed_apps": [], "allowed_browsers": [], "default_action": "intercept"}, "defaults": {"non_whitelisted_host_action": "tunnel", "unknown_app_action": "host_only", "whitelisted_unknown_app_action": "intercept"}},
+                "detection_index": {},
+                "domain_index": {},
+                "formats": {},
+                "filters": {"domain_patterns": [], "path_patterns": [], "keywords": []},
+                "collectors": {}
+            }
+        }))
+        .expect("payload bytes");
+        let metadata = RegistryVersionResponse {
+            bundle_type: "local".to_string(),
+            version: "bundle-v3".to_string(),
+            sha256: format!("{:x}", Sha256::digest(payload.as_slice())),
+            bundle_hash: None,
+            compiled_at: "2026-03-03T00:00:00Z".to_string(),
+            provider_count: 0,
+            domain_count: 0,
+            format_count: 0,
+            size_bytes: payload.len() as u64,
+            manifest: None,
+            channel: Some("stable".to_string()),
+        };
+
+        let installed = puller
+            .maybe_install_registry_projection_bundle(&metadata, payload.as_slice())
+            .expect("projection decision should succeed");
+        assert!(installed.is_none());
+        assert_eq!(state.lock().expect("mock state").install_calls, 0);
     }
 }

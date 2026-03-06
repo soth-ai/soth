@@ -535,6 +535,15 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
         confidence: detect_confidence,
         detect_latency_us: 0,
         warnings: Vec::new(),
+        session_mutations: soth_core::SessionMutations::default(),
+        is_prefix_repeat: false,
+        novel_token_count: 0,
+        repeated_token_count: 0,
+        novel_tail_start_idx: None,
+        prefix_hash: None,
+        is_repeated_code_context: false,
+        ast_normalized_hash: None,
+        first_blob_event_id: None,
     }
 }
 
@@ -580,6 +589,7 @@ fn build_proxy_context(context: &ContextInput) -> ProxyContext {
         traffic_classification: traffic,
         classification_source: source,
         session_snapshot: session,
+        request_method: None,
     }
 }
 

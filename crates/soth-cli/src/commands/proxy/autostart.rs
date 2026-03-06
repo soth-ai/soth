@@ -243,7 +243,12 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
         program_arguments.push_str(&format!("    <string>{}</string>\n", xml_escape(arg)));
     }
     let logs_dir = home.join(".soth").join("logs");
-    std::fs::create_dir_all(&logs_dir).ok();
+    std::fs::create_dir_all(&logs_dir).with_context(|| {
+        format!(
+            "failed creating launch agent log directory {}",
+            logs_dir.display()
+        )
+    })?;
     let stdout_path = logs_dir.join("edge-autostart.log");
 
     let body = format!(
@@ -280,40 +285,65 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
     let _ = launchctl_silent(["bootout", &gui_target]);
     let _ = launchctl_silent(["bootout", &user_target]);
 
-    let bootstrap_gui = Command::new("launchctl")
-        .args([
-            "bootstrap",
-            &format!("gui/{uid}"),
-            &plist_path.display().to_string(),
-        ])
-        .status();
-    if !bootstrap_gui
-        .map(|status| status.success())
-        .unwrap_or(false)
-    {
-        let _ = Command::new("launchctl")
-            .args([
-                "bootstrap",
-                &format!("user/{uid}"),
-                &plist_path.display().to_string(),
-            ])
-            .status();
+    let plist_path_str = plist_path.display().to_string();
+    let gui_domain = format!("gui/{uid}");
+    let user_domain = format!("user/{uid}");
+
+    let bootstrap_domain = match launchctl_require_success(&[
+        "bootstrap",
+        &gui_domain,
+        &plist_path_str,
+    ]) {
+        Ok(()) => "gui",
+        Err(gui_error) => {
+            launchctl_require_success(&["bootstrap", &user_domain, &plist_path_str]).map_err(
+                |user_error| {
+                    anyhow!(
+                        "failed to bootstrap launchd service in both gui and user domains.\nGUI error: {}\nUSER error: {}",
+                        gui_error,
+                        user_error
+                    )
+                },
+            )?;
+            "user"
+        }
+    };
+
+    let (primary_target, secondary_target) = if bootstrap_domain == "gui" {
+        (gui_target.as_str(), user_target.as_str())
+    } else {
+        (user_target.as_str(), gui_target.as_str())
+    };
+
+    if let Err(primary_error) = launchctl_require_success(&["enable", primary_target]) {
+        launchctl_require_success(&["enable", secondary_target]).map_err(|secondary_error| {
+            anyhow!(
+                "failed to enable launchd service.\nPrimary ({}) error: {}\nSecondary ({}) error: {}",
+                primary_target,
+                primary_error,
+                secondary_target,
+                secondary_error
+            )
+        })?;
     }
-    let _ = Command::new("launchctl")
-        .args(["enable", &gui_target])
-        .status();
-    let _ = Command::new("launchctl")
-        .args(["kickstart", "-k", &gui_target])
-        .status()
-        .or_else(|_| {
-            Command::new("launchctl")
-                .args(["kickstart", "-k", &user_target])
-                .status()
-        });
+
+    if let Err(primary_error) = launchctl_require_success(&["kickstart", "-k", primary_target]) {
+        launchctl_require_success(&["kickstart", "-k", secondary_target]).map_err(
+            |secondary_error| {
+                anyhow!(
+                    "failed to kickstart launchd service.\nPrimary ({}) error: {}\nSecondary ({}) error: {}",
+                    primary_target,
+                    primary_error,
+                    secondary_target,
+                    secondary_error
+                )
+            },
+        )?;
+    }
 
     Ok(format!(
-        "launchd enabled ({label}) at {}",
-        plist_path.display()
+        "launchd enabled ({label}) at {} (domain: {bootstrap_domain})",
+        plist_path.display(),
     ))
 }
 
@@ -325,6 +355,32 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_require_success(args: &[&str]) -> Result<()> {
+    let output = Command::new("launchctl")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed running launchctl {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let details = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no launchctl output".to_string()
+    };
+    anyhow::bail!(
+        "launchctl {} failed with status {}: {}",
+        args.join(" "),
+        output.status,
+        details
+    );
 }
 
 #[cfg(target_os = "linux")]

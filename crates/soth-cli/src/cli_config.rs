@@ -18,6 +18,8 @@ pub struct SothConfig {
     pub exchange: ExchangeConfig,
     pub bundle: BundleConfig,
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub pipeline: PipelineOverrides,
 }
 
 impl Default for SothConfig {
@@ -28,6 +30,7 @@ impl Default for SothConfig {
             exchange: ExchangeConfig::default(),
             bundle: BundleConfig::default(),
             proxy: ProxyConfig::default(),
+            pipeline: PipelineOverrides::default(),
         }
     }
 }
@@ -40,6 +43,27 @@ pub struct ForwardProxyConfig {
     pub port: u16,
     pub autostart_on_boot: bool,
     pub ca: CaConfig,
+    pub unix_socket_path: Option<String>,
+    pub destinations: Vec<String>,
+    pub passthrough_unlisted: bool,
+    pub pool: ForwardProxyPoolConfig,
+    pub process_attribution: ForwardProxyProcessAttributionConfig,
+    pub tls: ForwardProxyTlsConfig,
+    pub flow_runtime: ForwardProxyFlowRuntimeConfig,
+    #[serde(alias = "request_timeout")]
+    pub upstream_timeout: DurationSetting,
+    pub upstream_retry_on_failure: bool,
+    pub upstream_retry_delay: DurationSetting,
+    pub capture_max_body_bytes: usize,
+    pub buffer_request_bodies: bool,
+    pub handler_request_timeout: DurationSetting,
+    pub handler_response_timeout: DurationSetting,
+    pub handler_recover_from_panics: bool,
+    pub max_http_head_bytes: usize,
+    pub accept_retry_backoff: DurationSetting,
+    pub max_flow_event_backlog: usize,
+    pub max_in_flight_bytes: usize,
+    pub max_concurrent_flows: usize,
 }
 
 impl Default for ForwardProxyConfig {
@@ -50,6 +74,26 @@ impl Default for ForwardProxyConfig {
             port: 8080,
             autostart_on_boot: true,
             ca: CaConfig::default(),
+            unix_socket_path: None,
+            destinations: vec!["*".to_string()],
+            passthrough_unlisted: true,
+            pool: ForwardProxyPoolConfig::default(),
+            process_attribution: ForwardProxyProcessAttributionConfig::default(),
+            tls: ForwardProxyTlsConfig::default(),
+            flow_runtime: ForwardProxyFlowRuntimeConfig::default(),
+            upstream_timeout: DurationSetting::millis(30_000),
+            upstream_retry_on_failure: false,
+            upstream_retry_delay: DurationSetting::millis(200),
+            capture_max_body_bytes: 10 * 1024 * 1024,
+            buffer_request_bodies: true,
+            handler_request_timeout: DurationSetting::millis(5_000),
+            handler_response_timeout: DurationSetting::millis(5_000),
+            handler_recover_from_panics: true,
+            max_http_head_bytes: 64 * 1024,
+            accept_retry_backoff: DurationSetting::millis(100),
+            max_flow_event_backlog: 8 * 1024,
+            max_in_flight_bytes: 64 * 1024 * 1024,
+            max_concurrent_flows: 2_048,
         }
     }
 }
@@ -61,10 +105,111 @@ impl ForwardProxyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DurationSetting {
+    Millis(u64),
+    Text(String),
+}
+
+impl DurationSetting {
+    pub fn millis(value: u64) -> Self {
+        Self::Millis(value)
+    }
+
+    pub fn to_millis_or(&self, default_ms: u64) -> u64 {
+        match self {
+            Self::Millis(value) => *value,
+            Self::Text(value) => parse_duration_text_to_millis(value).unwrap_or(default_ms),
+        }
+    }
+}
+
+impl Default for DurationSetting {
+    fn default() -> Self {
+        Self::Millis(0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ForwardProxyPoolConfig {
+    pub max_connections_per_host: u32,
+    pub idle_timeout: DurationSetting,
+    pub connect_timeout: DurationSetting,
+    pub max_idle_per_host: u32,
+}
+
+impl Default for ForwardProxyPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections_per_host: 64,
+            idle_timeout: DurationSetting::millis(60_000),
+            connect_timeout: DurationSetting::millis(10_000),
+            max_idle_per_host: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ForwardProxyProcessAttributionConfig {
+    pub enabled: bool,
+    pub lookup_timeout: DurationSetting,
+    pub cache_capacity: usize,
+    pub cache_ttl: Option<DurationSetting>,
+}
+
+impl Default for ForwardProxyProcessAttributionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lookup_timeout: DurationSetting::millis(5_000),
+            cache_capacity: 4_096,
+            cache_ttl: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ForwardProxyTlsConfig {
+    pub capture_fingerprint: bool,
+    pub verify_upstream_tls: bool,
+    pub http2_enabled: bool,
+    pub http2_max_header_list_size: u32,
+    pub http3_passthrough: bool,
+}
+
+impl Default for ForwardProxyTlsConfig {
+    fn default() -> Self {
+        Self {
+            capture_fingerprint: true,
+            verify_upstream_tls: true,
+            http2_enabled: true,
+            http2_max_header_list_size: 64 * 1024,
+            http3_passthrough: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ForwardProxyFlowRuntimeConfig {
+    pub dispatch_queue_capacity: Option<usize>,
+    pub closed_flow_lru_capacity: Option<usize>,
+    pub stale_flow_ttl: Option<DurationSetting>,
+    pub stale_reap_max_batch: Option<usize>,
+    pub dispatch_queue_send_timeout: Option<DurationSetting>,
+    pub dispatch_close_join_timeout: Option<DurationSetting>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaConfig {
     pub cert_path: String,
     pub key_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_cert_path: Option<String>,
 }
 
 impl Default for CaConfig {
@@ -72,6 +217,7 @@ impl Default for CaConfig {
         Self {
             cert_path: "~/.soth/certs/soth-mitm-ca.pem".to_string(),
             key_path: "~/.soth/certs/soth-mitm-ca-key.pem".to_string(),
+            trust_cert_path: None,
         }
     }
 }
@@ -102,11 +248,15 @@ impl Default for CloudConfig {
 #[serde(default)]
 pub struct ExchangeConfig {
     pub enabled: bool,
+    pub legacy_upload_enabled: bool,
 }
 
 impl Default for ExchangeConfig {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            legacy_upload_enabled: false,
+        }
     }
 }
 
@@ -116,6 +266,8 @@ pub struct BundleConfig {
     pub bundle_dir: String,
     pub vendor_pubkey_hex: String,
     pub verify_vendor_signature: bool,
+    pub require_verified_bundle: bool,
+    pub org_approval_pubkey_hex: Option<String>,
 }
 
 impl Default for BundleConfig {
@@ -123,7 +275,9 @@ impl Default for BundleConfig {
         Self {
             bundle_dir: "~/.soth/bundle".to_string(),
             vendor_pubkey_hex: "00".repeat(32),
-            verify_vendor_signature: false,
+            verify_vendor_signature: true,
+            require_verified_bundle: false,
+            org_approval_pubkey_hex: None,
         }
     }
 }
@@ -146,6 +300,13 @@ impl Default for ProxyConfig {
             db_write_queue_capacity: 4_096,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PipelineOverrides {
+    pub unknown_app_action: Option<String>,
+    pub non_cataloged_host_action: Option<String>,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -218,6 +379,47 @@ pub fn write_config(path: &Path, config: &SothConfig) -> Result<()> {
     let body = serde_yaml::to_string(config).context("failed serializing config YAML")?;
     fs::write(path, body).with_context(|| format!("failed writing {}", path.display()))?;
     Ok(())
+}
+
+fn parse_duration_text_to_millis(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return trimmed.parse::<u64>().ok();
+    }
+
+    let mut total: u64 = 0;
+    for token in trimmed.split_whitespace() {
+        let (num, unit) = split_number_and_unit(token)?;
+        let value = num.parse::<u64>().ok()?;
+        let factor = match unit {
+            "" | "ms" | "msec" | "millisecond" | "milliseconds" => 1,
+            "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+            "d" | "day" | "days" => 86_400_000,
+            _ => return None,
+        };
+        total = total.checked_add(value.checked_mul(factor)?)?;
+    }
+    Some(total)
+}
+
+fn split_number_and_unit(token: &str) -> Option<(&str, &str)> {
+    if token.is_empty() {
+        return None;
+    }
+    let split = token
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(idx, _)| idx)
+        .unwrap_or(token.len());
+    if split == 0 {
+        return None;
+    }
+    Some((&token[..split], token[split..].trim()))
 }
 
 pub fn read_client_device_id() -> Option<String> {

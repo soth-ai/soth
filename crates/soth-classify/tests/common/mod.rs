@@ -39,6 +39,15 @@ pub fn make_detect_result() -> soth_core::DetectResult {
         confidence: soth_core::ParseConfidence::Full,
         detect_latency_us: 0,
         warnings: Vec::new(),
+        session_mutations: soth_core::SessionMutations::default(),
+        is_prefix_repeat: false,
+        novel_token_count: 0,
+        repeated_token_count: 0,
+        novel_tail_start_idx: None,
+        prefix_hash: None,
+        is_repeated_code_context: false,
+        ast_normalized_hash: None,
+        first_blob_event_id: None,
     }
 }
 
@@ -64,5 +73,6 @@ pub fn make_proxy_ctx(
         traffic_classification: soth_core::TrafficClassification::Other,
         classification_source: soth_core::ClassificationSource::Proxy,
         session_snapshot,
+        request_method: None,
     }
 }

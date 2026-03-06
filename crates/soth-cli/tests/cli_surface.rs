@@ -17,7 +17,7 @@ fn help_lists_supported_commands() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     for token in [
         "start", "stop", "up", "down", "on", "off", "logs", "status", "init", "enroll", "setup-ca",
-        "doctor", "env", "events",
+        "doctor", "env", "events", "bundle",
     ] {
         assert!(
             stdout.contains(token),
@@ -46,6 +46,16 @@ fn events_help_lists_list_and_stream() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("list"));
     assert!(stdout.contains("stream"));
+}
+
+#[test]
+fn bundle_help_lists_status_and_verify() {
+    let out = run_cli(&["bundle", "--help"]);
+    assert!(out.status.success());
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("status"));
+    assert!(stdout.contains("verify"));
 }
 
 #[test]

@@ -89,6 +89,25 @@ Gaps identified during plan audit (2026-03-06). Pick up when available.
 - [ ] `build_extension_manager()` wired into soth-proxy main.rs
 - [ ] `ExtensionManager` wired into `ProxyHandler` startup
 
+## Backlog — Dead Telemetry Variables
+
+Remaining `TelemetryEvent` fields that are declared but never receive meaningful values. Tracked here for future work.
+
+### `estimated_output_tokens` — needs response-path amendment (Medium)
+Response usage (`output_tokens`) is already extracted in `response.rs` and applied to the session store via `apply_response_usage()`. However the telemetry event is pushed in `classify_task.rs` on the request path *before* the response arrives. Wiring this requires either: (a) a follow-up amendment event pushed when the response arrives, or (b) delaying the telemetry push until response usage is captured. Both are architectural changes to the telemetry pipeline.
+
+### `import_categories` — needs detect-level import extraction (Large)
+The `ImportCategory` enum (Crypto, Auth, Network, Database, Filesystem, Serialization) exists in soth-core but soth-detect has no import-line extraction from `CodeBlock` artifacts. Stage 7 hardcodes `Vec::new()`. Requires a new detect stage (tree-sitter or regex-based import parsing).
+
+### `cache_level` — needs caching layer (Not planned)
+`CacheLevel` enum (Exact, Semantic, Prefix) exists but no caching layer evaluates whether a request is a cache hit. Infrastructure for cache-hit determination doesn't exist. This is an intelligence-layer feature, not in scope for the edge proxy.
+
+### `first_step_event_id` / `agent_step_number` — needs agent-step tracker (Medium)
+For multi-step agent conversations. The session store has `max_tool_depth_seen` and `AnomalyFlag::AgentLoopPattern` exists, but no code assigns step numbers or tracks the originating event ID of a multi-step sequence. Needs: detection of sequential tool-use turns, first-event-ID tracking, and step counter in session state.
+
+### `code_fraction` (cloud API only) — needs computation (Small-Medium)
+Exists only on cloud-facing `api_types::TelemetryEvent`, not on `soth_core::TelemetryEvent`. Would be the ratio of code tokens to total tokens. soth-detect already produces `CodeBlock` artifacts with char offsets, so a rough `code_block_chars / total_body_len` could be computed in stage 7 or detect. Needs a new field on core `TelemetryEvent` and the ratio computation.
+
 ## Practical Checklist for New Provider/Agent
 1. Add/update provider + domain + detection rules in cloud bundle seed/compiler.
 2. Ensure `detection_id` values are present and stable in compiled bundle/providers.

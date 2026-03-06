@@ -55,7 +55,7 @@ fn run_ac01() -> i32 {
         };
         let request = random_request(case_idx, socket, &mut rng);
         let result = std::panic::catch_unwind(|| {
-            let _ = process_with_registry(&registry, &request, &bundle_slice);
+            let _ = process_with_registry(&registry, &request, &bundle_slice, &soth_core::SessionSnapshot::default());
         });
         if result.is_err() {
             panic_count += 1;
@@ -87,7 +87,7 @@ fn run_ac14() -> i32 {
 
     for request in &fixtures {
         let started = Instant::now();
-        let out = process_with_registry(&registry, request, &bundle_slice);
+        let out = process_with_registry(&registry, request, &bundle_slice, &soth_core::SessionSnapshot::default());
         latencies_ms.push(started.elapsed().as_secs_f64() * 1000.0);
 
         let key = parse_source_name(&out);
@@ -151,7 +151,7 @@ fn run_ac15() -> i32 {
             _ => SocketKind::UnixDomain,
         };
         let request = benchmark_request(idx, socket);
-        let out = process_with_registry(&registry, &request, &bundle_slice);
+        let out = process_with_registry(&registry, &request, &bundle_slice, &soth_core::SessionSnapshot::default());
         checksum = checksum
             .wrapping_add(out.detect_latency_us)
             .wrapping_add(out.normalized.user_content_token_estimate as u64);
@@ -485,6 +485,7 @@ fn build_bundle() -> OwnedDetectBundle {
             provider_id: Some("openai".to_string()),
             name: Some("OpenAI".to_string()),
             api_format: Some("openai".to_string()),
+            ..ProviderEntry::default()
         },
     );
     providers.insert(
@@ -493,6 +494,7 @@ fn build_bundle() -> OwnedDetectBundle {
             provider_id: Some("anthropic".to_string()),
             name: Some("Anthropic".to_string()),
             api_format: Some("anthropic".to_string()),
+            ..ProviderEntry::default()
         },
     );
     providers.insert(
@@ -501,6 +503,7 @@ fn build_bundle() -> OwnedDetectBundle {
             provider_id: Some("google_vertex".to_string()),
             name: Some("Google Vertex".to_string()),
             api_format: Some("grpc".to_string()),
+            ..ProviderEntry::default()
         },
     );
     providers.insert(
@@ -509,6 +512,7 @@ fn build_bundle() -> OwnedDetectBundle {
             provider_id: Some("warp".to_string()),
             name: Some("Warp".to_string()),
             api_format: Some("graphql".to_string()),
+            ..ProviderEntry::default()
         },
     );
 

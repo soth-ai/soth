@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::{AppType, CaptureMode};
 
@@ -19,6 +20,8 @@ impl GatingBundle {
             normalize_host_pattern_set(&self.gates.stage0_tls.passthrough_domains);
         self.gates.stage5_host_origin.allowed_host_origins =
             normalize_host_pattern_set(&self.gates.stage5_host_origin.allowed_host_origins);
+        normalize_identity_index_keys(&mut self.identity_index.hosts);
+        normalize_identity_index_keys(&mut self.identity_index.non_hosts);
 
         normalize_entity_hosts(&mut self.entities.providers);
         normalize_entity_hosts(&mut self.entities.web_apps);
@@ -40,6 +43,12 @@ pub struct IdentityEntry {
     pub app_type: AppType,
     pub capture_mode: CaptureMode,
     pub action: ProcessAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_list_ref: Option<String>,
 }
 
 impl Default for IdentityEntry {
@@ -49,6 +58,9 @@ impl Default for IdentityEntry {
             app_type: AppType::Unknown,
             capture_mode: CaptureMode::MetadataOnly,
             action: ProcessAction::Intercept,
+            enabled: None,
+            host_filter: None,
+            host_list_ref: None,
         }
     }
 }
@@ -98,6 +110,14 @@ pub struct GateDefaults {
     pub unknown_app_action: UnknownAppAction,
     pub non_cataloged_host_action: NonCatalogedAction,
     pub discovery: DiscoveryConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_unknown_app_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_whitelisted_unknown_app_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_non_whitelisted_host_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_browser_default_action: Option<String>,
 }
 
 impl Default for GateDefaults {
@@ -108,6 +128,10 @@ impl Default for GateDefaults {
             unknown_app_action: UnknownAppAction::Skip,
             non_cataloged_host_action: NonCatalogedAction::Skip,
             discovery: DiscoveryConfig::default(),
+            source_unknown_app_action: None,
+            source_whitelisted_unknown_app_action: None,
+            source_non_whitelisted_host_action: None,
+            source_browser_default_action: None,
         }
     }
 }
@@ -245,6 +269,16 @@ pub struct EntityTrafficRules {
     pub capture_mode: CaptureMode,
     #[serde(default)]
     pub hosts: Vec<HostRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<JsonValue>,
 }
 
 impl Default for EntityTrafficRules {
@@ -253,6 +287,11 @@ impl Default for EntityTrafficRules {
             entity_id: "unknown".to_string(),
             capture_mode: CaptureMode::MetadataOnly,
             hosts: Vec::new(),
+            api_format: None,
+            entity_type: None,
+            pricing: None,
+            capture: None,
+            detection: None,
         }
     }
 }
@@ -263,6 +302,8 @@ pub struct HostRule {
     #[serde(default)]
     pub methods: Vec<HttpMethod>,
     pub paths: PathRules,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -342,6 +383,38 @@ fn normalize_entity_hosts(rules: &mut [EntityTrafficRules]) {
     }
 }
 
+fn normalize_identity_index_keys(map: &mut HashMap<String, IdentityEntry>) {
+    if map.is_empty() {
+        return;
+    }
+
+    let mut entries: Vec<(String, IdentityEntry)> = map.drain().collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut normalized = HashMap::with_capacity(entries.len());
+
+    // Prefer already-canonical lowercase keys when collisions normalize to the same identity.
+    for (key, entry) in &entries {
+        let normalized_key = key.trim().to_ascii_lowercase();
+        if normalized_key.is_empty() || key.trim() != normalized_key {
+            continue;
+        }
+        normalized
+            .entry(normalized_key)
+            .or_insert_with(|| entry.clone());
+    }
+
+    for (key, entry) in entries {
+        let normalized_key = key.trim().to_ascii_lowercase();
+        if normalized_key.is_empty() {
+            continue;
+        }
+        normalized.entry(normalized_key).or_insert(entry);
+    }
+
+    *map = normalized;
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -396,7 +469,9 @@ mod tests {
                 pattern: "^f-log-.*\\.grammarly\\.io$".to_string(),
                 methods: Vec::new(),
                 paths: PathRules::default(),
+                ..HostRule::default()
             }],
+            ..EntityTrafficRules::default()
         });
 
         bundle.normalize_host_patterns_in_place();
@@ -416,5 +491,50 @@ mod tests {
 
         let unique = passthrough.iter().cloned().collect::<HashSet<_>>();
         assert_eq!(unique.len(), passthrough.len());
+    }
+
+    #[test]
+    fn normalize_bundle_in_place_normalizes_identity_index_keys() {
+        let mut bundle = GatingBundle::default();
+        bundle.identity_index.hosts.insert(
+            "com.google.Chrome".to_string(),
+            IdentityEntry {
+                entity_id: "chrome-upper".to_string(),
+                app_type: AppType::Host,
+                capture_mode: CaptureMode::MetadataOnly,
+                action: ProcessAction::Skip,
+                ..IdentityEntry::default()
+            },
+        );
+        bundle.identity_index.hosts.insert(
+            "com.google.chrome".to_string(),
+            IdentityEntry {
+                entity_id: "chrome-lower".to_string(),
+                app_type: AppType::Host,
+                capture_mode: CaptureMode::Full,
+                action: ProcessAction::Intercept,
+                ..IdentityEntry::default()
+            },
+        );
+        bundle.identity_index.non_hosts.insert(
+            " Cursor ".to_string(),
+            IdentityEntry {
+                entity_id: "cursor".to_string(),
+                app_type: AppType::NonHost,
+                capture_mode: CaptureMode::MetadataOnly,
+                action: ProcessAction::Intercept,
+                ..IdentityEntry::default()
+            },
+        );
+
+        bundle.normalize_host_patterns_in_place();
+
+        assert_eq!(bundle.identity_index.hosts.len(), 1);
+        assert_eq!(
+            bundle.identity_index.hosts["com.google.chrome"].entity_id,
+            "chrome-lower"
+        );
+        assert_eq!(bundle.identity_index.non_hosts.len(), 1);
+        assert!(bundle.identity_index.non_hosts.contains_key("cursor"));
     }
 }

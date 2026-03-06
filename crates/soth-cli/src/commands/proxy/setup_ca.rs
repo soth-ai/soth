@@ -13,18 +13,26 @@ pub async fn run(
     global_config: Option<PathBuf>,
 ) -> Result<()> {
     let config = cli_config::load_effective_config(global_config.as_ref(), None)?;
+    let resolved = super::ca_health::resolve_ca_paths(&config);
     let cert_path = output
         .as_ref()
         .map(|out| cli_config::expand_tilde(Path::new(out)).join("soth-mitm-ca.pem"))
-        .unwrap_or_else(|| {
-            cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()))
-        });
+        .unwrap_or_else(|| resolved.runtime_cert_path.clone());
     let key_path = output
         .as_ref()
         .map(|out| cli_config::expand_tilde(Path::new(out)).join("soth-mitm-ca-key.pem"))
-        .unwrap_or_else(|| {
-            cli_config::expand_tilde(Path::new(config.forward_proxy.ca.key_path.as_str()))
-        });
+        .unwrap_or_else(|| resolved.runtime_key_path.clone());
+    let trust_cert_path = if output.is_some() {
+        cert_path.clone()
+    } else {
+        resolved.trust_cert_path.clone()
+    };
+    let trust_source = if output.is_some() {
+        "runtime_cert"
+    } else {
+        resolved.trust_source
+    };
+    let external_trust_path = trust_cert_path != cert_path;
 
     if let Some(parent) = cert_path.parent() {
         std::fs::create_dir_all(parent)
@@ -35,15 +43,94 @@ pub async fn run(
             .with_context(|| format!("failed creating {}", parent.display()))?;
     }
 
-    generate_ca_files(&cert_path, &key_path)?;
-    style::success(&format!("CA generated: {}", cert_path.display()));
+    let cert_exists = cert_path.exists();
+    let key_exists = key_path.exists();
+    match (cert_exists, key_exists) {
+        (true, true) => {
+            style::info(&format!(
+                "Reusing existing CA cert/key at {} and {}",
+                cert_path.display(),
+                key_path.display()
+            ));
+        }
+        (false, false) => {
+            generate_ca_files(&cert_path, &key_path)?;
+            style::success(&format!("CA generated: {}", cert_path.display()));
+        }
+        _ => {
+            anyhow::bail!(
+                "CA files are inconsistent: cert exists={}, key exists={}. Refusing implicit rotation. Remove stale file(s) and re-run `soth setup-ca`.",
+                cert_exists,
+                key_exists
+            );
+        }
+    }
+
+    let runtime_fingerprint = super::ca_health::cert_fingerprint_sha256(&cert_path)
+        .context("failed computing runtime CA fingerprint")?;
+
+    if external_trust_path {
+        if !trust_cert_path.exists() {
+            anyhow::bail!(
+                "Configured external trust cert path ({}) is missing. Install the CA via MDM or update forward_proxy.ca.trust_cert_path.",
+                trust_cert_path.display()
+            );
+        }
+        let trust_fingerprint = super::ca_health::cert_fingerprint_sha256(&trust_cert_path)
+            .context("failed computing external trust cert fingerprint")?;
+        if trust_fingerprint != runtime_fingerprint {
+            anyhow::bail!(
+                "Runtime CA fingerprint does not match external trust cert fingerprint.\nruntime={} ({})\ntrust={} ({})",
+                runtime_fingerprint,
+                cert_path.display(),
+                trust_fingerprint,
+                trust_cert_path.display()
+            );
+        }
+    }
 
     if no_trust {
         style::info("Skipping system trust installation (--no-trust).");
         return Ok(());
     }
 
-    install_trust(&cert_path)?;
+    if external_trust_path {
+        style::info(&format!(
+            "External trust path configured (source={}): {}",
+            trust_source,
+            trust_cert_path.display()
+        ));
+    } else {
+        install_trust(&cert_path)?;
+    }
+
+    let os_trust = super::ca_health::check_os_trust(&trust_cert_path)
+        .with_context(|| format!("failed checking OS trust for {}", trust_cert_path.display()))?;
+    match os_trust.status {
+        super::ca_health::OsTrustStatus::Trusted => {
+            style::success(&format!(
+                "CA trust verified ({}) fingerprint={} source={}",
+                trust_cert_path.display(),
+                runtime_fingerprint,
+                trust_source
+            ));
+        }
+        super::ca_health::OsTrustStatus::Untrusted => {
+            anyhow::bail!(
+                "CA is not trusted by OS at {} (source={}): {}",
+                trust_cert_path.display(),
+                trust_source,
+                os_trust.detail
+            );
+        }
+        super::ca_health::OsTrustStatus::Unknown => {
+            style::warning(&format!(
+                "Could not verify OS trust state for {}: {}",
+                trust_cert_path.display(),
+                os_trust.detail
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -86,7 +173,11 @@ fn install_trust(cert_path: &Path) -> Result<()> {
             .arg(cert_path)
             .output()
             .context("failed executing security add-trusted-cert")?;
-        if output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if output.status.success()
+            || stderr.contains("already exists")
+            || stderr.contains("the specified item already exists")
+        {
             style::success("CA trusted in macOS login keychain.");
             return Ok(());
         }

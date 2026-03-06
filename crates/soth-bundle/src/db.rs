@@ -101,11 +101,18 @@ mod tests {
 
     use super::*;
     use crate::manifest::{AssetEntry, BundleManifest, BundleScope};
+    use crate::{BundleMeta, BundleTrustLevel};
 
     fn fixture_bundle() -> LoadedBundle {
         let manifest = BundleManifest {
             version: "bundle-v1".to_string(),
             created_at: 1,
+            bundle_id: None,
+            model_version: None,
+            policy_version: None,
+            org_id: None,
+            issued_at: None,
+            expires_at: None,
             vendor_sig: "sig".to_string(),
             org_approval_sig: Some("org-sig".to_string()),
             assets: vec![AssetEntry {
@@ -119,6 +126,17 @@ mod tests {
         LoadedBundle {
             version: manifest.version.clone(),
             installed_at: 42,
+            meta: BundleMeta {
+                bundle_id: "bundle-v1".to_string(),
+                model_version: "model-v1".to_string(),
+                policy_version: "policy-v1".to_string(),
+                org_id: "demo".to_string(),
+                issued_at: 1,
+                expires_at: None,
+                vendor_sig: Some("sig".to_string()),
+                org_approval_sig: Some("org-sig".to_string()),
+            },
+            trust_level: BundleTrustLevel::Verified,
             classify: soth_classify::ClassifyBundle::fallback(),
             policy: Arc::new(soth_policy::sync_policy::PolicyBundle {
                 metadata: soth_policy::sync_policy::PolicyBundleMetadata {

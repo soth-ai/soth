@@ -1,5 +1,6 @@
 use crate::types::{DetectBundleSlice, DetectedFormat, HeaderMap, ProviderEntry};
-use crate::util::{header_value, lookup_domain_provider};
+use crate::util::{header_value, host_without_port, lookup_domain_provider};
+use serde_json::Value as JsonValue;
 
 pub fn fingerprint(
     method: &str,
@@ -25,6 +26,17 @@ pub fn fingerprint(
     }
 
     if let Some(provider_id) = matched_provider {
+        let hinted = provider_entry_to_format(provider_id, bundle.llm_providers.get(provider_id));
+        if hinted != DetectedFormat::Unknown {
+            return hinted;
+        }
+        // Apps with custom REST formats are in rest_formats, not llm_providers
+        if bundle.rest_formats.contains_key(provider_id) {
+            return DetectedFormat::CustomRest(provider_id.to_string());
+        }
+    }
+
+    if let Some(provider_id) = match_provider_by_detection_hints(path, headers, bundle) {
         let hinted = provider_entry_to_format(provider_id, bundle.llm_providers.get(provider_id));
         if hinted != DetectedFormat::Unknown {
             return hinted;
@@ -75,7 +87,15 @@ pub fn fingerprint(
         header_value(headers, "host").or_else(|| header_value(headers, ":authority"))
     {
         if let Some(provider_id) = lookup_domain_provider(bundle.domain_index, host) {
-            return provider_entry_to_format(provider_id, bundle.llm_providers.get(provider_id));
+            let format =
+                provider_entry_to_format(provider_id, bundle.llm_providers.get(provider_id));
+            if format != DetectedFormat::Unknown {
+                return format;
+            }
+            // Apps with custom REST formats are in rest_formats, not llm_providers
+            if bundle.rest_formats.contains_key(provider_id) {
+                return DetectedFormat::CustomRest(provider_id.to_string());
+            }
         }
 
         if host.eq_ignore_ascii_case("127.0.0.1") {
@@ -99,6 +119,237 @@ pub fn fingerprint(
     }
 
     DetectedFormat::Unknown
+}
+
+fn match_provider_by_detection_hints<'a>(
+    path: &str,
+    headers: &HeaderMap,
+    bundle: &'a DetectBundleSlice<'_>,
+) -> Option<&'a str> {
+    let path_lc = path.to_ascii_lowercase();
+    let host_lc = header_value(headers, "host")
+        .or_else(|| header_value(headers, ":authority"))
+        .map(|host| {
+            host_without_port(host)
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+        });
+    let mut best: Option<(&str, usize)> = None;
+
+    for (provider_id, entry) in bundle.llm_providers.iter() {
+        let Some(score) = detection_match_score(
+            entry.detection.as_ref(),
+            &path_lc,
+            host_lc.as_deref(),
+            headers,
+        ) else {
+            continue;
+        };
+
+        match best {
+            Some((best_provider, best_score))
+                if best_score > score
+                    || (best_score == score && best_provider <= provider_id.as_str()) => {}
+            _ => best = Some((provider_id.as_str(), score)),
+        }
+    }
+
+    best.map(|(provider_id, _)| provider_id)
+}
+
+fn detection_match_score(
+    detection: Option<&JsonValue>,
+    path_lc: &str,
+    host_lc: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<usize> {
+    let detection = detection?;
+    let mut matched = false;
+    let mut score = 0usize;
+
+    if let Some(patterns) = detection.get("path_patterns").and_then(JsonValue::as_array) {
+        let mut best_path_score = 0usize;
+        for pattern in patterns.iter().filter_map(JsonValue::as_str) {
+            if pattern.is_empty() {
+                continue;
+            }
+            let pattern_lc = pattern.to_ascii_lowercase();
+            if glob_match(&pattern_lc, path_lc) {
+                matched = true;
+                best_path_score = best_path_score.max(non_wildcard_len(&pattern_lc) + 20);
+            }
+        }
+        score += best_path_score;
+    }
+
+    if let Some(header_hints) = detection.get("header_hints") {
+        let mut header_hits = 0usize;
+        match header_hints {
+            JsonValue::Object(map) => {
+                for (name, hint_value) in map {
+                    if let Some(header_val) = header_value(headers, name) {
+                        if header_hint_matches(hint_value, header_val) {
+                            header_hits += 1;
+                        }
+                    }
+                }
+            }
+            JsonValue::Array(items) => {
+                for item in items.iter().filter_map(JsonValue::as_str) {
+                    if header_value(headers, item).is_some() {
+                        header_hits += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if header_hits > 0 {
+            matched = true;
+            score += header_hits * 10;
+        }
+    }
+
+    if let (Some(host), Some(hosts)) = (
+        host_lc,
+        detection.get("hosts").and_then(JsonValue::as_array),
+    ) {
+        let mut best_host_score = 0usize;
+        for host_rule in hosts {
+            let Some(pattern) = host_rule.get("pattern").and_then(JsonValue::as_str) else {
+                continue;
+            };
+            let pattern_lc = pattern.to_ascii_lowercase();
+            if !glob_match(&pattern_lc, host) {
+                continue;
+            }
+            if !host_rule_allows_path(host_rule, path_lc) {
+                continue;
+            }
+            let host_score = non_wildcard_len(&pattern_lc) + 100;
+            best_host_score = best_host_score.max(host_score);
+        }
+        if best_host_score > 0 {
+            matched = true;
+            score += best_host_score;
+        }
+    }
+
+    if matched {
+        Some(score)
+    } else {
+        None
+    }
+}
+
+fn host_rule_allows_path(host_rule: &JsonValue, path_lc: &str) -> bool {
+    let Some(paths) = host_rule.get("paths") else {
+        return true;
+    };
+    let deny_exact = paths
+        .get("deny_exact")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    if deny_exact.into_iter().any(|deny| deny == path_lc) {
+        return false;
+    }
+
+    let deny_glob = paths
+        .get("deny_glob")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    if deny_glob.into_iter().any(|deny| glob_match(&deny, path_lc)) {
+        return false;
+    }
+
+    let allow = paths
+        .get("allow")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if allow.is_empty() {
+        return true;
+    }
+    allow.iter().any(|allowed| glob_match(allowed, path_lc))
+}
+
+fn header_hint_matches(hint: &JsonValue, header_value_raw: &str) -> bool {
+    let header_lc = header_value_raw.to_ascii_lowercase();
+    match hint {
+        JsonValue::String(expected) => {
+            let expected_lc = expected.to_ascii_lowercase();
+            expected_lc.is_empty() || expected_lc == "*" || header_lc.contains(&expected_lc)
+        }
+        JsonValue::Bool(flag) => *flag,
+        JsonValue::Array(values) => values
+            .iter()
+            .any(|value| header_hint_matches(value, header_value_raw)),
+        JsonValue::Object(map) => {
+            if let Some(expected) = map.get("contains").and_then(JsonValue::as_str) {
+                return header_lc.contains(&expected.to_ascii_lowercase());
+            }
+            if let Some(expected) = map.get("equals").and_then(JsonValue::as_str) {
+                return header_lc == expected.to_ascii_lowercase();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn non_wildcard_len(pattern: &str) -> usize {
+    pattern.chars().filter(|ch| *ch != '*').count()
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let starts_anchored = !pattern.starts_with('*');
+    let ends_anchored = !pattern.ends_with('*');
+
+    let mut index = 0usize;
+    let mut first_non_empty = true;
+    for part in parts.iter().copied().filter(|part| !part.is_empty()) {
+        if first_non_empty && starts_anchored {
+            if !text[index..].starts_with(part) {
+                return false;
+            }
+            index += part.len();
+            first_non_empty = false;
+            continue;
+        }
+
+        match text[index..].find(part) {
+            Some(pos) => index += pos + part.len(),
+            None => return false,
+        }
+        first_non_empty = false;
+    }
+
+    if ends_anchored {
+        let last_non_empty = pattern
+            .split('*')
+            .filter(|part| !part.is_empty())
+            .next_back()
+            .unwrap_or("");
+        text.ends_with(last_non_empty)
+    } else {
+        true
+    }
 }
 
 fn is_openai_like_path(path: &str) -> bool {
@@ -173,6 +424,7 @@ fn provider_entry_to_format(provider_id: &str, entry: Option<&ProviderEntry>) ->
             if lower.contains("jsonrpc") || lower.contains("json-rpc") {
                 return DetectedFormat::JsonRpc;
             }
+            return DetectedFormat::CustomRest(api_format.to_string());
         }
     }
 
@@ -213,6 +465,7 @@ mod tests {
                 provider_id: Some("hint-jsonrpc".to_string()),
                 name: Some("hint-jsonrpc".to_string()),
                 api_format: Some("jsonrpc".to_string()),
+                ..ProviderEntry::default()
             },
         );
         bundle.llm_providers.insert(
@@ -221,6 +474,7 @@ mod tests {
                 provider_id: Some("openai".to_string()),
                 name: Some("openai".to_string()),
                 api_format: Some("openai".to_string()),
+                ..ProviderEntry::default()
             },
         );
         bundle
@@ -335,5 +589,45 @@ mod tests {
             &bundle.as_slice(),
         );
         assert_eq!(detected, DetectedFormat::OpenAIRest);
+    }
+
+    #[test]
+    fn detection_hints_match_provider_before_hardcoded_paths() {
+        let mut bundle = bundle_fixture();
+        bundle.llm_providers.insert(
+            "anthropic".to_string(),
+            ProviderEntry {
+                provider_id: Some("anthropic".to_string()),
+                name: Some("Anthropic".to_string()),
+                api_format: Some("anthropic".to_string()),
+                detection: Some(serde_json::json!({
+                    "hosts": [
+                        {
+                            "pattern": "api.anthropic.com",
+                            "paths": {
+                                "allow": ["/v1/messages"],
+                                "deny_exact": [],
+                                "deny_glob": []
+                            }
+                        }
+                    ],
+                    "path_patterns": ["**/v1/messages**"]
+                })),
+                ..ProviderEntry::default()
+            },
+        );
+
+        let detected = fingerprint(
+            "POST",
+            "/v1/messages",
+            &headers(&[
+                ("host", "api.anthropic.com"),
+                ("content-type", "application/json"),
+            ]),
+            br#"{"model":"claude-sonnet"}"#,
+            None,
+            &bundle.as_slice(),
+        );
+        assert_eq!(detected, DetectedFormat::AnthropicRest);
     }
 }

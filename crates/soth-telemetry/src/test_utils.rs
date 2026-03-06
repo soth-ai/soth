@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use soth_core::{
-    AnomalyFlag, AppType, CaptureMode, EndpointType, ParseConfidence, ParseSource,
+    AnomalyFlag, AppType, CaptureMode, DataSource, EndpointType, ParseConfidence, ParseSource,
     ProcessMatchKind, ProcessResolution, RequestMethod, SensitiveCodeFlags, TelemetryEvent,
     TelemetryPolicyKind, TrafficClassification, UseCaseLabel, VolatilityClass,
 };
@@ -42,7 +42,25 @@ pub(crate) fn sample_event(event_id: Uuid) -> TelemetryEvent {
         anomaly_flags: vec![AnomalyFlag::TopicDrift],
         anomaly_score: Some(0.2),
         policy_kind: Some(TelemetryPolicyKind::Allow),
+        bundle_trust_level: Some(soth_core::BundleTrustLevel::Verified),
         sensitive_code_flags: SensitiveCodeFlags::default(),
+        session_key_hash: String::new(),
+        is_prefix_repeat: false,
+        is_code_context_repeat: false,
+        novel_token_count: 100,
+        repeated_token_count: 0,
+        first_step_event_id: None,
+        original_event_id: None,
+        prefix_hash: None,
+        agent_step_number: None,
+        is_historical: false,
+        data_source: DataSource::LiveProxy,
+        original_timestamp: None,
+        topic_cluster_id: 0,
+        semantic_hash: String::new(),
+        is_semantic_collision: false,
+        endpoint_hash: String::new(),
+        policy_rule_id: None,
     }
 }
 

@@ -1,0 +1,30 @@
+[package]
+name = "soth-extensions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+async-trait.workspace = true
+dashmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+soth-core = { workspace = true }
+soth-classify = { workspace = true }
+soth-policy = { workspace = true }
+soth-telemetry = { workspace = true }
+soth-detect = { workspace = true }
+
+[dev-dependencies]
+chrono.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

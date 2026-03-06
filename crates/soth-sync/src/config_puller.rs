@@ -7,7 +7,7 @@ use tracing::warn;
 use crate::api_types::ConfigResponse;
 use crate::cache;
 use crate::http_client::SothHttpClient;
-use crate::registry_puller::RegistryPuller;
+use crate::registry_puller::{RegistryPullOutcome, RegistryPuller};
 
 #[derive(Clone)]
 pub struct ConfigPuller {
@@ -51,10 +51,10 @@ impl ConfigPuller {
     }
 
     pub async fn pull_once(&self) -> anyhow::Result<Option<ConfigResponse>> {
-        let url = self.cloud.url("/api/v1/config");
+        let url = self.cloud.url("/v1/edge/config");
         let response = self
             .cloud
-            .get("/api/v1/config")
+            .get("/v1/edge/config")
             .send()
             .await
             .with_context(|| format!("cloud config pull failed for {url}"))?;
@@ -82,6 +82,13 @@ impl ConfigPuller {
         }
 
         Ok(Some(config))
+    }
+
+    pub async fn refresh_registry_now(&self) -> anyhow::Result<Option<RegistryPullOutcome>> {
+        let Some(registry_puller) = self.registry_puller.as_ref() else {
+            return Ok(None);
+        };
+        registry_puller.refresh_now().await.map(Some)
     }
 
     pub fn cache_path(&self) -> &PathBuf {

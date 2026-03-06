@@ -3,9 +3,8 @@ use crate::http_client::SothHttpClient;
 use anyhow::Context;
 use flate2::{write::GzEncoder, Compression};
 use std::io::Write;
-use tracing::warn;
 
-const EXCHANGE_BATCH_UPLOAD_PATH: &str = "/api/v1/exchanges/batch";
+const EDGE_EXCHANGE_UPLOAD_PATH: &str = "/v1/edge/enroll/exchange";
 
 #[derive(Debug, Clone)]
 pub enum ExchangePushResult {
@@ -22,97 +21,31 @@ pub enum ExchangeBatchRoute {
 #[derive(Clone)]
 pub struct MetadataPusher {
     cloud: SothHttpClient,
-    frontload_upload_path: Option<String>,
 }
 
 impl MetadataPusher {
     pub fn new(
         endpoint: impl Into<String>,
         api_key: impl Into<String>,
-        frontload_upload_path: Option<String>,
+        _frontload_upload_path: Option<String>,
     ) -> Self {
         Self {
             cloud: SothHttpClient::new(endpoint, api_key),
-            frontload_upload_path: frontload_upload_path
-                .as_deref()
-                .and_then(normalize_upload_path),
         }
     }
 
     pub async fn push_exchange_batch(
         &self,
         request: &ExchangeBatchRequest,
-        route: ExchangeBatchRoute,
+        _route: ExchangeBatchRoute,
     ) -> anyhow::Result<ExchangePushResult> {
         let request_json =
             serde_json::to_vec(request).context("failed encoding exchange push request")?;
         let request_gzip = gzip_bytes(request_json.as_slice())
             .context("failed compressing exchange push request")?;
-        let primary_url = self.exchange_upload_url(route);
-        let primary = self
-            .push_exchange_batch_to_url(primary_url.as_str(), request_gzip.as_slice())
-            .await;
-
-        if !matches!(route, ExchangeBatchRoute::Frontload) {
-            return primary;
-        }
-
-        let Some(fallback_url) = self.frontload_fallback_url(primary_url.as_str()) else {
-            return primary;
-        };
-
-        match primary {
-            Ok(ExchangePushResult::NonSuccessStatus(status))
-                if should_fallback_frontload_route(status) =>
-            {
-                warn!(
-                    primary_url = %primary_url,
-                    fallback_url = %fallback_url,
-                    status = %status.as_u16(),
-                    "Frontload exchange upload route unavailable; retrying against default exchange batch endpoint"
-                );
-                self.push_exchange_batch_to_url(fallback_url.as_str(), request_gzip.as_slice())
-                    .await
-            }
-            Err(error) => {
-                warn!(
-                    primary_url = %primary_url,
-                    fallback_url = %fallback_url,
-                    error = %error,
-                    "Frontload exchange upload failed; retrying against default exchange batch endpoint"
-                );
-                self.push_exchange_batch_to_url(fallback_url.as_str(), request_gzip.as_slice())
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "frontload exchange upload failed for {primary_url}; fallback also failed ({fallback_url})"
-                        )
-                    })
-            }
-            other => other,
-        }
-    }
-
-    fn exchange_upload_url(&self, route: ExchangeBatchRoute) -> String {
-        match route {
-            ExchangeBatchRoute::Live => self.cloud.url(EXCHANGE_BATCH_UPLOAD_PATH),
-            ExchangeBatchRoute::Frontload => {
-                if let Some(path) = self.frontload_upload_path.as_deref() {
-                    self.cloud.url(path)
-                } else {
-                    self.cloud.url(EXCHANGE_BATCH_UPLOAD_PATH)
-                }
-            }
-        }
-    }
-
-    fn frontload_fallback_url(&self, primary_url: &str) -> Option<String> {
-        let live_url = self.cloud.url(EXCHANGE_BATCH_UPLOAD_PATH);
-        if live_url.eq_ignore_ascii_case(primary_url) {
-            None
-        } else {
-            Some(live_url)
-        }
+        let url = self.cloud.url(EDGE_EXCHANGE_UPLOAD_PATH);
+        self.push_exchange_batch_to_url(url.as_str(), request_gzip.as_slice())
+            .await
     }
 
     async fn push_exchange_batch_to_url(
@@ -139,34 +72,6 @@ impl MetadataPusher {
         }
         Ok(ExchangePushResult::NonSuccessStatus(response.status()))
     }
-}
-
-fn normalize_upload_path(path: &str) -> Option<String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return Some(trimmed.trim_end_matches('/').to_string());
-    }
-    let normalized = if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
-    };
-    let normalized = normalized.trim_end_matches('/').to_string();
-    if normalized.is_empty() {
-        Some("/".to_string())
-    } else {
-        Some(normalized)
-    }
-}
-
-fn should_fallback_frontload_route(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::NOT_FOUND
-        || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
-        || status == reqwest::StatusCode::GONE
-        || status == reqwest::StatusCode::NOT_IMPLEMENTED
 }
 
 pub fn estimate_gzip_exchange_batch_size(request: &ExchangeBatchRequest) -> anyhow::Result<usize> {

@@ -38,6 +38,40 @@ pub struct NormalizedRequest {
     pub format_metadata: FormatMetadata,
 }
 
+impl Default for NormalizedRequest {
+    fn default() -> Self {
+        Self {
+            parse_confidence: ParseConfidence::Heuristic,
+            parser_id: String::new(),
+            schema_version: String::new(),
+            parse_warnings: Vec::new(),
+            is_ai_call: false,
+            provider: DetectedProvider::Unknown,
+            model: None,
+            endpoint_type: EndpointType::Unknown,
+            api_version: None,
+            system_prompt_hash: None,
+            system_prompt_token_estimate: None,
+            user_content_hash: String::new(),
+            user_content_token_estimate: 0,
+            conversation_hash: String::new(),
+            conversation_turn: None,
+            has_tool_definitions: false,
+            tool_definition_hash: None,
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            top_p: None,
+            stop_sequences: Vec::new(),
+            estimated_input_tokens: 0,
+            estimated_cost_usd: 0.0,
+            parse_source: ParseSource::Heuristic,
+            canonical_cache_key: String::new(),
+            format_metadata: FormatMetadata::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FormatMetadata {

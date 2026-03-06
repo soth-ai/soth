@@ -80,7 +80,7 @@ fn detect_output_corpus_matches_expected_contract() {
 
     for case in corpus {
         let request = build_request(&case.request);
-        let out = process_with_registry(&registry, &request, &bundle.as_slice());
+        let out = process_with_registry(&registry, &request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_case(&case.id, &case.expect, &out);
     }
 }
@@ -345,6 +345,7 @@ fn bundle_fixture() -> OwnedDetectBundle {
             provider_id: Some("openai".to_string()),
             name: Some("OpenAI".to_string()),
             api_format: Some("openai".to_string()),
+            ..ProviderEntry::default()
         },
     );
     providers.insert(
@@ -353,6 +354,7 @@ fn bundle_fixture() -> OwnedDetectBundle {
             provider_id: Some("anthropic".to_string()),
             name: Some("Anthropic".to_string()),
             api_format: Some("anthropic".to_string()),
+            ..ProviderEntry::default()
         },
     );
     providers.insert(
@@ -361,6 +363,7 @@ fn bundle_fixture() -> OwnedDetectBundle {
             provider_id: Some("google_vertex".to_string()),
             name: Some("Google Vertex".to_string()),
             api_format: Some("grpc".to_string()),
+            ..ProviderEntry::default()
         },
     );
 

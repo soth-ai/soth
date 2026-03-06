@@ -6,6 +6,18 @@ use crate::error::BundleError;
 pub struct BundleManifest {
     pub version: String,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
     pub vendor_sig: String,
     pub org_approval_sig: Option<String>,
     #[serde(default)]
@@ -46,6 +58,18 @@ pub struct OrgSignedConfig {
 struct CanonicalManifest<'a> {
     version: &'a str,
     created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issued_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
     vendor_sig: &'a str,
     org_approval_sig: Option<&'a str>,
     assets: Vec<&'a AssetEntry>,
@@ -59,6 +83,12 @@ pub fn canonical_manifest_bytes(manifest: &BundleManifest) -> Result<Vec<u8>, Bu
     let canonical = CanonicalManifest {
         version: &manifest.version,
         created_at: manifest.created_at,
+        bundle_id: manifest.bundle_id.as_deref(),
+        model_version: manifest.model_version.as_deref(),
+        policy_version: manifest.policy_version.as_deref(),
+        org_id: manifest.org_id.as_deref(),
+        issued_at: manifest.issued_at,
+        expires_at: manifest.expires_at,
         vendor_sig: "",
         org_approval_sig: manifest.org_approval_sig.as_deref(),
         assets,
@@ -78,6 +108,12 @@ mod tests {
         let manifest = BundleManifest {
             version: "v1".to_string(),
             created_at: 1,
+            bundle_id: None,
+            model_version: None,
+            policy_version: None,
+            org_id: None,
+            issued_at: None,
+            expires_at: None,
             vendor_sig: "deadbeef".to_string(),
             org_approval_sig: None,
             assets: vec![

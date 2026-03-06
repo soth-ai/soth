@@ -1915,6 +1915,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.10",
+ "soketto",
  "tokio",
  "tokio-openssl",
  "tokio-rustls",
@@ -3031,9 +3032,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "soketto"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e859df029d160cb88608f5d7df7fb4753fd20fdfb4de5644f3d8b8440841721"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "httparse",
+ "log",
+ "rand 0.8.5",
+ "sha1",
+]
+
+[[package]]
 name = "soth-bundle"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
@@ -3081,11 +3098,14 @@ name = "soth-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "comfy-table",
  "criterion",
  "dirs",
+ "ed25519-dalek",
+ "hex",
  "libc",
  "owo-colors",
  "rcgen 0.13.2",
@@ -3094,6 +3114,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "soth-bundle",
  "soth-core",
  "soth-proxy",
  "soth-sync",
@@ -3138,6 +3159,27 @@ dependencies = [
  "soth-core",
  "tree-sitter",
  "tree-sitter-rust",
+ "uuid",
+]
+
+[[package]]
+name = "soth-extensions"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "dashmap 5.5.3",
+ "serde",
+ "serde_json",
+ "sha2",
+ "soth-classify",
+ "soth-core",
+ "soth-detect",
+ "soth-policy",
+ "soth-telemetry",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -3205,6 +3247,7 @@ dependencies = [
  "soth-classify",
  "soth-core",
  "soth-detect",
+ "soth-extensions",
  "soth-mitm",
  "soth-policy",
  "soth-sqlite-vec",
@@ -3238,6 +3281,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "flate2",
+ "hex",
  "rand 0.8.5",
  "reqwest",
  "rusqlite",

@@ -1,7 +1,6 @@
 //! Environment variable output command
 
 use crate::cli_config;
-use std::path::Path;
 use std::path::PathBuf;
 
 const ENV_VARS: &[&str] = &[
@@ -15,8 +14,6 @@ const ENV_VARS: &[&str] = &[
     "REQUESTS_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
     "CURL_CA_BUNDLE",
-    "GIT_SSL_CAINFO",
-    "AWS_CA_BUNDLE",
 ];
 
 /// Run the env command
@@ -24,12 +21,27 @@ pub async fn run(
     shell: &str,
     ca_only: bool,
     unset: bool,
+    hook: bool,
     config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    if hook {
+        let kind = match shell.to_ascii_lowercase().as_str() {
+            "bash" | "sh" => super::shell_env::ShellKind::Bash,
+            "zsh" => super::shell_env::ShellKind::Zsh,
+            "fish" => super::shell_env::ShellKind::Fish,
+            other => {
+                anyhow::bail!(
+                    "`soth env --hook` is supported for bash, zsh, and fish (got: {other})"
+                );
+            }
+        };
+        println!("{}", super::shell_env::render_hook(kind));
+        return Ok(());
+    }
+
     let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
-    let ca_path = cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()))
-        .display()
-        .to_string();
+    let ca_paths = super::ca_health::resolve_ca_paths(&config);
+    let ca_path = ca_paths.trust_cert_path.display().to_string();
     let proxy_addr = format!("http://{}", config.forward_proxy.socket_addr());
 
     if ca_only {
@@ -53,8 +65,6 @@ pub async fn run(
                 println!("export REQUESTS_CA_BUNDLE={}", ca_path);
                 println!("export NODE_EXTRA_CA_CERTS={}", ca_path);
                 println!("export CURL_CA_BUNDLE={}", ca_path);
-                println!("export GIT_SSL_CAINFO={}", ca_path);
-                println!("export AWS_CA_BUNDLE={}", ca_path);
                 println!("# Run: eval \"$(soth env)\"");
             }
         }
@@ -77,8 +87,6 @@ pub async fn run(
                 println!("set -gx REQUESTS_CA_BUNDLE {}", ca_path);
                 println!("set -gx NODE_EXTRA_CA_CERTS {}", ca_path);
                 println!("set -gx CURL_CA_BUNDLE {}", ca_path);
-                println!("set -gx GIT_SSL_CAINFO {}", ca_path);
-                println!("set -gx AWS_CA_BUNDLE {}", ca_path);
                 println!("# Run: eval (soth env --shell fish)");
             }
         }
@@ -97,8 +105,6 @@ pub async fn run(
                 println!("$env:REQUESTS_CA_BUNDLE = \"{}\"", ca_path);
                 println!("$env:NODE_EXTRA_CA_CERTS = \"{}\"", ca_path);
                 println!("$env:CURL_CA_BUNDLE = \"{}\"", ca_path);
-                println!("$env:GIT_SSL_CAINFO = \"{}\"", ca_path);
-                println!("$env:AWS_CA_BUNDLE = \"{}\"", ca_path);
                 println!("# Run in PowerShell to set variables");
             }
         }
@@ -117,8 +123,6 @@ pub async fn run(
                 println!("set REQUESTS_CA_BUNDLE={}", ca_path);
                 println!("set NODE_EXTRA_CA_CERTS={}", ca_path);
                 println!("set CURL_CA_BUNDLE={}", ca_path);
-                println!("set GIT_SSL_CAINFO={}", ca_path);
-                println!("set AWS_CA_BUNDLE={}", ca_path);
                 println!("REM Run each line in Command Prompt");
             }
         }
@@ -134,8 +138,6 @@ pub async fn run(
                 println!("# REQUESTS_CA_BUNDLE={}", ca_path);
                 println!("# NODE_EXTRA_CA_CERTS={}", ca_path);
                 println!("# CURL_CA_BUNDLE={}", ca_path);
-                println!("# GIT_SSL_CAINFO={}", ca_path);
-                println!("# AWS_CA_BUNDLE={}", ca_path);
             }
         }
     }

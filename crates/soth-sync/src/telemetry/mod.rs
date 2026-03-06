@@ -21,6 +21,8 @@ pub use sink::SyncTelemetrySink;
 pub struct TelemetryRuntimeConfig {
     pub endpoint: String,
     pub api_key: String,
+    pub device_id_hash: String,
+    pub telemetry_signing_key_hex: Option<String>,
     pub db: Arc<Mutex<Connection>>,
     pub telemetry: TelemetrySyncConfig,
 }
@@ -30,6 +32,8 @@ impl TelemetryRuntimeConfig {
         Self {
             endpoint: config.endpoint.clone(),
             api_key: config.api_key.clone(),
+            device_id_hash: config.device_id_hash.clone(),
+            telemetry_signing_key_hex: config.telemetry_signing_key_hex.clone(),
             db,
             telemetry: config.telemetry.clone().sanitize(),
         }
@@ -52,6 +56,8 @@ impl TelemetrySyncRuntime {
             config.endpoint,
             config.api_key,
             telemetry.endpoint_path.clone(),
+            config.device_id_hash,
+            config.telemetry_signing_key_hex,
         )?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let worker =

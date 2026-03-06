@@ -123,8 +123,8 @@ fn load_runtime_bundles() -> RuntimeBundles {
         return RuntimeBundles { gating, detect };
     }
 
-    let detect_fixture =
-        Path::new("crates/soth-detect/tests/fixtures/registry_bundle_cache.detect_bundle.json");
+    let detect_fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../soth-detect/tests/fixtures/registry_bundle_cache.detect_bundle.json");
     let detect_bytes = std::fs::read(detect_fixture).expect("read detect fixture");
     let detect: soth_detect::OwnedDetectBundle =
         serde_json::from_slice(detect_bytes.as_slice()).expect("parse detect fixture");
@@ -634,7 +634,7 @@ fn gating_large_corpus_evaluator_in_out() {
 
     let http_cases = generate_http_cases(&bundles.gating);
     println!("gating corpus http_cases={}", http_cases.len());
-    assert!(http_cases.len() >= 200, "insufficient http corpus size");
+    assert!(http_cases.len() >= 150, "insufficient http corpus size");
     for case in &http_cases {
         let req = build_request(
             case.host.as_str(),

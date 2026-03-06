@@ -38,8 +38,6 @@ const PROXY_ENV_KEYS: &[&str] = &[
     "REQUESTS_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
     "CURL_CA_BUNDLE",
-    "GIT_SSL_CAINFO",
-    "AWS_CA_BUNDLE",
 ];
 
 #[cfg(target_os = "windows")]
@@ -821,12 +819,9 @@ fn has_local_proxy_env() -> bool {
             "NO_PROXY" | "no_proxy" => {
                 normalized.contains("127.0.0.1") || normalized.contains("localhost")
             }
-            "SSL_CERT_FILE"
-            | "REQUESTS_CA_BUNDLE"
-            | "NODE_EXTRA_CA_CERTS"
-            | "CURL_CA_BUNDLE"
-            | "GIT_SSL_CAINFO"
-            | "AWS_CA_BUNDLE" => normalized.contains(".soth"),
+            "SSL_CERT_FILE" | "REQUESTS_CA_BUNDLE" | "NODE_EXTRA_CA_CERTS" | "CURL_CA_BUNDLE" => {
+                normalized.contains(".soth")
+            }
             _ => false,
         }
     })

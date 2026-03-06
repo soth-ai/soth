@@ -11,6 +11,7 @@ members = [
     "crates/soth-policy",
     "crates/soth-sync",
     "crates/soth-detect",
+    "crates/soth-extensions",
 ]
 default-members = [
     "crates/soth-cli",
@@ -21,6 +22,7 @@ default-members = [
     "crates/soth-telemetry",
     "crates/soth-policy",
     "crates/soth-sync",
+    "crates/soth-extensions",
 ]
 exclude = [
     "tests/tools/mock_mcp_server",
@@ -45,6 +47,7 @@ soth-telemetry = { path = "crates/soth-telemetry" }
 soth-policy = { path = "crates/soth-policy" }
 soth-sync = { path = "crates/soth-sync" }
 soth-detect = { path = "crates/soth-detect" }
+soth-extensions = { path = "crates/soth-extensions" }
 
 # Async runtime
 tokio = { version = "1", features = [

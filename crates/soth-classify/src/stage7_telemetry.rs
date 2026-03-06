@@ -3,8 +3,8 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use soth_core::{
-    ArtifactKind, ClassificationFlag, ImportCategory, ProgrammingLanguage, RequestMethod,
-    SensitiveCodeFlags, TelemetryEvent, TelemetryPolicyKind,
+    ArtifactKind, ClassificationFlag, DataSource, ImportCategory, ProgrammingLanguage,
+    RequestMethod, RoutingReason, SensitiveCodeFlags, TelemetryEvent, TelemetryPolicyKind,
 };
 
 use crate::stage2_cluster::ClusterOutput;
@@ -23,7 +23,7 @@ pub(crate) struct TelemetryOutput {
 pub(crate) fn run(
     detect_result: &soth_core::DetectResult,
     proxy_ctx: &soth_core::ProxyContext,
-    _cluster: &ClusterOutput,
+    cluster: &ClusterOutput,
     usecase: &UsecaseOutput,
     volatility: &VolatilityOutput,
     anomaly: &AnomalyOutput,
@@ -54,8 +54,8 @@ pub(crate) fn run(
         use_case: usecase.label,
         volatility_class: volatility.class,
         cache_level: None,
-        routing_reason: None,
-        request_method: RequestMethod::Post,
+        routing_reason: derive_routing_reason(&policy.decision.kind),
+        request_method: proxy_ctx.request_method.unwrap_or(RequestMethod::Post),
         estimated_input_tokens: Some(detect_result.normalized.estimated_input_tokens),
         estimated_output_tokens: None,
         estimated_cost_usd: Some(detect_result.normalized.estimated_cost_usd as f32),
@@ -67,7 +67,29 @@ pub(crate) fn run(
         anomaly_flags: anomaly.flags.clone(),
         anomaly_score: Some(anomaly.score),
         policy_kind: Some(map_policy_kind(&policy.decision.kind)),
+        policy_rule_id: policy.decision.matched_rule.as_ref().map(|r| r.rule_id.clone()),
+        bundle_trust_level: None,
         sensitive_code_flags: build_sensitive_code_flags(&detect_result.artifacts),
+        session_key_hash: proxy_ctx
+            .session_snapshot
+            .as_ref()
+            .map(|s| s.session_key_hash.clone())
+            .unwrap_or_default(),
+        is_prefix_repeat: detect_result.is_prefix_repeat,
+        is_code_context_repeat: detect_result.is_repeated_code_context,
+        novel_token_count: detect_result.novel_token_count,
+        repeated_token_count: detect_result.repeated_token_count,
+        first_step_event_id: None,
+        original_event_id: None,
+        prefix_hash: detect_result.prefix_hash.clone(),
+        agent_step_number: None,
+        is_historical: false,
+        data_source: DataSource::LiveProxy,
+        original_timestamp: None,
+        topic_cluster_id: cluster.topic_cluster_id,
+        semantic_hash: cluster.semantic_hash.clone(),
+        is_semantic_collision: cluster.is_semantic_collision,
+        endpoint_hash: proxy_ctx.endpoint_hash.clone(),
     };
 
     TelemetryOutput {
@@ -143,6 +165,13 @@ fn build_sensitive_code_flags(artifacts: &[soth_core::SensitiveArtifact]) -> Sen
         }
     }
     flags
+}
+
+fn derive_routing_reason(kind: &soth_core::PolicyDecisionKind) -> Option<RoutingReason> {
+    match kind {
+        soth_core::PolicyDecisionKind::Reroute { .. } => Some(RoutingReason::PolicyReroute),
+        _ => None,
+    }
 }
 
 fn map_policy_kind(kind: &soth_core::PolicyDecisionKind) -> TelemetryPolicyKind {
@@ -242,6 +271,15 @@ mod tests {
             confidence: soth_core::ParseConfidence::Full,
             detect_latency_us: 0,
             warnings: Vec::new(),
+            session_mutations: soth_core::SessionMutations::default(),
+            is_prefix_repeat: false,
+            novel_token_count: 0,
+            repeated_token_count: 0,
+            novel_tail_start_idx: None,
+            prefix_hash: None,
+            is_repeated_code_context: false,
+            ast_normalized_hash: None,
+            first_blob_event_id: None,
         }
     }
 
@@ -267,6 +305,7 @@ mod tests {
             traffic_classification: soth_core::TrafficClassification::Other,
             classification_source: soth_core::ClassificationSource::Proxy,
             session_snapshot: Some(session),
+            request_method: None,
         }
     }
 

@@ -90,6 +90,7 @@ fn sample_proxy_context(capture_mode: CaptureMode, timestamp_epoch_ms: i64) -> P
             current_request_timestamp: timestamp_epoch_ms,
             ..SessionSnapshot::default()
         }),
+        request_method: None,
     }
 }
 
@@ -105,7 +106,7 @@ fn run_detect(capture_mode: CaptureMode) -> soth_core::DetectResult {
             "stream":false
         }"#,
     );
-    soth_detect::process_with_registry(&registry, &request, &bundle.as_slice())
+    soth_detect::process_with_registry(&registry, &request, &bundle.as_slice(), &soth_core::SessionSnapshot::default())
 }
 
 #[test]

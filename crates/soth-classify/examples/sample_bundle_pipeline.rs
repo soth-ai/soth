@@ -55,6 +55,15 @@ fn main() {
         confidence: ParseConfidence::Full,
         detect_latency_us: 0,
         warnings: Vec::new(),
+        session_mutations: soth_core::SessionMutations::default(),
+        is_prefix_repeat: false,
+        novel_token_count: 0,
+        repeated_token_count: 0,
+        novel_tail_start_idx: None,
+        prefix_hash: None,
+        is_repeated_code_context: false,
+        ast_normalized_hash: None,
+        first_blob_event_id: None,
     };
 
     let mut session = SessionSnapshot::default();
@@ -79,6 +88,7 @@ fn main() {
         traffic_classification: TrafficClassification::ToolUsage,
         classification_source: ClassificationSource::Proxy,
         session_snapshot: Some(session),
+        request_method: None,
     };
 
     let out = soth_classify::classify(

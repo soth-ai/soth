@@ -24,6 +24,7 @@ fn bench_classify_fallback(c: &mut Criterion) {
         traffic_classification: soth_core::TrafficClassification::Other,
         classification_source: soth_core::ClassificationSource::Proxy,
         session_snapshot: None,
+        request_method: None,
     };
 
     c.bench_function("classify/fallback", |b| {

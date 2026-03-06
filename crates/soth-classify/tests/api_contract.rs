@@ -34,3 +34,9 @@ fn fallback_model_asset_status_is_explicit() {
     assert!(!status.has_embedding_onnx);
     assert!(!status.has_use_case_mlp);
 }
+
+#[test]
+fn classify_bundle_trait_contract_is_send_sync_clone() {
+    fn assert_bundle_traits<T: Send + Sync + Clone>() {}
+    assert_bundle_traits::<ClassifyBundle>();
+}

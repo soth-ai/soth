@@ -405,3 +405,72 @@ pub struct HeartbeatRegistryDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_stale: Option<bool>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryBatchRequest {
+    pub batch_id: String,
+    pub org_id: String,
+    pub device_id_hash: String,
+    pub proxy_version: String,
+    pub timestamp: i64,
+    pub events: Vec<TelemetryEvent>,
+    pub proxy_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryEvent {
+    pub event_id: String,
+    pub timestamp: i64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub use_case_label: Option<String>,
+    pub topic_cluster_id: Option<String>,
+    pub semantic_hash: Option<String>,
+    #[serde(default)]
+    pub is_semantic_collision: bool,
+    pub collision_response_stability: Option<f64>,
+    pub anomaly_score: Option<f64>,
+    pub volatility_class: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub estimated_cost_usd: Option<f64>,
+    pub policy_decision: Option<String>,
+    pub policy_rule_id: Option<String>,
+    pub redaction_event: Option<bool>,
+    pub credential_pattern_detected: Option<bool>,
+    pub endpoint_hash: Option<String>,
+    pub code_fraction: Option<f64>,
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_prefix_repeat: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_code_context_repeat: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub novel_token_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_token_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_step_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryBatchResponse {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub errors: Vec<TelemetryBatchError>,
+    pub config_changed: bool,
+    pub server_time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryBatchError {
+    pub event_id: String,
+    pub reason: String,
+}

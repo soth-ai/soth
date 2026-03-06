@@ -19,6 +19,7 @@ use soth_core::{
     CaptureMode, EndpointType, ParseConfidence, ParseSource, RequestMethod, SensitiveCodeFlags,
     TelemetryEvent, TelemetryPolicyKind, UseCaseLabel, VolatilityClass,
 };
+use soth_sync::api_types::TelemetryBatchRequest;
 use soth_sync::telemetry::{TelemetryOutbox, TelemetryRuntimeConfig, TelemetrySyncRuntime};
 use soth_sync::TelemetrySyncConfig;
 use soth_telemetry::{SignedBatch, TelemetryBatch, TransmittedBatch};
@@ -34,16 +35,15 @@ async fn routed_telemetry_handler(
 ) -> StatusCode {
     state.calls.fetch_add(1, Ordering::SeqCst);
 
-    let Ok(batch) = serde_json::from_slice::<TransmittedBatch>(payload.as_ref()) else {
+    let Ok(batch) = serde_json::from_slice::<TelemetryBatchRequest>(payload.as_ref()) else {
         return StatusCode::BAD_REQUEST;
     };
 
-    let org = batch.org_id();
-    if org.starts_with("ok-") {
+    if batch.org_id.starts_with("ok-") {
         StatusCode::OK
-    } else if org.starts_with("retry-") {
+    } else if batch.org_id.starts_with("retry-") {
         StatusCode::SERVICE_UNAVAILABLE
-    } else if org.starts_with("bad-") {
+    } else if batch.org_id.starts_with("bad-") {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -54,7 +54,7 @@ async fn start_telemetry_server(state: RoutedTelemetryServerState) -> Option<Str
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let addr = listener.local_addr().ok()?;
     let app = Router::new()
-        .route("/api/v1/telemetry/batch", post(routed_telemetry_handler))
+        .route("/v1/edge/telemetry/batch", post(routed_telemetry_handler))
         .with_state(state);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -91,7 +91,25 @@ fn sample_event(event_id: Uuid) -> TelemetryEvent {
         anomaly_flags: Vec::new(),
         anomaly_score: Some(0.1),
         policy_kind: Some(TelemetryPolicyKind::Allow),
+        bundle_trust_level: Some(soth_core::BundleTrustLevel::Verified),
         sensitive_code_flags: SensitiveCodeFlags::default(),
+        session_key_hash: String::new(),
+        is_prefix_repeat: false,
+        is_code_context_repeat: false,
+        novel_token_count: 0,
+        repeated_token_count: 0,
+        first_step_event_id: None,
+        original_event_id: None,
+        prefix_hash: None,
+        agent_step_number: None,
+        is_historical: false,
+        data_source: soth_core::DataSource::LiveProxy,
+        original_timestamp: None,
+        topic_cluster_id: 0,
+        semantic_hash: String::new(),
+        is_semantic_collision: false,
+        endpoint_hash: String::new(),
+        policy_rule_id: None,
     }
 }
 
@@ -275,6 +293,8 @@ async fn telemetry_replay_large_corpus_startup_drain_matrix() {
     let runtime = TelemetrySyncRuntime::start(TelemetryRuntimeConfig {
         endpoint,
         api_key: "test-key".to_string(),
+        device_id_hash: "device-hash-test".to_string(),
+        telemetry_signing_key_hex: None,
         db: Arc::new(Mutex::new(
             Connection::open(&db_path).expect("open runtime db"),
         )),
@@ -367,12 +387,14 @@ async fn telemetry_replay_large_corpus_retry_deadletter_matrix() {
     let runtime = TelemetrySyncRuntime::start(TelemetryRuntimeConfig {
         endpoint,
         api_key: "test-key".to_string(),
+        device_id_hash: "device-hash-test".to_string(),
+        telemetry_signing_key_hex: None,
         db: Arc::new(Mutex::new(
             Connection::open(&db_path).expect("open runtime db"),
         )),
         telemetry: TelemetrySyncConfig {
             enabled: true,
-            endpoint_path: "/api/v1/telemetry/batch".to_string(),
+            endpoint_path: "/v1/edge/telemetry/batch".to_string(),
             max_retry_attempts: 1,
             backoff_base_ms: 10,
             backoff_max_ms: 10,

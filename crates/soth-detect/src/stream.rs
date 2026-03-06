@@ -145,6 +145,15 @@ pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
         detect_latency_us: session.start_time.elapsed().as_micros() as u64,
         warnings,
         raw_body_bytes: Some(Bytes::from(assembled)),
+        session_mutations: soth_core::SessionMutations::default(),
+        is_prefix_repeat: false,
+        novel_token_count: 0,
+        repeated_token_count: 0,
+        novel_tail_start_idx: None,
+        prefix_hash: None,
+        is_repeated_code_context: false,
+        ast_normalized_hash: None,
+        first_blob_event_id: None,
     }
 }
 

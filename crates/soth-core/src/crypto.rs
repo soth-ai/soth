@@ -11,6 +11,25 @@ pub fn commitment_hash(body_bytes: &[u8], nonce: &[u8; 32]) -> String {
     hex::encode(digest)
 }
 
+/// Deterministically derives a per-device Ed25519 seed from the device identity.
+///
+/// The output is stable for the same device id hash and safe to pass into
+/// `ed25519_dalek::SigningKey::from_bytes`.
+pub fn derive_proxy_signing_seed(device_id_hash: &str) -> [u8; 32] {
+    let normalized = if device_id_hash.trim().is_empty() {
+        "local-device"
+    } else {
+        device_id_hash.trim()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"soth.proxy.ed25519.seed.v1|");
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 pub fn cache_key_from_normalized(nr: &NormalizedRequest) -> String {
     let mut hasher = Sha256::new();
 
@@ -63,6 +82,14 @@ mod tests {
         let left = commitment_hash(b"hello", &nonce);
         let right = commitment_hash(b"hello", &nonce);
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn derive_proxy_signing_seed_is_stable() {
+        let left = derive_proxy_signing_seed("device-test-123");
+        let right = derive_proxy_signing_seed("device-test-123");
+        assert_eq!(left, right);
+        assert_ne!(left, derive_proxy_signing_seed("device-test-456"));
     }
 
     #[test]

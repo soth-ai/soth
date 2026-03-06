@@ -33,6 +33,7 @@ const LOCAL_UNVERIFIED_BUNDLE_VERSION: &str = "local-unverified";
 pub(crate) const EMBEDDING_DIM: usize = 384;
 pub(crate) const LSH_PROJECTION_ROWS: usize = 128;
 
+#[derive(Clone)]
 pub struct ClassifyBundle {
     pub(crate) classifier: Arc<dyn ClassificationProvider>,
     #[allow(dead_code)]

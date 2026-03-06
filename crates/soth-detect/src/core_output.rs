@@ -19,6 +19,15 @@ impl From<&DetectResult> for soth_core::DetectResult {
             confidence: value.confidence,
             detect_latency_us: value.detect_latency_us,
             warnings: value.warnings.iter().map(map_detect_warning).collect(),
+            session_mutations: value.session_mutations.clone(),
+            is_prefix_repeat: value.is_prefix_repeat,
+            novel_token_count: value.novel_token_count,
+            repeated_token_count: value.repeated_token_count,
+            novel_tail_start_idx: value.novel_tail_start_idx,
+            prefix_hash: value.prefix_hash.clone(),
+            is_repeated_code_context: value.is_repeated_code_context,
+            ast_normalized_hash: value.ast_normalized_hash.clone(),
+            first_blob_event_id: value.first_blob_event_id,
         }
     }
 }

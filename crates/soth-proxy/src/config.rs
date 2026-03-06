@@ -632,6 +632,7 @@ pub struct PipelineConfig {
     pub session_ttl_secs: u64,
     pub unknown_app_action: Option<GateAction>,
     pub non_cataloged_host_action: Option<GateAction>,
+    pub session: SessionConfig,
 }
 
 impl Default for PipelineConfig {
@@ -642,6 +643,29 @@ impl Default for PipelineConfig {
             session_ttl_secs: 3_600,
             unknown_app_action: None,
             non_cataloged_host_action: None,
+            session: SessionConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    pub window_secs: u64,
+    pub max_sessions: usize,
+    pub reaper_interval_secs: u64,
+    pub code_hash_ring_capacity: usize,
+    pub prefix_hash_ring_capacity: usize,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: 3_600,
+            max_sessions: 1_024,
+            reaper_interval_secs: 3_600,
+            code_hash_ring_capacity: 256,
+            prefix_hash_ring_capacity: 128,
         }
     }
 }
