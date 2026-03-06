@@ -72,6 +72,16 @@ fn compute_dynamic_fraction(
         score += 0.2;
     }
 
+    // Confirmed tool results in context = live dynamic data
+    if normalized.has_tool_results {
+        score += 0.30;
+    }
+
+    // Deep tool cycle (many turns + tools) = agent loop with live values
+    if normalized.has_tool_definitions && normalized.conversation_turn.unwrap_or(0) > 5 {
+        score += 0.15;
+    }
+
     if let Some(text) = content_for_embedding {
         let text_lc = text.to_ascii_lowercase();
         let temporal_hits = config
@@ -148,6 +158,9 @@ mod tests {
             },
             canonical_cache_key: "key".to_string(),
             format_metadata: FormatMetadata::Unknown,
+            has_structured_output: false,
+            has_tool_results: false,
+            estimated_output_tokens: None,
         }
     }
 

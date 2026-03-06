@@ -24,7 +24,7 @@ pub struct TreeSitterResult {
     pub complexity_estimate: u8,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DetectedImportCategory {
     Crypto,
     Auth,

@@ -34,7 +34,7 @@ pub(crate) fn run(
         process_resolution: proxy_ctx.process_resolution.clone(),
         capture_mode: proxy_ctx.capture_mode,
         traffic_classification: proxy_ctx.traffic_classification,
-        deployment: deployment_from_source(proxy_ctx.classification_source),
+        deployment: build_deployment_model(proxy_ctx),
         skip_org_rules,
         semantic: Some(SemanticPolicyContext {
             use_case_label: usecase.label,
@@ -61,17 +61,35 @@ pub(crate) fn run(
     )
 }
 
-fn deployment_from_source(source: ClassificationSource) -> DeploymentModel {
-    match source {
+fn build_deployment_model(proxy_ctx: &soth_core::ProxyContext) -> DeploymentModel {
+    match proxy_ctx.classification_source {
         ClassificationSource::Proxy => DeploymentModel::Proxy,
-        ClassificationSource::Sidecar => DeploymentModel::Sidecar {
-            service_name: "unknown".to_string(),
-            environment: "unknown".to_string(),
-        },
-        ClassificationSource::Sdk => DeploymentModel::Sdk {
-            service_name: "unknown".to_string(),
-            environment: "unknown".to_string(),
-        },
+        ClassificationSource::Sidecar => {
+            if let Some(ctx) = &proxy_ctx.deployment_context {
+                DeploymentModel::Sidecar {
+                    service_name: ctx.service_name.clone(),
+                    environment: ctx.environment.clone(),
+                }
+            } else {
+                DeploymentModel::Sidecar {
+                    service_name: "unknown".to_string(),
+                    environment: "unknown".to_string(),
+                }
+            }
+        }
+        ClassificationSource::Sdk => {
+            if let Some(ctx) = &proxy_ctx.deployment_context {
+                DeploymentModel::Sdk {
+                    service_name: ctx.service_name.clone(),
+                    environment: ctx.environment.clone(),
+                }
+            } else {
+                DeploymentModel::Sdk {
+                    service_name: "unknown".to_string(),
+                    environment: "unknown".to_string(),
+                }
+            }
+        }
     }
 }
 
@@ -153,6 +171,9 @@ mod tests {
             classification_source: soth_core::ClassificationSource::Proxy,
             session_snapshot: None,
             request_method: None,
+            deployment_context: None,
+            precomputed_commitment_nonce: None,
+            precomputed_commitment_hash: None,
         }
     }
 
@@ -188,6 +209,9 @@ mod tests {
                 },
                 canonical_cache_key: "cache-key".to_string(),
                 format_metadata: soth_core::FormatMetadata::Unknown,
+                has_structured_output: false,
+                has_tool_results: false,
+                estimated_output_tokens: None,
             },
             artifacts: Vec::new(),
             capture_mode: soth_core::CaptureMode::MetadataOnly,
@@ -206,6 +230,7 @@ mod tests {
             is_repeated_code_context: false,
             ast_normalized_hash: None,
             first_blob_event_id: None,
+            import_categories: Vec::new(),
         }
     }
 

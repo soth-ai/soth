@@ -25,6 +25,9 @@ fn bench_classify_fallback(c: &mut Criterion) {
         classification_source: soth_core::ClassificationSource::Proxy,
         session_snapshot: None,
         request_method: None,
+        deployment_context: None,
+        precomputed_commitment_nonce: None,
+        precomputed_commitment_hash: None,
     };
 
     c.bench_function("classify/fallback", |b| {

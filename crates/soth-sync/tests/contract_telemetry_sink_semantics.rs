@@ -62,6 +62,18 @@ fn sample_event(event_id: Uuid) -> TelemetryEvent {
         is_semantic_collision: false,
         endpoint_hash: String::new(),
         policy_rule_id: None,
+        use_case_confidence: 0.0,
+        secondary_label: None,
+        complexity_score: 0,
+        embedding_norm: 0.0,
+        system_prompt_hash: None,
+        system_prompt_token_length: None,
+        dynamic_fraction: 0.0,
+        prefix_repeat_signature: None,
+        tool_definition_hash: None,
+        collision_response_stability: None,
+        commitment_hash: String::new(),
+        code_fraction: 0.0,
     }
 }
 

@@ -93,6 +93,9 @@ fn fixture_request() -> NormalizedRequest {
         parse_source: ParseSource::GraphQl,
         canonical_cache_key: String::new(),
         format_metadata: FormatMetadata::Unknown,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
     }
 }
 

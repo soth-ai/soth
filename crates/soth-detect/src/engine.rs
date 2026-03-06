@@ -172,6 +172,7 @@ fn process_inner(
     );
     let mut artifacts = Vec::new();
     let mut ast_normalized_hash: Option<String> = None;
+    let mut import_categories: Vec<code::DetectedImportCategory> = Vec::new();
 
     if full_like {
         // Body-level scans
@@ -195,6 +196,9 @@ fn process_inner(
                 );
                 artifacts.extend(code_result.artifacts);
                 warnings.extend(code_result.warnings);
+                if let Some(ts) = &code_result.tree_sitter {
+                    import_categories.extend(ts.import_categories.iter().cloned());
+                }
                 if ast_normalized_hash.is_none() {
                     let lang = code_result
                         .detected_language
@@ -218,6 +222,9 @@ fn process_inner(
                     let code_result = detect_code_artifacts(text, location.clone());
                     artifacts.extend(code_result.artifacts);
                     warnings.extend(code_result.warnings);
+                    if let Some(ts) = &code_result.tree_sitter {
+                        import_categories.extend(ts.import_categories.iter().cloned());
+                    }
 
                     if ast_normalized_hash.is_none() {
                         let lang = code_result
@@ -237,6 +244,9 @@ fn process_inner(
             }
         }
     }
+    // Deduplicate import categories
+    import_categories.sort();
+    import_categories.dedup();
 
     // Prefix repeat detection
     let (is_prefix_repeat, novel_token_count, repeated_token_count, novel_tail_start_idx, prefix_hash) =
@@ -290,6 +300,7 @@ fn process_inner(
         is_repeated_code_context,
         ast_normalized_hash,
         first_blob_event_id: None,
+        import_categories,
     }
 }
 

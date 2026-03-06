@@ -28,14 +28,28 @@ pub(crate) fn run(
     volatility: &VolatilityOutput,
     anomaly: &AnomalyOutput,
     policy: &PolicyOutput,
+    embedding_norm: f32,
 ) -> TelemetryOutput {
     let started = Instant::now();
 
-    let mut nonce = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    // Use precomputed nonce from proxy if available, otherwise generate
+    let nonce = proxy_ctx
+        .precomputed_commitment_nonce
+        .unwrap_or_else(|| {
+            let mut n = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut n);
+            n
+        });
+
+    // Commitment hash: use precomputed from proxy, or empty until proxy ships it
+    let commitment_hash = proxy_ctx
+        .precomputed_commitment_hash
+        .clone()
+        .unwrap_or_default();
 
     let classifications = build_classification_flags(detect_result, anomaly, policy);
     let languages = extract_languages(&detect_result.artifacts);
+    let code_fraction = compute_code_fraction(detect_result);
 
     let event = TelemetryEvent {
         event_id: Uuid::new_v4(),
@@ -57,19 +71,22 @@ pub(crate) fn run(
         routing_reason: derive_routing_reason(&policy.decision.kind),
         request_method: proxy_ctx.request_method.unwrap_or(RequestMethod::Post),
         estimated_input_tokens: Some(detect_result.normalized.estimated_input_tokens),
-        estimated_output_tokens: None,
+        estimated_output_tokens: detect_result.normalized.estimated_output_tokens,
         estimated_cost_usd: Some(detect_result.normalized.estimated_cost_usd as f32),
         process_resolution: Some(proxy_ctx.process_resolution.clone()),
         traffic_classification: Some(proxy_ctx.traffic_classification),
         languages,
-        import_categories: Vec::<ImportCategory>::new(),
+        import_categories: detect_result.import_categories.clone(),
         classification_flags: classifications,
         anomaly_flags: anomaly.flags.clone(),
         anomaly_score: Some(anomaly.score),
         policy_kind: Some(map_policy_kind(&policy.decision.kind)),
         policy_rule_id: policy.decision.matched_rule.as_ref().map(|r| r.rule_id.clone()),
         bundle_trust_level: None,
-        sensitive_code_flags: build_sensitive_code_flags(&detect_result.artifacts),
+        sensitive_code_flags: build_sensitive_code_flags(
+            &detect_result.artifacts,
+            &detect_result.import_categories,
+        ),
         session_key_hash: proxy_ctx
             .session_snapshot
             .as_ref()
@@ -90,6 +107,19 @@ pub(crate) fn run(
         semantic_hash: cluster.semantic_hash.clone(),
         is_semantic_collision: cluster.is_semantic_collision,
         endpoint_hash: proxy_ctx.endpoint_hash.clone(),
+        // Gap 8: new telemetry fields
+        use_case_confidence: usecase.confidence.clamp(0.0, 1.0),
+        secondary_label: usecase.secondary_label,
+        complexity_score: usecase.complexity_score,
+        embedding_norm,
+        system_prompt_hash: detect_result.normalized.system_prompt_hash.clone(),
+        system_prompt_token_length: detect_result.normalized.system_prompt_token_estimate,
+        dynamic_fraction: volatility.dynamic_fraction.clamp(0.0, 1.0),
+        prefix_repeat_signature: volatility.prefix_repeat_signature.clone(),
+        tool_definition_hash: detect_result.normalized.tool_definition_hash.clone(),
+        collision_response_stability: None,
+        commitment_hash,
+        code_fraction,
     };
 
     TelemetryOutput {
@@ -133,8 +163,12 @@ fn build_classification_flags(
     flags
 }
 
-fn build_sensitive_code_flags(artifacts: &[soth_core::SensitiveArtifact]) -> SensitiveCodeFlags {
+fn build_sensitive_code_flags(
+    artifacts: &[soth_core::SensitiveArtifact],
+    import_categories: &[ImportCategory],
+) -> SensitiveCodeFlags {
     let mut flags = SensitiveCodeFlags::default();
+
     for artifact in artifacts {
         match &artifact.kind {
             ArtifactKind::PrivateKey => {
@@ -164,7 +198,38 @@ fn build_sensitive_code_flags(artifacts: &[soth_core::SensitiveArtifact]) -> Sen
             }
         }
     }
+
+    // Gap 10: import category based flags
+    for category in import_categories {
+        match category {
+            ImportCategory::Network => flags.network_calls_detected = true,
+            ImportCategory::Filesystem => flags.file_io_detected = true,
+            ImportCategory::Crypto => flags.crypto_operations_detected = true,
+            ImportCategory::Auth => flags.auth_logic_detected = true,
+            _ => {}
+        }
+    }
+
     flags
+}
+
+fn compute_code_fraction(detect_result: &soth_core::DetectResult) -> f32 {
+    let code_block_count = detect_result
+        .artifacts
+        .iter()
+        .filter(|a| matches!(a.kind, ArtifactKind::CodeBlock { .. }))
+        .count();
+
+    if code_block_count == 0 {
+        return 0.0;
+    }
+
+    // Approximate: each code block artifact represents a detected code region.
+    // Use estimated_input_tokens as proxy for total content size.
+    // A typical code block is ~200 tokens; scale by block count.
+    let total_tokens = detect_result.normalized.estimated_input_tokens.max(1) as f32;
+    let estimated_code_tokens = (code_block_count as f32) * 200.0;
+    (estimated_code_tokens / total_tokens).clamp(0.0, 1.0)
 }
 
 fn derive_routing_reason(kind: &soth_core::PolicyDecisionKind) -> Option<RoutingReason> {
@@ -262,6 +327,9 @@ mod tests {
                 },
                 canonical_cache_key: "cache-key".to_string(),
                 format_metadata: soth_core::FormatMetadata::Unknown,
+                has_structured_output: false,
+                has_tool_results: false,
+                estimated_output_tokens: None,
             },
             artifacts: Vec::new(),
             capture_mode: soth_core::CaptureMode::MetadataOnly,
@@ -280,6 +348,7 @@ mod tests {
             is_repeated_code_context: false,
             ast_normalized_hash: None,
             first_blob_event_id: None,
+            import_categories: Vec::new(),
         }
     }
 
@@ -306,6 +375,9 @@ mod tests {
             classification_source: soth_core::ClassificationSource::Proxy,
             session_snapshot: Some(session),
             request_method: None,
+            deployment_context: None,
+            precomputed_commitment_nonce: None,
+            precomputed_commitment_hash: None,
         }
     }
 
@@ -354,6 +426,7 @@ mod tests {
             &volatility,
             &anomaly,
             &policy,
+            1.5,
         );
 
         assert_eq!(out.event.timestamp_epoch_ms, 1_700_000_000_111);
@@ -371,6 +444,19 @@ mod tests {
         assert_eq!(out.event.estimated_cost_usd, Some(0.045));
         assert_eq!(out.event.request_method, soth_core::RequestMethod::Post);
         assert!(out.nonce.iter().any(|byte| *byte != 0));
+        // Gap 8 fields
+        assert!((out.event.use_case_confidence - 0.8).abs() < 0.01);
+        assert_eq!(
+            out.event.secondary_label,
+            Some(soth_core::UseCaseLabel::CodeReview)
+        );
+        assert_eq!(out.event.complexity_score, 4);
+        assert!((out.event.embedding_norm - 1.5).abs() < 0.01);
+        assert!((out.event.dynamic_fraction - 0.45).abs() < 0.01);
+        assert_eq!(
+            out.event.prefix_repeat_signature,
+            Some("abc123".to_string())
+        );
     }
 
     #[test]
@@ -427,6 +513,7 @@ mod tests {
             &volatility,
             &anomaly,
             &policy,
+            0.0,
         );
 
         assert!(out
@@ -481,6 +568,7 @@ mod tests {
             &VolatilityOutput::default(),
             &AnomalyOutput::default(),
             &policy_allow(),
+            0.0,
         );
 
         let rust_count = out
@@ -509,10 +597,67 @@ mod tests {
             &VolatilityOutput::default(),
             &AnomalyOutput::default(),
             &policy_allow(),
+            0.0,
         );
 
         assert!(out.event.sensitive_code_flags.private_key_detected);
         assert!(out.event.sensitive_code_flags.hardcoded_secret_detected);
         assert!(out.event.sensitive_code_flags.credential_pattern_detected);
+    }
+
+    #[test]
+    fn telemetry_import_categories_set_network_and_file_io_flags() {
+        let mut detect = detect_result();
+        detect.import_categories = vec![ImportCategory::Network, ImportCategory::Filesystem];
+
+        let out = run(
+            &detect,
+            &proxy_ctx_with_time(4),
+            &ClusterOutput::default(),
+            &usecase_output(),
+            &VolatilityOutput::default(),
+            &AnomalyOutput::default(),
+            &policy_allow(),
+            0.0,
+        );
+
+        assert!(out.event.sensitive_code_flags.network_calls_detected);
+        assert!(out.event.sensitive_code_flags.file_io_detected);
+        assert_eq!(out.event.import_categories.len(), 2);
+    }
+
+    #[test]
+    fn telemetry_commitment_hash_from_precomputed() {
+        let mut proxy = proxy_ctx_with_time(5);
+        proxy.precomputed_commitment_hash = Some("abc123hash".to_string());
+
+        let out = run(
+            &detect_result(),
+            &proxy,
+            &ClusterOutput::default(),
+            &usecase_output(),
+            &VolatilityOutput::default(),
+            &AnomalyOutput::default(),
+            &policy_allow(),
+            0.0,
+        );
+
+        assert_eq!(out.event.commitment_hash, "abc123hash");
+    }
+
+    #[test]
+    fn telemetry_commitment_hash_empty_without_precomputed() {
+        let out = run(
+            &detect_result(),
+            &proxy_ctx_with_time(6),
+            &ClusterOutput::default(),
+            &usecase_output(),
+            &VolatilityOutput::default(),
+            &AnomalyOutput::default(),
+            &policy_allow(),
+            0.0,
+        );
+
+        assert!(out.event.commitment_hash.is_empty());
     }
 }

@@ -78,6 +78,7 @@ pub(crate) fn run(
         &volatility,
         &anomaly,
         &policy,
+        embed.norm,
     );
 
     let stage_latencies = StageTiming {

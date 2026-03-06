@@ -192,6 +192,7 @@ pub struct DetectResult {
     pub is_repeated_code_context: bool,
     pub ast_normalized_hash: Option<String>,
     pub first_blob_event_id: Option<uuid::Uuid>,
+    pub import_categories: Vec<crate::code::DetectedImportCategory>,
 }
 
 impl DetectResult {
@@ -247,6 +248,7 @@ impl DetectResult {
             is_repeated_code_context: false,
             ast_normalized_hash: None,
             first_blob_event_id: None,
+            import_categories: Vec::new(),
         }
     }
 

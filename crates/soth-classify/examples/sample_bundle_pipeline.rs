@@ -46,6 +46,9 @@ fn main() {
             },
             canonical_cache_key: "cache-key".to_string(),
             format_metadata: FormatMetadata::Unknown,
+            has_structured_output: false,
+            has_tool_results: false,
+            estimated_output_tokens: None,
         },
         artifacts: Vec::new(),
         capture_mode: CaptureMode::MetadataOnly,
@@ -64,6 +67,7 @@ fn main() {
         is_repeated_code_context: false,
         ast_normalized_hash: None,
         first_blob_event_id: None,
+        import_categories: Vec::new(),
     };
 
     let mut session = SessionSnapshot::default();
@@ -89,6 +93,9 @@ fn main() {
         classification_source: ClassificationSource::Proxy,
         session_snapshot: Some(session),
         request_method: None,
+        deployment_context: None,
+        precomputed_commitment_nonce: None,
+        precomputed_commitment_hash: None,
     };
 
     let out = soth_classify::classify(

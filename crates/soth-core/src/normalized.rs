@@ -34,6 +34,13 @@ pub struct NormalizedRequest {
     pub estimated_cost_usd: f64,
     pub parse_source: ParseSource,
 
+    #[serde(default)]
+    pub has_structured_output: bool,
+    #[serde(default)]
+    pub has_tool_results: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_output_tokens: Option<u32>,
+
     pub canonical_cache_key: String,
     pub format_metadata: FormatMetadata,
 }
@@ -66,6 +73,9 @@ impl Default for NormalizedRequest {
             estimated_input_tokens: 0,
             estimated_cost_usd: 0.0,
             parse_source: ParseSource::Heuristic,
+            has_structured_output: false,
+            has_tool_results: false,
+            estimated_output_tokens: None,
             canonical_cache_key: String::new(),
             format_metadata: FormatMetadata::Unknown,
         }

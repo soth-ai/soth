@@ -198,7 +198,7 @@ pub struct TelemetryEvent {
     pub anomaly_flags: Vec<AnomalyFlag>,
     pub anomaly_score: Option<f32>,
     pub policy_kind: Option<TelemetryPolicyKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub bundle_trust_level: Option<BundleTrustLevel>,
     pub sensitive_code_flags: SensitiveCodeFlags,
     #[serde(default)]
@@ -233,8 +233,33 @@ pub struct TelemetryEvent {
     pub is_semantic_collision: bool,
     #[serde(default)]
     pub endpoint_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub policy_rule_id: Option<String>,
+
+    #[serde(default)]
+    pub use_case_confidence: f32,
+    #[serde(default)]
+    pub secondary_label: Option<UseCaseLabel>,
+    #[serde(default)]
+    pub complexity_score: u8,
+    #[serde(default)]
+    pub embedding_norm: f32,
+    #[serde(default)]
+    pub system_prompt_hash: Option<String>,
+    #[serde(default)]
+    pub system_prompt_token_length: Option<u32>,
+    #[serde(default)]
+    pub dynamic_fraction: f32,
+    #[serde(default)]
+    pub prefix_repeat_signature: Option<String>,
+    #[serde(default)]
+    pub tool_definition_hash: Option<String>,
+    #[serde(default)]
+    pub collision_response_stability: Option<f32>,
+    #[serde(default)]
+    pub commitment_hash: String,
+    #[serde(default)]
+    pub code_fraction: f32,
 }
 
 impl Default for TelemetryEvent {
@@ -284,6 +309,18 @@ impl Default for TelemetryEvent {
             is_semantic_collision: false,
             endpoint_hash: String::new(),
             policy_rule_id: None,
+            use_case_confidence: 0.0,
+            secondary_label: None,
+            complexity_score: 0,
+            embedding_norm: 0.0,
+            system_prompt_hash: None,
+            system_prompt_token_length: None,
+            dynamic_fraction: 0.0,
+            prefix_repeat_signature: None,
+            tool_definition_hash: None,
+            collision_response_stability: None,
+            commitment_hash: String::new(),
+            code_fraction: 0.0,
         }
     }
 }

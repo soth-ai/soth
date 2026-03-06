@@ -130,6 +130,9 @@ mod tests {
             parse_source: ParseSource::Heuristic,
             canonical_cache_key: String::new(),
             format_metadata: FormatMetadata::Unknown,
+            has_structured_output: false,
+            has_tool_results: false,
+            estimated_output_tokens: None,
         }
     }
 }

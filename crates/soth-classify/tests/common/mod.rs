@@ -30,6 +30,9 @@ pub fn make_detect_result() -> soth_core::DetectResult {
             },
             canonical_cache_key: "cache-key".to_string(),
             format_metadata: soth_core::FormatMetadata::Unknown,
+            has_structured_output: false,
+            has_tool_results: false,
+            estimated_output_tokens: None,
         },
         artifacts: Vec::new(),
         capture_mode: soth_core::CaptureMode::MetadataOnly,
@@ -48,6 +51,7 @@ pub fn make_detect_result() -> soth_core::DetectResult {
         is_repeated_code_context: false,
         ast_normalized_hash: None,
         first_blob_event_id: None,
+        import_categories: Vec::new(),
     }
 }
 
@@ -74,5 +78,8 @@ pub fn make_proxy_ctx(
         classification_source: soth_core::ClassificationSource::Proxy,
         session_snapshot,
         request_method: None,
+        deployment_context: None,
+        precomputed_commitment_nonce: None,
+        precomputed_commitment_hash: None,
     }
 }

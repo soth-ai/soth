@@ -12,6 +12,7 @@ pub struct ComplexityWeights {
     pub token_weight: f32,
     pub tool_count_weight: f32,
     pub turn_depth_weight: f32,
+    pub structured_output_weight: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -30,9 +31,10 @@ impl Default for ClassifyConfig {
             anomaly_enabled: true,
             lsh_near_dupe_threshold: 8,
             complexity_weights: ComplexityWeights {
-                token_weight: 0.4,
-                tool_count_weight: 0.3,
-                turn_depth_weight: 0.3,
+                token_weight: 0.40,
+                tool_count_weight: 0.25,
+                turn_depth_weight: 0.25,
+                structured_output_weight: 0.10,
             },
             volatility: VolatilityConfig::default(),
         }

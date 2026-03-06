@@ -292,6 +292,9 @@ impl ProxyHandler {
             classification_source: soth_core::ClassificationSource::Proxy,
             session_snapshot: Some(session_snapshot),
             request_method: Some(map_request_method(req.method.as_str())),
+            deployment_context: None,
+            precomputed_commitment_nonce: None,
+            precomputed_commitment_hash: None,
         };
 
         let raw_body_for_commitment = match outcome.capture_mode {

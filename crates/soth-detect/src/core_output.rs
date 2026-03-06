@@ -28,6 +28,11 @@ impl From<&DetectResult> for soth_core::DetectResult {
             is_repeated_code_context: value.is_repeated_code_context,
             ast_normalized_hash: value.ast_normalized_hash.clone(),
             first_blob_event_id: value.first_blob_event_id,
+            import_categories: value
+                .import_categories
+                .iter()
+                .map(map_import_category)
+                .collect(),
         }
     }
 }
@@ -70,6 +75,9 @@ fn to_core_normalized(value: &DetectResult) -> NormalizedRequest {
         parse_source: map_parse_source(&value.parse_source),
         canonical_cache_key: normalized.canonical_hash.clone(),
         format_metadata: map_format_metadata(&normalized.format_meta),
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
     }
 }
 
@@ -238,5 +246,20 @@ fn map_artifact_location(value: &DetectArtifactLocation) -> ArtifactLocation {
             tool_name: Some(tool_name.clone()),
         },
         _ => ArtifactLocation::Unknown,
+    }
+}
+
+fn map_import_category(
+    value: &crate::code::DetectedImportCategory,
+) -> soth_core::ImportCategory {
+    match value {
+        crate::code::DetectedImportCategory::Crypto => soth_core::ImportCategory::Crypto,
+        crate::code::DetectedImportCategory::Auth => soth_core::ImportCategory::Auth,
+        crate::code::DetectedImportCategory::Network => soth_core::ImportCategory::Network,
+        crate::code::DetectedImportCategory::Database => soth_core::ImportCategory::Database,
+        crate::code::DetectedImportCategory::FileSystem => soth_core::ImportCategory::Filesystem,
+        crate::code::DetectedImportCategory::Serialization => {
+            soth_core::ImportCategory::Serialization
+        }
     }
 }

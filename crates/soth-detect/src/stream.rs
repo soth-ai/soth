@@ -166,6 +166,7 @@ pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
         is_repeated_code_context: false,
         ast_normalized_hash: None,
         first_blob_event_id: None,
+        import_categories: Vec::new(),
     }
 }
 

@@ -91,6 +91,9 @@ fn sample_proxy_context(capture_mode: CaptureMode, timestamp_epoch_ms: i64) -> P
             ..SessionSnapshot::default()
         }),
         request_method: None,
+        deployment_context: None,
+        precomputed_commitment_nonce: None,
+        precomputed_commitment_hash: None,
     }
 }
 

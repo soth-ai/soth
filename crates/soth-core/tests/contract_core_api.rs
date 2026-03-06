@@ -67,6 +67,9 @@ fn sample_normalized_request() -> NormalizedRequest {
         format_metadata: soth_core::FormatMetadata::JsonRpc {
             method: "tools/call".to_string(),
         },
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
     }
 }
 
@@ -123,6 +126,9 @@ fn proxy_context_and_policy_context_semantic_extension_contract() {
         classification_source: ClassificationSource::Proxy,
         session_snapshot: Some(SessionSnapshot::default()),
         request_method: None,
+        deployment_context: None,
+        precomputed_commitment_nonce: None,
+        precomputed_commitment_hash: None,
     };
     assert_eq!(proxy_ctx.org_id, "org-test");
     assert_eq!(proxy_ctx.capture_mode, CaptureMode::SensitiveArtifacts);
@@ -197,6 +203,18 @@ fn telemetry_event_surface_excludes_raw_content_fields() {
         is_semantic_collision: false,
         endpoint_hash: String::new(),
         policy_rule_id: None,
+        use_case_confidence: 0.0,
+        secondary_label: None,
+        complexity_score: 0,
+        embedding_norm: 0.0,
+        system_prompt_hash: None,
+        system_prompt_token_length: None,
+        dynamic_fraction: 0.0,
+        prefix_repeat_signature: None,
+        tool_definition_hash: None,
+        collision_response_stability: None,
+        commitment_hash: String::new(),
+        code_fraction: 0.0,
     };
 
     let value = serde_json::to_value(event).expect("serialize telemetry event");
@@ -541,6 +559,18 @@ fn telemetry_event_new_fields_serde_roundtrip() {
         is_semantic_collision: false,
         endpoint_hash: String::new(),
         policy_rule_id: None,
+        use_case_confidence: 0.0,
+        secondary_label: None,
+        complexity_score: 0,
+        embedding_norm: 0.0,
+        system_prompt_hash: None,
+        system_prompt_token_length: None,
+        dynamic_fraction: 0.0,
+        prefix_repeat_signature: None,
+        tool_definition_hash: None,
+        collision_response_stability: None,
+        commitment_hash: String::new(),
+        code_fraction: 0.0,
     };
 
     let json = serde_json::to_string(&event).expect("serialize");

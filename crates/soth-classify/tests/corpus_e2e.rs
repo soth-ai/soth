@@ -461,6 +461,9 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
         },
         canonical_cache_key: "cache-key".to_string(),
         format_metadata: FormatMetadata::Unknown,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
     };
 
     if let Some(provider) = request.provider.as_deref() {
@@ -499,6 +502,7 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
     }
     if let Some(max_tokens) = request.max_tokens {
         normalized.max_tokens = Some(max_tokens);
+        normalized.estimated_output_tokens = Some(max_tokens);
     }
     if let Some(user_content_token_estimate) = request.user_content_token_estimate {
         normalized.user_content_token_estimate = user_content_token_estimate;
@@ -544,6 +548,7 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
         is_repeated_code_context: false,
         ast_normalized_hash: None,
         first_blob_event_id: None,
+        import_categories: Vec::new(),
     }
 }
 
@@ -590,6 +595,9 @@ fn build_proxy_context(context: &ContextInput) -> ProxyContext {
         classification_source: source,
         session_snapshot: session,
         request_method: None,
+        deployment_context: None,
+        precomputed_commitment_nonce: None,
+        precomputed_commitment_hash: None,
     }
 }
 

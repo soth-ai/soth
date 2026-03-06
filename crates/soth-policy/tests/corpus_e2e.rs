@@ -338,6 +338,9 @@ fn default_request() -> NormalizedRequest {
         parse_source: ParseSource::GraphQl,
         canonical_cache_key: "cache-key".to_string(),
         format_metadata: FormatMetadata::Unknown,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
     }
 }
 

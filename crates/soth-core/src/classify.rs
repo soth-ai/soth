@@ -18,6 +18,20 @@ pub struct ProxyContext {
     pub session_snapshot: Option<SessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_method: Option<RequestMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_context: Option<DeploymentContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precomputed_commitment_nonce: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precomputed_commitment_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentContext {
+    pub service_name: String,
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

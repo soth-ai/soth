@@ -196,6 +196,9 @@ fn build_extension_proxy_ctx(event: &soth_core::GovernableEvent) -> soth_core::P
         classification_source: soth_core::ClassificationSource::Sdk,
         session_snapshot: Some(soth_core::SessionSnapshot::default()),
         request_method: None,
+        deployment_context: None,
+        precomputed_commitment_nonce: None,
+        precomputed_commitment_hash: None,
     }
 }
 

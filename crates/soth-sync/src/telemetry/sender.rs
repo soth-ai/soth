@@ -205,7 +205,11 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         } else {
             Some(event.endpoint_hash.clone())
         },
-        code_fraction: None,
+        code_fraction: if event.code_fraction > 0.0 {
+            Some(f64::from(event.code_fraction))
+        } else {
+            None
+        },
         tags,
         session_key_hash: if event.session_key_hash.is_empty() {
             None

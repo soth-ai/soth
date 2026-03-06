@@ -33,6 +33,8 @@ pub struct DetectResult {
     pub ast_normalized_hash: Option<String>,
     #[serde(default)]
     pub first_blob_event_id: Option<Uuid>,
+    #[serde(default)]
+    pub import_categories: Vec<crate::ImportCategory>,
 }
 
 impl Default for DetectResult {
@@ -54,6 +56,7 @@ impl Default for DetectResult {
             is_repeated_code_context: false,
             ast_normalized_hash: None,
             first_blob_event_id: None,
+            import_categories: Vec::new(),
         }
     }
 }

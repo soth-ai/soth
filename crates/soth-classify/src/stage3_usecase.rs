@@ -75,12 +75,21 @@ fn compute_complexity(
         0.0
     };
     let turn_score = (normalized.conversation_turn.unwrap_or(0) as f32 / 20.0).clamp(0.0, 1.0);
+    let structured_score = if normalized.has_structured_output {
+        1.0
+    } else {
+        0.0
+    };
 
     let weighted = token_score * weights.token_weight
         + tool_score * weights.tool_count_weight
-        + turn_score * weights.turn_depth_weight;
-    let total_weight =
-        (weights.token_weight + weights.tool_count_weight + weights.turn_depth_weight).max(1e-6);
+        + turn_score * weights.turn_depth_weight
+        + structured_score * weights.structured_output_weight;
+    let total_weight = (weights.token_weight
+        + weights.tool_count_weight
+        + weights.turn_depth_weight
+        + weights.structured_output_weight)
+        .max(1e-6);
     let raw = (weighted / total_weight).clamp(0.0, 1.0);
 
     (raw.mul_add(4.0, 1.0)).round().clamp(1.0, 5.0) as u8

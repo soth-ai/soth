@@ -15,9 +15,10 @@ pub(crate) struct AnomalyOutput {
 struct PreEmitEvent<'a> {
     timestamp_utc: i64,
     input_tokens: u32,
-    output_tokens: u32,
+    output_tokens: Option<u32>,
     system_prompt_hash: Option<&'a str>,
     tool_call_depth: u8,
+    has_tool_definitions: bool,
     embedding: Option<&'a [f32]>,
 }
 
@@ -40,13 +41,13 @@ pub(crate) fn run(
     let pre_emit = PreEmitEvent {
         timestamp_utc: snapshot.current_request_timestamp,
         input_tokens: normalized.estimated_input_tokens,
-        // Current normalized schema has no true output token estimate yet.
-        output_tokens: normalized.max_tokens.unwrap_or(0),
+        output_tokens: normalized.estimated_output_tokens,
         system_prompt_hash: normalized.system_prompt_hash.as_deref(),
         tool_call_depth: normalized
             .conversation_turn
             .unwrap_or(0)
             .min(u32::from(u8::MAX)) as u8,
+        has_tool_definitions: normalized.has_tool_definitions,
         embedding,
     };
 
@@ -148,15 +149,27 @@ fn score_rule_based(
         }
     }
 
-    // 7) Exfiltration-like shape (scoring only for now)
-    if current.input_tokens < 50 && current.output_tokens > 2_000 {
-        score += 0.25;
+    // 7) Exfiltration-like shape — only when actual output tokens are known
+    if let Some(output_tokens) = current.output_tokens {
+        if current.input_tokens < 50 && output_tokens > 2_000 {
+            score += 0.25;
+        }
     }
 
     // 8) Tool depth spike
     if current.tool_call_depth > snapshot.max_tool_depth_seen.saturating_add(3) {
         flags.push(AnomalyFlag::ToolCallDepthSpike);
         score += 0.15;
+    }
+
+    // 9) Agent loop pattern
+    let has_rapid_fire = flags.contains(&AnomalyFlag::RapidFireRequests);
+    let high_volume = request_count_this_hour > 50;
+    let has_tools = current.tool_call_depth > 0 || current.has_tool_definitions;
+    let multi_model = snapshot.models_used_this_session.len() >= 2;
+
+    if (has_rapid_fire || high_volume) && has_tools && multi_model {
+        flags.push(AnomalyFlag::AgentLoopPattern);
     }
 
     dedupe_flags(&mut flags);
@@ -260,6 +273,9 @@ mod tests {
             },
             canonical_cache_key: "cache-key".to_string(),
             format_metadata: soth_core::FormatMetadata::Unknown,
+            has_structured_output: false,
+            has_tool_results: false,
+            estimated_output_tokens: None,
         }
     }
 
@@ -410,7 +426,7 @@ mod tests {
     fn exfiltration_shape_adds_score_without_new_flag() {
         let mut normalized = baseline_normalized();
         normalized.estimated_input_tokens = 30;
-        normalized.max_tokens = Some(3_500);
+        normalized.estimated_output_tokens = Some(3_500);
 
         let output = run_stage(
             Some(vec![1.0, 0.0]),

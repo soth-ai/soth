@@ -120,6 +120,9 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         parse_source: soth_core::artifacts::ParseSource::JsonRpc,
         canonical_cache_key: String::new(),
         format_metadata: FormatMetadata::Unknown,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
     };
 
     GovernableEvent {
@@ -149,7 +152,9 @@ fn tool_to_provider(tool: &AiTool) -> DetectedProvider {
         AiTool::GeminiCli => DetectedProvider::Gemini,
         AiTool::OpenAiCodex => DetectedProvider::OpenAi,
         AiTool::GithubCopilot => DetectedProvider::OpenAi,
-        AiTool::Continue => DetectedProvider::Unknown,
+        // Cursor IDE uses OpenAI-compatible models by default.
+        AiTool::Cursor => DetectedProvider::OpenAi,
+        AiTool::Continue | AiTool::OpenClaw => DetectedProvider::Unknown,
         AiTool::Unknown(_) => DetectedProvider::Unknown,
     }
 }
