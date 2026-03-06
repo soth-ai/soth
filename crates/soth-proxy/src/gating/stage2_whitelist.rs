@@ -156,6 +156,7 @@ mod tests {
                 pattern: "api.openai.com".to_string(),
                 methods: methods.iter().map(|m| (*m).to_string()).collect(),
                 paths,
+                priority: None,
             },
         }
     }

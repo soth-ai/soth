@@ -8,6 +8,10 @@ use uuid::Uuid;
 pub struct PendingCapture {
     pub connection_id: Uuid,
     pub stored_at: Instant,
+    pub request_method: String,
+    pub request_host: String,
+    pub request_path: String,
+    pub request_body_bytes: usize,
     pub outcome: soth_core::GateOutcome,
     pub detect_result: soth_core::DetectResult,
     pub proxy_ctx: soth_core::ProxyContext,

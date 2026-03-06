@@ -26,6 +26,7 @@ static RUNTIME_POLICY_ENFORCED_FALSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_CLASSIFY_OVERLOAD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_CLASSIFY_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_DB_WRITE_QUEUE_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_BUNDLE_TRUST_LEVEL: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_blacklist_keyword_dropped() {
     BLACKLIST_KEYWORD_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -79,6 +80,10 @@ pub fn record_classify_in_flight_finished() {
 
 pub fn record_db_write_queue_fallback() {
     RUNTIME_DB_WRITE_QUEUE_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_bundle_trust_level(level: soth_bundle::BundleTrustLevel) {
+    RUNTIME_BUNDLE_TRUST_LEVEL.store(bundle_trust_level_code(level), Ordering::Relaxed);
 }
 
 pub fn refresh_registry_runtime_metrics(registry_cache_path: &Path) {
@@ -172,6 +177,10 @@ pub fn heartbeat_telemetry_snapshot() -> HeartbeatTelemetry {
         "edge.runtime.db_write_queue_fallback_total".to_string(),
         RUNTIME_DB_WRITE_QUEUE_FALLBACK_TOTAL.load(Ordering::Relaxed),
     );
+    counters.insert(
+        "edge.runtime.bundle_trust_level".to_string(),
+        RUNTIME_BUNDLE_TRUST_LEVEL.load(Ordering::Relaxed),
+    );
     HeartbeatTelemetry { counters }
 }
 
@@ -191,6 +200,14 @@ fn parse_rfc3339_unix_secs(value: &str) -> Option<u64> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .and_then(|dt| u64::try_from(dt.with_timezone(&Utc).timestamp()).ok())
+}
+
+fn bundle_trust_level_code(level: soth_bundle::BundleTrustLevel) -> u64 {
+    match level {
+        soth_bundle::BundleTrustLevel::Verified => 2,
+        soth_bundle::BundleTrustLevel::Unverified => 1,
+        soth_bundle::BundleTrustLevel::SignatureDisabled => 0,
+    }
 }
 
 fn refresh_runtime_fd_metrics() {
@@ -253,9 +270,10 @@ fn parse_limit_value(value: &str) -> Option<u64> {
 mod tests {
     use super::{
         heartbeat_telemetry_snapshot, parse_linux_fd_limits, record_blacklist_keyword_dropped,
-        record_classify_in_flight_finished, record_classify_in_flight_started,
-        record_classify_overload_drop, record_db_write_queue_fallback,
-        record_discovery_catalog_intercept, record_policy_enforced_false,
+        record_bundle_trust_level, record_classify_in_flight_finished,
+        record_classify_in_flight_started, record_classify_overload_drop,
+        record_db_write_queue_fallback, record_discovery_catalog_intercept,
+        record_policy_enforced_false,
     };
 
     #[test]
@@ -270,6 +288,9 @@ mod tests {
         assert!(telemetry
             .counters
             .contains_key("edge.runtime.policy_enforced_false_total"));
+        assert!(telemetry
+            .counters
+            .contains_key("edge.runtime.bundle_trust_level"));
     }
 
     #[test]
@@ -393,5 +414,24 @@ mod tests {
         let limits =
             "Limit                     Soft Limit           Hard Limit           Units\nMax open files            1024                 4096                 files\n";
         assert_eq!(parse_linux_fd_limits(limits), Some((1024, 4096)));
+    }
+
+    #[test]
+    fn bundle_trust_level_counter_updates() {
+        record_bundle_trust_level(soth_bundle::BundleTrustLevel::Verified);
+        let verified = heartbeat_telemetry_snapshot()
+            .counters
+            .get("edge.runtime.bundle_trust_level")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(verified, 2);
+
+        record_bundle_trust_level(soth_bundle::BundleTrustLevel::Unverified);
+        let unverified = heartbeat_telemetry_snapshot()
+            .counters
+            .get("edge.runtime.bundle_trust_level")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(unverified, 1);
     }
 }

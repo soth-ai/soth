@@ -180,6 +180,7 @@ pub fn spawn_classify_task(
     raw_body_for_commitment: Option<Bytes>,
     classify_bundle: Arc<soth_classify::ClassifyBundle>,
     policy_bundle: Arc<soth_policy::PolicyBundle>,
+    bundle_trust_level: soth_core::BundleTrustLevel,
     classify_config: Arc<soth_classify::ClassifyConfig>,
     policy_block_enforced: Arc<AtomicBool>,
     session_store: Arc<SessionStore>,
@@ -241,6 +242,8 @@ pub fn spawn_classify_task(
                 }
             }
         };
+
+        result.telemetry_event.bundle_trust_level = Some(bundle_trust_level);
 
         if let soth_core::PolicyDecisionKind::Block { .. } = &result.policy_decision.kind {
             emit_block_signal(&mut block_signal_tx, result.policy_decision.kind.clone());

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, Mutex,
@@ -62,10 +61,9 @@ impl ProxyHandler {
     ) -> Self {
         let ttl = Duration::from_secs(pipeline_config.session_ttl_secs.max(1));
         let initial_bundle = bundle_handle.current();
+        crate::heartbeat_telemetry::record_bundle_trust_level(initial_bundle.trust_level);
         let initial_parser_registry = build_parser_registry(initial_bundle.detect.as_ref());
-        let initial_gating_bundle =
-            load_local_gating_bundle().unwrap_or_else(|| initial_bundle.gating.clone());
-        let initial_gate_evaluator = GateEvaluator::new(initial_gating_bundle);
+        let initial_gate_evaluator = GateEvaluator::new(initial_bundle.gating.clone());
         let classify_runtime =
             crate::classify_task::Runtime::new(db.clone(), classify_runtime_config);
         Self {
@@ -134,9 +132,9 @@ impl ProxyHandler {
     }
 
     pub fn on_bundle_updated(&self, bundle: &soth_bundle::LoadedBundle) {
+        crate::heartbeat_telemetry::record_bundle_trust_level(bundle.trust_level);
         let parser_registry = build_parser_registry(bundle.detect.as_ref());
-        let gating_bundle = load_local_gating_bundle().unwrap_or_else(|| bundle.gating.clone());
-        let gate_evaluator = GateEvaluator::new(gating_bundle);
+        let gate_evaluator = GateEvaluator::new(bundle.gating.clone());
         self.gate_evaluator.store(Arc::new(gate_evaluator));
         self.parser_registry.store(Arc::new(parser_registry));
         tracing::info!(
@@ -287,6 +285,10 @@ impl ProxyHandler {
         self.pending.insert(PendingCapture {
             connection_id,
             stored_at: Instant::now(),
+            request_method: req.method.clone(),
+            request_host: host.clone(),
+            request_path: req.path.clone(),
+            request_body_bytes: original_body_len,
             outcome: outcome.clone(),
             detect_result: detect_result.clone(),
             proxy_ctx: proxy_ctx.clone(),
@@ -305,6 +307,7 @@ impl ProxyHandler {
             raw_body_for_db,
             bundle.classify.clone(),
             bundle.policy.clone(),
+            map_bundle_trust_level(bundle.trust_level),
             self.classify_config.clone(),
             policy_block_enforced.clone(),
             self.session_store.clone(),
@@ -373,6 +376,17 @@ impl ProxyHandler {
         }
 
         let Some(_pending) = self.pending.take(&connection_id) else {
+            crate::trace::response_without_pending(
+                connection_id,
+                response.status,
+                response.body.len(),
+            );
+            warn!(
+                connection_id = %connection_id,
+                status = response.status,
+                response_body_bytes = response.body.len(),
+                "response received without pending state; dropping usage update"
+            );
             return;
         };
 
@@ -396,10 +410,45 @@ impl ProxyHandler {
 
     async fn handle_stream_end(&self, connection_id: Uuid) {
         let Some(completed) = self.streaming.take(&connection_id) else {
-            if self.pending.remove(&connection_id) {
+            if let Some(pending) = self.pending.take(&connection_id) {
+                let pending_age_ms = pending.stored_at.elapsed().as_millis();
+                let stored_raw_body_bytes = pending
+                    .raw_body
+                    .as_ref()
+                    .map(|body| body.len())
+                    .unwrap_or_default();
+                crate::trace::stream_finalized_without_chunks(
+                    connection_id,
+                    pending.request_method.as_str(),
+                    pending.request_host.as_str(),
+                    pending.request_path.as_str(),
+                    pending.request_body_bytes,
+                    stored_raw_body_bytes,
+                    pending_age_ms,
+                    pending.outcome.capture_mode,
+                    pending.outcome.matched_provider.as_deref(),
+                    pending.outcome.matched_application.as_deref(),
+                    &pending.detect_result.parse_source,
+                    pending.detect_result.normalized.parser_id.as_str(),
+                );
                 warn!(
                     connection_id = %connection_id,
-                    "stream finalized without chunks; cleaned pending request state"
+                    method = pending.request_method,
+                    host = pending.request_host,
+                    path = pending.request_path,
+                    request_body_bytes = pending.request_body_bytes,
+                    stored_raw_body_bytes,
+                    pending_age_ms = pending_age_ms as u64,
+                    capture_mode = ?pending.outcome.capture_mode,
+                    matched_provider = pending.outcome.matched_provider.as_deref().unwrap_or("unknown"),
+                    matched_application = pending.outcome.matched_application.as_deref().unwrap_or("unknown"),
+                    parse_source = ?pending.detect_result.parse_source,
+                    parser_id = pending
+                        .detect_result
+                        .normalized
+                        .parser_id
+                        .as_str(),
+                    "stream finalized without chunks; dropped pending request before response usage"
                 );
             }
             return;
@@ -599,23 +648,14 @@ fn build_app_identity(
     }
 }
 
-fn load_local_gating_bundle() -> Option<Arc<soth_core::GatingBundle>> {
-    let path = if let Ok(path) = std::env::var("SOTH_GATING_BUNDLE_PATH") {
-        PathBuf::from(path)
-    } else {
-        let enabled = std::env::var("SOTH_ENABLE_LOCAL_GATING_BUNDLE")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false);
-        if !enabled {
-            return None;
+fn map_bundle_trust_level(level: soth_bundle::BundleTrustLevel) -> soth_core::BundleTrustLevel {
+    match level {
+        soth_bundle::BundleTrustLevel::Verified => soth_core::BundleTrustLevel::Verified,
+        soth_bundle::BundleTrustLevel::Unverified => soth_core::BundleTrustLevel::Unverified,
+        soth_bundle::BundleTrustLevel::SignatureDisabled => {
+            soth_core::BundleTrustLevel::SignatureDisabled
         }
-        dirs::home_dir()?.join(".soth/registry_bundle_cache.gating_bundle.json")
-    };
-    let bytes = std::fs::read(path.as_path()).ok()?;
-    let mut bundle = serde_json::from_slice::<soth_core::GatingBundle>(bytes.as_slice()).ok()?;
-    bundle.normalize_host_patterns_in_place();
-    Some(Arc::new(bundle))
+    }
 }
 
 fn build_parser_registry(bundle: &soth_detect::OwnedDetectBundle) -> soth_detect::ParserRegistry {

@@ -67,6 +67,12 @@ fn signed_manifest_bytes(
     let mut manifest = BundleManifest {
         version: version.to_string(),
         created_at: 1_772_000_010,
+        bundle_id: None,
+        model_version: None,
+        policy_version: None,
+        org_id: None,
+        issued_at: None,
+        expires_at: None,
         vendor_sig: String::new(),
         org_approval_sig: None,
         assets: entries,
@@ -89,6 +95,10 @@ fn detect_bundle_with_openai_catalog() -> soth_detect::OwnedDetectBundle {
             provider_id: Some("openai".to_string()),
             name: Some("openai".to_string()),
             api_format: Some("openai_rest".to_string()),
+            provider_type: None,
+            pricing: None,
+            capture: None,
+            detection: None,
         },
     );
     detect

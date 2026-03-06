@@ -234,6 +234,63 @@ pub(crate) fn gate_stage(
 }
 
 #[cfg(feature = "dev-pipeline-trace")]
+pub(crate) fn stage1_identity_resolution(
+    connection_id: Uuid,
+    host: &str,
+    path: &str,
+    process_info: Option<&soth_core::ProcessInfo>,
+    identity: Option<&crate::gating::stage1_app_origin::IdentityMatch>,
+) {
+    let candidates_checked = process_info
+        .map(|info| {
+            [info.bundle_id.as_deref(), info.process_name.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    emit(
+        "stage1_identity_resolution",
+        json!({
+            "connection_id": connection_id.to_string(),
+            "host": host,
+            "path": path,
+            "candidates_checked": candidates_checked,
+            "process": process_info.map(|info| json!({
+                "pid": info.pid,
+                "process_name": info.process_name.as_deref(),
+                "bundle_id": info.bundle_id.as_deref(),
+                "parent_pid": info.parent_pid,
+                "parent_process_name": info.parent_process_name.as_deref(),
+                "parent_bundle_id": info.parent_bundle_id.as_deref(),
+            })).unwrap_or(Value::Null),
+            "identity": identity.map(|matched| json!({
+                "entity_id": matched.entry.entity_id.as_str(),
+                "match_kind": serialize_json(matched.match_kind),
+                "app_type": serialize_json(matched.entry.app_type),
+                "capture_mode": serialize_json(matched.entry.capture_mode),
+                "action": serialize_json(matched.entry.action),
+            })).unwrap_or(Value::Null),
+        }),
+    );
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+pub(crate) fn stage1_identity_resolution(
+    _connection_id: Uuid,
+    _host: &str,
+    _path: &str,
+    _process_info: Option<&soth_core::ProcessInfo>,
+    _identity: Option<&crate::gating::stage1_app_origin::IdentityMatch>,
+) {
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
 pub(crate) fn http_gate(
     connection_id: Uuid,
     method: &str,
@@ -418,6 +475,86 @@ pub(crate) fn db_write_err(connection_id: Uuid, event_id: Uuid, error: &str) {
 #[cfg(not(feature = "dev-pipeline-trace"))]
 #[inline(always)]
 pub(crate) fn db_write_err(_connection_id: Uuid, _event_id: Uuid, _error: &str) {}
+
+#[cfg(feature = "dev-pipeline-trace")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_finalized_without_chunks(
+    connection_id: Uuid,
+    method: &str,
+    host: &str,
+    path: &str,
+    request_body_bytes: usize,
+    stored_raw_body_bytes: usize,
+    pending_age_ms: u128,
+    capture_mode: soth_core::CaptureMode,
+    matched_provider: Option<&str>,
+    matched_application: Option<&str>,
+    parse_source: &soth_core::ParseSource,
+    parser_id: &str,
+) {
+    let pending_age_ms = pending_age_ms.min(u128::from(u64::MAX)) as u64;
+    emit(
+        "stream_finalized_without_chunks",
+        json!({
+            "connection_id": connection_id.to_string(),
+            "method": method,
+            "host": host,
+            "path": path,
+            "request_body_bytes": request_body_bytes,
+            "stored_raw_body_bytes": stored_raw_body_bytes,
+            "pending_age_ms": pending_age_ms,
+            "capture_mode": serialize_json(capture_mode),
+            "matched_provider": matched_provider,
+            "matched_application": matched_application,
+            "parse_source": serialize_json(parse_source),
+            "parser_id": parser_id,
+        }),
+    );
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_finalized_without_chunks(
+    _connection_id: Uuid,
+    _method: &str,
+    _host: &str,
+    _path: &str,
+    _request_body_bytes: usize,
+    _stored_raw_body_bytes: usize,
+    _pending_age_ms: u128,
+    _capture_mode: soth_core::CaptureMode,
+    _matched_provider: Option<&str>,
+    _matched_application: Option<&str>,
+    _parse_source: &soth_core::ParseSource,
+    _parser_id: &str,
+) {
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+pub(crate) fn response_without_pending(
+    connection_id: Uuid,
+    status: u16,
+    response_body_bytes: usize,
+) {
+    emit(
+        "response_without_pending",
+        json!({
+            "connection_id": connection_id.to_string(),
+            "status": status,
+            "response_body_bytes": response_body_bytes,
+        }),
+    );
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+pub(crate) fn response_without_pending(
+    _connection_id: Uuid,
+    _status: u16,
+    _response_body_bytes: usize,
+) {
+}
 
 #[cfg(feature = "dev-pipeline-trace")]
 pub(crate) fn response_usage(connection_id: Uuid, usage: Option<&crate::response::UsageSummary>) {

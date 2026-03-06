@@ -1,4 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+mod bundle_runtime;
+
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,29 +11,6 @@ use tracing::{info, warn};
 use soth_proxy::{config::ProxyConfig, db, ProxyHandler};
 
 const DISCOVERY_TLS_WILDCARD_DESTINATION: &str = "*:443";
-
-#[derive(Clone)]
-struct BundleWatcherInstallHook {
-    watcher: Arc<soth_bundle::BundleWatcher>,
-}
-
-impl BundleWatcherInstallHook {
-    fn new(watcher: Arc<soth_bundle::BundleWatcher>) -> Self {
-        Self { watcher }
-    }
-}
-
-impl soth_sync::BundleWatcher for BundleWatcherInstallHook {
-    fn install_bundle(
-        &self,
-        manifest_bytes: &[u8],
-        assets: HashMap<String, Vec<u8>>,
-    ) -> anyhow::Result<String> {
-        self.watcher
-            .install(manifest_bytes, assets)
-            .map_err(anyhow::Error::from)
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,19 +29,20 @@ async fn main() -> Result<()> {
         .bundle_verification_options()
         .context("parse bundle verification options")?;
 
-    let (bundle_watcher, bundle_handle) = soth_bundle::init_with_options(
-        config.bundle.bundle_dir.as_path(),
-        &vendor_pubkey,
-        org_config,
-        db.clone(),
-        bundle_verification,
-    )
-    .with_context(|| {
-        format!(
-            "load initial bundle from {}",
-            config.bundle.bundle_dir.display()
+    let (bundle_watcher, bundle_handle, startup_bundle_source) =
+        bundle_runtime::init_bundle_watcher_with_fallback(
+            config.bundle.bundle_dir.as_path(),
+            &vendor_pubkey,
+            org_config,
+            db.clone(),
+            bundle_verification,
         )
-    })?;
+        .with_context(|| {
+            format!(
+                "load initial bundle from {}",
+                config.bundle.bundle_dir.display()
+            )
+        })?;
 
     let bundle_watcher = Arc::new(bundle_watcher);
 
@@ -70,7 +50,14 @@ async fn main() -> Result<()> {
         let sync_config = config.sync_config();
         let (agent, telemetry_sink) =
             soth_sync::SyncAgent::new(sync_config, db.clone()).context("initialize sync agent")?;
-        let install_hook = Arc::new(BundleWatcherInstallHook::new(bundle_watcher.clone()));
+        let allow_registry_projection_install = !bundle_verification.verify_vendor_signature
+            && !bundle_verification.require_verified_bundle;
+        let install_hook = Arc::new(bundle_runtime::BundleWatcherInstallHook::new(
+            bundle_watcher.clone(),
+            allow_registry_projection_install,
+            config.bundle.bundle_dir.clone(),
+            startup_bundle_source,
+        ));
         agent.set_bundle_watcher(install_hook);
         (Some(Arc::new(agent)), Some(Arc::new(telemetry_sink)))
     } else {

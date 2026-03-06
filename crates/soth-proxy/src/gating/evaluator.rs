@@ -182,6 +182,7 @@ impl GateEvaluator {
         overrides: GateOverrides,
     ) -> GateOutcome {
         let connection_id = req.connection_meta.connection_id;
+        let host = request_host(req);
         let defaults = &self.bundle.gates.defaults;
         let unknown_app_action = overrides
             .unknown_app_action
@@ -193,6 +194,13 @@ impl GateEvaluator {
         let identity = process_info
             .as_ref()
             .and_then(|info| resolve_identity(&self.bundle.identity_index, info));
+        crate::trace::stage1_identity_resolution(
+            connection_id,
+            host.as_str(),
+            req.path.as_str(),
+            process_info.as_ref(),
+            identity.as_ref(),
+        );
 
         if let Some(matched) = identity.as_ref() {
             match matched.entry.action {
@@ -307,7 +315,6 @@ impl GateEvaluator {
             );
         }
 
-        let host = request_host(req);
         let entity_match = match_entity(&self.bundle.entities, host.as_str());
         let app_type = stage4_app_type::derive(identity.as_ref());
 
@@ -691,6 +698,10 @@ mod tests {
                     unknown_app_action: UnknownAppAction::Skip,
                     non_cataloged_host_action: NonCatalogedAction::Skip,
                     discovery: soth_core::DiscoveryConfig::default(),
+                    source_unknown_app_action: None,
+                    source_whitelisted_unknown_app_action: None,
+                    source_non_whitelisted_host_action: None,
+                    source_browser_default_action: None,
                 },
                 stage0_tls: soth_core::Stage0Config {
                     tls_intercept_hosts: HashSet::from(["api.openai.com".to_string()]),
@@ -722,7 +733,13 @@ mod tests {
                             deny_glob: Vec::new(),
                             allow: vec!["/v1/chat/completions".to_string()],
                         },
+                        priority: None,
                     }],
+                    api_format: None,
+                    entity_type: None,
+                    pricing: None,
+                    capture: None,
+                    detection: None,
                 }],
                 web_apps: Vec::new(),
                 native_apps: Vec::new(),

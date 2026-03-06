@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
+use soth_core::derive_proxy_signing_seed;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,10 +88,20 @@ impl ProxyConfig {
         }
     }
 
-    pub fn bundle_verification_options(&self) -> soth_bundle::VerificationOptions {
-        soth_bundle::VerificationOptions {
+    pub fn bundle_verification_options(&self) -> Result<soth_bundle::VerificationOptions> {
+        let org_approval_pubkey = self
+            .bundle
+            .org_approval_pubkey_hex
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse_fixed_hex::<32>(value, "bundle.org_approval_pubkey_hex"))
+            .transpose()?;
+
+        Ok(soth_bundle::VerificationOptions {
             verify_vendor_signature: self.bundle.verify_vendor_signature,
-        }
+            require_verified_bundle: self.bundle.require_verified_bundle,
+            org_approval_pubkey,
+        })
     }
 
     pub fn classify_config(&self) -> soth_classify::ClassifyConfig {
@@ -109,15 +120,21 @@ impl ProxyConfig {
             return Ok(None);
         }
 
-        let config = self
-            .telemetry
-            .to_telemetry_config(self.org_id.clone(), bundle_version)?;
+        let config = self.telemetry.to_telemetry_config(
+            self.org_id.clone(),
+            bundle_version,
+            self.device_id_hash.clone(),
+        )?;
         Ok(Some(config))
     }
 
     pub fn sync_config(&self) -> soth_sync::SyncAgentConfig {
-        self.sync
-            .to_sync_agent_config(self.db_path.clone(), self.bundle.bundle_dir.clone())
+        self.sync.to_sync_agent_config(
+            self.db_path.clone(),
+            self.bundle.bundle_dir.clone(),
+            self.device_id_hash.clone(),
+            self.telemetry.signing_key_hex.clone(),
+        )
     }
 }
 
@@ -130,19 +147,66 @@ pub struct MitmRuntimeConfig {
     pub passthrough_unlisted: bool,
     pub process_attribution_enabled: bool,
     pub process_lookup_timeout_ms: u64,
+    pub process_cache_capacity: usize,
+    pub process_cache_ttl_ms: Option<u64>,
     pub ca_cert_path: PathBuf,
     pub ca_key_path: PathBuf,
     pub capture_fingerprint: bool,
+    pub http2_enabled: bool,
+    pub http2_max_header_list_size: u32,
+    pub http3_passthrough: bool,
+    pub max_http_head_bytes: usize,
+    pub accept_retry_backoff_ms: u64,
+    pub max_flow_event_backlog: usize,
+    pub max_in_flight_bytes: usize,
+    pub max_concurrent_flows: usize,
     pub upstream_timeout_ms: u64,
+    pub h2_header_stage_timeout_ms: u64,
+    pub h2_body_idle_timeout_ms: u64,
+    pub h2_response_overflow_mode: H2ResponseOverflowModeConfig,
     pub upstream_connect_timeout_ms: u64,
+    pub upstream_retry_on_failure: bool,
+    pub upstream_retry_delay_ms: u64,
     pub verify_upstream_tls: bool,
     pub max_connections_per_host: u32,
     pub idle_timeout_ms: u64,
     pub max_idle_per_host: u32,
     pub max_body_bytes: usize,
     pub buffer_request_bodies: bool,
+    pub intercept_mode: Option<InterceptModeConfig>,
     pub request_timeout_ms: u64,
     pub response_timeout_ms: u64,
+    pub handler_recover_from_panics: bool,
+    pub flow_dispatch_queue_capacity: Option<usize>,
+    pub closed_flow_lru_capacity: Option<usize>,
+    pub stale_flow_ttl_ms: Option<u64>,
+    pub stale_reap_max_batch: Option<usize>,
+    pub dispatch_queue_send_timeout_ms: Option<u64>,
+    pub dispatch_close_join_timeout_ms: Option<u64>,
+}
+
+/// Controls whether the proxy runs in observe-only or store-and-forward mode.
+/// When set, this takes precedence over `buffer_request_bodies`.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InterceptModeConfig {
+    /// Streaming tee: forward request to upstream immediately while observing.
+    Monitor,
+    /// Store-and-forward: buffer request body, call handler, then forward or block.
+    Enforce,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum H2ResponseOverflowModeConfig {
+    TruncateContinue,
+    StrictFail,
+}
+
+impl Default for H2ResponseOverflowModeConfig {
+    fn default() -> Self {
+        Self::TruncateContinue
+    }
 }
 
 impl Default for MitmRuntimeConfig {
@@ -156,19 +220,42 @@ impl Default for MitmRuntimeConfig {
             passthrough_unlisted: true,
             process_attribution_enabled: true,
             process_lookup_timeout_ms: 5_000,
+            process_cache_capacity: 4_096,
+            process_cache_ttl_ms: None,
             ca_cert_path: certs.join("soth-mitm-ca.pem"),
             ca_key_path: certs.join("soth-mitm-ca-key.pem"),
             capture_fingerprint: true,
+            http2_enabled: true,
+            http2_max_header_list_size: 64 * 1024,
+            http3_passthrough: true,
+            max_http_head_bytes: 64 * 1024,
+            accept_retry_backoff_ms: 100,
+            max_flow_event_backlog: 8 * 1024,
+            max_in_flight_bytes: 64 * 1024 * 1024,
+            max_concurrent_flows: 2_048,
             upstream_timeout_ms: 30_000,
+            h2_header_stage_timeout_ms: 30_000,
+            h2_body_idle_timeout_ms: 120_000,
+            h2_response_overflow_mode: H2ResponseOverflowModeConfig::TruncateContinue,
             upstream_connect_timeout_ms: 10_000,
+            upstream_retry_on_failure: false,
+            upstream_retry_delay_ms: 200,
             verify_upstream_tls: true,
             max_connections_per_host: 64,
-            idle_timeout_ms: 60_000,
+            idle_timeout_ms: 600_000,
             max_idle_per_host: 16,
-            max_body_bytes: 10 * 1024 * 1024,
-            buffer_request_bodies: true,
-            request_timeout_ms: 5_000,
-            response_timeout_ms: 5_000,
+            max_body_bytes: 32 * 1024 * 1024,
+            buffer_request_bodies: false,
+            intercept_mode: Some(InterceptModeConfig::Monitor),
+            request_timeout_ms: 15_000,
+            response_timeout_ms: 15_000,
+            handler_recover_from_panics: true,
+            flow_dispatch_queue_capacity: None,
+            closed_flow_lru_capacity: None,
+            stale_flow_ttl_ms: None,
+            stale_reap_max_batch: None,
+            dispatch_queue_send_timeout_ms: None,
+            dispatch_close_join_timeout_ms: None,
         }
     }
 }
@@ -190,6 +277,8 @@ impl MitmRuntimeConfig {
             process_attribution: soth_mitm::ProcessAttributionConfig {
                 enabled: self.process_attribution_enabled,
                 lookup_timeout_ms: self.process_lookup_timeout_ms,
+                cache_capacity: self.process_cache_capacity.max(1),
+                cache_ttl_ms: self.process_cache_ttl_ms.filter(|ttl| *ttl > 0),
             },
             tls: soth_mitm::TlsConfig {
                 ca_cert_path: self.ca_cert_path.clone(),
@@ -197,11 +286,29 @@ impl MitmRuntimeConfig {
                 min_version: soth_mitm::TlsVersion::Tls12,
                 capture_fingerprint: self.capture_fingerprint,
             },
+            http2_enabled: self.http2_enabled,
+            http2_max_header_list_size: self.http2_max_header_list_size.max(1),
+            http3_passthrough: self.http3_passthrough,
+            max_http_head_bytes: self.max_http_head_bytes.max(1),
+            accept_retry_backoff_ms: self.accept_retry_backoff_ms.max(1),
+            max_flow_event_backlog: self.max_flow_event_backlog.max(1),
+            max_in_flight_bytes: self.max_in_flight_bytes.max(1),
+            max_concurrent_flows: self.max_concurrent_flows.max(1),
             upstream: soth_mitm::UpstreamConfig {
                 timeout_ms: self.upstream_timeout_ms,
+                h2_header_stage_timeout_ms: self.h2_header_stage_timeout_ms,
+                h2_body_idle_timeout_ms: self.h2_body_idle_timeout_ms,
+                h2_response_overflow_mode: match self.h2_response_overflow_mode {
+                    H2ResponseOverflowModeConfig::TruncateContinue => {
+                        soth_mitm::H2ResponseOverflowMode::TruncateContinue
+                    }
+                    H2ResponseOverflowModeConfig::StrictFail => {
+                        soth_mitm::H2ResponseOverflowMode::StrictFail
+                    }
+                },
                 connect_timeout_ms: self.upstream_connect_timeout_ms,
-                retry_on_failure: false,
-                retry_delay_ms: 200,
+                retry_on_failure: self.upstream_retry_on_failure,
+                retry_delay_ms: self.upstream_retry_delay_ms.max(1),
                 verify_upstream_tls: self.verify_upstream_tls,
             },
             connection_pool: soth_mitm::ConnectionPoolConfig {
@@ -213,10 +320,34 @@ impl MitmRuntimeConfig {
                 max_size_bytes: self.max_body_bytes,
                 buffer_request_bodies: self.buffer_request_bodies,
             },
+            intercept_mode: match self.intercept_mode {
+                Some(InterceptModeConfig::Monitor) => soth_mitm::InterceptMode::Monitor,
+                Some(InterceptModeConfig::Enforce) => soth_mitm::InterceptMode::Enforce,
+                // Backwards-compat: derive from buffer_request_bodies when not explicitly set.
+                None => {
+                    if self.buffer_request_bodies {
+                        soth_mitm::InterceptMode::Enforce
+                    } else {
+                        soth_mitm::InterceptMode::Monitor
+                    }
+                }
+            },
             handler: soth_mitm::HandlerConfig {
                 request_timeout_ms: self.request_timeout_ms,
                 response_timeout_ms: self.response_timeout_ms,
-                recover_from_panics: true,
+                recover_from_panics: self.handler_recover_from_panics,
+            },
+            flow_runtime: soth_mitm::FlowRuntimeConfig {
+                dispatch_queue_capacity: self.flow_dispatch_queue_capacity.map(|v| v.max(1)),
+                closed_flow_lru_capacity: self.closed_flow_lru_capacity.map(|v| v.max(1)),
+                stale_flow_ttl_ms: self.stale_flow_ttl_ms.filter(|ttl| *ttl > 0),
+                stale_reap_max_batch: self.stale_reap_max_batch.map(|v| v.max(1)),
+                dispatch_queue_send_timeout_ms: self
+                    .dispatch_queue_send_timeout_ms
+                    .filter(|timeout| *timeout > 0),
+                dispatch_close_join_timeout_ms: self
+                    .dispatch_close_join_timeout_ms
+                    .filter(|timeout| *timeout > 0),
             },
         })
     }
@@ -228,6 +359,8 @@ pub struct BundleConfig {
     pub bundle_dir: PathBuf,
     pub vendor_pubkey_hex: String,
     pub verify_vendor_signature: bool,
+    pub require_verified_bundle: bool,
+    pub org_approval_pubkey_hex: Option<String>,
     pub allows_https_intercept: bool,
     pub allows_http_intercept: bool,
     pub process_filter: Option<Vec<String>>,
@@ -240,7 +373,9 @@ impl Default for BundleConfig {
         Self {
             bundle_dir: home.join(".soth").join("bundle"),
             vendor_pubkey_hex: "00".repeat(32),
-            verify_vendor_signature: false,
+            verify_vendor_signature: true,
+            require_verified_bundle: false,
+            org_approval_pubkey_hex: None,
             allows_https_intercept: true,
             allows_http_intercept: true,
             process_filter: None,
@@ -327,12 +462,13 @@ impl TelemetryPipelineConfig {
         &self,
         org_id: String,
         bundle_version: String,
+        device_id_hash: String,
     ) -> Result<soth_telemetry::TelemetryConfig> {
         let signing_key_bytes = match &self.signing_key_hex {
             Some(hex) if !hex.trim().is_empty() => {
                 parse_fixed_hex::<32>(hex.as_str(), "telemetry.signing_key_hex")?
             }
-            _ => [7u8; 32],
+            _ => derive_proxy_signing_seed(device_id_hash.as_str()),
         };
         let signing_key = SigningKey::from_bytes(&signing_key_bytes);
 
@@ -395,8 +531,10 @@ pub struct SyncRuntimeConfig {
     pub frontload_max_compressed_batch_bytes: usize,
     pub frontload_hard_events_cap: usize,
     pub frontload_hard_compressed_cap_bytes: usize,
+    pub legacy_exchange_upload_enabled: bool,
     pub body_upload_max_bytes: usize,
     pub telemetry_enabled: bool,
+    pub telemetry_signing_key_hex: Option<String>,
 }
 
 impl Default for SyncRuntimeConfig {
@@ -423,8 +561,10 @@ impl Default for SyncRuntimeConfig {
             frontload_max_compressed_batch_bytes: 32 * 1024 * 1024,
             frontload_hard_events_cap: 5000,
             frontload_hard_compressed_cap_bytes: 64 * 1024 * 1024,
+            legacy_exchange_upload_enabled: false,
             body_upload_max_bytes: 2 * 1024 * 1024,
             telemetry_enabled: true,
+            telemetry_signing_key_hex: None,
         }
     }
 }
@@ -434,6 +574,8 @@ impl SyncRuntimeConfig {
         &self,
         db_path: PathBuf,
         bundle_dir: PathBuf,
+        device_id_hash: String,
+        telemetry_signing_key_hex: Option<String>,
     ) -> soth_sync::SyncAgentConfig {
         let registry_cache_path = self
             .registry_cache_path
@@ -463,8 +605,10 @@ impl SyncRuntimeConfig {
             frontload_hard_events_cap: self.frontload_hard_events_cap.max(1),
             frontload_hard_compressed_cap_bytes: self.frontload_hard_compressed_cap_bytes.max(1),
             frontload_exchange_upload_path: None,
+            legacy_exchange_upload_enabled: self.legacy_exchange_upload_enabled,
             body_upload_max_bytes: self.body_upload_max_bytes.max(1),
             global_tags: BTreeMap::new(),
+            device_id_hash,
             heartbeat_telemetry: Some(Arc::new(move || {
                 if let Some(path) = heartbeat_registry_cache_path.as_ref() {
                     crate::heartbeat_telemetry::refresh_registry_runtime_metrics(path);
@@ -475,6 +619,7 @@ impl SyncRuntimeConfig {
                 enabled: self.telemetry_enabled,
                 ..soth_sync::TelemetrySyncConfig::default()
             },
+            telemetry_signing_key_hex,
         }
     }
 }
@@ -532,12 +677,13 @@ fn parse_fixed_hex<const N: usize>(value: &str, field: &str) -> Result<[u8; N]> 
 
 #[cfg(test)]
 mod tests {
-    use super::ProxyConfig;
+    use super::{H2ResponseOverflowModeConfig, ProxyConfig};
 
     #[test]
     fn sync_config_wires_edge_heartbeat_telemetry_provider() {
         let cfg = ProxyConfig::default();
         let sync_cfg = cfg.sync_config();
+        assert!(!sync_cfg.legacy_exchange_upload_enabled);
         let provider = sync_cfg
             .heartbeat_telemetry
             .as_ref()
@@ -555,6 +701,14 @@ mod tests {
     }
 
     #[test]
+    fn sync_config_maps_legacy_exchange_upload_flag() {
+        let mut cfg = ProxyConfig::default();
+        cfg.sync.legacy_exchange_upload_enabled = true;
+        let sync_cfg = cfg.sync_config();
+        assert!(sync_cfg.legacy_exchange_upload_enabled);
+    }
+
+    #[test]
     fn classify_runtime_knobs_map_from_config() {
         let mut cfg = ProxyConfig::default();
         cfg.classify.max_in_flight = 12;
@@ -565,5 +719,21 @@ mod tests {
         assert_eq!(runtime.max_in_flight, 12);
         assert_eq!(runtime.slot_acquire_timeout_ms, 750);
         assert_eq!(runtime.db_write_queue_capacity, 8_192);
+    }
+
+    #[test]
+    fn mitm_h2_reliability_knobs_map_from_config() {
+        let mut cfg = ProxyConfig::default();
+        cfg.mitm.h2_header_stage_timeout_ms = 9_000;
+        cfg.mitm.h2_body_idle_timeout_ms = 120_000;
+        cfg.mitm.h2_response_overflow_mode = H2ResponseOverflowModeConfig::StrictFail;
+
+        let mitm = cfg.mitm_config().expect("mitm config");
+        assert_eq!(mitm.upstream.h2_header_stage_timeout_ms, 9_000);
+        assert_eq!(mitm.upstream.h2_body_idle_timeout_ms, 120_000);
+        assert_eq!(
+            mitm.upstream.h2_response_overflow_mode,
+            soth_mitm::H2ResponseOverflowMode::StrictFail
+        );
     }
 }

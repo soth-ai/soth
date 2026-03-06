@@ -65,6 +65,12 @@ fn signed_manifest_bytes(
     let mut manifest = BundleManifest {
         version: version.to_string(),
         created_at: 1_772_000_020,
+        bundle_id: None,
+        model_version: None,
+        policy_version: None,
+        org_id: None,
+        issued_at: None,
+        expires_at: None,
         vendor_sig: String::new(),
         org_approval_sig: None,
         assets: entries,
@@ -87,6 +93,10 @@ fn detect_bundle_with_openai_catalog() -> soth_detect::OwnedDetectBundle {
             provider_id: Some("openai".to_string()),
             name: Some("openai".to_string()),
             api_format: Some("openai_rest".to_string()),
+            provider_type: None,
+            pricing: None,
+            capture: None,
+            detection: None,
         },
     );
     detect
@@ -105,6 +115,9 @@ fn gating_bundle(include_openai_passthrough: bool) -> GatingBundle {
             app_type: AppType::Host,
             capture_mode: CaptureMode::MetadataOnly,
             action: ProcessAction::Intercept,
+            enabled: None,
+            host_filter: None,
+            host_list_ref: None,
         },
     )]);
     let non_hosts = HashMap::from([
@@ -115,6 +128,9 @@ fn gating_bundle(include_openai_passthrough: bool) -> GatingBundle {
                 app_type: AppType::NonHost,
                 capture_mode: CaptureMode::MetadataOnly,
                 action: ProcessAction::Intercept,
+                enabled: None,
+                host_filter: None,
+                host_list_ref: None,
             },
         ),
         (
@@ -124,6 +140,9 @@ fn gating_bundle(include_openai_passthrough: bool) -> GatingBundle {
                 app_type: AppType::NonHost,
                 capture_mode: CaptureMode::MetadataOnly,
                 action: ProcessAction::Block,
+                enabled: None,
+                host_filter: None,
+                host_list_ref: None,
             },
         ),
     ]);
@@ -139,7 +158,13 @@ fn gating_bundle(include_openai_passthrough: bool) -> GatingBundle {
                 deny_glob: vec!["*/deny/*".to_string()],
                 allow: vec!["/v1/chat/completions*".to_string()],
             },
+            priority: None,
         }],
+        api_format: None,
+        entity_type: None,
+        pricing: None,
+        capture: None,
+        detection: None,
     };
 
     GatingBundle {
@@ -160,6 +185,10 @@ fn gating_bundle(include_openai_passthrough: bool) -> GatingBundle {
                 unknown_app_action: UnknownAppAction::Skip,
                 non_cataloged_host_action: NonCatalogedAction::Skip,
                 discovery: soth_core::DiscoveryConfig::default(),
+                source_unknown_app_action: None,
+                source_whitelisted_unknown_app_action: None,
+                source_non_whitelisted_host_action: None,
+                source_browser_default_action: None,
             },
             stage0_tls: Stage0Config {
                 tls_intercept_hosts: HashSet::from(["api.openai.com".to_string()]),

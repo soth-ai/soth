@@ -90,6 +90,12 @@ fn signed_manifest_bytes(
     let mut manifest = BundleManifest {
         version: version.to_string(),
         created_at: 1_772_000_050,
+        bundle_id: None,
+        model_version: None,
+        policy_version: None,
+        org_id: None,
+        issued_at: None,
+        expires_at: None,
         vendor_sig: String::new(),
         org_approval_sig: None,
         assets: entries,
