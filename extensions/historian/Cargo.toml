@@ -1,0 +1,42 @@
+[package]
+name = "soth-historian"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+standalone = ["clap", "tracing-subscriber"]
+
+[dependencies]
+async-stream = "0.3"
+async-trait.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+notify.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream = "0.1"
+tracing.workspace = true
+uuid.workspace = true
+
+soth-core = { workspace = true }
+soth-extensions = { workspace = true }
+
+# standalone binary only
+clap = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bin]]
+name = "soth-historian"
+path = "src/bin/standalone.rs"
+required-features = ["standalone"]

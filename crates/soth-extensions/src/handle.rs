@@ -9,7 +9,7 @@ pub struct ExtensionHandle {
 }
 
 impl ExtensionHandle {
-    pub(crate) fn new(event_tx: mpsc::Sender<soth_core::GovernableEvent>) -> Self {
+    pub fn new(event_tx: mpsc::Sender<soth_core::GovernableEvent>) -> Self {
         Self { event_tx }
     }
 

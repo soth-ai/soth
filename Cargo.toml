@@ -12,6 +12,7 @@ members = [
     "crates/soth-sync",
     "crates/soth-detect",
     "crates/soth-extensions",
+    "extensions/historian",
 ]
 default-members = [
     "crates/soth-cli",
@@ -48,6 +49,7 @@ soth-policy = { path = "crates/soth-policy" }
 soth-sync = { path = "crates/soth-sync" }
 soth-detect = { path = "crates/soth-detect" }
 soth-extensions = { path = "crates/soth-extensions" }
+soth-historian = { path = "extensions/historian" }
 
 # Async runtime
 tokio = { version = "1", features = [

@@ -199,6 +199,15 @@ fn build_extension_proxy_ctx(event: &soth_core::GovernableEvent) -> soth_core::P
     }
 }
 
+fn parse_data_source(value: Option<&str>) -> soth_core::DataSource {
+    match value {
+        Some("HistorianClaudeCode") => soth_core::DataSource::HistorianClaudeCode,
+        Some("HistorianGemini") => soth_core::DataSource::HistorianGemini,
+        Some("HistorianCodex") => soth_core::DataSource::HistorianCodex,
+        _ => soth_core::DataSource::LiveProxy,
+    }
+}
+
 fn build_detect_result_from_event(event: &soth_core::GovernableEvent) -> soth_core::DetectResult {
     let mut result = soth_core::DetectResult::default();
     if let Some(ref normalized) = event.normalized {
@@ -237,6 +246,18 @@ fn build_minimal_telemetry_event(
     te.endpoint_type = event.endpoint_type;
     te.capture_mode = event.capture_mode;
     te.policy_kind = policy_kind;
-    te.data_source = soth_core::DataSource::LiveProxy;
+
+    // Propagate historian metadata if present
+    let meta = &event.context.metadata;
+    if meta.get("is_historical").map(|v| v.as_str()) == Some("true") {
+        te.is_historical = true;
+        te.data_source = parse_data_source(meta.get("data_source").map(|s| s.as_str()));
+        te.original_timestamp = meta
+            .get("original_timestamp")
+            .and_then(|v| v.parse::<i64>().ok());
+    } else {
+        te.data_source = soth_core::DataSource::LiveProxy;
+    }
+
     te
 }
