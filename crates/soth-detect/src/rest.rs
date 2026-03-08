@@ -214,12 +214,9 @@ fn extract_model_from_url(path: &str, marker: Option<&str>) -> Option<String> {
     let marker = marker.unwrap_or("/models/");
     let idx = path.find(marker)? + marker.len();
     let suffix = &path[idx..];
-    let model = suffix
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_end_matches(':');
+    let segment = suffix.split('/').next().unwrap_or("").trim();
+    // Strip Gemini-style action suffix like ":generateContent" or ":streamGenerateContent"
+    let model = segment.split(':').next().unwrap_or(segment);
     if model.is_empty() {
         None
     } else {
@@ -484,13 +481,15 @@ fn extract_content_string(value: &Value) -> Option<String> {
 
 fn infer_endpoint_type(path: &str) -> EndpointType {
     let lower = path.to_ascii_lowercase();
-    if lower.contains("embeddings") {
+    if lower.contains("embeddings") || lower.contains("embed") {
         return EndpointType::Embedding;
     }
     if lower.contains("chat")
         || lower.contains("message")
         || lower.contains("conversation")
         || lower.contains("response")
+        || lower.contains("generatecontent")
+        || lower.contains("streamgeneratecontent")
     {
         return EndpointType::Chat;
     }

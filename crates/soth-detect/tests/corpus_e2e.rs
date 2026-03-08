@@ -333,10 +333,32 @@ fn bundle_fixture() -> OwnedDetectBundle {
             ..RestFormatDescriptor::default()
         },
     );
+    rest_formats.insert(
+        "google".to_string(),
+        RestFormatDescriptor {
+            request: RestRequestPaths {
+                model: Some("{url_path}".to_string()),
+                contents: Some("$.contents".to_string()),
+                system_instruction: Some("$.systemInstruction".to_string()),
+                tools: Some("$.tools".to_string()),
+                max_tokens: Some("$.generationConfig.maxOutputTokens".to_string()),
+                temperature: Some("$.generationConfig.temperature".to_string()),
+                top_p: Some("$.generationConfig.topP".to_string()),
+                ..RestRequestPaths::default()
+            },
+            system_in_messages: true,
+            model_from_url_segment: Some("/models/".to_string()),
+            ..RestFormatDescriptor::default()
+        },
+    );
 
     let mut domain_index = HashMap::new();
     domain_index.insert("api.openai.com".to_string(), "openai".to_string());
     domain_index.insert("api.anthropic.com".to_string(), "anthropic".to_string());
+    domain_index.insert(
+        "generativelanguage.googleapis.com".to_string(),
+        "google".to_string(),
+    );
 
     let mut providers = HashMap::new();
     providers.insert(
@@ -363,6 +385,15 @@ fn bundle_fixture() -> OwnedDetectBundle {
             provider_id: Some("google_vertex".to_string()),
             name: Some("Google Vertex".to_string()),
             api_format: Some("grpc".to_string()),
+            ..ProviderEntry::default()
+        },
+    );
+    providers.insert(
+        "google".to_string(),
+        ProviderEntry {
+            provider_id: Some("google".to_string()),
+            name: Some("Google Gemini".to_string()),
+            api_format: Some("google".to_string()),
             ..ProviderEntry::default()
         },
     );
