@@ -296,6 +296,7 @@ fn sample_connection_meta(
             exe_name: None,
             exe_path: None,
             parent_pid: None,
+            parent_process_name: None,
         }),
         tls_info: None,
     })

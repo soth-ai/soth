@@ -684,6 +684,7 @@ fn sample_mitm_request(connection_id: Uuid, case: &HttpCase) -> soth_mitm::RawRe
                 exe_name: None,
                 exe_path: None,
                 parent_pid: None,
+                parent_process_name: None,
             }),
             tls_info: None,
         }),
