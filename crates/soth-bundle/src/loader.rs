@@ -258,13 +258,7 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
     let mut hosts_index = HashMap::new();
     let mut non_hosts_index = HashMap::new();
     for (identity, policy) in &detect.app_policies {
-        let app_type = match policy.app_kind {
-            soth_core::AppKind::Browser => AppType::Host,
-            soth_core::AppKind::AgentApp | soth_core::AppKind::Ide | soth_core::AppKind::Cli => {
-                AppType::NonHost
-            }
-            soth_core::AppKind::Unknown => AppType::Unknown,
-        };
+        let app_type = policy.app_kind.to_app_type();
         let entry = IdentityEntry {
             entity_id: policy.app_id.clone(),
             app_type,
@@ -300,6 +294,44 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
                 host_filter: None,
                 host_list_ref: None,
             });
+    }
+
+    // Populate identity index from applications[].bundle_ids and process_names.
+    // This ensures that process-based identity resolution (stage1) can match
+    // apps by their macOS bundle_id or process_name, not just by app_policies keys.
+    for (app_key, app) in &detect.applications {
+        let app_id = app
+            .app_id
+            .as_deref()
+            .unwrap_or(app_key.as_str())
+            .to_string();
+        let app_type = app
+            .app_type
+            .as_deref()
+            .map(|v| soth_core::AppKind::from_type_str(v).to_app_type())
+            .unwrap_or(AppType::NonHost);
+        let entry = IdentityEntry {
+            entity_id: app_id,
+            app_type,
+            capture_mode: soth_core::CaptureMode::MetadataOnly,
+            action: ProcessAction::Intercept,
+            enabled: None,
+            host_filter: None,
+            host_list_ref: None,
+        };
+        let index = if app_type == AppType::Host {
+            &mut hosts_index
+        } else {
+            &mut non_hosts_index
+        };
+        // Insert bundle_ids and process_names as identity keys.
+        // app_policies entries take precedence (already inserted above).
+        for bid in &app.bundle_ids {
+            index.entry(bid.to_ascii_lowercase()).or_insert_with(|| entry.clone());
+        }
+        for pname in &app.process_names {
+            index.entry(pname.to_ascii_lowercase()).or_insert_with(|| entry.clone());
+        }
     }
 
     let tls_intercept_hosts = detect

@@ -458,6 +458,12 @@ pub struct OwnedDetectBundle {
     pub source_metadata: Option<JsonValue>,
     #[serde(default)]
     pub org_patterns: Vec<String>,
+    /// Process names that are script runtimes / interpreters (e.g. "node", "python3").
+    /// When a connection originates from a script runtime, identity resolution
+    /// falls back to the parent process. Server-pushable; when empty the edge
+    /// uses a built-in default list.
+    #[serde(default)]
+    pub script_runtimes: Vec<String>,
 }
 
 impl OwnedDetectBundle {
@@ -478,6 +484,7 @@ impl OwnedDetectBundle {
             collectors: &self.collectors,
             source_metadata: self.source_metadata.as_ref(),
             org_patterns: &self.org_patterns,
+            script_runtimes: &self.script_runtimes,
         }
     }
 }
@@ -499,6 +506,7 @@ pub struct DetectBundleSlice<'a> {
     pub collectors: &'a HashMap<String, JsonValue>,
     pub source_metadata: Option<&'a JsonValue>,
     pub org_patterns: &'a [String],
+    pub script_runtimes: &'a [String],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]

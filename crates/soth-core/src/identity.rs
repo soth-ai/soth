@@ -96,6 +96,30 @@ pub enum AppKind {
     Unknown,
 }
 
+impl AppKind {
+    /// Parse an app_type string from bundle data into an `AppKind`.
+    /// Accepts all known variants including legacy / alternate spellings.
+    pub fn from_type_str(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "browser" | "host" => Self::Browser,
+            "ide" => Self::Ide,
+            "cli" => Self::Cli,
+            "agent_app" | "agent-app" | "non_host" => Self::AgentApp,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert to the coarser `AppType` used by the gating layer.
+    /// `Browser` → `Host`, everything else → `NonHost`, `Unknown` → `Unknown`.
+    pub fn to_app_type(self) -> crate::AppType {
+        match self {
+            Self::Browser => crate::AppType::Host,
+            Self::AgentApp | Self::Ide | Self::Cli => crate::AppType::NonHost,
+            Self::Unknown => crate::AppType::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsInfo {
     pub sni: Option<String>,

@@ -59,6 +59,18 @@ pub enum AppType {
     Unknown,
 }
 
+impl AppType {
+    /// Convert to the finer-grained `AppKind`. Lossy: `NonHost` maps to
+    /// `AgentApp` since the original granularity (Ide/Cli/AgentApp) was lost.
+    pub fn to_app_kind(self) -> crate::AppKind {
+        match self {
+            Self::Host => crate::AppKind::Browser,
+            Self::NonHost => crate::AppKind::AgentApp,
+            Self::Unknown => crate::AppKind::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessMatchKind {
