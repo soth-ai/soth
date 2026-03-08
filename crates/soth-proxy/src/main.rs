@@ -191,8 +191,26 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing() {
+    // When RUST_LOG is set, honour it exactly. Otherwise apply sensible defaults
+    // so that soth crates log at INFO while noisy dependencies stay quiet.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "warn,\
+             soth_proxy=info,\
+             soth_detect=info,\
+             soth_bundle=info,\
+             soth_sync=info,\
+             soth_classify=info,\
+             soth_telemetry=info,\
+             soth_core=info,\
+             soth_mitm=info,\
+             mitm_sidecar=info,\
+             hudsucker::proxy::internal=off",
+        )
+    });
+
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .try_init();
 }
 

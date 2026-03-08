@@ -11,7 +11,7 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot::error::TryRecvError;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::classify_task;
@@ -403,7 +403,7 @@ impl ProxyHandler {
                 response.status,
                 response.body.len(),
             );
-            warn!(
+            debug!(
                 connection_id = %connection_id,
                 status = response.status,
                 response_body_bytes = response.body.len(),
@@ -651,11 +651,7 @@ fn build_app_identity(
         .or_else(|| process_resolution.process_name.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let app_kind = match process_resolution.app_type {
-        soth_core::AppType::Host => soth_core::AppKind::Browser,
-        soth_core::AppType::NonHost => soth_core::AppKind::AgentApp,
-        soth_core::AppType::Unknown => soth_core::AppKind::Unknown,
-    };
+    let app_kind = process_resolution.app_type.to_app_kind();
 
     soth_core::AppIdentity {
         app_id: app_id.clone(),

@@ -143,6 +143,10 @@ async fn spawn_proxy_process(config_path: &Path) -> Result<Child> {
     let proxy_bin = resolve_proxy_binary()?;
     let mut cmd = Command::new(proxy_bin);
     cmd.env("SOTH_PROXY_CONFIG", config_path);
+    // Propagate RUST_LOG so user overrides reach the proxy subprocess.
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
