@@ -97,6 +97,7 @@ fn detect_bundle_with_openai_catalog() -> soth_detect::OwnedDetectBundle {
             pricing: None,
             capture: None,
             detection: None,
+            matching_rules: vec![],
         },
     );
     detect

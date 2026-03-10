@@ -71,7 +71,7 @@ pub enum ParseWarning {
 #[derive(Clone, Debug)]
 pub struct NormalizedRequest {
     pub parse_confidence: ParseConfidence,
-    pub parser_id: &'static str,
+    pub parser_id: String,
     pub schema_version: &'static str,
     pub parse_warnings: Vec<ParseWarning>,
     pub is_ai_call: bool,
@@ -112,7 +112,7 @@ impl NormalizedRequest {
     pub fn empty_heuristic(method: &str, path: &str) -> Self {
         Self {
             parse_confidence: ParseConfidence::Heuristic,
-            parser_id: "heuristic-v1",
+            parser_id: "heuristic-v1".to_string(),
             schema_version: "1",
             parse_warnings: Vec::new(),
             is_ai_call: true,
@@ -199,7 +199,7 @@ impl DetectResult {
     pub fn filtered() -> Self {
         let normalized = NormalizedRequest {
             parse_confidence: ParseConfidence::Heuristic,
-            parser_id: "filtered-v1",
+            parser_id: "filtered-v1".to_string(),
             schema_version: "1",
             parse_warnings: vec![ParseWarning::FilteredByKeyword],
             is_ai_call: false,
@@ -293,6 +293,40 @@ pub struct StreamSession {
     pub model: Option<String>,
     pub request_format: Option<FormatMeta>,
     pub estimated_input_tokens: u32,
+    /// The rest format descriptor name (e.g. "chatgpt_web", "gemini_web") for
+    /// bundle-driven streaming response extraction.
+    pub format_name: Option<String>,
+    /// Whether this is a WebSocket stream (multi-turn capable).
+    pub is_websocket: bool,
+    /// Number of turns completed so far (WebSocket only).
+    pub turns_emitted: u64,
+    /// Model for the current in-flight turn, captured from the client's
+    /// `response.create` request frame.  Preferred over extracting from
+    /// the server's `response.completed`.
+    pub current_turn_model: Option<String>,
+    /// Last usage extracted from any frame in the current turn.
+    pub last_usage: Option<StreamUsage>,
+}
+
+/// Usage data extracted from a streaming frame.
+#[derive(Clone, Debug, Default)]
+pub struct StreamUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub finish_reason: Option<String>,
+}
+
+/// A completed AI turn within a WebSocket stream.
+///
+/// Emitted by `process_chunk_with_bundle()` when a `response.completed`
+/// event is detected.  Model comes from the client's `response.create`
+/// request frame; usage comes from the server's `response.completed`.
+#[derive(Clone, Debug)]
+pub struct StreamTurn {
+    pub connection_id: Uuid,
+    pub model: Option<String>,
+    pub usage: StreamUsage,
+    pub turn_number: u64,
 }
 
 impl StreamSession {
@@ -309,6 +343,11 @@ impl StreamSession {
             model: None,
             request_format: None,
             estimated_input_tokens: 0,
+            format_name: None,
+            is_websocket: false,
+            turns_emitted: 0,
+            current_turn_model: None,
+            last_usage: None,
         }
     }
 
@@ -328,6 +367,11 @@ impl StreamSession {
         self.model = model;
         self.request_format = Some(format);
         self.estimated_input_tokens = estimated_input_tokens;
+    }
+
+    /// Set the rest format descriptor name for bundle-driven streaming extraction.
+    pub fn set_format_name(&mut self, name: impl Into<String>) {
+        self.format_name = Some(name.into());
     }
 
     pub fn set_grpc_context(&mut self, service: impl Into<String>, method: impl Into<String>) {
@@ -509,6 +553,50 @@ pub struct DetectBundleSlice<'a> {
     pub script_runtimes: &'a [String],
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestEncoding {
+    #[default]
+    Json,
+    Form,
+    QueryParams,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PreprocessOp {
+    pub op: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamFormat {
+    #[default]
+    Sse,
+    Ndjson,
+    LengthPrefixed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct StreamOptions {
+    /// SSE data line prefixes (default: ["data: "])
+    #[serde(default)]
+    pub prefixes: Vec<String>,
+    /// SSE values to skip (e.g. ["[DONE]"])
+    #[serde(default)]
+    pub skip_values: Vec<String>,
+    /// NDJSON chunk delimiter (e.g. "}{", "-----CHUNK_BOUNDARY-----")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    /// Length-prefixed header to strip (e.g. ")]}'\\n")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_strip: Option<String>,
+    /// Length-prefixed encoding (e.g. "protobuf", "json")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct RestFormatDescriptor {
     pub tier: Option<u8>,
@@ -529,6 +617,25 @@ pub struct RestFormatDescriptor {
     pub model_id_parse: bool,
     #[serde(default)]
     pub ephemeral_request_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_default: Option<String>,
+    /// Request body encoding: json (default), form, query_params
+    #[serde(default)]
+    pub encoding: RequestEncoding,
+    /// Form field name for form-encoded requests (e.g. "f.req", "variables")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_field: Option<String>,
+    /// Request body preprocessing pipeline (json_parse, index, etc.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preprocess: Vec<PreprocessOp>,
+    /// Response streaming format (sse, ndjson, length_prefixed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_format: Option<StreamFormat>,
+    /// Stream format-specific options
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -819,6 +926,10 @@ pub struct ProviderEntry {
     pub capture: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection: Option<JsonValue>,
+    /// Signal-based matching rules from NativeBundle v3.
+    /// Backward-compatible: absent/empty in v2 bundles.
+    #[serde(default)]
+    pub matching_rules: Vec<soth_core::MatchingRule>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -837,6 +948,12 @@ pub struct ApplicationEntry {
     pub capture: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_format: Option<String>,
+    /// Signal-based matching rules from NativeBundle v3.
+    /// Backward-compatible: absent/empty in v2 bundles.
+    #[serde(default)]
+    pub matching_rules: Vec<soth_core::MatchingRule>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -889,22 +1006,21 @@ impl Filters {
             }
         }
 
-        let has_header_needles = !self.header_keywords.is_empty() || !self.keywords.is_empty();
-        if !has_header_needles {
+        // Only use dedicated header_keywords for header matching.
+        // The shared `keywords` list is path-oriented (contains "sentry", "telemetry", etc.)
+        // and would false-positive on standard request headers like `sentry-trace`.
+        if self.header_keywords.is_empty() {
             return false;
         }
 
         headers.iter().any(|(key, value)| {
             let key_lc = key.to_ascii_lowercase();
             let val_lc = value.to_ascii_lowercase();
-            self.header_keywords
-                .iter()
-                .chain(self.keywords.iter())
-                .any(|needle| {
-                    let needle_lc = needle.to_ascii_lowercase();
-                    !needle_lc.is_empty()
-                        && (key_lc.contains(&needle_lc) || val_lc.contains(&needle_lc))
-                })
+            self.header_keywords.iter().any(|needle| {
+                let needle_lc = needle.to_ascii_lowercase();
+                !needle_lc.is_empty()
+                    && (key_lc.contains(&needle_lc) || val_lc.contains(&needle_lc))
+            })
         })
     }
 }

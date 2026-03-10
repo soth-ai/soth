@@ -1,5 +1,5 @@
 use crate::code::{self, detect_code_artifacts};
-use crate::fingerprint::fingerprint;
+use crate::fingerprint::{classify_request, fingerprint};
 use crate::graphql::{parse_graphql, ApqStore, NoopApqStore};
 use crate::grpc::parse_grpc;
 use crate::hash::canonical_hash;
@@ -11,7 +11,7 @@ use crate::jsonrpc::parse_jsonrpc;
 use crate::rest::parse_rest;
 use crate::sensitive::{credential_scan, org_pattern_scan, structural_scan};
 use crate::types::{
-    ArtifactLocation, CaptureMode, DetectBundleSlice, DetectResult, DetectWarning, DetectedFormat,
+    ArtifactLocation, DetectBundleSlice, DetectResult, DetectWarning, DetectedFormat,
     FormatMeta, NormalizedRequest, ParseSource, ParseWarning, Provider, ProviderEntry, RawRequest,
 };
 use lru::LruCache;
@@ -130,12 +130,18 @@ fn process_inner(
         return out;
     }
 
+    // v3 signal-based classification: refine matched_provider/matched_application
+    // using matching_rules when available, falling back to gating output otherwise.
+    let (effective_provider, effective_application) =
+        refine_with_classify(req, bundle);
+
     let format = fingerprint(
         &req.method,
         &req.path,
         &req.headers,
         &req.body[..req.body.len().min(512)],
-        req.connection_meta.matched_provider.as_deref(),
+        effective_provider.as_deref(),
+        effective_application.as_deref(),
         bundle,
     );
 
@@ -166,15 +172,15 @@ fn process_inner(
         }
     }
 
-    let full_like = matches!(
-        capture_mode,
-        CaptureMode::Full | CaptureMode::SensitiveArtifacts | CaptureMode::FullContent
-    );
+    // Artifact extraction runs for all capture modes. The `full` mode is reserved
+    // for a future extraction API that surfaces secrets externally; for now both
+    // `metadata_only` and `full` run the same pipeline.
+    let _ = capture_mode; // will gate the extraction API in a future release
     let mut artifacts = Vec::new();
     let mut ast_normalized_hash: Option<String> = None;
     let mut import_categories: Vec<code::DetectedImportCategory> = Vec::new();
 
-    if full_like {
+    {
         // Body-level scans
         artifacts.extend(credential_scan(&req.body, ArtifactLocation::Unknown));
         artifacts.extend(structural_scan(&req.body, ArtifactLocation::Unknown));
@@ -402,6 +408,55 @@ fn extract_scannable_locations(
     locations
 }
 
+/// Refine gating's matched_provider/matched_application using v3 signal-based
+/// classify_request(). When matching_rules exist and produce a match, the classify
+/// result takes precedence. Falls back to gating output when no rules match.
+fn refine_with_classify(
+    req: &RawRequest,
+    bundle: &DetectBundleSlice<'_>,
+) -> (Option<String>, Option<String>) {
+    let host = crate::util::header_value(&req.headers, "host")
+        .or_else(|| crate::util::header_value(&req.headers, ":authority"));
+    let (process_bundle_id, process_name, parent_process_name) =
+        match req.connection_meta.process_info.as_ref() {
+            Some(info) => (
+                info.bundle_id.as_deref(),
+                info.process_name.as_deref(),
+                info.parent_process_name.as_deref(),
+            ),
+            None => (None, None, None),
+        };
+
+    match classify_request(
+        host,
+        &req.path,
+        &req.headers,
+        process_bundle_id,
+        process_name,
+        parent_process_name,
+        bundle,
+    ) {
+        Some(result) => match result.entity_kind {
+            "provider" => (
+                Some(result.entity_id),
+                req.connection_meta.matched_application.clone(),
+            ),
+            "application" => (
+                req.connection_meta.matched_provider.clone(),
+                Some(result.entity_id),
+            ),
+            _ => (
+                req.connection_meta.matched_provider.clone(),
+                req.connection_meta.matched_application.clone(),
+            ),
+        },
+        None => (
+            req.connection_meta.matched_provider.clone(),
+            req.connection_meta.matched_application.clone(),
+        ),
+    }
+}
+
 fn parse_by_format(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
@@ -433,6 +488,14 @@ fn parse_by_format(
             let descriptor = bundle.rest_formats.get(key.as_str());
             parse_rest(req, &provider_name, format.clone(), descriptor).map(|mut nr| {
                 nr.provider = Provider::new(provider_name.clone());
+                // Apply model_default when model wasn't extracted from request
+                if nr.model.is_none() {
+                    if let Some(desc) = descriptor {
+                        if let Some(default_model) = desc.model_default.as_deref() {
+                            nr.model = Some(default_model.to_string());
+                        }
+                    }
+                }
                 nr
             })
         }
@@ -478,7 +541,27 @@ fn provider_for_format(
     bundle: &DetectBundleSlice<'_>,
 ) -> String {
     if let Some(provider) = req.connection_meta.matched_provider.as_deref() {
-        return canonical_provider_candidate(provider, format, bundle);
+        let resolved = canonical_provider_candidate(provider, format, bundle);
+        let default = default_provider_for_format(format);
+        // If provider resolved to a known entry, use it. Otherwise fall through
+        // to check the application entity's provider_hint for correct attribution.
+        if resolved != default {
+            return resolved;
+        }
+    }
+
+    // Application entity: check api_format → provider_hint for correct attribution
+    if let Some(app_id) = req.connection_meta.matched_application.as_deref() {
+        if let Some(app_entry) = bundle.applications.get(app_id) {
+            if let Some(api_format) = app_entry.api_format.as_deref() {
+                if let Some(descriptor) = bundle.rest_formats.get(api_format) {
+                    if let Some(hint) = descriptor.provider_hint.as_deref() {
+                        return hint.to_string();
+                    }
+                }
+            }
+        }
+        return canonical_provider_candidate(app_id, format, bundle);
     }
 
     let headers = &req.headers;

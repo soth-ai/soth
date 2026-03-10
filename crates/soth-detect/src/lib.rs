@@ -21,11 +21,14 @@ use once_cell::sync::Lazy;
 
 pub use core_output::to_core_detect_result;
 pub use engine::ParserRegistry;
+pub use fingerprint::{classify_request, fingerprint, ClassifyResult};
 pub use identity::resolve_app_identity;
 pub use intelligence::*;
 pub use intelligence_store::IntelligenceStore;
 pub use replay::replay_heuristic_events;
-pub use stream::{finalize_stream_summary, process_chunk_with_bundle, scan_proto_strings};
+pub use stream::{
+    finalize_stream_summary, process_chunk_with_bundle, scan_proto_strings, ChunkEvent,
+};
 pub use types::*;
 
 #[cfg(test)]
@@ -111,7 +114,7 @@ pub fn process_with_registry_and_intelligence(
 pub fn process_chunk(
     chunk: &StreamChunk,
     state: &mut StreamDetectState,
-) -> Option<PartialDetectResult> {
+) -> Option<ChunkEvent> {
     static EMPTY_BUNDLE: Lazy<OwnedDetectBundle> = Lazy::new(OwnedDetectBundle::default);
     stream::process_chunk_with_bundle(chunk, state, &EMPTY_BUNDLE.as_slice())
 }
@@ -177,7 +180,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_only_skips_credentials() {
+    fn metadata_only_still_extracts_artifacts() {
+        // metadata_only runs the full pipeline including artifact extraction.
+        // The `full` mode will additionally surface secrets via extraction API (future).
         let mut bundle = bundle_fixture();
         bundle.capture_rules.default_mode = CaptureMode::MetadataOnly;
 
@@ -195,7 +200,7 @@ mod tests {
         };
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
-        assert!(out.artifacts.is_empty());
+        assert!(!out.artifacts.is_empty());
     }
 
     #[test]
@@ -678,7 +683,8 @@ mod tests {
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.capture_mode, CaptureMode::MetadataOnly);
-        assert!(out.artifacts.is_empty());
+        // metadata_only still extracts artifacts; only the future extraction API is gated by `full`
+        assert!(!out.artifacts.is_empty());
     }
 
     #[test]

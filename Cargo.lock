@@ -1966,75 +1966,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mitm-core"
-version = "0.1.0"
-dependencies = [
- "mitm-http",
- "mitm-observe",
- "mitm-policy",
- "serde",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "mitm-http"
-version = "0.1.0"
-
-[[package]]
-name = "mitm-observe"
-version = "0.1.0"
-dependencies = [
- "mitm-http",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "mitm-policy"
-version = "0.1.0"
-
-[[package]]
-name = "mitm-sidecar"
-version = "0.1.0"
-dependencies = [
- "brotli",
- "bytes",
- "dashmap 6.1.0",
- "flate2",
- "h2",
- "http",
- "mitm-core",
- "mitm-http",
- "mitm-observe",
- "mitm-policy",
- "mitm-tls",
- "openssl",
- "parking_lot",
- "pin-project-lite",
- "serde",
- "serde_json",
- "socket2 0.5.10",
- "soketto",
- "tokio",
- "tokio-openssl",
- "tokio-rustls",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "mitm-tls"
-version = "0.1.0"
-dependencies = [
- "mitm-http",
- "rcgen 0.14.7",
- "rustls",
- "webpki-roots",
-]
-
-[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3345,25 +3276,36 @@ dependencies = [
 name = "soth-mitm"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "brotli",
  "bytes",
  "dashmap 6.1.0",
+ "flate2",
  "futures",
+ "h2",
  "http",
  "libc",
  "lru",
- "mitm-core",
- "mitm-http",
- "mitm-observe",
- "mitm-policy",
- "mitm-sidecar",
+ "openssl",
  "parking_lot",
+ "pin-project-lite",
  "plist",
  "rcgen 0.14.7",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha1",
+ "socket2 0.5.10",
+ "soketto",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-openssl",
+ "tokio-rustls",
  "tracing",
  "uuid",
+ "webpki-roots",
+ "zstd",
 ]
 
 [[package]]
