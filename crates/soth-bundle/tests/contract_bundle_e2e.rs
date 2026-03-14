@@ -231,7 +231,7 @@ fn bundle_watcher_e2e_hot_swap_and_db_contract() {
     let vendor_pubkey = vendor.verifying_key().to_bytes();
 
     let initial_assets = bundle_assets(
-        serde_json::to_vec(&soth_detect::OwnedDetectBundle::default()).expect("default detect"),
+        serde_json::to_vec(&soth_core::OwnedDetectBundle::default()).expect("default detect"),
         "api.openai.com",
         "policy-v1",
     );
@@ -335,7 +335,7 @@ fn bundle_watcher_e2e_hot_swap_and_db_contract() {
 fn bundle_large_scope_matrix_corpus_e2e() {
     let vendor = SigningKey::from_bytes(&[92u8; 32]);
     let vendor_pubkey = vendor.verifying_key().to_bytes();
-    let detect = serde_json::to_vec(&soth_detect::OwnedDetectBundle::default())
+    let detect = serde_json::to_vec(&soth_core::OwnedDetectBundle::default())
         .expect("serialize default detect");
 
     let assets = bundle_assets(detect, "api.openai.com", "policy-corpus");
@@ -443,7 +443,7 @@ fn bundle_home_detect_fixture_optional_smoke() {
     }
 
     let detect_bytes = std::fs::read(detect_path.as_path()).expect("read home detect bundle");
-    let detect: soth_detect::OwnedDetectBundle =
+    let detect: soth_core::OwnedDetectBundle =
         serde_json::from_slice(detect_bytes.as_slice()).expect("parse home detect bundle");
     assert!(
         !detect.domain_index.is_empty(),

@@ -114,6 +114,7 @@ mod tests {
             event_count: events.len() as u32,
             events,
             timestamp_utc: 1_700_000_000,
+            observation_records: None,
         };
         match build_signed_batch(batch, &key) {
             Ok(signed) => signed,

@@ -77,7 +77,10 @@ impl Default for NormalizedRequest {
             has_tool_results: false,
             estimated_output_tokens: None,
             canonical_cache_key: String::new(),
-            format_metadata: FormatMetadata::Unknown,
+            format_metadata: FormatMetadata::Unknown {
+                method: String::new(),
+                path: String::new(),
+            },
         }
     }
 }
@@ -91,15 +94,30 @@ pub enum FormatMetadata {
     GraphQl {
         operation_name: Option<String>,
         operation_type: GraphQlOperationType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mutation_field: Option<String>,
     },
     Grpc {
         service: String,
         method: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proto_package: Option<String>,
     },
     JsonRpc {
         method: String,
+        #[serde(default)]
+        is_batch: bool,
     },
-    Unknown,
+    WebSocket {
+        #[serde(default)]
+        frame_kind_hint: String,
+    },
+    Unknown {
+        #[serde(default)]
+        method: String,
+        #[serde(default)]
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

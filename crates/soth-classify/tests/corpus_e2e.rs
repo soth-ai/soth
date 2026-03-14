@@ -460,7 +460,7 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
             provider: DetectedProvider::OpenAi,
         },
         canonical_cache_key: "cache-key".to_string(),
-        format_metadata: FormatMetadata::Unknown,
+        format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
@@ -587,6 +587,8 @@ fn build_proxy_context(context: &ContextInput) -> ProxyContext {
             capture_mode: Some(capture_mode),
             process_name: None,
             bundle_id: None,
+            matched_app_id: None,
+            ..Default::default()
         },
         capture_mode,
         matched_provider: Some("openai".to_string()),
@@ -688,6 +690,8 @@ fn build_artifacts(input: &[ArtifactInput]) -> Vec<SensitiveArtifact> {
                 kind: kind.clone(),
                 severity,
                 location: ArtifactLocation::Unknown,
+                commitment: None,
+                redacted_hint: None,
             });
         }
     }
@@ -1251,6 +1255,11 @@ fn parse_artifact_kind(input: &ArtifactInput) -> ArtifactKind {
         },
         "auth_logic" => ArtifactKind::AuthLogic,
         "crypto_operation" => ArtifactKind::CryptoOperation,
+        "aws_access_key" => ArtifactKind::AwsAccessKey,
+        "github_pat" => ArtifactKind::GitHubPat,
+        "gitlab_token" => ArtifactKind::GitLabToken,
+        "slack_token" => ArtifactKind::SlackToken,
+        "stripe_secret_key" => ArtifactKind::StripeSecretKey,
         other => panic!("unsupported artifact kind in fixture: {other}"),
     }
 }

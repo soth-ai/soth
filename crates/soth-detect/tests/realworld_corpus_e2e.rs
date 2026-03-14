@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use serde_json::{json, Value};
 use soth_core::{ConnectionMeta, DetectedProvider, ParseSource, SocketFamily};
-use soth_detect::{build_registry, process_with_registry, OwnedDetectBundle, RawRequest};
+use soth_core::OwnedDetectBundle;
+use soth_detect::{build_registry, process_with_registry, RawRequest};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;

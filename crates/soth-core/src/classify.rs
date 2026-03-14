@@ -51,11 +51,12 @@ pub enum TrafficClassification {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppType {
     Host,
     NonHost,
+    #[default]
     Unknown,
 }
 
@@ -71,21 +72,42 @@ impl AppType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessMatchKind {
     Exact,
     Pattern,
+    #[default]
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessResolution {
     pub match_kind: ProcessMatchKind,
     pub app_type: AppType,
     pub capture_mode: Option<CaptureMode>,
     pub process_name: Option<String>,
     pub bundle_id: Option<String>,
+    /// Resolved app_id from the detect bundle (e.g. "claude-code", "cursor").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_app_id: Option<String>,
+
+    // ── Unified registry resolved fields (v6+) ──
+    // Pre-resolved at the edge so the cloud can use them directly
+    // without catalog lookup or COALESCE fallback chains.
+
+    /// Human-readable display name (e.g. "Cursor", "Claude Code").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Fine-grained entity kind: "ide", "cli", "browser", "platform", etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_kind: Option<String>,
+    /// Dashboard category: "Code Editor", "CLI Tool", "AI Platform", etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_category: Option<String>,
+    /// Linked provider entity slug (e.g. "anthropic" for Cursor→Anthropic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

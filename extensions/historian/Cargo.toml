@@ -26,6 +26,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 soth-core = { workspace = true }
+soth-classify = { workspace = true }
+soth-detect = { workspace = true }
 soth-extensions = { workspace = true }
 
 # standalone binary only

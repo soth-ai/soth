@@ -17,6 +17,8 @@ fn bench_classify_fallback(c: &mut Criterion) {
             capture_mode: None,
             process_name: None,
             bundle_id: None,
+            matched_app_id: None,
+            ..Default::default()
         },
         capture_mode: soth_core::CaptureMode::MetadataOnly,
         matched_provider: None,

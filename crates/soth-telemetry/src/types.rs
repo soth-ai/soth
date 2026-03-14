@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use soth_core::TelemetryEvent;
+use soth_core::{ObservationEvent, TelemetryEvent};
+
+/// Wrapper for ObservationEvent in telemetry batches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservationTelemetryRecord {
+    pub schema_version: u8,
+    pub event: ObservationEvent,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryBatch {
@@ -12,6 +19,11 @@ pub struct TelemetryBatch {
     pub events: Vec<TelemetryEvent>,
     pub event_count: u32,
     pub timestamp_utc: i64,
+    /// Observation records from passive observer extensions.
+    /// Optional to maintain backward compatibility with cloud consumers
+    /// that do not yet process observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_records: Option<Vec<ObservationTelemetryRecord>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

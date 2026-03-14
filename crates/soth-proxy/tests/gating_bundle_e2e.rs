@@ -82,14 +82,14 @@ fn signed_manifest_bytes(
     serde_json::to_vec(&manifest).expect("serialize signed manifest")
 }
 
-fn detect_bundle_with_openai_catalog() -> soth_detect::OwnedDetectBundle {
-    let mut detect = soth_detect::OwnedDetectBundle::default();
+fn detect_bundle_with_openai_catalog() -> soth_core::OwnedDetectBundle {
+    let mut detect = soth_core::OwnedDetectBundle::default();
     detect
         .domain_index
         .insert("api.openai.com".to_string(), "openai".to_string());
     detect.llm_providers.insert(
         "openai".to_string(),
-        soth_detect::ProviderEntry {
+        soth_core::ProviderEntry {
             provider_id: Some("openai".to_string()),
             name: Some("openai".to_string()),
             api_format: Some("openai_rest".to_string()),
@@ -229,7 +229,7 @@ fn gating_bundle(include_openai_passthrough: bool) -> GatingBundle {
 fn build_handler(
     db_path: &Path,
     pipeline_config: PipelineConfig,
-    detect_bundle: soth_detect::OwnedDetectBundle,
+    detect_bundle: soth_core::OwnedDetectBundle,
     gating_bundle: GatingBundle,
 ) -> ProxyHandler {
     let vendor = SigningKey::from_bytes(&[93u8; 32]);
@@ -269,6 +269,7 @@ fn build_handler(
     let proxy_db = Arc::new(Mutex::new(db::open(db_path).expect("open proxy db")));
     ProxyHandler::new(
         handle,
+        None,
         None,
         proxy_db,
         pipeline_config,

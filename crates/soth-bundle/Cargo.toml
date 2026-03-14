@@ -5,11 +5,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Enables entity_index_from_native, which converts a soth-interface NativeBundle
+# into a soth-core EntityIndex.  Off by default so the OSS proxy binary does not
+# pull in the proprietary soth-interface crate.
+native-bundle = ["dep:soth-interface"]
+
 [dependencies]
 soth-core = { workspace = true }
 soth-classify = { workspace = true }
 soth-policy = { workspace = true }
-soth-detect = { workspace = true }
+soth-detect = { workspace = true, default-features = false }
+soth-interface = { path = "../../../soth-cloud/crates/soth-interface", optional = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

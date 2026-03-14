@@ -4,7 +4,7 @@
 use soth_core::{
     GatingBundle, MatchingRule, SignalKind, SignalMatcher,
 };
-use soth_detect::{ApplicationEntry, OwnedDetectBundle, ProviderEntry};
+use soth_core::{ApplicationEntry, OwnedDetectBundle, ProviderEntry};
 use std::collections::HashMap;
 
 // Expose gating_from_detect via the loader module's public load_from_bytes path,

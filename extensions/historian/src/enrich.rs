@@ -1,0 +1,183 @@
+//! Classify enrichment for historian events.
+//!
+//! Runs the soth-classify pipeline on GovernableEvents *before* they are
+//! serialised to the governance queue.  The classify results are stored
+//! as typed metadata keys so that `TelemetryEvent::from_governable()` can
+//! read them back without requiring access to embed_content (which is
+//! `#[serde(skip)]`).
+
+use std::path::Path;
+use std::sync::Arc;
+
+use soth_classify::{ClassifyBundle, ClassifyConfig, ProxyContext};
+use soth_core::classify::{
+    AppType, ClassificationSource, ProcessMatchKind, ProcessResolution, TrafficClassification,
+};
+use soth_core::extensions::GovernableEvent;
+use soth_core::{CaptureMode, DetectResult};
+
+use soth_extensions::ExtensionRuntimeContext;
+
+/// Metadata keys written by the enrichment step and read by
+/// `TelemetryEvent::from_governable()`.
+pub mod keys {
+    pub const USE_CASE: &str = "classify.use_case";
+    pub const USE_CASE_CONFIDENCE: &str = "classify.use_case_confidence";
+    pub const VOLATILITY_CLASS: &str = "classify.volatility_class";
+    pub const DYNAMIC_FRACTION: &str = "classify.dynamic_fraction";
+    pub const ANOMALY_SCORE: &str = "classify.anomaly_score";
+    pub const COMPLEXITY_SCORE: &str = "classify.complexity_score";
+    pub const TOPIC_CLUSTER_ID: &str = "classify.topic_cluster_id";
+}
+
+/// Holds the loaded classify bundle + config for the duration of a
+/// backfill / watch run.  Created once, shared across all events.
+pub struct ClassifyEnricher {
+    bundle: Arc<ClassifyBundle>,
+    config: ClassifyConfig,
+    proxy_ctx: ProxyContext,
+}
+
+impl ClassifyEnricher {
+    /// Try to build an enricher from the runtime context.
+    /// Returns `None` if the classify bundle cannot be loaded (e.g. bundle
+    /// doesn't contain model assets).  The caller should proceed without
+    /// enrichment in that case.
+    pub fn try_new(ctx: &ExtensionRuntimeContext) -> Option<Self> {
+        let bundle = load_classify_bundle(&ctx.bundle_path)?;
+        let config = ClassifyConfig::default();
+        let proxy_ctx = build_historian_proxy_ctx(ctx);
+        Some(Self {
+            bundle,
+            config,
+            proxy_ctx,
+        })
+    }
+
+    /// Build from an existing bundle (useful when the proxy already has one).
+    pub fn with_bundle(
+        bundle: Arc<ClassifyBundle>,
+        ctx: &ExtensionRuntimeContext,
+    ) -> Self {
+        Self {
+            bundle,
+            config: ClassifyConfig::default(),
+            proxy_ctx: build_historian_proxy_ctx(ctx),
+        }
+    }
+
+    /// Run classify on a GovernableEvent and write enrichment results
+    /// into its metadata.  The event is modified in-place.
+    pub fn enrich(&self, event: &mut GovernableEvent) {
+        let detect_result = build_detect_result(event);
+        let content = event.embed_content.as_deref();
+
+        let result = soth_classify::classify(
+            &detect_result,
+            content,
+            &self.proxy_ctx,
+            &self.bundle,
+            &self.config,
+        );
+
+        // Write classify results into metadata so they survive queue
+        // serialization (embed_content is #[serde(skip)]).
+        let meta = &mut event.context.metadata;
+        meta.insert(
+            keys::USE_CASE.to_string(),
+            serde_json::to_string(&result.use_case_label).unwrap_or_default(),
+        );
+        meta.insert(
+            keys::USE_CASE_CONFIDENCE.to_string(),
+            result.use_case_confidence.to_string(),
+        );
+        meta.insert(
+            keys::VOLATILITY_CLASS.to_string(),
+            serde_json::to_string(&result.volatility_class).unwrap_or_default(),
+        );
+        meta.insert(
+            keys::DYNAMIC_FRACTION.to_string(),
+            result.dynamic_fraction.to_string(),
+        );
+        meta.insert(
+            keys::ANOMALY_SCORE.to_string(),
+            result.anomaly_score.to_string(),
+        );
+        meta.insert(
+            keys::COMPLEXITY_SCORE.to_string(),
+            result.complexity_score.to_string(),
+        );
+        meta.insert(
+            keys::TOPIC_CLUSTER_ID.to_string(),
+            result.topic_cluster_id.to_string(),
+        );
+    }
+}
+
+/// Build a synthetic `DetectResult` from the GovernableEvent's already-parsed
+/// data.  This avoids re-running the soth-detect HTTP parsing pipeline.
+fn build_detect_result(event: &GovernableEvent) -> DetectResult {
+    let normalized = event
+        .normalized
+        .clone()
+        .unwrap_or_default();
+
+    DetectResult {
+        normalized,
+        artifacts: event.artifacts.clone(),
+        capture_mode: event.capture_mode,
+        parse_source: event
+            .normalized
+            .as_ref()
+            .map(|n| n.parse_source.clone())
+            .unwrap_or(soth_core::ParseSource::Heuristic),
+        confidence: event
+            .normalized
+            .as_ref()
+            .map(|n| n.parse_confidence)
+            .unwrap_or(soth_core::ParseConfidence::Heuristic),
+        ..DetectResult::default()
+    }
+}
+
+/// Build a minimal ProxyContext for historian events.
+fn build_historian_proxy_ctx(ctx: &ExtensionRuntimeContext) -> ProxyContext {
+    ProxyContext {
+        org_id: ctx.org_id.clone(),
+        user_id_hmac: ctx.user_id_hmac.clone(),
+        team_id: String::new(),
+        device_id_hash: ctx.device_id.clone(),
+        endpoint_hash: String::new(),
+        process_resolution: ProcessResolution {
+            match_kind: ProcessMatchKind::Unknown,
+            app_type: AppType::NonHost,
+            capture_mode: Some(CaptureMode::MetadataOnly),
+            process_name: None,
+            bundle_id: None,
+            matched_app_id: None,
+            ..Default::default()
+        },
+        capture_mode: CaptureMode::MetadataOnly,
+        matched_provider: None,
+        matched_application: None,
+        traffic_classification: TrafficClassification::ToolUsage,
+        classification_source: ClassificationSource::Proxy,
+        session_snapshot: None,
+        request_method: None,
+        deployment_context: None,
+        precomputed_commitment_nonce: None,
+        precomputed_commitment_hash: None,
+    }
+}
+
+/// Attempt to load the classify bundle from the bundle directory.
+fn load_classify_bundle(bundle_path: &Path) -> Option<Arc<ClassifyBundle>> {
+    match soth_classify::load_bundle(bundle_path) {
+        Ok(bundle) => Some(bundle),
+        Err(_) => {
+            // Fall back to the built-in fallback bundle (no ONNX model,
+            // but heuristic stages still work).
+            Some(soth_classify::fallback_bundle())
+        }
+    }
+}

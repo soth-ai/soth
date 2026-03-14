@@ -17,7 +17,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 pub use config::{EncryptionMode, TelemetryConfig};
 pub use db::SqlitePool;
-pub use types::{EncryptedBatch, SignedBatch, TelemetryBatch, TransmittedBatch};
+pub use types::{
+    EncryptedBatch, ObservationTelemetryRecord, SignedBatch, TelemetryBatch, TransmittedBatch,
+};
 
 pub const TELEMETRY_VERSION: &str = "1.0.0";
 
@@ -232,6 +234,8 @@ mod tests {
             proxy_version: "proxy-v1".to_string(),
             bundle_version: "bundle-v1".to_string(),
             org_id: "org-test".to_string(),
+            observation_queue_dir: None,
+            governance_queue_dir: None,
         }
     }
 
@@ -553,6 +557,7 @@ mod tests {
             events: vec![event],
             event_count: 1,
             timestamp_utc: 1_700_000_000,
+            observation_records: None,
         };
         let signed = match signing::build_signed_batch(batch, &signing_key) {
             Ok(value) => value,

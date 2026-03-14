@@ -4,11 +4,11 @@ use soth_core::{
     ArtifactKind, CaptureMode, DetectResult, EndpointType, FormatMetadata, ParseConfidence,
     ParseSource, SocketFamily,
 };
-use soth_detect::{
-    build_registry, process_with_registry, CaptureRules, ConnectionMeta, GraphQLOperationRegistry,
-    GrpcServiceRegistry, OwnedDetectBundle, ProviderEntry, RawRequest, RestFormatDescriptor,
-    RestRequestPaths,
+use soth_core::{
+    CaptureRules, GraphQLOperationRegistry, GrpcServiceRegistry, OwnedDetectBundle, ProviderEntry,
+    RestFormatDescriptor, RestRequestPaths,
 };
+use soth_detect::{build_registry, process_with_registry, ConnectionMeta, RawRequest};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
@@ -219,7 +219,8 @@ fn format_kind_label(value: &FormatMetadata) -> &'static str {
         FormatMetadata::GraphQl { .. } => "graphql",
         FormatMetadata::Grpc { .. } => "grpc",
         FormatMetadata::JsonRpc { .. } => "jsonrpc",
-        FormatMetadata::Unknown => "unknown",
+        FormatMetadata::WebSocket { .. } => "websocket",
+        FormatMetadata::Unknown { .. } => "unknown",
     }
 }
 
@@ -238,6 +239,11 @@ fn artifact_kind_label(value: &ArtifactKind) -> String {
         ArtifactKind::OrgPattern { .. } => "org_pattern".to_string(),
         ArtifactKind::AuthLogic => "auth_logic".to_string(),
         ArtifactKind::CryptoOperation => "crypto_operation".to_string(),
+        ArtifactKind::AwsAccessKey => "aws_access_key".to_string(),
+        ArtifactKind::GitHubPat => "github_pat".to_string(),
+        ArtifactKind::GitLabToken => "gitlab_token".to_string(),
+        ArtifactKind::SlackToken => "slack_token".to_string(),
+        ArtifactKind::StripeSecretKey => "stripe_secret_key".to_string(),
     }
 }
 

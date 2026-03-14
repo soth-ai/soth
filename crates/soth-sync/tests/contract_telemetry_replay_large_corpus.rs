@@ -135,6 +135,7 @@ fn sample_batch(batch_id: Uuid, event_id: Uuid, org_id: String) -> TransmittedBa
             events: vec![sample_event(event_id)],
             event_count: 1,
             timestamp_utc: 1_700_000_001,
+            observation_records: None,
         },
         proxy_signature: [0u8; 64],
         proxy_pubkey: [1u8; 32],

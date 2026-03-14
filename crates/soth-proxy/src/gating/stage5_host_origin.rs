@@ -9,7 +9,7 @@ pub fn origin_allowed(
     ["origin", "referer"]
         .iter()
         .filter_map(|name| header_value(headers, name))
-        .filter_map(|value| extract_host_from_url(value))
+        .filter_map(extract_host_from_url)
         .any(|host| {
             allowed_host_origins
                 .iter()

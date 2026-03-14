@@ -9,10 +9,8 @@
 /// AWS Bedrock, Groq, Mistral, Fireworks, xAI.
 use serde_json::json;
 use soth_core::{MatchingRule, SignalKind, SignalMatcher};
-use soth_detect::{
-    classify_request, fingerprint, ApplicationEntry, DetectedFormat, OwnedDetectBundle,
-    ProviderEntry,
-};
+use soth_core::{ApplicationEntry, OwnedDetectBundle, ProviderEntry};
+use soth_detect::{classify_request, fingerprint, DetectedFormat};
 use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -669,8 +667,8 @@ fn build_shared_base() -> OwnedDetectBundle {
     let mut rest_formats = HashMap::new();
     rest_formats.insert(
         "openai".to_string(),
-        soth_detect::RestFormatDescriptor {
-            request: soth_detect::RestRequestPaths {
+        soth_core::RestFormatDescriptor {
+            request: soth_core::RestRequestPaths {
                 model: Some("$.model".to_string()),
                 messages: Some("$.messages".to_string()),
                 ..Default::default()
@@ -680,8 +678,8 @@ fn build_shared_base() -> OwnedDetectBundle {
     );
     rest_formats.insert(
         "anthropic".to_string(),
-        soth_detect::RestFormatDescriptor {
-            request: soth_detect::RestRequestPaths {
+        soth_core::RestFormatDescriptor {
+            request: soth_core::RestRequestPaths {
                 model: Some("$.model".to_string()),
                 messages: Some("$.messages".to_string()),
                 system: Some("$.system".to_string()),
@@ -690,13 +688,13 @@ fn build_shared_base() -> OwnedDetectBundle {
             ..Default::default()
         },
     );
-    rest_formats.insert("chatgpt_web".to_string(), soth_detect::RestFormatDescriptor::default());
-    rest_formats.insert("claude_web".to_string(), soth_detect::RestFormatDescriptor::default());
-    rest_formats.insert("gemini_web".to_string(), soth_detect::RestFormatDescriptor::default());
-    rest_formats.insert("deepseek_web".to_string(), soth_detect::RestFormatDescriptor::default());
-    rest_formats.insert("grok_web".to_string(), soth_detect::RestFormatDescriptor::default());
-    rest_formats.insert("perplexity_web".to_string(), soth_detect::RestFormatDescriptor::default());
-    rest_formats.insert("codex_web".to_string(), soth_detect::RestFormatDescriptor::default());
+    rest_formats.insert("chatgpt_web".to_string(), soth_core::RestFormatDescriptor::default());
+    rest_formats.insert("claude_web".to_string(), soth_core::RestFormatDescriptor::default());
+    rest_formats.insert("gemini_web".to_string(), soth_core::RestFormatDescriptor::default());
+    rest_formats.insert("deepseek_web".to_string(), soth_core::RestFormatDescriptor::default());
+    rest_formats.insert("grok_web".to_string(), soth_core::RestFormatDescriptor::default());
+    rest_formats.insert("perplexity_web".to_string(), soth_core::RestFormatDescriptor::default());
+    rest_formats.insert("codex_web".to_string(), soth_core::RestFormatDescriptor::default());
 
     let mut llm_providers = HashMap::new();
     for (id, fmt) in &[

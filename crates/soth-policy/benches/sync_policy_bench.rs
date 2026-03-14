@@ -92,7 +92,7 @@ fn fixture_request() -> NormalizedRequest {
         estimated_cost_usd: 0.21,
         parse_source: ParseSource::GraphQl,
         canonical_cache_key: String::new(),
-        format_metadata: FormatMetadata::Unknown,
+        format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
@@ -107,6 +107,8 @@ fn fixture_context() -> PolicyContext {
             app_type: AppType::Host,
             capture_mode: None,
             process_name: Some("agentd".to_string()),
+            matched_app_id: None,
+            ..Default::default()
         },
         capture_mode: CaptureMode::MetadataOnly,
         traffic_classification: TrafficClassification::ToolUsage,

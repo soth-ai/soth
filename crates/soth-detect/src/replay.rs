@@ -1,7 +1,7 @@
 use crate::engine::{process_with_registry, ParserRegistry};
 use crate::intelligence::{
-    confidence_rank, now_epoch_secs, parse_confidence_from_label, warning_to_string,
-    IntelligenceResult, ReparseJobRecord, ReparseResultRecord, ReparseRunSummary,
+    confidence_rank, now_epoch_secs, parse_confidence_from_label, IntelligenceResult,
+    ReparseJobRecord, ReparseResultRecord, ReparseRunSummary,
 };
 use crate::intelligence_store::IntelligenceStore;
 use crate::types::{ConnectionMeta, DetectBundleSlice, RawRequest, SocketFamily};
@@ -55,12 +55,12 @@ pub fn replay_heuristic_events(
             new_confidence: crate::intelligence::parse_confidence_label(&new_result.confidence)
                 .to_string(),
             old_canonical_hash: candidate.old_canonical_hash,
-            new_canonical_hash: new_result.normalized.canonical_hash,
+            new_canonical_hash: new_result.normalized.canonical_cache_key.clone(),
             status: status.to_string(),
             warnings: new_result
                 .warnings
                 .iter()
-                .map(warning_to_string)
+                .map(|w| format!("{w:?}"))
                 .collect::<Vec<_>>(),
         };
 

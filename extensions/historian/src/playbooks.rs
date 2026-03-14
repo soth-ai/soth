@@ -88,7 +88,7 @@ fn claude_code() -> Playbook {
             detect: PlaybookDetect::GlobExists {
                 pattern: "**/*.jsonl".into(),
             },
-            exclude_dirs: vec!["memory".into()],
+            exclude_dirs: vec!["memory".into(), "subagents".into()],
             exclude_file_patterns: vec![],
         },
         source: PlaybookSource::JsonlFiles {

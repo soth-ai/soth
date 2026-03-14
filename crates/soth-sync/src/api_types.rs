@@ -415,6 +415,10 @@ pub struct TelemetryBatchRequest {
     pub timestamp: i64,
     pub events: Vec<TelemetryEvent>,
     pub proxy_signature: String,
+    /// Observation records from passive observer extensions.
+    /// Omitted when empty for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_records: Option<Vec<soth_telemetry::ObservationTelemetryRecord>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,6 +462,30 @@ pub struct TelemetryEvent {
     pub original_event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_source: Option<String>,
+
+    // Response-side fields (populated when response data is available)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u64>,
+
+    // Session metadata
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_request_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_credential_alerts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_turn: Option<u32>,
+
+    // WebSocket turn number
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_turn_number: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

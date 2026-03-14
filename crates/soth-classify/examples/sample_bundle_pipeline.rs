@@ -45,7 +45,7 @@ fn main() {
                 provider: DetectedProvider::OpenAi,
             },
             canonical_cache_key: "cache-key".to_string(),
-            format_metadata: FormatMetadata::Unknown,
+            format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
@@ -85,6 +85,8 @@ fn main() {
             capture_mode: Some(CaptureMode::MetadataOnly),
             process_name: Some("cursor".to_string()),
             bundle_id: Some("com.todesktop.230313mzl4w4u92".to_string()),
+            matched_app_id: None,
+            ..Default::default()
         },
         capture_mode: CaptureMode::MetadataOnly,
         matched_provider: Some("openai".to_string()),

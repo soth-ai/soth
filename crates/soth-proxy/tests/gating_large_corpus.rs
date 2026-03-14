@@ -36,7 +36,7 @@ struct CanonicalManifest<'a> {
 #[derive(Clone)]
 struct RuntimeBundles {
     gating: GatingBundle,
-    detect: soth_detect::OwnedDetectBundle,
+    detect: soth_core::OwnedDetectBundle,
 }
 
 #[derive(Clone)]
@@ -118,7 +118,7 @@ fn load_runtime_bundles() -> RuntimeBundles {
         let mut gating: GatingBundle =
             serde_json::from_slice(gating_bytes.as_slice()).expect("parse local gating bundle");
         gating.normalize_host_patterns_in_place();
-        let detect: soth_detect::OwnedDetectBundle =
+        let detect: soth_core::OwnedDetectBundle =
             serde_json::from_slice(detect_bytes.as_slice()).expect("parse local detect bundle");
         return RuntimeBundles { gating, detect };
     }
@@ -126,7 +126,7 @@ fn load_runtime_bundles() -> RuntimeBundles {
     let detect_fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../soth-detect/tests/fixtures/registry_bundle_cache.detect_bundle.json");
     let detect_bytes = std::fs::read(detect_fixture).expect("read detect fixture");
-    let detect: soth_detect::OwnedDetectBundle =
+    let detect: soth_core::OwnedDetectBundle =
         serde_json::from_slice(detect_bytes.as_slice()).expect("parse detect fixture");
 
     let vendor = SigningKey::from_bytes(&[61u8; 32]);
@@ -191,6 +191,7 @@ fn build_handler(
     ProxyHandler::new(
         handle,
         None,
+        None,
         proxy_db,
         pipeline_config,
         soth_classify::ClassifyConfig::default(),
@@ -244,37 +245,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
-    if !pattern.contains('*') {
-        return pattern == text;
-    }
-    let starts_with_wildcard = pattern.starts_with('*');
-    let ends_with_wildcard = pattern.ends_with('*');
-    let parts: Vec<&str> = pattern.split('*').filter(|part| !part.is_empty()).collect();
-    if parts.is_empty() {
-        return true;
-    }
-    let mut cursor = 0usize;
-    for (idx, part) in parts.iter().enumerate() {
-        let is_first = idx == 0;
-        let is_last = idx + 1 == parts.len();
-
-        if is_first && !starts_with_wildcard {
-            if !text[cursor..].starts_with(part) {
-                return false;
-            }
-            cursor += part.len();
-            continue;
-        }
-        if is_last && !ends_with_wildcard {
-            return text.ends_with(part);
-        }
-        if let Some(offset) = text[cursor..].find(part) {
-            cursor += offset + part.len();
-        } else {
-            return false;
-        }
-    }
-    true
+    soth_parse::glob_match(pattern, text)
 }
 
 fn path_denied_by_host_rule(host_rule: &HostRule, path: &str) -> bool {

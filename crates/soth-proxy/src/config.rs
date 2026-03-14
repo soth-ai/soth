@@ -415,11 +415,12 @@ impl Default for ClassifyRuntimeConfig {
 
 impl ClassifyRuntimeConfig {
     fn to_classify_config(&self) -> soth_classify::ClassifyConfig {
-        let mut cfg = soth_classify::ClassifyConfig::default();
-        cfg.embedding_enabled = self.embedding_enabled;
-        cfg.anomaly_enabled = self.anomaly_enabled;
-        cfg.lsh_near_dupe_threshold = self.lsh_near_dupe_threshold;
-        cfg
+        soth_classify::ClassifyConfig {
+            embedding_enabled: self.embedding_enabled,
+            anomaly_enabled: self.anomaly_enabled,
+            lsh_near_dupe_threshold: self.lsh_near_dupe_threshold,
+            ..Default::default()
+        }
     }
 
     fn to_runtime_config(&self) -> crate::classify_task::RuntimeConfig {
@@ -492,6 +493,8 @@ impl TelemetryPipelineConfig {
             proxy_version: self.proxy_version.clone(),
             bundle_version,
             org_id,
+            observation_queue_dir: None, // wired by extension registry when enabled
+            governance_queue_dir: None, // wired by extension registry when enabled
         })
     }
 }

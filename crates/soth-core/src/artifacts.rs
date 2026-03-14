@@ -6,6 +6,10 @@ pub struct SensitiveArtifact {
     pub kind: ArtifactKind,
     pub severity: ArtifactSeverity,
     pub location: ArtifactLocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +25,12 @@ pub enum ArtifactKind {
     OrgPattern { pattern_id: u32 },
     AuthLogic,
     CryptoOperation,
+    // Specific key types (from soth-parse ArtifactType)
+    AwsAccessKey,
+    GitHubPat,
+    GitLabToken,
+    SlackToken,
+    StripeSecretKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -37,7 +47,10 @@ pub enum ArtifactSeverity {
 pub enum ArtifactLocation {
     SystemPrompt { char_offset: u32 },
     UserContent { turn: u32, char_offset: u32 },
+    AssistantContent { turn: u32, char_offset: u32 },
     ToolResult { tool_name: Option<String> },
+    Header { name: String },
+    StreamChunk { sequence: u64 },
     Unknown,
 }
 
@@ -55,6 +68,11 @@ impl SensitiveArtifact {
                 | ArtifactKind::HexKey
                 | ArtifactKind::ConnectionString
                 | ArtifactKind::UnknownCredential
+                | ArtifactKind::AwsAccessKey
+                | ArtifactKind::GitHubPat
+                | ArtifactKind::GitLabToken
+                | ArtifactKind::SlackToken
+                | ArtifactKind::StripeSecretKey
         )
     }
 }
@@ -103,17 +121,23 @@ pub enum ParseSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParseWarning {
-    GraphQlUnknownOperation {
-        operation_name: String,
-    },
-    PartialBodyParse {
-        reason: String,
-    },
-    #[serde(alias = "oversize_body")]
-    BodyTruncated {
-        actual_bytes: u64,
-        limit_bytes: u64,
-    },
-    EncodingError,
+    InvalidJson,
+    MissingField { field: String },
+    NonJsonBody,
+    LongestStringHeuristic,
+    ContentNotExtracted,
+    GraphQlSyntaxError,
+    GraphQlUnknownOperation { operation_name: String },
+    GrpcDescriptorMissing { service: String },
     GrpcNoDescriptor,
+    WebSocketBinaryUnparseable,
+    TreeSitterPanic,
+    TreeSitterTimeout,
+    ParserError { reason: String },
+    NoParserForFormat { format: String },
+    FilteredByKeyword,
+    PartialBodyParse { reason: String },
+    #[serde(alias = "oversize_body")]
+    BodyTruncated { actual_bytes: u64, limit_bytes: u64 },
+    EncodingError,
 }

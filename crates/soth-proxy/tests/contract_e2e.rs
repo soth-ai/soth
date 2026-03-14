@@ -80,6 +80,8 @@ fn sample_proxy_context(capture_mode: CaptureMode, timestamp_epoch_ms: i64) -> P
             capture_mode: Some(capture_mode),
             process_name: Some("test-proc".to_string()),
             bundle_id: None,
+            matched_app_id: None,
+            ..Default::default()
         },
         capture_mode,
         matched_provider: Some("openai".to_string()),
@@ -98,7 +100,7 @@ fn sample_proxy_context(capture_mode: CaptureMode, timestamp_epoch_ms: i64) -> P
 }
 
 fn run_detect(capture_mode: CaptureMode) -> soth_core::DetectResult {
-    let bundle = soth_detect::OwnedDetectBundle::default();
+    let bundle = soth_core::OwnedDetectBundle::default();
     let registry = soth_detect::build_registry(&bundle.as_slice()).expect("build registry");
     let request = sample_request(
         Some(capture_mode),
@@ -190,6 +192,8 @@ async fn telemetry_contract_input_output() {
             proxy_version: "proxy-test".to_string(),
             bundle_version: "bundle-test".to_string(),
             org_id: "org-test".to_string(),
+            observation_queue_dir: None,
+            governance_queue_dir: None,
         },
         Arc::new(soth_telemetry::SqlitePool::new(db_path.clone())),
         Arc::new(sink.clone()),

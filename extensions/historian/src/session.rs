@@ -4,9 +4,14 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use soth_core::artifacts::CaptureMode;
-use soth_core::extensions::{EventSource, ExtensionContext, ExtensionType, GovernableEvent};
+use soth_core::extensions::{EventSource, ExtensionContext, ExtensionSource, GovernableEvent};
 use soth_core::normalized::{EndpointType, FormatMetadata};
 use soth_core::providers::DetectedProvider;
+use soth_core::SensitiveArtifact;
+
+use soth_detect::code::detect_code_artifacts;
+use soth_detect::sensitive::{credential_scan, structural_scan};
+use soth_detect::{map_artifact, ArtifactLocation};
 
 use crate::types::{AiTool, HistoricalSession};
 
@@ -81,9 +86,15 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
 
     // Historical markers — the extension manager reads these to set
     // TelemetryEvent.data_source, is_historical, and original_timestamp.
+    // Use serde serialization (snake_case) so soth-core can deserialize it
+    // back into `DataSource`. Debug format produces "HistorianClaudeCode"
+    // which fails serde deserialization and silently falls back to LiveProxy.
     metadata.insert(
         "data_source".to_string(),
-        format!("{:?}", session.tool.data_source()),
+        serde_json::to_value(session.tool.data_source())
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "live_proxy".to_string()),
     );
     metadata.insert("is_historical".to_string(), "true".to_string());
     if let Some(ts) = session.started_at {
@@ -119,23 +130,28 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         estimated_cost_usd: 0.0,
         parse_source: soth_core::artifacts::ParseSource::JsonRpc,
         canonical_cache_key: String::new(),
-        format_metadata: FormatMetadata::Unknown,
+        format_metadata: FormatMetadata::Unknown {
+            method: String::new(),
+            path: String::new(),
+        },
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
     };
 
+    let artifacts = scan_session_artifacts(session);
+
     GovernableEvent {
         event_id: Uuid::new_v4(),
         timestamp_epoch_ms: timestamp,
         source: EventSource::Extension {
-            ext_type: ExtensionType::Historian,
+            source: ExtensionSource::Historian,
         },
         provider,
         model: None,
         endpoint_type: EndpointType::ChatCompletion,
         normalized: Some(normalized),
-        artifacts: Vec::new(),
+        artifacts,
         capture_mode: CaptureMode::MetadataOnly,
         embed_content: Some(full_conversation),
         context: ExtensionContext {
@@ -144,6 +160,56 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
             metadata,
         },
     }
+}
+
+/// Scan all messages in a session for sensitive artifacts (credentials, code
+/// blocks, structural patterns). Returns soth-core artifact types ready for
+/// the GovernableEvent.
+fn scan_session_artifacts(session: &HistoricalSession) -> Vec<SensitiveArtifact> {
+    let mut user_turn: u32 = 0;
+    let mut assistant_turn: u32 = 0;
+    let mut artifacts = Vec::new();
+
+    for msg in &session.messages {
+        let location = match msg.role.as_str() {
+            "system" => ArtifactLocation::SystemPrompt,
+            "user" | "human" => {
+                let loc = ArtifactLocation::UserMessage {
+                    turn_index: user_turn,
+                };
+                user_turn += 1;
+                loc
+            }
+            "assistant" | "model" => {
+                let loc = ArtifactLocation::AssistantMessage {
+                    turn_index: assistant_turn,
+                };
+                assistant_turn += 1;
+                loc
+            }
+            _ => ArtifactLocation::Unknown,
+        };
+
+        let body = msg.content.as_bytes();
+
+        // Credential scanning (API keys, private keys, JWTs, connection strings)
+        for raw in credential_scan(body, location.clone()) {
+            artifacts.push(map_artifact(&raw));
+        }
+
+        // Structural scanning (auth logic, crypto operation patterns)
+        for raw in structural_scan(body, location.clone()) {
+            artifacts.push(map_artifact(&raw));
+        }
+
+        // Code block detection (language identification, code artifacts)
+        let code_result = detect_code_artifacts(&msg.content, location);
+        for raw in code_result.artifacts {
+            artifacts.push(map_artifact(&raw));
+        }
+    }
+
+    artifacts
 }
 
 fn tool_to_provider(tool: &AiTool) -> DetectedProvider {
@@ -220,7 +286,7 @@ mod tests {
         assert_eq!(
             event.source,
             EventSource::Extension {
-                ext_type: ExtensionType::Historian
+                source: ExtensionSource::Historian
             }
         );
     }
@@ -272,7 +338,7 @@ mod tests {
         let event = reconstruct_event(&sample_session());
         let meta = &event.context.metadata;
         assert_eq!(meta.get("is_historical").unwrap(), "true");
-        assert_eq!(meta.get("data_source").unwrap(), "HistorianClaudeCode");
+        assert_eq!(meta.get("data_source").unwrap(), "historian_claude_code");
         assert_eq!(meta.get("original_timestamp").unwrap(), "1700000000000");
     }
 
@@ -325,6 +391,105 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_detects_credential_artifacts() {
+        let session = HistoricalSession {
+            tool: AiTool::ClaudeCode,
+            session_id: "cred-test".to_string(),
+            messages: vec![HistoricalMessage {
+                role: "user".to_string(),
+                content: "use key sk-abcdefghijklmnopqrstuvwxyz1234 for auth".to_string(),
+                timestamp: Some(1700000000000),
+                token_estimate: 10,
+            }],
+            started_at: Some(1700000000000),
+            ended_at: Some(1700000000000),
+        };
+        let event = reconstruct_event(&session);
+        assert!(
+            !event.artifacts.is_empty(),
+            "should detect API key credential"
+        );
+        assert!(event
+            .artifacts
+            .iter()
+            .any(|a| a.is_credential()));
+    }
+
+    #[test]
+    fn reconstruct_detects_code_artifacts() {
+        let session = HistoricalSession {
+            tool: AiTool::ClaudeCode,
+            session_id: "code-test".to_string(),
+            messages: vec![
+                HistoricalMessage {
+                    role: "user".to_string(),
+                    content: "write a rust function".to_string(),
+                    timestamp: Some(1700000000000),
+                    token_estimate: 5,
+                },
+                HistoricalMessage {
+                    role: "assistant".to_string(),
+                    content: "fn main() {\n    let mut x = 5;\n    impl Foo { pub struct Bar; }\n    use std::io;\n}".to_string(),
+                    timestamp: Some(1700000001000),
+                    token_estimate: 20,
+                },
+            ],
+            started_at: Some(1700000000000),
+            ended_at: Some(1700000001000),
+        };
+        let event = reconstruct_event(&session);
+        assert!(
+            event.artifacts.iter().any(|a| matches!(
+                a.kind,
+                soth_core::artifacts::ArtifactKind::CodeBlock { .. }
+            )),
+            "should detect code block in assistant response"
+        );
+    }
+
+    #[test]
+    fn reconstruct_no_artifacts_for_plain_text() {
+        let session = HistoricalSession {
+            tool: AiTool::ClaudeCode,
+            session_id: "plain-test".to_string(),
+            messages: vec![HistoricalMessage {
+                role: "user".to_string(),
+                content: "What is the weather today?".to_string(),
+                timestamp: Some(1700000000000),
+                token_estimate: 6,
+            }],
+            started_at: Some(1700000000000),
+            ended_at: Some(1700000000000),
+        };
+        let event = reconstruct_event(&session);
+        assert!(
+            event.artifacts.is_empty(),
+            "plain text should produce no artifacts"
+        );
+    }
+
+    #[test]
+    fn reconstruct_detects_private_key() {
+        let session = HistoricalSession {
+            tool: AiTool::ClaudeCode,
+            session_id: "pkey-test".to_string(),
+            messages: vec![HistoricalMessage {
+                role: "user".to_string(),
+                content: "here is my key:\n-----BEGIN PRIVATE KEY-----\nblah\n-----END PRIVATE KEY-----".to_string(),
+                timestamp: Some(1700000000000),
+                token_estimate: 15,
+            }],
+            started_at: Some(1700000000000),
+            ended_at: Some(1700000000000),
+        };
+        let event = reconstruct_event(&session);
+        assert!(
+            event.artifacts.iter().any(|a| a.is_private_key()),
+            "should detect private key"
+        );
+    }
+
+    #[test]
     fn gemini_session_sets_correct_data_source() {
         let session = HistoricalSession {
             tool: AiTool::GeminiCli,
@@ -341,7 +506,7 @@ mod tests {
         let event = reconstruct_event(&session);
         assert_eq!(
             event.context.metadata.get("data_source").unwrap(),
-            "HistorianGemini"
+            "historian_gemini"
         );
     }
 }

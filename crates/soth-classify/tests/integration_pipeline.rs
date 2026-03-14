@@ -5,6 +5,8 @@ fn private_key_artifact() -> soth_core::SensitiveArtifact {
         kind: soth_core::ArtifactKind::PrivateKey,
         severity: soth_core::ArtifactSeverity::Critical,
         location: soth_core::ArtifactLocation::SystemPrompt { char_offset: 0 },
+        commitment: None,
+        redacted_hint: None,
     }
 }
 
@@ -18,6 +20,8 @@ fn credential_artifact() -> soth_core::SensitiveArtifact {
             turn: 0,
             char_offset: 0,
         },
+        commitment: None,
+        redacted_hint: None,
     }
 }
 

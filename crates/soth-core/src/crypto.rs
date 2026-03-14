@@ -129,7 +129,7 @@ mod tests {
             estimated_cost_usd: 0.1,
             parse_source: ParseSource::Heuristic,
             canonical_cache_key: String::new(),
-            format_metadata: FormatMetadata::Unknown,
+            format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,

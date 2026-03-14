@@ -166,6 +166,44 @@ fn normalize_hash(raw: &str) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn check_macos_trust(cert_path: &Path) -> Result<OsTrustCheck> {
+    // Primary check: `security verify-cert` tests actual SSL trust policy,
+    // not just keychain presence. A cert can be in the keychain but have
+    // zero trust settings, which means browsers will reject it.
+    let verify = Command::new("security")
+        .args(["verify-cert", "-c"])
+        .arg(cert_path)
+        .args(["-p", "ssl"])
+        .output()
+        .context("failed running security verify-cert")?;
+
+    if verify.status.success() {
+        return Ok(OsTrustCheck {
+            status: OsTrustStatus::Trusted,
+            detail: "certificate passes SSL trust verification (security verify-cert)".to_string(),
+        });
+    }
+
+    // verify-cert failed — cert is not trusted for SSL.
+    // Gather extra detail: check if it's at least present in a keychain.
+    let stderr = String::from_utf8_lossy(&verify.stderr);
+    let keychain_detail = match macos_keychain_presence(cert_path) {
+        Ok(Some(location)) => format!(
+            "certificate is in {location} keychain but lacks SSL trust policy. \
+             Run `soth setup-ca` to set trust."
+        ),
+        Ok(None) => "certificate not found in any keychain. Run `soth setup-ca` to install and trust.".to_string(),
+        Err(_) => format!("verify-cert failed: {}", stderr.trim()),
+    };
+
+    Ok(OsTrustCheck {
+        status: OsTrustStatus::Untrusted,
+        detail: keychain_detail,
+    })
+}
+
+/// Check which keychains contain the certificate (for diagnostics only).
+#[cfg(target_os = "macos")]
+fn macos_keychain_presence(cert_path: &Path) -> Result<Option<&'static str>> {
     let expected_sha256 = cert_fingerprint_sha256(cert_path)?;
     let expected_sha1 = cert_fingerprint_sha1(cert_path)?;
 
@@ -177,37 +215,16 @@ fn check_macos_trust(cert_path: &Path) -> Result<OsTrustCheck> {
     let login_hashes = macos_collect_keychain_hashes(login_keychain.as_path())?;
     let system_hashes = macos_collect_keychain_hashes(system_keychain.as_path())?;
 
-    if login_hashes.is_empty() && system_hashes.is_empty() {
-        return Ok(OsTrustCheck {
-            status: OsTrustStatus::Unknown,
-            detail: "keychain scan returned no certificate hashes".to_string(),
-        });
-    }
-
-    let trusted_login = login_hashes.contains(expected_sha256.as_str())
+    let in_login = login_hashes.contains(expected_sha256.as_str())
         || login_hashes.contains(expected_sha1.as_str());
-    let trusted_system = system_hashes.contains(expected_sha256.as_str())
+    let in_system = system_hashes.contains(expected_sha256.as_str())
         || system_hashes.contains(expected_sha1.as_str());
 
-    if trusted_login || trusted_system {
-        return Ok(OsTrustCheck {
-            status: OsTrustStatus::Trusted,
-            detail: format!(
-                "certificate fingerprint present in {} keychain(s)",
-                if trusted_login && trusted_system {
-                    "login+system"
-                } else if trusted_login {
-                    "login"
-                } else {
-                    "system"
-                }
-            ),
-        });
-    }
-
-    Ok(OsTrustCheck {
-        status: OsTrustStatus::Untrusted,
-        detail: "certificate fingerprint not found in login/system keychains".to_string(),
+    Ok(match (in_login, in_system) {
+        (true, true) => Some("login+system"),
+        (true, false) => Some("login"),
+        (false, true) => Some("system"),
+        (false, false) => None,
     })
 }
 

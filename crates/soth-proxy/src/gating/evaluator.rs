@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use soth_core::{
     AppType, CaptureMode, DecisionReason, GateDecision, GateOutcome, GateStage, GatingBundle,
     NonCatalogedAction, ProcessInfo, TrafficClassification, UnknownAppAction,
@@ -10,7 +10,7 @@ use soth_core::{
 use crate::gating::stage0_tls::{normalize_sni, HostMatcher};
 use crate::gating::stage1_app_origin::{resolve_identity, IdentityMatch};
 use crate::gating::stage2_whitelist::{
-    evaluate_path_rules, match_entity, EntityMatch, EntityMatchKind,
+    evaluate_path_rules, match_entities, EntityMatch, EntityMatchSet,
 };
 use crate::gating::stage3_blacklist;
 use crate::gating::stage4_app_type;
@@ -19,7 +19,9 @@ use crate::heartbeat_telemetry;
 
 #[derive(Debug, Default)]
 struct DiscoveryCounters {
-    date: String,
+    /// Day number (from `NaiveDate::num_days_from_ce()`). Avoids the
+    /// `format!` + `String` allocation that a date-string comparison needs.
+    day: i32,
     app_hits: HashMap<String, u32>,
     domain_hits: HashMap<String, u32>,
 }
@@ -33,9 +35,9 @@ enum DiscoveryCounterOutcome {
 
 impl DiscoveryCounters {
     fn reset_if_new_day(&mut self) {
-        let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
-        if self.date != today {
-            self.date = today;
+        let today = Utc::now().date_naive().num_days_from_ce();
+        if self.day != today {
+            self.day = today;
             self.app_hits.clear();
             self.domain_hits.clear();
         }
@@ -315,7 +317,8 @@ impl GateEvaluator {
             );
         }
 
-        let entity_match = match_entity(&self.bundle.entities, host.as_str());
+        let entity_match_set = match_entities(&self.bundle.entities, host.as_str());
+        let entity_match = entity_match_set.best();
         let app_type = stage4_app_type::derive(identity.as_ref());
 
         let discovery_capture = entity_match.is_none()
@@ -360,7 +363,7 @@ impl GateEvaluator {
             };
         }
 
-        if let Some(matched) = entity_match.as_ref() {
+        if let Some(matched) = entity_match {
             if let Some(reason) = evaluate_path_rules(
                 matched,
                 req.path.as_str(),
@@ -476,9 +479,23 @@ impl GateEvaluator {
             },
         );
 
-        let capture_mode =
-            derive_capture_mode(identity.as_ref(), entity_match.as_ref(), discovery_capture);
-        let (matched_provider, matched_application) = classify_entity_match(entity_match.as_ref());
+        let capture_mode = derive_capture_mode(
+            identity.as_ref(),
+            entity_match,
+            entity_match_set.application.as_ref(),
+            discovery_capture,
+        );
+        let (matched_provider, mut matched_application) =
+            classify_entity_match_set(&entity_match_set);
+        // When stage1 identity resolved a specific app by process name that
+        // differs from the host-based entity match, prefer the process identity.
+        // This handles cases like Codex vs ChatGPT sharing chatgpt.com.
+        if let Some(id) = identity.as_ref() {
+            let id_entity = &id.entry.entity_id;
+            if matched_application.as_ref() != Some(id_entity) {
+                matched_application = Some(id_entity.clone());
+            }
+        }
         let traffic_classification = derive_traffic_classification(
             matched_provider.is_some(),
             matched_application.is_some(),
@@ -575,33 +592,19 @@ fn header_value<'a>(headers: &'a soth_core::RequestHeaders, key: &str) -> Option
 }
 
 fn derive_capture_mode(
-    identity: Option<&IdentityMatch>,
-    entity_match: Option<&EntityMatch>,
-    discovery_capture: bool,
+    _identity: Option<&IdentityMatch>,
+    _entity_match: Option<&EntityMatch>,
+    _application_match: Option<&EntityMatch>,
+    _discovery_capture: bool,
 ) -> CaptureMode {
-    let mut mode = identity
-        .map(|matched| matched.entry.capture_mode)
-        .unwrap_or(CaptureMode::MetadataOnly);
-
-    if let Some(matched) = entity_match {
-        mode = matched.capture_mode;
-    }
-
-    if discovery_capture {
-        CaptureMode::MetadataOnly
-    } else {
-        mode
-    }
+    // All traffic goes through the full pipeline unconditionally.
+    CaptureMode::Full
 }
 
-fn classify_entity_match(entity_match: Option<&EntityMatch>) -> (Option<String>, Option<String>) {
-    let Some(matched) = entity_match else {
-        return (None, None);
-    };
-    match matched.kind {
-        EntityMatchKind::Provider => (Some(matched.entity_id.clone()), None),
-        EntityMatchKind::Application => (None, Some(matched.entity_id.clone())),
-    }
+fn classify_entity_match_set(match_set: &EntityMatchSet) -> (Option<String>, Option<String>) {
+    let provider = match_set.provider.as_ref().map(|m| m.entity_id.clone());
+    let application = match_set.application.as_ref().map(|m| m.entity_id.clone());
+    (provider, application)
 }
 
 fn derive_traffic_classification(
@@ -626,7 +629,7 @@ fn outcome_skip(reason: DecisionReason, stage: GateStage, discovery_capture: boo
         decision: GateDecision::Skip,
         reason,
         app_type: AppType::Unknown,
-        capture_mode: CaptureMode::MetadataOnly,
+        capture_mode: CaptureMode::Full,
         matched_provider: None,
         matched_application: None,
         traffic_classification: TrafficClassification::Other,
@@ -644,7 +647,7 @@ fn outcome_passthrough(
         decision: GateDecision::Passthrough,
         reason,
         app_type: AppType::Unknown,
-        capture_mode: CaptureMode::MetadataOnly,
+        capture_mode: CaptureMode::Full,
         matched_provider: None,
         matched_application: None,
         traffic_classification: TrafficClassification::Other,
@@ -661,7 +664,7 @@ fn outcome_block(reason: DecisionReason, stage: GateStage, discovery_capture: bo
         },
         reason,
         app_type: AppType::Unknown,
-        capture_mode: CaptureMode::MetadataOnly,
+        capture_mode: CaptureMode::Full,
         matched_provider: None,
         matched_application: None,
         traffic_classification: TrafficClassification::Other,

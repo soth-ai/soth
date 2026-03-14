@@ -174,27 +174,27 @@ fn load_policy_bundle(assets: &HashMap<String, Vec<u8>>) -> Result<Arc<PolicyBun
 
 fn load_detect_bundle(
     assets: &HashMap<String, Vec<u8>>,
-) -> Result<Arc<soth_detect::OwnedDetectBundle>, BundleError> {
+) -> Result<Arc<soth_core::OwnedDetectBundle>, BundleError> {
     let section = extract_section(assets, "detect/");
     if let Some(bytes) = section.get("bundle.json") {
-        let bundle: soth_detect::OwnedDetectBundle = serde_json::from_slice(bytes.as_slice())
+        let bundle: soth_core::OwnedDetectBundle = serde_json::from_slice(bytes.as_slice())
             .map_err(|error| BundleError::DetectLoadFailed(error.to_string()))?;
         return Ok(Arc::new(bundle));
     }
     if section.is_empty() && !assets.contains_key("detect_bundle.json") {
-        return Ok(Arc::new(soth_detect::OwnedDetectBundle::default()));
+        return Ok(Arc::new(soth_core::OwnedDetectBundle::default()));
     }
     if let Some(bytes) = assets.get("detect_bundle.json") {
-        let bundle: soth_detect::OwnedDetectBundle = serde_json::from_slice(bytes.as_slice())
+        let bundle: soth_core::OwnedDetectBundle = serde_json::from_slice(bytes.as_slice())
             .map_err(|error| BundleError::DetectLoadFailed(error.to_string()))?;
         return Ok(Arc::new(bundle));
     }
-    Ok(Arc::new(soth_detect::OwnedDetectBundle::default()))
+    Ok(Arc::new(soth_core::OwnedDetectBundle::default()))
 }
 
 fn load_gating_bundle(
     assets: &HashMap<String, Vec<u8>>,
-    detect: &soth_detect::OwnedDetectBundle,
+    detect: &soth_core::OwnedDetectBundle,
 ) -> Result<Arc<GatingBundle>, BundleError> {
     let section = extract_section(assets, "gating/");
     if let Some(bytes) = section.get("bundle.json") {
@@ -214,37 +214,111 @@ fn load_gating_bundle(
     Ok(Arc::new(gating_from_detect(detect)))
 }
 
-fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
-    let mut providers_by_id = HashMap::<String, HashSet<String>>::new();
+fn gating_from_detect(detect: &soth_core::OwnedDetectBundle) -> GatingBundle {
+    // Build a host → PathRules lookup from application detection.hosts.
+    // Provider entities from domain_index inherit path rules from matching
+    // application entries (deny_glob, allow, deny_exact).
+    let mut app_paths_by_host: HashMap<String, PathRules> = HashMap::new();
+    for app in detect.applications.values() {
+        // Extract hosts from matching_rules (v3 signal-based).
+        for rule in &app.matching_rules {
+            for signal in &rule.signals {
+                if signal.kind == soth_core::SignalKind::HttpHost && !signal.is_negated {
+                    app_paths_by_host
+                        .entry(signal.pattern.clone())
+                        .or_insert_with(PathRules::default);
+                }
+            }
+        }
+        // Also extract from legacy detection.hosts (v2).
+        if let Some(hosts_array) = app
+            .detection
+            .as_ref()
+            .and_then(|d| d.get("hosts"))
+            .and_then(|v| v.as_array())
+        {
+            for host_rule in hosts_array {
+                if let Some(pattern) = host_rule.get("pattern").and_then(|v| v.as_str()) {
+                    if let Some(paths_val) = host_rule.get("paths") {
+                        if let Ok(paths) = serde_json::from_value::<PathRules>(paths_val.clone()) {
+                            app_paths_by_host
+                                .entry(pattern.to_string())
+                                .and_modify(|existing| {
+                                    existing.allow.extend(paths.allow.iter().cloned());
+                                    existing.deny_exact.extend(paths.deny_exact.iter().cloned());
+                                    existing.deny_glob.extend(paths.deny_glob.iter().cloned());
+                                })
+                                .or_insert(paths);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Track (hosts, optional llm_provider entry) per entity_id.
+    let mut providers_by_id =
+        HashMap::<String, (HashSet<String>, Option<&soth_core::ProviderEntry>)>::new();
+
+    // Extract hosts from matching_rules (v3 signal-based) on providers.
+    for (provider_key, entry) in &detect.llm_providers {
+        let provider_id = entry
+            .provider_id
+            .as_deref()
+            .unwrap_or(provider_key.as_str())
+            .to_string();
+        for rule in &entry.matching_rules {
+            for signal in &rule.signals {
+                if signal.kind == soth_core::SignalKind::HttpHost && !signal.is_negated {
+                    if let Some(pattern) = normalize_bundle_host_pattern(&signal.pattern) {
+                        let group = providers_by_id.entry(provider_id.clone()).or_default();
+                        group.0.insert(pattern);
+                        if group.1.is_none() {
+                            group.1 = Some(entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also populate from legacy domain_index (v2).
     for (host, provider_key) in &detect.domain_index {
-        let provider_id = detect
-            .llm_providers
-            .get(provider_key)
+        let llm_entry = detect.llm_providers.get(provider_key);
+        let provider_id = llm_entry
             .and_then(|entry| entry.provider_id.clone())
             .unwrap_or_else(|| provider_key.to_string());
         if let Some(pattern) = normalize_bundle_host_pattern(host) {
-            providers_by_id
-                .entry(provider_id)
-                .or_default()
-                .insert(pattern);
+            let group = providers_by_id.entry(provider_id).or_default();
+            group.0.insert(pattern);
+            if group.1.is_none() {
+                group.1 = llm_entry;
+            }
         }
     }
 
     let providers = providers_by_id
         .into_iter()
-        .map(|(entity_id, hosts)| EntityTrafficRules {
+        .map(|(entity_id, (hosts, llm_entry))| EntityTrafficRules {
             entity_id: entity_id.clone(),
-            capture_mode: detect
-                .capture_rules
-                .mode_for(&soth_detect::Provider::new(entity_id.as_str())),
+            capture_mode: detect.capture_rules.mode_for_with_entry(
+                entity_id.as_str(),
+                llm_entry,
+            ),
             hosts: hosts
                 .into_iter()
                 .filter(|pattern| !pattern.is_empty())
-                .map(|pattern| HostRule {
-                    pattern,
-                    methods: Vec::new(),
-                    paths: PathRules::default(),
-                    priority: None,
+                .map(|pattern| {
+                    let paths = app_paths_by_host
+                        .get(pattern.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    HostRule {
+                        pattern,
+                        methods: Vec::new(),
+                        paths,
+                        priority: None,
+                    }
                 })
                 .collect(),
             api_format: None,
@@ -296,7 +370,8 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
             });
     }
 
-    // Populate identity index from applications[].bundle_ids and process_names.
+    // Populate identity index from applications[].bundle_ids, process_names,
+    // AND matching_rules signals (ProcessBundleId, ProcessName).
     // This ensures that process-based identity resolution (stage1) can match
     // apps by their macOS bundle_id or process_name, not just by app_policies keys.
     for (app_key, app) in &detect.applications {
@@ -332,24 +407,70 @@ fn gating_from_detect(detect: &soth_detect::OwnedDetectBundle) -> GatingBundle {
         for pname in &app.process_names {
             index.entry(pname.to_ascii_lowercase()).or_insert_with(|| entry.clone());
         }
+        // Extract identity signals from matching_rules (v3).
+        for rule in &app.matching_rules {
+            for signal in &rule.signals {
+                if signal.is_negated {
+                    continue;
+                }
+                match &signal.kind {
+                    soth_core::SignalKind::ProcessBundleId => {
+                        index
+                            .entry(signal.pattern.to_ascii_lowercase())
+                            .or_insert_with(|| entry.clone());
+                    }
+                    soth_core::SignalKind::ProcessName => {
+                        index
+                            .entry(signal.pattern.to_ascii_lowercase())
+                            .or_insert_with(|| entry.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
-    let tls_intercept_hosts = detect
+    let mut tls_intercept_hosts = detect
         .domain_index
         .keys()
         .filter_map(|host| normalize_bundle_host_pattern(host))
         .collect::<HashSet<_>>();
+    // Also add HttpHost patterns from provider/app matching_rules.
+    for entry in detect.llm_providers.values() {
+        for rule in &entry.matching_rules {
+            for signal in &rule.signals {
+                if signal.kind == soth_core::SignalKind::HttpHost && !signal.is_negated {
+                    if let Some(pattern) = normalize_bundle_host_pattern(&signal.pattern) {
+                        tls_intercept_hosts.insert(pattern);
+                    }
+                }
+            }
+        }
+    }
+    for entry in detect.applications.values() {
+        for rule in &entry.matching_rules {
+            for signal in &rule.signals {
+                if signal.kind == soth_core::SignalKind::HttpHost && !signal.is_negated {
+                    if let Some(pattern) = normalize_bundle_host_pattern(&signal.pattern) {
+                        tls_intercept_hosts.insert(pattern);
+                    }
+                }
+            }
+        }
+    }
     let passthrough_domains = detect
         .passthrough_domains
         .iter()
         .filter_map(|host| normalize_bundle_host_pattern(host))
         .collect::<HashSet<_>>();
 
-    let allowed_host_origins = detect
+    let mut allowed_host_origins = detect
         .domain_index
         .keys()
         .filter_map(|host| normalize_bundle_host_pattern(host))
         .collect::<HashSet<_>>();
+    // Include HttpHost patterns from matching_rules in allowed origins.
+    allowed_host_origins.extend(tls_intercept_hosts.iter().cloned());
 
     let mut bundle = GatingBundle {
         identity_index: IdentityIndex {
@@ -535,7 +656,7 @@ mod tests {
         let vendor = SigningKey::from_bytes(&[31u8; 32]);
         let policy_bytes = signed_policy_bundle_bytes();
         let detect_bytes =
-            serde_json::to_vec(&soth_detect::OwnedDetectBundle::default()).expect("detect json");
+            serde_json::to_vec(&soth_core::OwnedDetectBundle::default()).expect("detect json");
 
         let assets = HashMap::from([
             ("policy/policy_bundle.json".to_string(), policy_bytes),
@@ -599,7 +720,7 @@ mod tests {
 
     #[test]
     fn detect_fallback_normalizes_passthrough_patterns() {
-        let mut detect = soth_detect::OwnedDetectBundle::default();
+        let mut detect = soth_core::OwnedDetectBundle::default();
         detect
             .passthrough_domains
             .push("^.*\\.manus\\.computer$".to_string());
@@ -615,10 +736,10 @@ mod tests {
 
     #[test]
     fn detect_fallback_uses_app_policy_action_and_capture_fields() {
-        let mut detect = soth_detect::OwnedDetectBundle::default();
+        let mut detect = soth_core::OwnedDetectBundle::default();
         detect.app_policies.insert(
             "cursor".to_string(),
-            soth_detect::AppPolicy {
+            soth_core::AppPolicy {
                 app_id: "cursor".to_string(),
                 display_name: Some("Cursor".to_string()),
                 app_kind: soth_core::AppKind::Ide,

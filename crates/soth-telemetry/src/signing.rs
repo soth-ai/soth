@@ -20,6 +20,14 @@ pub fn signing_message(batch: &TelemetryBatch) -> Vec<u8> {
     for event_id in event_ids {
         msg.extend_from_slice(event_id.as_bytes());
     }
+    // Include observation record IDs in the signed message
+    if let Some(ref observations) = batch.observation_records {
+        let mut obs_ids: Vec<Uuid> = observations.iter().map(|r| r.event.event_id).collect();
+        obs_ids.sort_unstable();
+        for obs_id in obs_ids {
+            msg.extend_from_slice(obs_id.as_bytes());
+        }
+    }
     msg
 }
 
@@ -93,6 +101,7 @@ mod tests {
                 .collect(),
             event_count: ids.len() as u32,
             timestamp_utc: 1_700_000_000,
+            observation_records: None,
         }
     }
 
@@ -151,6 +160,7 @@ mod tests {
             events: Vec::new(),
             event_count: 0,
             timestamp_utc: 0,
+            observation_records: None,
         };
         let result = build_signed_batch(batch, &key);
         assert!(matches!(result, Err(SigningError::EmptyBatch)));

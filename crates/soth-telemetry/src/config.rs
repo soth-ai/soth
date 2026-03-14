@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -18,6 +19,13 @@ pub struct TelemetryConfig {
     pub proxy_version: String,
     pub bundle_version: String,
     pub org_id: String,
+    /// Directory containing extension observation queue files (*.obs.queue).
+    /// When set, the batcher drains these files at flush time.
+    pub observation_queue_dir: Option<PathBuf>,
+    /// Directory containing governance queue files (*.queue) written by
+    /// extensions like historian. Drained at flush time and converted to
+    /// TelemetryEvents via `TelemetryEvent::from_governable`.
+    pub governance_queue_dir: Option<PathBuf>,
 }
 
 impl TelemetryConfig {

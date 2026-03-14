@@ -43,13 +43,18 @@ pub fn read_sessions_jsonl<'a>(
 
             match parse_jsonl_file(&path, playbook, since) {
                 Ok(Some(session)) => {
+                    debug!(
+                        path = %path.display(),
+                        messages = session.messages.len(),
+                        "parsed session"
+                    );
                     if let Some(mt) = file_mtime {
                         latest_mtime = Some(latest_mtime.map_or(mt, |prev: i64| prev.max(mt)));
                     }
                     yield session;
                 }
                 Ok(None) => {
-                    debug!(path = %path.display(), "no usable messages, skipping");
+                    debug!(path = %path.display(), "no text messages found, skipping");
                 }
                 Err(e) => {
                     warn!(path = %path.display(), err = %e, "reader error, skipping file");
@@ -98,6 +103,12 @@ fn parse_jsonl_file(
     let mut min_ts: Option<i64> = None;
     let mut max_ts: Option<i64> = None;
 
+    let total_lines = content.lines().count();
+    let mut json_ok: u32 = 0;
+    let mut filter_pass: u32 = 0;
+    let mut role_pass: u32 = 0;
+    let mut content_pass: u32 = 0;
+
     for (line_num, raw) in content.lines().enumerate() {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -116,6 +127,7 @@ fn parse_jsonl_file(
                 continue;
             }
         };
+        json_ok += 1;
 
         // Check for metadata line (session_id extraction).
         if let SessionIdConfig::MetaLine {
@@ -138,18 +150,21 @@ fn parse_jsonl_file(
         if !passes_filters(&parsed, &extraction.records.filters) {
             continue;
         }
+        filter_pass += 1;
 
         // Extract role.
         let role = match extract_role(&parsed, &extraction.role) {
             Some(r) => r,
             None => continue,
         };
+        role_pass += 1;
 
         // Extract content.
         let text = match extract_content(&parsed, &extraction.content) {
             Some(t) => t,
             None => continue,
         };
+        content_pass += 1;
 
         // Extract timestamp.
         let ts = parse_timestamp(&parsed, &extraction.timestamp.field, &extraction.timestamp.format);
@@ -177,6 +192,15 @@ fn parse_jsonl_file(
     }
 
     if messages.is_empty() {
+        debug!(
+            path = %path.display(),
+            total_lines,
+            json_ok,
+            filter_pass,
+            role_pass,
+            content_pass,
+            "parse_jsonl_file breakdown"
+        );
         return Ok(None);
     }
 
@@ -277,7 +301,7 @@ mod tests {
             discovery: PlaybookDiscovery {
                 roots: vec!["${HOME}/.claude/projects".into()],
                 detect: PlaybookDetect::GlobExists { pattern: "**/*.jsonl".into() },
-                exclude_dirs: vec!["memory".into()],
+                exclude_dirs: vec!["memory".into(), "subagents".into()],
                 exclude_file_patterns: vec![],
             },
             source: PlaybookSource::JsonlFiles {
@@ -394,6 +418,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_code_realistic_session_with_extra_types() {
+        // Realistic session with file-history-snapshot, progress, queue-operation
+        // lines mixed in — must still extract user/assistant text messages.
+        let tmp = TempDir::new().unwrap();
+        let jsonl = r#"{"type":"file-history-snapshot","messageId":"m1","snapshot":{}}
+{"parentUuid":null,"isSidechain":false,"userType":"external","cwd":"/tmp","sessionId":"sess-1","version":"2.1.56","type":"user","message":{"role":"user","content":"fix the auth bug"},"uuid":"u1","timestamp":"2026-01-01T00:00:01.000Z"}
+{"parentUuid":"u1","isSidechain":false,"userType":"external","cwd":"/tmp","sessionId":"sess-1","version":"2.1.56","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll fix the auth bug now."}]},"uuid":"u2","timestamp":"2026-01-01T00:00:02.000Z"}
+{"type":"progress","data":{"status":"running"},"timestamp":"2026-01-01T00:00:03.000Z"}
+{"parentUuid":"u2","isSidechain":false,"userType":"external","cwd":"/tmp","sessionId":"sess-1","version":"2.1.56","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tid-1","name":"Read","input":{"file":"auth.rs"}}]},"uuid":"u3","timestamp":"2026-01-01T00:00:04.000Z"}
+{"parentUuid":"u3","isSidechain":false,"userType":"external","cwd":"/tmp","sessionId":"sess-1","version":"2.1.56","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tid-1","content":"fn auth() {}"}]},"uuid":"u4","timestamp":"2026-01-01T00:00:05.000Z"}
+{"type":"queue-operation","data":{"op":"flush"},"timestamp":"2026-01-01T00:00:06.000Z"}
+{"parentUuid":"u4","isSidechain":false,"userType":"external","cwd":"/tmp","sessionId":"sess-1","version":"2.1.56","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Fixed. The auth now validates tokens."}]},"uuid":"u5","timestamp":"2026-01-01T00:00:07.000Z"}"#;
+        write_file(tmp.path(), "sess-1.jsonl", jsonl);
+
+        let pb = claude_code_playbook();
+        let cursor = Mutex::new(None);
+        let mut stream = read_sessions_jsonl(&pb, tmp.path(), None, &cursor);
+
+        let session = stream.next().await.unwrap().unwrap();
+        assert_eq!(session.session_id, "sess-1");
+        // 3 messages: user prompt + 2 assistant text blocks
+        // Skipped: file-history-snapshot, progress, queue-operation, tool_use, tool_result
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[0].role, "user");
+        assert_eq!(session.messages[0].content, "fix the auth bug");
+        assert_eq!(session.messages[1].role, "assistant");
+        assert!(session.messages[1].content.contains("auth bug"));
+        assert_eq!(session.messages[2].role, "assistant");
+        assert!(session.messages[2].content.contains("validates tokens"));
+    }
+
+    #[tokio::test]
     async fn codex_playbook_reads_session() {
         let tmp = TempDir::new().unwrap();
         let jsonl = r#"{"timestamp":"2025-11-30T07:23:26.312Z","type":"session_meta","payload":{"id":"codex-session-1"}}
@@ -466,6 +522,77 @@ mod tests {
         let c = cursor.lock().unwrap();
         assert!(c.is_some());
         assert!(matches!(c.as_ref().unwrap(), Cursor::FileMtime { .. }));
+    }
+
+    #[tokio::test]
+    async fn mixed_tool_calls_extracts_text_only() {
+        // Sessions with tool_use/tool_result exchanges interleaved with text
+        // should extract only the natural language messages.
+        let tmp = TempDir::new().unwrap();
+        let jsonl = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tid-1","content":"file contents here"}]},"timestamp":"2026-01-01T00:00:01.000Z"}
+{"type":"user","message":{"role":"user","content":"Your task is to refactor the auth module"},"timestamp":"2026-01-01T00:00:02.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","text":"let me analyze"}]},"timestamp":"2026-01-01T00:00:03.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll refactor the auth module to use middleware."}]},"timestamp":"2026-01-01T00:00:04.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tid-2","name":"Edit","input":{"file":"auth.rs"}}]},"timestamp":"2026-01-01T00:00:05.000Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tid-2","content":"edit applied"}]},"timestamp":"2026-01-01T00:00:06.000Z"}
+{"type":"progress","data":{"status":"running"},"timestamp":"2026-01-01T00:00:07.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done. The auth module now uses middleware."}]},"timestamp":"2026-01-01T00:00:08.000Z"}"#;
+        write_file(tmp.path(), "session-abc/agent-a1234.jsonl", jsonl);
+
+        let pb = claude_code_playbook();
+        let cursor = Mutex::new(None);
+        let mut stream = read_sessions_jsonl(&pb, tmp.path(), None, &cursor);
+
+        let session = stream.next().await.unwrap().unwrap();
+        assert_eq!(session.session_id, "agent-a1234");
+        // Should extract: user prompt (string), 2 assistant text blocks
+        // Should skip: tool_result (user), thinking (assistant), tool_use (assistant), progress
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[0].role, "user");
+        assert_eq!(session.messages[0].content, "Your task is to refactor the auth module");
+        assert_eq!(session.messages[1].role, "assistant");
+        assert!(session.messages[1].content.contains("middleware"));
+        assert_eq!(session.messages[2].role, "assistant");
+        assert!(session.messages[2].content.contains("Done"));
+    }
+
+    #[tokio::test]
+    async fn excludes_subagents_dir() {
+        // Subagent files are AI-to-AI conversations that duplicate content
+        // already captured in the parent session — they should be excluded.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "subagents/agent-a1234.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"delegated task"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
+        write_file(tmp.path(), "session.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"real user msg"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
+
+        let pb = claude_code_playbook();
+        let cursor = Mutex::new(None);
+        let mut stream = read_sessions_jsonl(&pb, tmp.path(), None, &cursor);
+
+        let session = stream.next().await.unwrap().unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "real user msg");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn all_tool_calls_file_skipped() {
+        // A file with ONLY tool_use/tool_result exchanges and no text
+        // should produce Ok(None) — legitimately no usable messages.
+        let tmp = TempDir::new().unwrap();
+        let jsonl = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tid-1","content":"file contents"}]},"timestamp":"2026-01-01T00:00:01.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tid-2","name":"Read","input":{"file":"main.rs"}}]},"timestamp":"2026-01-01T00:00:02.000Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tid-2","content":"fn main() {}"}]},"timestamp":"2026-01-01T00:00:03.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tid-3","name":"Edit","input":{"file":"main.rs"}}]},"timestamp":"2026-01-01T00:00:04.000Z"}"#;
+        write_file(tmp.path(), "session-abc.jsonl", jsonl);
+
+        let pb = claude_code_playbook();
+        let cursor = Mutex::new(None);
+        let mut stream = read_sessions_jsonl(&pb, tmp.path(), None, &cursor);
+
+        // No text content at all — file is legitimately skipped.
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

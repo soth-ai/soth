@@ -18,6 +18,7 @@ pub(crate) struct EmbedOutput {
     pub vector: Option<Vec<f32>>,
     pub norm: f32,
     pub latency_us: u64,
+    #[allow(dead_code)] // read in tests
     pub skipped_reason: Option<EmbedSkipReason>,
 }
 

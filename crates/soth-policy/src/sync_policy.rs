@@ -1680,7 +1680,7 @@ mod tests {
             estimated_cost_usd: 0.04,
             parse_source: ParseSource::GraphQl,
             canonical_cache_key: String::new(),
-            format_metadata: FormatMetadata::Unknown,
+            format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
@@ -1695,6 +1695,8 @@ mod tests {
                 app_type: AppType::Unknown,
                 capture_mode: None,
                 process_name: None,
+                matched_app_id: None,
+                ..Default::default()
             },
             capture_mode: CaptureMode::MetadataOnly,
             traffic_classification: TrafficClassification::ToolUsage,
@@ -1722,6 +1724,8 @@ mod tests {
             kind,
             severity,
             location: ArtifactLocation::Unknown,
+            commitment: None,
+            redacted_hint: None,
         }
     }
 
@@ -2335,6 +2339,8 @@ mod tests {
                     kind: artifact_pool[rng.gen_range(0..artifact_pool.len())].clone(),
                     severity: severity_pool[rng.gen_range(0..severity_pool.len())],
                     location: ArtifactLocation::Unknown,
+                    commitment: None,
+                    redacted_hint: None,
                 });
             }
 

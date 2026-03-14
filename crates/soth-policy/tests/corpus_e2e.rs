@@ -337,7 +337,7 @@ fn default_request() -> NormalizedRequest {
         estimated_cost_usd: 0.05,
         parse_source: ParseSource::GraphQl,
         canonical_cache_key: "cache-key".to_string(),
-        format_metadata: FormatMetadata::Unknown,
+        format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
@@ -355,6 +355,8 @@ fn build_artifacts(input: &[ArtifactInput]) -> Vec<SensitiveArtifact> {
                 kind: kind.clone(),
                 severity,
                 location: ArtifactLocation::Unknown,
+                commitment: None,
+                redacted_hint: None,
             });
         }
     }
@@ -444,6 +446,8 @@ fn default_context() -> PolicyContext {
             capture_mode: None,
             process_name: None,
             bundle_id: None,
+            matched_app_id: None,
+            ..Default::default()
         },
         capture_mode: CaptureMode::MetadataOnly,
         traffic_classification: TrafficClassification::ToolUsage,
@@ -718,6 +722,11 @@ fn parse_artifact_kind(value: &ArtifactInput) -> ArtifactKind {
         },
         "auth_logic" => ArtifactKind::AuthLogic,
         "crypto_operation" => ArtifactKind::CryptoOperation,
+        "aws_access_key" => ArtifactKind::AwsAccessKey,
+        "github_pat" => ArtifactKind::GitHubPat,
+        "gitlab_token" => ArtifactKind::GitLabToken,
+        "slack_token" => ArtifactKind::SlackToken,
+        "stripe_secret_key" => ArtifactKind::StripeSecretKey,
         other => panic!("unsupported artifact kind in fixture: {other}"),
     }
 }

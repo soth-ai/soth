@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::db;
+use crate::pending_emit::{self, ClassifyData, PendingEmitStore, ResolvedEmit};
 use crate::session::{Lane, SessionManager};
 
 const DEFAULT_CLASSIFY_MAX_IN_FLIGHT: usize = 8;
@@ -169,6 +170,7 @@ struct DbWriteJob {
     matched_application: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_classify_task(
     connection_id: Uuid,
     detect_result: soth_core::DetectResult,
@@ -185,8 +187,10 @@ pub fn spawn_classify_task(
     policy_block_enforced: Arc<AtomicBool>,
     session_store: Arc<SessionManager>,
     telemetry: Option<Arc<soth_telemetry::TelemetryPipeline>>,
+    observer_broadcast: Option<soth_core::ObserverBroadcast>,
     runtime: Arc<Runtime>,
     lane: Lane,
+    pending_emit_store: Option<Arc<PendingEmitStore>>,
 ) -> oneshot::Receiver<soth_core::PolicyDecisionKind> {
     let (tx, rx) = oneshot::channel();
 
@@ -232,6 +236,9 @@ pub fn spawn_classify_task(
                             error = %error,
                             "code-context-repeat classification worker failed"
                         );
+                        if let Some(ref store) = pending_emit_store {
+                            store.remove(&connection_id);
+                        }
                         return;
                     }
                 }
@@ -245,8 +252,27 @@ pub fn spawn_classify_task(
                 &detect_result.normalized,
             );
 
-            if let Some(pipeline) = telemetry {
-                pipeline.push(result.telemetry_event.clone());
+            if should_emit_telemetry(&result.telemetry_event) {
+                let classify_data = ClassifyData {
+                    telemetry_event: result.telemetry_event.clone(),
+                    anomaly_score: result.anomaly_score,
+                    anomaly_flags: result.anomaly_flags.clone(),
+                    policy_decision_kind: Some(result.policy_decision.kind.clone()),
+                    capture_mode,
+                };
+
+                if let Some(ref store) = pending_emit_store {
+                    if let Some(resolved) = store.deposit_classify(connection_id, classify_data) {
+                        merge_and_emit(
+                            connection_id,
+                            resolved,
+                            telemetry.as_ref(),
+                            observer_broadcast.as_ref(),
+                        );
+                    }
+                }
+            } else if let Some(ref store) = pending_emit_store {
+                store.remove(&connection_id);
             }
 
             runtime.enqueue_db_write(DbWriteJob {
@@ -269,6 +295,9 @@ pub fn spawn_classify_task(
                     connection_id = %connection_id,
                     "classification slot unavailable; dropping semantic classify task"
                 );
+                if let Some(ref store) = pending_emit_store {
+                    store.remove(&connection_id);
+                }
                 return;
             };
 
@@ -296,6 +325,9 @@ pub fn spawn_classify_task(
                         error = %error,
                         "classification worker failed before completion"
                     );
+                    if let Some(ref store) = pending_emit_store {
+                        store.remove(&connection_id);
+                    }
                     return;
                 }
             }
@@ -319,8 +351,27 @@ pub fn spawn_classify_task(
             &detect_result.normalized,
         );
 
-        if let Some(pipeline) = telemetry {
-            pipeline.push(result.telemetry_event.clone());
+        if should_emit_telemetry(&result.telemetry_event) {
+            let classify_data = ClassifyData {
+                telemetry_event: result.telemetry_event.clone(),
+                anomaly_score: result.anomaly_score,
+                anomaly_flags: result.anomaly_flags.clone(),
+                policy_decision_kind: Some(result.policy_decision.kind.clone()),
+                capture_mode,
+            };
+
+            if let Some(ref store) = pending_emit_store {
+                if let Some(resolved) = store.deposit_classify(connection_id, classify_data) {
+                    merge_and_emit(
+                        connection_id,
+                        resolved,
+                        telemetry.as_ref(),
+                        observer_broadcast.as_ref(),
+                    );
+                }
+            }
+        } else if let Some(ref store) = pending_emit_store {
+            store.remove(&connection_id);
         }
 
         runtime.enqueue_db_write(DbWriteJob {
@@ -336,6 +387,99 @@ pub fn spawn_classify_task(
     });
 
     rx
+}
+
+/// Merge response + session data into the telemetry event and push to pipeline.
+/// Called by both classify_task (when classify arrives second) and handler
+/// (when response arrives second).
+pub fn merge_and_emit(
+    connection_id: Uuid,
+    resolved: ResolvedEmit,
+    telemetry: Option<&Arc<soth_telemetry::TelemetryPipeline>>,
+    observer_broadcast: Option<&soth_core::ObserverBroadcast>,
+) {
+    let Some(classify_data) = resolved.classify_data else {
+        return;
+    };
+    let mut event = classify_data.telemetry_event;
+
+    if let Some(ref response) = resolved.response_data {
+        pending_emit::apply_response_to_event(
+            &mut event,
+            response,
+            resolved.session_request_count,
+            resolved.session_total_tokens,
+            resolved.session_credential_alerts,
+            resolved.conversation_turn,
+        );
+    }
+
+    debug!(
+        connection_id = %connection_id,
+        actual_output_tokens = event.actual_output_tokens,
+        response_latency_ms = event.response_latency_ms,
+        ttfb_ms = event.ttfb_ms,
+        "merged telemetry event with response data"
+    );
+
+    if let Some(pipeline) = telemetry {
+        pipeline.push(event.clone());
+    }
+    if let Some(broadcast) = observer_broadcast {
+        let pre = soth_core::PreEmitEvent::from_telemetry_event(
+            &event,
+            classify_data.anomaly_score,
+            &classify_data.anomaly_flags,
+            classify_data.policy_decision_kind,
+            classify_data.capture_mode,
+        );
+        broadcast(&pre);
+    }
+}
+
+/// Decide whether a telemetry event should be pushed to the cloud pipeline.
+///
+/// Heuristic-parsed events where both provider and model are unknown are
+/// likely non-AI requests that the proxy intercepted on a cataloged AI domain
+/// but couldn't fingerprint. These add noise to analytics without providing
+/// actionable data. We still write them to the local DB for audit/debugging.
+///
+/// Events are emitted when ANY of these are true:
+/// - Parse confidence is Full or Partial (format was recognized)
+/// - Provider is known (not Unknown)
+/// - Model was extracted (even heuristically, e.g. from $.model in body)
+/// - A policy block/alert was triggered (always important)
+fn should_emit_telemetry(event: &soth_core::TelemetryEvent) -> bool {
+    // Always emit events with known provider
+    if event.provider != soth_core::DetectedProvider::Unknown {
+        return true;
+    }
+
+    // Always emit events where a model was extracted
+    if event.model.is_some() {
+        return true;
+    }
+
+    // Always emit events with non-heuristic parse confidence
+    if event.parse_confidence != soth_core::ParseConfidence::Heuristic {
+        return true;
+    }
+
+    // Always emit policy block/alert events
+    if let Some(ref kind) = event.policy_kind {
+        if matches!(
+            kind,
+            soth_core::TelemetryPolicyKind::Block | soth_core::TelemetryPolicyKind::Flag
+        ) {
+            return true;
+        }
+    }
+
+    debug!(
+        event_id = %event.event_id,
+        "suppressing unidentified heuristic telemetry event from cloud push"
+    );
+    false
 }
 
 fn fast_block_decision(

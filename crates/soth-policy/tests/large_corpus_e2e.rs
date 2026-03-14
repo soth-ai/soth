@@ -238,6 +238,8 @@ fn case_inputs(idx: usize) -> (NormalizedRequest, Vec<SensitiveArtifact>, Policy
             kind: ArtifactKind::PrivateKey,
             severity: ArtifactSeverity::Critical,
             location: ArtifactLocation::SystemPrompt { char_offset: 0 },
+            commitment: None,
+            redacted_hint: None,
         });
     } else if idx % 5 == 0 {
         artifacts.push(SensitiveArtifact {
@@ -249,6 +251,8 @@ fn case_inputs(idx: usize) -> (NormalizedRequest, Vec<SensitiveArtifact>, Policy
                 turn: 0,
                 char_offset: 0,
             },
+            commitment: None,
+            redacted_hint: None,
         });
     }
 
@@ -398,7 +402,7 @@ fn default_request() -> NormalizedRequest {
             provider: DetectedProvider::OpenAi,
         },
         canonical_cache_key: "cache-key".to_string(),
-        format_metadata: FormatMetadata::Unknown,
+        format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
@@ -413,6 +417,8 @@ fn default_context() -> PolicyContext {
             capture_mode: Some(CaptureMode::MetadataOnly),
             process_name: Some("cursor".to_string()),
             bundle_id: Some("com.todesktop.230313mzl4w4u92".to_string()),
+            matched_app_id: None,
+            ..Default::default()
         },
         capture_mode: CaptureMode::MetadataOnly,
         traffic_classification: TrafficClassification::ToolUsage,

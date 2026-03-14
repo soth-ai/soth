@@ -28,6 +28,10 @@ struct ProxyStatusJson {
     autostart: String,
     #[serde(skip_serializing)]
     ca_valid_until: Option<String>,
+    /// CA SSL trust status: "trusted", "untrusted", or "unknown".
+    ca_trust: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ca_trust_detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,8 +94,10 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<bool> {
     let last_24h = collect_last_24h(&conn, now)?;
     let runtime_degraded = proxy_runtime_degraded(&proxy);
 
+    let ca_trusted = proxy.ca_trust == "trusted";
     let healthy = proxy.running
         && proxy.ca_valid_until.is_some()
+        && ca_trusted
         && !runtime_degraded
         && (!config.cloud.enabled || sync.failed == 0);
 
@@ -159,6 +165,22 @@ fn render_human(status: &StatusJson) {
             .map(|value| format!("valid until {value}"))
             .unwrap_or_else(|| "missing/invalid".to_string())
     );
+    println!(
+        "CA trust:      {}",
+        match status.proxy.ca_trust.as_str() {
+            "trusted" => "trusted (SSL verified)".to_string(),
+            "untrusted" => format!(
+                "UNTRUSTED — browsers will reject proxy certs{}",
+                status
+                    .proxy
+                    .ca_trust_detail
+                    .as_deref()
+                    .map(|d| format!(". {d}"))
+                    .unwrap_or_default()
+            ),
+            _ => "unknown".to_string(),
+        }
+    );
     if let Some(source) = status.proxy.bundle_runtime_source.as_deref() {
         println!("Bundle mode:   {}", runtime_source_label(source));
     }
@@ -218,7 +240,24 @@ fn render_human(status: &StatusJson) {
     if status.healthy {
         style::success("healthy");
     } else {
-        style::warning("degraded");
+        let mut reasons = Vec::new();
+        if !status.proxy.running {
+            reasons.push("proxy not running");
+        }
+        if status.proxy.ca_valid_until.is_none() {
+            reasons.push("CA cert missing/invalid");
+        }
+        if status.proxy.ca_trust == "untrusted" {
+            reasons.push("CA not trusted for SSL");
+        }
+        if proxy_runtime_degraded(&status.proxy) {
+            reasons.push("bundle runtime degraded");
+        }
+        if reasons.is_empty() {
+            style::warning("degraded");
+        } else {
+            style::warning(&format!("degraded ({})", reasons.join(", ")));
+        }
     }
 }
 
@@ -243,8 +282,17 @@ fn collect_proxy_status(
         });
     let system_proxy_on = system_proxy_state_path().exists();
     let autostart = super::autostart::managed_status().unwrap_or_else(|_| "unknown".to_string());
-    let cert_path = cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()));
-    let ca_valid_until = parse_cert_not_after(cert_path.as_path()).ok();
+    let ca_paths = super::ca_health::resolve_ca_paths(config);
+    let cert_path = ca_paths.trust_cert_path.clone();
+    let ca_valid_until = parse_cert_not_after(ca_paths.runtime_cert_path.as_path()).ok();
+    let (ca_trust, ca_trust_detail) = if cert_path.exists() {
+        match super::ca_health::check_os_trust(cert_path.as_path()) {
+            Ok(check) => (check.status.as_str().to_string(), Some(check.detail)),
+            Err(_) => ("unknown".to_string(), None),
+        }
+    } else {
+        ("unknown".to_string(), Some("CA cert not found".to_string()))
+    };
     let runtime_state = read_runtime_bundle_state();
     let bundle_runtime_source = runtime_state
         .as_ref()
@@ -261,6 +309,8 @@ fn collect_proxy_status(
         system_proxy_on,
         autostart,
         ca_valid_until,
+        ca_trust,
+        ca_trust_detail,
     })
 }
 

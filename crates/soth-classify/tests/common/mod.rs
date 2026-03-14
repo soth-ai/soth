@@ -29,7 +29,7 @@ pub fn make_detect_result() -> soth_core::DetectResult {
                 provider: soth_core::DetectedProvider::OpenAi,
             },
             canonical_cache_key: "cache-key".to_string(),
-            format_metadata: soth_core::FormatMetadata::Unknown,
+            format_metadata: soth_core::FormatMetadata::Unknown { method: String::new(), path: String::new() },
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
@@ -70,6 +70,8 @@ pub fn make_proxy_ctx(
             capture_mode: Some(soth_core::CaptureMode::MetadataOnly),
             process_name: None,
             bundle_id: None,
+            matched_app_id: None,
+            ..Default::default()
         },
         capture_mode: soth_core::CaptureMode::MetadataOnly,
         matched_provider: Some("openai".to_string()),

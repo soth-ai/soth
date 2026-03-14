@@ -10,19 +10,29 @@ use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
-use soth_extensions::ExtensionHandle;
+use soth_extensions::TelemetryQueueWriter;
 
 use crate::dedup::DedupChecker;
 use crate::reader::FormatReader;
 use crate::session::reconstruct_event;
 use crate::types::{AiTool, DiscoveredTool};
 
+/// Default policy decision for historian events — always Allow.
+fn allow_decision() -> soth_core::PolicyDecision {
+    soth_core::PolicyDecision {
+        kind: soth_core::PolicyDecisionKind::Allow,
+        matched_rule: None,
+        warnings: Vec::new(),
+        eval_latency_us: 0,
+    }
+}
+
 /// File-watch engine that detects new conversation data and emits events.
 pub struct WatchEngine {
     readers: Vec<Box<dyn FormatReader>>,
     tools: Vec<DiscoveredTool>,
     dedup: Arc<DedupChecker>,
-    handle: ExtensionHandle,
+    writer: TelemetryQueueWriter,
     debounce: Duration,
     stats: WatchStats,
 }
@@ -53,13 +63,13 @@ impl WatchEngine {
         readers: Vec<Box<dyn FormatReader>>,
         tools: Vec<DiscoveredTool>,
         dedup: Arc<DedupChecker>,
-        handle: ExtensionHandle,
+        writer: TelemetryQueueWriter,
     ) -> Self {
         Self {
             readers,
             tools,
             dedup,
-            handle,
+            writer,
             debounce: Duration::from_secs(2),
             stats: WatchStats::default(),
         }
@@ -206,7 +216,7 @@ impl WatchEngine {
                     continue;
                 }
 
-                match self.handle.submit(event.clone()).await {
+                match self.writer.enqueue(&event, &allow_decision()) {
                     Ok(()) => {
                         self.stats.events_emitted.fetch_add(1, Ordering::Relaxed);
                         if let Err(e) = self.dedup.mark_processed_with_semantic(
@@ -222,7 +232,7 @@ impl WatchEngine {
                     }
                     Err(e) => {
                         self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(err = %e, "failed to submit event from watch");
+                        warn!(err = %e, "failed to enqueue event from watch");
                     }
                 }
             }

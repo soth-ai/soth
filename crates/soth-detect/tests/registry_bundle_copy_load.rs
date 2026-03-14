@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use soth_core::{CaptureMode, ConnectionMeta, ParseConfidence, ParseSource, SocketFamily};
-use soth_detect::{build_registry, process_with_registry, OwnedDetectBundle, RawRequest};
+use soth_core::OwnedDetectBundle;
+use soth_detect::{build_registry, process_with_registry, RawRequest};
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;

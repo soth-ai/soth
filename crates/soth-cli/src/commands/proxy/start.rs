@@ -14,8 +14,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const LISTENER_STARTUP_TIMEOUT_SECS: u64 = 20;
-const LISTENER_HEALTH_CHECK_INTERVAL_MS: u64 = 250;
-const LISTENER_HEALTH_FAILURE_WINDOW_MS: u64 = 5_000;
+const LISTENER_HEALTH_CHECK_INTERVAL_MS: u64 = 1_000;
+const LISTENER_HEALTH_FAILURE_WINDOW_MS: u64 = 30_000;
+const MAX_RESTART_ATTEMPTS: u32 = 10;
+const RESTART_BACKOFF_BASE_MS: u64 = 1_000;
+const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
 const DEFAULT_NOFILE_MIN_SOFT_LIMIT: u64 = 8_192;
 const DEFAULT_NOFILE_WARN_SOFT_LIMIT: u64 = 2_048;
 const AGENT_INSTANCE_ID_TAG: &str = "agent_instance_id";
@@ -60,15 +63,14 @@ pub async fn run(
         .context("spawn soth-proxy process")?;
     wait_for_listener_start(&mut child, expected_port).await?;
 
-    if foreground {
-        if !quiet {
+    if !quiet {
+        if foreground {
             style::success("Proxy started in foreground mode.");
             style::info("Press Ctrl+C to stop.");
         }
-        return wait_with_ctrl_c(&mut child, expected_port).await;
     }
 
-    wait_as_daemon_child(&mut child, expected_port).await
+    supervise_proxy(&mut child, generated_path.as_path(), expected_port, foreground).await
 }
 
 fn ensure_ca_runtime_health(paths: &super::ca_health::ResolvedCaPaths, quiet: bool) -> Result<()> {
@@ -154,76 +156,136 @@ async fn spawn_proxy_process(config_path: &Path) -> Result<Child> {
         .map_err(|error| anyhow::anyhow!("failed launching soth-proxy: {error}"))
 }
 
-async fn wait_with_ctrl_c(child: &mut Child, expected_port: u16) -> Result<()> {
-    let health_monitor = monitor_listener_health(expected_port);
-    tokio::pin!(health_monitor);
-    tokio::select! {
-        status = child.wait() => {
-            let status = status.context("failed waiting for soth-proxy process")?;
-            if status.success() {
-                Ok(())
-            } else {
-                anyhow::bail!("soth-proxy exited with status {status}");
+/// Supervise the proxy child process with auto-restart on failure.
+///
+/// The proxy is a system-level component — if it dies, all network traffic
+/// routed through it stops working.  Instead of bailing on failure, we
+/// kill the unhealthy child and respawn it, with exponential backoff up to
+/// [`MAX_RESTART_ATTEMPTS`] consecutive failures.  The restart counter
+/// resets every time the proxy runs healthily for at least 60 seconds.
+async fn supervise_proxy(
+    child: &mut Child,
+    config_path: &Path,
+    expected_port: u16,
+    foreground: bool,
+) -> Result<()> {
+    let mut consecutive_failures: u32 = 0;
+    let mut last_healthy = Instant::now();
+
+    loop {
+        let exit_reason = wait_until_exit_or_unhealthy(child, expected_port, foreground).await;
+        match exit_reason {
+            ProxyExit::Signal => {
+                terminate_child(child).await?;
+                return Ok(());
+            }
+            ProxyExit::ChildExited(status) if status.success() => {
+                return Ok(());
+            }
+            ProxyExit::ChildExited(status) => {
+                warn!("soth-proxy exited with status {status}");
+            }
+            ProxyExit::Unhealthy => {
+                warn!(
+                    port = expected_port,
+                    "proxy listener unresponsive for {}s — restarting child process",
+                    LISTENER_HEALTH_FAILURE_WINDOW_MS / 1000
+                );
+                terminate_child(child).await?;
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            terminate_child(child).await?;
-            Ok(())
+
+        // If the proxy was healthy for a sustained period, reset the failure counter.
+        if last_healthy.elapsed() < Duration::from_secs(60) {
+            consecutive_failures += 1;
+        } else {
+            consecutive_failures = 1;
         }
-        health = &mut health_monitor => {
-            terminate_child(child).await?;
-            health
+
+        if consecutive_failures > MAX_RESTART_ATTEMPTS {
+            anyhow::bail!(
+                "soth-proxy failed {} consecutive times — giving up. Check logs for root cause.",
+                MAX_RESTART_ATTEMPTS
+            );
         }
+
+        let backoff_ms = (RESTART_BACKOFF_BASE_MS * 2u64.saturating_pow(consecutive_failures - 1))
+            .min(RESTART_BACKOFF_MAX_MS);
+        warn!(
+            attempt = consecutive_failures,
+            max_attempts = MAX_RESTART_ATTEMPTS,
+            backoff_ms,
+            "restarting soth-proxy in {}ms",
+            backoff_ms
+        );
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
+        *child = spawn_proxy_process(config_path)
+            .await
+            .context("respawn soth-proxy process")?;
+        if let Err(error) = wait_for_listener_start(child, expected_port).await {
+            warn!("proxy failed to start after respawn: {error}");
+            continue;
+        }
+        info!(
+            port = expected_port,
+            attempt = consecutive_failures,
+            "soth-proxy restarted successfully"
+        );
+        last_healthy = Instant::now();
     }
 }
 
-async fn wait_as_daemon_child(child: &mut Child, expected_port: u16) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let health_monitor = monitor_listener_health(expected_port);
-        tokio::pin!(health_monitor);
-        let mut term = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
-        let mut interrupt = signal(SignalKind::interrupt()).context("listen for SIGINT")?;
+enum ProxyExit {
+    Signal,
+    ChildExited(std::process::ExitStatus),
+    Unhealthy,
+}
+
+async fn wait_until_exit_or_unhealthy(
+    child: &mut Child,
+    expected_port: u16,
+    foreground: bool,
+) -> ProxyExit {
+    let health_monitor = monitor_listener_health(expected_port);
+    tokio::pin!(health_monitor);
+
+    if foreground {
         tokio::select! {
             status = child.wait() => {
-                let status = status.context("failed waiting for soth-proxy process")?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    anyhow::bail!("soth-proxy exited with status {status}");
+                ProxyExit::ChildExited(status.unwrap_or_else(|_| {
+                    std::process::ExitStatus::default()
+                }))
+            }
+            _ = tokio::signal::ctrl_c() => ProxyExit::Signal,
+            _ = &mut health_monitor => ProxyExit::Unhealthy,
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).expect("listen for SIGTERM");
+            let mut interrupt = signal(SignalKind::interrupt()).expect("listen for SIGINT");
+            tokio::select! {
+                status = child.wait() => {
+                    ProxyExit::ChildExited(status.unwrap_or_else(|_| {
+                        std::process::ExitStatus::default()
+                    }))
                 }
-            }
-            _ = term.recv() => {
-                terminate_child(child).await?;
-                Ok(())
-            }
-            _ = interrupt.recv() => {
-                terminate_child(child).await?;
-                Ok(())
-            }
-            health = &mut health_monitor => {
-                terminate_child(child).await?;
-                health
+                _ = term.recv() => ProxyExit::Signal,
+                _ = interrupt.recv() => ProxyExit::Signal,
+                _ = &mut health_monitor => ProxyExit::Unhealthy,
             }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let health_monitor = monitor_listener_health(expected_port);
-        tokio::pin!(health_monitor);
-        tokio::select! {
-            status = child.wait() => {
-                let status = status.context("failed waiting for soth-proxy process")?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    anyhow::bail!("soth-proxy exited with status {status}");
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                status = child.wait() => {
+                    ProxyExit::ChildExited(status.unwrap_or_else(|_| {
+                        std::process::ExitStatus::default()
+                    }))
                 }
-            }
-            health = &mut health_monitor => {
-                terminate_child(child).await?;
-                health
+                _ = &mut health_monitor => ProxyExit::Unhealthy,
             }
         }
     }
@@ -267,17 +329,34 @@ async fn monitor_listener_health(port: u16) -> Result<()> {
 
     let mut unhealthy_since: Option<Instant> = None;
     let failure_window = Duration::from_millis(LISTENER_HEALTH_FAILURE_WINDOW_MS);
+    let mut warned = false;
 
     loop {
         interval.tick().await;
         if is_local_listener_ready(port) {
+            if warned {
+                info!(port, "proxy listener recovered — accepting connections again");
+            }
             unhealthy_since = None;
+            warned = false;
             continue;
         }
 
         let now = Instant::now();
         let started_at = unhealthy_since.get_or_insert(now);
-        if now.duration_since(*started_at) >= failure_window {
+        let elapsed = now.duration_since(*started_at);
+
+        if !warned && elapsed >= Duration::from_secs(5) {
+            warn!(
+                port,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "proxy listener not accepting connections — monitoring (will bail after {}s)",
+                LISTENER_HEALTH_FAILURE_WINDOW_MS / 1000
+            );
+            warned = true;
+        }
+
+        if elapsed >= failure_window {
             anyhow::bail!(
                 "proxy listener on 127.0.0.1:{} stopped accepting connections for >= {}ms",
                 port,
@@ -289,7 +368,7 @@ async fn monitor_listener_health(port: u16) -> Result<()> {
 
 fn is_local_listener_ready(port: u16) -> bool {
     let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok()
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
 fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result<PathBuf> {

@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use soth_core::{
     AppType, CaptureMode, ClassificationSource, ConnectionMeta, EndpointType, EventSource,
-    ExtensionContext, ExtensionType, FrameKind, GovernableEvent, NormalizedRequest,
+    ExtensionContext, ExtensionSource, FrameKind, GovernableEvent, NormalizedRequest,
     ParseConfidence, ParseSource, PolicyContext, PolicyDecisionKind, ProcessMatchKind,
     ProcessResolution, ProxyContext, RequestMethod, Session, SessionAppIdentity, SessionKey,
     SessionMutations, SessionSnapshot, SocketFamily, TelemetryEvent, TelemetryPolicyKind,
@@ -33,6 +33,8 @@ fn sample_process_resolution() -> ProcessResolution {
         capture_mode: Some(CaptureMode::SensitiveArtifacts),
         process_name: Some("cursor".to_string()),
         bundle_id: Some("com.cursor.app".to_string()),
+        matched_app_id: None,
+        ..Default::default()
     }
 }
 
@@ -66,6 +68,7 @@ fn sample_normalized_request() -> NormalizedRequest {
         canonical_cache_key: "cache-key".to_string(),
         format_metadata: soth_core::FormatMetadata::JsonRpc {
             method: "tools/call".to_string(),
+            is_batch: false,
         },
         has_structured_output: false,
         has_tool_results: false,
@@ -427,17 +430,17 @@ fn event_source_variants_serialize_correctly() {
     assert_eq!(http["kind"], "http");
 
     let ext = serde_json::to_value(EventSource::Extension {
-        ext_type: ExtensionType::Historian,
+        source: ExtensionSource::Historian,
     })
     .unwrap();
     assert_eq!(ext["kind"], "extension");
-    assert_eq!(ext["ext_type"], "historian");
+    assert_eq!(ext["source"], "historian");
 
     let custom = serde_json::to_value(EventSource::Extension {
-        ext_type: ExtensionType::Custom("my-ext".to_string()),
+        source: ExtensionSource::Custom("my-ext".to_string()),
     })
     .unwrap();
-    assert_eq!(custom["ext_type"]["custom"], "my-ext");
+    assert_eq!(custom["source"]["custom"], "my-ext");
 }
 
 #[test]
@@ -581,4 +584,261 @@ fn telemetry_event_new_fields_serde_roundtrip() {
     assert_eq!(roundtrip.repeated_token_count, 150);
     assert_eq!(roundtrip.first_step_event_id.as_deref(), Some("step-1"));
     assert_eq!(roundtrip.agent_step_number, Some(3));
+}
+
+// ---------------------------------------------------------------------------
+// from_governable artifact-based enrichment
+// ---------------------------------------------------------------------------
+
+#[test]
+fn from_governable_enriches_languages_and_classification_flags() {
+    use soth_core::{
+        ArtifactKind, ArtifactLocation, ArtifactSeverity, ClassificationFlag,
+        ProgrammingLanguage, SensitiveArtifact,
+    };
+
+    let event = GovernableEvent {
+        event_id: Uuid::new_v4(),
+        timestamp_epoch_ms: 1_700_000_000_000,
+        source: EventSource::Extension {
+            source: ExtensionSource::Historian,
+        },
+        provider: soth_core::DetectedProvider::OpenAi,
+        model: Some("gpt-4o".to_string()),
+        endpoint_type: EndpointType::ChatCompletion,
+        normalized: Some(sample_normalized_request()),
+        artifacts: vec![
+            SensitiveArtifact {
+                kind: ArtifactKind::CodeBlock {
+                    language: "rust".to_string(),
+                },
+                severity: ArtifactSeverity::Low,
+                location: ArtifactLocation::UserContent {
+                    turn: 0,
+                    char_offset: 0,
+                },
+                commitment: None,
+                redacted_hint: None,
+            },
+            SensitiveArtifact {
+                kind: ArtifactKind::CodeBlock {
+                    language: "python".to_string(),
+                },
+                severity: ArtifactSeverity::Low,
+                location: ArtifactLocation::UserContent {
+                    turn: 1,
+                    char_offset: 0,
+                },
+                commitment: None,
+                redacted_hint: None,
+            },
+            SensitiveArtifact {
+                kind: ArtifactKind::ApiKey { provider: None },
+                severity: ArtifactSeverity::High,
+                location: ArtifactLocation::UserContent {
+                    turn: 0,
+                    char_offset: 50,
+                },
+                commitment: None,
+                redacted_hint: None,
+            },
+        ],
+        capture_mode: CaptureMode::SensitiveArtifacts,
+        embed_content: None,
+        context: ExtensionContext {
+            extension_name: "historian".to_string(),
+            extension_version: "0.1.0".to_string(),
+            metadata: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("is_historical".to_string(), "true".to_string());
+                m.insert(
+                    "data_source".to_string(),
+                    "historian_claude_code".to_string(),
+                );
+                m
+            },
+        },
+    };
+
+    let telemetry = TelemetryEvent::from_governable(&event, Some(TelemetryPolicyKind::Allow));
+
+    // Languages extracted from code block artifacts
+    assert!(telemetry.languages.contains(&ProgrammingLanguage::Rust));
+    assert!(telemetry.languages.contains(&ProgrammingLanguage::Python));
+    assert_eq!(telemetry.languages.len(), 2);
+
+    // Classification flags from artifacts
+    assert!(telemetry
+        .classification_flags
+        .contains(&ClassificationFlag::CodeDetected));
+    assert!(telemetry
+        .classification_flags
+        .contains(&ClassificationFlag::CredentialDetected));
+
+    // Sensitive code flags from artifacts
+    assert!(telemetry.sensitive_code_flags.credential_pattern_detected);
+    assert!(telemetry.sensitive_code_flags.hardcoded_secret_detected);
+
+    // Code fraction is non-zero (2 code blocks / 42 tokens)
+    assert!(telemetry.code_fraction > 0.0);
+
+    // Historical metadata still mapped
+    assert!(telemetry.is_historical);
+
+    // Token estimates from normalized
+    assert_eq!(telemetry.estimated_input_tokens, Some(42));
+    assert_eq!(telemetry.estimated_cost_usd, Some(0.01));
+    assert_eq!(telemetry.tool_definition_hash, Some("tool-hash".to_string()));
+}
+
+#[test]
+fn from_governable_with_private_key_sets_sensitive_flags() {
+    use soth_core::{ArtifactKind, ArtifactLocation, ArtifactSeverity, SensitiveArtifact};
+
+    let event = GovernableEvent {
+        event_id: Uuid::new_v4(),
+        timestamp_epoch_ms: 1_700_000_000_000,
+        source: EventSource::Http,
+        provider: soth_core::DetectedProvider::Anthropic,
+        model: Some("claude-sonnet-4-6".to_string()),
+        endpoint_type: EndpointType::ChatCompletion,
+        normalized: None,
+        artifacts: vec![SensitiveArtifact {
+            kind: ArtifactKind::PrivateKey,
+            severity: ArtifactSeverity::Critical,
+            location: ArtifactLocation::SystemPrompt { char_offset: 0 },
+            commitment: None,
+            redacted_hint: None,
+        }],
+        capture_mode: CaptureMode::MetadataOnly,
+        embed_content: None,
+        context: ExtensionContext::default(),
+    };
+
+    let telemetry = TelemetryEvent::from_governable(&event, Some(TelemetryPolicyKind::Block));
+
+    assert!(telemetry.sensitive_code_flags.private_key_detected);
+    assert!(telemetry.sensitive_code_flags.hardcoded_secret_detected);
+    assert!(telemetry.sensitive_code_flags.credential_pattern_detected);
+
+    // Block policy sets PolicyTriggered flag
+    assert!(telemetry
+        .classification_flags
+        .contains(&soth_core::ClassificationFlag::PolicyTriggered));
+    // Also CredentialDetected from the private key
+    assert!(telemetry
+        .classification_flags
+        .contains(&soth_core::ClassificationFlag::CredentialDetected));
+}
+
+#[test]
+fn from_governable_without_artifacts_has_empty_enrichment() {
+    let event = GovernableEvent {
+        event_id: Uuid::new_v4(),
+        timestamp_epoch_ms: 1_700_000_000_000,
+        source: EventSource::Http,
+        provider: soth_core::DetectedProvider::Unknown,
+        model: None,
+        endpoint_type: EndpointType::Unknown,
+        normalized: None,
+        artifacts: vec![],
+        capture_mode: CaptureMode::MetadataOnly,
+        embed_content: None,
+        context: ExtensionContext::default(),
+    };
+
+    let telemetry = TelemetryEvent::from_governable(&event, Some(TelemetryPolicyKind::Allow));
+
+    assert!(telemetry.languages.is_empty());
+    assert!(telemetry.classification_flags.is_empty());
+    assert!(!telemetry.sensitive_code_flags.credential_pattern_detected);
+    assert_eq!(telemetry.code_fraction, 0.0);
+}
+
+#[test]
+fn from_governable_reads_classify_metadata() {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "classify.use_case".to_string(),
+        "\"code_generation\"".to_string(),
+    );
+    metadata.insert(
+        "classify.use_case_confidence".to_string(),
+        "0.85".to_string(),
+    );
+    metadata.insert(
+        "classify.volatility_class".to_string(),
+        "\"dynamic\"".to_string(),
+    );
+    metadata.insert(
+        "classify.dynamic_fraction".to_string(),
+        "0.42".to_string(),
+    );
+    metadata.insert(
+        "classify.anomaly_score".to_string(),
+        "0.15".to_string(),
+    );
+    metadata.insert(
+        "classify.complexity_score".to_string(),
+        "3".to_string(),
+    );
+    metadata.insert(
+        "classify.topic_cluster_id".to_string(),
+        "17".to_string(),
+    );
+
+    let event = GovernableEvent {
+        event_id: Uuid::new_v4(),
+        timestamp_epoch_ms: 1_700_000_000_000,
+        source: EventSource::Http,
+        provider: soth_core::DetectedProvider::OpenAi,
+        model: Some("gpt-4o".to_string()),
+        endpoint_type: EndpointType::ChatCompletion,
+        normalized: None,
+        artifacts: vec![],
+        capture_mode: CaptureMode::MetadataOnly,
+        embed_content: None,
+        context: ExtensionContext {
+            extension_name: "historian".to_string(),
+            extension_version: "0.1.0".to_string(),
+            metadata,
+        },
+    };
+
+    let telemetry = TelemetryEvent::from_governable(&event, None);
+
+    assert_eq!(telemetry.use_case, UseCaseLabel::CodeGeneration);
+    assert!((telemetry.use_case_confidence - 0.85).abs() < 0.001);
+    assert_eq!(telemetry.volatility_class, VolatilityClass::Dynamic);
+    assert!((telemetry.dynamic_fraction - 0.42).abs() < 0.001);
+    assert_eq!(telemetry.anomaly_score, Some(0.15));
+    assert_eq!(telemetry.complexity_score, 3);
+    assert_eq!(telemetry.topic_cluster_id, 17);
+}
+
+#[test]
+fn from_governable_without_classify_metadata_uses_defaults() {
+    let event = GovernableEvent {
+        event_id: Uuid::new_v4(),
+        timestamp_epoch_ms: 1_700_000_000_000,
+        source: EventSource::Http,
+        provider: soth_core::DetectedProvider::Unknown,
+        model: None,
+        endpoint_type: EndpointType::Unknown,
+        normalized: None,
+        artifacts: vec![],
+        capture_mode: CaptureMode::MetadataOnly,
+        embed_content: None,
+        context: ExtensionContext::default(),
+    };
+
+    let telemetry = TelemetryEvent::from_governable(&event, None);
+
+    assert_eq!(telemetry.use_case, UseCaseLabel::Unknown);
+    assert_eq!(telemetry.use_case_confidence, 0.0);
+    assert_eq!(telemetry.volatility_class, VolatilityClass::Static);
+    assert_eq!(telemetry.dynamic_fraction, 0.0);
+    assert_eq!(telemetry.anomaly_score, None);
+    assert_eq!(telemetry.complexity_score, 0);
+    assert_eq!(telemetry.topic_cluster_id, 0);
 }

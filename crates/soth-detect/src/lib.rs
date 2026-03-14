@@ -1,41 +1,45 @@
-mod code;
-mod core_output;
+pub mod code;
 mod engine;
 mod fingerprint;
 mod graphql;
 mod grpc;
 mod hash;
 mod heuristic;
-mod identity;
+#[cfg(feature = "intelligence")]
 mod intelligence;
+#[cfg(feature = "intelligence")]
 mod intelligence_store;
 mod jsonrpc;
+#[cfg(feature = "intelligence")]
 mod replay;
 mod rest;
-mod sensitive;
+pub mod sensitive;
 mod stream;
 mod types;
 mod util;
 
 use once_cell::sync::Lazy;
 
-pub use core_output::to_core_detect_result;
-pub use engine::ParserRegistry;
-pub use fingerprint::{classify_request, fingerprint, ClassifyResult};
-pub use identity::resolve_app_identity;
-pub use intelligence::*;
-pub use intelligence_store::IntelligenceStore;
-pub use replay::replay_heuristic_events;
-pub use stream::{
-    finalize_stream_summary, process_chunk_with_bundle, scan_proto_strings, ChunkEvent,
+pub use engine::{
+    map_artifact, map_artifact_kind, map_artifact_location, map_artifact_severity,
+    map_import_category, process, process_with_registry, to_core_detect_result, ParserRegistry,
 };
+pub use fingerprint::{
+    classify_request, classify_request_pair, fingerprint, ClassifyPairResult, ClassifyResult,
+};
+#[cfg(feature = "intelligence")]
+pub use intelligence::*;
+#[cfg(feature = "intelligence")]
+pub use intelligence_store::IntelligenceStore;
+#[cfg(feature = "intelligence")]
+pub use replay::replay_heuristic_events;
+pub use soth_parse::proto::scan_proto_strings;
+pub use stream::{finalize_stream_summary, process_chunk_with_bundle, ChunkEvent};
 pub use types::*;
 
-#[cfg(test)]
-pub use engine::{
-    process, process_with_intelligence, process_with_registry,
-    process_with_registry_and_intelligence,
-};
+#[cfg(feature = "intelligence")]
+pub use engine::{process_with_intelligence, process_with_registry_and_intelligence};
+
 // Re-export soth_core::SessionSnapshot so callers can reference it without
 // directly depending on soth_core for this type.
 pub use soth_core::SessionSnapshot;
@@ -69,48 +73,6 @@ pub fn build_registry(bundle: &DetectBundleSlice<'_>) -> Result<ParserRegistry, 
     Ok(ParserRegistry::new(apq_cache_capacity))
 }
 
-#[cfg(not(test))]
-pub fn process(
-    req: &RawRequest,
-    bundle: &DetectBundleSlice<'_>,
-    snapshot: &soth_core::SessionSnapshot,
-) -> soth_core::DetectResult {
-    to_core_detect_result(&engine::process(req, bundle, snapshot))
-}
-
-#[cfg(not(test))]
-pub fn process_with_intelligence(
-    req: &RawRequest,
-    bundle: &DetectBundleSlice<'_>,
-    snapshot: &soth_core::SessionSnapshot,
-    sink: &dyn IntelligenceSink,
-) -> soth_core::DetectResult {
-    to_core_detect_result(&engine::process_with_intelligence(req, bundle, snapshot, sink))
-}
-
-#[cfg(not(test))]
-pub fn process_with_registry(
-    registry: &ParserRegistry,
-    req: &RawRequest,
-    bundle: &DetectBundleSlice<'_>,
-    snapshot: &soth_core::SessionSnapshot,
-) -> soth_core::DetectResult {
-    to_core_detect_result(&engine::process_with_registry(registry, req, bundle, snapshot))
-}
-
-#[cfg(not(test))]
-pub fn process_with_registry_and_intelligence(
-    registry: &ParserRegistry,
-    req: &RawRequest,
-    bundle: &DetectBundleSlice<'_>,
-    snapshot: &soth_core::SessionSnapshot,
-    sink: &dyn IntelligenceSink,
-) -> soth_core::DetectResult {
-    to_core_detect_result(&engine::process_with_registry_and_intelligence(
-        registry, req, bundle, snapshot, sink,
-    ))
-}
-
 pub fn process_chunk(
     chunk: &StreamChunk,
     state: &mut StreamDetectState,
@@ -126,6 +88,10 @@ pub fn finalize_stream(state: StreamDetectState) -> soth_core::DetectResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soth_core::{
+        CaptureRules, GraphQLOperationRegistry, GraphQLOperationSpec, GrpcServiceRegistry,
+        OwnedDetectBundle, ProviderEntry, RestFormatDescriptor, RestRequestPaths,
+    };
     use bytes::Bytes;
     use std::collections::{BTreeMap, HashMap};
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -145,7 +111,7 @@ mod tests {
         };
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
-        assert!(matches!(out.parse_source, ParseSource::Filtered));
+        assert!(matches!(out.parse_source, soth_core::ParseSource::Filtered));
         assert!(!out.normalized.is_ai_call);
     }
 
@@ -174,8 +140,8 @@ mod tests {
         let right = process(&request_uds, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
 
         assert_eq!(
-            left.normalized.canonical_hash,
-            right.normalized.canonical_hash
+            left.normalized.canonical_cache_key,
+            right.normalized.canonical_cache_key
         );
     }
 
@@ -329,16 +295,13 @@ mod tests {
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Full);
-        assert!(matches!(
-            out.parse_source,
-            ParseSource::JsonRpc { method: Some(_) }
-        ));
+        assert!(matches!(out.parse_source, soth_core::ParseSource::JsonRpc));
         assert_eq!(out.normalized.model.as_deref(), Some("gpt-4o-mini"));
-        if let FormatMeta::JsonRpc { method, is_batch } = &out.normalized.format_meta {
-            assert_eq!(method.as_deref(), Some("chat.completions"));
+        if let soth_core::FormatMetadata::JsonRpc { method, is_batch } = &out.normalized.format_metadata {
+            assert_eq!(method.as_str(), "chat.completions");
             assert!(!is_batch);
         } else {
-            panic!("expected jsonrpc format meta");
+            panic!("expected jsonrpc format metadata");
         }
     }
 
@@ -366,7 +329,7 @@ mod tests {
         };
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
-        assert!(matches!(out.parse_source, ParseSource::GraphQL { .. }));
+        assert!(matches!(out.parse_source, soth_core::ParseSource::GraphQl));
         assert_eq!(out.confidence, ParseConfidence::Full);
     }
 
@@ -418,8 +381,8 @@ mod tests {
         assert_eq!(first.confidence, ParseConfidence::Full);
         assert_eq!(second.confidence, ParseConfidence::Full);
         assert_eq!(
-            first.normalized.canonical_hash,
-            second.normalized.canonical_hash
+            first.normalized.canonical_cache_key,
+            second.normalized.canonical_cache_key
         );
     }
 
@@ -454,19 +417,19 @@ mod tests {
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Full);
-        assert!(matches!(out.parse_source, ParseSource::Grpc { .. }));
+        assert!(matches!(out.parse_source, soth_core::ParseSource::Grpc));
         assert_eq!(
             out.normalized.model.as_deref(),
             Some("projects/demo/models/gemini-1.5-pro")
         );
-        if let FormatMeta::Grpc {
+        if let soth_core::FormatMetadata::Grpc {
             service, method, ..
-        } = &out.normalized.format_meta
+        } = &out.normalized.format_metadata
         {
             assert_eq!(service, "google.cloud.aiplatform.v1.PredictionService");
             assert_eq!(method, "Predict");
         } else {
-            panic!("expected gRPC format meta");
+            panic!("expected gRPC format metadata");
         }
     }
 
@@ -494,14 +457,14 @@ mod tests {
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Heuristic);
-        if let FormatMeta::Grpc {
+        if let soth_core::FormatMetadata::Grpc {
             service, method, ..
-        } = &out.normalized.format_meta
+        } = &out.normalized.format_metadata
         {
             assert_eq!(service, "com.example.UnknownService");
             assert_eq!(method, "Generate");
         } else {
-            panic!("expected gRPC format meta");
+            panic!("expected gRPC format metadata");
         }
     }
 
@@ -658,7 +621,7 @@ mod tests {
         assert!(out
             .artifacts
             .iter()
-            .any(|a| matches!(a.artifact_type, ArtifactType::OpenAIKey)));
+            .any(|a| matches!(a.kind, soth_core::ArtifactKind::ApiKey { provider: Some(soth_core::DetectedProvider::OpenAi) })));
     }
 
     #[test]
@@ -705,13 +668,16 @@ mod tests {
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Heuristic);
-        assert!(matches!(out.parse_source, ParseSource::Heuristic));
-        assert!(out.warnings.iter().any(|w| w.code == "parser_error"));
+        assert!(matches!(out.parse_source, soth_core::ParseSource::Heuristic));
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| matches!(w, soth_core::ParseWarning::PartialBodyParse { .. })));
         assert!(out
             .normalized
             .parse_warnings
             .iter()
-            .any(|w| matches!(w, ParseWarning::ParserError(_))));
+            .any(|w| matches!(w, soth_core::ParseWarning::ParserError { .. })));
     }
 
     #[test]
@@ -733,12 +699,17 @@ mod tests {
         };
 
         let without_hint = process(&base, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
-        assert!(matches!(without_hint.parse_source, ParseSource::Heuristic));
+        assert!(matches!(without_hint.parse_source, soth_core::ParseSource::Heuristic));
 
         let mut with_hint_req = base.clone();
         with_hint_req.connection_meta.matched_provider = Some("openai".to_string());
         let with_hint = process(&with_hint_req, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
-        assert!(matches!(with_hint.parse_source, ParseSource::OpenAI));
+        assert!(matches!(
+            with_hint.parse_source,
+            soth_core::ParseSource::Rest {
+                provider: soth_core::DetectedProvider::OpenAi
+            }
+        ));
         assert_eq!(with_hint.confidence, ParseConfidence::Full);
         assert_eq!(with_hint.normalized.model.as_deref(), Some("gpt-4o-mini"));
     }
@@ -781,11 +752,11 @@ mod tests {
 
         let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
         assert_eq!(out.confidence, ParseConfidence::Full);
-        if let FormatMeta::JsonRpc { method, is_batch } = &out.normalized.format_meta {
-            assert_eq!(method.as_deref(), Some("chat.completions"));
+        if let soth_core::FormatMetadata::JsonRpc { method, is_batch } = &out.normalized.format_metadata {
+            assert_eq!(method.as_str(), "chat.completions");
             assert!(*is_batch);
         } else {
-            panic!("expected jsonrpc format meta");
+            panic!("expected jsonrpc format metadata");
         }
     }
 

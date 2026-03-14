@@ -16,21 +16,50 @@ pub struct EntityMatch {
     pub host_rule: HostRule,
 }
 
-pub fn match_entity(catalog: &EntityCatalog, host: &str) -> Option<EntityMatch> {
-    let mut best: Option<(usize, EntityMatch)> = None;
+#[derive(Debug, Clone, Default)]
+pub struct EntityMatchSet {
+    pub provider: Option<EntityMatch>,
+    pub application: Option<EntityMatch>,
+}
+
+impl EntityMatchSet {
+    /// Pick the single best match (highest specificity, prefer provider on tie).
+    pub fn best(&self) -> Option<&EntityMatch> {
+        match (&self.provider, &self.application) {
+            (Some(p), Some(a)) => {
+                let p_score = specificity(&p.host_rule.pattern);
+                let a_score = specificity(&a.host_rule.pattern);
+                if p_score >= a_score {
+                    Some(p)
+                } else {
+                    Some(a)
+                }
+            }
+            (Some(p), None) => Some(p),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
+}
+
+pub fn match_entities(catalog: &EntityCatalog, host: &str) -> EntityMatchSet {
+    let mut best_provider: Option<(usize, EntityMatch)> = None;
+    let mut best_app: Option<(usize, EntityMatch)> = None;
 
     for entity in &catalog.providers {
         for rule in &entity.hosts {
             if host_pattern_matches(rule.pattern.as_str(), host) {
                 let score = specificity(rule.pattern.as_str());
-                let current = EntityMatch {
-                    kind: EntityMatchKind::Provider,
-                    entity_id: entity.entity_id.clone(),
-                    capture_mode: entity.capture_mode,
-                    host_rule: rule.clone(),
-                };
-                if best.as_ref().is_none_or(|(s, _)| score > *s) {
-                    best = Some((score, current));
+                if best_provider.as_ref().map_or(true, |(s, _)| score > *s) {
+                    best_provider = Some((
+                        score,
+                        EntityMatch {
+                            kind: EntityMatchKind::Provider,
+                            entity_id: entity.entity_id.clone(),
+                            capture_mode: entity.capture_mode,
+                            host_rule: rule.clone(),
+                        },
+                    ));
                 }
             }
         }
@@ -40,20 +69,29 @@ pub fn match_entity(catalog: &EntityCatalog, host: &str) -> Option<EntityMatch> 
         for rule in &entity.hosts {
             if host_pattern_matches(rule.pattern.as_str(), host) {
                 let score = specificity(rule.pattern.as_str());
-                let current = EntityMatch {
-                    kind: EntityMatchKind::Application,
-                    entity_id: entity.entity_id.clone(),
-                    capture_mode: entity.capture_mode,
-                    host_rule: rule.clone(),
-                };
-                if best.as_ref().is_none_or(|(s, _)| score > *s) {
-                    best = Some((score, current));
+                if best_app.as_ref().map_or(true, |(s, _)| score > *s) {
+                    best_app = Some((
+                        score,
+                        EntityMatch {
+                            kind: EntityMatchKind::Application,
+                            entity_id: entity.entity_id.clone(),
+                            capture_mode: entity.capture_mode,
+                            host_rule: rule.clone(),
+                        },
+                    ));
                 }
             }
         }
     }
 
-    best.map(|(_, matched)| matched)
+    EntityMatchSet {
+        provider: best_provider.map(|(_, m)| m),
+        application: best_app.map(|(_, m)| m),
+    }
+}
+
+pub fn match_entity(catalog: &EntityCatalog, host: &str) -> Option<EntityMatch> {
+    match_entities(catalog, host).best().cloned()
 }
 
 pub fn evaluate_path_rules(
@@ -104,42 +142,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
-    if !pattern.contains('*') {
-        return pattern == text;
-    }
-
-    let starts_with_wildcard = pattern.starts_with('*');
-    let ends_with_wildcard = pattern.ends_with('*');
-    let parts: Vec<&str> = pattern.split('*').filter(|part| !part.is_empty()).collect();
-    if parts.is_empty() {
-        return true;
-    }
-
-    let mut cursor = 0usize;
-    for (idx, part) in parts.iter().enumerate() {
-        let is_first = idx == 0;
-        let is_last = idx + 1 == parts.len();
-
-        if is_first && !starts_with_wildcard {
-            if !text[cursor..].starts_with(part) {
-                return false;
-            }
-            cursor += part.len();
-            continue;
-        }
-
-        if is_last && !ends_with_wildcard {
-            return text.ends_with(part);
-        }
-
-        if let Some(offset) = text[cursor..].find(part) {
-            cursor += offset + part.len();
-        } else {
-            return false;
-        }
-    }
-
-    true
+    soth_parse::glob_match(pattern, text)
 }
 
 #[cfg(test)]

@@ -84,14 +84,14 @@ fn signed_manifest_bytes(
     serde_json::to_vec(&manifest).expect("serialize signed manifest")
 }
 
-fn detect_bundle_with_openai_catalog() -> soth_detect::OwnedDetectBundle {
-    let mut detect = soth_detect::OwnedDetectBundle::default();
+fn detect_bundle_with_openai_catalog() -> soth_core::OwnedDetectBundle {
+    let mut detect = soth_core::OwnedDetectBundle::default();
     detect
         .domain_index
         .insert("api.openai.com".to_string(), "openai".to_string());
     detect.llm_providers.insert(
         "openai".to_string(),
-        soth_detect::ProviderEntry {
+        soth_core::ProviderEntry {
             provider_id: Some("openai".to_string()),
             name: Some("openai".to_string()),
             api_format: Some("openai_rest".to_string()),
@@ -108,7 +108,7 @@ fn detect_bundle_with_openai_catalog() -> soth_detect::OwnedDetectBundle {
 fn build_handler(
     db_path: &Path,
     pipeline_config: PipelineConfig,
-    detect_bundle: soth_detect::OwnedDetectBundle,
+    detect_bundle: soth_core::OwnedDetectBundle,
 ) -> ProxyHandler {
     let vendor = SigningKey::from_bytes(&[47u8; 32]);
     let vendor_pubkey = vendor.verifying_key().to_bytes();
@@ -142,6 +142,7 @@ fn build_handler(
     let proxy_db = Arc::new(Mutex::new(db::open(db_path).expect("open proxy db")));
     ProxyHandler::new(
         handle,
+        None,
         None,
         proxy_db,
         pipeline_config,
@@ -231,7 +232,7 @@ async fn handler_contract_skips_non_cataloged_host_by_default() {
     let handler = build_handler(
         db_path.as_path(),
         PipelineConfig::default(),
-        soth_detect::OwnedDetectBundle::default(),
+        soth_core::OwnedDetectBundle::default(),
     );
 
     let request = sample_request(
@@ -254,7 +255,7 @@ fn handler_contract_connect_gate_skips_non_catalog_tls() {
     let handler = build_handler(
         db_path.as_path(),
         PipelineConfig::default(),
-        soth_detect::OwnedDetectBundle::default(),
+        soth_core::OwnedDetectBundle::default(),
     );
 
     use soth_mitm::InterceptHandler;
@@ -403,7 +404,7 @@ fn handler_contract_intercept_schema_contains_reference_columns() {
     let _handler = build_handler(
         db_path.as_path(),
         PipelineConfig::default(),
-        soth_detect::OwnedDetectBundle::default(),
+        soth_core::OwnedDetectBundle::default(),
     );
     let columns = intercept_columns(db_path.as_path());
 

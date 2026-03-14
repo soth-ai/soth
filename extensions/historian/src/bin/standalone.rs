@@ -5,6 +5,7 @@ use clap::Parser;
 use tokio::sync::watch;
 use tracing::{error, info};
 
+use soth_extensions::{ExtensionRuntimeContext, TelemetryQueueWriter};
 use soth_historian::backfill::BackfillEngine;
 use soth_historian::db;
 use soth_historian::dedup::DedupChecker;
@@ -61,6 +62,7 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+    let ctx = ExtensionRuntimeContext::from_defaults();
 
     // Open DB
     let conn = match db::open_historian_db(&cli.db_path) {
@@ -92,23 +94,8 @@ async fn main() {
         return;
     }
 
-    // Create a no-op extension handle that just logs
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
-    let handle = soth_extensions::ExtensionHandle::new(event_tx);
-
-    // Drain events in background (standalone mode — just count them)
-    let drain_task = tokio::spawn(async move {
-        let mut count: u64 = 0;
-        while event_rx.recv().await.is_some() {
-            count += 1;
-            if count % 100 == 0 {
-                info!(events = count, "events processed");
-            }
-        }
-        info!(total_events = count, "event drain complete");
-    });
-
     let dedup = Arc::new(DedupChecker::new(conn));
+    let writer = TelemetryQueueWriter::for_extension(&ctx, "historian");
 
     // Backfill
     let readers = build_readers();
@@ -116,7 +103,7 @@ async fn main() {
         readers,
         report.tools.clone(),
         Arc::clone(&dedup),
-        handle.clone(),
+        writer,
         cli.db_path.clone(),
     )
     .with_rate_limit(cli.rate_limit);
@@ -132,8 +119,6 @@ async fn main() {
     );
 
     if cli.backfill_only {
-        drop(handle);
-        let _ = drain_task.await;
         return;
     }
 
@@ -158,10 +143,10 @@ async fn main() {
     };
     let watch_dedup = Arc::new(DedupChecker::new(watch_conn));
     let watch_readers = build_readers();
-    let watch_engine = WatchEngine::new(watch_readers, report.tools, watch_dedup, handle);
+    let watch_writer = TelemetryQueueWriter::for_extension(&ctx, "historian");
+    let watch_engine = WatchEngine::new(watch_readers, report.tools, watch_dedup, watch_writer);
     watch_engine.run(shutdown_rx).await;
 
     drop(shutdown_tx);
-    let _ = drain_task.await;
     info!("historian standalone exiting");
 }

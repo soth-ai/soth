@@ -8,6 +8,7 @@ pub mod gating;
 pub mod handler;
 mod heartbeat_telemetry;
 pub mod pending;
+pub mod pending_emit;
 pub mod response;
 pub mod search;
 pub mod session;

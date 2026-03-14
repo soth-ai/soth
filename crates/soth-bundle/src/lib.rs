@@ -7,6 +7,8 @@ mod manifest;
 mod scope_check;
 mod verify;
 mod watcher;
+#[cfg(feature = "native-bundle")]
+pub mod entity_index;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,6 +23,8 @@ pub use crate::loader::{
 pub use crate::manifest::{AssetEntry, BundleManifest, BundleScope, OrgSignedConfig};
 pub use crate::scope_check::check_scope;
 pub use crate::watcher::{BundleHandle, BundleWatcher};
+#[cfg(feature = "native-bundle")]
+pub use crate::entity_index::entity_index_from_native;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerificationOptions {
@@ -39,13 +43,7 @@ impl Default for VerificationOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BundleTrustLevel {
-    Verified,
-    Unverified,
-    SignatureDisabled,
-}
+pub use soth_core::BundleTrustLevel;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleMeta {
@@ -67,13 +65,13 @@ pub struct LoadedBundle {
     pub trust_level: BundleTrustLevel,
     pub classify: Arc<soth_classify::ClassifyBundle>,
     pub policy: Arc<soth_policy::sync_policy::PolicyBundle>,
-    pub detect: Arc<soth_detect::OwnedDetectBundle>,
+    pub detect: Arc<soth_core::OwnedDetectBundle>,
     pub gating: Arc<soth_core::GatingBundle>,
     pub manifest: BundleManifest,
 }
 
 impl LoadedBundle {
-    pub fn detect_slice(&self) -> soth_detect::DetectBundleSlice<'_> {
+    pub fn detect_slice(&self) -> soth_core::DetectBundleSlice<'_> {
         self.detect.as_slice()
     }
 }

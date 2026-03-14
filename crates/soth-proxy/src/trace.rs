@@ -63,16 +63,34 @@ fn init_runtime() -> Option<TraceRuntime> {
 }
 
 #[cfg(feature = "dev-pipeline-trace")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceLevel {
+    Off,
+    /// Metadata-only pipeline trace (provider, model, tokens, decisions)
+    On,
+    /// Full content verification: includes request/response body previews
+    Verify,
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+fn trace_level() -> TraceLevel {
+    static LEVEL: OnceLock<TraceLevel> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        match std::env::var("SOTH_PIPELINE_TRACE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("verify" | "verbose" | "full") => TraceLevel::Verify,
+            Some("1" | "true" | "yes" | "on") => TraceLevel::On,
+            _ => TraceLevel::Off,
+        }
+    })
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
 fn runtime_trace_enabled() -> bool {
-    std::env::var("SOTH_PIPELINE_TRACE")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    trace_level() != TraceLevel::Off
 }
 
 #[cfg(feature = "dev-pipeline-trace")]
@@ -532,6 +550,91 @@ pub(crate) fn stream_finalized_without_chunks(
 }
 
 #[cfg(feature = "dev-pipeline-trace")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_completed(
+    connection_id: Uuid,
+    chunk_count: u64,
+    elapsed_ms: u64,
+    usage: Option<&crate::response::UsageSummary>,
+    host: &str,
+    path: &str,
+    parser_id: &str,
+    matched_provider: Option<&str>,
+    matched_application: Option<&str>,
+) {
+    let (input_tokens, output_tokens, finish_reason) = if let Some(usage) = usage {
+        (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.finish_reason.as_deref().unwrap_or("-"),
+        )
+    } else {
+        (0, 0, "-")
+    };
+    emit(
+        "stream_completed",
+        json!({
+            "connection_id": connection_id.to_string(),
+            "chunk_count": chunk_count,
+            "elapsed_ms": elapsed_ms,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "finish_reason": finish_reason,
+            "host": host,
+            "path": path,
+            "parser_id": parser_id,
+            "matched_provider": matched_provider,
+            "matched_application": matched_application,
+        }),
+    );
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_completed(
+    _connection_id: Uuid,
+    _chunk_count: u64,
+    _elapsed_ms: u64,
+    _usage: Option<&crate::response::UsageSummary>,
+    _host: &str,
+    _path: &str,
+    _parser_id: &str,
+    _matched_provider: Option<&str>,
+    _matched_application: Option<&str>,
+) {
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+pub(crate) fn stream_turn_completed(
+    connection_id: Uuid,
+    turn_number: u64,
+    model: Option<&str>,
+    usage: &soth_detect::StreamUsage,
+) {
+    emit(
+        "stream_turn_completed",
+        json!({
+            "connection_id": connection_id.to_string(),
+            "turn": turn_number,
+            "model": model.unwrap_or("unknown"),
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+        }),
+    );
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+pub(crate) fn stream_turn_completed(
+    _connection_id: Uuid,
+    _turn_number: u64,
+    _model: Option<&str>,
+    _usage: &soth_detect::StreamUsage,
+) {
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
 pub(crate) fn response_without_pending(
     connection_id: Uuid,
     status: u16,
@@ -557,7 +660,13 @@ pub(crate) fn response_without_pending(
 }
 
 #[cfg(feature = "dev-pipeline-trace")]
-pub(crate) fn response_usage(connection_id: Uuid, usage: Option<&crate::response::UsageSummary>) {
+pub(crate) fn response_usage(
+    connection_id: Uuid,
+    usage: Option<&crate::response::UsageSummary>,
+    status: u16,
+    response_body_bytes: usize,
+    body_prefix: &str,
+) {
     let (input_tokens, output_tokens, finish_reason) = if let Some(usage) = usage {
         (
             usage.input_tokens,
@@ -574,11 +683,278 @@ pub(crate) fn response_usage(connection_id: Uuid, usage: Option<&crate::response
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "finish_reason": finish_reason,
+            "status": status,
+            "response_body_bytes": response_body_bytes,
+            "body_prefix": body_prefix,
         }),
     );
 }
 
 #[cfg(not(feature = "dev-pipeline-trace"))]
 #[inline(always)]
-pub(crate) fn response_usage(_connection_id: Uuid, _usage: Option<&crate::response::UsageSummary>) {
+pub(crate) fn response_usage(
+    _connection_id: Uuid,
+    _usage: Option<&crate::response::UsageSummary>,
+    _status: u16,
+    _response_body_bytes: usize,
+    _body_prefix: &str,
+) {
+}
+
+// ---------------------------------------------------------------------------
+// Dev-verify mode: content-level verification for development/debugging
+// ---------------------------------------------------------------------------
+//
+// Enabled with SOTH_DEV_VERIFY=1 (requires dev-pipeline-trace feature).
+// Logs the actual request/response content alongside soth's detected metadata
+// so the developer can verify:
+//   (a) passthrough integrity — the proxy isn't corrupting requests/responses
+//   (b) detection accuracy — provider, model, token counts are correct
+
+#[cfg(feature = "dev-pipeline-trace")]
+fn dev_verify_enabled() -> bool {
+    trace_level() == TraceLevel::Verify
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+fn dev_verify_max_body() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("SOTH_PIPELINE_TRACE_MAX_BODY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4096)
+    })
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+fn truncate_body(body: &[u8], max: usize) -> String {
+    let slice = &body[..body.len().min(max)];
+    let text = String::from_utf8_lossy(slice);
+    if body.len() > max {
+        format!("{}... ({} bytes truncated)", text, body.len() - max)
+    } else {
+        text.into_owned()
+    }
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+pub(crate) fn dev_verify_request(
+    connection_id: Uuid,
+    method: &str,
+    host: &str,
+    path: &str,
+    request_body: &[u8],
+    detect_result: &soth_core::DetectResult,
+    capture_mode: soth_core::CaptureMode,
+) {
+    if !dev_verify_enabled() {
+        return;
+    }
+
+    let max = dev_verify_max_body();
+    let body_text = truncate_body(request_body, max);
+    let n = &detect_result.normalized;
+
+    let summary = format!(
+        "\n\
+         ┌─── DEV VERIFY: REQUEST ───────────────────────────────────\n\
+         │ connection:  {connection_id}\n\
+         │ {method} {host}{path}\n\
+         │ capture:     {capture_mode:?}\n\
+         ├─── DETECTION ──────────────────────────────────────────────\n\
+         │ provider:    {provider}\n\
+         │ model:       {model}\n\
+         │ endpoint:    {endpoint:?}\n\
+         │ confidence:  {confidence:?}\n\
+         │ source:      {source:?}\n\
+         │ is_ai_call:  {is_ai}\n\
+         │ est_input_tokens: {input_tokens}\n\
+         │ artifacts:   {artifacts}\n\
+         │ warnings:    {warnings}\n\
+         ├─── REQUEST BODY ({body_bytes} bytes) ──────────────────────\n\
+         {body_lines}\
+         └────────────────────────────────────────────────────────────",
+        provider = n.provider.canonical_name(),
+        model = n.model.as_deref().unwrap_or("-"),
+        endpoint = n.endpoint_type,
+        confidence = detect_result.confidence,
+        source = detect_result.parse_source,
+        is_ai = n.is_ai_call,
+        input_tokens = n.estimated_input_tokens,
+        artifacts = detect_result.artifacts.len(),
+        warnings = detect_result.warnings.len(),
+        body_bytes = request_body.len(),
+        body_lines = body_text
+            .lines()
+            .map(|l| format!("│ {l}\n"))
+            .collect::<String>(),
+    );
+
+    eprintln!("{summary}");
+
+    emit(
+        "dev_verify_request",
+        json!({
+            "connection_id": connection_id.to_string(),
+            "method": method,
+            "host": host,
+            "path": path,
+            "provider": n.provider.canonical_name(),
+            "model": n.model,
+            "endpoint_type": serialize_json(n.endpoint_type),
+            "confidence": serialize_json(detect_result.confidence),
+            "parse_source": serialize_json(&detect_result.parse_source),
+            "is_ai_call": n.is_ai_call,
+            "estimated_input_tokens": n.estimated_input_tokens,
+            "capture_mode": serialize_json(capture_mode),
+            "artifacts_count": detect_result.artifacts.len(),
+            "warnings_count": detect_result.warnings.len(),
+            "request_body_bytes": request_body.len(),
+            "request_body_preview": body_text,
+        }),
+    );
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+pub(crate) fn dev_verify_request(
+    _connection_id: Uuid,
+    _method: &str,
+    _host: &str,
+    _path: &str,
+    _request_body: &[u8],
+    _detect_result: &soth_core::DetectResult,
+    _capture_mode: soth_core::CaptureMode,
+) {
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+pub(crate) fn dev_verify_response(
+    connection_id: Uuid,
+    status: u16,
+    response_body: &[u8],
+    usage: Option<&crate::response::UsageSummary>,
+    provider: &str,
+    model: Option<&str>,
+) {
+    if !dev_verify_enabled() {
+        return;
+    }
+
+    let max = dev_verify_max_body();
+    let body_text = truncate_body(response_body, max);
+    let (input_tokens, output_tokens, finish_reason) = if let Some(u) = usage {
+        (u.input_tokens, u.output_tokens, u.finish_reason.as_deref().unwrap_or("-"))
+    } else {
+        (0, 0, "-")
+    };
+
+    let summary = format!(
+        "\n\
+         ┌─── DEV VERIFY: RESPONSE ──────────────────────────────────\n\
+         │ connection:     {connection_id}\n\
+         │ status:         {status}\n\
+         ├─── USAGE ──────────────────────────────────────────────────\n\
+         │ provider:       {provider}\n\
+         │ model:          {model}\n\
+         │ input_tokens:   {input_tokens}\n\
+         │ output_tokens:  {output_tokens}\n\
+         │ finish_reason:  {finish_reason}\n\
+         ├─── RESPONSE BODY ({body_bytes} bytes) ─────────────────────\n\
+         {body_lines}\
+         └────────────────────────────────────────────────────────────",
+        model = model.unwrap_or("-"),
+        body_bytes = response_body.len(),
+        body_lines = body_text
+            .lines()
+            .map(|l| format!("│ {l}\n"))
+            .collect::<String>(),
+    );
+
+    eprintln!("{summary}");
+
+    emit(
+        "dev_verify_response",
+        json!({
+            "connection_id": connection_id.to_string(),
+            "status": status,
+            "provider": provider,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "finish_reason": finish_reason,
+            "response_body_bytes": response_body.len(),
+            "response_body_preview": body_text,
+        }),
+    );
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+pub(crate) fn dev_verify_response(
+    _connection_id: Uuid,
+    _status: u16,
+    _response_body: &[u8],
+    _usage: Option<&crate::response::UsageSummary>,
+    _provider: &str,
+    _model: Option<&str>,
+) {
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+pub(crate) fn dev_verify_stream_complete(
+    connection_id: Uuid,
+    chunk_count: u64,
+    elapsed_ms: u64,
+    usage: Option<&crate::response::UsageSummary>,
+    provider: &str,
+    model: Option<&str>,
+    host: &str,
+    path: &str,
+) {
+    if !dev_verify_enabled() {
+        return;
+    }
+
+    let (input_tokens, output_tokens, finish_reason) = if let Some(u) = usage {
+        (u.input_tokens, u.output_tokens, u.finish_reason.as_deref().unwrap_or("-"))
+    } else {
+        (0, 0, "-")
+    };
+
+    let summary = format!(
+        "\n\
+         ┌─── DEV VERIFY: STREAM COMPLETE ───────────────────────────\n\
+         │ connection:     {connection_id}\n\
+         │ {host}{path}\n\
+         ├─── STREAM STATS ───────────────────────────────────────────\n\
+         │ chunks:         {chunk_count}\n\
+         │ elapsed_ms:     {elapsed_ms}\n\
+         ├─── USAGE ──────────────────────────────────────────────────\n\
+         │ provider:       {provider}\n\
+         │ model:          {model}\n\
+         │ input_tokens:   {input_tokens}\n\
+         │ output_tokens:  {output_tokens}\n\
+         │ finish_reason:  {finish_reason}\n\
+         └────────────────────────────────────────────────────────────",
+        model = model.unwrap_or("-"),
+    );
+
+    eprintln!("{summary}");
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dev_verify_stream_complete(
+    _connection_id: Uuid,
+    _chunk_count: u64,
+    _elapsed_ms: u64,
+    _usage: Option<&crate::response::UsageSummary>,
+    _provider: &str,
+    _model: Option<&str>,
+    _host: &str,
+    _path: &str,
+) {
 }

@@ -157,7 +157,7 @@ mod tests {
                 provider: DetectedProvider::OpenAi,
             },
             canonical_cache_key: "key".to_string(),
-            format_metadata: FormatMetadata::Unknown,
+            format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,

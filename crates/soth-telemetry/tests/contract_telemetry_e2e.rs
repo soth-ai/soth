@@ -61,6 +61,8 @@ fn config(encryption: EncryptionMode, max_batch_size: usize) -> TelemetryConfig 
         proxy_version: "proxy-v1".to_string(),
         bundle_version: "bundle-v1".to_string(),
         org_id: "org-test".to_string(),
+        observation_queue_dir: None,
+        governance_queue_dir: None,
     }
 }
 
@@ -153,6 +155,8 @@ fn corpus_event(index: usize, threshold_mode: bool) -> TelemetryEvent {
             capture_mode: Some(CaptureMode::MetadataOnly),
             process_name: Some(format!("proc-{index}")),
             bundle_id: Some(format!("com.example.app{}", index % 17)),
+            matched_app_id: None,
+            ..Default::default()
         }),
         traffic_classification: Some(if index % 2 == 0 {
             TrafficClassification::ToolUsage

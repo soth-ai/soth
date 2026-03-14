@@ -116,6 +116,7 @@ impl TelemetrySender {
             timestamp: signed.batch.timestamp_utc,
             events,
             proxy_signature: String::new(),
+            observation_records: signed.batch.observation_records.clone(),
         };
 
         let signing_payload = TelemetrySigningPayload {
@@ -163,6 +164,52 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
     }
     if let Some(bundle_trust_level) = event.bundle_trust_level.as_ref().and_then(enum_name) {
         tags.insert("bundle_trust_level".to_string(), bundle_trust_level);
+    }
+
+    // Emit app identity from process_resolution so cloud can group by tool
+    if let Some(ref pr) = event.process_resolution {
+        // source_class: agent_app / browser / unknown
+        let source_class = match pr.app_type {
+            soth_core::AppType::NonHost => "agent_app",
+            soth_core::AppType::Host => "browser",
+            soth_core::AppType::Unknown => "unknown",
+        };
+        tags.insert("source_class".to_string(), source_class.to_string());
+
+        // tool_identity_key: resolved app_id from detect bundle (e.g. "claude-code", "cursor")
+        // Fallback chain: matched_app_id → process_name → bundle_id
+        let tool_key = pr
+            .matched_app_id
+            .as_deref()
+            .or(pr.process_name.as_deref())
+            .or(pr.bundle_id.as_deref());
+        if let Some(key) = tool_key {
+            tags.insert("tool_identity_key".to_string(), key.to_string());
+        }
+        if let Some(ref name) = pr.process_name {
+            tags.insert("process_name".to_string(), name.clone());
+        }
+        if let Some(ref bid) = pr.bundle_id {
+            tags.insert("bundle_id".to_string(), bid.clone());
+        }
+        if let Some(match_kind) = enum_name(&pr.match_kind) {
+            tags.insert("match_kind".to_string(), match_kind);
+        }
+
+        // Unified registry resolved fields (v6+).
+        // Pre-resolved at edge so cloud can use directly without catalog lookup.
+        if let Some(ref name) = pr.tool_name {
+            tags.insert("tool_name".to_string(), name.clone());
+        }
+        if let Some(ref kind) = pr.tool_kind {
+            tags.insert("tool_kind".to_string(), kind.clone());
+        }
+        if let Some(ref cat) = pr.tool_category {
+            tags.insert("tool_category".to_string(), cat.clone());
+        }
+        if let Some(ref pid) = pr.provider_id {
+            tags.insert("provider_id".to_string(), pid.clone());
+        }
     }
 
     TelemetryEvent {
@@ -223,6 +270,15 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         first_step_event_id: event.first_step_event_id.clone(),
         original_event_id: event.original_event_id.clone(),
         data_source: enum_name(&event.data_source),
+        actual_output_tokens: event.actual_output_tokens,
+        finish_reason: event.finish_reason.clone(),
+        response_latency_ms: event.response_latency_ms,
+        ttfb_ms: event.ttfb_ms,
+        session_request_count: event.session_request_count,
+        session_total_tokens: event.session_total_tokens,
+        session_credential_alerts: event.session_credential_alerts,
+        conversation_turn: event.conversation_turn,
+        ws_turn_number: event.ws_turn_number,
     }
 }
 

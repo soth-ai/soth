@@ -28,6 +28,8 @@ pub struct SessionManager {
 
 struct SessionEntry {
     session: Session,
+    /// Cached SHA-256 hash of the session key, computed once at creation.
+    key_hash: String,
     request_timestamps_ms: Vec<i64>,
     credential_timestamps_ms: Vec<i64>,
     last_active: Instant,
@@ -99,33 +101,35 @@ impl SessionManager {
 
     /// Get or create a session for the given key. Returns the session key hash.
     pub fn get_or_create(&self, key: &SessionKey) -> String {
-        let key_hash = session_key_hash(key);
-
-        if !self.sessions.contains_key(key) {
-            // Enforce max_sessions: evict oldest if needed
-            if self.sessions.len() >= self.config.max_sessions {
-                self.evict_oldest();
-            }
-
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            self.sessions.insert(
-                key.clone(),
-                SessionEntry {
-                    session: Session {
-                        key: key.clone(),
-                        code_hash_ring: VecDeque::new(),
-                        prefix_hash_ring: VecDeque::new(),
-                        stats: SessionStats::default(),
-                        anomaly_baseline: AnomalyBaseline::default(),
-                        created_at: now_ms,
-                        last_activity: now_ms,
-                    },
-                    request_timestamps_ms: Vec::new(),
-                    credential_timestamps_ms: Vec::new(),
-                    last_active: Instant::now(),
-                },
-            );
+        if let Some(entry) = self.sessions.get(key) {
+            return entry.key_hash.clone();
         }
+
+        // Enforce max_sessions: evict oldest if needed
+        if self.sessions.len() >= self.config.max_sessions {
+            self.evict_oldest();
+        }
+
+        let key_hash = session_key_hash(key);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.sessions.insert(
+            key.clone(),
+            SessionEntry {
+                session: Session {
+                    key: key.clone(),
+                    code_hash_ring: VecDeque::new(),
+                    prefix_hash_ring: VecDeque::new(),
+                    stats: SessionStats::default(),
+                    anomaly_baseline: AnomalyBaseline::default(),
+                    created_at: now_ms,
+                    last_activity: now_ms,
+                },
+                key_hash: key_hash.clone(),
+                request_timestamps_ms: Vec::new(),
+                credential_timestamps_ms: Vec::new(),
+                last_active: Instant::now(),
+            },
+        );
 
         key_hash
     }
@@ -334,7 +338,7 @@ impl SessionManager {
                 .iter()
                 .map(|blob| blob.ast_normalized_hash.clone())
                 .collect(),
-            session_key_hash: session_key_hash(&session.key),
+            session_key_hash: entry.key_hash.clone(),
         }
     }
 
@@ -494,6 +498,8 @@ mod tests {
             capture_mode: None,
             process_name: Some("cursor".to_string()),
             bundle_id: Some("com.cursor".to_string()),
+            matched_app_id: None,
+            ..Default::default()
         };
         let key = mgr.derive_key(&process_resolution, Some("cursor-app"));
         match &key.app_identity {
@@ -513,6 +519,8 @@ mod tests {
             capture_mode: None,
             process_name: None,
             bundle_id: Some("com.google.chrome".to_string()),
+            matched_app_id: None,
+            ..Default::default()
         };
         let key = mgr.derive_key(&process_resolution, Some("chatgpt.com"));
         match &key.app_identity {

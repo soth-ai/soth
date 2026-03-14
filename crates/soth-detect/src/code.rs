@@ -1,7 +1,13 @@
 use crate::hash::sha256_hex;
-use crate::types::{ArtifactLocation, ArtifactType, DetectWarning, SensitiveArtifact, Severity};
+use crate::types::{
+    ArtifactLocation, ArtifactType, DetectWarning, DetectedImportCategory, SensitiveArtifact,
+    Severity,
+};
+#[cfg(feature = "tree-sitter")]
 use std::panic::catch_unwind;
+#[cfg(feature = "tree-sitter")]
 use std::time::Instant;
+#[cfg(feature = "tree-sitter")]
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Debug)]
@@ -13,6 +19,7 @@ pub struct CodeDetectResult {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // fields populated for future classification use
 pub struct TreeSitterResult {
     pub confirmed_language: Option<String>,
     pub import_categories: Vec<DetectedImportCategory>,
@@ -22,16 +29,6 @@ pub struct TreeSitterResult {
     pub has_file_io: bool,
     pub function_count: u32,
     pub complexity_estimate: u8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DetectedImportCategory {
-    Crypto,
-    Auth,
-    Network,
-    Database,
-    FileSystem,
-    Serialization,
 }
 
 static CODE_KEYWORDS: &[&str] = &[
@@ -95,36 +92,45 @@ pub fn detect_code_artifacts(content: &str, location: ArtifactLocation) -> CodeD
     }
 
     let detected_language = language.clone();
+    #[cfg_attr(not(feature = "tree-sitter"), allow(unused_mut))]
     let mut warnings = Vec::new();
     let mut ts_result: Option<TreeSitterResult> = None;
+    #[cfg_attr(not(feature = "tree-sitter"), allow(unused_mut))]
     let mut confirmed_lang = language.clone();
 
     if content.len() > 200 {
         if let Some(lang) = &language {
-            let started = Instant::now();
-            let parse = catch_unwind(|| analyze_with_tree_sitter(content, lang));
+            #[cfg(feature = "tree-sitter")]
+            {
+                let started = Instant::now();
+                let parse = catch_unwind(|| analyze_with_tree_sitter(content, lang));
 
-            match parse {
-                Ok(Some(result)) => {
-                    if let Some(ref cl) = result.confirmed_language {
-                        confirmed_lang = Some(cl.clone());
+                match parse {
+                    Ok(Some(result)) => {
+                        if let Some(ref cl) = result.confirmed_language {
+                            confirmed_lang = Some(cl.clone());
+                        }
+                        ts_result = Some(result);
                     }
-                    ts_result = Some(result);
+                    Ok(None) => {}
+                    Err(_) => {
+                        warnings.push(DetectWarning {
+                            code: "tree_sitter_panic",
+                            detail: "tree-sitter parser panic captured".to_string(),
+                        });
+                    }
                 }
-                Ok(None) => {}
-                Err(_) => {
+
+                if started.elapsed().as_millis() > 15 {
                     warnings.push(DetectWarning {
-                        code: "tree_sitter_panic",
-                        detail: "tree-sitter parser panic captured".to_string(),
+                        code: "tree_sitter_timeout",
+                        detail: "tree-sitter parse exceeded 15ms budget".to_string(),
                     });
                 }
             }
-
-            if started.elapsed().as_millis() > 15 {
-                warnings.push(DetectWarning {
-                    code: "tree_sitter_timeout",
-                    detail: "tree-sitter parse exceeded 15ms budget".to_string(),
-                });
+            #[cfg(not(feature = "tree-sitter"))]
+            {
+                ts_result = fallback_analysis(content, lang);
             }
         }
     }
@@ -294,6 +300,7 @@ fn replace_numeric_literals(input: &str) -> String {
     out
 }
 
+#[cfg(feature = "tree-sitter")]
 fn analyze_with_tree_sitter(content: &str, language: &str) -> Option<TreeSitterResult> {
     macro_rules! try_lang {
         ($lang_const:expr) => {{
@@ -381,6 +388,7 @@ fn fallback_analysis(content: &str, language: &str) -> Option<TreeSitterResult> 
     })
 }
 
+#[cfg(feature = "tree-sitter")]
 fn extract_import_strings(root: Node<'_>, source: &str) -> Vec<String> {
     let mut imports = Vec::new();
     let mut cursor = root.walk();
@@ -388,6 +396,7 @@ fn extract_import_strings(root: Node<'_>, source: &str) -> Vec<String> {
     imports
 }
 
+#[cfg(feature = "tree-sitter")]
 fn collect_import_nodes(node: Node<'_>, cursor: &mut tree_sitter::TreeCursor<'_>, source: &str, imports: &mut Vec<String>) {
     let kind = node.kind();
     if matches!(kind,
@@ -472,12 +481,14 @@ fn classify_imports(imports: &[String]) -> Vec<DetectedImportCategory> {
     categories
 }
 
+#[cfg(feature = "tree-sitter")]
 fn count_functions(root: Node<'_>) -> u32 {
     let mut count = 0u32;
     count_functions_recursive(root, &mut count);
     count
 }
 
+#[cfg(feature = "tree-sitter")]
 fn count_functions_recursive(node: Node<'_>, count: &mut u32) {
     let kind = node.kind();
     if matches!(kind,
@@ -565,6 +576,7 @@ fn is_likely_json(content: &str) -> bool {
         && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
 }
 
+#[cfg(feature = "tree-sitter")]
 fn count_error_nodes(root: Node<'_>) -> u32 {
     let mut count: u32 = if root.is_error() { 1 } else { 0 };
     let mut cursor = root.walk();

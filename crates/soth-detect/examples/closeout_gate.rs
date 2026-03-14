@@ -1,10 +1,10 @@
 use bytes::Bytes;
 use soth_core::{DetectResult, ParseSource};
-use soth_detect::{
-    process_with_registry, CaptureMode, CaptureRules, ConnectionMeta, GraphQLOperationRegistry,
-    GrpcServiceRegistry, OwnedDetectBundle, ParserRegistry, ProviderEntry, RawRequest,
-    RestFormatDescriptor, RestRequestPaths, SocketFamily,
+use soth_core::{
+    CaptureMode, CaptureRules, GraphQLOperationRegistry, GrpcServiceRegistry, OwnedDetectBundle,
+    ProviderEntry, RestFormatDescriptor, RestRequestPaths,
 };
+use soth_detect::{process_with_registry, ConnectionMeta, ParserRegistry, RawRequest, SocketFamily};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};

@@ -95,7 +95,7 @@ fn startup_fallback_contract_uses_last_known_good_and_marks_runtime_degraded() {
     let fallback_bundle_dir = soth_home.join("bundle.last_known_good");
 
     let mut assets = HashMap::new();
-    let detect_bundle = serde_json::to_vec(&soth_detect::OwnedDetectBundle::default())
+    let detect_bundle = serde_json::to_vec(&soth_core::OwnedDetectBundle::default())
         .expect("serialize detect bundle");
     assets.insert("detect/bundle.json".to_string(), detect_bundle);
 

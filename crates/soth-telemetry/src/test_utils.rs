@@ -34,6 +34,8 @@ pub(crate) fn sample_event(event_id: Uuid) -> TelemetryEvent {
             capture_mode: Some(CaptureMode::MetadataOnly),
             process_name: None,
             bundle_id: None,
+            matched_app_id: None,
+            ..Default::default()
         }),
         traffic_classification: Some(TrafficClassification::Other),
         languages: Vec::new(),
@@ -73,6 +75,15 @@ pub(crate) fn sample_event(event_id: Uuid) -> TelemetryEvent {
         collision_response_stability: None,
         commitment_hash: String::new(),
         code_fraction: 0.0,
+        actual_output_tokens: None,
+        finish_reason: None,
+        response_latency_ms: None,
+        ttfb_ms: None,
+        session_request_count: None,
+        session_total_tokens: None,
+        session_credential_alerts: None,
+        conversation_turn: None,
+        ws_turn_number: None,
     }
 }
 

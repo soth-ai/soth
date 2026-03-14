@@ -8,7 +8,7 @@ use crate::normalized::{EndpointType, NormalizedRequest};
 use crate::providers::DetectedProvider;
 
 // ---------------------------------------------------------------------------
-// GovernableEvent — normalized event shape all extensions produce
+// GovernableEvent — normalized event shape governance extensions produce
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,21 +37,41 @@ pub struct GovernableEvent {
 pub enum EventSource {
     Http,
     Sidecar,
-    Extension { ext_type: ExtensionType },
+    Extension { source: ExtensionSource },
 }
 
 // ---------------------------------------------------------------------------
-// ExtensionType — known extension variants + custom escape hatch
+// ExtensionSource — known extension variants
 // ---------------------------------------------------------------------------
+//
+// Supersedes the former `ExtensionType` enum. Broader scope: includes all
+// known first-party extensions plus a custom escape hatch.
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExtensionType {
-    McpReticle,
+pub enum ExtensionSource {
     Gryph,
+    McpReticle,
     Historian,
+    SubscriptionDetector,
     Custom(String),
 }
+
+impl ExtensionSource {
+    /// Stable machine name used in file paths, queue files, migration tags.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Gryph => "gryph",
+            Self::McpReticle => "mcp_reticle",
+            Self::Historian => "historian",
+            Self::SubscriptionDetector => "subscription_detector",
+            Self::Custom(name) => name.as_str(),
+        }
+    }
+}
+
+/// Backward-compatible alias during migration.
+pub type ExtensionType = ExtensionSource;
 
 // ---------------------------------------------------------------------------
 // ExtensionContext — metadata an extension attaches to each event

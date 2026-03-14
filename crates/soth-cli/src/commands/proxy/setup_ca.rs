@@ -164,27 +164,7 @@ fn generate_ca_files(cert_path: &Path, key_path: &Path) -> Result<()> {
 fn install_trust(cert_path: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let keychain = dirs::home_dir()
-            .map(|home| home.join("Library/Keychains/login.keychain-db"))
-            .unwrap_or_else(|| PathBuf::from("login.keychain-db"));
-        let output = Command::new("security")
-            .args(["add-trusted-cert", "-d", "-r", "trustRoot", "-k"])
-            .arg(&keychain)
-            .arg(cert_path)
-            .output()
-            .context("failed executing security add-trusted-cert")?;
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if output.status.success()
-            || stderr.contains("already exists")
-            || stderr.contains("the specified item already exists")
-        {
-            style::success("CA trusted in macOS login keychain.");
-            return Ok(());
-        }
-        anyhow::bail!(
-            "security add-trusted-cert failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        return install_trust_macos(cert_path);
     }
 
     #[cfg(target_os = "windows")]
@@ -240,4 +220,88 @@ fn install_trust(cert_path: &Path) -> Result<()> {
         ));
         Ok(())
     }
+}
+
+/// macOS trust installation strategy:
+/// 1. Add cert to login keychain (non-admin, ensures it's present)
+/// 2. Verify SSL trust with `security verify-cert`
+/// 3. If not trusted, elevate via `osascript` to add to system keychain with admin trust
+/// 4. If elevation fails/declined, print manual instructions
+#[cfg(target_os = "macos")]
+fn install_trust_macos(cert_path: &Path) -> Result<()> {
+    let login_keychain = dirs::home_dir()
+        .map(|home| home.join("Library/Keychains/login.keychain-db"))
+        .unwrap_or_else(|| PathBuf::from("login.keychain-db"));
+
+    // Step 1: Add to login keychain (ensures cert is present, may not set trust).
+    let add_output = Command::new("security")
+        .args(["add-certificates", "-k"])
+        .arg(&login_keychain)
+        .arg(cert_path)
+        .output()
+        .context("failed adding certificate to login keychain")?;
+    let add_stderr = String::from_utf8_lossy(&add_output.stderr).to_ascii_lowercase();
+    if !add_output.status.success()
+        && !add_stderr.contains("already exists")
+        && !add_stderr.contains("the specified item already exists")
+    {
+        style::warning(&format!(
+            "Could not add cert to login keychain: {}",
+            String::from_utf8_lossy(&add_output.stderr).trim()
+        ));
+    }
+
+    // Step 2: Check if already trusted for SSL (e.g., from a previous setup-ca or MDM).
+    if macos_verify_ssl_trust(cert_path) {
+        style::success("CA is already trusted for SSL.");
+        return Ok(());
+    }
+
+    // Step 3: Elevate to set trust. Uses osascript which shows a native macOS
+    // password dialog — no terminal sudo needed.
+    style::info("Administrator privileges are required to trust the CA for SSL.");
+    let cert_escaped = cert_path.display().to_string().replace('\'', "'\\''");
+    let script = format!(
+        "do shell script \"security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '{cert_escaped}'\" with administrator privileges"
+    );
+    let elevate = Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .context("failed executing osascript for admin trust elevation")?;
+
+    if elevate.status.success() {
+        // Verify it actually took effect.
+        if macos_verify_ssl_trust(cert_path) {
+            style::success("CA trusted in macOS system keychain (SSL verified).");
+            return Ok(());
+        }
+        style::warning("Admin trust command succeeded but SSL verification still fails.");
+    } else {
+        let stderr = String::from_utf8_lossy(&elevate.stderr);
+        if stderr.to_ascii_lowercase().contains("user canceled")
+            || stderr.contains("-128")
+        {
+            style::warning("Administrator elevation was cancelled.");
+        } else {
+            style::warning(&format!("Admin elevation failed: {}", stderr.trim()));
+        }
+    }
+
+    // Step 4: Fallback instructions.
+    style::info(&format!(
+        "To trust the CA manually, run:\n  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
+        cert_path.display()
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_verify_ssl_trust(cert_path: &Path) -> bool {
+    Command::new("security")
+        .args(["verify-cert", "-c"])
+        .arg(cert_path)
+        .args(["-p", "ssl"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }

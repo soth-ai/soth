@@ -40,27 +40,30 @@ impl HostMatcher {
         }
     }
 
+    /// Check if a host matches any pattern in this matcher.
+    ///
+    /// Caller contract: `host` must already be trimmed and lowercased (e.g. via
+    /// `normalize_sni`). This avoids a `to_ascii_lowercase` allocation on every call.
     pub fn matches(&self, host: &str) -> bool {
-        let host = host.trim().to_ascii_lowercase();
         if host.is_empty() {
             return false;
         }
 
-        if self.exact_only.contains(host.as_str()) {
+        if self.exact_only.contains(host) {
             return true;
         }
 
         if self
             .suffix
             .iter()
-            .any(|pattern| host == *pattern || host.ends_with(format!(".{pattern}").as_str()))
+            .any(|pattern| suffix_matches(host, pattern))
         {
             return true;
         }
 
         self.globs
             .iter()
-            .any(|pattern| wildcard_match(pattern.as_str(), host.as_str()))
+            .any(|pattern| wildcard_match(pattern.as_str(), host))
     }
 }
 
@@ -87,13 +90,20 @@ pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
     if let Some(exact) = pattern.strip_prefix('=') {
         return host == exact;
     }
-    if pattern == host {
-        return true;
-    }
     if pattern.contains('*') {
         return wildcard_match(pattern.as_str(), host.as_str());
     }
-    host == pattern || host.ends_with(format!(".{pattern}").as_str())
+    suffix_matches(&host, &pattern)
+}
+
+/// Check if `host` matches `pattern` exactly or as a subdomain suffix.
+/// e.g. pattern "openai.com" matches "openai.com" and "api.openai.com"
+/// but NOT "notopenai.com".
+fn suffix_matches(host: &str, pattern: &str) -> bool {
+    host == pattern
+        || (host.len() > pattern.len()
+            && host.ends_with(pattern)
+            && host.as_bytes()[host.len() - pattern.len() - 1] == b'.')
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {

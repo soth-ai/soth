@@ -407,6 +407,8 @@ fn apply_case_inputs(idx: usize, detect: &mut DetectResult, proxy: &mut ProxyCon
             kind: ArtifactKind::PrivateKey,
             severity: ArtifactSeverity::Critical,
             location: ArtifactLocation::SystemPrompt { char_offset: 0 },
+            commitment: None,
+            redacted_hint: None,
         }]
     } else if idx % 5 == 0 {
         vec![SensitiveArtifact {
@@ -418,6 +420,8 @@ fn apply_case_inputs(idx: usize, detect: &mut DetectResult, proxy: &mut ProxyCon
                 turn: 0,
                 char_offset: 0,
             },
+            commitment: None,
+            redacted_hint: None,
         }]
     } else {
         Vec::new()

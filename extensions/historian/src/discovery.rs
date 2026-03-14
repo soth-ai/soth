@@ -9,6 +9,7 @@ use crate::playbooks::load_playbooks;
 use crate::types::{AiTool, DiscoveredTool, DiscoveryReport, StorageFormat};
 
 /// Discovers locally-installed AI tools and their history locations.
+#[derive(Clone)]
 pub struct ToolDiscovery {
     roots: Vec<(AiTool, PathBuf)>,
     exclude_patterns: Vec<String>,

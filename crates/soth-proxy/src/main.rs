@@ -10,12 +10,31 @@ use tracing::{info, warn};
 
 use soth_proxy::{config::ProxyConfig, db, ProxyHandler};
 
+#[cfg(feature = "extensions")]
+use soth_extensions::{ExtensionRegistry, ExtensionRuntimeContext, MigrationRunner};
+
 const DISCOVERY_TLS_WILDCARD_DESTINATION: &str = "*:443";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_rustls_provider();
-    init_tracing();
+
+    // ── Extension registry (built early so tracing picks up extension targets) ──
+    #[cfg(feature = "extensions")]
+    let ext_registry = {
+        let mut registry = ExtensionRegistry::empty();
+        registry.register(Arc::new(
+            soth_historian::HistorianExtension::with_defaults(),
+        ));
+        registry
+    };
+
+    #[cfg(feature = "extensions")]
+    let ext_tracing_targets = ext_registry.tracing_targets();
+    #[cfg(not(feature = "extensions"))]
+    let ext_tracing_targets: Vec<&str> = Vec::new();
+
+    init_tracing(&ext_tracing_targets);
 
     let config = ProxyConfig::from_env_or_default().context("load proxy config")?;
     let db_conn = db::open(config.db_path.as_path())?;
@@ -64,10 +83,40 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    // ── Extension lifecycle ─────────────────────────────────────────────
+    #[cfg(feature = "extensions")]
+    let (observer_broadcast, observation_queue_dir, governance_queue_dir) = {
+        let ext_ctx = Arc::new(ExtensionRuntimeContext::from_defaults());
+
+        let all_migrations = ext_registry.all_migrations();
+        if let Err(error) = MigrationRunner::run_all(ext_ctx.db_path.as_path(), all_migrations) {
+            warn!(error = %error, "extension migration runner failed; continuing");
+        }
+
+        let broadcast = ext_registry.build_observer_broadcast(ext_ctx.clone());
+        let queue_dir = Some(ext_ctx.queue_dir.clone());
+
+        // Start all extension lifecycles (historian backfill + watch, etc.)
+        ext_registry.start_all(ext_ctx).await;
+
+        (broadcast, queue_dir.clone(), queue_dir)
+    };
+
+    #[cfg(not(feature = "extensions"))]
+    let (observer_broadcast, observation_queue_dir, governance_queue_dir): (
+        Option<soth_core::ObserverBroadcast>,
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+    ) = (None, None, None);
+
+    // ── Telemetry pipeline ────────────────────────────────────────────────
     let telemetry_pipeline = if config.telemetry.enabled {
-        let telemetry_cfg = config
+        let mut telemetry_cfg = config
             .telemetry_config(bundle_handle.current().version.clone())?
             .context("telemetry enabled but no telemetry config available")?;
+
+        telemetry_cfg.observation_queue_dir = observation_queue_dir;
+        telemetry_cfg.governance_queue_dir = governance_queue_dir;
 
         let sink: Arc<dyn soth_telemetry::TelemetrySink> = match &sync_telemetry_sink {
             Some(sink) => sink.clone(),
@@ -91,6 +140,7 @@ async fn main() -> Result<()> {
     let handler = ProxyHandler::new(
         bundle_handle.clone(),
         telemetry_pipeline.clone(),
+        observer_broadcast,
         db,
         config.pipeline.clone(),
         config.classify_config(),
@@ -173,6 +223,10 @@ async fn main() -> Result<()> {
     maintenance_task.abort();
     bundle_watch_task.abort();
 
+    // Shut down all extension lifecycles.
+    #[cfg(feature = "extensions")]
+    ext_registry.shutdown_all().await;
+
     if let Some(agent) = sync_agent {
         if let Err(error) = agent.flush_for_shutdown(3).await {
             warn!(error = %error, "sync shutdown flush failed");
@@ -190,11 +244,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(extension_targets: &[&str]) {
     // When RUST_LOG is set, honour it exactly. Otherwise apply sensible defaults
     // so that soth crates log at INFO while noisy dependencies stay quiet.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(
+        let mut base = String::from(
             "warn,\
              soth_proxy=info,\
              soth_detect=info,\
@@ -204,9 +258,17 @@ fn init_tracing() {
              soth_telemetry=info,\
              soth_core=info,\
              soth_mitm=info,\
+             soth_extensions=info,\
              mitm_sidecar=info,\
              hudsucker::proxy::internal=off",
-        )
+        );
+        // Append extension tracing targets discovered from the registry.
+        for target in extension_targets {
+            base.push(',');
+            base.push_str(target);
+            base.push_str("=info");
+        }
+        tracing_subscriber::EnvFilter::new(base)
     });
 
     let _ = tracing_subscriber::fmt()

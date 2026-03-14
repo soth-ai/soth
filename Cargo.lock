@@ -3121,6 +3121,7 @@ dependencies = [
  "soth-classify",
  "soth-core",
  "soth-detect",
+ "soth-interface",
  "soth-policy",
  "tempfile",
  "thiserror 1.0.69",
@@ -3216,6 +3217,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "soth-core",
+ "soth-parse",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-java",
@@ -3231,16 +3233,13 @@ name = "soth-extensions"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chrono",
- "dashmap 5.5.3",
+ "clap",
+ "dirs",
+ "rusqlite",
  "serde",
  "serde_json",
- "sha2",
- "soth-classify",
  "soth-core",
- "soth-detect",
- "soth-policy",
- "soth-telemetry",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -3261,7 +3260,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "soth-classify",
  "soth-core",
+ "soth-detect",
  "soth-extensions",
  "tempfile",
  "thiserror 1.0.69",
@@ -3269,6 +3270,16 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "soth-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "soth-core",
  "uuid",
 ]
 
@@ -3306,6 +3317,22 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "zstd",
+]
+
+[[package]]
+name = "soth-parse"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "graphql-parser",
+ "lru",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "soth-core",
+ "uuid",
 ]
 
 [[package]]
@@ -3348,7 +3375,9 @@ dependencies = [
  "soth-core",
  "soth-detect",
  "soth-extensions",
+ "soth-historian",
  "soth-mitm",
+ "soth-parse",
  "soth-policy",
  "soth-sqlite-vec",
  "soth-sync",
@@ -3410,6 +3439,7 @@ dependencies = [
  "rmp-serde",
  "rusqlite",
  "serde",
+ "serde_json",
  "sha2",
  "soth-core",
  "thiserror 1.0.69",

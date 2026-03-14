@@ -10,9 +10,11 @@
 /// detect pipeline (engine.rs refine_with_classify).
 use bytes::Bytes;
 use soth_core::{DetectedProvider, MatchingRule, SignalKind, SignalMatcher};
+use soth_core::{
+    ApplicationEntry, OwnedDetectBundle, ProviderEntry, RestFormatDescriptor, RestRequestPaths,
+};
 use soth_detect::{
-    build_registry, process_with_registry, ApplicationEntry, ConnectionMeta, OwnedDetectBundle,
-    ProcessInfo, ProviderEntry, RawRequest, RestFormatDescriptor, RestRequestPaths,
+    build_registry, process_with_registry, ConnectionMeta, ProcessInfo, RawRequest,
     SessionSnapshot, SocketFamily,
 };
 use std::collections::{BTreeMap, HashMap};

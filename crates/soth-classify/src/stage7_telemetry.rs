@@ -120,6 +120,15 @@ pub(crate) fn run(
         collision_response_stability: None,
         commitment_hash,
         code_fraction,
+        actual_output_tokens: None,
+        finish_reason: None,
+        response_latency_ms: None,
+        ttfb_ms: None,
+        session_request_count: None,
+        session_total_tokens: None,
+        session_credential_alerts: None,
+        conversation_turn: None,
+        ws_turn_number: None,
     };
 
     TelemetryOutput {
@@ -195,6 +204,14 @@ fn build_sensitive_code_flags(
             }
             ArtifactKind::CryptoOperation => {
                 flags.crypto_operations_detected = true;
+            }
+            ArtifactKind::AwsAccessKey
+            | ArtifactKind::GitHubPat
+            | ArtifactKind::GitLabToken
+            | ArtifactKind::SlackToken
+            | ArtifactKind::StripeSecretKey => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
             }
         }
     }
@@ -326,7 +343,7 @@ mod tests {
                     provider: soth_core::DetectedProvider::OpenAi,
                 },
                 canonical_cache_key: "cache-key".to_string(),
-                format_metadata: soth_core::FormatMetadata::Unknown,
+                format_metadata: soth_core::FormatMetadata::Unknown { method: String::new(), path: String::new() },
                 has_structured_output: false,
                 has_tool_results: false,
                 estimated_output_tokens: None,
@@ -367,6 +384,8 @@ mod tests {
                 capture_mode: Some(soth_core::CaptureMode::MetadataOnly),
                 process_name: None,
                 bundle_id: None,
+                matched_app_id: None,
+                ..Default::default()
             },
             capture_mode: soth_core::CaptureMode::MetadataOnly,
             matched_provider: Some("openai".to_string()),
@@ -472,6 +491,8 @@ mod tests {
                     turn: 0,
                     char_offset: 0,
                 },
+                commitment: None,
+                redacted_hint: None,
             },
             soth_core::SensitiveArtifact {
                 kind: soth_core::ArtifactKind::ApiKey {
@@ -482,6 +503,8 @@ mod tests {
                     turn: 0,
                     char_offset: 0,
                 },
+                commitment: None,
+                redacted_hint: None,
             },
         ];
 
@@ -547,6 +570,8 @@ mod tests {
                     turn: 0,
                     char_offset: 0,
                 },
+                commitment: None,
+                redacted_hint: None,
             },
             soth_core::SensitiveArtifact {
                 kind: soth_core::ArtifactKind::CodeBlock {
@@ -557,6 +582,8 @@ mod tests {
                     turn: 1,
                     char_offset: 0,
                 },
+                commitment: None,
+                redacted_hint: None,
             },
         ];
 
@@ -587,6 +614,8 @@ mod tests {
             kind: soth_core::ArtifactKind::PrivateKey,
             severity: soth_core::ArtifactSeverity::Critical,
             location: soth_core::ArtifactLocation::SystemPrompt { char_offset: 0 },
+            commitment: None,
+            redacted_hint: None,
         }];
 
         let out = run(

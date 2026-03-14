@@ -209,6 +209,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_intercept_record(
     db: &Arc<Mutex<rusqlite::Connection>>,
     connection_id: Uuid,
@@ -485,6 +486,150 @@ pub fn write_intercept_record(
     }
 
     Ok(())
+}
+
+/// Update the most recent intercept record for a connection with stream usage data.
+/// Called after stream completion when output_tokens/input_tokens become available.
+pub fn update_stream_usage(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    connection_id: Uuid,
+    usage: &crate::response::UsageSummary,
+    extracted_model: Option<&str>,
+) {
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // Update the most recent record for this connection_id.
+    // Also patch model if we extracted one from stream data (WebSocket frames).
+    let result = conn.execute(
+        "
+        UPDATE intercept_records
+        SET output_tokens = :output_tokens,
+            input_tokens = CASE WHEN (input_tokens IS NULL OR input_tokens = 0) THEN :input_tokens ELSE input_tokens END,
+            model = CASE WHEN (model IS NULL OR model = 'unknown') AND :model IS NOT NULL THEN :model ELSE model END
+        WHERE event_id = (
+            SELECT event_id FROM intercept_records
+            WHERE connection_id = :connection_id
+            ORDER BY created_at_epoch_ms DESC
+            LIMIT 1
+        )
+        ",
+        named_params! {
+            ":output_tokens": usage.output_tokens as i64,
+            ":input_tokens": usage.input_tokens as i64,
+            ":model": extracted_model,
+            ":connection_id": connection_id.to_string(),
+        },
+    );
+    if let Err(error) = result {
+        tracing::warn!(
+            connection_id = %connection_id,
+            error = %error,
+            "failed to update stream usage in db"
+        );
+    }
+}
+
+/// Write a lightweight per-turn record for a completed turn within a WebSocket
+/// stream.  Each `response.completed` event gets its own row so we capture
+/// model and usage even if the WebSocket connection stays open for hours.
+pub fn write_stream_turn(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    connection_id: Uuid,
+    turn: &soth_detect::StreamTurn,
+    pending: &crate::pending::PendingCapture,
+) {
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let event_id = Uuid::new_v4().to_string();
+    let model = turn
+        .model
+        .as_deref()
+        .unwrap_or("unknown");
+    let provider = pending.detect_result.normalized.provider.canonical_name();
+    let capture_mode = format!("{:?}", pending.outcome.capture_mode);
+    let now_ms = Utc::now().timestamp_millis();
+
+    let result = conn.execute(
+        "
+        INSERT OR IGNORE INTO intercept_records (
+            event_id,
+            connection_id,
+            timestamp_utc,
+            provider,
+            model,
+            endpoint_hash,
+            input_tokens,
+            output_tokens,
+            policy_decision,
+            parse_confidence,
+            parser_id,
+            is_ai_call,
+            capture_mode,
+            matched_provider,
+            matched_application,
+            telemetry_json,
+            created_at_epoch_ms
+        ) VALUES (
+            :event_id,
+            :connection_id,
+            :timestamp_utc,
+            :provider,
+            :model,
+            :endpoint_hash,
+            :input_tokens,
+            :output_tokens,
+            'ALLOW',
+            'STREAM',
+            'websocket-turn',
+            1,
+            :capture_mode,
+            :matched_provider,
+            :matched_application,
+            '{}',
+            :created_at_epoch_ms
+        )
+        ",
+        named_params! {
+            ":event_id": event_id,
+            ":connection_id": connection_id.to_string(),
+            ":timestamp_utc": now_ms,
+            ":provider": provider,
+            ":model": model,
+            ":endpoint_hash": pending.proxy_ctx.endpoint_hash.clone(),
+            ":input_tokens": turn.usage.input_tokens as i64,
+            ":output_tokens": turn.usage.output_tokens as i64,
+            ":capture_mode": capture_mode,
+            ":matched_provider": pending.outcome.matched_provider.as_deref(),
+            ":matched_application": pending.outcome.matched_application.as_deref(),
+            ":created_at_epoch_ms": now_ms,
+        },
+    );
+
+    match result {
+        Ok(_) => {
+            tracing::debug!(
+                connection_id = %connection_id,
+                turn = turn.turn_number,
+                model = model,
+                input_tokens = turn.usage.input_tokens,
+                output_tokens = turn.usage.output_tokens,
+                "wrote websocket turn record"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                connection_id = %connection_id,
+                turn = turn.turn_number,
+                error = %error,
+                "failed to write websocket turn record"
+            );
+        }
+    }
 }
 
 pub fn expire_embeddings(db: &Arc<Mutex<rusqlite::Connection>>, days: u32) -> Result<usize> {

@@ -1,9 +1,12 @@
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use soth_core::{
+    CaptureRules, GraphQLOperationRegistry, GrpcServiceRegistry, OwnedDetectBundle,
+    RestFormatDescriptor, RestRequestPaths,
+};
 use soth_detect::{
-    process_with_registry_and_intelligence, CaptureRules, ConnectionMeta, GraphQLOperationRegistry,
-    GrpcServiceRegistry, IntelligenceStore, OwnedDetectBundle, ParserRegistry, RawRequest,
-    RestFormatDescriptor, RestRequestPaths, SocketFamily,
+    process_with_registry_and_intelligence, ConnectionMeta, IntelligenceStore, ParserRegistry,
+    RawRequest, SocketFamily,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddrV4};

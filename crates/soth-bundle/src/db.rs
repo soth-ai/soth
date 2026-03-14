@@ -150,7 +150,7 @@ mod tests {
                 org_patterns: Arc::new(soth_policy::sync_policy::OrgPatterns::default()),
                 budget_limits: soth_policy::sync_policy::BudgetLimits::default(),
             }),
-            detect: Arc::new(soth_detect::OwnedDetectBundle::default()),
+            detect: Arc::new(soth_core::OwnedDetectBundle::default()),
             gating: Arc::new(soth_core::GatingBundle::default()),
             manifest,
         }

@@ -813,7 +813,14 @@ fn project_detect_bundle(bundle: &Value, passthrough_domains: &[String]) -> Valu
                 },
                 "role_map": {},
                 "model_id_parse": matches!(normalize_string(request.get("model")).as_deref(), Some("{url_path}")),
-                "ephemeral_request_fields": []
+                "ephemeral_request_fields": [],
+                "provider_hint": normalize_string(format_value.get("provider_hint")),
+                "model_default": normalize_string(format_value.get("model_default")),
+                "encoding": normalize_string(request.get("encoding")).unwrap_or_else(|| "json".to_string()),
+                "form_field": normalize_string(request.get("form_field")),
+                "preprocess": request.get("preprocess").and_then(Value::as_array).cloned().unwrap_or_default(),
+                "stream_format": normalize_string(value_at_path(&Value::Object(response.clone()), &["stream", "format"])),
+                "stream_options": value_at_path(&Value::Object(response.clone()), &["stream", "format_options"]).cloned()
             }),
         );
     }
@@ -875,7 +882,8 @@ fn project_detect_bundle(bundle: &Value, passthrough_domains: &[String]) -> Valu
                 "app_type": normalize_string(app_value.get("type")),
                 "pricing": app_value.get("pricing").cloned(),
                 "capture": value_at_path(app_value, &["capture"]).cloned(),
-                "detection": value_at_path(app_value, &["detection"]).cloned()
+                "detection": value_at_path(app_value, &["detection"]).cloned(),
+                "api_format": normalize_string(app_value.get("api_format"))
             }),
         );
     }
