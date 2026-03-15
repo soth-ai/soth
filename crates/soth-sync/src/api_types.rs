@@ -463,6 +463,18 @@ pub struct TelemetryEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_source: Option<String>,
 
+    // Caching intelligence fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_fraction: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_definition_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_repeat_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity_score: Option<u8>,
+
     // Response-side fields (populated when response data is available)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_output_tokens: Option<u64>,

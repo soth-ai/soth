@@ -270,6 +270,19 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         first_step_event_id: event.first_step_event_id.clone(),
         original_event_id: event.original_event_id.clone(),
         data_source: enum_name(&event.data_source),
+        dynamic_fraction: if event.dynamic_fraction > 0.0 {
+            Some(event.dynamic_fraction)
+        } else {
+            None
+        },
+        system_prompt_hash: event.system_prompt_hash.clone(),
+        tool_definition_hash: event.tool_definition_hash.clone(),
+        prefix_repeat_signature: event.prefix_repeat_signature.clone(),
+        complexity_score: if event.complexity_score > 0 {
+            Some(event.complexity_score)
+        } else {
+            None
+        },
         actual_output_tokens: event.actual_output_tokens,
         finish_reason: event.finish_reason.clone(),
         response_latency_ms: event.response_latency_ms,
