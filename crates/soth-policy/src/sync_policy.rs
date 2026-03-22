@@ -910,7 +910,7 @@ fn build_eval_scope(
 
     scope.insert(
         "request.provider",
-        EvalValue::String(normalized.provider.canonical_name().to_string()),
+        EvalValue::String(normalized.provider.clone()),
     );
     scope.insert(
         "request.model",

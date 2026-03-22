@@ -8,7 +8,7 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
-use tracing::{debug, info, warn};
+use tracing::{trace, info, warn};
 
 use soth_extensions::TelemetryQueueWriter;
 
@@ -176,7 +176,7 @@ impl WatchEngine {
                 None => continue,
             };
 
-            debug!(tool = %tool, root = %root.display(), "processing changes");
+            trace!(tool = %tool, root = %root.display(), "processing changes");
 
             // Read only recent sessions (last 60 seconds window to catch new data)
             let since = Some(chrono::Utc::now().timestamp_millis() - 60_000);

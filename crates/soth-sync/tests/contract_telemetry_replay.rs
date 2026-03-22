@@ -16,7 +16,7 @@ use uuid::Uuid;
 use soth_core::DetectedProvider;
 use soth_core::{
     CaptureMode, EndpointType, ParseConfidence, ParseSource, RequestMethod, SensitiveCodeFlags,
-    TelemetryEvent, TelemetryPolicyKind, UseCaseLabel, VolatilityClass,
+    SurfaceType, TelemetryEvent, TelemetryPolicyKind, UseCaseLabel, VolatilityClass,
 };
 use soth_sync::telemetry::{TelemetryOutbox, TelemetryReplayWorker, TelemetrySender};
 use soth_sync::TelemetrySyncConfig;
@@ -110,6 +110,19 @@ fn sample_event(event_id: Uuid) -> TelemetryEvent {
         collision_response_stability: None,
         commitment_hash: String::new(),
         code_fraction: 0.0,
+        actual_output_tokens: None,
+        finish_reason: None,
+        response_latency_ms: None,
+        ttfb_ms: None,
+        session_request_count: None,
+        session_total_tokens: None,
+        session_credential_alerts: None,
+        conversation_turn: None,
+        ws_turn_number: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     }
 }
 

@@ -51,15 +51,16 @@ pub(crate) fn run(
     let languages = extract_languages(&detect_result.artifacts);
     let code_fraction = compute_code_fraction(detect_result);
 
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
     let event = TelemetryEvent {
         event_id: Uuid::new_v4(),
-        timestamp_epoch_ms: proxy_ctx
-            .session_snapshot
-            .as_ref()
-            .map(|session| session.current_request_timestamp)
-            .unwrap_or(0),
-        connection_id: None,
-        provider: detect_result.normalized.provider,
+        timestamp_epoch_ms: now_ms,
+        connection_id: proxy_ctx.connection_id,
+        provider: detect_result.normalized.provider.clone(),
         model: detect_result.normalized.model.clone(),
         endpoint_type: detect_result.normalized.endpoint_type,
         parse_confidence: detect_result.confidence,
@@ -82,7 +83,7 @@ pub(crate) fn run(
         anomaly_score: Some(anomaly.score),
         policy_kind: Some(map_policy_kind(&policy.decision.kind)),
         policy_rule_id: policy.decision.matched_rule.as_ref().map(|r| r.rule_id.clone()),
-        bundle_trust_level: None,
+        bundle_trust_level: proxy_ctx.bundle_trust_level,
         sensitive_code_flags: build_sensitive_code_flags(
             &detect_result.artifacts,
             &detect_result.import_categories,
@@ -107,7 +108,6 @@ pub(crate) fn run(
         semantic_hash: cluster.semantic_hash.clone(),
         is_semantic_collision: cluster.is_semantic_collision,
         endpoint_hash: proxy_ctx.endpoint_hash.clone(),
-        // Gap 8: new telemetry fields
         use_case_confidence: usecase.confidence.clamp(0.0, 1.0),
         secondary_label: usecase.secondary_label,
         complexity_score: usecase.complexity_score,
@@ -124,11 +124,25 @@ pub(crate) fn run(
         finish_reason: None,
         response_latency_ms: None,
         ttfb_ms: None,
-        session_request_count: None,
-        session_total_tokens: None,
-        session_credential_alerts: None,
-        conversation_turn: None,
+        session_request_count: proxy_ctx
+            .session_snapshot
+            .as_ref()
+            .map(|s| s.request_count),
+        session_total_tokens: proxy_ctx
+            .session_snapshot
+            .as_ref()
+            .map(|s| s.total_tokens),
+        session_credential_alerts: proxy_ctx
+            .session_snapshot
+            .as_ref()
+            .map(|s| s.credential_alerts),
+        conversation_turn: detect_result.normalized.conversation_turn,
         ws_turn_number: None,
+        // Product/Session taxonomy — populated by proxy handler, not classify
+        session_id: proxy_ctx.session_id,
+        product_id: proxy_ctx.product_id.clone(),
+        surface_type: proxy_ctx.surface_type,
+        is_shadow_it: proxy_ctx.is_shadow_it,
     };
 
     TelemetryOutput {
@@ -397,6 +411,12 @@ mod tests {
             deployment_context: None,
             precomputed_commitment_nonce: None,
             precomputed_commitment_hash: None,
+            connection_id: None,
+            bundle_trust_level: None,
+            session_id: None,
+            product_id: None,
+            surface_type: soth_core::SurfaceType::Unknown,
+            is_shadow_it: false,
         }
     }
 
@@ -448,7 +468,8 @@ mod tests {
             1.5,
         );
 
-        assert_eq!(out.event.timestamp_epoch_ms, 1_700_000_000_111);
+        // timestamp_epoch_ms is now wall-clock time, not session timestamp
+        assert!(out.event.timestamp_epoch_ms > 0);
         assert_eq!(out.event.provider, soth_core::DetectedProvider::OpenAi);
         assert_eq!(
             out.event.endpoint_type,

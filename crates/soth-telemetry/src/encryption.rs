@@ -34,7 +34,7 @@ pub fn encrypt_batch(
     let shared_secret = x25519(ephemeral_secret, *vendor_static_pubkey);
     let aead_key = derive_aead_key(&shared_secret)?;
 
-    let plaintext = rmp_serde::to_vec(signed)
+    let plaintext = rmp_serde::to_vec_named(signed)
         .map_err(|error| EncryptionError::Serialization(error.to_string()))?;
 
     let mut nonce_bytes = [0u8; 12];

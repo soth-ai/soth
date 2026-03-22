@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio_stream::Stream;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::error::ReaderError;
 use crate::reader::FormatReader;
@@ -156,7 +156,7 @@ fn parse_session(
         let parsed: ConversationLine = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                debug!(
+                trace!(
                     path = %path.display(),
                     line = line_num + 1,
                     err = %e,
@@ -329,7 +329,7 @@ impl FormatReader for ClaudeCodeReader {
                         yield session;
                     }
                     Ok(None) => {
-                        debug!(path = %path.display(), "no usable messages, skipping");
+                        trace!(path = %path.display(), "no usable messages, skipping");
                     }
                     Err(e) => {
                         warn!(path = %path.display(), err = %e, "reader error, skipping file");

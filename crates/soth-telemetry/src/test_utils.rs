@@ -2,8 +2,8 @@
 
 use soth_core::{
     AnomalyFlag, AppType, CaptureMode, DataSource, EndpointType, ParseConfidence, ParseSource,
-    ProcessMatchKind, ProcessResolution, RequestMethod, SensitiveCodeFlags, TelemetryEvent,
-    TelemetryPolicyKind, TrafficClassification, UseCaseLabel, VolatilityClass,
+    ProcessMatchKind, ProcessResolution, RequestMethod, SensitiveCodeFlags, SurfaceType,
+    TelemetryEvent, TelemetryPolicyKind, TrafficClassification, UseCaseLabel, VolatilityClass,
 };
 use uuid::Uuid;
 
@@ -84,6 +84,10 @@ pub(crate) fn sample_event(event_id: Uuid) -> TelemetryEvent {
         session_credential_alerts: None,
         conversation_turn: None,
         ws_turn_number: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     }
 }
 

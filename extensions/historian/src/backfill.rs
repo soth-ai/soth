@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
-use tracing::{debug, info, warn};
+use tracing::{trace, info, warn};
 
 use soth_extensions::TelemetryQueueWriter;
 
@@ -87,7 +87,7 @@ impl BackfillEngine {
                 match db::open_historian_db(&self.db_path) {
                     Ok(conn) => {
                         if is_tool_backfill_complete(&conn, t.tool.key()) {
-                            debug!(tool = %t.tool, "backfill already complete, skipping");
+                            trace!(tool = %t.tool, "backfill already complete, skipping");
                             return false;
                         }
                     }
@@ -196,7 +196,7 @@ async fn backfill_one_tool(
     let reader = match reader_for_tool(readers, &tool_info.tool) {
         Some(r) => r,
         None => {
-            debug!(tool = %tool_info.tool, "no reader registered, skipping");
+            trace!(tool = %tool_info.tool, "no reader registered, skipping");
             return summary;
         }
     };

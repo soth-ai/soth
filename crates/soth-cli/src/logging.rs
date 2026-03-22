@@ -24,9 +24,9 @@ static LOG_OUTPUT_PAUSED: AtomicBool = AtomicBool::new(false);
 /// Build the default log filter when `RUST_LOG` is not explicitly provided.
 pub fn default_log_filter(verbose: bool) -> EnvFilter {
     let fallback = if verbose {
-        "debug,hudsucker::proxy::internal=warn,soth_dashboard::websocket=debug"
+        "debug,soth_mitm=warn"
     } else {
-        "warn,soth_cli=info,soth_proxy=info,soth_dashboard=info,soth_dashboard::websocket=warn,hudsucker::proxy::internal=off"
+        "warn,soth_cli=info,soth_proxy=info,soth_mitm=off"
     };
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback))
 }
@@ -183,7 +183,7 @@ fn should_suppress_noisy_proxy_error(target: &str, level: &Level, message: &str)
     if std::env::var_os("SOTH_LOG_TRANSIENT_PROXY_ERRORS").is_some() {
         return false;
     }
-    if *level != Level::ERROR || !target.starts_with("hudsucker") {
+    if *level != Level::ERROR || !target.starts_with("soth_mitm") {
         return false;
     }
 

@@ -1,7 +1,7 @@
 use soth_core::{
     AppType, CaptureMode, ClassificationSource, DetectResult, DetectedProvider, EndpointType,
     FormatMetadata, NormalizedRequest, ParseConfidence, ParseSource, ProcessMatchKind,
-    ProcessResolution, ProxyContext, SessionSnapshot, TrafficClassification,
+    ProcessResolution, ProxyContext, SessionSnapshot, SurfaceType, TrafficClassification,
 };
 
 fn main() {
@@ -98,6 +98,12 @@ fn main() {
         deployment_context: None,
         precomputed_commitment_nonce: None,
         precomputed_commitment_hash: None,
+        connection_id: None,
+        bundle_trust_level: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     };
 
     let out = soth_classify::classify(

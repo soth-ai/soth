@@ -176,6 +176,12 @@ mod tests {
             deployment_context: None,
             precomputed_commitment_nonce: None,
             precomputed_commitment_hash: None,
+            connection_id: None,
+            bundle_trust_level: None,
+            session_id: None,
+            product_id: None,
+            surface_type: soth_core::SurfaceType::Unknown,
+            is_shadow_it: false,
         }
     }
 

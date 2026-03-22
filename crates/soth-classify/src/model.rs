@@ -7,7 +7,7 @@ use soth_core::{AnomalyFlag, UseCaseLabel};
 
 use crate::traits::{AnomalyScorer, AnomalySignals, ClassificationProvider, ClassificationResult};
 
-const EMBEDDING_DIMS: usize = 384;
+use crate::bundle::EMBEDDING_DIM;
 const MLP_ASSET_CANDIDATES: [&str; 2] = ["classify/use_case_mlp.bin", "use_case_mlp.bin"];
 const SOTH_MLP_MAGIC: u32 = 0x534F_5448;
 const LABEL_SPACE: [UseCaseLabel; 17] = [
@@ -81,8 +81,8 @@ impl BundleModelClassifier {
         let mut weights = Vec::with_capacity(LABEL_SPACE.len());
         let mut biases = Vec::with_capacity(LABEL_SPACE.len());
         for label_idx in 0..LABEL_SPACE.len() {
-            let mut weight = Vec::with_capacity(EMBEDDING_DIMS);
-            for dim in 0..EMBEDDING_DIMS {
+            let mut weight = Vec::with_capacity(EMBEDDING_DIM);
+            for dim in 0..EMBEDDING_DIM {
                 let value = sample_signed(seed, label_idx as u64, dim as u64);
                 weight.push(value);
             }
@@ -116,7 +116,7 @@ impl ClassificationProvider for BundleModelClassifier {
 }
 
 fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> ClassificationResult {
-    if embedding.len() != EMBEDDING_DIMS {
+    if embedding.len() != EMBEDDING_DIM {
         return ClassificationResult {
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
@@ -140,7 +140,7 @@ fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> Classificatio
 }
 
 fn classify_soth_binary(model: &SothBinaryClassifier, embedding: &[f32]) -> ClassificationResult {
-    if embedding.len() != EMBEDDING_DIMS {
+    if embedding.len() != EMBEDDING_DIM {
         return ClassificationResult {
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
@@ -424,7 +424,7 @@ fn parse_classifier_soth_binary(
     let hidden1_dim = usize::try_from(cursor.read_u32()?).ok()?;
     let input_dim = usize::try_from(cursor.read_u32()?).ok()?;
 
-    if input_dim != EMBEDDING_DIMS || usecase_count == 0 || hidden1_dim == 0 {
+    if input_dim != EMBEDDING_DIM || usecase_count == 0 || hidden1_dim == 0 {
         return None;
     }
 
@@ -496,7 +496,7 @@ fn parse_classifier_raw(bundle_version: String, bytes: &[u8]) -> Option<BundleMo
         .collect::<Vec<_>>();
 
     let label_count = LABEL_SPACE.len();
-    let weight_len = label_count * EMBEDDING_DIMS;
+    let weight_len = label_count * EMBEDDING_DIM;
     if floats.len() < weight_len {
         return None;
     }
@@ -504,7 +504,7 @@ fn parse_classifier_raw(bundle_version: String, bytes: &[u8]) -> Option<BundleMo
     let mut weights = Vec::with_capacity(label_count);
     let mut offset = 0usize;
     for _ in 0..label_count {
-        let end = offset + EMBEDDING_DIMS;
+        let end = offset + EMBEDDING_DIM;
         weights.push(floats[offset..end].to_vec());
         offset = end;
     }
@@ -527,7 +527,7 @@ fn build_classifier_from_parts(
     if weights.len() != label_count || biases.len() != label_count {
         return None;
     }
-    if !weights.iter().all(|row| row.len() == EMBEDDING_DIMS) {
+    if !weights.iter().all(|row| row.len() == EMBEDDING_DIM) {
         return None;
     }
 
@@ -839,9 +839,9 @@ mod tests {
 
     #[test]
     fn classifier_can_load_raw_mlp_asset() {
-        let mut floats = vec![0.0f32; LABEL_SPACE.len() * EMBEDDING_DIMS + LABEL_SPACE.len()];
+        let mut floats = vec![0.0f32; LABEL_SPACE.len() * EMBEDDING_DIM + LABEL_SPACE.len()];
         floats[0] = 5.0;
-        floats[(EMBEDDING_DIMS) + 1] = 5.0;
+        floats[(EMBEDDING_DIM) + 1] = 5.0;
         let mut bytes = Vec::with_capacity(floats.len() * 4);
         for value in floats {
             bytes.extend_from_slice(value.to_le_bytes().as_slice());
@@ -850,7 +850,7 @@ mod tests {
         let assets = HashMap::from([("classify/use_case_mlp.bin".to_string(), bytes)]);
         let (classifier, _) = build_model_providers("bundle-v9".to_string(), &assets);
 
-        let mut embedding = vec![0.0f32; EMBEDDING_DIMS];
+        let mut embedding = vec![0.0f32; EMBEDDING_DIM];
         embedding[0] = 1.0;
         let out = classifier.classify(embedding.as_slice());
         assert_eq!(out.label, UseCaseLabel::CodeGeneration);
@@ -862,7 +862,7 @@ mod tests {
         let assets = HashMap::from([("classify/use_case_mlp.bin".to_string(), bytes)]);
         let (classifier, _) = build_model_providers("bundle-v10".to_string(), &assets);
 
-        let embedding = vec![0.0f32; EMBEDDING_DIMS];
+        let embedding = vec![0.0f32; EMBEDDING_DIM];
         let out = classifier.classify(embedding.as_slice());
         assert_eq!(out.label, UseCaseLabel::CodeGeneration);
         assert!(out.confidence > 0.7);
@@ -907,9 +907,9 @@ mod tests {
         push_u32(&mut out, usecase_count);
         push_u32(&mut out, aux_count);
         push_u32(&mut out, hidden1_dim);
-        push_u32(&mut out, EMBEDDING_DIMS as u32);
+        push_u32(&mut out, EMBEDDING_DIM as u32);
 
-        for _ in 0..(hidden1_dim as usize * EMBEDDING_DIMS) {
+        for _ in 0..(hidden1_dim as usize * EMBEDDING_DIM) {
             push_f32(&mut out, 0.0);
         }
 

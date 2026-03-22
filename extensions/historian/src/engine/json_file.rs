@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use tokio_stream::Stream;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::error::ReaderError;
 use crate::playbook::{Playbook, PlaybookSource, RecordIterMethod, SessionIdConfig};
@@ -48,7 +48,7 @@ pub fn read_sessions_json<'a>(
                     yield session;
                 }
                 Ok(None) => {
-                    debug!(path = %path.display(), "no usable messages, skipping");
+                    trace!(path = %path.display(), "no usable messages, skipping");
                 }
                 Err(e) => {
                     warn!(path = %path.display(), err = %e, "reader error, skipping file");

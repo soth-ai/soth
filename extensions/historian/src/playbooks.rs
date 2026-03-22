@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::playbook::*;
 
@@ -36,10 +36,10 @@ pub fn load_playbooks() -> Vec<Playbook> {
             for ovr in overrides {
                 // Replace existing playbook with same tool key, or append.
                 if let Some(pos) = playbooks.iter().position(|p| p.tool == ovr.tool) {
-                    debug!(tool = %ovr.tool, "overriding built-in playbook from disk");
+                    trace!(tool = %ovr.tool, "overriding built-in playbook from disk");
                     playbooks[pos] = ovr;
                 } else {
-                    debug!(tool = %ovr.tool, "loading new playbook from disk");
+                    trace!(tool = %ovr.tool, "loading new playbook from disk");
                     playbooks.push(ovr);
                 }
             }
@@ -61,7 +61,7 @@ pub fn load_playbooks_from_dir(dir: &Path) -> Vec<Playbook> {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match serde_json::from_str::<Playbook>(&content) {
                     Ok(pb) => {
-                        debug!(tool = %pb.tool, path = %path.display(), "loaded playbook");
+                        trace!(tool = %pb.tool, path = %path.display(), "loaded playbook");
                         result.push(pb);
                     }
                     Err(e) => {

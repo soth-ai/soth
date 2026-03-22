@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio_stream::Stream;
-use tracing::{debug, info, warn};
+use tracing::{trace, info, warn};
 
 use crate::error::ReaderError;
 use crate::reader::FormatReader;
@@ -69,6 +69,7 @@ struct ConversationRecord {
 /// A single message within a Gemini CLI conversation.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct MessageRecord {
     #[serde(default)]
     r#type: Option<String>,
@@ -88,6 +89,7 @@ struct MessageRecord {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct TokenUsage {
     #[serde(default)]
     input: Option<u32>,
@@ -401,7 +403,7 @@ impl FormatReader for GeminiReader {
             let json_files = collect_gemini_json_files(&root);
 
             if json_files.is_empty() {
-                debug!(root = %root.display(), "no Gemini CLI JSON files found");
+                trace!(root = %root.display(), "no Gemini CLI JSON files found");
                 return;
             }
 
@@ -418,7 +420,7 @@ impl FormatReader for GeminiReader {
                         yield session;
                     }
                     Ok(None) => {
-                        debug!(path = %path.display(), "no usable messages, skipping");
+                        trace!(path = %path.display(), "no usable messages, skipping");
                     }
                     Err(e) => {
                         warn!(path = %path.display(), err = %e, "reader error, skipping file");

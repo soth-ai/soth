@@ -5,6 +5,11 @@ use ort::value::Tensor;
 use tokenizers::tokenizer::TruncationDirection;
 use tokenizers::Tokenizer;
 
+/// Maximum token sequence length for the ONNX embedding model. Inputs
+/// longer than this are truncated from the right. Align with the model's
+/// training truncation length when retraining.
+const TOKENIZER_MAX_LENGTH: usize = 256;
+
 pub(crate) struct OnnxEmbeddingRuntime {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
@@ -16,6 +21,10 @@ impl OnnxEmbeddingRuntime {
             Tokenizer::from_bytes(tokenizer_json).map_err(|error| format!("tokenizer: {error}"))?;
         let session = Session::builder()
             .map_err(|error| format!("ort builder: {error}"))?
+            .with_intra_threads(1)
+            .map_err(|error| format!("ort intra_threads: {error}"))?
+            .with_inter_threads(1)
+            .map_err(|error| format!("ort inter_threads: {error}"))?
             .commit_from_memory(model_bytes)
             .map_err(|error| format!("ort session: {error}"))?;
         Ok(Self {
@@ -29,7 +38,7 @@ impl OnnxEmbeddingRuntime {
             .tokenizer
             .encode(text, true)
             .map_err(|error| format!("tokenize: {error}"))?;
-        encoding.truncate(256, 0, TruncationDirection::Right);
+        encoding.truncate(TOKENIZER_MAX_LENGTH, 0, TruncationDirection::Right);
 
         let input_ids = encoding
             .get_ids()
@@ -103,17 +112,10 @@ impl OnnxEmbeddingRuntime {
         for slot in &mut pooled {
             *slot *= scale;
         }
-        l2_normalize(&mut pooled);
+        // Return the raw mean-pooled vector WITHOUT L2 normalization.
+        // Normalization and norm computation happen in stage1_embed.rs
+        // so that embedding_norm reflects the true pre-normalization
+        // magnitude (a fleet health signal).
         Ok(pooled)
-    }
-}
-
-fn l2_normalize(values: &mut [f32]) {
-    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm <= 1e-9 {
-        return;
-    }
-    for value in values {
-        *value /= norm;
     }
 }

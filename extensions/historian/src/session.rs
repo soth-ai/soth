@@ -6,12 +6,11 @@ use uuid::Uuid;
 use soth_core::artifacts::CaptureMode;
 use soth_core::extensions::{EventSource, ExtensionContext, ExtensionSource, GovernableEvent};
 use soth_core::normalized::{EndpointType, FormatMetadata};
-use soth_core::providers::DetectedProvider;
 use soth_core::SensitiveArtifact;
 
 use soth_detect::code::detect_code_artifacts;
 use soth_detect::sensitive::{credential_scan, structural_scan};
-use soth_detect::{map_artifact, ArtifactLocation};
+use soth_detect::ArtifactLocation;
 
 use crate::types::{AiTool, HistoricalSession};
 
@@ -107,7 +106,7 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         schema_version: "1".to_string(),
         parse_warnings: Vec::new(),
         is_ai_call: true,
-        provider,
+        provider: provider.clone(),
         model: None,
         endpoint_type: EndpointType::ChatCompletion,
         api_version: None,
@@ -128,7 +127,7 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         stop_sequences: Vec::new(),
         estimated_input_tokens: total_input_tokens,
         estimated_cost_usd: 0.0,
-        parse_source: soth_core::artifacts::ParseSource::JsonRpc,
+        parse_source: soth_core::artifacts::ParseSource::Heuristic,
         canonical_cache_key: String::new(),
         format_metadata: FormatMetadata::Unknown {
             method: String::new(),
@@ -137,6 +136,7 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
+        user_prompt: None,
     };
 
     let artifacts = scan_session_artifacts(session);
@@ -172,17 +172,19 @@ fn scan_session_artifacts(session: &HistoricalSession) -> Vec<SensitiveArtifact>
 
     for msg in &session.messages {
         let location = match msg.role.as_str() {
-            "system" => ArtifactLocation::SystemPrompt,
+            "system" => ArtifactLocation::SystemPrompt { char_offset: 0 },
             "user" | "human" => {
-                let loc = ArtifactLocation::UserMessage {
-                    turn_index: user_turn,
+                let loc = ArtifactLocation::UserContent {
+                    turn: user_turn,
+                    char_offset: 0,
                 };
                 user_turn += 1;
                 loc
             }
             "assistant" | "model" => {
-                let loc = ArtifactLocation::AssistantMessage {
-                    turn_index: assistant_turn,
+                let loc = ArtifactLocation::AssistantContent {
+                    turn: assistant_turn,
+                    char_offset: 0,
                 };
                 assistant_turn += 1;
                 loc
@@ -194,34 +196,33 @@ fn scan_session_artifacts(session: &HistoricalSession) -> Vec<SensitiveArtifact>
 
         // Credential scanning (API keys, private keys, JWTs, connection strings)
         for raw in credential_scan(body, location.clone()) {
-            artifacts.push(map_artifact(&raw));
+            artifacts.push(raw);
         }
 
         // Structural scanning (auth logic, crypto operation patterns)
         for raw in structural_scan(body, location.clone()) {
-            artifacts.push(map_artifact(&raw));
+            artifacts.push(raw);
         }
 
         // Code block detection (language identification, code artifacts)
         let code_result = detect_code_artifacts(&msg.content, location);
         for raw in code_result.artifacts {
-            artifacts.push(map_artifact(&raw));
+            artifacts.push(raw);
         }
     }
 
     artifacts
 }
 
-fn tool_to_provider(tool: &AiTool) -> DetectedProvider {
+fn tool_to_provider(tool: &AiTool) -> String {
     match tool {
-        AiTool::ClaudeCode => DetectedProvider::Anthropic,
-        AiTool::GeminiCli => DetectedProvider::Gemini,
-        AiTool::OpenAiCodex => DetectedProvider::OpenAi,
-        AiTool::GithubCopilot => DetectedProvider::OpenAi,
-        // Cursor IDE uses OpenAI-compatible models by default.
-        AiTool::Cursor => DetectedProvider::OpenAi,
-        AiTool::Continue | AiTool::OpenClaw => DetectedProvider::Unknown,
-        AiTool::Unknown(_) => DetectedProvider::Unknown,
+        AiTool::ClaudeCode => "anthropic".to_string(),
+        AiTool::GeminiCli => "gemini".to_string(),
+        AiTool::OpenAiCodex => "openai".to_string(),
+        AiTool::GithubCopilot => "openai".to_string(),
+        AiTool::Cursor => "openai".to_string(),
+        AiTool::Continue | AiTool::OpenClaw => "unknown".to_string(),
+        AiTool::Unknown(_) => "unknown".to_string(),
     }
 }
 
@@ -294,7 +295,7 @@ mod tests {
     #[test]
     fn reconstruct_sets_provider_from_tool() {
         let event = reconstruct_event(&sample_session());
-        assert_eq!(event.provider, DetectedProvider::Anthropic);
+        assert_eq!(event.provider, "anthropic");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use soth_core::{
     FormatMetadata, NormalizedRequest, ParseConfidence, ParseSource, PolicyDecisionKind,
     ProcessMatchKind, ProcessResolution, ProgrammingLanguage, ProxyContext, RedactTarget,
     RerouteTarget, SensitiveArtifact, SessionSnapshot, TelemetryPolicyKind, TrafficClassification,
-    UseCaseLabel, VolatilityClass,
+    SurfaceType, UseCaseLabel, VolatilityClass,
 };
 use soth_policy::sync_policy::{
     BudgetLimits, OrgPatterns, PolicyBundleMetadata, PolicyBundlePayload, RuleAction,
@@ -600,6 +600,12 @@ fn build_proxy_context(context: &ContextInput) -> ProxyContext {
         deployment_context: None,
         precomputed_commitment_nonce: None,
         precomputed_commitment_hash: None,
+        connection_id: None,
+        bundle_trust_level: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     }
 }
 
@@ -719,10 +725,12 @@ fn assert_case(case_id: &str, expect: &CorpusExpect, out: &soth_classify::Classi
             "case {case_id}: volatility class mismatch"
         );
     }
-    if let Some(timestamp) = expect.timestamp_epoch_ms {
-        assert_eq!(
-            out.telemetry_event.timestamp_epoch_ms, timestamp,
-            "case {case_id}: telemetry timestamp mismatch"
+    if expect.timestamp_epoch_ms.is_some() {
+        // timestamp_epoch_ms is now wall-clock time, just verify it's recent
+        assert!(
+            out.telemetry_event.timestamp_epoch_ms > 1_700_000_000_000,
+            "case {case_id}: telemetry timestamp should be recent wall-clock time, got {}",
+            out.telemetry_event.timestamp_epoch_ms
         );
     }
     assert!(
@@ -958,9 +966,10 @@ fn assert_stable_subset(
         "case {case_id}: policy warnings changed across identical runs"
     );
 
-    assert_eq!(
-        first.telemetry_event.timestamp_epoch_ms, second.telemetry_event.timestamp_epoch_ms,
-        "case {case_id}: telemetry timestamp changed across identical runs"
+    // timestamp_epoch_ms is wall-clock; allow small divergence between runs
+    assert!(
+        (first.telemetry_event.timestamp_epoch_ms - second.telemetry_event.timestamp_epoch_ms).unsigned_abs() < 1000,
+        "case {case_id}: telemetry timestamps diverged by more than 1s across identical runs"
     );
     assert_eq!(
         first.telemetry_event.provider, second.telemetry_event.provider,

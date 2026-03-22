@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::engine::expand_home;
 use crate::playbook::Playbook;
@@ -71,18 +71,18 @@ impl ToolDiscovery {
 
         for (tool, root) in &self.roots {
             if self.is_excluded(root) {
-                debug!(tool = %tool, root = %root.display(), "skipping excluded root");
+                trace!(tool = %tool, root = %root.display(), "skipping excluded root");
                 continue;
             }
 
             if !root.exists() {
-                debug!(tool = %tool, root = %root.display(), "root does not exist, skipping");
+                trace!(tool = %tool, root = %root.display(), "root does not exist, skipping");
                 continue;
             }
 
             match self.probe_tool(tool, root) {
                 Ok(discovered) => {
-                    debug!(
+                    trace!(
                         tool = %discovered.tool,
                         root = %discovered.root_path.display(),
                         sessions = ?discovered.session_count_estimate,
@@ -225,6 +225,7 @@ fn count_jsonl_sessions(root: &Path) -> Option<u64> {
 }
 
 /// Count JSON session files under a Codex history directory.
+#[allow(dead_code)]
 fn count_json_files(root: &Path) -> Option<u64> {
     let count = walkdir(root, "json");
     if count > 0 {

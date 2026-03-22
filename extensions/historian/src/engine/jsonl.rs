@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use tokio_stream::Stream;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::error::ReaderError;
 use crate::playbook::{Playbook, PlaybookSource, SessionIdConfig};
@@ -43,9 +43,15 @@ pub fn read_sessions_jsonl<'a>(
 
             match parse_jsonl_file(&path, playbook, since) {
                 Ok(Some(session)) => {
-                    debug!(
-                        path = %path.display(),
+                    let first_prompt = session.messages.iter()
+                        .find(|m| m.role == "user")
+                        .map(|m| truncate_for_log(&m.content, 80))
+                        .unwrap_or_default();
+                    trace!(
+                        tool = %playbook.tool,
+                        session_id = %session.session_id,
                         messages = session.messages.len(),
+                        prompt = %first_prompt,
                         "parsed session"
                     );
                     if let Some(mt) = file_mtime {
@@ -54,7 +60,7 @@ pub fn read_sessions_jsonl<'a>(
                     yield session;
                 }
                 Ok(None) => {
-                    debug!(path = %path.display(), "no text messages found, skipping");
+                    trace!(path = %path.display(), "no text messages found, skipping");
                 }
                 Err(e) => {
                     warn!(path = %path.display(), err = %e, "reader error, skipping file");
@@ -118,7 +124,7 @@ fn parse_jsonl_file(
         let parsed: serde_json::Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
-                debug!(
+                trace!(
                     path = %path.display(),
                     line = line_num + 1,
                     err = %e,
@@ -192,14 +198,22 @@ fn parse_jsonl_file(
     }
 
     if messages.is_empty() {
-        debug!(
+        let reason = if content_pass > 0 && since.is_some() {
+            "all messages older than since threshold"
+        } else if content_pass == 0 && role_pass > 0 {
+            "no text content in message bodies (tool calls only)"
+        } else {
+            "no matching messages in file"
+        };
+        trace!(
             path = %path.display(),
             total_lines,
             json_ok,
             filter_pass,
             role_pass,
             content_pass,
-            "parse_jsonl_file breakdown"
+            reason,
+            "skipping file"
         );
         return Ok(None);
     }
@@ -274,6 +288,16 @@ fn collect_recursive(
             }
             out.push(path);
         }
+    }
+}
+
+fn truncate_for_log(s: &str, max: usize) -> String {
+    let clean = s.replace('\n', " ");
+    if clean.len() <= max {
+        clean
+    } else {
+        let end = clean.char_indices().nth(max).map(|(i, _)| i).unwrap_or(clean.len());
+        format!("{}...", &clean[..end])
     }
 }
 

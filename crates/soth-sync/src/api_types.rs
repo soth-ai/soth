@@ -230,7 +230,8 @@ pub struct RegistryVersionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_hash: Option<String>,
     pub compiled_at: String,
-    pub provider_count: u64,
+    #[serde(alias = "provider_count")]
+    pub llm_provider_count: u64,
     pub domain_count: u64,
     pub format_count: u64,
     pub size_bytes: u64,
@@ -498,6 +499,16 @@ pub struct TelemetryEvent {
     // WebSocket turn number
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_turn_number: Option<u64>,
+
+    // Product/Session taxonomy (v7+)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_shadow_it: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

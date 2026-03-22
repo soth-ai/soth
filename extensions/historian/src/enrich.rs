@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use soth_classify::{ClassifyBundle, ClassifyConfig, ProxyContext};
 use soth_core::classify::{
-    AppType, ClassificationSource, ProcessMatchKind, ProcessResolution, TrafficClassification,
+    AppType, ClassificationSource, ProcessMatchKind, ProcessResolution, SurfaceType,
+    TrafficClassification,
 };
 use soth_core::extensions::GovernableEvent;
 use soth_core::{CaptureMode, DetectResult};
@@ -167,6 +168,12 @@ fn build_historian_proxy_ctx(ctx: &ExtensionRuntimeContext) -> ProxyContext {
         deployment_context: None,
         precomputed_commitment_nonce: None,
         precomputed_commitment_hash: None,
+        connection_id: None,
+        bundle_trust_level: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     }
 }
 

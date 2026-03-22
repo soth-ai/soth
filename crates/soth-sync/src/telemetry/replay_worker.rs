@@ -12,6 +12,10 @@ use crate::config::TelemetrySyncConfig;
 use super::outbox::TelemetryOutbox;
 use super::sender::{TelemetrySendOutcome, TelemetrySender};
 
+/// Retention period for completed (SENT/DEAD) outbox rows. Rows older than
+/// this are purged during the periodic scan to prevent unbounded growth.
+const COMPLETED_ROW_RETENTION_SECS: i64 = 7 * 24 * 3600; // 7 days
+
 pub struct TelemetryReplayWorker {
     outbox: Arc<TelemetryOutbox>,
     sender: TelemetrySender,
@@ -53,6 +57,9 @@ impl TelemetryReplayWorker {
                 _ = scan_interval.tick() => {
                     if let Err(error) = self.outbox.drain_on_startup() {
                         tracing::warn!(error = %error, "telemetry replay worker periodic due-scan failed");
+                    }
+                    if let Err(error) = self.outbox.purge_completed(COMPLETED_ROW_RETENTION_SECS) {
+                        tracing::warn!(error = %error, "telemetry outbox purge failed");
                     }
                 }
                 maybe_batch_id = self.rx.recv() => {

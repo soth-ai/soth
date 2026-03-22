@@ -62,7 +62,8 @@ fn classify_end_to_end_system_block_sets_policy_triggered() {
             .sensitive_code_flags
             .private_key_detected
     );
-    assert_eq!(out.telemetry_event.timestamp_epoch_ms, 1_700_000_000_500);
+    // timestamp_epoch_ms is now wall-clock time
+    assert!(out.telemetry_event.timestamp_epoch_ms > 1_700_000_000_000);
 }
 
 #[test]

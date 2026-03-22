@@ -13,8 +13,8 @@ use sha2::Digest;
 use soth_core::{
     AnomalyFlag, AppType, CaptureMode, ClassificationFlag, DetectedProvider, EndpointType,
     ParseConfidence, ParseSource, ProcessMatchKind, ProcessResolution, RequestMethod,
-    SensitiveCodeFlags, TelemetryEvent, TelemetryPolicyKind, TrafficClassification, UseCaseLabel,
-    VolatilityClass,
+    SensitiveCodeFlags, SurfaceType, TelemetryEvent, TelemetryPolicyKind, TrafficClassification,
+    UseCaseLabel, VolatilityClass,
 };
 use soth_telemetry::{
     EncryptedBatch, EncryptionMode, SignedBatch, SqlitePool, TelemetryConfig, TelemetryPipeline,
@@ -204,6 +204,19 @@ fn corpus_event(index: usize, threshold_mode: bool) -> TelemetryEvent {
         collision_response_stability: None,
         commitment_hash: String::new(),
         code_fraction: 0.0,
+        actual_output_tokens: None,
+        finish_reason: None,
+        response_latency_ms: None,
+        ttfb_ms: None,
+        session_request_count: None,
+        session_total_tokens: None,
+        session_credential_alerts: None,
+        conversation_turn: None,
+        ws_turn_number: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     }
 }
 

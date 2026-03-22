@@ -19,6 +19,7 @@ const ENV_KEYS: &[&str] = &[
     "REQUESTS_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
     "CURL_CA_BUNDLE",
+    "CODEX_CA_CERTIFICATE",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +217,8 @@ fn desired_env_values(config: &SothConfig) -> BTreeMap<String, String> {
     values.insert("SSL_CERT_FILE".to_string(), ca_path.clone());
     values.insert("REQUESTS_CA_BUNDLE".to_string(), ca_path.clone());
     values.insert("NODE_EXTRA_CA_CERTS".to_string(), ca_path.clone());
-    values.insert("CURL_CA_BUNDLE".to_string(), ca_path);
+    values.insert("CURL_CA_BUNDLE".to_string(), ca_path.clone());
+    values.insert("CODEX_CA_CERTIFICATE".to_string(), ca_path);
     values
 }
 

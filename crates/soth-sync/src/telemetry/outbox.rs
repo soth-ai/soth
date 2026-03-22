@@ -354,6 +354,34 @@ impl TelemetryOutbox {
         Ok(())
     }
 
+    /// Delete SENT and DEAD rows older than `max_age_secs` from both the
+    /// outbox and transmitted_events tables. Called periodically to prevent
+    /// unbounded SQLite growth.
+    pub fn purge_completed(&self, max_age_secs: i64) -> Result<u64> {
+        let conn = self.lock_db()?;
+        let cutoff = Utc::now().timestamp().saturating_sub(max_age_secs);
+
+        let outbox_deleted: u64 = conn
+            .execute(
+                "DELETE FROM telemetry_outbox
+                 WHERE status IN (?1, ?2)
+                   AND first_queued_at <= ?3",
+                params![OUTBOX_STATUS_SENT, OUTBOX_STATUS_DEAD, cutoff],
+            )
+            .context("purge completed telemetry outbox rows")? as u64;
+
+        let events_deleted: u64 = conn
+            .execute(
+                "DELETE FROM transmitted_events
+                 WHERE transmission_status IN (?1, ?2)
+                   AND transmitted_at <= ?3",
+                params![OUTBOX_STATUS_SENT, OUTBOX_STATUS_DEAD, cutoff],
+            )
+            .context("purge completed transmitted_events rows")? as u64;
+
+        Ok(outbox_deleted.saturating_add(events_deleted))
+    }
+
     fn lock_db(&self) -> Result<MutexGuard<'_, Connection>> {
         self.db
             .lock()

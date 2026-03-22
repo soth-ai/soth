@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use crate::bundle::ClassifyBundle;
+use crate::bundle::{ClassifyBundle, EMBEDDING_DIM};
 use crate::config::ClassifyConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +87,12 @@ pub(crate) fn run(
     let embedded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(runtime) = bundle.onnx_runtime.as_ref() {
             let vector = runtime.embed(text).ok()?;
-            let mut vector = normalize_embedding_dims(vector, 384)?;
+            let mut vector = normalize_embedding_dims(vector, EMBEDDING_DIM)?;
+            // Compute L2 norm from the raw (pre-normalization) vector.
+            // This is the fleet health signal exposed as embedding_norm in
+            // telemetry. Near-zero = ONNX failure or degenerate input.
+            // TODO(retraining): after validation run, record observed p5/p95
+            // norm range here for use as intelligence-layer anomaly threshold.
             let norm_sq = vector.iter().map(|value| value * value).sum::<f32>();
             let norm = norm_sq.sqrt();
             if norm <= 1e-9 {
@@ -133,7 +138,7 @@ fn embed_text(
         return embed_text_legacy(text);
     }
 
-    let mut vec = vec![0.0f32; 384];
+    let mut vec = vec![0.0f32; EMBEDDING_DIM];
     let model_seed = model_seed(model_bytes.as_slice());
     let token_salt = tokenizer_salt(tokenizer_json);
 
@@ -146,20 +151,20 @@ fn embed_text(
         let digest = hasher.finalize();
 
         for (byte_idx, byte) in digest.iter().enumerate() {
-            let dim = (idx * digest.len() + byte_idx) % 384;
+            let dim = (idx * digest.len() + byte_idx) % EMBEDDING_DIM;
             let signed = (*byte as f32 / 127.5) - 1.0;
             vec[dim] += signed;
         }
     }
 
-    if text.len() > 384 {
+    if text.len() > EMBEDDING_DIM {
         for (idx, window) in text.as_bytes().windows(3).take(1024).enumerate() {
             let mut hasher = Sha256::new();
             hasher.update(model_seed.to_le_bytes());
             hasher.update((idx as u64).to_le_bytes());
             hasher.update(window);
             let digest = hasher.finalize();
-            let dim = (digest[0] as usize + idx) % 384;
+            let dim = (digest[0] as usize + idx) % EMBEDDING_DIM;
             let signed = (digest[1] as f32 / 127.5) - 1.0;
             vec[dim] += signed * 0.5;
         }
@@ -194,9 +199,9 @@ fn normalize_embedding_dims(mut vector: Vec<f32>, target: usize) -> Option<Vec<f
 }
 
 fn embed_text_legacy(text: &str) -> Option<(Vec<f32>, f32)> {
-    let mut vec = vec![0.0f32; 384];
+    let mut vec = vec![0.0f32; EMBEDDING_DIM];
     for (idx, byte) in text.as_bytes().iter().enumerate() {
-        let pos = idx % 384;
+        let pos = idx % EMBEDDING_DIM;
         vec[pos] += *byte as f32 / 255.0;
     }
 

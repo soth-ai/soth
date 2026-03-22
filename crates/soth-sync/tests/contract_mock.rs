@@ -31,29 +31,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
-const TEST_BUNDLE_VERSION: &str = "bundle-v1";
+const TEST_BUNDLE_VERSION: &str = "bundle-v4";
 const TEST_BUNDLE_JSON: &str = r#"{
-  "schema_version": 1,
-  "version":"bundle-v1",
+  "schema_version": 4,
+  "version":"bundle-v4",
   "compiled_at":"2026-02-13T00:00:00Z",
-  "bundle_type":"local",
-  "domain_index":[],
-  "providers":{
-    "openai":{
-      "id":"openai",
-      "name":"OpenAI",
-      "type":"ai-inference",
-      "domains":["api.openai.com"]
-    }
-  },
-  "filters":{
-    "whitelist":[],
-    "blacklist":[],
-    "passthrough":[],
-    "noise_keywords":[]
-  },
-  "pricing":{},
-  "stats":{"providers":1,"domains":1,"formats":1}
+  "bundle_type":"native"
 }"#;
 
 fn test_bundle_sha() -> String {
@@ -958,7 +941,7 @@ async fn registry_version_handler(
             sha256: test_bundle_sha(),
             bundle_hash: Some(test_bundle_sha()),
             compiled_at: Utc::now().to_rfc3339(),
-            provider_count: 3,
+            llm_provider_count: 3,
             domain_count: 10,
             format_count: 5,
             size_bytes: TEST_BUNDLE_JSON.as_bytes().len() as u64,

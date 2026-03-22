@@ -66,7 +66,7 @@ impl HistorianWorker {
     async fn run(
         self,
         ctx: Arc<ExtensionRuntimeContext>,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         // ── Backfill phase ──────────────────────────────────────────────
         {

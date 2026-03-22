@@ -1,3 +1,24 @@
+//! Seven-stage classify pipeline.
+//!
+//! Data flow:
+//! ```text
+//! content_for_embedding (user prompt text)
+//!   └→ Stage 1 (embed)     → EmbedOutput { vector, norm }
+//!       └→ Stage 2 (cluster)   → ClusterOutput { topic_cluster_id, semantic_hash }
+//!       └→ Stage 3 (usecase)   → UsecaseOutput { label, confidence, complexity }
+//!   detect_result.normalized
+//!   + content_for_embedding
+//!       └→ Stage 4 (volatility) → VolatilityOutput { class, dynamic_fraction }
+//!   embed.vector + cluster + normalized + artifacts + session
+//!       └→ Stage 5 (anomaly)    → AnomalyOutput { score, flags }
+//!   detect_result + proxy_ctx + all stage outputs
+//!       └→ Stage 6 (policy)     → PolicyOutput { decision }
+//!       └→ Stage 7 (telemetry)  → TelemetryEvent (merged with response via PendingEmitStore)
+//! ```
+//!
+//! Each stage is a pure function in its own module with `pub(crate) fn run()`.
+//! Stages share no mutable state — outputs flow forward only.
+
 use std::time::Instant;
 
 use crate::bundle::ClassifyBundle;

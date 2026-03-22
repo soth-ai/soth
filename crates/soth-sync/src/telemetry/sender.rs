@@ -215,7 +215,7 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
     TelemetryEvent {
         event_id: event.event_id.to_string(),
         timestamp: event.timestamp_epoch_ms / 1_000,
-        provider: Some(event.provider.canonical_name().to_string()),
+        provider: Some(event.provider.clone()),
         model: event.model.clone(),
         use_case_label: enum_name(&event.use_case),
         topic_cluster_id: if event.topic_cluster_id > 0 {
@@ -292,6 +292,10 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         session_credential_alerts: event.session_credential_alerts,
         conversation_turn: event.conversation_turn,
         ws_turn_number: event.ws_turn_number,
+        session_id: event.session_id.map(|u| u.to_string()),
+        product_id: event.product_id.clone(),
+        surface_type: enum_name(&event.surface_type),
+        is_shadow_it: if event.is_shadow_it { Some(true) } else { None },
     }
 }
 
