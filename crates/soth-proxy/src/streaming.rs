@@ -36,6 +36,7 @@ pub struct CompletedStream {
 
 pub struct StreamingStore {
     inner: DashMap<Uuid, StreamAccumulator>,
+    max_capacity: usize,
 }
 
 impl Default for StreamingStore {
@@ -48,10 +49,15 @@ impl StreamingStore {
     pub fn new() -> Self {
         Self {
             inner: DashMap::new(),
+            max_capacity: 1_024,
         }
     }
 
     pub fn start_stream(&self, pending: PendingCapture) {
+        // Enforce capacity
+        if self.inner.len() >= self.max_capacity {
+            self.evict_oldest(self.max_capacity / 8);
+        }
         let mut detect_session =
             soth_detect::StreamDetectState::new(pending.connection_id, pending.outcome.capture_mode);
         detect_session.is_websocket = pending.is_websocket;
@@ -83,6 +89,24 @@ impl StreamingStore {
         if let Some(mut state) = self.inner.get_mut(&chunk.connection_id) {
             if state.first_chunk_at.is_none() {
                 state.first_chunk_at = Some(Instant::now());
+
+                // Resolve format_name from matched entity's api_format on first
+                // chunk. This is critical for WebSocket streams where the initial
+                // GET has no body, so the detect pipeline can't fingerprint the
+                // format from the request alone.
+                if state.detect_session.format_name.is_none() {
+                    // Resolve api_format using the same classify path the
+                    // detect engine uses: match host + path against entity
+                    // matching_rules to find the most specific entity.
+                    let host = state.pending.request_host.as_str();
+                    let path = state.pending.request_path.as_str();
+                    let format_name = soth_detect::classify_request_format(
+                        host, path, bundle,
+                    );
+                    if let Some(name) = format_name {
+                        state.detect_session.set_format_name(name);
+                    }
+                }
             }
             state.chunk_count = state.chunk_count.saturating_add(1);
             state.accumulated_payload_bytes = state
@@ -160,8 +184,30 @@ impl StreamingStore {
             })
     }
 
-    pub fn evict_stale(&self, max_age: Duration) {
-        self.inner
-            .retain(|_, state| state.started_at.elapsed() <= max_age);
+    pub fn evict_stale(&self, max_age: Duration, max_scan: usize) {
+        let mut scanned = 0;
+        let mut to_remove = Vec::new();
+        for entry in self.inner.iter() {
+            if scanned >= max_scan {
+                break;
+            }
+            if entry.value().started_at.elapsed() > max_age {
+                to_remove.push(*entry.key());
+            }
+            scanned += 1;
+        }
+        for id in to_remove {
+            self.inner.remove(&id);
+        }
+    }
+
+    fn evict_oldest(&self, count: usize) {
+        let mut entries: Vec<(Uuid, Instant)> = self.inner.iter()
+            .map(|e| (*e.key(), e.value().started_at))
+            .collect();
+        entries.sort_by_key(|(_, ts)| *ts);
+        for (id, _) in entries.into_iter().take(count) {
+            self.inner.remove(&id);
+        }
     }
 }

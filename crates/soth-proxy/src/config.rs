@@ -232,17 +232,17 @@ impl Default for MitmRuntimeConfig {
             accept_retry_backoff_ms: 100,
             max_flow_event_backlog: 8 * 1024,
             max_in_flight_bytes: 64 * 1024 * 1024,
-            max_concurrent_flows: 2_048,
+            max_concurrent_flows: 16_384,
             upstream_timeout_ms: 30_000,
-            h2_header_stage_timeout_ms: 30_000,
-            h2_body_idle_timeout_ms: 120_000,
+            h2_header_stage_timeout_ms: 120_000,
+            h2_body_idle_timeout_ms: 60_000,
             h2_response_overflow_mode: H2ResponseOverflowModeConfig::TruncateContinue,
             upstream_connect_timeout_ms: 10_000,
             upstream_retry_on_failure: false,
             upstream_retry_delay_ms: 200,
             verify_upstream_tls: true,
             max_connections_per_host: 64,
-            idle_timeout_ms: 600_000,
+            idle_timeout_ms: 90_000,
             max_idle_per_host: 16,
             max_body_bytes: 32 * 1024 * 1024,
             buffer_request_bodies: false,
@@ -251,9 +251,9 @@ impl Default for MitmRuntimeConfig {
             response_timeout_ms: 15_000,
             handler_recover_from_panics: true,
             flow_dispatch_queue_capacity: None,
-            closed_flow_lru_capacity: None,
-            stale_flow_ttl_ms: None,
-            stale_reap_max_batch: None,
+            closed_flow_lru_capacity: Some(32_768),
+            stale_flow_ttl_ms: Some(300_000),      // 5 min — LLM APIs can take 30-120s for first token
+            stale_reap_max_batch: Some(256),        // large batches to keep up with tunnel churn
             dispatch_queue_send_timeout_ms: None,
             dispatch_close_join_timeout_ms: None,
         }
@@ -267,89 +267,99 @@ impl MitmRuntimeConfig {
             .parse()
             .with_context(|| format!("invalid mitm.bind address: {}", self.bind))?;
 
-        Ok(soth_mitm::MitmConfig {
-            bind,
-            unix_socket_path: self.unix_socket_path.clone(),
-            interception: soth_mitm::InterceptionScope {
-                destinations: self.destinations.clone(),
-                passthrough_unlisted: self.passthrough_unlisted,
-            },
-            process_attribution: soth_mitm::ProcessAttributionConfig {
-                enabled: self.process_attribution_enabled,
-                lookup_timeout_ms: self.process_lookup_timeout_ms,
-                cache_capacity: self.process_cache_capacity.max(1),
-                cache_ttl_ms: self.process_cache_ttl_ms.filter(|ttl| *ttl > 0),
-            },
-            tls: soth_mitm::TlsConfig {
-                ca_cert_path: self.ca_cert_path.clone(),
-                ca_key_path: self.ca_key_path.clone(),
-                min_version: soth_mitm::TlsVersion::Tls12,
-                capture_fingerprint: self.capture_fingerprint,
-            },
-            http2_enabled: self.http2_enabled,
-            http2_max_header_list_size: self.http2_max_header_list_size.max(1),
-            http3_passthrough: self.http3_passthrough,
-            max_http_head_bytes: self.max_http_head_bytes.max(1),
-            accept_retry_backoff_ms: self.accept_retry_backoff_ms.max(1),
-            max_flow_event_backlog: self.max_flow_event_backlog.max(1),
-            max_in_flight_bytes: self.max_in_flight_bytes.max(1),
-            max_concurrent_flows: self.max_concurrent_flows.max(1),
-            upstream: soth_mitm::UpstreamConfig {
-                timeout_ms: self.upstream_timeout_ms,
-                h2_header_stage_timeout_ms: self.h2_header_stage_timeout_ms,
-                h2_body_idle_timeout_ms: self.h2_body_idle_timeout_ms,
-                h2_response_overflow_mode: match self.h2_response_overflow_mode {
-                    H2ResponseOverflowModeConfig::TruncateContinue => {
-                        soth_mitm::H2ResponseOverflowMode::TruncateContinue
-                    }
-                    H2ResponseOverflowModeConfig::StrictFail => {
-                        soth_mitm::H2ResponseOverflowMode::StrictFail
-                    }
-                },
-                connect_timeout_ms: self.upstream_connect_timeout_ms,
-                retry_on_failure: self.upstream_retry_on_failure,
-                retry_delay_ms: self.upstream_retry_delay_ms.max(1),
-                verify_upstream_tls: self.verify_upstream_tls,
-            },
-            connection_pool: soth_mitm::ConnectionPoolConfig {
-                max_connections_per_host: self.max_connections_per_host,
-                idle_timeout_ms: self.idle_timeout_ms,
-                max_idle_per_host: self.max_idle_per_host,
-            },
-            body: soth_mitm::BodyConfig {
-                max_size_bytes: self.max_body_bytes,
-                buffer_request_bodies: self.buffer_request_bodies,
-            },
-            intercept_mode: match self.intercept_mode {
-                Some(InterceptModeConfig::Monitor) => soth_mitm::InterceptMode::Monitor,
-                Some(InterceptModeConfig::Enforce) => soth_mitm::InterceptMode::Enforce,
-                // Backwards-compat: derive from buffer_request_bodies when not explicitly set.
-                None => {
-                    if self.buffer_request_bodies {
-                        soth_mitm::InterceptMode::Enforce
-                    } else {
-                        soth_mitm::InterceptMode::Monitor
-                    }
+        let mut interception = soth_mitm::InterceptionScope::default();
+        interception.destinations = self.destinations.clone();
+        interception.passthrough_unlisted = self.passthrough_unlisted;
+
+        let mut process_attribution = soth_mitm::ProcessAttributionConfig::default();
+        process_attribution.enabled = self.process_attribution_enabled;
+        process_attribution.lookup_timeout_ms = self.process_lookup_timeout_ms;
+        process_attribution.cache_capacity = self.process_cache_capacity.max(1);
+        process_attribution.cache_ttl_ms = self.process_cache_ttl_ms.filter(|ttl| *ttl > 0);
+
+        let mut tls = soth_mitm::TlsConfig::default();
+        tls.ca_cert_path = self.ca_cert_path.clone();
+        tls.ca_key_path = self.ca_key_path.clone();
+        tls.min_version = soth_mitm::TlsVersion::Tls12;
+        tls.capture_fingerprint = self.capture_fingerprint;
+
+        let mut upstream = soth_mitm::UpstreamConfig::default();
+        upstream.timeout_ms = self.upstream_timeout_ms;
+        upstream.h2_header_stage_timeout_ms = self.h2_header_stage_timeout_ms;
+        upstream.h2_body_idle_timeout_ms = self.h2_body_idle_timeout_ms;
+        upstream.h2_response_overflow_mode = match self.h2_response_overflow_mode {
+            H2ResponseOverflowModeConfig::TruncateContinue => {
+                soth_mitm::H2ResponseOverflowMode::TruncateContinue
+            }
+            H2ResponseOverflowModeConfig::StrictFail => {
+                soth_mitm::H2ResponseOverflowMode::StrictFail
+            }
+        };
+        upstream.connect_timeout_ms = self.upstream_connect_timeout_ms;
+        upstream.retry_on_failure = self.upstream_retry_on_failure;
+        upstream.retry_delay_ms = self.upstream_retry_delay_ms.max(1);
+        upstream.verify_upstream_tls = self.verify_upstream_tls;
+
+        let mut connection_pool = soth_mitm::ConnectionPoolConfig::default();
+        connection_pool.max_connections_per_host = self.max_connections_per_host;
+        connection_pool.idle_timeout_ms = self.idle_timeout_ms;
+        connection_pool.max_idle_per_host = self.max_idle_per_host;
+
+        let mut body = soth_mitm::BodyConfig::default();
+        body.max_size_bytes = self.max_body_bytes;
+        body.buffer_request_bodies = self.buffer_request_bodies;
+
+        let intercept_mode = match self.intercept_mode {
+            Some(InterceptModeConfig::Monitor) => soth_mitm::InterceptMode::Monitor,
+            Some(InterceptModeConfig::Enforce) => soth_mitm::InterceptMode::Enforce,
+            // Backwards-compat: derive from buffer_request_bodies when not explicitly set.
+            None => {
+                if self.buffer_request_bodies {
+                    soth_mitm::InterceptMode::Enforce
+                } else {
+                    soth_mitm::InterceptMode::Monitor
                 }
-            },
-            handler: soth_mitm::HandlerConfig {
-                request_timeout_ms: self.request_timeout_ms,
-                response_timeout_ms: self.response_timeout_ms,
-                recover_from_panics: self.handler_recover_from_panics,
-            },
-            flow_runtime: soth_mitm::FlowRuntimeConfig {
-                dispatch_queue_capacity: self.flow_dispatch_queue_capacity.map(|v| v.max(1)),
-                closed_flow_lru_capacity: self.closed_flow_lru_capacity.map(|v| v.max(1)),
-                stale_flow_ttl_ms: self.stale_flow_ttl_ms.filter(|ttl| *ttl > 0),
-                stale_reap_max_batch: self.stale_reap_max_batch.map(|v| v.max(1)),
-                dispatch_queue_send_timeout_ms: self
-                    .dispatch_queue_send_timeout_ms
-                    .filter(|timeout| *timeout > 0),
-                dispatch_close_join_timeout_ms: self
-                    .dispatch_close_join_timeout_ms
-                    .filter(|timeout| *timeout > 0),
-            },
-        })
+            }
+        };
+
+        let mut handler = soth_mitm::HandlerConfig::default();
+        handler.request_timeout_ms = self.request_timeout_ms;
+        handler.response_timeout_ms = self.response_timeout_ms;
+        handler.recover_from_panics = self.handler_recover_from_panics;
+
+        let mut flow_runtime = soth_mitm::FlowRuntimeConfig::default();
+        flow_runtime.dispatch_queue_capacity = self.flow_dispatch_queue_capacity.map(|v| v.max(1));
+        flow_runtime.closed_flow_lru_capacity = self.closed_flow_lru_capacity.map(|v| v.max(1));
+        flow_runtime.stale_flow_ttl_ms = self.stale_flow_ttl_ms.filter(|ttl| *ttl > 0);
+        flow_runtime.stale_reap_max_batch = self.stale_reap_max_batch.map(|v| v.max(1));
+        flow_runtime.dispatch_queue_send_timeout_ms = self
+            .dispatch_queue_send_timeout_ms
+            .filter(|timeout| *timeout > 0);
+        flow_runtime.dispatch_close_join_timeout_ms = self
+            .dispatch_close_join_timeout_ms
+            .filter(|timeout| *timeout > 0);
+
+        let mut config = soth_mitm::MitmConfig::default();
+        config.bind = bind;
+        config.unix_socket_path = self.unix_socket_path.clone();
+        config.interception = interception;
+        config.process_attribution = process_attribution;
+        config.tls = tls;
+        config.http2_enabled = self.http2_enabled;
+        config.http2_max_header_list_size = self.http2_max_header_list_size.max(1);
+        config.http3_passthrough = self.http3_passthrough;
+        config.max_http_head_bytes = self.max_http_head_bytes.max(1);
+        config.accept_retry_backoff_ms = self.accept_retry_backoff_ms.max(1);
+        config.max_flow_event_backlog = self.max_flow_event_backlog.max(1);
+        config.max_in_flight_bytes = self.max_in_flight_bytes.max(1);
+        config.max_concurrent_flows = self.max_concurrent_flows.max(1);
+        config.upstream = upstream;
+        config.connection_pool = connection_pool;
+        config.body = body;
+        config.intercept_mode = intercept_mode;
+        config.handler = handler;
+        config.flow_runtime = flow_runtime;
+        Ok(config)
     }
 }
 

@@ -171,27 +171,52 @@ struct DbWriteJob {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_classify_task(
-    connection_id: Uuid,
-    detect_result: soth_core::DetectResult,
-    content_for_embedding: Option<String>,
-    proxy_ctx: soth_core::ProxyContext,
-    capture_mode: soth_core::CaptureMode,
-    matched_provider: Option<String>,
-    matched_application: Option<String>,
-    raw_body_for_commitment: Option<Bytes>,
-    classify_bundle: Arc<soth_classify::ClassifyBundle>,
-    policy_bundle: Arc<soth_policy::PolicyBundle>,
-    bundle_trust_level: soth_core::BundleTrustLevel,
-    classify_config: Arc<soth_classify::ClassifyConfig>,
-    policy_block_enforced: Arc<AtomicBool>,
-    session_store: Arc<SessionManager>,
-    telemetry: Option<Arc<soth_telemetry::TelemetryPipeline>>,
-    observer_broadcast: Option<soth_core::ObserverBroadcast>,
-    runtime: Arc<Runtime>,
-    lane: Lane,
-    pending_emit_store: Option<Arc<PendingEmitStore>>,
-) -> oneshot::Receiver<soth_core::PolicyDecisionKind> {
+/// All inputs needed to spawn a classify task. Replaces the 20-argument
+/// function signature with a single struct.
+pub struct ClassifyTaskInput {
+    pub connection_id: Uuid,
+    pub detect_result: soth_core::DetectResult,
+    pub content_for_embedding: Option<String>,
+    pub proxy_ctx: soth_core::ProxyContext,
+    pub capture_mode: soth_core::CaptureMode,
+    pub matched_provider: Option<String>,
+    pub matched_application: Option<String>,
+    pub raw_body_for_commitment: Option<Bytes>,
+    pub classify_bundle: Arc<soth_classify::ClassifyBundle>,
+    pub policy_bundle: Arc<soth_policy::PolicyBundle>,
+    pub bundle_trust_level: soth_core::BundleTrustLevel,
+    pub classify_config: Arc<soth_classify::ClassifyConfig>,
+    pub policy_block_enforced: Arc<AtomicBool>,
+    pub session_store: Arc<SessionManager>,
+    pub telemetry: Option<Arc<soth_telemetry::TelemetryPipeline>>,
+    pub observer_broadcast: Option<soth_core::ObserverBroadcast>,
+    pub runtime: Arc<Runtime>,
+    pub lane: Lane,
+    pub pending_emit_store: Option<Arc<PendingEmitStore>>,
+}
+
+pub fn spawn_classify_task(input: ClassifyTaskInput) -> oneshot::Receiver<soth_core::PolicyDecisionKind> {
+    let ClassifyTaskInput {
+        connection_id,
+        detect_result,
+        content_for_embedding,
+        proxy_ctx,
+        capture_mode,
+        matched_provider,
+        matched_application,
+        raw_body_for_commitment,
+        classify_bundle,
+        policy_bundle,
+        bundle_trust_level,
+        classify_config,
+        policy_block_enforced,
+        session_store,
+        telemetry,
+        observer_broadcast,
+        runtime,
+        lane,
+        pending_emit_store,
+    } = input;
     let (tx, rx) = oneshot::channel();
 
     tokio::spawn(async move {
@@ -401,6 +426,12 @@ pub fn merge_and_emit(
     let Some(classify_data) = resolved.classify_data else {
         return;
     };
+    if resolved.response_data.is_none() {
+        tracing::debug!(
+            %connection_id,
+            "emitting partial event without response data (output tokens, TTFB, finish reason will be absent)"
+        );
+    }
     let mut event = classify_data.telemetry_event;
 
     if let Some(ref response) = resolved.response_data {
@@ -451,7 +482,7 @@ pub fn merge_and_emit(
 /// - A policy block/alert was triggered (always important)
 fn should_emit_telemetry(event: &soth_core::TelemetryEvent) -> bool {
     // Always emit events with known provider
-    if event.provider != soth_core::DetectedProvider::Unknown {
+    if event.provider != "unknown" {
         return true;
     }
 

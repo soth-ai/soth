@@ -617,6 +617,9 @@ fn gating_large_corpus_evaluator_in_out() {
             &req,
             &build_process_info(case.bundle_id.as_str()),
             GateOverrides::default(),
+            None,
+            &soth_core::EntityIndex::build(vec![]),
+            &soth_core::EnvIndex::default(),
         );
         assert_gate_outcome(case, &outcome);
     }
@@ -724,6 +727,9 @@ async fn gating_large_corpus_proxy_handler_subset_e2e() {
             &req_core,
             &build_process_info(case.bundle_id.as_str()),
             GateOverrides::default(),
+            None,
+            &soth_core::EntityIndex::build(vec![]),
+            &soth_core::EnvIndex::default(),
         );
         assert_gate_outcome(case, &expected);
 

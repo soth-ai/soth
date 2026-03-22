@@ -48,6 +48,7 @@ pub struct PendingCapture {
 
 pub struct PendingStore {
     inner: DashMap<Uuid, PendingCapture>,
+    max_capacity: usize,
 }
 
 impl Default for PendingStore {
@@ -60,10 +61,22 @@ impl PendingStore {
     pub fn new() -> Self {
         Self {
             inner: DashMap::new(),
+            max_capacity: 2_048,
+        }
+    }
+
+    pub fn with_capacity(max_capacity: usize) -> Self {
+        Self {
+            inner: DashMap::new(),
+            max_capacity,
         }
     }
 
     pub fn insert(&self, capture: PendingCapture) {
+        // Enforce capacity: evict oldest entries if at limit
+        if self.inner.len() >= self.max_capacity {
+            self.evict_oldest(self.max_capacity / 8); // evict ~12.5% to avoid thrashing
+        }
         self.inner.insert(capture.connection_id, capture);
     }
 
@@ -75,8 +88,31 @@ impl PendingStore {
         self.inner.remove(connection_id).is_some()
     }
 
-    pub fn evict_stale(&self, max_age: Duration) {
-        self.inner
-            .retain(|_, pending| pending.stored_at.elapsed() <= max_age);
+    pub fn evict_stale(&self, max_age: Duration, max_scan: usize) {
+        let mut scanned = 0;
+        let mut to_remove = Vec::new();
+        for entry in self.inner.iter() {
+            if scanned >= max_scan {
+                break;
+            }
+            if entry.value().stored_at.elapsed() > max_age {
+                to_remove.push(*entry.key());
+            }
+            scanned += 1;
+        }
+        for id in to_remove {
+            self.inner.remove(&id);
+        }
+    }
+
+    /// Force-evict the oldest N entries regardless of age.
+    fn evict_oldest(&self, count: usize) {
+        let mut entries: Vec<(Uuid, Instant)> = self.inner.iter()
+            .map(|e| (*e.key(), e.value().stored_at))
+            .collect();
+        entries.sort_by_key(|(_, ts)| *ts);
+        for (id, _) in entries.into_iter().take(count) {
+            self.inner.remove(&id);
+        }
     }
 }

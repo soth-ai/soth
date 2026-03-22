@@ -122,11 +122,13 @@ fn runtime_status_path() -> PathBuf {
 }
 
 fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|value| value.as_millis() as u64)
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(e) => {
+            tracing::warn!(error = %e, "system clock before UNIX epoch; using timestamp 0");
+            0
+        }
+    }
 }
 
 fn run_dir() -> PathBuf {

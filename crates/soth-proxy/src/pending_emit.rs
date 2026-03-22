@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use uuid::Uuid;
@@ -56,6 +56,7 @@ pub struct ResolvedEmit {
 /// both halves so the caller can emit the complete telemetry event.
 pub struct PendingEmitStore {
     inner: DashMap<Uuid, PendingEmit>,
+    max_capacity: usize,
 }
 
 impl Default for PendingEmitStore {
@@ -68,6 +69,7 @@ impl PendingEmitStore {
     pub fn new() -> Self {
         Self {
             inner: DashMap::new(),
+            max_capacity: 2_048,
         }
     }
 
@@ -80,6 +82,10 @@ impl PendingEmitStore {
         session_credential_alerts: u32,
         conversation_turn: Option<u32>,
     ) {
+        // Enforce capacity: evict oldest entries if at limit
+        if self.inner.len() >= self.max_capacity {
+            self.evict_oldest(self.max_capacity / 8); // evict ~12.5% to avoid thrashing
+        }
         self.inner.insert(
             connection_id,
             PendingEmit {
@@ -135,18 +141,30 @@ impl PendingEmitStore {
         self.inner.remove(connection_id);
     }
 
-    /// Evict entries older than `max_age`. Returns stale entries that had
-    /// at least classify or response data (for partial emission).
-    pub fn evict_stale(&self, max_age: std::time::Duration) -> Vec<(Uuid, ResolvedEmit)> {
+    /// Evict entries older than `max_age`. Scans at most `max_scan` entries per call
+    /// to avoid GC pauses. Returns stale entries that had at least classify or
+    /// response data (for partial emission).
+    pub fn evict_stale(&self, max_age: Duration, max_scan: usize) -> Vec<(Uuid, ResolvedEmit)> {
         let mut stale = Vec::new();
-        self.inner.retain(|id, entry| {
-            if entry.created_at.elapsed() > max_age {
+        let mut scanned = 0;
+        let mut to_remove = Vec::new();
+        for entry in self.inner.iter() {
+            if scanned >= max_scan {
+                break;
+            }
+            if entry.value().created_at.elapsed() > max_age {
+                to_remove.push(*entry.key());
+            }
+            scanned += 1;
+        }
+        for id in to_remove {
+            if let Some((_, entry)) = self.inner.remove(&id) {
                 if entry.classify_data.is_some() || entry.response_data.is_some() {
                     stale.push((
-                        *id,
+                        id,
                         ResolvedEmit {
-                            classify_data: entry.classify_data.take(),
-                            response_data: entry.response_data.take(),
+                            classify_data: entry.classify_data,
+                            response_data: entry.response_data,
                             session_request_count: entry.session_request_count,
                             session_total_tokens: entry.session_total_tokens,
                             session_credential_alerts: entry.session_credential_alerts,
@@ -154,12 +172,19 @@ impl PendingEmitStore {
                         },
                     ));
                 }
-                false // remove
-            } else {
-                true // keep
             }
-        });
+        }
         stale
+    }
+
+    fn evict_oldest(&self, count: usize) {
+        let mut entries: Vec<(Uuid, Instant)> = self.inner.iter()
+            .map(|e| (*e.key(), e.value().created_at))
+            .collect();
+        entries.sort_by_key(|(_, ts)| *ts);
+        for (id, _) in entries.into_iter().take(count) {
+            self.inner.remove(&id);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -283,7 +308,7 @@ mod tests {
         store.deposit_classify(id, sample_classify_data());
 
         // Evict with zero duration to force stale
-        let stale = store.evict_stale(std::time::Duration::ZERO);
+        let stale = store.evict_stale(std::time::Duration::ZERO, 256);
         assert_eq!(stale.len(), 1);
         assert!(stale[0].1.classify_data.is_some());
         assert!(stale[0].1.response_data.is_none());

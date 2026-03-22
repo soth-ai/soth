@@ -11,7 +11,7 @@ use uuid::Uuid;
 use soth_core::{
     AppType, CaptureMode, ClassificationSource, ConnectionMeta, ParseConfidence,
     PolicyDecisionKind, ProcessMatchKind, ProcessResolution, ProxyContext, RawRequest,
-    SessionSnapshot, SocketFamily, TrafficClassification,
+    SessionSnapshot, SocketFamily, SurfaceType, TrafficClassification,
 };
 use soth_telemetry::{EncryptionMode, SinkError, TelemetrySink, TransmittedBatch};
 
@@ -96,6 +96,10 @@ fn sample_proxy_context(capture_mode: CaptureMode, timestamp_epoch_ms: i64) -> P
         deployment_context: None,
         precomputed_commitment_nonce: None,
         precomputed_commitment_hash: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     }
 }
 

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::sync::oneshot::error::TryRecvError;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -41,6 +41,10 @@ pub struct ProxyHandler {
     /// Populated from the native registry bundle when available; falls back
     /// to an empty index so the proxy functions correctly without it.
     entity_index: Arc<ArcSwap<soth_core::EntityIndex>>,
+    /// Pre-built environment index mapping parent process identifiers to their
+    /// `EnvironmentClass`.  Built from `detect.environments` at bundle load
+    /// time.  Used for shadow-IT surface fallback and IdePlugin gating.
+    env_index: Arc<ArcSwap<soth_core::EnvIndex>>,
     session_store: Arc<SessionManager>,
     pending: Arc<PendingStore>,
     pending_emit: Arc<PendingEmitStore>,
@@ -77,18 +81,20 @@ impl ProxyHandler {
         crate::heartbeat_telemetry::record_bundle_trust_level(initial_bundle.trust_level);
         let initial_parser_registry = build_parser_registry(initial_bundle.detect.as_ref());
         let initial_gate_evaluator = GateEvaluator::new(initial_bundle.gating.clone());
-        // Entity index starts empty; the native-bundle wiring layer is
-        // responsible for calling `on_bundle_updated` with a bundle that
-        // carries a populated index.  An empty index is safe: the four
-        // resolved fields in ProcessResolution will simply remain None.
-        let initial_entity_index = soth_core::EntityIndex::build(vec![]);
+        // Seed the entity index from the initial bundle so host resolution
+        // works immediately — before the first hot-reload fires.
+        let initial_entity_index = initial_bundle.entity_index.clone();
+        // Env index is seeded from the initial bundle's detect data so that
+        // parent-environment lookups work even before the first hot-reload.
+        let initial_env_index = (*initial_bundle.env_index).clone();
         let classify_runtime =
             crate::classify_task::Runtime::new(db.clone(), classify_runtime_config);
         Self {
             bundle_handle,
             parser_registry: Arc::new(ArcSwap::from_pointee(initial_parser_registry)),
             gate_evaluator: Arc::new(ArcSwap::from_pointee(initial_gate_evaluator)),
-            entity_index: Arc::new(ArcSwap::from_pointee(initial_entity_index)),
+            entity_index: Arc::new(ArcSwap::new(initial_entity_index)),
+            env_index: Arc::new(ArcSwap::from_pointee(initial_env_index)),
             session_store: Arc::new(SessionManager::new(pipeline_config.session.clone())),
             pending: Arc::new(PendingStore::new()),
             pending_emit: Arc::new(PendingEmitStore::new()),
@@ -109,14 +115,17 @@ impl ProxyHandler {
 
     pub fn maintenance_tick(&self) {
         self.gate_evaluator.load().maintenance_tick();
-        self.pending.evict_stale(Duration::from_secs(300));
-        self.streaming.evict_stale(Duration::from_secs(300));
-        self.session_store.evict_stale();
+
+        // Bounded reap: scan at most 256 entries per tick to avoid GC pauses
+        const MAX_REAP_SCAN: usize = 256;
+        self.pending.evict_stale(Duration::from_secs(300), MAX_REAP_SCAN);
+        self.streaming.evict_stale(Duration::from_secs(300), MAX_REAP_SCAN);
+        self.session_store.evict_stale(MAX_REAP_SCAN);
         self.expire_embeddings_if_due();
 
         // Evict stale pending_emit entries (classify completed but response never arrived).
         // Emit classify-only telemetry for these so they are not lost.
-        let stale_entries = self.pending_emit.evict_stale(Duration::from_secs(60));
+        let stale_entries = self.pending_emit.evict_stale(Duration::from_secs(60), MAX_REAP_SCAN);
         for (connection_id, stale) in stale_entries {
             if let Some(mut classify_data) = stale.classify_data {
                 // Stamp session metadata even without response data
@@ -187,6 +196,8 @@ impl ProxyHandler {
     }
 
     pub fn on_bundle_updated(&self, bundle: &soth_bundle::LoadedBundle) {
+        // Store the bundle's entity_index directly — it's already behind an Arc.
+        self.entity_index.store(Arc::clone(&bundle.entity_index));
         self.on_bundle_updated_with_index(bundle, None);
     }
 
@@ -209,6 +220,10 @@ impl ProxyHandler {
         if let Some(index) = entity_index {
             self.entity_index.store(Arc::new(index));
         }
+        // env_index is always rebuilt from the bundle's detect data; no
+        // separate optional path needed — every LoadedBundle carries one.
+        self.env_index
+            .store(Arc::clone(&bundle.env_index));
         tracing::info!(
             bundle_version = bundle.version,
             "bundle hot-swap applied; parser and gate evaluators rebuilt"
@@ -225,6 +240,8 @@ impl ProxyHandler {
 
         let bundle = self.bundle_handle.current();
         let detect_bundle = bundle.detect_slice();
+        let entity_index = self.entity_index.load();
+        let env_index = self.env_index.load();
         let outcome = self.gate_evaluator.load().evaluate_http(
             &req,
             &req.connection_meta.process_info,
@@ -238,6 +255,9 @@ impl ProxyHandler {
                     .non_cataloged_host_action
                     .and_then(map_non_cataloged_action),
             },
+            Some(&detect_bundle),
+            entity_index.as_ref(),
+            env_index.as_ref(),
         );
         crate::trace::http_gate(
             connection_id,
@@ -293,12 +313,51 @@ impl ProxyHandler {
             outcome.matched_application.as_deref(),
         ));
 
+        // Product identity from entity resolution (entity slug = product_id).
+        // IdePlugin gating is now enforced inside resolve_tool(): if the parent
+        // is not an IDE-class environment, resolve_tool() returns None and we
+        // fall through to the shadow IT branch below.
+        let env_index = self.env_index.load();
+        let parent_bundle_id = req
+            .connection_meta
+            .process_info
+            .as_ref()
+            .and_then(|info| info.parent_bundle_id.as_deref());
+        let parent_process_name = req
+            .connection_meta
+            .process_info
+            .as_ref()
+            .and_then(|info| info.parent_process_name.as_deref());
+        let resolved_tool = entity_index.resolve_tool(
+            process_resolution.bundle_id.as_deref(),
+            process_resolution.process_name.as_deref(),
+            parent_bundle_id,
+            parent_process_name,
+            env_index.as_ref(),
+        );
+        let (product_id, surface_type, is_shadow_it) = match resolved_tool {
+            Some((entity, _)) => (
+                Some(entity.id.clone()),
+                entity.kind.to_surface_type(),
+                false,
+            ),
+            None => {
+                // Shadow IT — derive surface_type from the parent environment so
+                // the telemetry record carries meaningful context even without a
+                // known entity match.  This branch also handles the IdePlugin
+                // case where the parent is not an IDE (resolve_tool returned None).
+                let parent_env_class = env_index.resolve_parent(parent_bundle_id, parent_process_name);
+                let surface = env_class_to_surface(parent_env_class);
+                (None, surface, true)
+            }
+        };
+
         // Derive session key and bind this connection
         let session_key = self.session_store.derive_key(
             &process_resolution,
             outcome.matched_application.as_deref(),
         );
-        self.session_store.get_or_create(&session_key);
+        let session_result = self.session_store.get_or_create(&session_key);
         self.session_store
             .bind_connection(connection_id, session_key.clone());
 
@@ -331,6 +390,23 @@ impl ProxyHandler {
                 detect_result.normalized.parse_confidence = soth_core::ParseConfidence::Partial;
             }
         }
+        // Concise per-request debug line: model + key metadata.
+        // Always visible at RUST_LOG=soth_proxy=debug.
+        {
+            let n = &detect_result.normalized;
+            debug!(
+                provider = n.provider.as_str(),
+                model = n.model.as_deref().unwrap_or("-"),
+                tokens = n.estimated_input_tokens,
+                confidence = ?detect_result.confidence,
+                artifacts = detect_result.artifacts.len(),
+                host = host.as_str(),
+                "{method} {path}",
+                method = req.method,
+                path = req.path,
+            );
+        }
+
         crate::trace::detect_summary(
             connection_id,
             original_body_len,
@@ -353,7 +429,13 @@ impl ProxyHandler {
 
         let content_for_embedding = match lane {
             crate::session::Lane::CodeContextRepeat => None,
-            _ => extract_content_for_embedding(&req.body),
+            // Prefer parsed content (system prompt + user message) over raw body.
+            // Raw body includes JSON structure, API params, temperature, etc. that
+            // would pollute the embedding vector.
+            _ => detect_result
+                .user_prompt
+                .clone()
+                .or_else(|| extract_content_for_embedding(&req.body)),
         };
 
         let request_timestamp_ms = chrono::Utc::now().timestamp_millis();
@@ -385,6 +467,12 @@ impl ProxyHandler {
             deployment_context: None,
             precomputed_commitment_nonce: None,
             precomputed_commitment_hash: None,
+            connection_id: Some(connection_id),
+            bundle_trust_level: Some(soth_core::BundleTrustLevel::SignatureDisabled),
+            session_id: Some(session_result.session_id),
+            product_id,
+            surface_type,
+            is_shadow_it,
         };
 
         let raw_body_for_commitment = match outcome.capture_mode {
@@ -400,7 +488,7 @@ impl ProxyHandler {
             emit_session_request_count,
             emit_session_total_tokens,
             emit_session_credential_alerts,
-            None, // conversation_turn populated by response handler for WS
+            detect_result.normalized.conversation_turn,
         );
 
         // Detect WebSocket upgrade intent from request headers.
@@ -417,42 +505,28 @@ impl ProxyHandler {
 
         if is_websocket_upgrade {
             // Seed provider from gating metadata so the DB record isn't "unknown".
-            if detect_result.normalized.provider == soth_core::DetectedProvider::Unknown {
+            if detect_result.normalized.provider == "unknown" {
                 if let Some(ref mp) = outcome.matched_provider {
                     detect_result.normalized.provider = provider_from_matched(mp);
                 }
             }
             detect_result.normalized.stream = true;
-
-            self.pending.insert(PendingCapture {
-                connection_id,
-                stored_at: Instant::now(),
-                request_method: req.method.clone(),
-                request_host: host.clone(),
-                request_path: req.path.clone(),
-                request_body_bytes: original_body_len,
-                outcome: outcome.clone(),
-                detect_result,
-                proxy_ctx,
-                raw_body: raw_body_for_commitment,
-                deferred_classify: Some(crate::pending::DeferredClassify {
-                    content_for_embedding,
-                    raw_body_for_db,
-                    classify_bundle: bundle.classify.clone(),
-                    policy_bundle: bundle.policy.clone(),
-                    bundle_trust_level: bundle.trust_level,
-                    classify_config: self.classify_config.clone(),
-                    lane,
-                }),
-                is_websocket: true,
-            });
-            crate::trace::handler_decision(
-                connection_id,
-                "allow",
-                "websocket upgrade; classify deferred to first frame",
-            );
-            return soth_mitm::HandlerDecision::Allow;
         }
+
+        // ── Phase 5: Insert PendingCapture (unified WS + HTTP path) ─────────
+        let deferred_classify = if is_websocket_upgrade {
+            Some(crate::pending::DeferredClassify {
+                content_for_embedding: content_for_embedding.clone(),
+                raw_body_for_db: raw_body_for_db.clone(),
+                classify_bundle: bundle.classify.clone(),
+                policy_bundle: bundle.policy.clone(),
+                bundle_trust_level: bundle.trust_level,
+                classify_config: self.classify_config.clone(),
+                lane,
+            })
+        } else {
+            None
+        };
 
         self.pending.insert(PendingCapture {
             connection_id,
@@ -465,31 +539,42 @@ impl ProxyHandler {
             detect_result: detect_result.clone(),
             proxy_ctx: proxy_ctx.clone(),
             raw_body: raw_body_for_commitment,
-            deferred_classify: None,
-            is_websocket: false,
+            deferred_classify,
+            is_websocket: is_websocket_upgrade,
         });
+
+        if is_websocket_upgrade {
+            crate::trace::handler_decision(
+                connection_id,
+                "allow",
+                "websocket upgrade; classify deferred to first frame",
+            );
+            return soth_mitm::HandlerDecision::Allow;
+        }
 
         let policy_block_enforced = Arc::new(AtomicBool::new(false));
         let mut block_rx = classify_task::spawn_classify_task(
-            connection_id,
-            detect_result,
-            content_for_embedding,
-            proxy_ctx,
-            outcome.capture_mode,
-            outcome.matched_provider.clone(),
-            outcome.matched_application.clone(),
-            raw_body_for_db,
-            bundle.classify.clone(),
-            bundle.policy.clone(),
-            bundle.trust_level,
-            self.classify_config.clone(),
-            policy_block_enforced.clone(),
-            self.session_store.clone(),
-            self.telemetry.clone(),
-            self.observer_broadcast.clone(),
-            self.classify_runtime.clone(),
-            lane,
-            Some(self.pending_emit.clone()),
+            classify_task::ClassifyTaskInput {
+                connection_id,
+                detect_result,
+                content_for_embedding,
+                proxy_ctx,
+                capture_mode: outcome.capture_mode,
+                matched_provider: outcome.matched_provider.clone(),
+                matched_application: outcome.matched_application.clone(),
+                raw_body_for_commitment: raw_body_for_db,
+                classify_bundle: bundle.classify.clone(),
+                policy_bundle: bundle.policy.clone(),
+                bundle_trust_level: bundle.trust_level,
+                classify_config: self.classify_config.clone(),
+                policy_block_enforced: policy_block_enforced.clone(),
+                session_store: self.session_store.clone(),
+                telemetry: self.telemetry.clone(),
+                observer_broadcast: self.observer_broadcast.clone(),
+                runtime: self.classify_runtime.clone(),
+                lane,
+                pending_emit_store: Some(self.pending_emit.clone()),
+            },
         );
 
         let timeout_ms = self.pipeline_config.block_signal_timeout_ms;
@@ -603,7 +688,7 @@ impl ProxyHandler {
         // estimate tokens from body size.  This covers providers like Gemini web
         // that use proprietary response formats without standard usage metadata.
         if usage.is_none() && !skip_body_parse && response_body_bytes > 256 {
-            let estimated_output_tokens = (response_body_bytes as u64) / 8;
+            let estimated_output_tokens = estimate_output_tokens(response_body_bytes as u64);
             usage = Some(UsageSummary {
                 input_tokens: pending
                     .detect_result
@@ -627,7 +712,7 @@ impl ProxyHandler {
             response.status,
             response.body.as_ref(),
             usage.as_ref(),
-            pending.detect_result.normalized.provider.canonical_name(),
+            pending.detect_result.normalized.provider.as_str(),
             pending.detect_result.normalized.model.as_deref(),
         );
         if let Some(ref usage) = usage {
@@ -658,31 +743,72 @@ impl ProxyHandler {
             // If classify was deferred (WebSocket upgrade with empty body),
             // spawn it now enriched with data from the first frame.
             if let Some(deferred) = pending.deferred_classify.take() {
-                // Model extraction from the first frame is handled by
-                // soth-detect's process_chunk_with_bundle() via the
-                // StreamSession, so we don't need to do it here.
+                // Re-run detect on the first frame body to get a fresh result
+                // with model/tokens. The original detect result from the upgrade
+                // request had an empty body (provider=unknown, model=null, 0 tokens).
+                let refreshed_detect = if !chunk.payload.is_empty() {
+                    let bundle = self.bundle_handle.current();
+                    let detect_bundle = bundle.detect_slice();
+                    let parser_registry = self.parser_registry.load();
+                    let mut frame_req = soth_core::RawRequest {
+                        method: pending.request_method.clone(),
+                        path: pending.request_path.clone(),
+                        headers: soth_core::RequestHeaders::new(),
+                        body: chunk.payload.clone(),
+                        connection_meta: soth_core::ConnectionMeta::from_transport(
+                            pending.connection_id,
+                            soth_core::SocketFamily::UnixDomain { path: None },
+                            None,
+                            None,
+                        ),
+                    };
+                    frame_req.connection_meta.matched_provider =
+                        pending.outcome.matched_provider.clone();
+                    frame_req.connection_meta.matched_application =
+                        pending.outcome.matched_application.clone();
+                    frame_req.connection_meta.capture_mode =
+                        Some(pending.outcome.capture_mode);
+                    let snapshot = soth_core::SessionSnapshot::default();
+                    let result = soth_detect::process_with_registry(
+                        parser_registry.as_ref(),
+                        &frame_req,
+                        &detect_bundle,
+                        &snapshot,
+                    );
+                    // Only use the refreshed result if it has better confidence
+                    // than the stale upgrade-request detect.
+                    if result.confidence != soth_core::ParseConfidence::Heuristic {
+                        result
+                    } else {
+                        pending.detect_result.clone()
+                    }
+                } else {
+                    pending.detect_result.clone()
+                };
 
                 let policy_block_enforced = Arc::new(AtomicBool::new(false));
                 let _block_rx = classify_task::spawn_classify_task(
-                    pending.connection_id,
-                    pending.detect_result.clone(),
-                    deferred.content_for_embedding,
-                    pending.proxy_ctx.clone(),
-                    pending.outcome.capture_mode,
-                    pending.outcome.matched_provider.clone(),
-                    pending.outcome.matched_application.clone(),
-                    deferred.raw_body_for_db,
-                    deferred.classify_bundle,
-                    deferred.policy_bundle,
-                    deferred.bundle_trust_level,
-                    deferred.classify_config,
-                    policy_block_enforced,
-                    self.session_store.clone(),
-                    self.telemetry.clone(),
-                    self.observer_broadcast.clone(),
-                    self.classify_runtime.clone(),
-                    deferred.lane,
-                    Some(self.pending_emit.clone()),
+                    classify_task::ClassifyTaskInput {
+                        connection_id: pending.connection_id,
+                        detect_result: refreshed_detect,
+                        content_for_embedding: deferred.content_for_embedding,
+                        proxy_ctx: pending.proxy_ctx.clone(),
+                        capture_mode: pending.outcome.capture_mode,
+                        matched_provider: pending.outcome.matched_provider.clone(),
+                        matched_application: pending.outcome.matched_application.clone(),
+                        raw_body_for_commitment: deferred.raw_body_for_db,
+                        classify_bundle: deferred.classify_bundle,
+                        policy_bundle: deferred.policy_bundle,
+                        bundle_trust_level: deferred.bundle_trust_level,
+                        classify_config: deferred.classify_config,
+                        policy_block_enforced,
+                        session_store: self.session_store.clone(),
+                        telemetry: self.telemetry.clone(),
+                        observer_broadcast: self.observer_broadcast.clone(),
+                        runtime: self.classify_runtime.clone(),
+                        lane: deferred.lane,
+                        pending_emit_store: Some(self.pending_emit.clone()),
+                    },
                 );
                 // Block signal is ignored — the WebSocket upgrade was already allowed.
             }
@@ -709,14 +835,10 @@ impl ProxyHandler {
                     &turn,
                     &state,
                 );
-                let usage_summary = UsageSummary {
-                    input_tokens: turn.usage.input_tokens,
-                    output_tokens: turn.usage.output_tokens,
-                    estimated_output_cost_usd: 0.0,
-                    finish_reason: turn.usage.finish_reason.clone(),
-                };
-                self.session_store
-                    .apply_response_usage(chunk.connection_id, &usage_summary);
+                // Per-turn usage is written to the DB via write_stream_turn above.
+                // Session token totals are NOT updated here — they are applied
+                // once at stream finalization (finalize_completed_stream) to avoid
+                // double-counting across turns + final summary.
             }
         }
     }
@@ -781,11 +903,17 @@ impl ProxyHandler {
             return;
         };
 
-        // If no usage was extracted from the stream, estimate output tokens from
-        // accumulated payload bytes.  SSE JSON overhead is ~50% of payload, so
-        // effective text ≈ payload_bytes / 2, then ~4 chars per token.
+        self.finalize_completed_stream(connection_id, completed);
+    }
+
+    /// Finalize a completed stream: estimate usage, trace, update session/DB, emit.
+    ///
+    /// Shared by `handle_stream_end` and `on_connection_close` — the two paths
+    /// that can close a stream. The caller is responsible for taking the
+    /// `CompletedStream` from the streaming store.
+    fn finalize_completed_stream(&self, connection_id: Uuid, completed: crate::streaming::CompletedStream) {
         let usage = completed.usage.unwrap_or_else(|| {
-            let estimated_output_tokens = completed.accumulated_payload_bytes / 8;
+            let estimated_output_tokens = estimate_output_tokens(completed.accumulated_payload_bytes);
             UsageSummary {
                 input_tokens: completed
                     .pending
@@ -814,7 +942,7 @@ impl ProxyHandler {
             completed.chunk_count,
             completed.elapsed.as_millis() as u64,
             Some(&usage),
-            completed.pending.detect_result.normalized.provider.canonical_name(),
+            completed.pending.detect_result.normalized.provider.as_str(),
             completed
                 .extracted_model
                 .as_deref()
@@ -837,7 +965,6 @@ impl ProxyHandler {
             warn!(connection_id = %connection_id, "stream closed without chunks");
         }
 
-        // Deposit response-side data for rendezvous with classify.
         let ttfb_ms = completed.ttfb.map(|d| d.as_millis() as u64);
         let resp_data = pending_emit::response_data_from_usage(
             &usage,
@@ -923,70 +1050,32 @@ impl soth_mitm::InterceptHandler for ProxyHandler {
         // This handles providers like Claude web where SSE connections stay
         // open indefinitely and handle_stream_end() never fires.
         if let Some(completed) = self.streaming.take(&connection_id) {
-            let usage = completed.usage.unwrap_or_else(|| {
-                let estimated_output_tokens = completed.accumulated_payload_bytes / 8;
-                UsageSummary {
-                    input_tokens: completed
-                        .pending
-                        .detect_result
-                        .normalized
-                        .estimated_input_tokens as u64,
-                    output_tokens: estimated_output_tokens,
-                    estimated_output_cost_usd: 0.0,
-                    finish_reason: None,
-                }
-            });
-
-            crate::trace::stream_completed(
-                connection_id,
-                completed.chunk_count,
-                completed.elapsed.as_millis() as u64,
-                Some(&usage),
-                completed.pending.request_host.as_str(),
-                completed.pending.request_path.as_str(),
-                completed.pending.detect_result.normalized.parser_id.as_str(),
-                completed.pending.outcome.matched_provider.as_deref(),
-                completed.pending.outcome.matched_application.as_deref(),
-            );
-
-            self.session_store
-                .apply_response_usage(connection_id, &usage);
-
-            crate::db::update_stream_usage(
-                &self.db,
-                connection_id,
-                &usage,
-                completed.extracted_model.as_deref(),
-            );
-
-            // Deposit response-side data for rendezvous with classify.
-            let ttfb_ms = completed.ttfb.map(|d| d.as_millis() as u64);
-            let resp_data = pending_emit::response_data_from_usage(
-                &usage,
-                completed.elapsed.as_millis() as u64,
-                ttfb_ms,
-            );
-            self.deposit_response_and_maybe_emit(connection_id, resp_data);
-
+            self.finalize_completed_stream(connection_id, completed);
             tracing::debug!(
                 connection_id = %connection_id,
-                chunk_count = completed.chunk_count,
-                elapsed_ms = completed.elapsed.as_millis() as u64,
-                output_tokens = usage.output_tokens,
-                extracted_model = completed.extracted_model.as_deref().unwrap_or("-"),
                 "connection closed; finalized active stream"
             );
-        } else {
-            // No active stream — clean up any orphaned emit slot.
+        } else if !had_pending {
+            // No active stream AND no pending state — safe to clean up the emit slot.
+            // When had_pending is true but streaming.take() returned None,
+            // handle_stream_end() already ran and deposited response data.
+            // Classify may still be in flight — leave the slot for the
+            // rendezvous or maintenance_tick stale eviction to handle.
             self.pending_emit.remove(&connection_id);
-            if had_pending {
-                tracing::debug!(
-                    connection_id = %connection_id,
-                    "connection closed with pending state; cleaned up"
-                );
-            }
+        } else {
+            tracing::debug!(
+                connection_id = %connection_id,
+                "connection closed with pending state; classify may still be in flight"
+            );
         }
     }
+}
+
+/// Estimate output tokens from accumulated payload bytes.
+/// SSE JSON overhead is ~50% of payload, so effective text ≈ bytes / 2,
+/// then ~4 chars per token → bytes / 8.
+fn estimate_output_tokens(payload_bytes: u64) -> u64 {
+    payload_bytes / 8
 }
 
 fn extract_host(header_host: Option<&str>, path: &str) -> String {
@@ -1013,9 +1102,7 @@ fn extract_content_for_embedding(body: &Bytes) -> Option<String> {
 }
 
 fn sha256_hex(input: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    hex::encode(hasher.finalize())
+    soth_core::sha256_hex(input)
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -1064,8 +1151,16 @@ fn process_resolution_from_outcome(
     // Attempt O(1) entity resolution from the pre-built index.
     // `resolve_tool` prefers bundle_id over process_name, matching the
     // same priority as the `match_kind` derivation above.
+    // Parent info is not available here and IdePlugin gating does not apply
+    // to ProcessResolution metadata population — pass empty parent context.
     let resolved = entity_index.and_then(|idx| {
-        idx.resolve_tool(bundle_id.as_deref(), process_name.as_deref())
+        idx.resolve_tool(
+            bundle_id.as_deref(),
+            process_name.as_deref(),
+            None,
+            None,
+            &soth_core::EnvIndex::default(),
+        )
     });
 
     let (matched_app_id, tool_name, tool_kind, tool_category, provider_id) =
@@ -1095,6 +1190,18 @@ fn process_resolution_from_outcome(
         tool_category,
         provider_id,
         ..Default::default()
+    }
+}
+
+/// Convert an `EnvironmentClass` (the *parent* process's class) to the
+/// `SurfaceType` that best describes a request originating from that context.
+/// Used for shadow-IT fallback and IdePlugin-without-IDE gating.
+fn env_class_to_surface(class: Option<soth_core::EnvironmentClass>) -> soth_core::SurfaceType {
+    match class {
+        Some(soth_core::EnvironmentClass::Terminal) => soth_core::SurfaceType::Cli,
+        Some(soth_core::EnvironmentClass::IDE) => soth_core::SurfaceType::IdePlugin,
+        Some(soth_core::EnvironmentClass::Browser) => soth_core::SurfaceType::WebApp,
+        None => soth_core::SurfaceType::Unknown,
     }
 }
 
@@ -1158,25 +1265,23 @@ fn map_request_method(method: &str) -> soth_core::RequestMethod {
 ///
 /// Gating entity IDs are defined in the bundle and may use various naming
 /// conventions (e.g., "openai", "google-gemini", "chatgpt").
-fn provider_from_matched(matched: &str) -> soth_core::DetectedProvider {
+fn provider_from_matched(matched: &str) -> String {
     match matched.to_ascii_lowercase().as_str() {
-        "openai" | "chatgpt" | "codex" => soth_core::DetectedProvider::OpenAi,
-        "anthropic" | "claude" => soth_core::DetectedProvider::Anthropic,
-        "gemini" | "google-gemini" | "google" | "google_vertex" => {
-            soth_core::DetectedProvider::Gemini
-        }
-        "azure-openai" | "azure_openai" => soth_core::DetectedProvider::AzureOpenAi,
-        "cohere" => soth_core::DetectedProvider::Cohere,
-        "bedrock" => soth_core::DetectedProvider::Bedrock,
-        "mistral" => soth_core::DetectedProvider::Mistral,
-        "groq" => soth_core::DetectedProvider::Groq,
-        "together" => soth_core::DetectedProvider::Together,
-        "fireworks" => soth_core::DetectedProvider::Fireworks,
-        "ollama" => soth_core::DetectedProvider::Ollama,
-        "vllm" => soth_core::DetectedProvider::VLlm,
-        "lmstudio" => soth_core::DetectedProvider::LmStudio,
-        "vertex-ai" | "vertex_ai" => soth_core::DetectedProvider::VertexAi,
-        _ => soth_core::DetectedProvider::Unknown,
+        "openai" | "chatgpt" | "codex" => "openai".to_string(),
+        "anthropic" | "claude" => "anthropic".to_string(),
+        "gemini" | "google-gemini" | "google" | "google_vertex" => "gemini".to_string(),
+        "azure-openai" | "azure_openai" => "azure_openai".to_string(),
+        "cohere" => "cohere".to_string(),
+        "bedrock" => "bedrock".to_string(),
+        "mistral" => "mistral".to_string(),
+        "groq" => "groq".to_string(),
+        "together" => "together".to_string(),
+        "fireworks" => "fireworks".to_string(),
+        "ollama" => "ollama".to_string(),
+        "vllm" => "vllm".to_string(),
+        "lmstudio" => "lmstudio".to_string(),
+        "vertex-ai" | "vertex_ai" => "vertex_ai".to_string(),
+        _ => "unknown".to_string(),
     }
 }
 
@@ -1226,6 +1331,10 @@ fn mitm_stream_chunk_to_core(chunk: &soth_mitm::StreamChunk) -> soth_core::Strea
             soth_mitm::FrameKind::WebSocketBinary => soth_core::FrameKind::WebSocketBinary,
             soth_mitm::FrameKind::WebSocketClose => soth_core::FrameKind::WebSocketClose,
         },
+        direction: chunk.direction.map(|d| match d {
+            soth_mitm::FrameDirection::ClientToServer => soth_core::FrameDirection::ClientToServer,
+            soth_mitm::FrameDirection::ServerToClient => soth_core::FrameDirection::ServerToClient,
+        }),
     }
 }
 

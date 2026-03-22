@@ -101,21 +101,35 @@ pub fn evaluate_path_rules(
     allow_empty_means_allow_all_except_denied: bool,
 ) -> Option<DecisionReason> {
     let rules = &matched.host_rule.paths;
-    if rules.deny_exact.iter().any(|p| p == path) {
+    // Path rules are defined on the path component only — strip any query string
+    // so that `/v1/messages?beta=true` matches the allow pattern `/v1/messages`.
+    // Lowercase both sides for case-insensitive matching (matching fingerprint convention).
+    let path_only = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+
+    if rules
+        .deny_exact
+        .iter()
+        .any(|p| p.to_ascii_lowercase() == path_only)
+    {
         return Some(DecisionReason::PathDeniedExact);
     }
-    if rules
-        .deny_glob
-        .iter()
-        .any(|pattern| glob_match(pattern, path))
-    {
+    if rules.deny_glob.iter().any(|pattern| {
+        glob_match(&pattern.to_ascii_lowercase(), &path_only)
+    }) {
         return Some(DecisionReason::PathDeniedGlob);
     }
 
     let path_allowed = if rules.allow.is_empty() {
         allow_empty_means_allow_all_except_denied
     } else {
-        rules.allow.iter().any(|pattern| glob_match(pattern, path))
+        rules
+            .allow
+            .iter()
+            .any(|pattern| glob_match(&pattern.to_ascii_lowercase(), &path_only))
     };
     if !path_allowed {
         return Some(DecisionReason::PathDeniedGlob);
@@ -134,7 +148,7 @@ pub fn evaluate_path_rules(
 }
 
 fn specificity(pattern: &str) -> usize {
-    pattern.chars().filter(|ch| *ch != '*').count()
+    soth_core::bundle::detect::pattern_specificity(pattern)
 }
 
 fn glob_match(pattern: &str, text: &str) -> bool {
@@ -211,5 +225,36 @@ mod tests {
         );
         let reason = evaluate_path_rules(&matched, "/v1/chat/completions", "POST", true);
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn case_insensitive_path_matching() {
+        // deny_exact should match regardless of case
+        let matched = matched_with(
+            PathRules {
+                deny_exact: vec!["/V1/Models".to_string()],
+                deny_glob: vec![],
+                allow: vec![],
+            },
+            &[],
+        );
+        assert_eq!(
+            evaluate_path_rules(&matched, "/v1/models", "GET", true),
+            Some(DecisionReason::PathDeniedExact),
+        );
+
+        // allow patterns should match regardless of case
+        let matched = matched_with(
+            PathRules {
+                deny_exact: vec![],
+                deny_glob: vec![],
+                allow: vec!["/V1/Chat/*".to_string()],
+            },
+            &["POST"],
+        );
+        assert_eq!(
+            evaluate_path_rules(&matched, "/v1/chat/completions", "POST", true),
+            None,
+        );
     }
 }

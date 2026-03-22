@@ -415,7 +415,7 @@ pub fn write_intercept_record(
             ":event_id": result.telemetry_event.event_id.to_string(),
             ":connection_id": connection_id.to_string(),
             ":timestamp_utc": result.telemetry_event.timestamp_epoch_ms,
-            ":provider": result.telemetry_event.provider.canonical_name(),
+            ":provider": result.telemetry_event.provider.as_str(),
             ":model": model_value,
             ":endpoint_hash": proxy_ctx.endpoint_hash.clone(),
             ":api_version": detect_result.normalized.api_version.clone(),
@@ -550,7 +550,7 @@ pub fn write_stream_turn(
         .model
         .as_deref()
         .unwrap_or("unknown");
-    let provider = pending.detect_result.normalized.provider.canonical_name();
+    let provider = pending.detect_result.normalized.provider.as_str();
     let capture_mode = format!("{:?}", pending.outcome.capture_mode);
     let now_ms = Utc::now().timestamp_millis();
 

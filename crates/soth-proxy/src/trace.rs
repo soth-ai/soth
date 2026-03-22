@@ -375,7 +375,7 @@ pub(crate) fn detect_summary(
             "connection_id": connection_id.to_string(),
             "body_bytes": body_bytes,
             "truncated": truncated.map(|(actual, limit)| json!({"actual": actual, "limit": limit})).unwrap_or(Value::Null),
-            "provider": serialize_json(detect_result.normalized.provider),
+            "provider": &detect_result.normalized.provider,
             "model": detect_result.normalized.model,
             "parse_confidence": serialize_json(detect_result.confidence),
             "parse_source": serialize_json(detect_result.parse_source),
@@ -752,9 +752,17 @@ pub(crate) fn dev_verify_request(
         return;
     }
 
-    let max = dev_verify_max_body();
-    let body_text = truncate_body(request_body, max);
     let n = &detect_result.normalized;
+    let (system_prompt, mut user_prompt) = extract_prompts(request_body);
+    // If the raw-body extraction failed (form-encoded, protobuf, etc.) but
+    // the parser successfully extracted a prompt, use that instead.
+    if user_prompt.starts_with("[non-json") || user_prompt.is_empty() {
+        if let Some(ref parsed) = n.user_prompt {
+            if !parsed.is_empty() {
+                user_prompt = parsed.clone();
+            }
+        }
+    }
 
     let summary = format!(
         "\n\
@@ -769,13 +777,15 @@ pub(crate) fn dev_verify_request(
          │ confidence:  {confidence:?}\n\
          │ source:      {source:?}\n\
          │ is_ai_call:  {is_ai}\n\
-         │ est_input_tokens: {input_tokens}\n\
+         │ est_tokens:  {input_tokens}\n\
          │ artifacts:   {artifacts}\n\
          │ warnings:    {warnings}\n\
-         ├─── REQUEST BODY ({body_bytes} bytes) ──────────────────────\n\
-         {body_lines}\
+         ├─── SYSTEM PROMPT ──────────────────────────────────────────\n\
+         {system_lines}\
+         ├─── USER PROMPT ────────────────────────────────────────────\n\
+         {prompt_lines}\
          └────────────────────────────────────────────────────────────",
-        provider = n.provider.canonical_name(),
+        provider = n.provider,
         model = n.model.as_deref().unwrap_or("-"),
         endpoint = n.endpoint_type,
         confidence = detect_result.confidence,
@@ -784,11 +794,8 @@ pub(crate) fn dev_verify_request(
         input_tokens = n.estimated_input_tokens,
         artifacts = detect_result.artifacts.len(),
         warnings = detect_result.warnings.len(),
-        body_bytes = request_body.len(),
-        body_lines = body_text
-            .lines()
-            .map(|l| format!("│ {l}\n"))
-            .collect::<String>(),
+        system_lines = format_trace_block(&system_prompt, 500),
+        prompt_lines = format_trace_block(&user_prompt, 2000),
     );
 
     eprintln!("{summary}");
@@ -800,7 +807,7 @@ pub(crate) fn dev_verify_request(
             "method": method,
             "host": host,
             "path": path,
-            "provider": n.provider.canonical_name(),
+            "provider": &n.provider,
             "model": n.model,
             "endpoint_type": serialize_json(n.endpoint_type),
             "confidence": serialize_json(detect_result.confidence),
@@ -811,9 +818,115 @@ pub(crate) fn dev_verify_request(
             "artifacts_count": detect_result.artifacts.len(),
             "warnings_count": detect_result.warnings.len(),
             "request_body_bytes": request_body.len(),
-            "request_body_preview": body_text,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
         }),
     );
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+fn extract_prompts(body: &[u8]) -> (String, String) {
+    let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        return (String::new(), String::from("[non-json body]"));
+    };
+
+    // System prompt: top-level "system" field (Anthropic) or first system message
+    let system = json
+        .get("system")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| json.get("systemInstruction")
+            .and_then(|v| v.get("parts"))
+            .and_then(|v| v.get(0))
+            .and_then(|v| v.get("text"))
+            .and_then(|v| v.as_str())
+            .map(String::from))
+        .or_else(|| {
+            json.get("messages")
+                .and_then(|v| v.as_array())
+                .and_then(|msgs| {
+                    msgs.iter()
+                        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                })
+                .and_then(|m| extract_message_content(m))
+        })
+        .unwrap_or_default();
+
+    // User prompt: last user message in messages array, or fallback fields
+    let user = json
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .and_then(|msgs| {
+            msgs.iter()
+                .rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
+        .and_then(|m| extract_message_content(m))
+        .or_else(|| json.get("prompt").and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| json.get("input").and_then(|v| v.as_str()).map(String::from))
+        // Gemini: contents[last].parts[0].text
+        .or_else(|| {
+            json.get("contents")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.last())
+                .and_then(|v| v.get("parts"))
+                .and_then(|v| v.get(0))
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        // GraphQL: variables.input.content
+        .or_else(|| {
+            json.get("variables")
+                .and_then(|v| v.get("input"))
+                .and_then(|v| v.get("content"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_default();
+
+    (system, user)
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+fn extract_message_content(msg: &Value) -> Option<String> {
+    let content = msg.get("content")?;
+    // String content
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    // Array of content blocks: extract text blocks
+    if let Some(parts) = content.as_array() {
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| {
+                let type_val = p.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+                if type_val == "text" || type_val == "input_text" {
+                    p.get("text").and_then(|t| t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !texts.is_empty() {
+            return Some(texts.join("\n"));
+        }
+    }
+    None
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+fn format_trace_block(text: &str, max_chars: usize) -> String {
+    if text.is_empty() {
+        return "│ (none)\n".to_string();
+    }
+    let display = if text.len() > max_chars {
+        let end = text.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(text.len());
+        format!("{}... ({} chars truncated)", &text[..end], text.len() - end)
+    } else {
+        text.to_string()
+    };
+    display.lines().map(|l| format!("│ {l}\n")).collect()
 }
 
 #[cfg(not(feature = "dev-pipeline-trace"))]

@@ -30,9 +30,18 @@ struct SessionEntry {
     session: Session,
     /// Cached SHA-256 hash of the session key, computed once at creation.
     key_hash: String,
+    /// Unique instance ID for this session, stable for the lifetime of the entry.
+    session_id: Uuid,
     request_timestamps_ms: Vec<i64>,
     credential_timestamps_ms: Vec<i64>,
     last_active: Instant,
+}
+
+/// Result of session creation/lookup, carrying both the deterministic
+/// key hash (for dedup) and the unique session instance ID (for grouping).
+pub struct SessionResult {
+    pub key_hash: String,
+    pub session_id: Uuid,
 }
 
 impl SessionManager {
@@ -99,21 +108,18 @@ impl SessionManager {
         self.connection_map.remove(connection_id).is_some()
     }
 
-    /// Get or create a session for the given key. Returns the session key hash.
-    pub fn get_or_create(&self, key: &SessionKey) -> String {
-        if let Some(entry) = self.sessions.get(key) {
-            return entry.key_hash.clone();
-        }
-
-        // Enforce max_sessions: evict oldest if needed
+    /// Get or create a session for the given key. Returns a [`SessionResult`] containing
+    /// the deterministic key hash and the unique session instance ID.
+    pub fn get_or_create(&self, key: &SessionKey) -> SessionResult {
+        // Enforce max_sessions before potential insert
         if self.sessions.len() >= self.config.max_sessions {
             self.evict_oldest();
         }
 
-        let key_hash = session_key_hash(key);
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        self.sessions.insert(
-            key.clone(),
+        // Atomic get-or-insert avoids TOCTOU race where concurrent requests
+        // for the same session key could each generate a different session_id.
+        let entry = self.sessions.entry(key.clone()).or_insert_with(|| {
+            let now_ms = chrono::Utc::now().timestamp_millis();
             SessionEntry {
                 session: Session {
                     key: key.clone(),
@@ -124,14 +130,33 @@ impl SessionManager {
                     created_at: now_ms,
                     last_activity: now_ms,
                 },
-                key_hash: key_hash.clone(),
+                key_hash: session_key_hash(key),
+                session_id: Uuid::new_v4(),
                 request_timestamps_ms: Vec::new(),
                 credential_timestamps_ms: Vec::new(),
                 last_active: Instant::now(),
-            },
-        );
+            }
+        });
 
-        key_hash
+        SessionResult {
+            key_hash: entry.key_hash.clone(),
+            session_id: entry.session_id,
+        }
+    }
+
+    /// Reap sessions that have been idle for longer than 2 hours.
+    /// Returns the `session_id`s of expired sessions.
+    pub fn reap_expired(&self) -> Vec<Uuid> {
+        let two_hours = std::time::Duration::from_secs(7200);
+        let mut expired = Vec::new();
+        self.sessions.retain(|_, entry| {
+            let is_expired = entry.last_active.elapsed() > two_hours;
+            if is_expired {
+                expired.push(entry.session_id);
+            }
+            !is_expired
+        });
+        expired
     }
 
     /// Produce an immutable SessionSnapshot from the current session state.
@@ -272,15 +297,41 @@ impl SessionManager {
     }
 
     /// Evict sessions inactive for longer than 2x window_secs.
-    pub fn evict_stale(&self) {
+    /// Scans at most `max_scan` entries per map per call to avoid GC pauses.
+    pub fn evict_stale(&self, max_scan: usize) {
+        // Bounded scan of sessions
         let max_inactive = std::time::Duration::from_secs(self.config.window_secs * 2);
-        self.sessions
-            .retain(|_, entry| entry.last_active.elapsed() <= max_inactive);
+        let mut scanned = 0;
+        let mut to_remove_sessions: Vec<SessionKey> = Vec::new();
+        for entry in self.sessions.iter() {
+            if scanned >= max_scan {
+                break;
+            }
+            if entry.value().last_active.elapsed() > max_inactive {
+                to_remove_sessions.push(entry.key().clone());
+            }
+            scanned += 1;
+        }
+        for key in to_remove_sessions {
+            self.sessions.remove(&key);
+        }
 
-        // Also clean up stale connection bindings
+        // Bounded scan of connection_map
         let max_binding_age = std::time::Duration::from_secs(self.config.window_secs * 3);
-        self.connection_map
-            .retain(|_, binding| binding.bound_at.elapsed() <= max_binding_age);
+        let mut scanned = 0;
+        let mut to_remove_bindings: Vec<Uuid> = Vec::new();
+        for entry in self.connection_map.iter() {
+            if scanned >= max_scan {
+                break;
+            }
+            if entry.value().bound_at.elapsed() > max_binding_age {
+                to_remove_bindings.push(*entry.key());
+            }
+            scanned += 1;
+        }
+        for id in to_remove_bindings {
+            self.connection_map.remove(&id);
+        }
     }
 
     /// Apply classification via connection_id (backward-compat wrapper for classify_task).
@@ -393,8 +444,10 @@ mod tests {
     fn get_or_create_inserts_new_session() {
         let mgr = SessionManager::new(test_config());
         let key = native_key("cursor");
-        let hash = mgr.get_or_create(&key);
+        let result = mgr.get_or_create(&key);
+        let hash = result.key_hash;
         assert!(!hash.is_empty());
+        assert!(!result.session_id.is_nil());
 
         let snapshot = mgr.snapshot(&key);
         assert_eq!(snapshot.request_count, 0);
@@ -485,7 +538,7 @@ mod tests {
             entry.last_active = Instant::now() - std::time::Duration::from_secs(10);
         }
 
-        mgr.evict_stale();
+        mgr.evict_stale(256);
         assert_eq!(mgr.sessions.len(), 0);
     }
 

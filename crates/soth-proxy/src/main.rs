@@ -165,10 +165,15 @@ async fn main() -> Result<()> {
 
     let mut sync_task = None;
     if let Some(agent) = sync_agent.clone() {
-        agent
-            .verify_bundle_source_ready()
-            .await
-            .context("sync startup bundle source readiness check failed")?;
+        match agent.verify_bundle_source_ready().await {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "sync startup bundle source readiness check failed; starting in degraded mode"
+                );
+            }
+        }
         sync_task = Some(tokio::spawn(async move { agent.run().await }));
     }
 
@@ -177,7 +182,13 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            maintenance_handler.maintenance_tick();
+            let handler = maintenance_handler.clone();
+            // Run on a blocking thread so DashMap scans don't starve the
+            // async listener accept loop and cause health-check failures.
+            let _ = tokio::task::spawn_blocking(move || {
+                handler.maintenance_tick();
+            })
+            .await;
         }
     });
 
@@ -192,15 +203,21 @@ async fn main() -> Result<()> {
         let derived_destinations =
             derive_interception_destinations_from_bundle(bundle_handle.current().as_ref());
         if derived_destinations.is_empty() {
-            anyhow::bail!(
-                "mitm.interception.destinations is empty/wildcard and bundle-derived destinations are empty"
+            warn!(
+                "no bundle-derived interception destinations; starting in tunnel-only mode \
+                 (all TLS traffic will be forwarded without inspection)"
             );
+            mitm_config
+                .interception
+                .destinations
+                .push(DISCOVERY_TLS_WILDCARD_DESTINATION.to_string());
+        } else {
+            info!(
+                destination_count = derived_destinations.len(),
+                "using bundle-derived mitm interception destinations"
+            );
+            mitm_config.interception.destinations = derived_destinations;
         }
-        info!(
-            destination_count = derived_destinations.len(),
-            "using bundle-derived mitm interception destinations"
-        );
-        mitm_config.interception.destinations = derived_destinations;
     }
 
     let proxy = soth_mitm::MitmProxyBuilder::new(mitm_config, handler)
@@ -260,7 +277,11 @@ fn init_tracing(extension_targets: &[&str]) {
              soth_mitm=info,\
              soth_extensions=info,\
              mitm_sidecar=info,\
-             hudsucker::proxy::internal=off",
+             soth_mitm::proxy::internal=off,\
+             hyper_util=warn,\
+             hyper=warn,\
+             rustls=warn,\
+             reqwest=warn",
         );
         // Append extension tracing targets discovered from the registry.
         for target in extension_targets {

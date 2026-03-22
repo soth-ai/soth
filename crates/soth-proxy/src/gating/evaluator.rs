@@ -2,15 +2,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{Datelike, Utc};
+use soth_core::bundle::detect::DetectBundleSlice;
+use soth_core::bundle::entity_index::EntityIndex;
+use soth_core::bundle::env_index::EnvIndex;
 use soth_core::{
     AppType, CaptureMode, DecisionReason, GateDecision, GateOutcome, GateStage, GatingBundle,
-    NonCatalogedAction, ProcessInfo, TrafficClassification, UnknownAppAction,
+    NonCatalogedAction, ProcessAction, ProcessInfo, TrafficClassification, UnknownAppAction,
 };
 
 use crate::gating::stage0_tls::{normalize_sni, HostMatcher};
-use crate::gating::stage1_app_origin::{resolve_identity, IdentityMatch};
+use crate::gating::stage1_app_origin::IdentityMatch;
 use crate::gating::stage2_whitelist::{
-    evaluate_path_rules, match_entities, EntityMatch, EntityMatchSet,
+    evaluate_path_rules, EntityMatch, EntityMatchKind, EntityMatchSet,
 };
 use crate::gating::stage3_blacklist;
 use crate::gating::stage4_app_type;
@@ -182,6 +185,9 @@ impl GateEvaluator {
         req: &soth_core::RawRequest,
         process_info: &Option<ProcessInfo>,
         overrides: GateOverrides,
+        detect_bundle: Option<&DetectBundleSlice<'_>>,
+        entity_index: &EntityIndex,
+        env_index: &EnvIndex,
     ) -> GateOutcome {
         let connection_id = req.connection_meta.connection_id;
         let host = request_host(req);
@@ -193,9 +199,28 @@ impl GateEvaluator {
             .non_cataloged_host_action
             .unwrap_or(defaults.non_cataloged_host_action);
 
-        let identity = process_info
-            .as_ref()
-            .and_then(|info| resolve_identity(&self.bundle.identity_index, info));
+        let identity = process_info.as_ref().and_then(|info| {
+            entity_index
+                .resolve_tool(
+                    info.bundle_id.as_deref(),
+                    info.process_name.as_deref(),
+                    info.parent_bundle_id.as_deref(),
+                    info.parent_process_name.as_deref(),
+                    env_index,
+                )
+                .map(|(entity, _match_source)| IdentityMatch {
+                    entry: soth_core::IdentityEntry {
+                        entity_id: entity.id.clone(),
+                        app_type: entity.app_type,
+                        capture_mode: entity.capture_mode.clone(),
+                        action: entity.action,
+                        enabled: None,
+                        host_filter: None,
+                        host_list_ref: None,
+                    },
+                    match_kind: soth_core::ProcessMatchKind::Exact,
+                })
+        });
         crate::trace::stage1_identity_resolution(
             connection_id,
             host.as_str(),
@@ -206,7 +231,7 @@ impl GateEvaluator {
 
         if let Some(matched) = identity.as_ref() {
             match matched.entry.action {
-                soth_core::ProcessAction::Skip => {
+                ProcessAction::Skip => {
                     crate::trace::gate_stage(
                         connection_id,
                         GateStage::Stage1AppOrigin,
@@ -220,7 +245,7 @@ impl GateEvaluator {
                         false,
                     );
                 }
-                soth_core::ProcessAction::Block => {
+                ProcessAction::Block => {
                     crate::trace::gate_stage(
                         connection_id,
                         GateStage::Stage1AppOrigin,
@@ -234,7 +259,7 @@ impl GateEvaluator {
                         false,
                     );
                 }
-                soth_core::ProcessAction::Intercept => crate::trace::gate_stage(
+                ProcessAction::Intercept => crate::trace::gate_stage(
                     connection_id,
                     GateStage::Stage1AppOrigin,
                     "continue",
@@ -317,7 +342,37 @@ impl GateEvaluator {
             );
         }
 
-        let entity_match_set = match_entities(&self.bundle.entities, host.as_str());
+        let host_set = entity_index.resolve_host_with_rules(host.as_str());
+        let entity_match_set = EntityMatchSet {
+            provider: host_set.provider.map(|m| {
+                let entity = entity_index.entity_for_host_match(&m);
+                EntityMatch {
+                    kind: EntityMatchKind::Provider,
+                    entity_id: entity.id.clone(),
+                    capture_mode: entity.capture_mode.clone(),
+                    host_rule: soth_core::HostRule {
+                        pattern: m.host_pattern,
+                        methods: m.methods,
+                        paths: m.paths,
+                        priority: None,
+                    },
+                }
+            }),
+            application: host_set.application.map(|m| {
+                let entity = entity_index.entity_for_host_match(&m);
+                EntityMatch {
+                    kind: EntityMatchKind::Application,
+                    entity_id: entity.id.clone(),
+                    capture_mode: entity.capture_mode.clone(),
+                    host_rule: soth_core::HostRule {
+                        pattern: m.host_pattern,
+                        methods: m.methods,
+                        paths: m.paths,
+                        priority: None,
+                    },
+                }
+            }),
+        };
         let entity_match = entity_match_set.best();
         let app_type = stage4_app_type::derive(identity.as_ref());
 
@@ -485,8 +540,48 @@ impl GateEvaluator {
             entity_match_set.application.as_ref(),
             discovery_capture,
         );
-        let (matched_provider, mut matched_application) =
+        let (mut matched_provider, mut matched_application) =
             classify_entity_match_set(&entity_match_set);
+
+        // Refine with signal-based classify_request_pair when a detect bundle is available.
+        // Signal rules (requires_all with host + path + process) are more precise
+        // than the host-only EntityCatalog match used by match_entities.
+        if let Some(db) = detect_bundle {
+            let (proc_bid, proc_name, parent_name) =
+                match process_info.as_ref() {
+                    Some(info) => (
+                        info.bundle_id.as_deref(),
+                        info.process_name.as_deref(),
+                        info.parent_process_name.as_deref(),
+                    ),
+                    None => (None, None, None),
+                };
+            let providers = db.llm_providers.iter().map(|(key, entry)| {
+                let eid = entry.provider_id.as_deref().unwrap_or(key.as_str());
+                (key.as_str(), eid, entry.matching_rules.as_slice())
+            });
+            let applications = db.products.iter().map(|(key, entry)| {
+                let eid = entry.app_id.as_deref().unwrap_or(key.as_str());
+                (key.as_str(), eid, entry.matching_rules.as_slice())
+            });
+            let classify_pair = soth_core::classify_request_pair(
+                Some(host.as_str()),
+                req.path.as_str(),
+                &req.headers,
+                proc_bid,
+                proc_name,
+                parent_name,
+                providers,
+                applications,
+            );
+            if let Some(cr) = classify_pair.provider {
+                matched_provider = Some(cr.entity_id);
+            }
+            if let Some(cr) = classify_pair.application {
+                matched_application = Some(cr.entity_id);
+            }
+        }
+
         // When stage1 identity resolved a specific app by process name that
         // differs from the host-based entity match, prefer the process identity.
         // This handles cases like Codex vs ChatGPT sharing chatgpt.com.
@@ -679,6 +774,33 @@ mod tests {
     use crate::heartbeat_telemetry;
     use std::collections::{HashMap, HashSet};
 
+    fn test_entity_index() -> EntityIndex {
+        use soth_core::bundle::entity_index::EntityIndexEntry;
+        EntityIndex::build(vec![EntityIndexEntry {
+            slug: "openai".into(),
+            name: "OpenAI".into(),
+            kind: "platform".into(),
+            category: Some("AI Platform".into()),
+            capture_mode: "metadata_only".into(),
+            api_format: Some("openai".into()),
+            provider_id: None,
+            vendor_slug: None,
+            action: soth_core::ProcessAction::Intercept,
+            host_rules: vec![(
+                "api.openai.com".into(),
+                vec!["POST".into()],
+                soth_core::PathRules {
+                    deny_exact: Vec::new(),
+                    deny_glob: Vec::new(),
+                    allow: vec!["/v1/chat/completions".into()],
+                },
+            )],
+            signals: vec![
+                ("HttpHost".into(), "api.openai.com".into()),
+            ],
+        }])
+    }
+
     fn bundle_with_defaults(skip_if_unresolved_process: bool) -> Arc<GatingBundle> {
         Arc::new(GatingBundle {
             identity_index: soth_core::IdentityIndex {
@@ -724,29 +846,7 @@ mod tests {
                     skip_for_discovery_capture: true,
                 },
             },
-            entities: soth_core::EntityCatalog {
-                providers: vec![soth_core::EntityTrafficRules {
-                    entity_id: "openai".to_string(),
-                    capture_mode: CaptureMode::MetadataOnly,
-                    hosts: vec![soth_core::HostRule {
-                        pattern: "api.openai.com".to_string(),
-                        methods: vec!["POST".to_string()],
-                        paths: soth_core::PathRules {
-                            deny_exact: Vec::new(),
-                            deny_glob: Vec::new(),
-                            allow: vec!["/v1/chat/completions".to_string()],
-                        },
-                        priority: None,
-                    }],
-                    api_format: None,
-                    entity_type: None,
-                    pricing: None,
-                    capture: None,
-                    detection: None,
-                }],
-                web_apps: Vec::new(),
-                native_apps: Vec::new(),
-            },
+            entities: soth_core::EntityCatalog::default(),
         })
     }
 
@@ -768,6 +868,8 @@ mod tests {
     #[test]
     fn unknown_policy_applies_for_unmatched_resolved_process() {
         let evaluator = GateEvaluator::new(bundle_with_defaults(true));
+        let ei = test_entity_index();
+        let env = EnvIndex::default();
         let req = request_for("api.openai.com");
         let process_info = Some(ProcessInfo {
             pid: Some(42),
@@ -778,7 +880,7 @@ mod tests {
             parent_bundle_id: None,
         });
 
-        let outcome = evaluator.evaluate_http(&req, &process_info, GateOverrides::default());
+        let outcome = evaluator.evaluate_http(&req, &process_info, GateOverrides::default(), None, &ei, &env);
         assert!(matches!(outcome.decision, GateDecision::Skip));
         assert_eq!(outcome.reason, DecisionReason::UnknownAppPolicy);
         assert_eq!(outcome.terminal_stage, GateStage::Stage1AppOrigin);
@@ -787,9 +889,11 @@ mod tests {
     #[test]
     fn unresolved_process_can_bypass_unknown_policy_when_disabled() {
         let evaluator = GateEvaluator::new(bundle_with_defaults(false));
+        let ei = test_entity_index();
+        let env = EnvIndex::default();
         let req = request_for("api.openai.com");
 
-        let outcome = evaluator.evaluate_http(&req, &None, GateOverrides::default());
+        let outcome = evaluator.evaluate_http(&req, &None, GateOverrides::default(), None, &ei, &env);
         assert!(matches!(outcome.decision, GateDecision::Intercept));
         assert_eq!(outcome.reason, DecisionReason::Intercept);
         assert_eq!(outcome.terminal_stage, GateStage::Intercept);
@@ -808,11 +912,13 @@ mod tests {
         let mut bundle = (*bundle_with_defaults(false)).clone();
         bundle.gates.stage3_blacklist.blacklisted_keywords = vec!["chat".to_string()];
         let evaluator = GateEvaluator::new(Arc::new(bundle));
+        let ei = test_entity_index();
+        let env = EnvIndex::default();
         let mut req = request_for("api.openai.com");
         req.body = bytes::Bytes::from_static(b"contains token marker");
 
         let before = counter_value("edge.blacklist.keyword_dropped_total");
-        let outcome = evaluator.evaluate_http(&req, &None, GateOverrides::default());
+        let outcome = evaluator.evaluate_http(&req, &None, GateOverrides::default(), None, &ei, &env);
         let after = counter_value("edge.blacklist.keyword_dropped_total");
 
         assert!(matches!(outcome.decision, GateDecision::Skip));
