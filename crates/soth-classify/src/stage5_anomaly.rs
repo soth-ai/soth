@@ -249,7 +249,7 @@ mod tests {
             schema_version: "1".to_string(),
             parse_warnings: Vec::new(),
             is_ai_call: true,
-            provider: soth_core::DetectedProvider::OpenAi,
+            provider: "openai".to_string(),
             model: Some("gpt-4o-mini".to_string()),
             endpoint_type: soth_core::EndpointType::ChatCompletion,
             api_version: None,
@@ -276,6 +276,7 @@ mod tests {
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
+            user_prompt: None,
         }
     }
 

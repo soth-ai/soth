@@ -55,7 +55,7 @@ fn sample_event(event_id: Uuid) -> TelemetryEvent {
         event_id,
         timestamp_epoch_ms: 1_700_000_001_000,
         connection_id: None,
-        provider: DetectedProvider::OpenAi,
+        provider: "openai".to_string(),
         model: Some("gpt-4o-mini".to_string()),
         endpoint_type: EndpointType::ChatCompletion,
         parse_confidence: ParseConfidence::Full,

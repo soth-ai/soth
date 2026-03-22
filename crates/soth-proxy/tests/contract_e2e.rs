@@ -96,6 +96,8 @@ fn sample_proxy_context(capture_mode: CaptureMode, timestamp_epoch_ms: i64) -> P
         deployment_context: None,
         precomputed_commitment_nonce: None,
         precomputed_commitment_hash: None,
+        connection_id: None,
+        bundle_trust_level: None,
         session_id: None,
         product_id: None,
         surface_type: SurfaceType::Unknown,

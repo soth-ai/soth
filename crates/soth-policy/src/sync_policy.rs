@@ -1591,7 +1591,7 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use soth_core::{
-        ArtifactKind, ArtifactLocation, ArtifactSeverity, CaptureMode, DetectedProvider,
+        ArtifactKind, ArtifactLocation, ArtifactSeverity, CaptureMode,
         EndpointType, FormatMetadata, ParseConfidence, ParseSource, ProcessMatchKind,
         ProcessResolution, SessionSnapshot as SessionBudget,
     };
@@ -1659,7 +1659,7 @@ mod tests {
             schema_version: "1".to_string(),
             parse_warnings: Vec::new(),
             is_ai_call: true,
-            provider: DetectedProvider::Anthropic,
+            provider: "anthropic".to_string(),
             model: Some("claude-3-5-sonnet-20241022".to_string()),
             endpoint_type: EndpointType::ChatCompletion,
             api_version: None,
@@ -1684,6 +1684,7 @@ mod tests {
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
+            user_prompt: None,
         }
     }
 
@@ -2230,7 +2231,7 @@ mod tests {
             },
             {
                 let mut req = fixture_request();
-                req.provider = DetectedProvider::OpenAi;
+                req.provider = "openai".to_string();
                 req.has_tool_definitions = false;
                 req.estimated_cost_usd = 0.02;
                 (req, Vec::new(), fixture_context(None))
@@ -2276,13 +2277,7 @@ mod tests {
         };
 
         let mut rng = StdRng::seed_from_u64(42);
-        let provider_pool = [
-            DetectedProvider::Anthropic,
-            DetectedProvider::OpenAi,
-            DetectedProvider::Gemini,
-            DetectedProvider::Cohere,
-            DetectedProvider::Unknown,
-        ];
+        let provider_pool = ["anthropic", "openai", "gemini", "cohere", "unknown"];
         let artifact_pool = [
             ArtifactKind::PrivateKey,
             ArtifactKind::UnknownCredential,
@@ -2304,7 +2299,7 @@ mod tests {
 
         for _ in 0..2000 {
             let mut request = fixture_request();
-            request.provider = provider_pool[rng.gen_range(0..provider_pool.len())];
+            request.provider = provider_pool[rng.gen_range(0..provider_pool.len())].to_string();
             request.model = if rng.gen_bool(0.3) {
                 None
             } else {

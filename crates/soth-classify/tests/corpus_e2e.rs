@@ -437,7 +437,7 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
         schema_version: "1".to_string(),
         parse_warnings: Vec::new(),
         is_ai_call: true,
-        provider: DetectedProvider::OpenAi,
+        provider: "openai".to_string(),
         model: Some("gpt-4o-mini".to_string()),
         endpoint_type: EndpointType::ChatCompletion,
         api_version: None,
@@ -464,10 +464,11 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
+        user_prompt: None,
     };
 
     if let Some(provider) = request.provider.as_deref() {
-        normalized.provider = parse_provider(provider);
+        normalized.provider = provider.to_string();
     }
     if request.clear_model.unwrap_or(false) {
         normalized.model = None;
@@ -482,7 +483,11 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
         normalized.parse_source = parse_parse_source(parse_source);
     } else if let ParseSource::Rest { .. } = normalized.parse_source {
         normalized.parse_source = ParseSource::Rest {
-            provider: normalized.provider,
+            provider: request
+                .provider
+                .as_deref()
+                .map(parse_provider)
+                .unwrap_or(DetectedProvider::OpenAi),
         };
     }
     if let Some(is_ai_call) = request.is_ai_call {
@@ -549,6 +554,7 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
         ast_normalized_hash: None,
         first_blob_event_id: None,
         import_categories: Vec::new(),
+        user_prompt: None,
     }
 }
 

@@ -355,7 +355,7 @@ fn expected_decision(detect: &DetectResult, proxy: &ProxyContext) -> ExpectedDec
     if matches!(detect.confidence, ParseConfidence::Heuristic) {
         return ExpectedDecision::Allow;
     }
-    if detect.normalized.provider == DetectedProvider::OpenAi {
+    if detect.normalized.provider == "openai" {
         return ExpectedDecision::FlagOpenAi;
     }
     if cost > 0.25 {
@@ -372,10 +372,10 @@ fn expected_decision(detect: &DetectResult, proxy: &ProxyContext) -> ExpectedDec
 
 fn apply_case_inputs(idx: usize, detect: &mut DetectResult, proxy: &mut ProxyContext) {
     detect.normalized.provider = match idx % 4 {
-        0 => DetectedProvider::OpenAi,
-        1 => DetectedProvider::Anthropic,
-        2 => DetectedProvider::Gemini,
-        _ => DetectedProvider::Cohere,
+        0 => "openai".to_string(),
+        1 => "anthropic".to_string(),
+        2 => "gemini".to_string(),
+        _ => "cohere".to_string(),
     };
     detect.normalized.endpoint_type = if idx % 9 == 0 {
         EndpointType::Embedding
@@ -432,7 +432,7 @@ fn apply_case_inputs(idx: usize, detect: &mut DetectResult, proxy: &mut ProxyCon
     if !detect.artifacts.is_empty() && !matches!(detect.artifacts[0].kind, ArtifactKind::PrivateKey)
     {
         proxy.traffic_classification = TrafficClassification::UnknownAgent;
-        detect.normalized.provider = DetectedProvider::Anthropic;
+        detect.normalized.provider = "anthropic".to_string();
         detect.normalized.estimated_cost_usd = 0.03;
         detect.confidence = ParseConfidence::Full;
         detect.normalized.endpoint_type = EndpointType::ChatCompletion;

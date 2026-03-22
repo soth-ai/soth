@@ -84,10 +84,11 @@ fn corpus_event(index: usize, threshold_mode: bool) -> TelemetryEvent {
         EndpointType::FunctionCall,
         EndpointType::Streaming,
     ];
-    let provider = providers[index % providers.len()];
+    let provider_enum = providers[index % providers.len()];
+    let provider = provider_enum.canonical_name().to_string();
     let endpoint = endpoints[index % endpoints.len()];
     let parse_source = match index % 4 {
-        0 => ParseSource::Rest { provider },
+        0 => ParseSource::Rest { provider: provider_enum },
         1 => ParseSource::JsonRpc,
         2 => ParseSource::Grpc,
         _ => ParseSource::GraphQl,

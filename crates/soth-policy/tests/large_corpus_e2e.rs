@@ -201,7 +201,7 @@ fn expected_decision(
     }
 
     let has_credential = artifacts.iter().any(SensitiveArtifact::is_credential);
-    if request.provider == DetectedProvider::OpenAi {
+    if request.provider == "openai" {
         return ExpectedDecision::FlagOpenAi;
     }
     if request.estimated_cost_usd > 0.25 {
@@ -219,10 +219,10 @@ fn expected_decision(
 fn case_inputs(idx: usize) -> (NormalizedRequest, Vec<SensitiveArtifact>, PolicyContext) {
     let mut request = default_request();
     request.provider = match idx % 4 {
-        0 => DetectedProvider::OpenAi,
-        1 => DetectedProvider::Anthropic,
-        2 => DetectedProvider::Gemini,
-        _ => DetectedProvider::Cohere,
+        0 => "openai".to_string(),
+        1 => "anthropic".to_string(),
+        2 => "gemini".to_string(),
+        _ => "cohere".to_string(),
     };
     request.endpoint_type = if idx % 8 == 3 {
         EndpointType::Embedding
@@ -289,7 +289,7 @@ fn case_inputs(idx: usize) -> (NormalizedRequest, Vec<SensitiveArtifact>, Policy
     if !artifacts.is_empty() && !matches!(artifacts[0].kind, ArtifactKind::PrivateKey) {
         context.traffic_classification = TrafficClassification::UnknownAgent;
         context.skip_org_rules = false;
-        request.provider = DetectedProvider::Anthropic;
+        request.provider = "anthropic".to_string();
         request.estimated_cost_usd = 0.03;
         request.endpoint_type = EndpointType::ChatCompletion;
     }
@@ -379,7 +379,7 @@ fn default_request() -> NormalizedRequest {
         schema_version: "1".to_string(),
         parse_warnings: Vec::new(),
         is_ai_call: true,
-        provider: DetectedProvider::OpenAi,
+        provider: "openai".to_string(),
         model: Some("gpt-4o-mini".to_string()),
         endpoint_type: EndpointType::ChatCompletion,
         api_version: None,
@@ -406,6 +406,7 @@ fn default_request() -> NormalizedRequest {
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
+        user_prompt: None,
     }
 }
 

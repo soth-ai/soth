@@ -90,7 +90,7 @@ fn make_test_event() -> GovernableEvent {
         source: soth_core::EventSource::Extension {
             source: ExtensionSource::Custom("noop_test".to_string()),
         },
-        provider: soth_core::DetectedProvider::Unknown,
+        provider: "unknown".to_string(),
         model: None,
         endpoint_type: soth_core::EndpointType::Unknown,
         normalized: None,

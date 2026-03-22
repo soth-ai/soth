@@ -6,7 +6,7 @@ pub fn make_detect_result() -> soth_core::DetectResult {
             schema_version: "1".to_string(),
             parse_warnings: Vec::new(),
             is_ai_call: true,
-            provider: soth_core::DetectedProvider::OpenAi,
+            provider: "openai".to_string(),
             model: Some("gpt-4o-mini".to_string()),
             endpoint_type: soth_core::EndpointType::ChatCompletion,
             api_version: None,
@@ -33,6 +33,7 @@ pub fn make_detect_result() -> soth_core::DetectResult {
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
+            user_prompt: None,
         },
         artifacts: Vec::new(),
         capture_mode: soth_core::CaptureMode::MetadataOnly,
@@ -52,6 +53,7 @@ pub fn make_detect_result() -> soth_core::DetectResult {
         ast_normalized_hash: None,
         first_blob_event_id: None,
         import_categories: Vec::new(),
+        user_prompt: None,
     }
 }
 

@@ -276,7 +276,7 @@ fn build_request(input: &RequestInput) -> NormalizedRequest {
     let mut request = default_request();
 
     if let Some(provider) = input.provider.as_deref() {
-        request.provider = parse_provider(provider);
+        request.provider = provider.to_string();
     }
     if let Some(model) = input.model.as_ref() {
         request.model = Some(model.clone());
@@ -316,7 +316,7 @@ fn default_request() -> NormalizedRequest {
         schema_version: "1".to_string(),
         parse_warnings: Vec::new(),
         is_ai_call: true,
-        provider: DetectedProvider::Anthropic,
+        provider: "anthropic".to_string(),
         model: Some("claude-3-5-sonnet-20241022".to_string()),
         endpoint_type: EndpointType::ChatCompletion,
         api_version: None,
@@ -341,6 +341,7 @@ fn default_request() -> NormalizedRequest {
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
+        user_prompt: None,
     }
 }
 
