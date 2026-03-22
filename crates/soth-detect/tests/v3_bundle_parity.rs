@@ -9,7 +9,7 @@
 /// AWS Bedrock, Groq, Mistral, Fireworks, xAI.
 use serde_json::json;
 use soth_core::{MatchingRule, SignalKind, SignalMatcher};
-use soth_core::{ApplicationEntry, OwnedDetectBundle, ProviderEntry};
+use soth_core::{ProductEntry, OwnedDetectBundle, ProviderEntry};
 use soth_detect::{classify_request, fingerprint, DetectedFormat};
 use std::collections::{BTreeMap, HashMap};
 
@@ -758,7 +758,7 @@ fn build_shared_base() -> OwnedDetectBundle {
     for (id, api_format, bundle_ids, process_names) in app_defs {
         applications.insert(
             id.to_string(),
-            ApplicationEntry {
+            ProductEntry {
                 app_id: Some(id.to_string()),
                 name: Some(id.to_string()),
                 api_format: api_format.map(String::from),
@@ -772,7 +772,7 @@ fn build_shared_base() -> OwnedDetectBundle {
     OwnedDetectBundle {
         rest_formats,
         llm_providers,
-        applications,
+        products: applications,
         ..Default::default()
     }
 }
@@ -806,7 +806,7 @@ fn set_provider_rules(bundle: &mut OwnedDetectBundle, id: &str, rules: Vec<Match
 }
 
 fn set_app_rules(bundle: &mut OwnedDetectBundle, id: &str, rules: Vec<MatchingRule>) {
-    if let Some(entry) = bundle.applications.get_mut(id) {
+    if let Some(entry) = bundle.products.get_mut(id) {
         entry.matching_rules = rules;
     }
 }
@@ -822,7 +822,7 @@ fn set_provider_detection(
 }
 
 fn set_app_detection(bundle: &mut OwnedDetectBundle, id: &str, detection: serde_json::Value) {
-    if let Some(entry) = bundle.applications.get_mut(id) {
+    if let Some(entry) = bundle.products.get_mut(id) {
         entry.detection = Some(detection);
     }
 }
