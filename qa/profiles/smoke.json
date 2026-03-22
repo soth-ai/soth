@@ -1,0 +1,46 @@
+{
+  "description": "Fast reusable corpus smoke across proxy/classify/policy",
+  "steps": [
+    {
+      "id": "proxy_e2e_smoke",
+      "target": "proxy_e2e",
+      "cwd": ".",
+      "cmd": ["./scripts/gating_trace_corpus.sh"],
+      "env": {
+        "SOTH_GATING_CORPUS_OUT": "/tmp/soth-corpus-suite-proxy-smoke.ndjson",
+        "SOTH_GATING_CORPUS_CASE_CAP": "40"
+      },
+      "result_kind": "proxy_ndjson"
+    },
+    {
+      "id": "classify_corpus_contract",
+      "target": "classify",
+      "cwd": ".",
+      "cmd": [
+        "cargo",
+        "test",
+        "-p",
+        "soth-classify",
+        "--test",
+        "corpus_e2e",
+        "classify_output_corpus_matches_expected_contract"
+      ],
+      "result_kind": "cargo_test"
+    },
+    {
+      "id": "policy_corpus_contract",
+      "target": "policy",
+      "cwd": ".",
+      "cmd": [
+        "cargo",
+        "test",
+        "-p",
+        "soth-policy",
+        "--test",
+        "corpus_e2e",
+        "policy_output_corpus_matches_expected_contract"
+      ],
+      "result_kind": "cargo_test"
+    }
+  ]
+}

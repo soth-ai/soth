@@ -1,0 +1,49 @@
+[package]
+name = "soth-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+dev-pipeline-trace = []
+extensions = ["dep:soth-extensions", "dep:soth-historian"]
+
+[dependencies]
+anyhow.workspace = true
+arc-swap = "1"
+async-trait.workspace = true
+bytes = "1"
+chrono.workspace = true
+dashmap.workspace = true
+dirs.workspace = true
+ed25519-dalek.workspace = true
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+rusqlite.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml = "0.8"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+soth-core = { workspace = true }
+soth-bundle = { workspace = true }
+soth-detect = { workspace = true, features = ["tree-sitter", "intelligence"] }
+soth-parse = { workspace = true }
+soth-classify = { workspace = true }
+soth-sqlite-vec = { workspace = true }
+soth-telemetry = { workspace = true }
+soth-policy = { workspace = true }
+soth-sync = { workspace = true }
+
+soth-extensions = { workspace = true, optional = true }
+soth-historian = { workspace = true, optional = true }
+soth-mitm = "0.2.2"

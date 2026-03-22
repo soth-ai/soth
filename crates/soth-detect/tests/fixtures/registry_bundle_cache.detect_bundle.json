@@ -1,0 +1,2375 @@
+{
+  "rest_formats": {
+    "anthropic": {
+      "tier": null,
+      "request": {
+        "model": "$.model",
+        "messages": "$.messages",
+        "message": null,
+        "chat_history": null,
+        "contents": null,
+        "system": "$.system",
+        "system_instruction": null,
+        "tools": "$.tools",
+        "tool_choice": "$.tool_choice",
+        "max_tokens": "$.max_tokens",
+        "temperature": "$.temperature",
+        "top_p": null,
+        "stream": "$.stream",
+        "stop": null
+      },
+      "response": {
+        "content": "$.content",
+        "model": "$.model",
+        "finish_reason": null,
+        "input_tokens": "$.usage.input_tokens",
+        "output_tokens": "$.usage.output_tokens",
+        "stop_reason": "$.stop_reason"
+      },
+      "system_in_messages": false,
+      "content_blocks": false,
+      "chat_history_mode": false,
+      "model_from_url_segment": null,
+      "role_map": {},
+      "model_id_parse": false,
+      "ephemeral_request_fields": []
+    },
+    "bedrock": {
+      "tier": null,
+      "request": {
+        "model": "$.modelId",
+        "messages": "$.messages",
+        "message": null,
+        "chat_history": null,
+        "contents": null,
+        "system": "$.system",
+        "system_instruction": null,
+        "tools": null,
+        "tool_choice": null,
+        "max_tokens": "$.max_tokens",
+        "temperature": "$.temperature",
+        "top_p": null,
+        "stream": null,
+        "stop": null
+      },
+      "response": {
+        "content": "$.output.message.content",
+        "model": "$.modelId",
+        "finish_reason": null,
+        "input_tokens": "$.usage.inputTokens",
+        "output_tokens": "$.usage.outputTokens",
+        "stop_reason": "$.stopReason"
+      },
+      "system_in_messages": false,
+      "content_blocks": false,
+      "chat_history_mode": false,
+      "model_from_url_segment": null,
+      "role_map": {},
+      "model_id_parse": false,
+      "ephemeral_request_fields": []
+    },
+    "cohere": {
+      "tier": null,
+      "request": {
+        "model": "$.model",
+        "messages": null,
+        "message": "$.message",
+        "chat_history": "$.chat_history",
+        "contents": null,
+        "system": null,
+        "system_instruction": null,
+        "tools": null,
+        "tool_choice": null,
+        "max_tokens": "$.max_tokens",
+        "temperature": "$.temperature",
+        "top_p": null,
+        "stream": "$.stream",
+        "stop": null
+      },
+      "response": {
+        "content": "$.text",
+        "model": null,
+        "finish_reason": "$.finish_reason",
+        "input_tokens": "$.meta.tokens.input_tokens",
+        "output_tokens": "$.meta.tokens.output_tokens",
+        "stop_reason": null
+      },
+      "system_in_messages": true,
+      "content_blocks": false,
+      "chat_history_mode": true,
+      "model_from_url_segment": null,
+      "role_map": {},
+      "model_id_parse": false,
+      "ephemeral_request_fields": []
+    },
+    "google": {
+      "tier": null,
+      "request": {
+        "model": "{url_path}",
+        "messages": null,
+        "message": null,
+        "chat_history": null,
+        "contents": "$.contents",
+        "system": null,
+        "system_instruction": "$.systemInstruction",
+        "tools": "$.tools",
+        "tool_choice": null,
+        "max_tokens": "$.generationConfig.maxOutputTokens",
+        "temperature": "$.generationConfig.temperature",
+        "top_p": "$.generationConfig.topP",
+        "stream": null,
+        "stop": null
+      },
+      "response": {
+        "content": "$.candidates[0].content",
+        "model": null,
+        "finish_reason": "$.candidates[0].finishReason",
+        "input_tokens": "$.usageMetadata.promptTokenCount",
+        "output_tokens": "$.usageMetadata.candidatesTokenCount",
+        "stop_reason": null
+      },
+      "system_in_messages": true,
+      "content_blocks": false,
+      "chat_history_mode": false,
+      "model_from_url_segment": "/models/",
+      "role_map": {},
+      "model_id_parse": true,
+      "ephemeral_request_fields": []
+    },
+    "openai": {
+      "tier": null,
+      "request": {
+        "model": "$.model",
+        "messages": "$.messages",
+        "message": null,
+        "chat_history": null,
+        "contents": null,
+        "system": null,
+        "system_instruction": null,
+        "tools": "$.tools",
+        "tool_choice": "$.tool_choice",
+        "max_tokens": "$.max_tokens",
+        "temperature": "$.temperature",
+        "top_p": null,
+        "stream": "$.stream",
+        "stop": null
+      },
+      "response": {
+        "content": "$.choices[0].message.content",
+        "model": "$.model",
+        "finish_reason": "$.choices[0].finish_reason",
+        "input_tokens": "$.usage.prompt_tokens",
+        "output_tokens": "$.usage.completion_tokens",
+        "stop_reason": null
+      },
+      "system_in_messages": true,
+      "content_blocks": false,
+      "chat_history_mode": false,
+      "model_from_url_segment": null,
+      "role_map": {},
+      "model_id_parse": false,
+      "ephemeral_request_fields": []
+    }
+  },
+  "graphql_operations": {
+    "version": null,
+    "operations": [],
+    "heuristic_patterns": []
+  },
+  "grpc_services": {
+    "version": null,
+    "services": []
+  },
+  "capture_rules": {
+    "default_mode": "metadata_only",
+    "full_capture_providers": [
+      "anthropic",
+      "google",
+      "openrouter"
+    ],
+    "org_overrides": {
+      "full_capture_providers": [],
+      "metadata_only_providers": []
+    }
+  },
+  "domain_index": {
+    "*.granola.ai": "granola",
+    "*.openai.azure.com": "azure_openai",
+    "127.0.0.1": "lmstudio",
+    "a-api.anthropic.com": "claude",
+    "active.ai": "active-ai",
+    "ada.cx": "ada",
+    "admin.hellotars.com": "tars",
+    "ai-gateway.helicone.ai": "helicone",
+    "aisera.com": "aisera",
+    "aleph-alpha.com": "aleph-alpha",
+    "alexa.amazon.com": "alexa",
+    "alibaba.com": "aligenie",
+    "api-inference.modelscope.cn": "modelscope",
+    "api.anthropic.com": "claude",
+    "api.cerebras.ai": "cerebras",
+    "api.cohere.ai": "cohere",
+    "api.cortecs.ai": "cortecs",
+    "api.fireworks.ai": "fireworks",
+    "api.friendli.ai": "friendli",
+    "api.githubcopilot.com": "github_copilot",
+    "api.granola.ai": "granola",
+    "api.groq.com": "groq",
+    "api.inceptionlabs.ai": "inception",
+    "api.inference.wandb.ai": "wandb",
+    "api.intelligence.io.solutions": "io_net",
+    "api.kimi.com": "kimi_for_coding",
+    "api.llama.com": "llama",
+    "api.manus.im": "manus-ai",
+    "api.minimax.io": "minimax",
+    "api.minimaxi.com": "minimax_cn",
+    "api.mistral.ai": "mistral",
+    "api.moonshot.ai": "moonshotai",
+    "api.moonshot.cn": "moonshotai_cn",
+    "api.morphllm.com": "morph",
+    "api.novita.ai": "novita_ai",
+    "api.openai.com": "openai",
+    "api.scaleway.ai": "scaleway",
+    "api.siliconflow.cn": "siliconflow_cn",
+    "api.siliconflow.com": "siliconflow",
+    "api.synthetic.new": "synthetic",
+    "api.tbox.cn": "bailing",
+    "api.tokenfactory.nebius.com": "nebius",
+    "api.upstage.ai": "upstage",
+    "api.venice.ai": "venice",
+    "api.vivgrid.com": "vivgrid",
+    "api.vultrinference.com": "vultr",
+    "api.x.ai": "xai",
+    "api.xiaomimimo.com": "xiaomi",
+    "api.z.ai": "zai_coding_plan",
+    "apis.iflow.cn": "iflowcn",
+    "app.alphachat.ai": "alphachat",
+    "app.bland.ai": "bland-ai",
+    "app.chatbot.com": "chatbot",
+    "app.devrev.ai": "devrev",
+    "app.drift.com": "drift",
+    "app.firmware.ai": "firmware",
+    "app.getmerlin.in": "merlin-ai",
+    "app.hubspot.com": "chatspot",
+    "app.intercom.com": "fin",
+    "app.jasper.ai": "jasper-chat",
+    "app.personal.ai": "personal-ai",
+    "app.textcortex.com": "zenochat",
+    "app.verloop.io": "verloop-io",
+    "app.writesonic.com": "chatsonic",
+    "apple.com": "siri",
+    "apps.mypurecloud.com": "genesys",
+    "arc.net": "arc",
+    "assistant.google.com": "google-assistant",
+    "avaamo.ai": "avaamo",
+    "bedrock-runtime.*.amazonaws.com": "aws_bedrock",
+    "bedrock.*.amazonaws.com": "aws_bedrock",
+    "bharatgpt.ai": "bharatgpt",
+    "boost.ai": "boost-ai",
+    "bots.kore.ai": "kore-ai",
+    "brainasoft.com": "braina",
+    "brave.com": "leo",
+    "caryn.ai": "caryn-ai",
+    "cbot.ai": "cbot",
+    "chai.ml": "chai",
+    "character.ai": "character-ai",
+    "chat.deepseek.com": "deepseek",
+    "chat.mistral.ai": "le-chat",
+    "chat.openai.com": "chatgpt",
+    "chatglm.cn": "glm-4-plus",
+    "chatgpt.com": "chatgpt",
+    "claude.ai": "claude",
+    "cloud.ibm.com": "ibm-watsonx",
+    "cloud.oracle.com": "oracle",
+    "cloud.yellow.ai": "yellow-ai",
+    "clova.ai": "clova",
+    "cognitivecode.com": "silvia",
+    "console.aws.amazon.com": "amazon-q",
+    "copilot.microsoft.com": "copilot",
+    "corover.ai": "corover-ai",
+    "dashboard.chatfuel.com": "chatfuel",
+    "dashboard.kommunicate.io": "kommunicate",
+    "dashscope-intl.aliyuncs.com": "alibaba",
+    "dashscope.aliyuncs.com": "alibaba_cn",
+    "decagon.ai": "decagon",
+    "dialogflow.cloud.google.com": "dialogflow",
+    "druidai.com": "druid-ai",
+    "gateway.ai.cloudflare.com": "cloudflare_ai_gateway",
+    "gemini.google.com": "google-gemini",
+    "generativelanguage.googleapis.com": "google",
+    "giga.chat": "gigachat",
+    "go.fastrouter.ai": "fastrouter",
+    "google.com": "chrome",
+    "grok.com": "grok",
+    "grok.x.ai": "grok",
+    "haptik.ai": "haptik",
+    "huawei.com": "celia",
+    "huggingface.co": "huggingchat",
+    "inbenta.com": "inbenta",
+    "inference.baseten.co": "baseten",
+    "inference.net": "inference",
+    "integrate.api.nvidia.com": "nvidia",
+    "kimi.moonshot.cn": "kimi",
+    "laiye.com": "laiye",
+    "leena.ai": "leena-ai",
+    "lennylp.com": "lenny",
+    "llm.chutes.ai": "chutes",
+    "llm.submodel.ai": "submodel",
+    "localhost": "privatemode_ai",
+    "lucidquery.com": "lucidquery",
+    "manus.im": "manus-ai",
+    "meon.co.in": "meon-chatbot",
+    "microsoft.com": "edge",
+    "models.github.ai": "github_models",
+    "moveworks.com": "moveworks",
+    "mozilla.org": "firefox",
+    "my.replika.com": "replika",
+    "mycroft.ai": "mycroft",
+    "nano-gpt.com": "nano_gpt",
+    "oai.endpoints.kepler.ai.cloud.ovh.net": "ovhcloud",
+    "ollama.com": "ollama",
+    "omilia.com": "omilia",
+    "onereach.ai": "onereach-ai",
+    "open.bigmodel.cn": "zhipuai_coding_plan",
+    "opencode.ai": "opencode",
+    "openrouter.ai": "openrouter",
+    "opera.com": "opera",
+    "parloa.com": "parloa",
+    "perplexity.ai": "perplexity",
+    "pi.ai": "pi",
+    "poe.com": "poe",
+    "qwen.ai": "qwen",
+    "rasa.com": "rasa",
+    "rezolve.ai": "rezolve-ai",
+    "routellm.abacus.ai": "abacus",
+    "router.huggingface.co": "huggingface",
+    "router.requesty.ai": "requesty",
+    "salesiq.zoho.com": "zoho-salesiq",
+    "samsung.com": "bixby",
+    "senseforth.ai": "senseforth-ai",
+    "servicenow.com": "servicenow",
+    "sesame.com": "sesame-ai",
+    "sierra.ai": "sierra-ai",
+    "simsimi.com": "simsimi",
+    "socrat.ai": "socrat-ai",
+    "socratic.org": "socratic",
+    "soundhound.com": "soundhound-ai",
+    "stepchat.cn": "stepfun",
+    "stream.api.granola.ai": "granola",
+    "talkie-ai.com": "talkie",
+    "trial.cognigy.ai": "cognigy",
+    "uniphore.com": "uniphore",
+    "us-central1-aiplatform.googleapis.com": "google_vertex",
+    "vivaldi.com": "vivaldi",
+    "www.baichuan-ai.com": "baichuan-ai",
+    "www.cleverbot.com": "cleverbot",
+    "www.doubao.com": "doubao",
+    "www.jabberwacky.com": "jabberwacky",
+    "www.khanmigo.ai": "khanmigo",
+    "www.kuki.ai": "mitsuku",
+    "www.llama2.ai": "llama2-ai",
+    "www.masswerk.at": "eliza",
+    "www.meta.ai": "meta-ai",
+    "www.pandorabots.com": "alice-pandorabots",
+    "www.perplexity.ai": "perplexity",
+    "www.superchinese.com": "superchinese",
+    "www.tidio.com": "tidio-lyro",
+    "www.zendesk.com": "zendesk",
+    "yandex.com": "alice-yandex",
+    "yiyan.baidu.com": "ernie-bot",
+    "you.com": "youchat",
+    "yuanbao.tencent.com": "yuanbao",
+    "z1.le.liveperson.net": "liveperson",
+    "zabaware.com": "ultra-hal",
+    "zapier.com": "zapier-chatbots",
+    "zenmux.ai": "zenmux"
+  },
+  "detection_index": {
+    "agent.active.ai.app": "active-ai",
+    "agent.ada.app": "ada",
+    "agent.aisera.app": "aisera",
+    "agent.aleph.alpha.app": "aleph-alpha",
+    "agent.alexa.app": "alexa",
+    "agent.alice.pandorabots.app": "alice-pandorabots",
+    "agent.alice.yandex.app": "alice-yandex",
+    "agent.aligenie.app": "aligenie",
+    "agent.alphachat.app": "alphachat",
+    "agent.amazon.lex.app": "amazon-lex",
+    "agent.amazon.q.app": "amazon-q",
+    "agent.amelia.app": "amelia",
+    "agent.arc.app": "arc",
+    "agent.avaamo.app": "avaamo",
+    "agent.baichuan.ai.app": "baichuan-ai",
+    "agent.bharatgpt.app": "bharatgpt",
+    "agent.bixby.app": "bixby",
+    "agent.bland.ai.app": "bland-ai",
+    "agent.boost.ai.app": "boost-ai",
+    "agent.braina.app": "braina",
+    "agent.brave.app": "brave",
+    "agent.caryn.ai.app": "caryn-ai",
+    "agent.cbot.app": "cbot",
+    "agent.celia.app": "celia",
+    "agent.chai.app": "chai",
+    "agent.character.ai.app": "character-ai",
+    "agent.chatbot.app": "chatbot",
+    "agent.chatfuel.app": "chatfuel",
+    "agent.chatgpt.app": "chatgpt",
+    "agent.chatsonic.app": "chatsonic",
+    "agent.chatspot.app": "chatspot",
+    "agent.chrome.app": "chrome",
+    "agent.claude.app": "claude",
+    "agent.cleverbot.app": "cleverbot",
+    "agent.clova.app": "clova",
+    "agent.cognigy.app": "cognigy",
+    "agent.conversational.cloud.app": "conversational-cloud",
+    "agent.copilot.app": "copilot",
+    "agent.corover.ai.app": "corover-ai",
+    "agent.decagon.app": "decagon",
+    "agent.deepseek.app": "deepseek",
+    "agent.devrev.app": "devrev",
+    "agent.dialogflow.app": "dialogflow",
+    "agent.doubao.app": "doubao",
+    "agent.drift.app": "drift",
+    "agent.druid.ai.app": "druid-ai",
+    "agent.edge.app": "edge",
+    "agent.eliza.app": "eliza",
+    "agent.ernie.bot.app": "ernie-bot",
+    "agent.fin.app": "fin",
+    "agent.firefox.app": "firefox",
+    "agent.gemini.app": "gemini",
+    "agent.genesys.app": "genesys",
+    "agent.gigachat.app": "gigachat",
+    "agent.glm.4.plus.app": "glm-4-plus",
+    "agent.google.assistant.app": "google-assistant",
+    "agent.google.gemini.app": "google-gemini",
+    "agent.granola.app": "granola",
+    "agent.grok.app": "grok",
+    "agent.haptik.app": "haptik",
+    "agent.huggingchat.app": "huggingchat",
+    "agent.ibm.watsonx.app": "ibm-watsonx",
+    "agent.inbenta.app": "inbenta",
+    "agent.jabberwacky.app": "jabberwacky",
+    "agent.jasper.chat.app": "jasper-chat",
+    "agent.khanmigo.app": "khanmigo",
+    "agent.kimi.app": "kimi",
+    "agent.kommunicate.app": "kommunicate",
+    "agent.kore.ai.app": "kore-ai",
+    "agent.kuki.app": "kuki",
+    "agent.laiye.app": "laiye",
+    "agent.le.chat.app": "le-chat",
+    "agent.leena.ai.app": "leena-ai",
+    "agent.lenny.app": "lenny",
+    "agent.leo.app": "leo",
+    "agent.liveperson.app": "liveperson",
+    "agent.llama2.ai.app": "llama2-ai",
+    "agent.manus.ai.app": "manus-ai",
+    "agent.meon.chatbot.app": "meon-chatbot",
+    "agent.merlin.ai.app": "merlin-ai",
+    "agent.meta.ai.app": "meta-ai",
+    "agent.mitsuku.app": "mitsuku",
+    "agent.moveworks.app": "moveworks",
+    "agent.mycroft.app": "mycroft",
+    "agent.omilia.app": "omilia",
+    "agent.onereach.ai.app": "onereach-ai",
+    "agent.opera.app": "opera",
+    "agent.oracle.app": "oracle",
+    "agent.parloa.app": "parloa",
+    "agent.perplexity.app": "perplexity",
+    "agent.personal.ai.app": "personal-ai",
+    "agent.pi.app": "pi",
+    "agent.poe.app": "poe",
+    "agent.qwen.app": "qwen",
+    "agent.rasa.app": "rasa",
+    "agent.replika.app": "replika",
+    "agent.rezolve.ai.app": "rezolve-ai",
+    "agent.safari.app": "safari",
+    "agent.senseforth.ai.app": "senseforth-ai",
+    "agent.servicenow.app": "servicenow",
+    "agent.sesame.ai.app": "sesame-ai",
+    "agent.sierra.ai.app": "sierra-ai",
+    "agent.silvia.app": "silvia",
+    "agent.simsimi.app": "simsimi",
+    "agent.siri.app": "siri",
+    "agent.socrat.ai.app": "socrat-ai",
+    "agent.socratic.app": "socratic",
+    "agent.soundhound.ai.app": "soundhound-ai",
+    "agent.stepfun.app": "stepfun",
+    "agent.superchinese.app": "superchinese",
+    "agent.talkie.app": "talkie",
+    "agent.tars.app": "tars",
+    "agent.tidio.lyro.app": "tidio-lyro",
+    "agent.ultra.hal.app": "ultra-hal",
+    "agent.uniphore.app": "uniphore",
+    "agent.verloop.io.app": "verloop-io",
+    "agent.vivaldi.app": "vivaldi",
+    "agent.yellow.ai.app": "yellow-ai",
+    "agent.youchat.app": "youchat",
+    "agent.yuanbao.app": "yuanbao",
+    "agent.zapier.agents.app": "zapier-agents",
+    "agent.zapier.chatbots.app": "zapier-chatbots",
+    "agent.zendesk.app": "zendesk",
+    "agent.zenochat.app": "zenochat",
+    "agent.zoho.salesiq.app": "zoho-salesiq",
+    "ai.abacus.service": "abacus",
+    "ai.alibaba.cn.service": "alibaba_cn",
+    "ai.alibaba.service": "alibaba",
+    "ai.anthropic.service": "anthropic",
+    "ai.aws.bedrock.service": "aws_bedrock",
+    "ai.azure.openai.service": "azure_openai",
+    "ai.bailing.service": "bailing",
+    "ai.baseten.service": "baseten",
+    "ai.cerebras.service": "cerebras",
+    "ai.chutes.service": "chutes",
+    "ai.cloudflare.ai.gateway.service": "cloudflare_ai_gateway",
+    "ai.cohere.service": "cohere",
+    "ai.cortecs.service": "cortecs",
+    "ai.fastrouter.service": "fastrouter",
+    "ai.fireworks.service": "fireworks",
+    "ai.firmware.service": "firmware",
+    "ai.friendli.service": "friendli",
+    "ai.github.copilot.service": "github_copilot",
+    "ai.github.models.service": "github_models",
+    "ai.google.service": "google",
+    "ai.google.vertex.service": "google_vertex",
+    "ai.groq.service": "groq",
+    "ai.helicone.service": "helicone",
+    "ai.huggingface.service": "huggingface",
+    "ai.iflowcn.service": "iflowcn",
+    "ai.inception.service": "inception",
+    "ai.inference.service": "inference",
+    "ai.io.net.service": "io_net",
+    "ai.kimi.for.coding.service": "kimi_for_coding",
+    "ai.llama.service": "llama",
+    "ai.lmstudio.service": "lmstudio",
+    "ai.lucidquery.service": "lucidquery",
+    "ai.minimax.cn.service": "minimax_cn",
+    "ai.minimax.service": "minimax",
+    "ai.mistral.service": "mistral",
+    "ai.modelscope.service": "modelscope",
+    "ai.moonshotai.cn.service": "moonshotai_cn",
+    "ai.moonshotai.service": "moonshotai",
+    "ai.morph.service": "morph",
+    "ai.nano.gpt.service": "nano_gpt",
+    "ai.nebius.service": "nebius",
+    "ai.novita.ai.service": "novita_ai",
+    "ai.nvidia.service": "nvidia",
+    "ai.ollama.service": "ollama",
+    "ai.openai.service": "openai",
+    "ai.opencode.service": "opencode",
+    "ai.openrouter.service": "openrouter",
+    "ai.ovhcloud.service": "ovhcloud",
+    "ai.privatemode.ai.service": "privatemode_ai",
+    "ai.requesty.service": "requesty",
+    "ai.scaleway.service": "scaleway",
+    "ai.siliconflow.cn.service": "siliconflow_cn",
+    "ai.siliconflow.service": "siliconflow",
+    "ai.submodel.service": "submodel",
+    "ai.synthetic.service": "synthetic",
+    "ai.upstage.service": "upstage",
+    "ai.venice.service": "venice",
+    "ai.vivgrid.service": "vivgrid",
+    "ai.vultr.service": "vultr",
+    "ai.wandb.service": "wandb",
+    "ai.xai.service": "xai",
+    "ai.xiaomi.service": "xiaomi",
+    "ai.zai.coding.plan.service": "zai_coding_plan",
+    "ai.zai.service": "zai",
+    "ai.zenmux.service": "zenmux",
+    "ai.zhipuai.coding.plan.service": "zhipuai_coding_plan",
+    "ai.zhipuai.service": "zhipuai"
+  },
+  "llm_providers": {
+    "abacus": {
+      "provider_id": "abacus",
+      "name": "Abacus",
+      "api_format": "openai"
+    },
+    "alibaba": {
+      "provider_id": "alibaba",
+      "name": "Alibaba",
+      "api_format": "openai"
+    },
+    "alibaba_cn": {
+      "provider_id": "alibaba_cn",
+      "name": "Alibaba (China)",
+      "api_format": "openai"
+    },
+    "anthropic": {
+      "provider_id": "anthropic",
+      "name": "Anthropic",
+      "api_format": "anthropic"
+    },
+    "aws_bedrock": {
+      "provider_id": "aws_bedrock",
+      "name": "Amazon Bedrock",
+      "api_format": "bedrock"
+    },
+    "azure_openai": {
+      "provider_id": "azure_openai",
+      "name": "Azure",
+      "api_format": "openai"
+    },
+    "bailing": {
+      "provider_id": "bailing",
+      "name": "Bailing",
+      "api_format": "openai"
+    },
+    "baseten": {
+      "provider_id": "baseten",
+      "name": "Baseten",
+      "api_format": "openai"
+    },
+    "cerebras": {
+      "provider_id": "cerebras",
+      "name": "Cerebras",
+      "api_format": "openai"
+    },
+    "chutes": {
+      "provider_id": "chutes",
+      "name": "Chutes",
+      "api_format": "openai"
+    },
+    "cloudflare_ai_gateway": {
+      "provider_id": "cloudflare_ai_gateway",
+      "name": "Cloudflare AI Gateway",
+      "api_format": "openai"
+    },
+    "cohere": {
+      "provider_id": "cohere",
+      "name": "Cohere",
+      "api_format": "cohere"
+    },
+    "cortecs": {
+      "provider_id": "cortecs",
+      "name": "Cortecs",
+      "api_format": "openai"
+    },
+    "fastrouter": {
+      "provider_id": "fastrouter",
+      "name": "FastRouter",
+      "api_format": "openai"
+    },
+    "fireworks": {
+      "provider_id": "fireworks",
+      "name": "Fireworks AI",
+      "api_format": "openai"
+    },
+    "firmware": {
+      "provider_id": "firmware",
+      "name": "Firmware",
+      "api_format": "openai"
+    },
+    "friendli": {
+      "provider_id": "friendli",
+      "name": "Friendli",
+      "api_format": "openai"
+    },
+    "github_copilot": {
+      "provider_id": "github_copilot",
+      "name": "GitHub Copilot",
+      "api_format": "openai"
+    },
+    "github_models": {
+      "provider_id": "github_models",
+      "name": "GitHub Models",
+      "api_format": "openai"
+    },
+    "google": {
+      "provider_id": "google",
+      "name": "Google",
+      "api_format": "google"
+    },
+    "google_vertex": {
+      "provider_id": "google_vertex",
+      "name": "Vertex",
+      "api_format": "google"
+    },
+    "groq": {
+      "provider_id": "groq",
+      "name": "Groq",
+      "api_format": "openai"
+    },
+    "helicone": {
+      "provider_id": "helicone",
+      "name": "Helicone",
+      "api_format": "openai"
+    },
+    "huggingface": {
+      "provider_id": "huggingface",
+      "name": "Hugging Face",
+      "api_format": "openai"
+    },
+    "iflowcn": {
+      "provider_id": "iflowcn",
+      "name": "iFlow",
+      "api_format": "openai"
+    },
+    "inception": {
+      "provider_id": "inception",
+      "name": "Inception",
+      "api_format": "openai"
+    },
+    "inference": {
+      "provider_id": "inference",
+      "name": "Inference",
+      "api_format": "openai"
+    },
+    "io_net": {
+      "provider_id": "io_net",
+      "name": "IO.NET",
+      "api_format": "openai"
+    },
+    "kimi_for_coding": {
+      "provider_id": "kimi_for_coding",
+      "name": "Kimi For Coding",
+      "api_format": "openai"
+    },
+    "llama": {
+      "provider_id": "llama",
+      "name": "Llama",
+      "api_format": "openai"
+    },
+    "lmstudio": {
+      "provider_id": "lmstudio",
+      "name": "LMStudio",
+      "api_format": "openai"
+    },
+    "lucidquery": {
+      "provider_id": "lucidquery",
+      "name": "LucidQuery AI",
+      "api_format": "openai"
+    },
+    "minimax": {
+      "provider_id": "minimax",
+      "name": "MiniMax",
+      "api_format": "openai"
+    },
+    "minimax_cn": {
+      "provider_id": "minimax_cn",
+      "name": "MiniMax (China)",
+      "api_format": "openai"
+    },
+    "mistral": {
+      "provider_id": "mistral",
+      "name": "Mistral",
+      "api_format": "openai"
+    },
+    "modelscope": {
+      "provider_id": "modelscope",
+      "name": "ModelScope",
+      "api_format": "openai"
+    },
+    "moonshotai": {
+      "provider_id": "moonshotai",
+      "name": "Moonshot AI",
+      "api_format": "openai"
+    },
+    "moonshotai_cn": {
+      "provider_id": "moonshotai_cn",
+      "name": "Moonshot AI (China)",
+      "api_format": "openai"
+    },
+    "morph": {
+      "provider_id": "morph",
+      "name": "Morph",
+      "api_format": "openai"
+    },
+    "nano_gpt": {
+      "provider_id": "nano_gpt",
+      "name": "NanoGPT",
+      "api_format": "openai"
+    },
+    "nebius": {
+      "provider_id": "nebius",
+      "name": "Nebius Token Factory",
+      "api_format": "openai"
+    },
+    "novita_ai": {
+      "provider_id": "novita_ai",
+      "name": "NovitaAI",
+      "api_format": "openai"
+    },
+    "nvidia": {
+      "provider_id": "nvidia",
+      "name": "Nvidia",
+      "api_format": "openai"
+    },
+    "ollama": {
+      "provider_id": "ollama",
+      "name": "Ollama Cloud",
+      "api_format": "openai"
+    },
+    "openai": {
+      "provider_id": "openai",
+      "name": "OpenAI",
+      "api_format": "openai"
+    },
+    "opencode": {
+      "provider_id": "opencode",
+      "name": "OpenCode Zen",
+      "api_format": "openai"
+    },
+    "openrouter": {
+      "provider_id": "openrouter",
+      "name": "OpenRouter",
+      "api_format": "openai"
+    },
+    "ovhcloud": {
+      "provider_id": "ovhcloud",
+      "name": "OVHcloud AI Endpoints",
+      "api_format": "openai"
+    },
+    "privatemode_ai": {
+      "provider_id": "privatemode_ai",
+      "name": "Privatemode AI",
+      "api_format": "openai"
+    },
+    "requesty": {
+      "provider_id": "requesty",
+      "name": "Requesty",
+      "api_format": "openai"
+    },
+    "scaleway": {
+      "provider_id": "scaleway",
+      "name": "Scaleway",
+      "api_format": "openai"
+    },
+    "siliconflow": {
+      "provider_id": "siliconflow",
+      "name": "SiliconFlow",
+      "api_format": "openai"
+    },
+    "siliconflow_cn": {
+      "provider_id": "siliconflow_cn",
+      "name": "SiliconFlow (China)",
+      "api_format": "openai"
+    },
+    "submodel": {
+      "provider_id": "submodel",
+      "name": "submodel",
+      "api_format": "openai"
+    },
+    "synthetic": {
+      "provider_id": "synthetic",
+      "name": "Synthetic",
+      "api_format": "openai"
+    },
+    "upstage": {
+      "provider_id": "upstage",
+      "name": "Upstage",
+      "api_format": "openai"
+    },
+    "venice": {
+      "provider_id": "venice",
+      "name": "Venice AI",
+      "api_format": "openai"
+    },
+    "vivgrid": {
+      "provider_id": "vivgrid",
+      "name": "Vivgrid",
+      "api_format": "openai"
+    },
+    "vultr": {
+      "provider_id": "vultr",
+      "name": "Vultr",
+      "api_format": "openai"
+    },
+    "wandb": {
+      "provider_id": "wandb",
+      "name": "Weights & Biases",
+      "api_format": "openai"
+    },
+    "xai": {
+      "provider_id": "xai",
+      "name": "xAI",
+      "api_format": "openai"
+    },
+    "xiaomi": {
+      "provider_id": "xiaomi",
+      "name": "Xiaomi",
+      "api_format": "openai"
+    },
+    "zai": {
+      "provider_id": "zai",
+      "name": "Z.AI",
+      "api_format": "openai"
+    },
+    "zai_coding_plan": {
+      "provider_id": "zai_coding_plan",
+      "name": "Z.AI Coding Plan",
+      "api_format": "openai"
+    },
+    "zenmux": {
+      "provider_id": "zenmux",
+      "name": "ZenMux",
+      "api_format": "openai"
+    },
+    "zhipuai": {
+      "provider_id": "zhipuai",
+      "name": "Zhipu AI",
+      "api_format": "openai"
+    },
+    "zhipuai_coding_plan": {
+      "provider_id": "zhipuai_coding_plan",
+      "name": "Zhipu AI Coding Plan",
+      "api_format": "openai"
+    }
+  },
+  "applications": {
+    "active-ai": {
+      "app_id": "active-ai",
+      "name": "Active.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "ada": {
+      "app_id": "ada",
+      "name": "Ada",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "aisera": {
+      "app_id": "aisera",
+      "name": "Aisera",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "aleph-alpha": {
+      "app_id": "aleph-alpha",
+      "name": "Aleph Alpha",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "alexa": {
+      "app_id": "alexa",
+      "name": "Alexa",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "alice-pandorabots": {
+      "app_id": "alice-pandorabots",
+      "name": "A.L.I.C.E.",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "alice-yandex": {
+      "app_id": "alice-yandex",
+      "name": "Alice",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "aligenie": {
+      "app_id": "aligenie",
+      "name": "AliGenie",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "alphachat": {
+      "app_id": "alphachat",
+      "name": "alphachat",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "amazon-lex": {
+      "app_id": "amazon-lex",
+      "name": "Amazon Lex",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "amazon-q": {
+      "app_id": "amazon-q",
+      "name": "Q",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "amelia": {
+      "app_id": "amelia",
+      "name": "Amelia",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "arc": {
+      "app_id": "arc",
+      "name": "Arc",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "avaamo": {
+      "app_id": "avaamo",
+      "name": "Avaamo.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "baichuan-ai": {
+      "app_id": "baichuan-ai",
+      "name": "Baichuan AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "bharatgpt": {
+      "app_id": "bharatgpt",
+      "name": "BharatGPT",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "bixby": {
+      "app_id": "bixby",
+      "name": "Bixby",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "bland-ai": {
+      "app_id": "bland-ai",
+      "name": "Bland AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "boost-ai": {
+      "app_id": "boost-ai",
+      "name": "Boost.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "braina": {
+      "app_id": "braina",
+      "name": "Braina",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "brave": {
+      "app_id": "brave",
+      "name": "Brave",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "caryn-ai": {
+      "app_id": "caryn-ai",
+      "name": "CarynAI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "cbot": {
+      "app_id": "cbot",
+      "name": "Cbot",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "celia": {
+      "app_id": "celia",
+      "name": "Celia",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "chai": {
+      "app_id": "chai",
+      "name": "Chai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "character-ai": {
+      "app_id": "character-ai",
+      "name": "Character AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "chatbot": {
+      "app_id": "chatbot",
+      "name": "ChatBot",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "chatfuel": {
+      "app_id": "chatfuel",
+      "name": "Chatfuel",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "chatgpt": {
+      "app_id": "chatgpt",
+      "name": "ChatGPT",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "chatsonic": {
+      "app_id": "chatsonic",
+      "name": "Chatsonic",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "chatspot": {
+      "app_id": "chatspot",
+      "name": "ChatSpot",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "chrome": {
+      "app_id": "chrome",
+      "name": "Google Chrome",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "claude": {
+      "app_id": "claude",
+      "name": "Claude",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "cleverbot": {
+      "app_id": "cleverbot",
+      "name": "Cleverbot",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "clova": {
+      "app_id": "clova",
+      "name": "Clova",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "cognigy": {
+      "app_id": "cognigy",
+      "name": "Cognigy",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "conversational-cloud": {
+      "app_id": "conversational-cloud",
+      "name": "Conversational Cloud",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "copilot": {
+      "app_id": "copilot",
+      "name": "Copilot",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "corover-ai": {
+      "app_id": "corover-ai",
+      "name": "CoRover.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "decagon": {
+      "app_id": "decagon",
+      "name": "Decagon",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "deepseek": {
+      "app_id": "deepseek",
+      "name": "DeepSeek",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "devrev": {
+      "app_id": "devrev",
+      "name": "DevRev",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "dialogflow": {
+      "app_id": "dialogflow",
+      "name": "Google Dialogflow",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "doubao": {
+      "app_id": "doubao",
+      "name": "Doubao",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "drift": {
+      "app_id": "drift",
+      "name": "Drift",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "druid-ai": {
+      "app_id": "druid-ai",
+      "name": "DRUID AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "edge": {
+      "app_id": "edge",
+      "name": "Microsoft Edge",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "eliza": {
+      "app_id": "eliza",
+      "name": "ELIZA",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "ernie-bot": {
+      "app_id": "ernie-bot",
+      "name": "Ernie Bot",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "fin": {
+      "app_id": "fin",
+      "name": "Fin",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "firefox": {
+      "app_id": "firefox",
+      "name": "Firefox",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "gemini": {
+      "app_id": "gemini",
+      "name": "Gemini",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "genesys": {
+      "app_id": "genesys",
+      "name": "Genesys",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "gigachat": {
+      "app_id": "gigachat",
+      "name": "GigaChat",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "glm-4-plus": {
+      "app_id": "glm-4-plus",
+      "name": "GLM-4 Plus",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "google-assistant": {
+      "app_id": "google-assistant",
+      "name": "Google Assistant",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "google-gemini": {
+      "app_id": "google-gemini",
+      "name": "Google Gemini",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "granola": {
+      "app_id": "granola",
+      "name": "Granola",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "grok": {
+      "app_id": "grok",
+      "name": "Grok",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "haptik": {
+      "app_id": "haptik",
+      "name": "Haptik.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "huggingchat": {
+      "app_id": "huggingchat",
+      "name": "HuggingChat",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "ibm-watsonx": {
+      "app_id": "ibm-watsonx",
+      "name": "IBM Watsonx Assistant",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "inbenta": {
+      "app_id": "inbenta",
+      "name": "Inbenta",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "jabberwacky": {
+      "app_id": "jabberwacky",
+      "name": "Jabberwacky",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "jasper-chat": {
+      "app_id": "jasper-chat",
+      "name": "Jasper Chat",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "khanmigo": {
+      "app_id": "khanmigo",
+      "name": "Khanmigo",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "kimi": {
+      "app_id": "kimi",
+      "name": "Kimi",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "kommunicate": {
+      "app_id": "kommunicate",
+      "name": "Kommunicate",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "kore-ai": {
+      "app_id": "kore-ai",
+      "name": "Kore.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "kuki": {
+      "app_id": "kuki",
+      "name": "Kuki",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "laiye": {
+      "app_id": "laiye",
+      "name": "Laiye",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "le-chat": {
+      "app_id": "le-chat",
+      "name": "Le Chat",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "leena-ai": {
+      "app_id": "leena-ai",
+      "name": "Leena.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "lenny": {
+      "app_id": "lenny",
+      "name": "Lenny",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "leo": {
+      "app_id": "leo",
+      "name": "Leo",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "liveperson": {
+      "app_id": "liveperson",
+      "name": "LivePerson",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "llama2-ai": {
+      "app_id": "llama2-ai",
+      "name": "Llama2.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "manus-ai": {
+      "app_id": "manus-ai",
+      "name": "Manus.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "meon-chatbot": {
+      "app_id": "meon-chatbot",
+      "name": "Meon Chatbot",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "merlin-ai": {
+      "app_id": "merlin-ai",
+      "name": "Merlin AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "meta-ai": {
+      "app_id": "meta-ai",
+      "name": "Meta AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "mitsuku": {
+      "app_id": "mitsuku",
+      "name": "Mitsuku",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "moveworks": {
+      "app_id": "moveworks",
+      "name": "Moveworks",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "mycroft": {
+      "app_id": "mycroft",
+      "name": "Mycroft",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "omilia": {
+      "app_id": "omilia",
+      "name": "Omilia",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "onereach-ai": {
+      "app_id": "onereach-ai",
+      "name": "OneReach.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "opera": {
+      "app_id": "opera",
+      "name": "Opera",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "oracle": {
+      "app_id": "oracle",
+      "name": "Oracle",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "parloa": {
+      "app_id": "parloa",
+      "name": "Parloa",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "perplexity": {
+      "app_id": "perplexity",
+      "name": "Perplexity AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "personal-ai": {
+      "app_id": "personal-ai",
+      "name": "Personal AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "pi": {
+      "app_id": "pi",
+      "name": "Pi",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "poe": {
+      "app_id": "poe",
+      "name": "Poe",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "qwen": {
+      "app_id": "qwen",
+      "name": "Qwen",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "rasa": {
+      "app_id": "rasa",
+      "name": "Rasa",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "replika": {
+      "app_id": "replika",
+      "name": "Replika",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "rezolve-ai": {
+      "app_id": "rezolve-ai",
+      "name": "Rezolve.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "safari": {
+      "app_id": "safari",
+      "name": "Safari",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "senseforth-ai": {
+      "app_id": "senseforth-ai",
+      "name": "Senseforth.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "servicenow": {
+      "app_id": "servicenow",
+      "name": "ServiceNow",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "sesame-ai": {
+      "app_id": "sesame-ai",
+      "name": "Sesame AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "sierra-ai": {
+      "app_id": "sierra-ai",
+      "name": "Sierra AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "silvia": {
+      "app_id": "silvia",
+      "name": "SILVIA",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "simsimi": {
+      "app_id": "simsimi",
+      "name": "SimSimi",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "siri": {
+      "app_id": "siri",
+      "name": "Siri",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "socrat-ai": {
+      "app_id": "socrat-ai",
+      "name": "Socrat.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "socratic": {
+      "app_id": "socratic",
+      "name": "Socratic",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "soundhound-ai": {
+      "app_id": "soundhound-ai",
+      "name": "SoundHound AI",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "stepfun": {
+      "app_id": "stepfun",
+      "name": "StepFun",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "superchinese": {
+      "app_id": "superchinese",
+      "name": "SuperChinese",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "talkie": {
+      "app_id": "talkie",
+      "name": "Talkie",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "tars": {
+      "app_id": "tars",
+      "name": "Tars",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "tidio-lyro": {
+      "app_id": "tidio-lyro",
+      "name": "Tidio Lyro",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "ultra-hal": {
+      "app_id": "ultra-hal",
+      "name": "Ultra Hal",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "uniphore": {
+      "app_id": "uniphore",
+      "name": "Uniphore",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "verloop-io": {
+      "app_id": "verloop-io",
+      "name": "Verloop.io",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "vivaldi": {
+      "app_id": "vivaldi",
+      "name": "Vivaldi",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "yellow-ai": {
+      "app_id": "yellow-ai",
+      "name": "Yellow.ai",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "youchat": {
+      "app_id": "youchat",
+      "name": "YouChat",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "yuanbao": {
+      "app_id": "yuanbao",
+      "name": "Yuanbao",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "zapier-agents": {
+      "app_id": "zapier-agents",
+      "name": "Zapier Agents",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "zapier-chatbots": {
+      "app_id": "zapier-chatbots",
+      "name": "Zapier Chatbots",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "zendesk": {
+      "app_id": "zendesk",
+      "name": "Zendesk",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "zenochat": {
+      "app_id": "zenochat",
+      "name": "ZenoChat",
+      "bundle_ids": [],
+      "process_names": []
+    },
+    "zoho-salesiq": {
+      "app_id": "zoho-salesiq",
+      "name": "Zoho SalesIQ",
+      "bundle_ids": [],
+      "process_names": []
+    }
+  },
+  "filters": {
+    "path_keywords": [
+      "/_data/v1/events",
+      "/_spa/assets/threadentrydebugtiming",
+      "/_worker/typeahead?",
+      "/alive",
+      "/backend-api/f/conversation/prepare",
+      "/cdn-cgi/trace",
+      "/graphql_subscriptions",
+      "/health",
+      "/monitoring?o=",
+      "/ready",
+      "/rest/enterprise/user/pending-invitation",
+      "/rest/entry/should-show-feedback",
+      "/rest/notifications/in-app/unread-count?",
+      "/rest/rate-limit/status",
+      "/rest/rate-limits",
+      "/rest/user/settings?",
+      "/sentinel/",
+      ":logs.us-east-1.amazonaws.com",
+      "akamaihd",
+      "akamaized",
+      "amplitude",
+      "appcenter",
+      "authtracker",
+      "azureedge",
+      "azurefd",
+      "beacon",
+      "bugsnag",
+      "cdn-agi",
+      "clarity",
+      "cloudflare",
+      "cloudflareinsights",
+      "connectivitycheck",
+      "datadog",
+      "doubleclick",
+      "fastly",
+      "fbcdn",
+      "featureassets",
+      "fullstory",
+      "generateagentreplicon",
+      "getagentfreeusage",
+      "google-analytics",
+      "googleadservices",
+      "googleapis",
+      "googlesyndication",
+      "googletagmanager",
+      "googleusercontent",
+      "gstatic",
+      "gtag",
+      "health-check",
+      "health_check",
+      "healthcheck",
+      "heartbeat",
+      "hotjar",
+      "icanhazip",
+      "in.appcenter.ms",
+      "jnn-pa.googleapis.com",
+      "jsdelivr",
+      "log_metric",
+      "logrocket",
+      "mail.superhuman.com",
+      "metrics",
+      "microsoftonline",
+      "mixpanel",
+      "msftauth",
+      "newrelic",
+      "nr-data",
+      "oaistatic",
+      "oauth",
+      "ocsp",
+      "onecdn",
+      "posthog",
+      "raw.githubusercontent.com",
+      "rollbar",
+      "safebrowsing",
+      "savemobilelayoutstate",
+      "segment",
+      "sentry",
+      "sentry-cdn",
+      "sitepresence",
+      "static.doubleclick.net",
+      "telemetry",
+      "token.safebrowsing.apple",
+      "tourservice",
+      "tracking",
+      "twimg",
+      "unpkg",
+      "updates.sempliva.com",
+      "ytimg"
+    ],
+    "header_keywords": []
+  },
+  "app_policies": {
+    "Amazon.QDeveloper": {
+      "app_id": "Amazon.QDeveloper",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Antigravity.App": {
+      "app_id": "Antigravity.App",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Cluely.Cluely": {
+      "app_id": "Cluely.Cluely",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Codeium.Codeium": {
+      "app_id": "Codeium.Codeium",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Figma.Figma": {
+      "app_id": "Figma.Figma",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "GitHub.GitHubDesktop": {
+      "app_id": "GitHub.GitHubDesktop",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Google.AndroidStudio": {
+      "app_id": "Google.AndroidStudio",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "JetBrains.CLion": {
+      "app_id": "JetBrains.CLion",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "JetBrains.Fleet": {
+      "app_id": "JetBrains.Fleet",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "JetBrains.IntelliJIDEA": {
+      "app_id": "JetBrains.IntelliJIDEA",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "JetBrains.PhpStorm": {
+      "app_id": "JetBrains.PhpStorm",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "JetBrains.PyCharm": {
+      "app_id": "JetBrains.PyCharm",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Microsoft.Copilot": {
+      "app_id": "Microsoft.Copilot",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Microsoft.VisualStudio": {
+      "app_id": "Microsoft.VisualStudio",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Microsoft.VisualStudioCode": {
+      "app_id": "Microsoft.VisualStudioCode",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Neovim.Neovim": {
+      "app_id": "Neovim.Neovim",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Notion.Notion": {
+      "app_id": "Notion.Notion",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "OpenAI.ChatGPT": {
+      "app_id": "OpenAI.ChatGPT",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Otter.Otter": {
+      "app_id": "Otter.Otter",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Perplexity.Perplexity": {
+      "app_id": "Perplexity.Perplexity",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Tabnine.Tabnine": {
+      "app_id": "Tabnine.Tabnine",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "WhatsAppDesktop": {
+      "app_id": "WhatsAppDesktop",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Wispr.Flow": {
+      "app_id": "Wispr.Flow",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "Zed.Zed": {
+      "app_id": "Zed.Zed",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "ai.perplexity.mac": {
+      "app_id": "ai.perplexity.mac",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "backend.raycast.com": {
+      "app_id": "backend.raycast.com",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "claude.exe": {
+      "app_id": "claude.exe",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.amazon.codewhisperer": {
+      "app_id": "com.amazon.codewhisperer",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.anthropic.claudefordesktop": {
+      "app_id": "com.anthropic.claudefordesktop",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.apple.dt.Xcode": {
+      "app_id": "com.apple.dt.Xcode",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.cluely.app": {
+      "app_id": "com.cluely.app",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.codeium.codeium": {
+      "app_id": "com.codeium.codeium",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.codeium.windsurf": {
+      "app_id": "com.codeium.windsurf",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.electron.wispr-flow": {
+      "app_id": "com.electron.wispr-flow",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.figma.Desktop": {
+      "app_id": "com.figma.Desktop",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.github.GitHubClient": {
+      "app_id": "com.github.GitHubClient",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.github.copilot": {
+      "app_id": "com.github.copilot",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.google.android.studio": {
+      "app_id": "com.google.android.studio",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.google.antigravity": {
+      "app_id": "com.google.antigravity",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.granola.app": {
+      "app_id": "com.granola.app",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.jetbrains.CLion": {
+      "app_id": "com.jetbrains.CLion",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.jetbrains.PhpStorm": {
+      "app_id": "com.jetbrains.PhpStorm",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.jetbrains.fleet": {
+      "app_id": "com.jetbrains.fleet",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.jetbrains.intellij": {
+      "app_id": "com.jetbrains.intellij",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.jetbrains.pycharm": {
+      "app_id": "com.jetbrains.pycharm",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.microsoft.VSCode": {
+      "app_id": "com.microsoft.VSCode",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.microsoft.copilot-mac": {
+      "app_id": "com.microsoft.copilot-mac",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.microsoft.visual-studio": {
+      "app_id": "com.microsoft.visual-studio",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.openai.atlas": {
+      "app_id": "com.openai.atlas",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.openai.chat": {
+      "app_id": "com.openai.chat",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.otterai.desktop": {
+      "app_id": "com.otterai.desktop",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.raycast.macos": {
+      "app_id": "com.raycast.macos",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "com.tabnine.tabnine": {
+      "app_id": "com.tabnine.tabnine",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "dev.warp.Warp-Stable": {
+      "app_id": "dev.warp.Warp-Stable",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "dev.zed.Zed": {
+      "app_id": "dev.zed.Zed",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "io.tldv.desktop": {
+      "app_id": "io.tldv.desktop",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "net.whatsapp.WhatsApp": {
+      "app_id": "net.whatsapp.WhatsApp",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "notion.id": {
+      "app_id": "notion.id",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "org.gnu.Emacs": {
+      "app_id": "org.gnu.Emacs",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "org.vim.MacVim": {
+      "app_id": "org.vim.MacVim",
+      "display_name": null,
+      "app_kind": "agent_app"
+    },
+    "tldv.tldv": {
+      "app_id": "tldv.tldv",
+      "display_name": null,
+      "app_kind": "agent_app"
+    }
+  },
+  "browser_policies": {
+    "allowed_apps": [
+      "115.Browser",
+      "2345.Explorer",
+      "360.ExtremeBrowser",
+      "360.SecureBrowser",
+      "AOL.ShieldPro",
+      "AVG.SecureBrowser",
+      "Agregore.Browser",
+      "Aloha.Browser",
+      "ArcticFox.Browser",
+      "Astian.Midori",
+      "Avast.SecureBrowser",
+      "Basilisk.Browser",
+      "Beaker.Browser",
+      "Biscuit.Browser",
+      "Blisk.Browser",
+      "BriskBard.Browser",
+      "BrowserJet.Browser",
+      "CCleaner.Browser",
+      "Catsxp.Browser",
+      "CentBrowser.Browser",
+      "Chedot.Browser",
+      "Chromium",
+      "Chromium.Gost",
+      "Citrio.Browser",
+      "CocCoc.Browser",
+      "Colibri.Browser",
+      "Comodo.Dragon",
+      "Comodo.IceDragon",
+      "Coowon.Browser",
+      "Core.Browser",
+      "Cromite.Browser",
+      "CryptoTab.Browser",
+      "CyberGhost.PrivateBrowser",
+      "Decentr.Browser",
+      "Dezor.Browser",
+      "Dissenter.Browser",
+      "Dooble.Browser",
+      "DotHQ.DotBrowser",
+      "DuckDuckGo.DesktopBrowser",
+      "Ecosia.Browser",
+      "Epic.PrivacyBrowser",
+      "Floorp.Floorp",
+      "Gener8.Browser",
+      "GhostBrowser.Browser",
+      "Ghostery.PrivateBrowser",
+      "Guardian.Browser",
+      "Haihaisoft.Xvast",
+      "Hola.Browser",
+      "Huawei.Browser",
+      "Iridium.Browser",
+      "KDE.Falkon",
+      "KMeleon.Browser",
+      "Kingpin.Browser",
+      "Lagrange.Browser",
+      "LambdaTest.LTBrowser",
+      "LibreWolf.LibreWolf",
+      "Lunascape.Browser",
+      "Mail.Ru.Atom",
+      "Maxthon.Browser",
+      "Mercury.Browser",
+      "Min.Browser",
+      "Moonchild.PaleMoon",
+      "Mullvad.Browser",
+      "Mypal.Browser",
+      "Naver.Whale",
+      "Norton.PrivateBrowser",
+      "Opera.CryptoBrowser",
+      "Opera.GX",
+      "Orbitum.Browser",
+      "Otter.Browser",
+      "Polarity.Browser",
+      "Polypane.Browser",
+      "Puffin.Browser",
+      "QtWeb.Browser",
+      "Responsively.Browser",
+      "SRWare.Iron",
+      "SSuite.NetSurfer",
+      "SeaMonkey.Browser",
+      "Seznam.Browser",
+      "Shift.Browser",
+      "Sidekick.Browser",
+      "Sizzy.Browser",
+      "Sleipnir.Browser",
+      "SlimBrowser.Browser",
+      "Slimjet.Browser",
+      "Sogou.Explorer",
+      "Stack.Browser",
+      "Station.Browser",
+      "Supermium.Browser",
+      "SushiBrowser",
+      "Tempest.Browser",
+      "Tencent.QQBrowser",
+      "TheBrowserCompany.Arc_ttt1ap7aakyb4!Arc",
+      "Thorium.Browser",
+      "TorProject.TorBrowser",
+      "Tusk.Browser",
+      "Twinkstar.Browser",
+      "UR.Browser",
+      "Undetectable.Browser",
+      "Ungoogled.Chromium",
+      "Viasat.Browser",
+      "Waterfox.Waterfox",
+      "Waterfox.Waterfox.Classic",
+      "Wave.Browser",
+      "Wavebox.Wavebox",
+      "Wexond.Browser",
+      "Yandex.Browser",
+      "Zen.Browser",
+      "Zoho.Ulaa",
+      "ai.impervious.browser",
+      "ai.perplexity.comet",
+      "app.floorp.Floorp",
+      "app.kosmik.Kosmik",
+      "app.responsively.browser",
+      "backend.raycast.com",
+      "brave.exe",
+      "ch.simoncaminada.alloy",
+      "chrome.exe",
+      "claude.exe",
+      "co.beamapp.browser",
+      "co.opqr.colibri",
+      "com.115.browser",
+      "com.360.browser",
+      "com.360.extreme",
+      "com.adaptivebee.urbrowser",
+      "com.agregore.Agregore",
+      "com.alohabrowser.Aloha",
+      "com.anthropic.claudefordesktop",
+      "com.aol.shieldpro",
+      "com.apple.Safari",
+      "com.avast.browser",
+      "com.avg.browser",
+      "com.beakerbrowser.Beaker",
+      "com.bigbearlabs.WebBuddy",
+      "com.bonsaibrowser.Bonsai",
+      "com.bookry.wavebox",
+      "com.brave.Browser",
+      "com.carbon.browser",
+      "com.ccleaner.browser",
+      "com.citrio.browser",
+      "com.cloudmosa.puffin",
+      "com.coccoc.browser",
+      "com.codeium.windsurf",
+      "com.cruzapp.cruz",
+      "com.cryptotab.browser",
+      "com.dezor.browser",
+      "com.dooble.Dooble",
+      "com.duckduckgo.macos.browser",
+      "com.eatbiscuit.biscuit",
+      "com.ecosia.browser",
+      "com.electron.min",
+      "com.epic.browser",
+      "com.fenrir.sleipnir",
+      "com.firstversionist.polypane",
+      "com.gab.Dissenter",
+      "com.ghostbrowser.Ghost",
+      "com.ghostery.browser",
+      "com.github.copilot",
+      "com.google.Chrome",
+      "com.granola.app",
+      "com.haihaisoft.xvast",
+      "com.horsebrowser.Horse",
+      "com.impervious.beacon",
+      "com.kagi.kagimacOS",
+      "com.kingpinbrowser.Kingpin",
+      "com.kitze.sizzy",
+      "com.lambdatest.LTBrowser",
+      "com.maxthon.mac.Maxthon",
+      "com.microsoft.edgemac",
+      "com.naver.Whale",
+      "com.norton.browser",
+      "com.operasoftware.CryptoBrowser",
+      "com.operasoftware.Opera",
+      "com.operasoftware.OperaGX",
+      "com.orbitum.browser",
+      "com.polarity.browser",
+      "com.pulsebrowser.browser",
+      "com.pushplaylabs.sidekick",
+      "com.raycast.macos",
+      "com.rdbrck.shift",
+      "com.sigmaos.sigmaos.macos",
+      "com.slashb.browser",
+      "com.slashlos.helium",
+      "com.slimjet.browser",
+      "com.stack.browser",
+      "com.sushibrowser.SushiBrowser",
+      "com.tempest.browser",
+      "com.tencent.QQBrowser",
+      "com.thorium.mercury",
+      "com.tusk.browser",
+      "com.viasat.browser",
+      "com.vivaldi.Vivaldi",
+      "com.wave.browser",
+      "com.wexond.browser",
+      "com.zoho.ulaa",
+      "company.thebrowser.Browser",
+      "de.iridiumbrowser",
+      "dev.warp.Warp-Stable",
+      "engineer.atlas.nyxt",
+      "fi.skyjake.Lagrange",
+      "firefox.exe",
+      "io.github.ungoogled_software.ungoogled_chromium",
+      "io.gitlab.librewolf-community",
+      "io.oryoki.Oryoki",
+      "msedge.exe",
+      "net.decentr.browser",
+      "net.mullvad.browser",
+      "net.waterfox.waterfox",
+      "net.waterfox.waterfox.classic",
+      "opera.exe",
+      "org.adblockplus.adblockbrowser",
+      "org.arcticfoxproject.arcticfox",
+      "org.astian.midori",
+      "org.basilisk-browser.basilisk",
+      "org.blisk.Blisk",
+      "org.chromium.Chromium",
+      "org.chromium.ChromiumGost",
+      "org.chromium.Thorium",
+      "org.cromite.cromite",
+      "org.dothq.browser",
+      "org.efounders.BrowserX",
+      "org.gnome.Epiphany",
+      "org.gnu.IceCat",
+      "org.hola.browser",
+      "org.kde.falkon",
+      "org.kde.konqueror",
+      "org.ladybird.Ladybird",
+      "org.mozilla.camino",
+      "org.mozilla.firefox",
+      "org.mozilla.palemoon",
+      "org.mozilla.seamonkey",
+      "org.mozilla.zen",
+      "org.qt-project.Qt.QtWebEngineCore",
+      "org.runecats.Roccat",
+      "org.servo.servo",
+      "org.torproject.torbrowser",
+      "org.wicknix.interweb",
+      "qutebrowser",
+      "ru.mail.browser",
+      "ru.yandex.desktop.yandex-browser",
+      "vivaldi.exe"
+    ]
+  },
+  "passthrough_domains": [
+    ".*.apple.com$",
+    ".*.icloud.com$",
+    ".*.icloud-content.com$",
+    ".*.itunes.com$",
+    ".*.mzstatic.com$",
+    ".*.apple-cloudkit.com$",
+    ".*.googlevideo.com$",
+    ".*.youtube.com$",
+    ".*.ytimg.com$",
+    ".*.yt3.ggpht.com$",
+    ".*.youtube-nocookie.com$",
+    ".*.youtu.be$",
+    "accounts.google.com$",
+    ".*.gstatic.com$",
+    ".*.live.com$",
+    ".*.sentry.io$",
+    ".*.cursor.sh$",
+    ".*.slack.com$",
+    ".*.slackb.com$",
+    ".*.whatsapp.net$",
+    ".*.whatsapp.com$",
+    ".*.segment.io$",
+    ".*.launchdarkly.com$",
+    "^cdn-settings.segment.com$",
+    "^ab.chatgpt.com$",
+    "sp.replit.com",
+    "cdn.replit.com",
+    "calendar.google.com",
+    "api.apple-cloudkit.com:",
+    "waa-pa.clients6.google.com",
+    "clientstream.launchdarkly.com",
+    "optimizationguide-pa.googleapis.com",
+    "accounts.google.com",
+    "ssl.gstatic.com",
+    "play.google.com",
+    "browser-intake-datadoghq.com",
+    "clerk.oximy.com",
+    "metrics.cursor.sh",
+    "api.oximy.com",
+    "github.com",
+    "word-telemetry.officeapps.live.com",
+    "usc-word-edit.officeapps.live.com",
+    "^multiplayer\\.api\\.gamma\\.app$",
+    "^events\\.api\\.gamma\\.app$",
+    "statsig.anthropic.com",
+    "^.*\\.manus\\.computer$",
+    "^files\\.manuscdn\\.com$",
+    "^private-us-east-1\\.manuscdn\\.com$",
+    "^manus-analytics\\.com$",
+    "^e\\.raycast\\.com$",
+    "^.*\\.femetrics\\.grammarly\\.io$",
+    "^f-log-.*\\.grammarly\\.io$",
+    "^gnar\\.grammarly\\.com$",
+    "^in\\.grammarly\\.com$",
+    "^config\\.extension\\.grammarly\\.com$",
+    "^data\\.data\\.conductor\\.com$",
+    "^content\\.data\\.conductor\\.com$",
+    "^assets\\.conductor\\.com$"
+  ]
+}

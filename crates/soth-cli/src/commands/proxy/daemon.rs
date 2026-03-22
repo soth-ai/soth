@@ -38,8 +38,6 @@ const PROXY_ENV_KEYS: &[&str] = &[
     "REQUESTS_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
     "CURL_CA_BUNDLE",
-    "GIT_SSL_CAINFO",
-    "AWS_CA_BUNDLE",
 ];
 
 #[cfg(target_os = "windows")]
@@ -159,6 +157,12 @@ impl Drop for DaemonLifecycleLock {
 }
 
 fn soth_home_dir() -> PathBuf {
+    if let Ok(value) = env::var("SOTH_HOME_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     dirs::home_dir()
         .map(|home| home.join(".soth"))
         .unwrap_or_else(|| PathBuf::from(".soth"))
@@ -365,6 +369,17 @@ fn read_pid_metadata() -> anyhow::Result<Option<DaemonPidMetadata>> {
     let parsed = serde_json::from_str::<DaemonPidMetadata>(&raw)
         .with_context(|| format!("failed parsing pid metadata {}", path.display()))?;
     Ok(Some(parsed))
+}
+
+pub(crate) fn active_daemon_port_hint() -> Option<u16> {
+    let metadata = read_pid_metadata().ok().flatten()?;
+    if !is_expected_daemon_process(metadata.pid) {
+        return None;
+    }
+    if !pid_matches_owned_artifacts(metadata.pid) {
+        return None;
+    }
+    Some(metadata.port)
 }
 
 fn write_pid_metadata(pid: u32, port: u16, owner_token: &str) -> anyhow::Result<()> {
@@ -773,9 +788,9 @@ fn shell_unset_hint_command() -> &'static str {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if shell.contains("fish") {
-        "eval (soth runtime env --shell fish --unset)"
+        "eval (soth env --shell fish --unset)"
     } else {
-        "eval \"$(soth runtime env --unset)\""
+        "eval \"$(soth env --unset)\""
     }
 }
 
@@ -785,9 +800,9 @@ fn shell_set_hint_command() -> &'static str {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if shell.contains("fish") {
-        "eval (soth runtime env --shell fish)"
+        "eval (soth env --shell fish)"
     } else {
-        "eval \"$(soth runtime env)\""
+        "eval \"$(soth env)\""
     }
 }
 
@@ -804,12 +819,9 @@ fn has_local_proxy_env() -> bool {
             "NO_PROXY" | "no_proxy" => {
                 normalized.contains("127.0.0.1") || normalized.contains("localhost")
             }
-            "SSL_CERT_FILE"
-            | "REQUESTS_CA_BUNDLE"
-            | "NODE_EXTRA_CA_CERTS"
-            | "CURL_CA_BUNDLE"
-            | "GIT_SSL_CAINFO"
-            | "AWS_CA_BUNDLE" => normalized.contains(".soth"),
+            "SSL_CERT_FILE" | "REQUESTS_CA_BUNDLE" | "NODE_EXTRA_CA_CERTS" | "CURL_CA_BUNDLE" => {
+                normalized.contains(".soth")
+            }
             _ => false,
         }
     })
@@ -863,9 +875,8 @@ pub async fn run_start_daemon(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     quiet: bool,
-    intercept_all: bool,
-    intercept_all_for: Option<u64>,
     no_autostart: bool,
+    allow_daemon_child_fallback: bool,
 ) -> anyhow::Result<()> {
     ensure_runtime_dirs()?;
     let _lifecycle_lock = acquire_lifecycle_lock()?;
@@ -935,45 +946,63 @@ pub async fn run_start_daemon(
         }
     }
 
-    if autostart_enabled && super::autostart::supports_managed_mode() {
-        match super::autostart::start_managed(expected_port, config_path.as_ref()) {
-            Ok(details) => {
-                let startup_timeout = daemon_startup_timeout();
-                let startup_deadline = std::time::Instant::now() + startup_timeout;
-                while !is_local_listener_ready(expected_port) {
-                    if std::time::Instant::now() >= startup_deadline {
+    if super::autostart::supports_managed_mode() {
+        if !autostart_enabled && !allow_daemon_child_fallback {
+            return Err(anyhow!(
+                "managed service mode is required by default on this OS, but startup autostart is disabled (--no-autostart). Remove --no-autostart or pass --allow-daemon-child-fallback."
+            ));
+        }
+
+        if autostart_enabled {
+            match super::autostart::start_managed(expected_port, config_path.as_ref()) {
+                Ok(details) => {
+                    let startup_timeout = daemon_startup_timeout();
+                    let startup_deadline = std::time::Instant::now() + startup_timeout;
+                    while !is_local_listener_ready(expected_port) {
+                        if std::time::Instant::now() >= startup_deadline {
+                            return Err(anyhow!(
+                                "managed proxy startup did not open 127.0.0.1:{} within {}s timeout; check {}",
+                                expected_port,
+                                startup_timeout.as_secs(),
+                                compact_path(&log_path())
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(120));
+                    }
+
+                    let _ = adopt_running_daemon_state(expected_port, true);
+                    if !quiet {
+                        let pid_text = read_pid()?
+                            .map(|pid| format!(" (pid {pid})"))
+                            .unwrap_or_default();
+                        style::success(&format!("Proxy managed service started{pid_text}."));
+                        style::kv("Logs", &compact_path(&log_path()));
+                        style::kv("Control", "soth stop");
+                        style::kv("Tail", "soth logs -f");
+                        style::info(&format!("Startup autostart ensured: {details}"));
+                        print_env_setup_hint_if_needed();
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    if !allow_daemon_child_fallback {
                         return Err(anyhow!(
-                            "managed proxy startup did not open 127.0.0.1:{} within {}s timeout; check {}",
-                            expected_port,
-                            startup_timeout.as_secs(),
-                            compact_path(&log_path())
+                            "managed startup unavailable and daemon-child fallback is disabled. Pass --allow-daemon-child-fallback to force legacy mode. Root cause: {}",
+                            error
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(120));
-                }
-
-                let _ = adopt_running_daemon_state(expected_port, true);
-                if !quiet {
-                    let pid_text = read_pid()?
-                        .map(|pid| format!(" (pid {pid})"))
-                        .unwrap_or_default();
-                    style::success(&format!("Proxy managed service started{pid_text}."));
-                    style::kv("Logs", &compact_path(&log_path()));
-                    style::kv("Control", "soth stop");
-                    style::kv("Tail", "soth logs -f");
-                    style::info(&format!("Startup autostart ensured: {details}"));
-                    print_env_setup_hint_if_needed();
-                }
-                return Ok(());
-            }
-            Err(error) => {
-                if !quiet {
-                    style::warning(&format!(
-                        "Managed startup unavailable (falling back to daemon-child): {}",
-                        error
-                    ));
+                    if !quiet {
+                        style::warning(&format!(
+                            "Managed startup unavailable (falling back to daemon-child): {}",
+                            error
+                        ));
+                    }
                 }
             }
+        } else if !quiet {
+            style::warning(
+                "Startup autostart disabled; using daemon-child fallback because --allow-daemon-child-fallback was provided.",
+            );
         }
     }
 
@@ -1013,13 +1042,6 @@ pub async fn run_start_daemon(
     if quiet {
         cmd.arg("--quiet");
     }
-    if intercept_all {
-        cmd.arg("--intercept-all");
-    }
-    if let Some(seconds) = intercept_all_for {
-        cmd.arg("--intercept-all-for").arg(seconds.to_string());
-    }
-
     if let Some(port) = port {
         cmd.arg("--port").arg(port.to_string());
     }
@@ -1276,21 +1298,18 @@ fn print_last_lines(path: &Path, lines: usize) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
-    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
-        let guard = ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env mutex poisoned");
+    fn with_temp_home<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> T {
+        let guard = crate::commands::proxy::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
+        let soth_home_override = temp.path().join(".soth");
         let old_home = env::var_os("HOME");
+        let old_soth_home = env::var_os("SOTH_HOME_DIR");
         unsafe {
             env::set_var("HOME", temp.path());
+            env::set_var("SOTH_HOME_DIR", &soth_home_override);
         }
-        let result = f();
+        let result = std::panic::catch_unwind(f);
         match old_home {
             Some(value) => unsafe {
                 env::set_var("HOME", value);
@@ -1299,8 +1318,19 @@ mod tests {
                 env::remove_var("HOME");
             },
         }
+        match old_soth_home {
+            Some(value) => unsafe {
+                env::set_var("SOTH_HOME_DIR", value);
+            },
+            None => unsafe {
+                env::remove_var("SOTH_HOME_DIR");
+            },
+        }
         drop(guard);
-        result
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     #[test]
@@ -1355,10 +1385,7 @@ mod tests {
 
     #[test]
     fn daemon_timeout_env_is_clamped() {
-        let _guard = ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env mutex poisoned");
+        let _guard = crate::commands::proxy::lock_test_env();
         unsafe {
             env::set_var("SOTH_DAEMON_STARTUP_TIMEOUT_SECS", "999");
         }
@@ -1379,11 +1406,33 @@ mod tests {
                 .build()
                 .expect("runtime");
             let err = runtime
-                .block_on(run_start_daemon(Some(18888), None, true, false, None, true))
+                .block_on(run_start_daemon(Some(18888), None, true, false, true))
                 .expect_err("daemon start should fail in unit test binary");
             let text = format!("{err:#}");
             assert!(
-                text.contains("proxy daemon exited early"),
+                text.contains("proxy daemon exited early")
+                    || text.contains("managed proxy startup did not open"),
+                "unexpected error: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn managed_only_rejects_no_autostart_without_fallback() {
+        with_temp_home(|| {
+            if !super::super::autostart::supports_managed_mode() {
+                return;
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime");
+            let err = runtime
+                .block_on(run_start_daemon(Some(18889), None, true, true, false))
+                .expect_err("managed-only should reject no-autostart without fallback");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("managed service mode is required"),
                 "unexpected error: {text}"
             );
         });

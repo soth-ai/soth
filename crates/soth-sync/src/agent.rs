@@ -1,28 +1,31 @@
-use crate::body_uploader::BodyUploader;
+use crate::api_types::{
+    EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest, ExchangeMetadata,
+    HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest, HeartbeatTelemetry,
+};
 use crate::cache;
+use crate::config::TelemetrySyncConfig;
 use crate::config_puller::ConfigPuller;
+use crate::db::{
+    open_sqlite_read_write, write_sync_state, SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS,
+};
+use crate::exchange::types::{
+    ExchangeBodyMode, ExchangeEvent, ExchangeSourceClass, ExchangeTransport,
+    EXCHANGE_CLIENT_APP_TYPE_HOST, EXCHANGE_CLIENT_APP_TYPE_NON_HOST,
+    EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
+};
 use crate::heartbeat::HeartbeatSender;
 use crate::metadata_pusher::{
     estimate_gzip_exchange_batch_size, ExchangeBatchRoute, ExchangePushResult, MetadataPusher,
 };
+use crate::registry_puller::{BundleWatcher, RegistryPullOutcome, RegistryPuller};
 use crate::retry_queue::BodyRetryQueue;
+use crate::telemetry::{SyncTelemetrySink, TelemetryRuntimeConfig, TelemetrySyncRuntime};
 use anyhow::Context;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use soth_core::api::{
-    BlobUploadRequest, EventClientMetadata, EventEnvelopeMetadata, ExchangeBatchRequest,
-    ExchangeMetadata, HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest,
-    HeartbeatTelemetry,
-};
-use soth_core::event_logger::{SYNC_KEY_LAST_SYNC_TIMESTAMP, SYNC_KEY_SYNC_ERRORS};
-use soth_core::storage::{open_sqlite_read_only, open_sqlite_read_write, write_sync_state};
-use soth_core::types::exchange::{
-    ExchangeBodyMode, ExchangeEvent, EXCHANGE_CLIENT_APP_TYPE_HOST,
-    EXCHANGE_CLIENT_APP_TYPE_NON_HOST, EXCHANGE_CLIENT_APP_TYPE_UNKNOWN,
-};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -39,8 +42,6 @@ const EXCHANGE_RETRY_BASE_SECS: u64 = 2;
 const SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1: &str = "migration_exchange_uuid_cleanup_v1";
 const EXCHANGE_SPOOL_STALE_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 const EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT: usize = 10_000;
-const EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX: u32 = 4;
-const EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_BASE_MS: u64 = 50;
 const SYNC_TELEMETRY_EXCHANGE_SENT: &str = "sync.exchange.sent";
 const SYNC_TELEMETRY_EXCHANGE_BLOB_UPLOADED: &str = "sync.exchange.blob_uploaded";
 const SYNC_TELEMETRY_EXCHANGE_RETRY_DEFERRED: &str = "sync.exchange.retry_deferred";
@@ -59,7 +60,7 @@ const SYNC_TELEMETRY_REGISTRY_VALIDATION_FAILED: &str = "sync.registry.validatio
 const REGISTRY_BUNDLE_DEGRADED_AGE_SECS: u64 = 24 * 60 * 60;
 
 const MIN_LIVE_EVENTS: usize = 25;
-const MIN_LIVE_COMPRESSED_BYTES: usize = 1 * 1024 * 1024;
+const MIN_LIVE_COMPRESSED_BYTES: usize = 1024 * 1024;
 const MIN_FRONTLOAD_EVENTS: usize = 50;
 const MIN_FRONTLOAD_COMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 
@@ -89,18 +90,22 @@ pub struct SyncAgentConfig {
     pub frontload_hard_events_cap: usize,
     pub frontload_hard_compressed_cap_bytes: usize,
     pub frontload_exchange_upload_path: Option<String>,
+    pub legacy_exchange_upload_enabled: bool,
     pub body_upload_max_bytes: usize,
     pub global_tags: BTreeMap<String, String>,
+    pub device_id_hash: String,
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
+    pub telemetry: TelemetrySyncConfig,
+    pub telemetry_signing_key_hex: Option<String>,
 }
 
 pub struct SyncAgent {
     pub config: SyncAgentConfig,
+    db: Arc<Mutex<Connection>>,
     pub metadata_pusher: MetadataPusher,
-    pub body_uploader: BodyUploader,
     pub heartbeat_sender: HeartbeatSender,
     pub retry_queue: BodyRetryQueue,
-    pub config_puller: Option<ConfigPuller>,
+    pub config_puller: Mutex<Option<ConfigPuller>>,
     sync_exchange_sent_total: AtomicU64,
     sync_exchange_blob_uploaded_total: AtomicU64,
     sync_exchange_retry_deferred_total: AtomicU64,
@@ -112,6 +117,8 @@ pub struct SyncAgent {
     sync_exchange_frontload_sent_total: AtomicU64,
     sync_exchange_live_sent_total: AtomicU64,
     adaptive_batch_state: Mutex<AdaptiveBatchState>,
+    telemetry_runtime: tokio::sync::Mutex<Option<TelemetrySyncRuntime>>,
+    shutdown_requested: AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,22 +207,9 @@ impl AdaptiveBatchState {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ExchangeBlobQueueItem {
-    side: String,
-    reference: String,
-    content_encoding: String,
-    content_type: Option<String>,
-    sha256: String,
-    bytes_raw: u64,
-    bytes_gzip: u64,
-    payload_gzip_b64: String,
-}
-
 #[derive(Debug, Clone)]
 enum PreparedRowResult {
     Prepared(PreparedExchangeQueueRow),
-    Retry { reason: String },
     Drop { reason: String },
 }
 
@@ -234,9 +228,75 @@ struct ExchangeQueueStats {
 }
 
 impl SyncAgent {
+    /// Contract constructor used by soth-proxy wiring.
+    ///
+    /// Sync internals run against the injected SQLite handle. The configured `event_db_path` is
+    /// normalized to the handle's main database path when available to keep reporting consistent.
     pub fn new(
         mut config: SyncAgentConfig,
+        db: Arc<Mutex<Connection>>,
+    ) -> anyhow::Result<(Self, SyncTelemetrySink)> {
+        let injected_path = {
+            let guard = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sync sqlite mutex poisoned"))?;
+            sqlite_main_db_path(&guard)?
+        };
+        if let Some(injected_path) = injected_path {
+            if injected_path != config.event_db_path {
+                warn!(
+                    configured = %config.event_db_path.display(),
+                    injected = %injected_path.display(),
+                    "sync event_db_path overridden to match injected sqlite handle"
+                );
+                config.event_db_path = injected_path;
+            }
+        } else {
+            warn!(
+                configured = %config.event_db_path.display(),
+                "injected sqlite handle has no on-disk main database path; using configured event_db_path"
+            );
+        }
+
+        let agent = Self::build(config, None, db.clone())?;
+        let sink = if agent.config.telemetry.enabled {
+            let runtime = TelemetrySyncRuntime::start(
+                TelemetryRuntimeConfig::from_sync_agent_config(&agent.config, db),
+            )
+            .context("start telemetry sync runtime")?;
+            let sink = runtime.sink();
+            let mut guard = agent
+                .telemetry_runtime
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("telemetry runtime mutex unexpectedly busy"))?;
+            *guard = Some(runtime);
+            (*sink).clone()
+        } else {
+            SyncTelemetrySink::disabled()
+        };
+        Ok((agent, sink))
+    }
+
+    /// Compatibility constructor retained for existing callers that inject
+    /// a pre-built ConfigPuller.
+    pub fn new_with_config_puller(
+        config: SyncAgentConfig,
         config_puller: Option<ConfigPuller>,
+    ) -> anyhow::Result<Self> {
+        let db_conn =
+            open_sqlite_read_write(config.event_db_path.as_path()).with_context(|| {
+                format!(
+                    "failed opening sqlite rw connection {}",
+                    config.event_db_path.display()
+                )
+            })?;
+        Self::build(config, config_puller, Arc::new(Mutex::new(db_conn)))
+    }
+
+    fn build(
+        mut config: SyncAgentConfig,
+        config_puller: Option<ConfigPuller>,
+        db: Arc<Mutex<Connection>>,
     ) -> anyhow::Result<Self> {
         config.batch_size = config.batch_size.max(1);
         config.body_batch_size = config.body_batch_size.max(1);
@@ -262,6 +322,14 @@ impl SyncAgent {
             config.frontload_hard_compressed_cap_bytes =
                 MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP;
         }
+        if config.device_id_hash.trim().is_empty() {
+            config.device_id_hash = "local-device".to_string();
+        }
+        config.telemetry_signing_key_hex = config
+            .telemetry_signing_key_hex
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         config.frontload_max_events_per_batch = config.frontload_max_events_per_batch.max(1).min(
             config
                 .frontload_hard_events_cap
@@ -275,48 +343,54 @@ impl SyncAgent {
                     .max(1)
                     .min(MAX_FRONTLOAD_METADATA_BATCH_COMPRESSED_BYTES_HARD_CAP),
             );
+        config.telemetry = config.telemetry.sanitize();
         let metadata_pusher = MetadataPusher::new(
             &config.endpoint,
             &config.api_key,
             config.frontload_exchange_upload_path.clone(),
         );
-        let body_uploader = BodyUploader::new(&config.endpoint, &config.api_key);
         let heartbeat_sender = HeartbeatSender::new(&config.endpoint, &config.api_key);
         let retry_queue =
             BodyRetryQueue::new(&config.retry_queue_dir, config.retry_queue_max_bytes)?;
-        ensure_exchange_sync_schema(config.event_db_path.as_path())?;
-        if let Err(error) = run_exchange_uuid_cleanup_migration(config.event_db_path.as_path()) {
-            warn!(
-                error = %error,
-                "Failed one-time exchange UUID cleanup migration; continuing"
-            );
-        }
-        if let Err(error) = run_exchange_spool_stale_cleanup(
-            config.event_db_path.as_path(),
-            Duration::from_secs(EXCHANGE_SPOOL_STALE_MAX_AGE_SECS),
-            EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT,
-        ) {
-            if is_sqlite_lock_anyhow(&error) {
-                debug!(
-                    error = %error,
-                    "Exchange spool stale cleanup skipped due to sqlite lock; continuing"
-                );
-            } else {
+        {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sync sqlite mutex poisoned"))?;
+            ensure_exchange_sync_schema(&conn)?;
+            if let Err(error) = run_exchange_uuid_cleanup_migration(&conn) {
                 warn!(
                     error = %error,
-                    "Failed exchange spool stale cleanup; continuing"
+                    "Failed one-time exchange UUID cleanup migration; continuing"
                 );
             }
+            if let Err(error) = run_exchange_spool_stale_cleanup(
+                &conn,
+                Duration::from_secs(EXCHANGE_SPOOL_STALE_MAX_AGE_SECS),
+                EXCHANGE_SPOOL_STALE_CLEANUP_LIMIT,
+            ) {
+                if is_sqlite_lock_anyhow(&error) {
+                    debug!(
+                        error = %error,
+                        "Exchange spool stale cleanup skipped due to sqlite lock; continuing"
+                    );
+                } else {
+                    warn!(
+                        error = %error,
+                        "Failed exchange spool stale cleanup; continuing"
+                    );
+                }
+            }
         }
+
         let adaptive_batch_state = Mutex::new(AdaptiveBatchState::new(&config));
 
         Ok(Self {
             config,
+            db,
             metadata_pusher,
-            body_uploader,
             heartbeat_sender,
             retry_queue,
-            config_puller,
+            config_puller: Mutex::new(config_puller),
             sync_exchange_sent_total: AtomicU64::new(0),
             sync_exchange_blob_uploaded_total: AtomicU64::new(0),
             sync_exchange_retry_deferred_total: AtomicU64::new(0),
@@ -328,10 +402,98 @@ impl SyncAgent {
             sync_exchange_frontload_sent_total: AtomicU64::new(0),
             sync_exchange_live_sent_total: AtomicU64::new(0),
             adaptive_batch_state,
+            telemetry_runtime: tokio::sync::Mutex::new(None),
+            shutdown_requested: AtomicBool::new(false),
         })
     }
 
+    pub fn set_config_puller(&self, config_puller: Option<ConfigPuller>) {
+        match self.config_puller.lock() {
+            Ok(mut guard) => {
+                *guard = config_puller;
+            }
+            Err(poisoned) => {
+                warn!("sync agent config_puller lock poisoned; recovering state");
+                let mut guard = poisoned.into_inner();
+                *guard = config_puller;
+            }
+        }
+    }
+
+    /// Injects a channel-2 bundle install hook without introducing a compile-time
+    /// dependency on soth-bundle. The hook is forwarded into RegistryPuller.
+    pub fn set_bundle_install_hook(&self, watcher: Arc<dyn BundleWatcher>) {
+        let registry_cache_path = self
+            .config
+            .registry_cache_path
+            .clone()
+            .unwrap_or_else(|| resolve_registry_cache_path(&self.config.cache_path));
+        let registry_puller = RegistryPuller::new(
+            self.config.endpoint.clone(),
+            self.config.api_key.clone(),
+            registry_cache_path,
+        )
+        .with_device_id_hash(self.config.device_id_hash.clone())
+        .with_bundle_watcher(watcher);
+        let config_puller = ConfigPuller::new(
+            self.config.endpoint.clone(),
+            self.config.api_key.clone(),
+            self.config.cache_path.clone(),
+        )
+        .with_registry_puller(registry_puller);
+        self.set_config_puller(Some(config_puller));
+    }
+
+    /// Compatibility alias matching the proxy architecture naming.
+    pub fn set_bundle_watcher(&self, watcher: Arc<dyn BundleWatcher>) {
+        self.set_bundle_install_hook(watcher);
+    }
+
+    /// Performs a startup-time hard check against the cloud bundle endpoint.
+    ///
+    /// This is used by the proxy to fail fast when `/v1/edge/bundle/current` is
+    /// unavailable, rather than silently running in degraded mode.
+    pub async fn verify_bundle_source_ready(&self) -> anyhow::Result<RegistryPullOutcome> {
+        let puller = match self.config_puller.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                warn!("sync agent config_puller lock poisoned; recovering state");
+                poisoned.into_inner().clone()
+            }
+        };
+        if let Some(puller) = puller {
+            if let Some(outcome) = puller
+                .refresh_registry_now()
+                .await
+                .context("startup bundle source readiness check failed")?
+            {
+                return Ok(outcome);
+            }
+        }
+
+        let registry_cache_path = self
+            .config
+            .registry_cache_path
+            .clone()
+            .unwrap_or_else(|| resolve_registry_cache_path(&self.config.cache_path));
+        let registry_puller = RegistryPuller::new(
+            self.config.endpoint.clone(),
+            self.config.api_key.clone(),
+            registry_cache_path,
+        )
+        .with_device_id_hash(self.config.device_id_hash.clone());
+        registry_puller
+            .refresh_now()
+            .await
+            .context("startup bundle source readiness check failed")
+    }
+
     pub async fn tick(&self) -> anyhow::Result<SyncTickSummary> {
+        if self.config.telemetry.enabled {
+            if let Err(error) = self.ensure_telemetry_runtime().await {
+                warn!(error = %error, "Failed to start telemetry sync runtime; continuing");
+            }
+        }
         let stats = self.sync_exchange_queue_once().await?;
         self.sync_exchange_sent_total
             .fetch_add(stats.exchange_sent as u64, Ordering::Relaxed);
@@ -364,6 +526,35 @@ impl SyncAgent {
         })
     }
 
+    /// Background loop for heartbeat + exchange sync.
+    pub async fn run(&self) {
+        self.shutdown_requested.store(false, Ordering::Relaxed);
+        let mut interval = tokio::time::interval(self.config.sync_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            if self.shutdown_requested.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if let Err(error) = self.send_heartbeat().await {
+                warn!(error = %error, "sync heartbeat failed");
+            }
+            if let Err(error) = self.tick().await {
+                warn!(error = %error, "sync tick failed");
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.shutdown_requested.store(true, Ordering::Relaxed);
+        if self.config.telemetry.enabled {
+            self.shutdown_telemetry_runtime().await?;
+        }
+        Ok(())
+    }
+
     /// Run a bounded best-effort sync drain during shutdown.
     ///
     /// This repeatedly runs normal sync ticks and exits early once a round
@@ -388,7 +579,23 @@ impl SyncAgent {
             }
         }
 
+        if self.config.telemetry.enabled {
+            self.shutdown_telemetry_runtime().await?;
+        }
+
         Ok(total)
+    }
+
+    /// Returns the telemetry sink used by `soth-telemetry::TelemetryPipeline`.
+    ///
+    /// The runtime is started lazily when this method is first called.
+    pub async fn telemetry_sink(&self) -> anyhow::Result<Option<Arc<SyncTelemetrySink>>> {
+        if !self.config.telemetry.enabled {
+            return Ok(None);
+        }
+        self.ensure_telemetry_runtime().await?;
+        let guard = self.telemetry_runtime.lock().await;
+        Ok(guard.as_ref().map(|runtime| runtime.sink()))
     }
 
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
@@ -416,7 +623,14 @@ impl SyncAgent {
         match self.heartbeat_sender.send(&request).await {
             Ok(Some(response)) => {
                 if response.config_changed {
-                    if let Some(puller) = &self.config_puller {
+                    let puller = match self.config_puller.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(poisoned) => {
+                            warn!("sync agent config_puller lock poisoned; recovering state");
+                            poisoned.into_inner().clone()
+                        }
+                    };
+                    if let Some(puller) = puller {
                         if let Err(error) = puller.pull_once().await {
                             warn!(
                                 "Cloud config refresh after heartbeat hint failed: {}",
@@ -541,6 +755,33 @@ impl SyncAgent {
         }
     }
 
+    async fn ensure_telemetry_runtime(&self) -> anyhow::Result<()> {
+        if !self.config.telemetry.enabled {
+            return Ok(());
+        }
+
+        let mut guard = self.telemetry_runtime.lock().await;
+        if guard.is_none() {
+            let runtime = TelemetrySyncRuntime::start(
+                TelemetryRuntimeConfig::from_sync_agent_config(&self.config, self.db.clone()),
+            )
+            .context("start telemetry sync runtime")?;
+            *guard = Some(runtime);
+        }
+        Ok(())
+    }
+
+    async fn shutdown_telemetry_runtime(&self) -> anyhow::Result<()> {
+        let mut guard = self.telemetry_runtime.lock().await;
+        if let Some(runtime) = guard.take() {
+            runtime
+                .shutdown()
+                .await
+                .context("shutdown telemetry sync runtime")?;
+        }
+        Ok(())
+    }
+
     fn collect_registry_heartbeat_details(&self) -> Option<HeartbeatRegistryDetails> {
         let registry_cache_path = self
             .config
@@ -584,9 +825,6 @@ impl SyncAgent {
                     ExchangeSyncMode::Live => live_rows.push(prepared),
                     ExchangeSyncMode::Frontload => frontload_rows.push(prepared),
                 },
-                Ok(PreparedRowResult::Retry { reason }) => {
-                    self.defer_exchange_row_with_retry(&row, &reason, &mut stats)?;
-                }
                 Ok(PreparedRowResult::Drop { reason }) => {
                     self.drop_exchange_row(&row, &reason, &mut stats)?;
                 }
@@ -658,59 +896,11 @@ impl SyncAgent {
             });
         }
         event.exchange_id = exchange_id.clone();
-
-        let blobs = match row.blobs_json.as_deref() {
-            Some(raw) if !raw.trim().is_empty() => {
-                match serde_json::from_str::<Vec<ExchangeBlobQueueItem>>(raw) {
-                    Ok(items) => items,
-                    Err(error) => {
-                        return Ok(PreparedRowResult::Drop {
-                            reason: format!("invalid_blob_payload:{error}"),
-                        });
-                    }
-                }
-            }
-            _ => Vec::new(),
-        };
-
-        let mut blob_uploaded = 0usize;
-        for blob in blobs {
-            let request = BlobUploadRequest {
-                exchange_id: exchange_id.clone(),
-                side: blob.side.clone(),
-                reference: Some(blob.reference.clone()),
-                content_encoding: Some(blob.content_encoding.clone()),
-                content_type: blob.content_type.clone(),
-                sha256: Some(blob.sha256.clone()),
-                bytes_raw: Some(blob.bytes_raw),
-                bytes_gzip: Some(blob.bytes_gzip),
-                payload_gzip_b64: Some(blob.payload_gzip_b64.clone()),
-            };
-            match self.body_uploader.upload_blob(&request).await? {
-                Some(response) if response.stored => {
-                    blob_uploaded += 1;
-                    let resolved_reference = response
-                        .key
-                        .or(response.blob_key)
-                        .unwrap_or(blob.reference.clone());
-                    match blob.side.to_ascii_lowercase().as_str() {
-                        "request" => event.request.body.reference = Some(resolved_reference),
-                        "response" => event.response.body.reference = Some(resolved_reference),
-                        _ => {}
-                    }
-                }
-                Some(_) => {
-                    return Ok(PreparedRowResult::Retry {
-                        reason: "blob_upload_rejected".to_string(),
-                    });
-                }
-                None => {
-                    return Ok(PreparedRowResult::Retry {
-                        reason: "blob_upload_non_success_status".to_string(),
-                    });
-                }
-            }
-        }
+        let _contains_legacy_blob_payloads = row
+            .blobs_json
+            .as_deref()
+            .map(|raw| !raw.trim().is_empty())
+            .unwrap_or(false);
 
         let global_device_id = normalized_global_device_id(&self.config.global_tags);
         let mut metadata = exchange_event_to_metadata(&event, global_device_id.as_deref());
@@ -720,7 +910,7 @@ impl SyncAgent {
             row,
             metadata,
             mode,
-            blob_uploaded,
+            blob_uploaded: 0,
         }))
     }
 
@@ -961,7 +1151,7 @@ impl SyncAgent {
                             item.row.attempt_count,
                         )?;
                     }
-                    self.set_sync_error(&format!("exchange_upload_error:{}", error))?;
+                    self.set_sync_error(&format!("exchange_upload_error:{error}"))?;
                     return Err(error);
                 }
             }
@@ -1049,7 +1239,7 @@ impl SyncAgent {
     }
 
     fn load_exchange_queue_ready(&self, limit: usize) -> anyhow::Result<Vec<ExchangeQueueRow>> {
-        let conn = open_read_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         let mut stmt = conn
             .prepare(
                 r#"
@@ -1083,7 +1273,7 @@ impl SyncAgent {
     }
 
     fn load_exchange_queue_depth(&self) -> anyhow::Result<u64> {
-        let conn = open_read_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         let depth = conn
             .query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
                 row.get::<_, i64>(0)
@@ -1102,7 +1292,7 @@ impl SyncAgent {
         exchange_id: &str,
         attempt_count: u32,
     ) -> anyhow::Result<()> {
-        let conn = open_rw_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         let shift = attempt_count.min(20);
         let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
         let retry_secs = EXCHANGE_RETRY_BASE_SECS
@@ -1131,7 +1321,7 @@ impl SyncAgent {
     }
 
     fn delete_exchange_queue_entry(&self, exchange_id: &str) -> anyhow::Result<()> {
-        let conn = open_rw_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         conn.execute(
             "DELETE FROM exchange_upload_queue WHERE exchange_id = ?1",
             [exchange_id],
@@ -1154,7 +1344,7 @@ impl SyncAgent {
     }
 
     fn write_sync_value(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let conn = open_rw_conn(&self.config.event_db_path)?;
+        let conn = self.lock_db()?;
         write_sync_state(&conn, key, value)?;
         Ok(())
     }
@@ -1168,10 +1358,15 @@ impl SyncAgent {
     fn set_sync_error(&self, error: &str) -> anyhow::Result<()> {
         self.write_sync_value(SYNC_KEY_SYNC_ERRORS, error)
     }
+
+    fn lock_db(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
+        self.db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sync sqlite mutex poisoned"))
+    }
 }
 
-fn ensure_exchange_sync_schema(path: &Path) -> anyhow::Result<()> {
-    let conn = open_rw_conn(path)?;
+fn ensure_exchange_sync_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS exchange_upload_queue (
@@ -1189,12 +1384,7 @@ fn ensure_exchange_sync_schema(path: &Path) -> anyhow::Result<()> {
             ON exchange_upload_queue(updated_at);
         "#,
     )
-    .with_context(|| {
-        format!(
-            "failed initializing exchange upload queue schema {}",
-            path.display()
-        )
-    })?;
+    .context("failed initializing exchange upload queue schema")?;
 
     if let Err(error) = conn.execute(
         "ALTER TABLE exchange_upload_queue ADD COLUMN blobs_json TEXT",
@@ -1202,21 +1392,16 @@ fn ensure_exchange_sync_schema(path: &Path) -> anyhow::Result<()> {
     ) {
         let message = error.to_string().to_ascii_lowercase();
         if !message.contains("duplicate column name") {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed applying exchange_upload_queue blobs_json migration {}",
-                    path.display()
-                )
-            });
+            return Err(error)
+                .context("failed applying exchange_upload_queue blobs_json migration");
         }
     }
 
     Ok(())
 }
 
-fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
-    let conn = open_rw_conn(path)?;
-    if !sqlite_table_exists(&conn, "sync_state")? {
+fn run_exchange_uuid_cleanup_migration(conn: &Connection) -> anyhow::Result<()> {
+    if !sqlite_table_exists(conn, "sync_state")? {
         return Ok(());
     }
     let already_done: Option<String> = conn
@@ -1232,13 +1417,13 @@ fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
 
     let mut deleted_total = 0usize;
     for table in ["exchange_upload_queue", "exchange_events", "exchange_spool"] {
-        if sqlite_table_exists(&conn, table)? {
-            deleted_total += prune_non_uuid_exchange_ids(&conn, table)?;
+        if sqlite_table_exists(conn, table)? {
+            deleted_total += prune_non_uuid_exchange_ids(conn, table)?;
         }
     }
 
     write_sync_state(
-        &conn,
+        conn,
         SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1,
         &format!("deleted={deleted_total}"),
     )?;
@@ -1253,34 +1438,19 @@ fn run_exchange_uuid_cleanup_migration(path: &Path) -> anyhow::Result<()> {
 }
 
 fn run_exchange_spool_stale_cleanup(
-    path: &Path,
+    conn: &Connection,
     max_age: Duration,
     limit: usize,
 ) -> anyhow::Result<()> {
-    for retry in 0..=EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX {
-        match run_exchange_spool_stale_cleanup_once(path, max_age, limit) {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if retry < EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_MAX
-                    && is_sqlite_lock_anyhow(&error) =>
-            {
-                std::thread::sleep(exchange_spool_cleanup_retry_backoff(retry));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(anyhow::anyhow!(
-        "exchange spool stale cleanup retry loop exited unexpectedly"
-    ))
+    run_exchange_spool_stale_cleanup_once(conn, max_age, limit)
 }
 
 fn run_exchange_spool_stale_cleanup_once(
-    path: &Path,
+    conn: &Connection,
     max_age: Duration,
     limit: usize,
 ) -> anyhow::Result<()> {
-    let conn = open_rw_conn(path)?;
-    if !sqlite_table_exists(&conn, "exchange_spool")? {
+    if !sqlite_table_exists(conn, "exchange_spool")? {
         return Ok(());
     }
 
@@ -1309,16 +1479,6 @@ fn run_exchange_spool_stale_cleanup_once(
     Ok(())
 }
 
-fn exchange_spool_cleanup_retry_backoff(retry: u32) -> Duration {
-    let shift = retry.min(10);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    Duration::from_millis(
-        EXCHANGE_SPOOL_CLEANUP_LOCK_RETRY_BASE_MS
-            .saturating_mul(multiplier)
-            .min(1_000),
-    )
-}
-
 fn is_sqlite_lock_anyhow(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string().to_ascii_lowercase();
@@ -1340,6 +1500,23 @@ fn sqlite_table_exists(conn: &Connection, table_name: &str) -> anyhow::Result<bo
     Ok(exists)
 }
 
+fn sqlite_main_db_path(conn: &Connection) -> anyhow::Result<Option<PathBuf>> {
+    let mut stmt = conn.prepare("PRAGMA database_list")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name != "main" {
+            continue;
+        }
+        let file: String = row.get(2)?;
+        if file.trim().is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(PathBuf::from(file)));
+    }
+    Ok(None)
+}
+
 fn prune_non_uuid_exchange_ids(conn: &Connection, table: &str) -> anyhow::Result<usize> {
     let select_sql = format!("SELECT exchange_id FROM {table}");
     let mut stmt = conn.prepare(&select_sql)?;
@@ -1358,18 +1535,6 @@ fn prune_non_uuid_exchange_ids(conn: &Connection, table: &str) -> anyhow::Result
         deleted += conn.execute(&delete_sql, [exchange_id])?;
     }
     Ok(deleted)
-}
-
-fn open_read_conn(path: &Path) -> anyhow::Result<Connection> {
-    let conn = open_sqlite_read_only(path)
-        .with_context(|| format!("failed opening sqlite read connection {}", path.display()))?;
-    Ok(conn)
-}
-
-fn open_rw_conn(path: &Path) -> anyhow::Result<Connection> {
-    let conn = open_sqlite_read_write(path)
-        .with_context(|| format!("failed opening sqlite rw connection {}", path.display()))?;
-    Ok(conn)
 }
 
 fn merge_tags(
@@ -1670,7 +1835,7 @@ fn build_exchange_event_envelope_metadata(event: &ExchangeEvent) -> Option<Event
         envelope_id: None,
         request_id: event.trace_id.clone(),
         capture_source: Some(match event.source_class {
-            soth_core::types::exchange::ExchangeSourceClass::Mcp => "wrap".to_string(),
+            ExchangeSourceClass::Mcp => "wrap".to_string(),
             _ => "proxy".to_string(),
         }),
         source: Some(exchange_transport_to_str(event.transport).to_string()),
@@ -1728,7 +1893,7 @@ fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<S
             let path = if path.is_empty() {
                 None
             } else {
-                Some(format!("/{}", path))
+                Some(format!("/{path}"))
             };
             return (Some(host.to_string()), path);
         }
@@ -1738,7 +1903,7 @@ fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<S
     if endpoint.contains('/') {
         let mut parts = endpoint.splitn(2, '/');
         let host = parts.next().unwrap_or_default();
-        let path = parts.next().map(|value| format!("/{}", value));
+        let path = parts.next().map(|value| format!("/{value}"));
         let host = if host.is_empty() {
             None
         } else {
@@ -1750,29 +1915,25 @@ fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<S
     (Some(endpoint.to_string()), None)
 }
 
-fn exchange_source_class_to_str(
-    source: soth_core::types::exchange::ExchangeSourceClass,
-) -> &'static str {
+fn exchange_source_class_to_str(source: ExchangeSourceClass) -> &'static str {
     match source {
-        soth_core::types::exchange::ExchangeSourceClass::AiInference => "ai_inference",
-        soth_core::types::exchange::ExchangeSourceClass::AgentApp => "agent_app",
-        soth_core::types::exchange::ExchangeSourceClass::Mcp => "mcp",
-        soth_core::types::exchange::ExchangeSourceClass::Collector => "collector",
+        ExchangeSourceClass::AiInference => "ai_inference",
+        ExchangeSourceClass::AgentApp => "agent_app",
+        ExchangeSourceClass::Mcp => "mcp",
+        ExchangeSourceClass::Collector => "collector",
     }
 }
 
-fn exchange_transport_to_str(
-    transport: soth_core::types::exchange::ExchangeTransport,
-) -> &'static str {
+fn exchange_transport_to_str(transport: ExchangeTransport) -> &'static str {
     match transport {
-        soth_core::types::exchange::ExchangeTransport::Http => "http",
-        soth_core::types::exchange::ExchangeTransport::Https => "https",
-        soth_core::types::exchange::ExchangeTransport::Http2 => "http2",
-        soth_core::types::exchange::ExchangeTransport::Ws => "ws",
-        soth_core::types::exchange::ExchangeTransport::Sse => "sse",
-        soth_core::types::exchange::ExchangeTransport::Ndjson => "ndjson",
-        soth_core::types::exchange::ExchangeTransport::Stdio => "stdio",
-        soth_core::types::exchange::ExchangeTransport::Jsonrpc => "jsonrpc",
+        ExchangeTransport::Http => "http",
+        ExchangeTransport::Https => "https",
+        ExchangeTransport::Http2 => "http2",
+        ExchangeTransport::Ws => "ws",
+        ExchangeTransport::Sse => "sse",
+        ExchangeTransport::Ndjson => "ndjson",
+        ExchangeTransport::Stdio => "stdio",
+        ExchangeTransport::Jsonrpc => "jsonrpc",
     }
 }
 
@@ -1843,8 +2004,15 @@ struct HostOsIdentity {
     version: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct HostHardwareDetails {
+    cpu_model: Option<String>,
+    memory_total_mb: Option<u64>,
+}
+
 fn collect_heartbeat_host_details() -> HeartbeatHostDetails {
     let identity = detect_host_os_identity();
+    let hardware = detect_host_hardware_details();
     HeartbeatHostDetails {
         platform: Some(identity.platform),
         os_family: Some(identity.family),
@@ -1854,6 +2022,8 @@ fn collect_heartbeat_host_details() -> HeartbeatHostDetails {
         cpu_logical_cores: std::thread::available_parallelism()
             .ok()
             .map(|value| value.get() as u64),
+        cpu_model: hardware.cpu_model,
+        memory_total_mb: hardware.memory_total_mb,
     }
 }
 
@@ -1890,6 +2060,62 @@ fn detect_host_os_identity() -> HostOsIdentity {
         family: std::env::consts::FAMILY.to_string(),
         version: None,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_host_hardware_details() -> HostHardwareDetails {
+    let cpu_model = run_trimmed_command_output(("sysctl", &["-n", "machdep.cpu.brand_string"]));
+    let memory_total_mb = run_trimmed_command_output(("sysctl", &["-n", "hw.memsize"]))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(bytes_to_mb);
+    HostHardwareDetails {
+        cpu_model,
+        memory_total_mb,
+    }
+}
+
+#[cfg(windows)]
+fn detect_host_hardware_details() -> HostHardwareDetails {
+    let cpu_model =
+        run_trimmed_command_output(("cmd", &["/C", "wmic", "cpu", "get", "Name", "/value"]))
+            .and_then(|value| parse_command_key_value(&value, "Name"));
+    let memory_total_mb = run_trimmed_command_output((
+        "cmd",
+        &[
+            "/C",
+            "wmic",
+            "computersystem",
+            "get",
+            "TotalPhysicalMemory",
+            "/value",
+        ],
+    ))
+    .and_then(|value| parse_command_key_value(&value, "TotalPhysicalMemory"))
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .map(bytes_to_mb);
+    HostHardwareDetails {
+        cpu_model,
+        memory_total_mb,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_host_hardware_details() -> HostHardwareDetails {
+    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|contents| parse_linux_cpu_model(&contents));
+    let memory_total_mb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_linux_mem_total_mb(&contents));
+    HostHardwareDetails {
+        cpu_model,
+        memory_total_mb,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn detect_host_hardware_details() -> HostHardwareDetails {
+    HostHardwareDetails::default()
 }
 
 fn normalize_os_text(raw: &str) -> Option<String> {
@@ -1972,6 +2198,45 @@ fn parse_os_release_key(contents: &str, key: &str) -> Option<String> {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_cpu_model(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let value = line
+            .strip_prefix("model name")
+            .or_else(|| line.strip_prefix("Hardware"))?
+            .split_once(':')
+            .map(|(_, value)| value.trim())?;
+        normalize_os_text(value)
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_mem_total_mb(contents: &str) -> Option<u64> {
+    let line = contents
+        .lines()
+        .find(|line| line.trim_start().starts_with("MemTotal:"))?;
+    let mut parts = line.split_whitespace();
+    let _ = parts.next();
+    let value_kb = parts.next()?.parse::<u64>().ok()?;
+    Some(value_kb / 1024)
+}
+
+#[cfg(any(windows, test))]
+fn parse_command_key_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (raw_key, raw_value) = line.split_once('=')?;
+        if !raw_key.trim().eq_ignore_ascii_case(key) {
+            return None;
+        }
+        normalize_os_text(raw_value)
+    })
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn bytes_to_mb(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
+}
+
 fn run_trimmed_command_output(command: (&'static str, &'static [&'static str])) -> Option<String> {
     let output = std::process::Command::new(command.0)
         .args(command.1.iter().copied())
@@ -1996,6 +2261,16 @@ fn hostname_resolution_command() -> (&'static str, &'static [&'static str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::Router;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rusqlite::Connection;
+    use serde::Serialize;
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
     use std::time::Duration;
     use tempfile::{tempdir, TempDir};
 
@@ -2027,17 +2302,211 @@ mod tests {
             frontload_hard_events_cap: 5000,
             frontload_hard_compressed_cap_bytes: 16 * 1024 * 1024,
             frontload_exchange_upload_path: None,
+            legacy_exchange_upload_enabled: true,
             body_upload_max_bytes: 15 * 1024 * 1024,
             global_tags: BTreeMap::new(),
+            device_id_hash: "device-test".to_string(),
             heartbeat_telemetry: None,
+            telemetry: TelemetrySyncConfig::default(),
+            telemetry_signing_key_hex: None,
         };
-        let agent = SyncAgent::new(config, None).expect("sync agent");
+        let agent = SyncAgent::new_with_config_puller(config, None).expect("sync agent");
         (dir, agent)
     }
 
     fn create_test_agent() -> SyncAgent {
         let (_dir, agent) = create_test_agent_with_tempdir();
         agent
+    }
+
+    #[derive(Clone)]
+    struct StartupBundleServerState {
+        payload: Arc<Vec<u8>>,
+        payload_sha256: String,
+        bundle_version: String,
+    }
+
+    async fn startup_bundle_current_handler(
+        State(state): State<StartupBundleServerState>,
+    ) -> impl IntoResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "etag",
+            HeaderValue::from_str(format!("\"{}\"", state.payload_sha256).as_str())
+                .unwrap_or_else(|_| HeaderValue::from_static("\"invalid\"")),
+        );
+        headers.insert(
+            "x-soth-bundle-version",
+            HeaderValue::from_str(state.bundle_version.as_str())
+                .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+        );
+        headers.insert(
+            "x-soth-bundle-hash",
+            HeaderValue::from_str(state.payload_sha256.as_str())
+                .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+        );
+        (StatusCode::OK, headers, state.payload.as_ref().clone())
+    }
+
+    async fn start_startup_bundle_server(state: StartupBundleServerState) -> Option<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let addr = listener.local_addr().ok()?;
+        let app = Router::new()
+            .route(
+                "/v1/edge/bundle/current",
+                get(startup_bundle_current_handler),
+            )
+            .with_state(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Some(format!("http://{}", addr))
+    }
+
+    #[derive(Serialize)]
+    struct StartupCanonicalManifest<'a> {
+        version: &'a str,
+        created_at: i64,
+        vendor_sig: &'a str,
+        org_approval_sig: Option<&'a str>,
+        assets: Vec<&'a Value>,
+        scope: &'a Value,
+    }
+
+    fn startup_canonical_manifest_bytes(manifest: &Value) -> Vec<u8> {
+        let mut assets: Vec<&Value> = manifest
+            .get("assets")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assets.sort_by(|left, right| {
+            left.get("path")
+                .and_then(Value::as_str)
+                .cmp(&right.get("path").and_then(Value::as_str))
+        });
+        let scope = manifest.get("scope").unwrap_or(&Value::Null);
+        serde_json::to_vec(&StartupCanonicalManifest {
+            version: manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            created_at: manifest
+                .get("created_at")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            vendor_sig: "",
+            org_approval_sig: manifest.get("org_approval_sig").and_then(Value::as_str),
+            assets,
+            scope,
+        })
+        .expect("serialize startup canonical manifest")
+    }
+
+    fn startup_hex_encode(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push_str(format!("{:02x}", byte).as_str());
+        }
+        out
+    }
+
+    fn startup_signed_manifest_value(version: &str, vendor_signing_key: &SigningKey) -> Value {
+        let mut manifest = json!({
+            "version": version,
+            "created_at": 1_772_000_000i64,
+            "vendor_sig": "",
+            "org_approval_sig": null,
+            "assets": [],
+            "scope": {
+                "intercept_https": false,
+                "intercept_http": false,
+                "process_filter": null,
+                "capture_modes": []
+            }
+        });
+        let signature =
+            vendor_signing_key.sign(startup_canonical_manifest_bytes(&manifest).as_slice());
+        manifest["vendor_sig"] = Value::String(startup_hex_encode(signature.to_bytes().as_slice()));
+        manifest
+    }
+
+    #[derive(Default)]
+    struct StartupInstallState {
+        install_calls: usize,
+        installed_version: Option<String>,
+    }
+
+    #[derive(Clone)]
+    struct StartupBundleWatcherAdapter {
+        state: Arc<Mutex<StartupInstallState>>,
+    }
+
+    impl BundleWatcher for StartupBundleWatcherAdapter {
+        fn install_bundle(
+            &self,
+            manifest_bytes: &[u8],
+            _assets: HashMap<String, Vec<u8>>,
+        ) -> anyhow::Result<String> {
+            let manifest: Value = serde_json::from_slice(manifest_bytes)?;
+            let version = manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("manifest.version missing"))?
+                .to_string();
+
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("startup install state poisoned"))?;
+            guard.install_calls = guard.install_calls.saturating_add(1);
+            guard.installed_version = Some(version.clone());
+            Ok(version)
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_bundle_readiness_uses_watcher_install_path() {
+        let vendor = SigningKey::from_bytes(&[71u8; 32]);
+        let manifest = startup_signed_manifest_value("bundle-v2", &vendor);
+        let payload = serde_json::to_vec(&json!({
+            "manifest": manifest,
+            "assets": {}
+        }))
+        .expect("serialize channel2 payload");
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload.as_slice()));
+        let state = StartupBundleServerState {
+            payload: Arc::new(payload),
+            payload_sha256: payload_sha256.clone(),
+            bundle_version: "bundle-v2".to_string(),
+        };
+        let Some(endpoint) = start_startup_bundle_server(state).await else {
+            eprintln!(
+                "Skipping startup_bundle_readiness_uses_watcher_install_path: cannot bind localhost listener"
+            );
+            return;
+        };
+
+        let (dir, mut agent) = create_test_agent_with_tempdir();
+        agent.config.endpoint = endpoint;
+        agent.config.registry_cache_path = Some(dir.path().join("registry_cache.json"));
+
+        let install_state = Arc::new(Mutex::new(StartupInstallState::default()));
+        let watcher = Arc::new(StartupBundleWatcherAdapter {
+            state: install_state.clone(),
+        });
+        agent.set_bundle_watcher(watcher);
+
+        let outcome = agent
+            .verify_bundle_source_ready()
+            .await
+            .expect("startup bundle source should be reachable");
+        assert!(outcome.checked);
+        assert!(outcome.downloaded);
+        assert_eq!(outcome.version.as_deref(), Some("bundle-v2"));
+
+        let guard = install_state.lock().expect("install state lock");
+        assert_eq!(guard.install_calls, 1);
+        assert_eq!(guard.installed_version.as_deref(), Some("bundle-v2"));
     }
 
     #[test]
@@ -2049,6 +2518,25 @@ mod tests {
         agent.config.body_upload_enabled = true;
         agent.config.body_batch_size = 7;
         assert_eq!(agent.ready_queue_load_limit(), 7);
+    }
+
+    #[test]
+    fn sqlite_main_db_path_returns_file_path_for_file_backed_connection() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("events.db");
+        let conn = Connection::open(&db_path).expect("open sqlite file");
+        let resolved = sqlite_main_db_path(&conn).expect("resolve sqlite main path");
+        let resolved = resolved.expect("expected sqlite main file path");
+        let resolved_real = std::fs::canonicalize(&resolved).expect("canonical resolved path");
+        let expected_real = std::fs::canonicalize(&db_path).expect("canonical expected path");
+        assert_eq!(resolved_real, expected_real);
+    }
+
+    #[test]
+    fn sqlite_main_db_path_returns_none_for_in_memory_connection() {
+        let conn = Connection::open_in_memory().expect("open sqlite memory");
+        let resolved = sqlite_main_db_path(&conn).expect("resolve sqlite main path");
+        assert!(resolved.is_none());
     }
 
     fn noisy_text(len: usize, seed: u64) -> String {
@@ -2065,8 +2553,8 @@ mod tests {
     fn build_prepared_row(exchange_id: &str, preview_len: usize) -> PreparedExchangeQueueRow {
         let mut event = ExchangeEvent::new(
             exchange_id,
-            soth_core::types::exchange::ExchangeSourceClass::Collector,
-            soth_core::types::exchange::ExchangeTransport::Https,
+            ExchangeSourceClass::Collector,
+            ExchangeTransport::Https,
             ExchangeBodyMode::MetadataOnly,
             ExchangeBodyMode::MetadataOnly,
         );
@@ -2093,6 +2581,12 @@ mod tests {
         assert!(!details.os_family.unwrap_or_default().is_empty());
         assert!(!details.arch.unwrap_or_default().is_empty());
         assert!(details.cpu_logical_cores.unwrap_or(0) > 0);
+        if let Some(memory_total_mb) = details.memory_total_mb {
+            assert!(memory_total_mb > 0);
+        }
+        if let Some(cpu_model) = details.cpu_model {
+            assert!(!cpu_model.trim().is_empty());
+        }
     }
 
     #[test]
@@ -2123,6 +2617,30 @@ mod tests {
         assert_eq!(
             parse_os_release_key(os_release, "VERSION_ID").as_deref(),
             Some("24.04")
+        );
+    }
+
+    #[test]
+    fn parse_linux_cpu_model_extracts_first_match() {
+        let cpuinfo = "processor\t: 0\nmodel name\t: Example CPU 3.20GHz\n";
+        assert_eq!(
+            parse_linux_cpu_model(cpuinfo).as_deref(),
+            Some("Example CPU 3.20GHz")
+        );
+    }
+
+    #[test]
+    fn parse_linux_mem_total_mb_extracts_kb_value() {
+        let meminfo = "MemTotal:       32768000 kB\nMemFree:         1024000 kB\n";
+        assert_eq!(parse_linux_mem_total_mb(meminfo), Some(32_000));
+    }
+
+    #[test]
+    fn parse_command_key_value_extracts_case_insensitive_values() {
+        let value = "Name=Example Processor\nOther=ignored\n";
+        assert_eq!(
+            parse_command_key_value(value, "name").as_deref(),
+            Some("Example Processor")
         );
     }
 
@@ -2179,8 +2697,8 @@ mod tests {
     fn exchange_event_to_metadata_normalizes_preview_only_body_mode() {
         let event = ExchangeEvent::new(
             "123e4567-e89b-42d3-a456-426614174000",
-            soth_core::types::exchange::ExchangeSourceClass::AgentApp,
-            soth_core::types::exchange::ExchangeTransport::Https,
+            ExchangeSourceClass::AgentApp,
+            ExchangeTransport::Https,
             ExchangeBodyMode::PreviewOnly,
             ExchangeBodyMode::PreviewOnly,
         );
@@ -2197,12 +2715,12 @@ mod tests {
     fn exchange_event_to_metadata_normalizes_legacy_client_app_type() {
         let mut event = ExchangeEvent::new(
             "123e4567-e89b-42d3-a456-426614174001",
-            soth_core::types::exchange::ExchangeSourceClass::AgentApp,
-            soth_core::types::exchange::ExchangeTransport::Https,
+            ExchangeSourceClass::AgentApp,
+            ExchangeTransport::Https,
             ExchangeBodyMode::Inline,
             ExchangeBodyMode::MetadataOnly,
         );
-        event.client = Some(soth_core::types::exchange::ExchangeClient {
+        event.client = Some(crate::exchange::types::ExchangeClient {
             pid: None,
             device_id: Some("device_local_01".to_string()),
             bundle_id: Some("agent.codex".to_string()),

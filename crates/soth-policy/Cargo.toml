@@ -1,26 +1,23 @@
 [package]
 name = "soth-policy"
-description = "OPA Wasm policy evaluation for SOTH"
+description = "Synchronous policy bundle evaluation for SOTH"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-default = []
-opa-wasm = ["dep:wasmtime"]
-
 [dependencies]
 soth-core = { workspace = true }
-wasmtime = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-dashmap = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true }
-parking_lot = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rand = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "sync_policy_bench"
+harness = false

@@ -1,22 +1,48 @@
-//! SOTH Policy - OPA Wasm policy evaluation
+#![allow(
+    clippy::result_large_err,
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::large_enum_variant,
+    clippy::if_same_then_else,
+    clippy::field_reassign_with_default,
+    clippy::approx_constant,
+    clippy::duplicated_attributes
+)]
+//! SOTH Policy - policy bundle evaluation.
 //!
-//! This crate provides:
-//! - OPA Wasm runtime using wasmtime
-//! - Two-tier decision caching
-//! - YAML policy definition compiler
-//! - Policy file loading and hot-reload support
+//! The canonical path is `sync_policy`, built on shared `soth-core` types.
 
-pub mod cache;
-pub mod compiler;
-pub mod engine;
-pub mod loader;
-#[cfg(feature = "opa-wasm")]
-pub mod wasm;
-
-pub use cache::{CacheConfig, CacheMetrics, DecisionCache};
-pub use compiler::{PolicyCompiler, PolicyDefinition};
-pub use engine::{PolicyEngine, PolicyEngineConfig};
-pub use loader::PolicyLoader;
+pub mod sync_policy;
 
 pub use soth_core::error::{Result, SothError};
-pub use soth_core::types::policy::*;
+pub use soth_core::policy::*;
+pub use sync_policy::{PolicyBundle, PolicyBundleError as PolicyError};
+
+/// Evaluate a normalized request and detected artifacts against the active policy bundle.
+///
+/// This is the canonical synchronous policy entrypoint used by classify/proxy wiring.
+pub fn evaluate(
+    normalized: &soth_core::NormalizedRequest,
+    artifacts: &[soth_core::SensitiveArtifact],
+    ctx: &soth_core::PolicyContext,
+    bundle: &PolicyBundle,
+) -> soth_core::PolicyDecision {
+    sync_policy::evaluate(normalized, artifacts, ctx, bundle)
+}
+
+/// Load a signed policy bundle from disk.
+pub fn load_bundle(path: &std::path::Path) -> std::result::Result<PolicyBundle, PolicyError> {
+    sync_policy::load_bundle(path)
+}
+
+/// Load a signed policy bundle from bytes.
+pub fn load_bundle_from_bytes(bytes: &[u8]) -> std::result::Result<PolicyBundle, PolicyError> {
+    sync_policy::load_bundle_from_bytes(bytes)
+}
+
+/// Warm policy state after load.
+///
+/// Current implementation is a no-op warmup hook that preserves the stable contract.
+pub fn warm(bundle: &PolicyBundle) {
+    sync_policy::warm(bundle);
+}

@@ -113,11 +113,6 @@ pub async fn enable(port: Option<u16>) -> Result<()> {
     enable_internal(port, true).await
 }
 
-/// Enable system proxy settings without printing user-facing output.
-pub async fn enable_quiet(port: Option<u16>) -> Result<()> {
-    enable_internal(port, false).await
-}
-
 async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<()> {
     let proxy_port = port.unwrap_or(DEFAULT_PROXY_PORT);
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -182,7 +177,7 @@ async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<(
                 println!(
                     "\n{} CA certificate not found. Run: {}",
                     style::WARNING,
-                    style::highlight("soth runtime setup-ca")
+                    style::highlight("soth setup-ca")
                 );
             }
         } else {
@@ -290,20 +285,25 @@ pub async fn status() -> Result<bool> {
 }
 
 fn get_ca_path() -> PathBuf {
+    soth_home_dir().join("certs").join("soth-mitm-ca.pem")
+}
+
+fn soth_home_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("SOTH_HOME_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".soth")
-        .join("ca")
-        .join("ca.crt")
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn system_proxy_state_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".soth")
-        .join("run")
-        .join(SYSTEM_PROXY_STATE_FILE)
+    soth_home_dir().join("run").join(SYSTEM_PROXY_STATE_FILE)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -349,11 +349,7 @@ fn now_unix_secs() -> u64 {
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn system_proxy_owner_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".soth")
-        .join("run")
-        .join(SYSTEM_PROXY_OWNER_FILE)
+    soth_home_dir().join("run").join(SYSTEM_PROXY_OWNER_FILE)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -1426,19 +1422,16 @@ async fn check_windows_proxy_status() -> Result<bool> {
 mod tests {
     use super::*;
     use std::env;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
-        let guard = ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env mutex poisoned");
+        let guard = crate::commands::proxy::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let old_home = env::var_os("HOME");
+        let old_soth_home = env::var_os("SOTH_HOME_DIR");
+        let soth_home = temp.path().join(".soth");
         unsafe {
             env::set_var("HOME", temp.path());
+            env::set_var("SOTH_HOME_DIR", &soth_home);
         }
         let result = f();
         match old_home {
@@ -1449,6 +1442,14 @@ mod tests {
                 env::remove_var("HOME");
             },
         }
+        match old_soth_home {
+            Some(value) => unsafe {
+                env::set_var("SOTH_HOME_DIR", value);
+            },
+            None => unsafe {
+                env::remove_var("SOTH_HOME_DIR");
+            },
+        }
         drop(guard);
         result
     }
@@ -1457,7 +1458,7 @@ mod tests {
     fn test_get_ca_path() {
         let path = get_ca_path();
         assert!(path.to_string_lossy().contains(".soth"));
-        assert!(path.to_string_lossy().contains("ca.crt"));
+        assert!(path.to_string_lossy().contains("soth-mitm-ca.pem"));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1533,5 +1534,30 @@ mod tests {
             let result = assert_state_owner_matches_local(&state);
             assert!(result.is_err());
         });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_windows_reg_value_dword() {
+        let sample = r#"
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
+    ProxyEnable    REG_DWORD    0x1
+"#;
+        let parsed = parse_windows_reg_value(sample, "ProxyEnable");
+        assert_eq!(parsed, Some(("REG_DWORD".to_string(), "0x1".to_string())));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_windows_reg_value_string() {
+        let sample = r#"
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
+    ProxyServer    REG_SZ    127.0.0.1:18881
+"#;
+        let parsed = parse_windows_reg_value(sample, "ProxyServer");
+        assert_eq!(
+            parsed,
+            Some(("REG_SZ".to_string(), "127.0.0.1:18881".to_string()))
+        );
     }
 }

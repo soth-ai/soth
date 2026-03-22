@@ -1,0 +1,33 @@
+SOTH Classify - Remaining Plan Items
+Date: 2026-02-25
+
+Remaining implementation items:
+
+1) Real bundle loading
+- Implement ClassifyBundle::load() and ClassifyBundle::load_from_bytes()
+- Verify manifest signature and asset hashes
+- Replace current Unsupported return path
+
+2) Real model path for stages 1-3
+- Stage 1: tokenizer + ONNX embedding inference
+- Stage 2: centroid/LSH matrix path from bundle assets
+- Stage 3: real classifier weights (MLP) path
+
+3) Model-backed anomaly scorer
+- Load and wire anomaly model from bundle
+- Keep heuristic fallback as safety path
+
+4) Commitment hash wiring in stage 7
+- Compute commitment hash from raw body bytes + nonce
+- Ensure nonce remains local-only and event remains content-free
+
+5) Performance/quality gates from plan
+- Add target latency validation (P50/P95/P99)
+- Add memory/heap usage checks
+- Add fuzz/prohibition-oriented checks from plan
+
+Completed so far:
+- Public API and pipeline skeleton
+- Stage wiring and policy integration (including heuristic skip_org_rules path)
+- Determinism/privacy/fallback and stage hardening tests
+- Current checks/tests passing for soth-core/soth-detect/soth-policy/soth-classify

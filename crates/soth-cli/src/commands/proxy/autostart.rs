@@ -8,16 +8,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-const SERVICE_NAME: &str = "soth-edge";
+const SERVICE_NAME: &str = "soth-proxy";
 
 #[cfg(target_os = "macos")]
-const MACOS_SERVICE_LABEL: &str = "ai.soth.edge";
+const MACOS_SERVICE_LABEL: &str = "ai.soth.proxy";
 
 #[cfg(target_os = "linux")]
-const XDG_AUTOSTART_FILE: &str = "soth-edge.desktop";
+const XDG_AUTOSTART_FILE: &str = "soth-proxy.desktop";
 
 #[cfg(target_os = "windows")]
-const WINDOWS_RUN_KEY_VALUE: &str = "SothEdge";
+const WINDOWS_RUN_KEY_VALUE: &str = "SothProxy";
 
 fn resolve_abs_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
@@ -102,23 +102,6 @@ pub fn stop_managed_runtime_only() -> Result<Option<String>> {
     Ok(None)
 }
 
-pub fn disable_managed_autostart() -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
-    {
-        return stop_macos_launch_agent().map(Some);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return stop_linux_autostart().map(Some);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return stop_windows_autostart().map(Some);
-    }
-    #[allow(unreachable_code)]
-    Ok(None)
-}
-
 pub fn managed_status() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
@@ -192,30 +175,6 @@ pub fn managed_status() -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn stop_macos_launch_agent() -> Result<String> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
-    let label = MACOS_SERVICE_LABEL;
-    let plist_path = home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{label}.plist"));
-    let uid = unsafe { libc::geteuid() }.to_string();
-    let gui_target = format!("gui/{uid}/{label}");
-    let user_target = format!("user/{uid}/{label}");
-
-    let _ = launchctl_silent(["bootout", &gui_target]);
-    let _ = launchctl_silent(["bootout", &user_target]);
-    let _ = launchctl_silent(["disable", &gui_target]);
-    let _ = launchctl_silent(["disable", &user_target]);
-
-    if plist_path.exists() {
-        let _ = std::fs::remove_file(&plist_path);
-    }
-
-    Ok(format!("launchd disabled ({label})"))
-}
-
-#[cfg(target_os = "macos")]
 fn stop_macos_launch_agent_runtime_only() -> Result<String> {
     let label = MACOS_SERVICE_LABEL;
     let uid = unsafe { libc::geteuid() }.to_string();
@@ -252,36 +211,6 @@ fn launchctl_silent<const N: usize>(args: [&str; N]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn stop_linux_autostart() -> Result<String> {
-    if which::which("systemctl").is_ok() {
-        let _ = run_linux_cmd(&["systemctl", "--user", "disable", "--now", SERVICE_NAME]);
-        if let Some(home) = dirs::home_dir() {
-            let unit_path = home
-                .join(".config")
-                .join("systemd")
-                .join("user")
-                .join(format!("{SERVICE_NAME}.service"));
-            if unit_path.exists() {
-                let _ = std::fs::remove_file(&unit_path);
-            }
-            let _ = run_linux_cmd(&["systemctl", "--user", "daemon-reload"]);
-        }
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        let desktop_path = home
-            .join(".config")
-            .join("autostart")
-            .join(XDG_AUTOSTART_FILE);
-        if desktop_path.exists() {
-            let _ = std::fs::remove_file(&desktop_path);
-        }
-    }
-
-    Ok("linux autostart disabled".to_string())
-}
-
-#[cfg(target_os = "linux")]
 fn stop_linux_runtime_only() -> Result<String> {
     if which::which("systemctl").is_ok() {
         let _ = run_linux_cmd(&["systemctl", "--user", "stop", SERVICE_NAME]);
@@ -290,38 +219,6 @@ fn stop_linux_runtime_only() -> Result<String> {
         ));
     }
     Ok("linux runtime stop handled by pid lifecycle; autostart registration preserved".to_string())
-}
-
-#[cfg(target_os = "windows")]
-fn stop_windows_autostart() -> Result<String> {
-    use std::os::windows::process::CommandExt;
-
-    let output = Command::new("reg")
-        .args([
-            "delete",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            WINDOWS_RUN_KEY_VALUE,
-            "/f",
-        ])
-        .creation_flags(0x08000000)
-        .output()
-        .context("failed removing Windows startup Run key")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if !stderr.contains("unable to find the specified registry key")
-            && !stderr.contains("unable to find the specified value")
-        {
-            anyhow::bail!(
-                "failed deleting Windows startup Run key: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-    }
-    Ok(format!(
-        "windows Run key removed (HKCU\\...\\Run\\{})",
-        WINDOWS_RUN_KEY_VALUE
-    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -346,7 +243,12 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
         program_arguments.push_str(&format!("    <string>{}</string>\n", xml_escape(arg)));
     }
     let logs_dir = home.join(".soth").join("logs");
-    std::fs::create_dir_all(&logs_dir).ok();
+    std::fs::create_dir_all(&logs_dir).with_context(|| {
+        format!(
+            "failed creating launch agent log directory {}",
+            logs_dir.display()
+        )
+    })?;
     let stdout_path = logs_dir.join("edge-autostart.log");
 
     let body = format!(
@@ -383,40 +285,65 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
     let _ = launchctl_silent(["bootout", &gui_target]);
     let _ = launchctl_silent(["bootout", &user_target]);
 
-    let bootstrap_gui = Command::new("launchctl")
-        .args([
-            "bootstrap",
-            &format!("gui/{uid}"),
-            &plist_path.display().to_string(),
-        ])
-        .status();
-    if !bootstrap_gui
-        .map(|status| status.success())
-        .unwrap_or(false)
-    {
-        let _ = Command::new("launchctl")
-            .args([
-                "bootstrap",
-                &format!("user/{uid}"),
-                &plist_path.display().to_string(),
-            ])
-            .status();
+    let plist_path_str = plist_path.display().to_string();
+    let gui_domain = format!("gui/{uid}");
+    let user_domain = format!("user/{uid}");
+
+    let bootstrap_domain = match launchctl_require_success(&[
+        "bootstrap",
+        &gui_domain,
+        &plist_path_str,
+    ]) {
+        Ok(()) => "gui",
+        Err(gui_error) => {
+            launchctl_require_success(&["bootstrap", &user_domain, &plist_path_str]).map_err(
+                |user_error| {
+                    anyhow!(
+                        "failed to bootstrap launchd service in both gui and user domains.\nGUI error: {}\nUSER error: {}",
+                        gui_error,
+                        user_error
+                    )
+                },
+            )?;
+            "user"
+        }
+    };
+
+    let (primary_target, secondary_target) = if bootstrap_domain == "gui" {
+        (gui_target.as_str(), user_target.as_str())
+    } else {
+        (user_target.as_str(), gui_target.as_str())
+    };
+
+    if let Err(primary_error) = launchctl_require_success(&["enable", primary_target]) {
+        launchctl_require_success(&["enable", secondary_target]).map_err(|secondary_error| {
+            anyhow!(
+                "failed to enable launchd service.\nPrimary ({}) error: {}\nSecondary ({}) error: {}",
+                primary_target,
+                primary_error,
+                secondary_target,
+                secondary_error
+            )
+        })?;
     }
-    let _ = Command::new("launchctl")
-        .args(["enable", &gui_target])
-        .status();
-    let _ = Command::new("launchctl")
-        .args(["kickstart", "-k", &gui_target])
-        .status()
-        .or_else(|_| {
-            Command::new("launchctl")
-                .args(["kickstart", "-k", &user_target])
-                .status()
-        });
+
+    if let Err(primary_error) = launchctl_require_success(&["kickstart", "-k", primary_target]) {
+        launchctl_require_success(&["kickstart", "-k", secondary_target]).map_err(
+            |secondary_error| {
+                anyhow!(
+                    "failed to kickstart launchd service.\nPrimary ({}) error: {}\nSecondary ({}) error: {}",
+                    primary_target,
+                    primary_error,
+                    secondary_target,
+                    secondary_error
+                )
+            },
+        )?;
+    }
 
     Ok(format!(
-        "launchd enabled ({label}) at {}",
-        plist_path.display()
+        "launchd enabled ({label}) at {} (domain: {bootstrap_domain})",
+        plist_path.display(),
     ))
 }
 
@@ -428,6 +355,32 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_require_success(args: &[&str]) -> Result<()> {
+    let output = Command::new("launchctl")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed running launchctl {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let details = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no launchctl output".to_string()
+    };
+    anyhow::bail!(
+        "launchctl {} failed with status {}: {}",
+        args.join(" "),
+        output.status,
+        details
+    );
 }
 
 #[cfg(target_os = "linux")]

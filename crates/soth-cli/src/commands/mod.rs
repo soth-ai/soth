@@ -1,27 +1,7 @@
-//! CLI command implementations
+//! CLI command implementations for the slim production surface.
 
-#[cfg(feature = "ops")]
-pub mod audit;
-#[cfg(feature = "ops")]
-pub mod budget;
-pub mod cloud_hooks;
-#[cfg(feature = "ops")]
-pub mod config;
+pub mod bundle;
 pub mod enroll;
-#[cfg(feature = "ops")]
-pub mod identity;
+pub mod events;
 pub mod init;
-#[cfg(feature = "ops")]
-pub mod install;
-pub mod login;
-#[cfg(feature = "ops")]
-pub mod policy;
 pub mod proxy;
-#[cfg(feature = "ops")]
-pub mod session;
-#[cfg(feature = "ops")]
-pub mod setup;
-#[cfg(feature = "local-debug")]
-pub mod test;
-#[cfg(feature = "local-debug")]
-pub mod tui;

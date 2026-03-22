@@ -69,3 +69,6 @@ lcov.info
 
 # Documentation (generated)
 docs/
+
+# Local test corpora (machine-specific fixtures)
+crates/*/tests/corpus/

@@ -1,35 +1,32 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/soth-core",
-    "crates/soth-helper",
-    "crates/soth-crypto",
-    "crates/soth-policy",
-    "crates/soth-observe",
-    "crates/soth-budget",
-    "crates/soth-collector",
-    "crates/soth-dashboard",
     "crates/soth-cli",
+    "crates/soth-core",
+    "crates/soth-bundle",
+    "crates/soth-classify",
+    "crates/soth-sqlite-vec",
+    "crates/soth-proxy",
+    "crates/soth-telemetry",
+    "crates/soth-policy",
     "crates/soth-sync",
-    "crates/soth-edge",
-    "crates/soth-wrap",
+    "crates/soth-parse",
+    "crates/soth-detect",
+    "crates/soth-extensions",
+    "extensions/historian",
 ]
 default-members = [
-    "crates/soth-core",
-    "crates/soth-helper",
-    "crates/soth-crypto",
-    "crates/soth-policy",
-    "crates/soth-observe",
-    "crates/soth-budget",
-    "crates/soth-collector",
     "crates/soth-cli",
+    "crates/soth-core",
+    "crates/soth-bundle",
+    "crates/soth-classify",
+    "crates/soth-proxy",
+    "crates/soth-telemetry",
+    "crates/soth-policy",
     "crates/soth-sync",
-    "crates/soth-edge",
-    "crates/soth-wrap",
+    "crates/soth-extensions",
 ]
-exclude = [
-    "tests/tools/mock_mcp_server",
-]
+exclude = []
 
 [workspace.package]
 version = "0.1.0"
@@ -42,16 +39,17 @@ authors = ["Labterminal"]
 [workspace.dependencies]
 # Internal crates
 soth-core = { path = "crates/soth-core" }
-soth-helper = { path = "crates/soth-helper" }
-soth-crypto = { path = "crates/soth-crypto" }
+soth-bundle = { path = "crates/soth-bundle" }
+soth-classify = { path = "crates/soth-classify" }
+soth-sqlite-vec = { path = "crates/soth-sqlite-vec" }
+soth-proxy = { path = "crates/soth-proxy" }
+soth-telemetry = { path = "crates/soth-telemetry" }
 soth-policy = { path = "crates/soth-policy" }
-soth-observe = { path = "crates/soth-observe" }
-soth-budget = { path = "crates/soth-budget" }
-soth-collector = { path = "crates/soth-collector" }
-soth-dashboard = { path = "crates/soth-dashboard" }
 soth-sync = { path = "crates/soth-sync" }
-soth-edge = { path = "crates/soth-edge" }
-soth-wrap = { path = "crates/soth-wrap" }
+soth-parse = { path = "crates/soth-parse" }
+soth-detect = { path = "crates/soth-detect", default-features = false }
+soth-extensions = { path = "crates/soth-extensions" }
+soth-historian = { path = "extensions/historian" }
 
 # Async runtime
 tokio = { version = "1", features = [
@@ -69,7 +67,6 @@ tokio = { version = "1", features = [
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 async-trait = "0.1"
 async-stream = "0.3"
-futures = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -79,35 +76,21 @@ serde_yaml = "0.9"
 # Cryptography
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
-bs58 = "0.5"
 rand = "0.8"
 base64 = "0.22"
 
-# Policy (OPA Wasm)
-wasmtime = "17"
-
-# HTTP/Proxy
+# HTTP
 axum = { version = "0.7", features = ["ws"] }
-tower = { version = "0.4", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
     "http2",
     "gzip",
 ] }
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
-http-body-util = "0.1"
-tokio-tungstenite = "0.21"
 
 # TLS
 rcgen = "0.13"
 rustls = "0.23"
-tokio-rustls = "0.26"
-rustls-pemfile = "2"
-x509-parser = "0.16"
-webpki-roots = "0.26"
 
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -125,12 +108,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 once_cell = "1"
 dashmap = "5"
-parking_lot = "0.12"
 dirs = "5"
-
-# Metrics/Monitoring
-metrics = "0.23"
-metrics-exporter-prometheus = "0.15"
 
 # Testing
 tempfile = "3"

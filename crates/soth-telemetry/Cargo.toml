@@ -1,0 +1,28 @@
+[package]
+name = "soth-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+soth-core = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+async-trait = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { version = "2", features = ["getrandom"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = { workspace = true }
+rmp-serde = "1"
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+hex = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

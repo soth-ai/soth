@@ -1,1575 +1,1248 @@
-//! Start sensor runtime command
+//! Start proxy runtime command.
 
 use super::daemon;
-use super::start_fd::{ensure_fd_budget, spawn_fd_monitor_runtime};
-use super::start_shutdown::{
-    disable_system_proxy_after_run, flush_local_event_buffers,
-    is_expected_shutdown_transport_error, runtime_shutdown_timeout, shutdown_cloud_runtime,
-    shutdown_collector_runtime, shutdown_fd_monitor_runtime, shutdown_retention_runtime,
-};
-use super::start_ui::{compact_path, print_logo_banner, render_startup_panel};
-use crate::cli_config;
-use crate::commands::cloud_hooks;
-use crate::commands::proxy::retention;
-use crate::commands::proxy::system;
+use crate::cli_config::{self, SothConfig};
 use crate::style;
-use owo_colors::OwoColorize;
-use soth_collector::CollectorRuntime;
-use soth_core::config::{HostFilterMode, ObserveCollectorConfig, SothConfig};
-use soth_core::event_logger::default_event_log_write_path;
-use soth_core::EventLogger;
-use soth_edge::proxy as edge_proxy;
-use soth_helper::metrics;
-use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::env;
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::task::JoinHandle;
+use tokio::process::{Child, Command};
 use tracing::{info, warn};
+use uuid::Uuid;
 
-/// Run the start command
+const LISTENER_STARTUP_TIMEOUT_SECS: u64 = 20;
+const LISTENER_HEALTH_CHECK_INTERVAL_MS: u64 = 1_000;
+const LISTENER_HEALTH_FAILURE_WINDOW_MS: u64 = 30_000;
+const MAX_RESTART_ATTEMPTS: u32 = 10;
+const RESTART_BACKOFF_BASE_MS: u64 = 1_000;
+const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
+const DEFAULT_NOFILE_MIN_SOFT_LIMIT: u64 = 8_192;
+const DEFAULT_NOFILE_WARN_SOFT_LIMIT: u64 = 2_048;
+const AGENT_INSTANCE_ID_TAG: &str = "agent_instance_id";
+const AGENT_INSTANCE_ID_FILE: &str = "agent_instance_id";
+const AGENT_INSTANCE_ID_PREFIX: &str = "edge-";
+
+/// Run the start command.
 pub async fn run(
     port: Option<u16>,
     config_path: Option<PathBuf>,
     quiet: bool,
     foreground: bool,
-    intercept_all: bool,
-    intercept_all_for: Option<u64>,
     daemon_child: bool,
     no_autostart: bool,
-) -> anyhow::Result<()> {
+    allow_daemon_child_fallback: bool,
+) -> Result<()> {
     if !foreground && !daemon_child {
         return daemon::run_start_daemon(
             port,
             config_path,
             quiet,
-            intercept_all,
-            intercept_all_for,
             no_autostart,
+            allow_daemon_child_fallback,
         )
         .await;
     }
 
+    let config = cli_config::load_effective_config(config_path.as_ref(), None)?;
+    let ca_paths = super::ca_health::resolve_ca_paths(&config);
     ensure_fd_budget();
-
-    let mut config = cli_config::load_effective_config(config_path.as_ref(), None)?;
-    if config.cloud.enabled {
-        let _ = cli_config::sync_client_device_id(&mut config, None)?;
+    let cert_path = ca_paths.runtime_cert_path.clone();
+    let key_path = ca_paths.runtime_key_path.clone();
+    if !cert_path.exists() || !key_path.exists() {
+        anyhow::bail!("CA certificate not found. Run `soth setup-ca` first.");
     }
-    cloud_hooks::apply_cached_controls(&mut config)?;
+    ensure_ca_runtime_health(&ca_paths, quiet)?;
 
-    // Override port if specified
-    let mut proxy_config = config.forward_proxy.clone();
-    if let Some(p) = port {
-        proxy_config.port = p;
-    }
-    let debug_intercept_all_for = intercept_all_for.map(Duration::from_secs);
-    let debug_intercept_all_enabled = intercept_all || debug_intercept_all_for.is_some();
-
-    // Ensure proxy is enabled
-    proxy_config.enabled = true;
-
-    // Forward proxy requires cert and key paths.
-    let ca_cert_path = cli_config::expand_tilde(&proxy_config.ca.cert_path);
-    let ca_key_path = cli_config::expand_tilde(&proxy_config.ca.key_path);
-
-    // Show startup spinner only in non-quiet mode.
-    let spinner = if quiet {
-        None
-    } else {
-        Some(style::spinner("Loading CA certificate..."))
-    };
-
-    // Check CA exists
-    if !ca_cert_path.exists() || !ca_key_path.exists() {
-        if let Some(pb) = spinner {
-            pb.finish_and_clear();
-        }
-        style::error("CA certificate not found. Run: soth runtime setup-ca");
-        anyhow::bail!("CA certificate not found");
-    }
-
-    if let Some(pb) = spinner {
-        pb.finish_and_clear();
-    }
-
-    // Best-effort startup refresh: in daemon-child mode, do not block proxy bind/readiness.
-    if daemon_child {
-        let startup_refresh_config = config.clone();
-        tokio::spawn(async move {
-            cloud_hooks::refresh_registry_bundle_on_start(&startup_refresh_config).await;
-        });
-    } else {
-        cloud_hooks::refresh_registry_bundle_on_start(&config).await;
-    }
-
-    // Fail-open: proxy runtime should still start even if system proxy toggling fails.
-    if let Err(error) = system::enable_quiet(Some(proxy_config.port)).await {
-        warn!(
-            error = %error,
-            port = proxy_config.port,
-            "Failed to auto-enable system proxy; continuing with sensor runtime only"
-        );
-        if !quiet {
-            style::warning(&format!(
-                "Could not auto-enable system proxy (continuing fail-open): {error}"
-            ));
-            style::info("Use `soth on` after resolving network/permission issues.");
-        }
-    }
-
-    let intercept_summary = match proxy_config.hosts.mode {
-        HostFilterMode::Discovery => "all non-local hosts (discovery mode)".to_string(),
-        HostFilterMode::Selective => "bundle-classified hosts (registry cache)".to_string(),
-    };
-
-    let inline_threshold = config.observe.storage.inline_threshold_bytes;
-    let (event_logger, event_logging_status) =
-        match EventLogger::with_default_path_from_runtime_config(
-            inline_threshold,
-            &config.crypto_identity,
-        ) {
-            Ok(logger) => {
-                let display = compact_path(logger.path());
-                (Some(logger), display)
-            }
-            Err(_) => (None, "disabled".to_string()),
-        };
-
-    let runtime_line = format!(
-        "soth sensor | {} | {} | {} | {}",
-        proxy_config.engine,
-        proxy_config.registry_mode,
-        proxy_config.hosts.mode,
-        proxy_config.socket_addr()
-    );
-    let rules_line = "source=cloud bundle (ai/mcp/agent classification)".to_string();
-    #[cfg(feature = "local-debug")]
-    let api_line = format!(
-        "off (run `soth dev api start --port {}` to enable)",
-        config.dashboard.port
-    );
-    #[cfg(not(feature = "local-debug"))]
-    let api_line = "unavailable in this build (enable `local-debug`)".to_string();
-
-    #[cfg(feature = "local-debug")]
-    let ui_line = "off (run `soth dev ui start` to enable)".to_string();
-    #[cfg(not(feature = "local-debug"))]
-    let ui_line = "unavailable in this build (enable `local-debug`)".to_string();
-    let system_proxy_line = format!("enabled @ 127.0.0.1:{}", proxy_config.port);
-
-    // Initialize Prometheus metrics
-    let _ = metrics::init_metrics();
+    let generated_path = write_proxy_config(&config, port)?;
+    let expected_port = port.unwrap_or(config.forward_proxy.port);
+    let mut child = spawn_proxy_process(generated_path.as_path())
+        .await
+        .context("spawn soth-proxy process")?;
+    wait_for_listener_start(&mut child, expected_port).await?;
 
     if !quiet {
-        print_logo_banner();
-        render_startup_panel(
-            &runtime_line,
-            &rules_line,
-            &intercept_summary,
-            "eval $(soth runtime env)",
-            &compact_path(&ca_cert_path),
-            &api_line,
-            &ui_line,
-            &event_logging_status,
-            &system_proxy_line,
-        );
-        if debug_intercept_all_enabled {
-            match debug_intercept_all_for {
-                Some(window) => style::warning(&format!(
-                    "Debug intercept-all enabled for {}s (non-local hosts)",
-                    window.as_secs()
-                )),
-                None => style::warning("Debug intercept-all enabled (non-local hosts)"),
-            }
+        if foreground {
+            style::success("Proxy started in foreground mode.");
+            style::info("Press Ctrl+C to stop.");
         }
-        println!(
-            "{} {}  |  AI/MCP → {}  |  Other → {}  |  {}",
-            style::CHECK.green(),
-            "Ready".bold(),
-            "MITM".cyan(),
-            "blind tunnel".dimmed(),
-            "Ctrl+C to stop".dimmed()
-        );
-        println!();
     }
 
-    run_forward_proxy(
-        &config,
-        proxy_config,
-        ca_cert_path,
-        ca_key_path,
-        event_logger,
-        quiet,
-        debug_intercept_all_enabled,
-        debug_intercept_all_for,
+    supervise_proxy(
+        &mut child,
+        generated_path.as_path(),
+        expected_port,
+        foreground,
     )
     .await
 }
 
-fn resolve_registry_bundle_cache_path(config: &SothConfig) -> PathBuf {
-    let cache_name = config.forward_proxy.engine.registry_bundle_cache_filename();
-    if let Some(config_cache_path) = config.cloud.cache_path.as_ref() {
-        let expanded = cli_config::expand_tilde(config_cache_path);
-        if let Some(parent) = expanded.parent() {
-            return parent.join(cache_name);
-        }
+fn ensure_ca_runtime_health(paths: &super::ca_health::ResolvedCaPaths, quiet: bool) -> Result<()> {
+    if !paths.trust_cert_path.exists() {
+        anyhow::bail!(
+            "Configured trust cert path does not exist: {} (source={}).",
+            paths.trust_cert_path.display(),
+            paths.trust_source
+        );
     }
 
-    dirs::home_dir()
-        .map(|home| home.join(".soth").join(cache_name))
-        .unwrap_or_else(|| PathBuf::from(".soth").join(cache_name))
-}
+    let runtime_fp = super::ca_health::cert_fingerprint_sha256(paths.runtime_cert_path.as_path())
+        .context("compute runtime CA fingerprint")?;
+    let trust_fp = super::ca_health::cert_fingerprint_sha256(paths.trust_cert_path.as_path())
+        .context("compute trust CA fingerprint")?;
+    if runtime_fp != trust_fp {
+        anyhow::bail!(
+            "CA fingerprint mismatch between runtime cert and trust cert.\nruntime={} ({})\ntrust={} ({})",
+            runtime_fp,
+            paths.runtime_cert_path.display(),
+            trust_fp,
+            paths.trust_cert_path.display()
+        );
+    }
 
-struct ProxyRuntime {
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-    proxy_task: JoinHandle<anyhow::Result<()>>,
-    event_logger: Option<EventLogger>,
-    fd_monitor_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    fd_monitor_task: Option<JoinHandle<()>>,
-    retention_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    retention_task: Option<JoinHandle<()>>,
-    cloud_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    cloud_task: Option<JoinHandle<()>>,
-    collector_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    collector_task: Option<JoinHandle<()>>,
-}
+    let key_matches = super::ca_health::cert_matches_key(
+        paths.runtime_cert_path.as_path(),
+        paths.runtime_key_path.as_path(),
+    )
+    .context("validate runtime CA cert/key pair")?;
+    if !key_matches {
+        anyhow::bail!(
+            "CA private key does not match runtime CA certificate.\ncert={}\nkey={}",
+            paths.runtime_cert_path.display(),
+            paths.runtime_key_path.display()
+        );
+    }
 
-/// Run the sensor transport.
-async fn run_forward_proxy(
-    config: &SothConfig,
-    proxy_config: soth_core::config::ForwardProxyConfig,
-    ca_cert_path: PathBuf,
-    ca_key_path: PathBuf,
-    event_logger: Option<EventLogger>,
-    quiet: bool,
-    debug_intercept_all_enabled: bool,
-    debug_intercept_all_for: Option<Duration>,
-) -> anyhow::Result<()> {
-    let runtime = match spawn_proxy_runtime(
-        config,
-        proxy_config,
-        ca_cert_path,
-        ca_key_path,
-        event_logger,
-        debug_intercept_all_enabled,
-        debug_intercept_all_for,
-    ) {
-        Ok(runtime) => runtime,
+    match super::ca_health::check_os_trust(paths.trust_cert_path.as_path()) {
+        Ok(check) => match check.status {
+            super::ca_health::OsTrustStatus::Trusted => {}
+            super::ca_health::OsTrustStatus::Untrusted => {
+                if paths.external_trust_path {
+                    anyhow::bail!(
+                        "External trust cert is not trusted by OS (source={}): {}.\nInstall trust via MDM/profile and retry.",
+                        paths.trust_source,
+                        check.detail
+                    );
+                }
+                anyhow::bail!(
+                    "Runtime CA is not trusted by OS: {}. Run `soth setup-ca` and retry.",
+                    check.detail
+                );
+            }
+            super::ca_health::OsTrustStatus::Unknown => {
+                if !quiet {
+                    warn!("Skipping strict OS CA trust gate: {}", check.detail);
+                }
+            }
+        },
         Err(error) => {
-            disable_system_proxy_after_run(quiet).await;
-            return Err(error);
-        }
-    };
-    let mut retention_shutdown_tx = runtime.retention_shutdown_tx;
-    let mut retention_task = runtime.retention_task;
-    let mut fd_monitor_shutdown_tx = runtime.fd_monitor_shutdown_tx;
-    let mut fd_monitor_task = runtime.fd_monitor_task;
-    let mut cloud_shutdown_tx = runtime.cloud_shutdown_tx;
-    let mut cloud_task = runtime.cloud_task;
-    let mut collector_shutdown_tx = runtime.collector_shutdown_tx;
-    let mut collector_task = runtime.collector_task;
-    let mut event_logger = runtime.event_logger;
-    let shutdown_tx = runtime.shutdown_tx;
-    let proxy_task = runtime.proxy_task;
-    let shutdown_timeout = runtime_shutdown_timeout(config);
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let run_started_at = Instant::now();
-
-    let shutdown_requested_signal = shutdown_requested.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        shutdown_requested_signal.store(true, Ordering::SeqCst);
-        if !quiet {
-            println!();
-            style::warning("Initiating graceful shutdown...");
-        }
-        let _ = shutdown_tx.send(());
-    });
-
-    let result = match proxy_task.await {
-        Ok(runtime_result) => runtime_result,
-        Err(error) => Err(anyhow::anyhow!("proxy runtime task join failed: {}", error)),
-    };
-
-    shutdown_collector_runtime(
-        &mut collector_shutdown_tx,
-        &mut collector_task,
-        shutdown_timeout,
-    )
-    .await;
-    shutdown_fd_monitor_runtime(
-        &mut fd_monitor_shutdown_tx,
-        &mut fd_monitor_task,
-        shutdown_timeout,
-    )
-    .await;
-    flush_local_event_buffers(&mut event_logger, shutdown_timeout, quiet).await;
-    shutdown_cloud_runtime(&mut cloud_shutdown_tx, &mut cloud_task, shutdown_timeout).await;
-    shutdown_retention_runtime(
-        &mut retention_shutdown_tx,
-        &mut retention_task,
-        shutdown_timeout,
-    )
-    .await;
-    disable_system_proxy_after_run(quiet).await;
-
-    match result {
-        Ok(()) => {
             if !quiet {
-                style::success("Proxy stopped.");
-            }
-            Ok(())
-        }
-        Err(error)
-            if is_expected_shutdown_transport_error(&error)
-                && (shutdown_requested.load(Ordering::SeqCst)
-                    || run_started_at.elapsed() >= Duration::from_secs(2)) =>
-        {
-            if !quiet {
-                style::success("Proxy stopped.");
-            }
-            Ok(())
-        }
-        Err(e) => {
-            style::error(&format!("Proxy error: {}", e));
-            Err(anyhow::anyhow!("Proxy error: {}", e))
-        }
-    }
-}
-
-fn spawn_proxy_runtime(
-    config: &SothConfig,
-    proxy_config: soth_core::config::ForwardProxyConfig,
-    ca_cert_path: PathBuf,
-    ca_key_path: PathBuf,
-    event_logger: Option<EventLogger>,
-    debug_intercept_all_enabled: bool,
-    _debug_intercept_all_for: Option<Duration>,
-) -> anyhow::Result<ProxyRuntime> {
-    let event_db_path = event_logger
-        .as_ref()
-        .map(|logger| logger.path().clone())
-        .or_else(|| default_event_log_write_path().ok());
-
-    let mut retention_shutdown_tx = None;
-    let mut retention_task = None;
-    if let Some(runtime) = retention::spawn_retention_runtime(config, event_db_path.clone()) {
-        retention_shutdown_tx = Some(runtime.shutdown_tx);
-        retention_task = Some(runtime.task);
-    }
-
-    let mut fd_monitor_shutdown_tx = None;
-    let mut fd_monitor_task = None;
-    if let Some(runtime) = spawn_fd_monitor_runtime() {
-        fd_monitor_shutdown_tx = Some(runtime.shutdown_tx);
-        fd_monitor_task = Some(runtime.task);
-    }
-
-    apply_collector_env_overrides(config, &config.observe.collector);
-
-    let mut cloud_shutdown_tx = None;
-    let mut cloud_task = None;
-    if let Some(runtime) = cloud_hooks::spawn_cloud_pull_runtime(config, event_db_path.clone()) {
-        cloud_shutdown_tx = Some(runtime.shutdown_tx);
-        cloud_task = Some(runtime.task);
-    }
-
-    let mut collector_shutdown_tx = None;
-    let mut collector_task = None;
-    if let Some(ref logger) = event_logger {
-        if let Some(CollectorRuntime { shutdown_tx, task }) = soth_collector::spawn_from_env(
-            logger.clone(),
-            config.observe.event_tags.clone(),
-            config.exchange.clone(),
-        ) {
-            collector_shutdown_tx = Some(shutdown_tx);
-            collector_task = Some(task);
-        }
-    }
-
-    let shutdown_event_logger = event_logger.clone();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let oisp_registry_cache_path = resolve_registry_bundle_cache_path(config);
-    let exchange_config = config.exchange.clone();
-    let handle = tokio::spawn(async move {
-        let shutdown = async move {
-            shutdown_rx.await.ok();
-        };
-        if debug_intercept_all_enabled {
-            warn!(
-                "Debug intercept-all flags are not yet implemented for edge engine; continuing without override"
-            );
-        }
-        edge_proxy::start_proxy_with_shutdown(
-            proxy_config,
-            &ca_cert_path,
-            &ca_key_path,
-            shutdown,
-            event_logger,
-            Some(oisp_registry_cache_path),
-            Some(exchange_config),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("Edge proxy error: {}", error))
-    });
-
-    Ok(ProxyRuntime {
-        shutdown_tx,
-        proxy_task: handle,
-        event_logger: shutdown_event_logger,
-        fd_monitor_shutdown_tx,
-        fd_monitor_task,
-        retention_shutdown_tx,
-        retention_task,
-        cloud_shutdown_tx,
-        cloud_task,
-        collector_shutdown_tx,
-        collector_task,
-    })
-}
-
-#[derive(Debug, Clone)]
-struct RegistryCollectorSource {
-    agent: String,
-    path: String,
-    parser: Option<String>,
-    skip_patterns: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct RegistryCollectorSqliteQuery {
-    file_type: String,
-    sql: String,
-    incremental_field: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct RegistryCollectorSqliteSource {
-    agent: String,
-    db_path: String,
-    queries: Vec<RegistryCollectorSqliteQuery>,
-    tags: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RegistryCollectorHints {
-    file_sources: Vec<RegistryCollectorSource>,
-    sqlite_sources: Vec<RegistryCollectorSqliteSource>,
-    upload_endpoint: Option<String>,
-}
-
-fn set_env_if_present<T: ToString>(key: &str, value: Option<T>) {
-    if let Some(value) = value {
-        std::env::set_var(key, value.to_string());
-    }
-}
-
-fn parse_registry_collector_hints(bundle: &serde_json::Value) -> RegistryCollectorHints {
-    let mut file_sources = Vec::new();
-    let mut file_seen = BTreeSet::new();
-    let mut sqlite_sources = Vec::new();
-    let mut sections = vec![bundle];
-    if let Some(data) = bundle.get("data") {
-        sections.push(data);
-    }
-    let mut upload_endpoint = None;
-
-    for section in sections {
-        parse_registry_collector_sources_from_local_sources_v2(
-            section.get("collector"),
-            &mut file_sources,
-            &mut file_seen,
-            &mut sqlite_sources,
-            &mut upload_endpoint,
-        );
-        if upload_endpoint.is_none() {
-            upload_endpoint = section
-                .get("localDataSources")
-                .and_then(|value| value.get("upload_endpoint"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-        }
-        parse_registry_collector_sources_from_array(
-            section
-                .get("collector")
-                .and_then(|value| value.get("sources"))
-                .and_then(serde_json::Value::as_array),
-            &mut file_sources,
-            &mut file_seen,
-        );
-        parse_registry_collector_sources_from_array(
-            section
-                .get("collector_sources")
-                .and_then(serde_json::Value::as_array),
-            &mut file_sources,
-            &mut file_seen,
-        );
-        parse_registry_collector_sources_from_local_artifacts(
-            section
-                .get("local_artifacts")
-                .and_then(serde_json::Value::as_array),
-            &mut file_sources,
-            &mut file_seen,
-            &mut sqlite_sources,
-        );
-        parse_registry_collector_sources_from_local_data_sources(
-            section
-                .get("localDataSources")
-                .and_then(|value| value.get("sources"))
-                .and_then(serde_json::Value::as_array),
-            &mut file_sources,
-            &mut file_seen,
-            &mut sqlite_sources,
-        );
-    }
-
-    RegistryCollectorHints {
-        file_sources,
-        sqlite_sources,
-        upload_endpoint,
-    }
-}
-
-fn parse_registry_collector_sources_from_array(
-    sources: Option<&Vec<serde_json::Value>>,
-    parsed: &mut Vec<RegistryCollectorSource>,
-    seen: &mut BTreeSet<String>,
-) {
-    let Some(sources) = sources else {
-        return;
-    };
-    for source in sources {
-        let Some(source_obj) = source.as_object() else {
-            continue;
-        };
-        let Some(agent) = source_obj
-            .get("agent")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let Some(path) = source_obj
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let parser = source_obj
-            .get("parser")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let skip_patterns = parse_registry_skip_patterns(source_obj.get("skip_patterns"));
-        push_registry_collector_source(parsed, seen, agent, path, parser, skip_patterns);
-    }
-}
-
-fn parse_registry_collector_sources_from_local_sources_v2(
-    collector: Option<&serde_json::Value>,
-    file_sources: &mut Vec<RegistryCollectorSource>,
-    file_seen: &mut BTreeSet<String>,
-    sqlite_sources: &mut Vec<RegistryCollectorSqliteSource>,
-    upload_endpoint: &mut Option<String>,
-) {
-    let Some(collector_obj) = collector.and_then(serde_json::Value::as_object) else {
-        return;
-    };
-    if collector_obj
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        .is_none()
-    {
-        return;
-    }
-
-    if upload_endpoint.is_none() {
-        *upload_endpoint = collector_obj
-            .get("local_ingestion")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|ingestion| ingestion.get("upload_endpoint"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-    }
-
-    let source_bindings = collector_obj
-        .get("local_ingestion")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|ingestion| ingestion.get("source_bindings"))
-        .and_then(serde_json::Value::as_object);
-
-    let Some(sources_obj) = collector_obj
-        .get("artifact_catalog")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|catalog| catalog.get("sources"))
-        .and_then(serde_json::Value::as_object)
-    else {
-        return;
-    };
-
-    for (source_name, source_value) in sources_obj {
-        let Some(source_obj) = source_value.as_object() else {
-            continue;
-        };
-        if !local_source_binding_enabled(source_bindings, source_name.as_str()) {
-            continue;
-        }
-        let agent = source_obj
-            .get("detection_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(source_name.as_str());
-
-        let parser = source_obj
-            .get("parser")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|parser| {
-                let enabled = parser
-                    .get("enabled")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true);
-                if enabled {
-                    parser
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                } else {
-                    None
-                }
-            });
-        let source_skip_patterns = parse_registry_skip_patterns(source_obj.get("skip_patterns"));
-
-        let Some(collectors) = source_obj
-            .get("collectors")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-
-        for collector_entry in collectors {
-            let Some(entry_obj) = collector_entry.as_object() else {
-                continue;
-            };
-            let kind = entry_obj
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-            match kind {
-                "glob" => {
-                    let Some(pattern) = entry_obj
-                        .get("pattern")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                    else {
-                        continue;
-                    };
-                    let content_type = entry_obj
-                        .get("content_type")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim);
-                    if !is_supported_registry_collector_glob(pattern, content_type) {
-                        continue;
-                    }
-                    let parser_name = parser.clone().or_else(|| {
-                        Some(
-                            default_registry_collector_parser_for_glob(pattern, content_type)
-                                .to_string(),
-                        )
-                    });
-                    let mut skip_patterns = source_skip_patterns.clone();
-                    merge_registry_skip_patterns(
-                        &mut skip_patterns,
-                        parse_registry_skip_patterns(entry_obj.get("skip_patterns")),
-                    );
-                    push_registry_collector_source(
-                        file_sources,
-                        file_seen,
-                        agent,
-                        pattern,
-                        parser_name,
-                        skip_patterns,
-                    );
-                }
-                "sqlite_query" => {
-                    let Some(db_path) = entry_obj
-                        .get("db_path")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                    else {
-                        continue;
-                    };
-                    let Some(file_type) = entry_obj
-                        .get("file_type")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                    else {
-                        continue;
-                    };
-                    let Some(sql) = entry_obj
-                        .get("sql")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                    else {
-                        continue;
-                    };
-                    let incremental_field = entry_obj
-                        .get("incremental_field")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string);
-                    let mut tags = std::collections::BTreeMap::new();
-                    tags.insert(
-                        "collector.discovery".to_string(),
-                        "registry_bundle".to_string(),
-                    );
-                    tags.insert("collector.agent".to_string(), agent.to_string());
-
-                    push_registry_sqlite_source(
-                        sqlite_sources,
-                        RegistryCollectorSqliteSource {
-                            agent: agent.to_string(),
-                            db_path: db_path.to_string(),
-                            queries: vec![RegistryCollectorSqliteQuery {
-                                file_type: file_type.to_string(),
-                                sql: sql.to_string(),
-                                incremental_field,
-                            }],
-                            tags,
-                        },
-                    );
-                }
-                _ => {}
+                warn!("Failed to check OS CA trust state (continuing): {}", error);
             }
         }
     }
+
+    Ok(())
 }
 
-fn local_source_binding_enabled(
-    source_bindings: Option<&serde_json::Map<String, serde_json::Value>>,
-    source_name: &str,
-) -> bool {
-    source_bindings
-        .and_then(|bindings| bindings.get(source_name))
-        .and_then(serde_json::Value::as_object)
-        .and_then(|binding| binding.get("enabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true)
-}
-
-fn parse_registry_collector_sources_from_local_artifacts(
-    artifacts: Option<&Vec<serde_json::Value>>,
-    file_sources: &mut Vec<RegistryCollectorSource>,
-    file_seen: &mut BTreeSet<String>,
-    sqlite_sources: &mut Vec<RegistryCollectorSqliteSource>,
-) {
-    let Some(artifacts) = artifacts else {
-        return;
-    };
-    for artifact in artifacts {
-        let Some(obj) = artifact.as_object() else {
-            continue;
-        };
-        let Some(agent) = obj
-            .get("slug")
-            .or_else(|| obj.get("name"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let parser = obj
-            .get("parserConfig")
-            .and_then(|value| value.get("parserName"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let mut source_skip_patterns = parse_registry_skip_patterns(obj.get("skip_patterns"));
-        merge_registry_skip_patterns(
-            &mut source_skip_patterns,
-            parse_registry_skip_patterns(
-                obj.get("collectionConfig")
-                    .and_then(|value| value.get("skip_patterns")),
-            ),
-        );
-        let globs = obj
-            .get("collectionConfig")
-            .and_then(|value| value.get("globs"))
-            .and_then(serde_json::Value::as_array);
-        let Some(globs) = globs else {
-            continue;
-        };
-        for glob in globs {
-            let Some(pattern) = glob
-                .get("pattern")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let content_type = glob
-                .get("content_type")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim);
-            if !is_supported_registry_collector_glob(pattern, content_type) {
-                continue;
-            }
-            let parser = parser.clone().or_else(|| {
-                Some(default_registry_collector_parser_for_glob(pattern, content_type).to_string())
-            });
-            let mut skip_patterns = source_skip_patterns.clone();
-            merge_registry_skip_patterns(
-                &mut skip_patterns,
-                parse_registry_skip_patterns(glob.get("skip_patterns")),
-            );
-            push_registry_collector_source(
-                file_sources,
-                file_seen,
-                agent,
-                pattern,
-                parser,
-                skip_patterns,
-            );
-        }
-        for sqlite_source in parse_registry_sqlite_sources_from_collection(
-            obj.get("collectionConfig")
-                .and_then(|value| value.get("sqlite"))
-                .and_then(serde_json::Value::as_array),
-            agent,
-        ) {
-            push_registry_sqlite_source(sqlite_sources, sqlite_source);
-        }
+async fn spawn_proxy_process(config_path: &Path) -> Result<Child> {
+    let proxy_bin = resolve_proxy_binary()?;
+    let mut cmd = Command::new(proxy_bin);
+    cmd.env("SOTH_PROXY_CONFIG", config_path);
+    // Propagate RUST_LOG so user overrides reach the proxy subprocess.
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
     }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+    cmd.spawn()
+        .map_err(|error| anyhow::anyhow!("failed launching soth-proxy: {error}"))
 }
 
-fn parse_registry_collector_sources_from_local_data_sources(
-    sources: Option<&Vec<serde_json::Value>>,
-    file_sources: &mut Vec<RegistryCollectorSource>,
-    file_seen: &mut BTreeSet<String>,
-    sqlite_sources: &mut Vec<RegistryCollectorSqliteSource>,
-) {
-    let Some(sources) = sources else {
-        return;
-    };
-    for source in sources {
-        let Some(source_obj) = source.as_object() else {
-            continue;
-        };
-        if source_obj
-            .get("enabled")
-            .and_then(serde_json::Value::as_bool)
-            .is_some_and(|enabled| !enabled)
-        {
-            continue;
-        }
-        let Some(agent) = source_obj
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let source_skip_patterns = parse_registry_skip_patterns(source_obj.get("skip_patterns"));
-        if let Some(globs) = source_obj
-            .get("globs")
-            .and_then(serde_json::Value::as_array)
-        {
-            for glob in globs {
-                let Some(pattern) = glob
-                    .get("pattern")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                else {
-                    continue;
-                };
-                let content_type = glob
-                    .get("content_type")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim);
-                if !is_supported_registry_collector_glob(pattern, content_type) {
-                    continue;
-                }
-                let mut skip_patterns = source_skip_patterns.clone();
-                merge_registry_skip_patterns(
-                    &mut skip_patterns,
-                    parse_registry_skip_patterns(glob.get("skip_patterns")),
+/// Supervise the proxy child process with auto-restart on failure.
+///
+/// The proxy is a system-level component — if it dies, all network traffic
+/// routed through it stops working.  Instead of bailing on failure, we
+/// kill the unhealthy child and respawn it, with exponential backoff up to
+/// [`MAX_RESTART_ATTEMPTS`] consecutive failures.  The restart counter
+/// resets every time the proxy runs healthily for at least 60 seconds.
+async fn supervise_proxy(
+    child: &mut Child,
+    config_path: &Path,
+    expected_port: u16,
+    foreground: bool,
+) -> Result<()> {
+    let mut consecutive_failures: u32 = 0;
+    let mut last_healthy = Instant::now();
+
+    loop {
+        let exit_reason = wait_until_exit_or_unhealthy(child, expected_port, foreground).await;
+        match exit_reason {
+            ProxyExit::Signal => {
+                terminate_child(child).await?;
+                return Ok(());
+            }
+            ProxyExit::ChildExited(status) if status.success() => {
+                return Ok(());
+            }
+            ProxyExit::ChildExited(status) => {
+                warn!("soth-proxy exited with status {status}");
+            }
+            ProxyExit::Unhealthy => {
+                warn!(
+                    port = expected_port,
+                    "proxy listener unresponsive for {}s — restarting child process",
+                    LISTENER_HEALTH_FAILURE_WINDOW_MS / 1000
                 );
-                push_registry_collector_source(
-                    file_sources,
-                    file_seen,
-                    agent,
-                    pattern,
-                    Some(
-                        default_registry_collector_parser_for_glob(pattern, content_type)
-                            .to_string(),
-                    ),
-                    skip_patterns,
-                );
+                terminate_child(child).await?;
             }
         }
-        for sqlite_source in parse_registry_sqlite_sources_from_collection(
-            source_obj
-                .get("sqlite")
-                .and_then(serde_json::Value::as_array),
-            agent,
-        ) {
-            push_registry_sqlite_source(sqlite_sources, sqlite_source);
+
+        // If the proxy was healthy for a sustained period, reset the failure counter.
+        if last_healthy.elapsed() < Duration::from_secs(60) {
+            consecutive_failures += 1;
+        } else {
+            consecutive_failures = 1;
         }
+
+        if consecutive_failures > MAX_RESTART_ATTEMPTS {
+            anyhow::bail!(
+                "soth-proxy failed {} consecutive times — giving up. Check logs for root cause.",
+                MAX_RESTART_ATTEMPTS
+            );
+        }
+
+        let backoff_ms = (RESTART_BACKOFF_BASE_MS * 2u64.saturating_pow(consecutive_failures - 1))
+            .min(RESTART_BACKOFF_MAX_MS);
+        warn!(
+            attempt = consecutive_failures,
+            max_attempts = MAX_RESTART_ATTEMPTS,
+            backoff_ms,
+            "restarting soth-proxy in {}ms",
+            backoff_ms
+        );
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
+        *child = spawn_proxy_process(config_path)
+            .await
+            .context("respawn soth-proxy process")?;
+        if let Err(error) = wait_for_listener_start(child, expected_port).await {
+            warn!("proxy failed to start after respawn: {error}");
+            continue;
+        }
+        info!(
+            port = expected_port,
+            attempt = consecutive_failures,
+            "soth-proxy restarted successfully"
+        );
+        last_healthy = Instant::now();
     }
 }
 
-fn push_registry_collector_source(
-    parsed: &mut Vec<RegistryCollectorSource>,
-    seen: &mut BTreeSet<String>,
-    agent: &str,
-    path: &str,
-    parser: Option<String>,
-    skip_patterns: Vec<String>,
-) {
-    let key = format!("{agent}|{path}");
-    if !seen.insert(key) {
-        if let Some(existing) = parsed
-            .iter_mut()
-            .find(|source| source.agent == agent && source.path == path)
-        {
-            if existing.parser.is_none() {
-                existing.parser = parser;
+enum ProxyExit {
+    Signal,
+    ChildExited(std::process::ExitStatus),
+    Unhealthy,
+}
+
+async fn wait_until_exit_or_unhealthy(
+    child: &mut Child,
+    expected_port: u16,
+    foreground: bool,
+) -> ProxyExit {
+    let health_monitor = monitor_listener_health(expected_port);
+    tokio::pin!(health_monitor);
+
+    if foreground {
+        tokio::select! {
+            status = child.wait() => {
+                ProxyExit::ChildExited(status.unwrap_or_else(|_| {
+                    std::process::ExitStatus::default()
+                }))
             }
-            merge_registry_skip_patterns(&mut existing.skip_patterns, skip_patterns);
+            _ = tokio::signal::ctrl_c() => ProxyExit::Signal,
+            _ = &mut health_monitor => ProxyExit::Unhealthy,
         }
-        return;
-    }
-    parsed.push(RegistryCollectorSource {
-        agent: agent.to_string(),
-        path: path.to_string(),
-        parser,
-        skip_patterns,
-    });
-}
-
-fn parse_registry_skip_patterns(value: Option<&serde_json::Value>) -> Vec<String> {
-    let mut parsed = value
-        .and_then(serde_json::Value::as_array)
-        .map(|patterns| {
-            patterns
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|pattern| !pattern.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    parsed.sort();
-    parsed.dedup();
-    parsed
-}
-
-fn merge_registry_skip_patterns(target: &mut Vec<String>, incoming: Vec<String>) {
-    target.extend(incoming);
-    target.sort();
-    target.dedup();
-}
-
-fn is_supported_registry_collector_glob(pattern: &str, content_type: Option<&str>) -> bool {
-    let normalized_content_type = content_type
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase());
-
-    if matches!(normalized_content_type.as_deref(), Some("binary")) {
-        return false;
-    }
-    if matches!(normalized_content_type.as_deref(), Some("json" | "text")) {
-        return true;
-    }
-
-    let lower = pattern.trim().to_ascii_lowercase();
-    [
-        ".jsonl", ".ndjson", ".json", ".toml", ".md", ".txt", ".log", ".yaml", ".yml", ".xml",
-        ".csv", ".pbtxt",
-    ]
-    .iter()
-    .any(|suffix| lower.ends_with(suffix))
-}
-
-fn default_registry_collector_parser_for_glob(
-    pattern: &str,
-    content_type: Option<&str>,
-) -> &'static str {
-    let normalized_content_type = content_type
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_default();
-    if normalized_content_type == "binary" {
-        return "text";
-    }
-    let lower = pattern.trim().to_ascii_lowercase();
-    if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
-        "jsonl"
     } else {
-        "text"
-    }
-}
-
-fn parse_registry_sqlite_sources_from_collection(
-    sqlite_entries: Option<&Vec<serde_json::Value>>,
-    agent: &str,
-) -> Vec<RegistryCollectorSqliteSource> {
-    let Some(sqlite_entries) = sqlite_entries else {
-        return Vec::new();
-    };
-    let mut parsed = Vec::new();
-    for sqlite in sqlite_entries {
-        let Some(db_path) = sqlite
-            .get("db_path")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let queries = sqlite
-            .get("queries")
-            .and_then(serde_json::Value::as_array)
-            .map(parse_registry_sqlite_queries)
-            .unwrap_or_default();
-        if queries.is_empty() {
-            continue;
-        }
-        let mut tags = std::collections::BTreeMap::new();
-        tags.insert(
-            "collector.discovery".to_string(),
-            "registry_bundle".to_string(),
-        );
-        tags.insert("collector.agent".to_string(), agent.to_string());
-        parsed.push(RegistryCollectorSqliteSource {
-            agent: agent.to_string(),
-            db_path: db_path.to_string(),
-            queries,
-            tags,
-        });
-    }
-    parsed
-}
-
-fn parse_registry_sqlite_queries(
-    queries: &Vec<serde_json::Value>,
-) -> Vec<RegistryCollectorSqliteQuery> {
-    let mut parsed = Vec::new();
-    for query in queries {
-        let Some(file_type) = query
-            .get("file_type")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let Some(sql) = query
-            .get("sql")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let incremental_field = query
-            .get("incremental_field")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        parsed.push(RegistryCollectorSqliteQuery {
-            file_type: file_type.to_string(),
-            sql: sql.to_string(),
-            incremental_field,
-        });
-    }
-    parsed
-}
-
-fn push_registry_sqlite_source(
-    parsed: &mut Vec<RegistryCollectorSqliteSource>,
-    source: RegistryCollectorSqliteSource,
-) {
-    if let Some(existing) = parsed.iter_mut().find(|entry| {
-        entry.agent.eq_ignore_ascii_case(source.agent.as_str())
-            && entry.db_path.eq_ignore_ascii_case(source.db_path.as_str())
-    }) {
-        for (key, value) in source.tags {
-            existing.tags.entry(key).or_insert(value);
-        }
-        for query in source.queries {
-            if !existing.queries.iter().any(|entry| {
-                entry.file_type == query.file_type
-                    && entry.sql == query.sql
-                    && entry.incremental_field == query.incremental_field
-            }) {
-                existing.queries.push(query);
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).expect("listen for SIGTERM");
+            let mut interrupt = signal(SignalKind::interrupt()).expect("listen for SIGINT");
+            tokio::select! {
+                status = child.wait() => {
+                    ProxyExit::ChildExited(status.unwrap_or_else(|_| {
+                        std::process::ExitStatus::default()
+                    }))
+                }
+                _ = term.recv() => ProxyExit::Signal,
+                _ = interrupt.recv() => ProxyExit::Signal,
+                _ = &mut health_monitor => ProxyExit::Unhealthy,
             }
         }
-        return;
-    }
-    parsed.push(source);
-}
-
-fn load_registry_collector_hints(config: &SothConfig) -> RegistryCollectorHints {
-    let cache_path = resolve_registry_bundle_cache_path(config);
-    let cached = match soth_sync::cache::load_registry_bundle_cache(cache_path.as_path()) {
-        Ok(Some(cached)) => cached,
-        Ok(None) => return RegistryCollectorHints::default(),
-        Err(error) => {
-            warn!(
-                cache = %cache_path.display(),
-                error = %error,
-                "Failed to read registry cache for collector source hints"
-            );
-            return RegistryCollectorHints::default();
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                status = child.wait() => {
+                    ProxyExit::ChildExited(status.unwrap_or_else(|_| {
+                        std::process::ExitStatus::default()
+                    }))
+                }
+                _ = &mut health_monitor => ProxyExit::Unhealthy,
+            }
         }
-    };
-    parse_registry_collector_hints(&cached.bundle)
+    }
 }
 
-fn apply_collector_env_overrides(config: &SothConfig, collector: &ObserveCollectorConfig) {
-    let registry_hints = load_registry_collector_hints(config);
-    let registry_sources = &registry_hints.file_sources;
-    if config.cloud.enabled {
-        if let Some(api_key) = config
+async fn terminate_child(child: &mut Child) -> Result<()> {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    Ok(())
+}
+
+async fn wait_for_listener_start(child: &mut Child, port: u16) -> Result<()> {
+    let timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if is_local_listener_ready(port) {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed checking soth-proxy startup status")?
+        {
+            anyhow::bail!("soth-proxy exited early with status {status}");
+        }
+        if Instant::now() >= deadline {
+            let _ = terminate_child(child).await;
+            anyhow::bail!(
+                "soth-proxy did not open 127.0.0.1:{} within {}s startup timeout",
+                port,
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
+async fn monitor_listener_health(port: u16) -> Result<()> {
+    let mut interval =
+        tokio::time::interval(Duration::from_millis(LISTENER_HEALTH_CHECK_INTERVAL_MS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut unhealthy_since: Option<Instant> = None;
+    let failure_window = Duration::from_millis(LISTENER_HEALTH_FAILURE_WINDOW_MS);
+    let mut warned = false;
+
+    loop {
+        interval.tick().await;
+        if is_local_listener_ready(port) {
+            if warned {
+                info!(
+                    port,
+                    "proxy listener recovered — accepting connections again"
+                );
+            }
+            unhealthy_since = None;
+            warned = false;
+            continue;
+        }
+
+        let now = Instant::now();
+        let started_at = unhealthy_since.get_or_insert(now);
+        let elapsed = now.duration_since(*started_at);
+
+        if !warned && elapsed >= Duration::from_secs(5) {
+            warn!(
+                port,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "proxy listener not accepting connections — monitoring (will bail after {}s)",
+                LISTENER_HEALTH_FAILURE_WINDOW_MS / 1000
+            );
+            warned = true;
+        }
+
+        if elapsed >= failure_window {
+            anyhow::bail!(
+                "proxy listener on 127.0.0.1:{} stopped accepting connections for >= {}ms",
+                port,
+                LISTENER_HEALTH_FAILURE_WINDOW_MS
+            );
+        }
+    }
+}
+
+fn is_local_listener_ready(port: u16) -> bool {
+    let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result<PathBuf> {
+    let soth_home = soth_home_dir();
+    let root = soth_home.join("run");
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("failed creating {}", root.display()))?;
+
+    let path = root.join("proxy.generated.toml");
+    let sync_agent_instance_id = resolve_sync_agent_instance_id(config, soth_home.as_path())?;
+    let sync_enabled = config.cloud.enabled
+        && config
             .cloud
             .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            std::env::set_var("SOTH_COLLECTOR_DIRECT_UPLOAD_ENABLED", "true");
-            std::env::set_var(
-                "SOTH_COLLECTOR_CLOUD_ENDPOINT",
-                config.cloud.endpoint.trim_end_matches('/'),
-            );
-            std::env::set_var("SOTH_COLLECTOR_CLOUD_API_KEY", api_key);
-            let upload_path = registry_hints
-                .upload_endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("/api/v1/ingest/local-sessions");
-            std::env::set_var("SOTH_COLLECTOR_UPLOAD_PATH", upload_path);
-            if let Some(device_id) = config
-                .cloud
-                .tags
-                .get("device_id")
-                .map(String::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                std::env::set_var("SOTH_COLLECTOR_CLIENT_DEVICE_ID", device_id);
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    let ca_cert_path =
+        cli_config::expand_tilde(Path::new(config.forward_proxy.ca.cert_path.as_str()));
+    let ca_key_path =
+        cli_config::expand_tilde(Path::new(config.forward_proxy.ca.key_path.as_str()));
+    let forward_proxy = &config.forward_proxy;
+    let lookup_timeout_ms = forward_proxy
+        .process_attribution
+        .lookup_timeout
+        .to_millis_or(5_000)
+        .max(1);
+    let process_cache_ttl_ms = forward_proxy
+        .process_attribution
+        .cache_ttl
+        .as_ref()
+        .map(|duration| duration.to_millis_or(0))
+        .filter(|ttl| *ttl > 0);
+    let upstream_timeout_ms = forward_proxy.upstream_timeout.to_millis_or(30_000).max(1);
+    let upstream_connect_timeout_ms = forward_proxy
+        .pool
+        .connect_timeout
+        .to_millis_or(10_000)
+        .max(1);
+    let upstream_retry_delay_ms = forward_proxy.upstream_retry_delay.to_millis_or(200).max(1);
+    let idle_timeout_ms = forward_proxy.pool.idle_timeout.to_millis_or(60_000).max(1);
+    let request_timeout_ms = forward_proxy
+        .handler_request_timeout
+        .to_millis_or(5_000)
+        .max(1);
+    let response_timeout_ms = forward_proxy
+        .handler_response_timeout
+        .to_millis_or(5_000)
+        .max(1);
+    let accept_retry_backoff_ms = forward_proxy.accept_retry_backoff.to_millis_or(100).max(1);
+    let stale_flow_ttl_ms = forward_proxy
+        .flow_runtime
+        .stale_flow_ttl
+        .as_ref()
+        .map(|duration| duration.to_millis_or(0))
+        .filter(|ttl| *ttl > 0);
+    let dispatch_queue_send_timeout_ms = forward_proxy
+        .flow_runtime
+        .dispatch_queue_send_timeout
+        .as_ref()
+        .map(|duration| duration.to_millis_or(0))
+        .filter(|ttl| *ttl > 0);
+    let dispatch_close_join_timeout_ms = forward_proxy
+        .flow_runtime
+        .dispatch_close_join_timeout
+        .as_ref()
+        .map(|duration| duration.to_millis_or(0))
+        .filter(|ttl| *ttl > 0);
+
+    let generated = GeneratedProxyConfig {
+        db_path: cli_config::resolved_db_path(config).display().to_string(),
+        org_id: config
+            .cloud
+            .tags
+            .get("org_id")
+            .or_else(|| config.cloud.tags.get("workspace_id"))
+            .cloned()
+            .unwrap_or_else(|| "local-org".to_string()),
+        team_id: config
+            .cloud
+            .tags
+            .get("team_id")
+            .or_else(|| config.cloud.tags.get("workspace_id"))
+            .cloned()
+            .unwrap_or_else(|| "local-team".to_string()),
+        device_id_hash: config
+            .cloud
+            .tags
+            .get("device_id")
+            .cloned()
+            .unwrap_or_else(|| "local-device".to_string()),
+        mitm: GeneratedMitmConfig {
+            bind: format!(
+                "{}:{}",
+                config.forward_proxy.address,
+                port_override.unwrap_or(config.forward_proxy.port)
+            ),
+            unix_socket_path: forward_proxy.unix_socket_path.clone(),
+            destinations: if forward_proxy.destinations.is_empty() {
+                vec!["*".to_string()]
             } else {
-                std::env::remove_var("SOTH_COLLECTOR_CLIENT_DEVICE_ID");
-            }
-        } else {
-            std::env::set_var("SOTH_COLLECTOR_DIRECT_UPLOAD_ENABLED", "false");
-            warn!("Collector direct upload disabled because cloud.api_key is missing");
+                forward_proxy.destinations.clone()
+            },
+            passthrough_unlisted: forward_proxy.passthrough_unlisted,
+            process_attribution_enabled: forward_proxy.process_attribution.enabled,
+            process_lookup_timeout_ms: lookup_timeout_ms,
+            process_cache_capacity: forward_proxy.process_attribution.cache_capacity.max(1),
+            process_cache_ttl_ms,
+            ca_cert_path: ca_cert_path.display().to_string(),
+            ca_key_path: ca_key_path.display().to_string(),
+            capture_fingerprint: forward_proxy.tls.capture_fingerprint,
+            http2_enabled: forward_proxy.tls.http2_enabled,
+            http2_max_header_list_size: forward_proxy.tls.http2_max_header_list_size.max(1),
+            http3_passthrough: forward_proxy.tls.http3_passthrough,
+            max_http_head_bytes: forward_proxy.max_http_head_bytes.max(1),
+            accept_retry_backoff_ms,
+            max_flow_event_backlog: forward_proxy.max_flow_event_backlog.max(1),
+            max_in_flight_bytes: forward_proxy.max_in_flight_bytes.max(1),
+            max_concurrent_flows: forward_proxy.max_concurrent_flows.max(1),
+            upstream_timeout_ms,
+            upstream_connect_timeout_ms,
+            upstream_retry_on_failure: forward_proxy.upstream_retry_on_failure,
+            upstream_retry_delay_ms,
+            verify_upstream_tls: forward_proxy.tls.verify_upstream_tls,
+            max_connections_per_host: forward_proxy.pool.max_connections_per_host.max(1),
+            idle_timeout_ms,
+            max_idle_per_host: forward_proxy.pool.max_idle_per_host.max(1),
+            max_body_bytes: forward_proxy.capture_max_body_bytes.max(1),
+            buffer_request_bodies: forward_proxy.buffer_request_bodies,
+            request_timeout_ms,
+            response_timeout_ms,
+            handler_recover_from_panics: forward_proxy.handler_recover_from_panics,
+            flow_dispatch_queue_capacity: forward_proxy.flow_runtime.dispatch_queue_capacity,
+            closed_flow_lru_capacity: forward_proxy.flow_runtime.closed_flow_lru_capacity,
+            stale_flow_ttl_ms,
+            stale_reap_max_batch: forward_proxy.flow_runtime.stale_reap_max_batch,
+            dispatch_queue_send_timeout_ms,
+            dispatch_close_join_timeout_ms,
+        },
+        bundle: GeneratedBundleConfig {
+            bundle_dir: cli_config::expand_tilde(Path::new(config.bundle.bundle_dir.as_str()))
+                .display()
+                .to_string(),
+            vendor_pubkey_hex: config.bundle.vendor_pubkey_hex.clone(),
+            verify_vendor_signature: config.bundle.verify_vendor_signature,
+            require_verified_bundle: config.bundle.require_verified_bundle,
+            org_approval_pubkey_hex: config.bundle.org_approval_pubkey_hex.clone(),
+        },
+        sync: GeneratedSyncConfig {
+            enabled: sync_enabled,
+            endpoint: config.cloud.endpoint.clone(),
+            api_key: config.cloud.api_key.clone().unwrap_or_default(),
+            agent_instance_id: sync_agent_instance_id,
+            sync_interval_secs: config.cloud.sync_interval_secs.max(5),
+            legacy_exchange_upload_enabled: config.exchange.legacy_upload_enabled,
+        },
+        classify: GeneratedClassifyConfig {
+            max_in_flight: config.proxy.classify_max_in_flight,
+            slot_acquire_timeout_ms: config.proxy.classify_slot_acquire_timeout_ms,
+            db_write_queue_capacity: config.proxy.db_write_queue_capacity,
+        },
+        pipeline: GeneratedPipelineConfig {
+            unknown_app_action: config.pipeline.unknown_app_action.clone(),
+            non_cataloged_host_action: config.pipeline.non_cataloged_host_action.clone(),
+        },
+        telemetry: GeneratedTelemetryConfig {
+            enabled: sync_enabled && config.exchange.enabled,
+        },
+    };
+
+    let body = toml::to_string_pretty(&generated).context("serialize proxy TOML")?;
+    std::fs::write(&path, body).with_context(|| format!("failed writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn soth_home_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("SOTH_HOME_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
         }
-    } else {
-        std::env::set_var("SOTH_COLLECTOR_DIRECT_UPLOAD_ENABLED", "false");
     }
-    if config.cloud.frontload_exchange_upload_path.is_none() {
-        if let Some(upload_endpoint) = registry_hints.upload_endpoint.as_deref() {
-            let trimmed = upload_endpoint.trim();
-            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("/api/v1/exchanges/batch") {
-                std::env::set_var("SOTH_CLOUD_FRONTLOAD_UPLOAD_PATH", trimmed);
-                info!(
-                    upload_endpoint = trimmed,
-                    "Applied registry localDataSources upload_endpoint for collector frontload exchange uploads"
+    dirs::home_dir()
+        .map(|home| home.join(".soth"))
+        .unwrap_or_else(|| PathBuf::from(".soth"))
+}
+
+fn resolve_sync_agent_instance_id(config: &SothConfig, soth_home: &Path) -> Result<String> {
+    if let Some(value) = config.cloud.tags.get(AGENT_INSTANCE_ID_TAG) {
+        if let Some(normalized) = normalize_agent_instance_id(value) {
+            return Ok(normalized);
+        }
+    }
+
+    let runtime_dir = soth_home.join("runtime");
+    std::fs::create_dir_all(&runtime_dir)
+        .with_context(|| format!("failed creating {}", runtime_dir.display()))?;
+    let id_path = runtime_dir.join(AGENT_INSTANCE_ID_FILE);
+
+    if let Ok(raw) = std::fs::read_to_string(&id_path) {
+        if let Some(normalized) = normalize_agent_instance_id(raw.as_str()) {
+            return Ok(normalized);
+        }
+    }
+
+    let generated = format!("{AGENT_INSTANCE_ID_PREFIX}{}", Uuid::new_v4());
+    std::fs::write(&id_path, format!("{generated}\n"))
+        .with_context(|| format!("failed writing {}", id_path.display()))?;
+    Ok(generated)
+}
+
+fn normalize_agent_instance_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut previous_dash = false;
+    for ch in trimmed.chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+            ch
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+        } else {
+            previous_dash = false;
+        }
+        normalized.push(next);
+    }
+
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn resolve_proxy_binary() -> Result<PathBuf> {
+    if let Ok(value) = std::env::var("SOTH_PROXY_BIN") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    if let Ok(current) = std::env::current_exe() {
+        let sibling = current.with_file_name("soth-proxy");
+        if sibling.exists() {
+            return Ok(sibling);
+        }
+    }
+
+    which::which("soth-proxy").context("could not locate `soth-proxy` executable")
+}
+
+fn parse_env_u64(key: &str) -> Option<u64> {
+    env::var(key).ok()?.trim().parse::<u64>().ok()
+}
+
+#[cfg(unix)]
+fn ensure_fd_budget() {
+    let requested_min_soft = parse_env_u64("SOTH_PROXY_NOFILE_MIN_SOFT_LIMIT")
+        .unwrap_or(DEFAULT_NOFILE_MIN_SOFT_LIMIT)
+        .max(1);
+    let warn_soft = parse_env_u64("SOTH_PROXY_NOFILE_WARN_SOFT_LIMIT")
+        .unwrap_or(DEFAULT_NOFILE_WARN_SOFT_LIMIT)
+        .max(1);
+
+    // SAFETY: getrlimit/setrlimit operate on process-level rlimit values.
+    unsafe {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
+            warn!("Failed to read RLIMIT_NOFILE");
+            return;
+        }
+
+        let initial_soft = limits.rlim_cur as u64;
+        let hard = limits.rlim_max as u64;
+
+        if initial_soft < requested_min_soft {
+            let target = std::cmp::min(hard, requested_min_soft) as libc::rlim_t;
+            if target > limits.rlim_cur {
+                limits.rlim_cur = target;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == 0 {
+                    info!(
+                        previous_soft = initial_soft,
+                        new_soft = target as u64,
+                        hard_limit = hard,
+                        "Raised RLIMIT_NOFILE soft limit"
+                    );
+                } else {
+                    warn!(
+                        soft_limit = initial_soft,
+                        hard_limit = hard,
+                        requested_min_soft = requested_min_soft,
+                        "Failed to raise RLIMIT_NOFILE soft limit"
+                    );
+                }
+            }
+        }
+
+        let mut verify = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut verify) == 0 {
+            let effective_soft = verify.rlim_cur as u64;
+            let effective_hard = verify.rlim_max as u64;
+            if effective_soft < warn_soft {
+                warn!(
+                    soft_limit = effective_soft,
+                    hard_limit = effective_hard,
+                    warn_soft = warn_soft,
+                    "Low RLIMIT_NOFILE soft limit may cause EMFILE under bursty traffic"
                 );
             }
         }
     }
-    if !collector.enabled {
-        if !registry_sources.is_empty() || !registry_hints.sqlite_sources.is_empty() {
-            warn!(
-                file_sources = registry_sources.len(),
-                sqlite_sources = registry_hints.sqlite_sources.len(),
-                "Registry collector sources available but observe.collector.enabled=false; collector remains disabled"
-            );
-        }
-        return;
-    }
+}
 
-    std::env::set_var("SOTH_COLLECTOR_ENABLED", "true");
-    std::env::set_var(
-        "SOTH_COLLECTOR_AUTO_DISCOVER",
-        collector.auto_discover_sources.to_string(),
-    );
-    std::env::set_var(
-        "SOTH_COLLECTOR_FRONTLOAD_ON_START",
-        collector.frontload_on_start.to_string(),
-    );
-    std::env::set_var(
-        "SOTH_COLLECTOR_FRONTLOAD_FORCE_FIRST_RUN",
-        collector.frontload_force_first_run.to_string(),
-    );
-    std::env::set_var(
-        "SOTH_COLLECTOR_FRONTLOAD_RESET_OFFSETS_ON_START",
-        collector.frontload_reset_offsets_on_start.to_string(),
-    );
+#[cfg(not(unix))]
+fn ensure_fd_budget() {}
 
-    let mut source_paths = BTreeSet::new();
-    let mut structured_sources = collector
-        .sources
-        .iter()
-        .map(|source| {
-            let path = cli_config::expand_tilde(&source.path)
-                .to_string_lossy()
-                .to_string();
-            source_paths.insert(path.clone());
-            serde_json::json!({
-                "name": source.name,
-                "path": path,
-                "parser": source.parser,
-            })
-        })
-        .collect::<Vec<_>>();
+#[derive(Debug, Serialize)]
+struct GeneratedProxyConfig {
+    db_path: String,
+    org_id: String,
+    team_id: String,
+    device_id_hash: String,
+    mitm: GeneratedMitmConfig,
+    bundle: GeneratedBundleConfig,
+    sync: GeneratedSyncConfig,
+    classify: GeneratedClassifyConfig,
+    pipeline: GeneratedPipelineConfig,
+    telemetry: GeneratedTelemetryConfig,
+}
 
-    for source in registry_sources {
-        source_paths.insert(source.path.clone());
-        structured_sources.push(serde_json::json!({
-            "name": format!("registry:{}", source.agent),
-            "path": source.path,
-            "parser": source.parser.clone().unwrap_or_else(|| "jsonl".to_string()),
-            "skip_patterns": source.skip_patterns,
-            "agent": source.agent,
-            "server_name": source.agent,
-            "tags": {
-                "collector.discovery": "registry_bundle",
-                "collector.agent": source.agent,
-            },
-        }));
-    }
+#[derive(Debug, Serialize)]
+struct GeneratedMitmConfig {
+    bind: String,
+    unix_socket_path: Option<String>,
+    destinations: Vec<String>,
+    passthrough_unlisted: bool,
+    process_attribution_enabled: bool,
+    process_lookup_timeout_ms: u64,
+    process_cache_capacity: usize,
+    process_cache_ttl_ms: Option<u64>,
+    ca_cert_path: String,
+    ca_key_path: String,
+    capture_fingerprint: bool,
+    http2_enabled: bool,
+    http2_max_header_list_size: u32,
+    http3_passthrough: bool,
+    max_http_head_bytes: usize,
+    accept_retry_backoff_ms: u64,
+    max_flow_event_backlog: usize,
+    max_in_flight_bytes: usize,
+    max_concurrent_flows: usize,
+    upstream_timeout_ms: u64,
+    upstream_connect_timeout_ms: u64,
+    upstream_retry_on_failure: bool,
+    upstream_retry_delay_ms: u64,
+    verify_upstream_tls: bool,
+    max_connections_per_host: u32,
+    idle_timeout_ms: u64,
+    max_idle_per_host: u32,
+    max_body_bytes: usize,
+    buffer_request_bodies: bool,
+    request_timeout_ms: u64,
+    response_timeout_ms: u64,
+    handler_recover_from_panics: bool,
+    flow_dispatch_queue_capacity: Option<usize>,
+    closed_flow_lru_capacity: Option<usize>,
+    stale_flow_ttl_ms: Option<u64>,
+    stale_reap_max_batch: Option<usize>,
+    dispatch_queue_send_timeout_ms: Option<u64>,
+    dispatch_close_join_timeout_ms: Option<u64>,
+}
 
-    if !structured_sources.is_empty() {
-        std::env::set_var(
-            "SOTH_COLLECTOR_SOURCES",
-            source_paths.into_iter().collect::<Vec<_>>().join(","),
-        );
-        if let Ok(raw) = serde_json::to_string(&structured_sources) {
-            std::env::set_var("SOTH_COLLECTOR_SOURCES_JSON", raw);
-        }
-    }
-    let mut sqlite_sources = collector
-        .sqlite_sources
-        .iter()
-        .map(|source| {
-            serde_json::json!({
-                "name": source.name,
-                "db_path": cli_config::expand_tilde(&source.db_path).to_string_lossy().to_string(),
-                "server_name": source.server_name,
-                "provider": source.provider,
-                "model": source.model,
-                "tags": source.tags,
-                "queries": source.queries.iter().map(|query| serde_json::json!({
-                    "file_type": query.file_type,
-                    "sql": query.sql,
-                    "incremental_field": query.incremental_field,
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
-    for source in &registry_hints.sqlite_sources {
-        sqlite_sources.push(serde_json::json!({
-            "name": format!("registry:{}", source.agent),
-            "db_path": source.db_path,
-            "server_name": source.agent,
-            "provider": serde_json::Value::Null,
-            "model": serde_json::Value::Null,
-            "tags": source.tags,
-            "queries": source.queries.iter().map(|query| serde_json::json!({
-                "file_type": query.file_type,
-                "sql": query.sql,
-                "incremental_field": query.incremental_field,
-            })).collect::<Vec<_>>(),
-        }));
-    }
-    if !sqlite_sources.is_empty() {
-        if let Ok(raw) = serde_json::to_string(&sqlite_sources) {
-            std::env::set_var("SOTH_COLLECTOR_SQLITE_SOURCES", raw);
-        }
-    }
+#[derive(Debug, Serialize)]
+struct GeneratedBundleConfig {
+    bundle_dir: String,
+    vendor_pubkey_hex: String,
+    verify_vendor_signature: bool,
+    require_verified_bundle: bool,
+    org_approval_pubkey_hex: Option<String>,
+}
 
-    set_env_if_present(
-        "SOTH_COLLECTOR_POLL_INTERVAL_SECS",
-        collector.poll_interval_secs,
-    );
-    set_env_if_present(
-        "SOTH_COLLECTOR_MAX_READ_BYTES",
-        collector.max_read_bytes_per_source,
-    );
-    set_env_if_present("SOTH_COLLECTOR_MAX_LINE_BYTES", collector.max_line_bytes);
-    set_env_if_present(
-        "SOTH_COLLECTOR_FRONTLOAD_MAX_CYCLES",
-        collector.frontload_max_cycles,
-    );
-    set_env_if_present(
-        "SOTH_COLLECTOR_FRONTLOAD_MAX_READ_BYTES",
-        collector.frontload_max_read_bytes_per_source,
-    );
-    set_env_if_present(
-        "SOTH_COLLECTOR_STATE_PATH",
-        collector
-            .state_path
-            .as_ref()
-            .map(cli_config::expand_tilde)
-            .map(|path| path.to_string_lossy().to_string()),
-    );
-    set_env_if_present("SOTH_COLLECTOR_AGENT", collector.agent_name.clone());
-    set_env_if_present(
-        "SOTH_COLLECTOR_EVENT_SOURCE",
-        collector.event_source.clone(),
-    );
+#[derive(Debug, Serialize)]
+struct GeneratedSyncConfig {
+    enabled: bool,
+    endpoint: String,
+    api_key: String,
+    agent_instance_id: String,
+    sync_interval_secs: u64,
+    legacy_exchange_upload_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedClassifyConfig {
+    max_in_flight: usize,
+    slot_acquire_timeout_ms: u64,
+    db_write_queue_capacity: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedPipelineConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unknown_app_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    non_cataloged_host_action: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedTelemetryConfig {
+    enabled: bool,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_registry_collector_hints;
+    use super::*;
 
-    #[test]
-    fn parse_registry_collector_sources_supports_sensor_local_sources() {
-        let bundle = serde_json::json!({
-            "data": {
-                "local_artifacts": [
-                    {
-                        "slug": "codex",
-                        "parserConfig": { "parserName": "codex" },
-                        "collectionConfig": {
-                            "globs": [
-                                { "pattern": "~/.codex/sessions/**/*.jsonl" },
-                                { "pattern": "~/.codex/config.toml" }
-                            ]
-                        }
-                    }
-                ],
-                "localDataSources": {
-                    "sources": [
-                        {
-                            "name": "codex",
-                            "enabled": true,
-                            "globs": [
-                                { "pattern": "~/.codex/sessions/**/*.jsonl" },
-                                { "pattern": "~/.codex/history.jsonl" }
-                            ]
-                        }
-                    ]
-                }
-            }
-        });
+    fn with_temp_home<T>(f: impl FnOnce(std::path::PathBuf) -> T + std::panic::UnwindSafe) -> T {
+        let guard = crate::commands::proxy::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_home = std::env::var_os("HOME");
+        let old_soth_home = std::env::var_os("SOTH_HOME_DIR");
+        let soth_home = temp.path().join(".soth");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("SOTH_HOME_DIR", &soth_home);
+        }
 
-        let hints = parse_registry_collector_hints(&bundle);
-        assert_eq!(hints.file_sources.len(), 3);
-        assert!(hints.file_sources.iter().any(|source| {
-            source.agent == "codex" && source.path == "~/.codex/sessions/**/*.jsonl"
-        }));
-        assert!(hints
-            .file_sources
-            .iter()
-            .any(|source| { source.agent == "codex" && source.path == "~/.codex/history.jsonl" }));
-        assert!(hints
-            .file_sources
-            .iter()
-            .any(|source| { source.agent == "codex" && source.path == "~/.codex/config.toml" }));
+        let result = std::panic::catch_unwind(|| f(temp.path().to_path_buf()));
+
+        match old_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        match old_soth_home {
+            Some(value) => unsafe {
+                std::env::set_var("SOTH_HOME_DIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("SOTH_HOME_DIR");
+            },
+        }
+        drop(guard);
+
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     #[test]
-    fn parse_registry_collector_sources_skips_binary_globs() {
-        let bundle = serde_json::json!({
-            "data": {
-                "localDataSources": {
-                    "sources": [
-                        {
-                            "name": "antigravity",
-                            "enabled": true,
-                            "globs": [
-                                { "pattern": "~/.gemini/antigravity/conversations/*.pb", "content_type": "binary" },
-                                { "pattern": "~/.gemini/antigravity/annotations/*.pbtxt", "content_type": "text" }
-                            ]
-                        }
-                    ]
-                }
-            }
-        });
+    fn generated_proxy_config_includes_ca_paths_and_port_override() {
+        with_temp_home(|home| {
+            let mut config = SothConfig::default();
+            config.forward_proxy.address = "127.0.0.1".to_string();
+            config.forward_proxy.port = 8080;
+            config.forward_proxy.ca.cert_path = home
+                .join("certs")
+                .join("custom-ca.pem")
+                .display()
+                .to_string();
+            config.forward_proxy.ca.key_path = home
+                .join("certs")
+                .join("custom-ca-key.pem")
+                .display()
+                .to_string();
+            config.bundle.bundle_dir = home.join("bundle").display().to_string();
+            config.bundle.vendor_pubkey_hex = "11".repeat(32);
+            config.proxy.classify_max_in_flight = 12;
+            config.proxy.classify_slot_acquire_timeout_ms = 750;
+            config.proxy.db_write_queue_capacity = 8_192;
 
-        let hints = parse_registry_collector_hints(&bundle);
-        assert_eq!(hints.file_sources.len(), 1);
-        assert_eq!(
-            hints.file_sources[0].path,
-            "~/.gemini/antigravity/annotations/*.pbtxt"
-        );
+            let generated = write_proxy_config(&config, Some(9999)).expect("write proxy config");
+            let raw = std::fs::read_to_string(&generated).expect("read generated config");
+            let value: toml::Value = toml::from_str(raw.as_str()).expect("parse generated toml");
+
+            assert_eq!(
+                value
+                    .get("mitm")
+                    .and_then(|v| v.get("bind"))
+                    .and_then(toml::Value::as_str),
+                Some("127.0.0.1:9999")
+            );
+            assert_eq!(
+                value
+                    .get("mitm")
+                    .and_then(|v| v.get("ca_cert_path"))
+                    .and_then(toml::Value::as_str),
+                Some(config.forward_proxy.ca.cert_path.as_str())
+            );
+            assert_eq!(
+                value
+                    .get("mitm")
+                    .and_then(|v| v.get("ca_key_path"))
+                    .and_then(toml::Value::as_str),
+                Some(config.forward_proxy.ca.key_path.as_str())
+            );
+            assert_eq!(
+                value
+                    .get("classify")
+                    .and_then(|v| v.get("max_in_flight"))
+                    .and_then(toml::Value::as_integer),
+                Some(12)
+            );
+            assert_eq!(
+                value
+                    .get("classify")
+                    .and_then(|v| v.get("slot_acquire_timeout_ms"))
+                    .and_then(toml::Value::as_integer),
+                Some(750)
+            );
+            assert_eq!(
+                value
+                    .get("classify")
+                    .and_then(|v| v.get("db_write_queue_capacity"))
+                    .and_then(toml::Value::as_integer),
+                Some(8_192)
+            );
+        });
     }
 
     #[test]
-    fn parse_registry_collector_sources_supports_legacy_collector_sources() {
-        let bundle = serde_json::json!({
-            "collector_sources": [
-                { "agent": "claude_code", "path": "~/.claude/projects/*/*.jsonl", "parser": "jsonl" }
-            ]
-        });
+    fn generated_proxy_config_wires_mitm_perf_and_backpressure_fields() {
+        with_temp_home(|_home| {
+            let mut config = SothConfig::default();
+            config.forward_proxy.pool.max_connections_per_host = 24;
+            config.forward_proxy.pool.max_idle_per_host = 6;
+            config.forward_proxy.pool.idle_timeout =
+                crate::cli_config::DurationSetting::Text("1m 30s".to_string());
+            config.forward_proxy.pool.connect_timeout =
+                crate::cli_config::DurationSetting::Text("12s".to_string());
+            config.forward_proxy.process_attribution.lookup_timeout =
+                crate::cli_config::DurationSetting::Text("250ms".to_string());
+            config.forward_proxy.process_attribution.cache_capacity = 8_192;
+            config.forward_proxy.process_attribution.cache_ttl =
+                Some(crate::cli_config::DurationSetting::Text("30s".to_string()));
+            config.forward_proxy.upstream_timeout =
+                crate::cli_config::DurationSetting::Text("45s".to_string());
+            config.forward_proxy.upstream_retry_on_failure = true;
+            config.forward_proxy.upstream_retry_delay =
+                crate::cli_config::DurationSetting::Text("350ms".to_string());
+            config.forward_proxy.capture_max_body_bytes = 2 * 1024 * 1024;
+            config.forward_proxy.buffer_request_bodies = false;
+            config.forward_proxy.handler_request_timeout =
+                crate::cli_config::DurationSetting::Text("1500ms".to_string());
+            config.forward_proxy.handler_response_timeout =
+                crate::cli_config::DurationSetting::Text("1750ms".to_string());
+            config.forward_proxy.handler_recover_from_panics = false;
+            config.forward_proxy.max_http_head_bytes = 96 * 1024;
+            config.forward_proxy.accept_retry_backoff =
+                crate::cli_config::DurationSetting::Text("150ms".to_string());
+            config.forward_proxy.max_flow_event_backlog = 9_999;
+            config.forward_proxy.max_in_flight_bytes = 32 * 1024 * 1024;
+            config.forward_proxy.max_concurrent_flows = 1_024;
+            config.forward_proxy.tls.http2_enabled = false;
+            config.forward_proxy.tls.http2_max_header_list_size = 96 * 1024;
+            config.forward_proxy.tls.http3_passthrough = false;
+            config.forward_proxy.tls.verify_upstream_tls = false;
+            config.forward_proxy.tls.capture_fingerprint = false;
+            config.forward_proxy.destinations = vec![
+                "api.openai.com:443".to_string(),
+                "*.google.com:443".to_string(),
+            ];
+            config.forward_proxy.passthrough_unlisted = false;
+            config.forward_proxy.flow_runtime.dispatch_queue_capacity = Some(777);
+            config.forward_proxy.flow_runtime.closed_flow_lru_capacity = Some(8_888);
+            config.forward_proxy.flow_runtime.stale_flow_ttl =
+                Some(crate::cli_config::DurationSetting::Text("40s".to_string()));
+            config.forward_proxy.flow_runtime.stale_reap_max_batch = Some(44);
+            config
+                .forward_proxy
+                .flow_runtime
+                .dispatch_queue_send_timeout = Some(crate::cli_config::DurationSetting::Text(
+                "900ms".to_string(),
+            ));
+            config
+                .forward_proxy
+                .flow_runtime
+                .dispatch_close_join_timeout = Some(crate::cli_config::DurationSetting::Text(
+                "1500ms".to_string(),
+            ));
 
-        let hints = parse_registry_collector_hints(&bundle);
-        assert_eq!(hints.file_sources.len(), 1);
-        assert_eq!(hints.file_sources[0].agent, "claude_code");
-        assert_eq!(hints.file_sources[0].path, "~/.claude/projects/*/*.jsonl");
+            let generated = write_proxy_config(&config, None).expect("write proxy config");
+            let raw = std::fs::read_to_string(&generated).expect("read generated config");
+            let value: toml::Value = toml::from_str(raw.as_str()).expect("parse generated toml");
+            let mitm = value.get("mitm").expect("mitm table must exist");
+
+            assert_eq!(
+                mitm.get("max_connections_per_host")
+                    .and_then(toml::Value::as_integer),
+                Some(24)
+            );
+            assert_eq!(
+                mitm.get("max_idle_per_host")
+                    .and_then(toml::Value::as_integer),
+                Some(6)
+            );
+            assert_eq!(
+                mitm.get("idle_timeout_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(90_000)
+            );
+            assert_eq!(
+                mitm.get("upstream_connect_timeout_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(12_000)
+            );
+            assert_eq!(
+                mitm.get("process_lookup_timeout_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(250)
+            );
+            assert_eq!(
+                mitm.get("process_cache_capacity")
+                    .and_then(toml::Value::as_integer),
+                Some(8_192)
+            );
+            assert_eq!(
+                mitm.get("process_cache_ttl_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(30_000)
+            );
+            assert_eq!(
+                mitm.get("upstream_timeout_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(45_000)
+            );
+            assert_eq!(
+                mitm.get("upstream_retry_on_failure")
+                    .and_then(toml::Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                mitm.get("upstream_retry_delay_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(350)
+            );
+            assert_eq!(
+                mitm.get("max_body_bytes").and_then(toml::Value::as_integer),
+                Some((2 * 1024 * 1024) as i64)
+            );
+            assert_eq!(
+                mitm.get("buffer_request_bodies")
+                    .and_then(toml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                mitm.get("request_timeout_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(1_500)
+            );
+            assert_eq!(
+                mitm.get("response_timeout_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(1_750)
+            );
+            assert_eq!(
+                mitm.get("handler_recover_from_panics")
+                    .and_then(toml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                mitm.get("max_http_head_bytes")
+                    .and_then(toml::Value::as_integer),
+                Some((96 * 1024) as i64)
+            );
+            assert_eq!(
+                mitm.get("accept_retry_backoff_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(150)
+            );
+            assert_eq!(
+                mitm.get("max_flow_event_backlog")
+                    .and_then(toml::Value::as_integer),
+                Some(9_999)
+            );
+            assert_eq!(
+                mitm.get("max_in_flight_bytes")
+                    .and_then(toml::Value::as_integer),
+                Some((32 * 1024 * 1024) as i64)
+            );
+            assert_eq!(
+                mitm.get("max_concurrent_flows")
+                    .and_then(toml::Value::as_integer),
+                Some(1_024)
+            );
+            assert_eq!(
+                mitm.get("http2_enabled").and_then(toml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                mitm.get("http2_max_header_list_size")
+                    .and_then(toml::Value::as_integer),
+                Some((96 * 1024) as i64)
+            );
+            assert_eq!(
+                mitm.get("http3_passthrough").and_then(toml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                mitm.get("verify_upstream_tls")
+                    .and_then(toml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                mitm.get("capture_fingerprint")
+                    .and_then(toml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                mitm.get("passthrough_unlisted")
+                    .and_then(toml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                mitm.get("flow_dispatch_queue_capacity")
+                    .and_then(toml::Value::as_integer),
+                Some(777)
+            );
+            assert_eq!(
+                mitm.get("closed_flow_lru_capacity")
+                    .and_then(toml::Value::as_integer),
+                Some(8_888)
+            );
+            assert_eq!(
+                mitm.get("stale_flow_ttl_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(40_000)
+            );
+            assert_eq!(
+                mitm.get("stale_reap_max_batch")
+                    .and_then(toml::Value::as_integer),
+                Some(44)
+            );
+            assert_eq!(
+                mitm.get("dispatch_queue_send_timeout_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(900)
+            );
+            assert_eq!(
+                mitm.get("dispatch_close_join_timeout_ms")
+                    .and_then(toml::Value::as_integer),
+                Some(1_500)
+            );
+            assert_eq!(
+                mitm.get("destinations")
+                    .and_then(toml::Value::as_array)
+                    .map(|items| items.len()),
+                Some(2)
+            );
+        });
     }
 
     #[test]
-    fn parse_registry_collector_hints_extracts_sqlite_sources() {
-        let bundle = serde_json::json!({
-            "data": {
-                "localDataSources": {
-                    "upload_endpoint": "/api/v1/ingest/local-sessions",
-                    "sources": [
-                        {
-                            "name": "cursor",
-                            "enabled": true,
-                            "sqlite": [
-                                {
-                                    "db_path": "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
-                                    "queries": [
-                                        {
-                                            "file_type": "sqlite_composer",
-                                            "sql": "SELECT rowid, value FROM cursorDiskKV WHERE rowid > ?",
-                                            "incremental_field": "rowid"
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
-        });
+    fn generated_proxy_config_prefers_org_and_team_tags() {
+        with_temp_home(|home| {
+            let mut config = SothConfig::default();
+            config
+                .cloud
+                .tags
+                .insert("workspace_id".to_string(), "ws_fallback".to_string());
+            config
+                .cloud
+                .tags
+                .insert("org_id".to_string(), "org_primary".to_string());
+            config
+                .cloud
+                .tags
+                .insert("team_id".to_string(), "team_primary".to_string());
+            config
+                .cloud
+                .tags
+                .insert("device_id".to_string(), "device_primary".to_string());
 
-        let hints = parse_registry_collector_hints(&bundle);
-        assert_eq!(
-            hints.upload_endpoint.as_deref(),
-            Some("/api/v1/ingest/local-sessions")
-        );
-        assert_eq!(hints.sqlite_sources.len(), 1);
-        let sqlite = &hints.sqlite_sources[0];
-        assert_eq!(sqlite.agent, "cursor");
-        assert_eq!(
-            sqlite.db_path,
-            "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
-        );
-        assert_eq!(sqlite.queries.len(), 1);
-        assert_eq!(sqlite.queries[0].file_type, "sqlite_composer");
+            let generated = write_proxy_config(&config, None).expect("write proxy config");
+            let raw = std::fs::read_to_string(&generated).expect("read generated config");
+            let value: toml::Value = toml::from_str(raw.as_str()).expect("parse generated toml");
+
+            assert_eq!(
+                value.get("org_id").and_then(toml::Value::as_str),
+                Some("org_primary")
+            );
+            assert_eq!(
+                value.get("team_id").and_then(toml::Value::as_str),
+                Some("team_primary")
+            );
+            assert_eq!(
+                value.get("device_id_hash").and_then(toml::Value::as_str),
+                Some("device_primary")
+            );
+
+            let agent_instance_id = value
+                .get("sync")
+                .and_then(|v| v.get("agent_instance_id"))
+                .and_then(toml::Value::as_str)
+                .expect("agent_instance_id should be set");
+            assert!(agent_instance_id.starts_with("edge-"));
+
+            let persisted = std::fs::read_to_string(
+                home.join(".soth").join("runtime").join("agent_instance_id"),
+            )
+            .expect("agent_instance_id should be persisted");
+            assert_eq!(persisted.trim(), agent_instance_id);
+        });
     }
 
     #[test]
-    fn parse_registry_collector_hints_supports_local_sources_v2_shape() {
-        let bundle = serde_json::json!({
-            "collector": {
-                "schema_version": 2,
-                "artifact_catalog": {
-                    "sources": {
-                        "codex": {
-                            "detection_id": "agent.codex.app",
-                            "parser": { "name": "codex", "enabled": true },
-                            "collectors": [
-                                {
-                                    "id": "glob_session_transcript_1",
-                                    "kind": "glob",
-                                    "pattern": "~/.codex/sessions/**/*.jsonl",
-                                    "skip_patterns": [
-                                        "*.deleted.*",
-                                        "*.resolved",
-                                        "*.resolved.*"
-                                    ],
-                                    "file_type": "session_transcript",
-                                    "read_mode": "incremental",
-                                    "content_type": "json"
-                                }
-                            ]
-                        },
-                        "cursor": {
-                            "detection_id": "agent.cursor.app",
-                            "collectors": [
-                                {
-                                    "id": "sqlite_sqlite_composer",
-                                    "kind": "sqlite_query",
-                                    "db_path": "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
-                                    "file_type": "sqlite_composer",
-                                    "sql": "SELECT rowid, value FROM cursorDiskKV WHERE rowid > ?",
-                                    "incremental_field": "rowid"
-                                }
-                            ]
-                        }
-                    }
-                },
-                "local_ingestion": {
-                    "upload_endpoint": "/api/v1/ingest/local-sessions",
-                    "source_bindings": {
-                        "codex": { "enabled": true },
-                        "cursor": { "enabled": true }
-                    }
-                }
-            }
-        });
+    fn generated_proxy_config_wires_legacy_exchange_upload_flag() {
+        with_temp_home(|_home| {
+            let mut config = SothConfig::default();
+            config.exchange.legacy_upload_enabled = true;
 
-        let hints = parse_registry_collector_hints(&bundle);
-        assert_eq!(
-            hints.upload_endpoint.as_deref(),
-            Some("/api/v1/ingest/local-sessions")
-        );
-        assert!(hints
-            .file_sources
-            .iter()
-            .any(|source| source.agent == "agent.codex.app"
-                && source.path == "~/.codex/sessions/**/*.jsonl"));
-        let codex = hints
-            .file_sources
-            .iter()
-            .find(|source| {
-                source.agent == "agent.codex.app" && source.path == "~/.codex/sessions/**/*.jsonl"
-            })
-            .expect("codex source present");
-        assert_eq!(
-            codex.skip_patterns,
-            vec![
-                "*.deleted.*".to_string(),
-                "*.resolved".to_string(),
-                "*.resolved.*".to_string()
-            ]
-        );
-        assert_eq!(hints.sqlite_sources.len(), 1);
-        assert_eq!(hints.sqlite_sources[0].agent, "agent.cursor.app");
-        assert_eq!(hints.sqlite_sources[0].queries.len(), 1);
-        assert_eq!(
-            hints.sqlite_sources[0].queries[0].file_type,
-            "sqlite_composer"
-        );
+            let generated = write_proxy_config(&config, None).expect("write proxy config");
+            let raw = std::fs::read_to_string(&generated).expect("read generated config");
+            let value: toml::Value = toml::from_str(raw.as_str()).expect("parse generated toml");
+
+            assert_eq!(
+                value
+                    .get("sync")
+                    .and_then(|v| v.get("legacy_exchange_upload_enabled"))
+                    .and_then(toml::Value::as_bool),
+                Some(true)
+            );
+        });
+    }
+
+    #[test]
+    fn generated_proxy_config_prefers_tagged_agent_instance_id() {
+        with_temp_home(|_home| {
+            let mut config = SothConfig::default();
+            config.cloud.tags.insert(
+                AGENT_INSTANCE_ID_TAG.to_string(),
+                " custom  edge::agent-01 ".to_string(),
+            );
+
+            let generated = write_proxy_config(&config, None).expect("write proxy config");
+            let raw = std::fs::read_to_string(&generated).expect("read generated config");
+            let value: toml::Value = toml::from_str(raw.as_str()).expect("parse generated toml");
+
+            assert_eq!(
+                value
+                    .get("sync")
+                    .and_then(|v| v.get("agent_instance_id"))
+                    .and_then(toml::Value::as_str),
+                Some("custom-edge::agent-01")
+            );
+        });
     }
 }

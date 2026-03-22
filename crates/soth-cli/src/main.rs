@@ -1,16 +1,11 @@
-//! SOTH ops CLI entry point.
+//! SOTH CLI entry point.
 
 mod cli_config;
 mod command_graph;
 mod commands;
 mod logging;
-pub mod style;
-
-pub use command_graph::{
-    AuditCommands, BudgetCommands, ConfigCommands, ConfigRegistryCommands, IdentityCommands,
-    PolicyCommands,
-};
+mod style;
 
 fn main() -> anyhow::Result<()> {
-    command_graph::run_ops()
+    command_graph::run()
 }

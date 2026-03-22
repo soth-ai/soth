@@ -8,41 +8,20 @@ default-run = "soth"
 
 [[bin]]
 name = "soth"
-path = "src/main_sensor.rs"
-required-features = ["sensor"]
-
-[[bin]]
-name = "soth-ops"
 path = "src/main.rs"
-required-features = ["ops"]
 
 [features]
-default = ["sensor"]
-sensor = ["dep:reqwest"]
-ops = ["dep:reqwest"]
-monitoring = ["soth-helper/monitoring"]
-local-debug = [
-    "ops",
-    "dep:soth-dashboard",
-    "dep:ratatui",
-    "dep:crossterm",
-    "monitoring",
-]
+default = []
+local-debug = []
+dev-pipeline-trace = ["soth-proxy/dev-pipeline-trace"]
 
 [dependencies]
 soth-core = { workspace = true }
-soth-crypto = { workspace = true }
-soth-policy = { workspace = true }
-soth-observe = { workspace = true, features = ["sqlite"] }
-soth-budget = { workspace = true }
-soth-collector = { workspace = true }
-soth-helper = { workspace = true }
-soth-edge = { workspace = true }
-soth-dashboard = { workspace = true, optional = true }
+soth-bundle = { workspace = true }
+soth-proxy = { workspace = true }
 soth-sync = { workspace = true }
-soth-wrap = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "signal", "time", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -50,28 +29,21 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-base64 = { workspace = true }
 uuid = { workspace = true }
-x509-parser = { workspace = true }
-sha2 = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+rcgen = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+toml = "0.8"
 hex = "0.4"
 dirs = "5.0"
-reqwest = { workspace = true, optional = true }
-rusqlite = { workspace = true }
+which = "6.0"
+libc = "0.2"
 
 # CLI styling
 owo-colors = "4.0"
 comfy-table = "7.0"
-indicatif = "0.17"
-console = "0.15"
-
-# TUI
-ratatui = { version = "0.28", optional = true }
-crossterm = { version = "0.28", optional = true }
-
-# System utilities
-which = "6.0"
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
