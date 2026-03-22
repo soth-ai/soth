@@ -20,6 +20,8 @@ struct StreamAccumulator {
     /// Detect-layer stream session that owns model extraction, usage
     /// extraction, turn lifecycle, and content accumulation.
     detect_session: soth_detect::StreamDetectState,
+    /// Sensitive artifacts discovered in streaming response chunks.
+    stream_artifacts: Vec<soth_core::SensitiveArtifact>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,8 @@ pub struct CompletedStream {
     pub extracted_model: Option<String>,
     /// Time to first byte: duration from request arrival to first chunk.
     pub ttfb: Option<Duration>,
+    /// Sensitive artifacts found in streaming response chunks (credentials, etc.).
+    pub stream_artifacts: Vec<soth_core::SensitiveArtifact>,
 }
 
 pub struct StreamingStore {
@@ -75,6 +79,7 @@ impl StreamingStore {
                 first_chunk_at: None,
                 accumulated_payload_bytes: 0,
                 detect_session,
+                stream_artifacts: Vec::new(),
             },
         );
     }
@@ -120,8 +125,8 @@ impl StreamingStore {
             {
                 match event {
                     ChunkEvent::TurnCompleted(turn) => return Some(turn),
-                    ChunkEvent::Artifact(_artifact) => {
-                        // TODO: forward sensitive artifacts to classify/telemetry
+                    ChunkEvent::Artifact(chunk_artifact) => {
+                        state.stream_artifacts.extend(chunk_artifact.artifacts);
                     }
                 }
             }
@@ -180,6 +185,7 @@ impl StreamingStore {
                     accumulated_payload_bytes: state.accumulated_payload_bytes,
                     extracted_model: session.model.clone(),
                     ttfb,
+                    stream_artifacts: state.stream_artifacts,
                 }
             })
     }

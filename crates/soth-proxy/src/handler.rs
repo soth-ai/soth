@@ -911,7 +911,17 @@ impl ProxyHandler {
     /// Shared by `handle_stream_end` and `on_connection_close` — the two paths
     /// that can close a stream. The caller is responsible for taking the
     /// `CompletedStream` from the streaming store.
-    fn finalize_completed_stream(&self, connection_id: Uuid, completed: crate::streaming::CompletedStream) {
+    fn finalize_completed_stream(&self, connection_id: Uuid, mut completed: crate::streaming::CompletedStream) {
+        // Merge streaming response artifacts (credentials found in response
+        // chunks) into the detect result so they reach telemetry + DB.
+        if !completed.stream_artifacts.is_empty() {
+            completed
+                .pending
+                .detect_result
+                .artifacts
+                .extend(completed.stream_artifacts.drain(..));
+        }
+
         let usage = completed.usage.unwrap_or_else(|| {
             let estimated_output_tokens = estimate_output_tokens(completed.accumulated_payload_bytes);
             UsageSummary {
