@@ -49,6 +49,18 @@ impl soth_sync::BundleWatcher for BundleWatcherInstallHook {
         let snapshot_assets = assets.clone();
         match self.watcher.install(manifest_bytes, assets) {
             Ok(version) => {
+                // Persist to the primary bundle_dir so the next startup
+                // loads this version immediately (without waiting for sync).
+                if let Err(error) = persist_primary_bundle(
+                    self.bundle_dir.as_path(),
+                    manifest_bytes,
+                    &snapshot_assets,
+                ) {
+                    warn!(
+                        error = %error,
+                        "bundle installed in memory but primary dir update failed"
+                    );
+                }
                 if let Err(error) = persist_last_known_good_from_payload(
                     self.bundle_dir.as_path(),
                     manifest_bytes,
@@ -220,6 +232,32 @@ fn persist_last_known_good_from_dir(bundle_dir: &Path) -> Result<()> {
         assets.insert(entry.path, bytes);
     }
     persist_last_known_good_from_payload(bundle_dir, manifest_bytes.as_slice(), &assets)
+}
+
+/// Write the installed bundle assets directly into the primary bundle_dir
+/// so the next proxy startup loads this version without waiting for sync.
+fn persist_primary_bundle(
+    bundle_dir: &Path,
+    manifest_bytes: &[u8],
+    assets: &HashMap<String, Vec<u8>>,
+) -> Result<()> {
+    // Write manifest
+    let manifest_path = bundle_dir.join("manifest.json");
+    std::fs::write(&manifest_path, manifest_bytes)
+        .with_context(|| format!("write primary manifest {}", manifest_path.display()))?;
+
+    // Write each asset
+    for (relative_path, bytes) in assets {
+        ensure_safe_relative_asset_path(relative_path.as_str())?;
+        let target = bundle_dir.join(relative_path.as_str());
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create asset parent {}", parent.display()))?;
+        }
+        std::fs::write(&target, bytes)
+            .with_context(|| format!("write primary asset {}", target.display()))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn persist_last_known_good_from_payload(
