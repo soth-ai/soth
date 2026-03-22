@@ -1,7 +1,8 @@
 use crate::hash::sha256_hex;
-use crate::types::{ArtifactLocation, ArtifactType, SensitiveArtifact, Severity};
+use crate::types::{ArtifactLocation, SensitiveArtifact};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use soth_core::{ArtifactKind, ArtifactSeverity, DetectedProvider};
 
 static OPENAI_KEY_RE: Lazy<Option<Regex>> =
     Lazy::new(|| Regex::new(r"\bsk-[A-Za-z0-9\-_]{16,}\b").ok());
@@ -33,48 +34,50 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
 
     // Scan Anthropic before OpenAI to avoid sk-ant- matching sk-
     scan_pattern(
-        &mut out, &text, &ANTHROPIC_KEY_RE, ArtifactType::AnthropicKey,
-        Severity::Critical, location.clone(),
+        &mut out, &text, &ANTHROPIC_KEY_RE,
+        ArtifactKind::ApiKey { provider: Some(DetectedProvider::Anthropic) },
+        ArtifactSeverity::Critical, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &OPENAI_KEY_RE, ArtifactType::OpenAIKey,
-        Severity::Critical, location.clone(),
+        &mut out, &text, &OPENAI_KEY_RE,
+        ArtifactKind::ApiKey { provider: Some(DetectedProvider::OpenAi) },
+        ArtifactSeverity::Critical, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &AWS_KEY_RE, ArtifactType::AwsAccessKey,
-        Severity::High, location.clone(),
+        &mut out, &text, &AWS_KEY_RE, ArtifactKind::AwsAccessKey,
+        ArtifactSeverity::High, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &GITHUB_PAT_RE, ArtifactType::GitHubPat,
-        Severity::High, location.clone(),
+        &mut out, &text, &GITHUB_PAT_RE, ArtifactKind::GitHubPat,
+        ArtifactSeverity::High, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &GITLAB_PAT_RE, ArtifactType::GitLabToken,
-        Severity::High, location.clone(),
+        &mut out, &text, &GITLAB_PAT_RE, ArtifactKind::GitLabToken,
+        ArtifactSeverity::High, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &SLACK_TOKEN_RE, ArtifactType::SlackToken,
-        Severity::High, location.clone(),
+        &mut out, &text, &SLACK_TOKEN_RE, ArtifactKind::SlackToken,
+        ArtifactSeverity::High, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &STRIPE_SECRET_RE, ArtifactType::StripeSecretKey,
-        Severity::Critical, location.clone(),
+        &mut out, &text, &STRIPE_SECRET_RE, ArtifactKind::StripeSecretKey,
+        ArtifactSeverity::Critical, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &STRIPE_TEST_RE, ArtifactType::StripeSecretKey,
-        Severity::Medium, location.clone(),
+        &mut out, &text, &STRIPE_TEST_RE, ArtifactKind::StripeSecretKey,
+        ArtifactSeverity::Medium, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &JWT_RE, ArtifactType::JwtToken,
-        Severity::Medium, location.clone(),
+        &mut out, &text, &JWT_RE, ArtifactKind::Jwt,
+        ArtifactSeverity::Medium, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &PRIVATE_KEY_RE, ArtifactType::PrivateKey,
-        Severity::Critical, location.clone(),
+        &mut out, &text, &PRIVATE_KEY_RE, ArtifactKind::PrivateKey,
+        ArtifactSeverity::Critical, location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &CONNECTION_STRING_RE, ArtifactType::ConnectionString,
-        Severity::High, location.clone(),
+        &mut out, &text, &CONNECTION_STRING_RE, ArtifactKind::ConnectionString,
+        ArtifactSeverity::High, location.clone(),
     );
 
     scan_hex_keys(&mut out, &text, location);
@@ -114,9 +117,9 @@ pub fn structural_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
 
     if has_auth_logic(&text_lc) {
         out.push(SensitiveArtifact {
-            artifact_type: ArtifactType::AuthLogicFlag,
-            commitment: sha256_hex(format!("auth_logic:present:{:?}", location)),
-            severity: Severity::Low,
+            kind: ArtifactKind::AuthLogic,
+            commitment: Some(sha256_hex(format!("auth_logic:present:{:?}", location))),
+            severity: ArtifactSeverity::Low,
             location: location.clone(),
             redacted_hint: None,
         });
@@ -124,9 +127,9 @@ pub fn structural_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
 
     if has_crypto_operations(&text_lc) {
         out.push(SensitiveArtifact {
-            artifact_type: ArtifactType::CryptoFlag,
-            commitment: sha256_hex(format!("crypto_op:present:{:?}", location)),
-            severity: Severity::Low,
+            kind: ArtifactKind::CryptoOperation,
+            commitment: Some(sha256_hex(format!("crypto_op:present:{:?}", location))),
+            severity: ArtifactSeverity::Low,
             location,
             redacted_hint: None,
         });
@@ -156,9 +159,61 @@ pub fn org_pattern_scan(
         if regex.is_match(&text) {
             let pattern_id = idx as u32;
             out.push(SensitiveArtifact {
-                artifact_type: ArtifactType::OrgPatternMatch { pattern_id },
-                commitment: sha256_hex(format!("org_pattern:{}:detect-v1", pattern_id)),
-                severity: Severity::Medium,
+                kind: ArtifactKind::OrgPattern { pattern_id },
+                commitment: Some(sha256_hex(format!("org_pattern:{}:detect-v1", pattern_id))),
+                severity: ArtifactSeverity::Medium,
+                location: location.clone(),
+                redacted_hint: None,
+            });
+        }
+    }
+
+    out
+}
+
+/// Pre-compiled org-pattern regexes. Compile once per request, scan once.
+pub struct CompiledOrgPatterns {
+    patterns: Vec<(u32, Regex)>,
+}
+
+impl CompiledOrgPatterns {
+    pub fn compile(org_patterns: &[String]) -> Self {
+        let patterns = org_patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, pattern_str)| {
+                Regex::new(pattern_str).ok().map(|re| (idx as u32, re))
+            })
+            .collect();
+        Self { patterns }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+}
+
+/// Like `org_pattern_scan` but takes pre-compiled regexes.
+pub fn org_pattern_scan_compiled(
+    body: &[u8],
+    compiled: &CompiledOrgPatterns,
+    location: ArtifactLocation,
+) -> Vec<SensitiveArtifact> {
+    if compiled.is_empty() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(body);
+    let mut out = Vec::new();
+
+    for (pattern_id, regex) in &compiled.patterns {
+        if regex.is_match(&text) {
+            out.push(SensitiveArtifact {
+                kind: ArtifactKind::OrgPattern {
+                    pattern_id: *pattern_id,
+                },
+                commitment: Some(sha256_hex(format!("org_pattern:{}:detect-v1", pattern_id))),
+                severity: ArtifactSeverity::Medium,
                 location: location.clone(),
                 redacted_hint: None,
             });
@@ -193,8 +248,8 @@ fn scan_pattern(
     out: &mut Vec<SensitiveArtifact>,
     haystack: &str,
     regex: &Option<Regex>,
-    artifact_type: ArtifactType,
-    severity: Severity,
+    kind: ArtifactKind,
+    severity: ArtifactSeverity,
     location: ArtifactLocation,
 ) {
     let Some(regex) = regex else {
@@ -205,14 +260,14 @@ fn scan_pattern(
         let raw = m.as_str();
         let commitment = sha256_hex(format!(
             "{}:{}:{}",
-            artifact_type_name(&artifact_type),
+            artifact_kind_name(&kind),
             raw,
             "detect-v1"
         ));
         out.push(SensitiveArtifact {
-            artifact_type: artifact_type.clone(),
-            commitment,
-            severity: severity.clone(),
+            kind: kind.clone(),
+            commitment: Some(commitment),
+            severity,
             location: location.clone(),
             redacted_hint: redacted_hint(raw),
         });
@@ -242,9 +297,9 @@ fn scan_hex_keys(
         if mixed_case || raw.len() >= 48 {
             let commitment = sha256_hex(format!("hex_key:{}:detect-v1", raw));
             out.push(SensitiveArtifact {
-                artifact_type: ArtifactType::UnknownCredential,
-                commitment,
-                severity: Severity::Medium,
+                kind: ArtifactKind::UnknownCredential,
+                commitment: Some(commitment),
+                severity: ArtifactSeverity::Medium,
                 location: location.clone(),
                 redacted_hint: redacted_hint(raw),
             });
@@ -263,23 +318,25 @@ fn redacted_hint(raw: &str) -> Option<String> {
     Some(format!("{}...XXXX", &raw[..4]))
 }
 
-fn artifact_type_name(kind: &ArtifactType) -> &'static str {
+fn artifact_kind_name(kind: &ArtifactKind) -> &'static str {
     match kind {
-        ArtifactType::OpenAIKey => "openai_key",
-        ArtifactType::AnthropicKey => "anthropic_key",
-        ArtifactType::AwsAccessKey => "aws_access_key",
-        ArtifactType::GitHubPat => "github_pat",
-        ArtifactType::GitLabToken => "gitlab_token",
-        ArtifactType::SlackToken => "slack_token",
-        ArtifactType::StripeSecretKey => "stripe_secret_key",
-        ArtifactType::JwtToken => "jwt",
-        ArtifactType::PrivateKey => "private_key",
-        ArtifactType::ConnectionString => "connection_string",
-        ArtifactType::CodeBlock { .. } => "code_block",
-        ArtifactType::UnknownCredential => "unknown_credential",
-        ArtifactType::AuthLogicFlag => "auth_logic",
-        ArtifactType::CryptoFlag => "crypto_operation",
-        ArtifactType::OrgPatternMatch { .. } => "org_pattern",
+        ArtifactKind::ApiKey { provider: Some(DetectedProvider::OpenAi) } => "openai_key",
+        ArtifactKind::ApiKey { provider: Some(DetectedProvider::Anthropic) } => "anthropic_key",
+        ArtifactKind::ApiKey { .. } => "api_key",
+        ArtifactKind::AwsAccessKey => "aws_access_key",
+        ArtifactKind::GitHubPat => "github_pat",
+        ArtifactKind::GitLabToken => "gitlab_token",
+        ArtifactKind::SlackToken => "slack_token",
+        ArtifactKind::StripeSecretKey => "stripe_secret_key",
+        ArtifactKind::Jwt => "jwt",
+        ArtifactKind::HexKey => "hex_key",
+        ArtifactKind::PrivateKey => "private_key",
+        ArtifactKind::ConnectionString => "connection_string",
+        ArtifactKind::CodeBlock { .. } => "code_block",
+        ArtifactKind::UnknownCredential => "unknown_credential",
+        ArtifactKind::AuthLogic => "auth_logic",
+        ArtifactKind::CryptoOperation => "crypto_operation",
+        ArtifactKind::OrgPattern { .. } => "org_pattern",
     }
 }
 
@@ -308,28 +365,28 @@ db=postgres://user:pass@db.local:5432/app
 "#;
 
         let artifacts = credential_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::OpenAIKey)));
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::AnthropicKey)));
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::AwsAccessKey)));
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::GitHubPat)));
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::GitLabToken)));
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::JwtToken)));
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::ConnectionString)));
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::PrivateKey)));
+        assert!(artifacts.iter().any(|a| matches!(&a.kind, ArtifactKind::ApiKey { provider: Some(DetectedProvider::OpenAi) })));
+        assert!(artifacts.iter().any(|a| matches!(&a.kind, ArtifactKind::ApiKey { provider: Some(DetectedProvider::Anthropic) })));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::AwsAccessKey)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::GitHubPat)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::GitLabToken)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::Jwt)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::ConnectionString)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::PrivateKey)));
     }
 
     #[test]
     fn credential_scan_detects_slack_token() {
         let body = b"token=xoxb-1234567890-abcdef";
         let artifacts = credential_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::SlackToken)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::SlackToken)));
     }
 
     #[test]
     fn credential_scan_detects_stripe_keys() {
         let body = b"live=sk_live_abcdefghijklmnop test=sk_test_abcdefghijklmnop";
         let artifacts = credential_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::StripeSecretKey)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::StripeSecretKey)));
     }
 
     #[test]
@@ -361,14 +418,14 @@ db=postgres://user:pass@db.local:5432/app
     fn structural_scan_detects_auth_logic() {
         let body = b"user.authenticate(password); check_password(hash); bearer token";
         let artifacts = structural_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::AuthLogicFlag)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::AuthLogic)));
     }
 
     #[test]
     fn structural_scan_detects_crypto_operations() {
         let body = b"let cipher = encrypt(data); let hash = sha256(input);";
         let artifacts = structural_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.artifact_type, ArtifactType::CryptoFlag)));
+        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::CryptoOperation)));
     }
 
     #[test]
@@ -384,7 +441,7 @@ db=postgres://user:pass@db.local:5432/app
         let patterns = vec![r"\d{3}-\d{2}-\d{4}".to_string()];
         let artifacts = org_pattern_scan(body, &patterns, ArtifactLocation::Unknown);
         assert_eq!(artifacts.len(), 1);
-        assert!(matches!(artifacts[0].artifact_type, ArtifactType::OrgPatternMatch { pattern_id: 0 }));
+        assert!(matches!(artifacts[0].kind, ArtifactKind::OrgPattern { pattern_id: 0 }));
         assert!(artifacts[0].redacted_hint.is_none());
     }
 
@@ -394,7 +451,7 @@ db=postgres://user:pass@db.local:5432/app
         let patterns = vec!["[invalid".to_string(), r"\btest\b".to_string()];
         let artifacts = org_pattern_scan(body, &patterns, ArtifactLocation::Unknown);
         assert_eq!(artifacts.len(), 1);
-        assert!(matches!(artifacts[0].artifact_type, ArtifactType::OrgPatternMatch { pattern_id: 1 }));
+        assert!(matches!(artifacts[0].kind, ArtifactKind::OrgPattern { pattern_id: 1 }));
     }
 
     #[test]

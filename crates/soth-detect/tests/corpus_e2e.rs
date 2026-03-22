@@ -102,7 +102,7 @@ fn assert_case(case_id: &str, expect: &CorpusExpect, out: &DetectResult) {
         "case {case_id}: capture_mode mismatch"
     );
     assert_eq!(
-        out.normalized.provider.canonical_name(),
+        out.normalized.provider.as_str(),
         expect.provider,
         "case {case_id}: provider mismatch"
     );

@@ -1,6 +1,6 @@
 use crate::code::{self, detect_code_artifacts};
-use crate::fingerprint::{classify_request_pair, fingerprint};
-use crate::graphql::{parse_graphql, ApqStore, NoopApqStore};
+use crate::fingerprint::fingerprint;
+use crate::graphql::{parse_graphql, ApqStore};
 use crate::grpc::parse_grpc;
 use crate::hash::canonical_hash;
 use crate::heuristic;
@@ -10,36 +10,38 @@ use crate::intelligence::{
 };
 use crate::jsonrpc::parse_jsonrpc;
 use crate::rest::parse_rest;
-use crate::sensitive::{credential_scan, org_pattern_scan, structural_scan};
+use crate::sensitive::{
+    credential_scan, org_pattern_scan_compiled, structural_scan, CompiledOrgPatterns,
+};
 use crate::types::{
-    ArtifactLocation, ArtifactType, DetectBundleSlice, DetectResult, DetectWarning, DetectedFormat,
-    DetectedImportCategory, FormatMeta, GqlOpType, NormalizedRequest, ParseSource, ParseWarning,
-    Provider, ProviderEntry, RawRequest,
+    ArtifactLocation, CaptureMode, DetectBundleSlice, DetectResult, DetectWarning, DetectedFormat,
+    DetectedImportCategory, FormatMeta, NormalizedRequest, ParseSource, ParseWarning,
+    ProviderEntry, RawRequest,
 };
 use lru::LruCache;
 use serde_json::Value as JsonValue;
-use soth_core::{
-    ArtifactKind, ArtifactLocation as CoreArtifactLocation, ArtifactSeverity, DetectedProvider,
-    EndpointType as CoreEndpointType, FormatMetadata, GraphQlOperationType,
-    NormalizedRequest as CoreNormalizedRequest, ParseSource as CoreParseSource,
-    ParseWarning as CoreParseWarning, SensitiveArtifact,
-};
+use soth_core::DetectedProvider;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::Instant;
 
 pub struct ParserRegistry {
     apq_cache: Mutex<LruCache<String, String>>,
+    compiled_org: CompiledOrgPatterns,
 }
 
 impl Default for ParserRegistry {
     fn default() -> Self {
-        Self::new(512)
+        Self::with_org_patterns(512, &[])
     }
 }
 
 impl ParserRegistry {
     pub fn new(apq_cache_capacity: usize) -> Self {
+        Self::with_org_patterns(apq_cache_capacity, &[])
+    }
+
+    pub fn with_org_patterns(apq_cache_capacity: usize, org_patterns: &[String]) -> Self {
         let capacity = if apq_cache_capacity == 0 {
             1
         } else {
@@ -49,6 +51,7 @@ impl ParserRegistry {
 
         Self {
             apq_cache: Mutex::new(LruCache::new(non_zero)),
+            compiled_org: CompiledOrgPatterns::compile(org_patterns),
         }
     }
 
@@ -58,7 +61,7 @@ impl ParserRegistry {
         bundle: &DetectBundleSlice<'_>,
         snapshot: &soth_core::SessionSnapshot,
     ) -> soth_core::DetectResult {
-        to_core_detect_result(&process_inner(req, bundle, self, snapshot))
+        to_core_detect_result(&process_inner(req, bundle, self, &self.compiled_org, snapshot))
     }
 }
 
@@ -82,15 +85,26 @@ impl ApqStore for ParserRegistry {
     }
 }
 
+/// Convenience entry point without a `ParserRegistry`. Constructs a
+/// temporary registry on every call — use `process_with_registry` for the
+/// hot path. Only intended for tests and one-shot sidecar use where
+/// `org_patterns` is empty. In debug builds, asserts that org_patterns is
+/// empty to catch accidental misuse.
 pub fn process(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
     snapshot: &soth_core::SessionSnapshot,
 ) -> soth_core::DetectResult {
-    let apq = NoopApqStore;
-    to_core_detect_result(&process_inner(req, bundle, &apq, snapshot))
+    debug_assert!(
+        bundle.org_patterns.is_empty(),
+        "process() compiles org patterns per call — use process_with_registry() for non-empty org_patterns"
+    );
+    let registry = ParserRegistry::with_org_patterns(1, bundle.org_patterns);
+    registry.process(req, bundle, snapshot)
 }
 
+/// Convenience entry point with intelligence logging but without a
+/// `ParserRegistry`. Same caveats as `process()`.
 #[cfg(feature = "intelligence")]
 pub fn process_with_intelligence(
     req: &RawRequest,
@@ -98,8 +112,12 @@ pub fn process_with_intelligence(
     snapshot: &soth_core::SessionSnapshot,
     sink: &dyn IntelligenceSink,
 ) -> soth_core::DetectResult {
-    let apq = NoopApqStore;
-    let result = process_inner(req, bundle, &apq, snapshot);
+    debug_assert!(
+        bundle.org_patterns.is_empty(),
+        "process_with_intelligence() compiles org patterns per call — use process_with_registry_and_intelligence()"
+    );
+    let registry = ParserRegistry::with_org_patterns(1, bundle.org_patterns);
+    let result = process_inner(req, bundle, &registry, &registry.compiled_org, snapshot);
     emit_intelligence(req, &result, sink);
     to_core_detect_result(&result)
 }
@@ -121,45 +139,60 @@ pub fn process_with_registry_and_intelligence(
     snapshot: &soth_core::SessionSnapshot,
     sink: &dyn IntelligenceSink,
 ) -> soth_core::DetectResult {
-    let result = process_inner(req, bundle, registry, snapshot);
+    let result = process_inner(req, bundle, registry, &registry.compiled_org, snapshot);
     emit_intelligence(req, &result, sink);
     to_core_detect_result(&result)
 }
 
-fn process_inner(
+// ---------------------------------------------------------------------------
+// Internal types for the parse/scan split
+// ---------------------------------------------------------------------------
+
+struct ParsePhaseResult {
+    normalized: NormalizedRequest,
+    parse_source: ParseSource,
+    warnings: Vec<DetectWarning>,
+    capture_mode: CaptureMode,
+}
+
+struct ScanInput {
+    segments: Vec<(ArtifactLocation, String)>,
+    fallback_content: Option<String>,
+}
+
+struct ScanResult {
+    artifacts: Vec<crate::types::SensitiveArtifact>,
+    warnings: Vec<DetectWarning>,
+    ast_normalized_hash: Option<String>,
+    import_categories: Vec<DetectedImportCategory>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: parse_request — fingerprint, dispatch, cost estimation
+// ---------------------------------------------------------------------------
+
+fn parse_request(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
     apq_store: &dyn ApqStore,
-    snapshot: &soth_core::SessionSnapshot,
-) -> DetectResult {
-    let started = Instant::now();
-
-    if bundle.filters.matches(&req.path, &req.headers) {
-        let mut out = DetectResult::filtered();
-        out.detect_latency_us = started.elapsed().as_micros() as u64;
-        return out;
-    }
-
-    // v3 signal-based classification: refine matched_provider/matched_application
-    // using matching_rules when available, falling back to gating output otherwise.
-    let (effective_provider, effective_application) =
-        refine_with_classify(req, bundle);
-
+) -> ParsePhaseResult {
+    // Use gating's answers directly — classify_request_pair is now called
+    // in the evaluator with full signal-based matching, so no re-derivation needed.
     let format = fingerprint(
         &req.method,
         &req.path,
         &req.headers,
         &req.body[..req.body.len().min(512)],
-        effective_provider.as_deref(),
-        effective_application.as_deref(),
+        req.connection_meta.matched_provider.as_deref(),
+        req.connection_meta.matched_application.as_deref(),
         bundle,
     );
 
     let (mut normalized, parse_source, mut warnings) =
         parse_by_format(req, bundle, format.clone(), apq_store);
 
-    if normalized.canonical_hash.is_empty() {
-        normalized.canonical_hash = canonical_hash(&normalized);
+    if normalized.canonical_cache_key.is_empty() {
+        normalized.canonical_cache_key = canonical_hash(&normalized);
     }
 
     let provider_entry = provider_entry_for(bundle, &normalized.provider);
@@ -167,7 +200,7 @@ fn process_inner(
     let capture_mode = req.connection_meta.capture_mode.clone().unwrap_or_else(|| {
         bundle
             .capture_rules
-            .mode_for_with_entry(normalized.provider.canonical_name(), provider_entry)
+            .mode_for_with_entry(&normalized.provider, provider_entry)
     });
 
     if normalized.estimated_cost_usd <= 0.0 {
@@ -178,43 +211,114 @@ fn process_inner(
                 normalized.estimated_input_tokens,
             )
         }) {
-            normalized.estimated_cost_usd = estimated_cost;
+            normalized.estimated_cost_usd = estimated_cost as f64;
         }
     }
 
-    // Artifact extraction runs for all capture modes. The `full` mode is reserved
-    // for a future extraction API that surfaces secrets externally; for now both
-    // `metadata_only` and `full` run the same pipeline.
-    let _ = capture_mode; // will gate the extraction API in a future release
+    warnings.extend(
+        normalized
+            .parse_warnings
+            .iter()
+            .map(parse_warning_to_detect_warning),
+    );
+
+    ParsePhaseResult {
+        normalized,
+        parse_source,
+        warnings,
+        capture_mode,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2a: build_scan_input — extract scannable locations with fallback
+// ---------------------------------------------------------------------------
+
+fn build_scan_input(body: &[u8], normalized: &NormalizedRequest) -> ScanInput {
+    let segments = extract_scannable_locations(body, normalized);
+    let fallback_content = if segments.is_empty() {
+        extract_content_sample(body)
+    } else {
+        None
+    };
+    ScanInput {
+        segments,
+        fallback_content,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b: scan_content — credential, structural, code, org-pattern scans
+// ---------------------------------------------------------------------------
+
+fn scan_content(
+    body: &[u8],
+    scan_input: &ScanInput,
+    compiled_org: &CompiledOrgPatterns,
+) -> ScanResult {
     let mut artifacts = Vec::new();
+    let mut warnings = Vec::new();
     let mut ast_normalized_hash: Option<String> = None;
     let mut import_categories: Vec<DetectedImportCategory> = Vec::new();
 
-    {
-        // Body-level scans
-        artifacts.extend(credential_scan(&req.body, ArtifactLocation::Unknown));
-        artifacts.extend(structural_scan(&req.body, ArtifactLocation::Unknown));
-        artifacts.extend(org_pattern_scan(
-            &req.body,
-            bundle.org_patterns,
-            ArtifactLocation::Unknown,
-        ));
+    // Body-level scans
+    artifacts.extend(credential_scan(body, ArtifactLocation::Unknown));
+    artifacts.extend(structural_scan(body, ArtifactLocation::Unknown));
+    artifacts.extend(org_pattern_scan_compiled(
+        body,
+        compiled_org,
+        ArtifactLocation::Unknown,
+    ));
 
-        // Per-location scans (multi-turn aware)
-        let scannable = extract_scannable_locations(&req.body, &normalized);
+    // Per-location scans (multi-turn aware)
+    if scan_input.segments.is_empty() {
+        if scan_input.fallback_content.is_none() && !body.is_empty() {
+            // No structured messages found and body is not JSON-parseable
+            // (e.g. protobuf/gRPC). Code detection cannot run.
+            warnings.push(DetectWarning {
+                code: "code_detection_skipped",
+                detail: "no scannable text extracted from body".to_string(),
+            });
+        }
 
-        if scannable.is_empty() {
-            // Fallback: use content_sample
-            if let Some(content_sample) = normalized.content_sample.as_deref() {
-                let code_result = detect_code_artifacts(
-                    content_sample,
-                    ArtifactLocation::UserMessage { turn_index: 0 },
-                );
+        // Fallback: use content_sample
+        if let Some(content_sample) = scan_input.fallback_content.as_deref() {
+            let code_result = detect_code_artifacts(
+                content_sample,
+                ArtifactLocation::UserContent { turn: 0, char_offset: 0 },
+            );
+            artifacts.extend(code_result.artifacts);
+            warnings.extend(code_result.warnings);
+            if let Some(ts) = &code_result.tree_sitter {
+                import_categories.extend(ts.import_categories.iter().cloned());
+            }
+            if ast_normalized_hash.is_none() {
+                let lang = code_result
+                    .detected_language
+                    .as_deref()
+                    .or_else(|| {
+                        code_result
+                            .tree_sitter
+                            .as_ref()
+                            .and_then(|ts| ts.confirmed_language.as_deref())
+                    });
+                if let Some(lang) = lang {
+                    ast_normalized_hash = code::ast_normalized_hash(content_sample, lang);
+                }
+            }
+        }
+    } else {
+        for (location, text) in &scan_input.segments {
+            artifacts.extend(credential_scan(text.as_bytes(), location.clone()));
+
+            if matches!(location, ArtifactLocation::UserContent { .. }) {
+                let code_result = detect_code_artifacts(text, location.clone());
                 artifacts.extend(code_result.artifacts);
                 warnings.extend(code_result.warnings);
                 if let Some(ts) = &code_result.tree_sitter {
                     import_categories.extend(ts.import_categories.iter().cloned());
                 }
+
                 if ast_normalized_hash.is_none() {
                     let lang = code_result
                         .detected_language
@@ -226,55 +330,81 @@ fn process_inner(
                                 .and_then(|ts| ts.confirmed_language.as_deref())
                         });
                     if let Some(lang) = lang {
-                        ast_normalized_hash = code::ast_normalized_hash(content_sample, lang);
-                    }
-                }
-            }
-        } else {
-            for (location, text) in &scannable {
-                artifacts.extend(credential_scan(text.as_bytes(), location.clone()));
-
-                if matches!(location, ArtifactLocation::UserMessage { .. }) {
-                    let code_result = detect_code_artifacts(text, location.clone());
-                    artifacts.extend(code_result.artifacts);
-                    warnings.extend(code_result.warnings);
-                    if let Some(ts) = &code_result.tree_sitter {
-                        import_categories.extend(ts.import_categories.iter().cloned());
-                    }
-
-                    if ast_normalized_hash.is_none() {
-                        let lang = code_result
-                            .detected_language
-                            .as_deref()
-                            .or_else(|| {
-                                code_result
-                                    .tree_sitter
-                                    .as_ref()
-                                    .and_then(|ts| ts.confirmed_language.as_deref())
-                            });
-                        if let Some(lang) = lang {
-                            ast_normalized_hash = code::ast_normalized_hash(text, lang);
-                        }
+                        ast_normalized_hash = code::ast_normalized_hash(text, lang);
                     }
                 }
             }
         }
     }
-    // Deduplicate import categories
-    import_categories.sort();
-    import_categories.dedup();
 
-    // Prefix repeat detection
+    // Deduplicate import categories (ImportCategory has no Ord or Hash, use O(n²) dedup).
+    // The set is always small (at most 6 variants), so this is fast.
+    let mut deduped: Vec<DetectedImportCategory> = Vec::new();
+    for cat in import_categories {
+        if !deduped.contains(&cat) {
+            deduped.push(cat);
+        }
+    }
+    let import_categories = deduped;
+
+    ScanResult {
+        artifacts,
+        warnings,
+        ast_normalized_hash,
+        import_categories,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// process_inner — composes parse + scan
+// ---------------------------------------------------------------------------
+
+fn process_inner(
+    req: &RawRequest,
+    bundle: &DetectBundleSlice<'_>,
+    apq_store: &dyn ApqStore,
+    compiled_org: &CompiledOrgPatterns,
+    snapshot: &soth_core::SessionSnapshot,
+) -> DetectResult {
+    let started = Instant::now();
+
+    if bundle.filters.matches(&req.path, &req.headers) {
+        let mut out = DetectResult::filtered();
+        out.detect_latency_us = started.elapsed().as_micros() as u64;
+        return out;
+    }
+
+    // Phase 1: Parse
+    let ParsePhaseResult {
+        normalized,
+        parse_source,
+        mut warnings,
+        capture_mode,
+    } = parse_request(req, bundle, apq_store);
+
+    // Phase 2: Scan
+    let scan_input = build_scan_input(&req.body, &normalized);
+    let scan = scan_content(&req.body, &scan_input, &compiled_org);
+
+    let artifacts = scan.artifacts;
+    warnings.extend(scan.warnings);
+    let ast_normalized_hash = scan.ast_normalized_hash;
+    let import_categories = scan.import_categories;
+
+    // Artifact extraction runs for all capture modes. The `full` mode is reserved
+    // for a future extraction API that surfaces secrets externally; for now both
+    // `metadata_only` and `full` run the same pipeline.
+    let _ = capture_mode; // will gate the extraction API in a future release
+
+    // Phase 3: Prefix repeat + session mutations
     let (is_prefix_repeat, novel_token_count, repeated_token_count, novel_tail_start_idx, prefix_hash) =
         compute_prefix_repeat(&normalized, snapshot);
 
-    // Code context repeat detection
     let is_repeated_code_context = ast_normalized_hash
         .as_deref()
         .map(|hash| snapshot.seen_code_hashes.iter().any(|h| h == hash))
         .unwrap_or(false);
 
-    // Session mutations
     let session_mutations = soth_core::SessionMutations {
         new_prefix_hash: Some(normalized.conversation_hash.clone()),
         new_code_hashes: ast_normalized_hash
@@ -291,13 +421,8 @@ fn process_inner(
     };
 
     let confidence = normalized.parse_confidence.clone();
-    warnings.extend(
-        normalized
-            .parse_warnings
-            .iter()
-            .map(parse_warning_to_detect_warning),
-    );
 
+    // Phase 4: Assemble DetectResult
     DetectResult {
         normalized,
         artifacts,
@@ -357,7 +482,7 @@ fn extract_scannable_locations(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        locations.push((ArtifactLocation::SystemPrompt, system.to_string()));
+        locations.push((ArtifactLocation::SystemPrompt { char_offset: 0 }, system.to_string()));
     }
 
     // Messages array
@@ -385,11 +510,13 @@ fn extract_scannable_locations(
 
             if let Some(text) = content.filter(|s| !s.is_empty()) {
                 let location = match role {
-                    "assistant" => ArtifactLocation::AssistantMessage {
-                        turn_index: idx as u32,
+                    "assistant" => ArtifactLocation::AssistantContent {
+                        turn: idx as u32,
+                        char_offset: 0,
                     },
-                    _ => ArtifactLocation::UserMessage {
-                        turn_index: idx as u32,
+                    _ => ArtifactLocation::UserContent {
+                        turn: idx as u32,
+                        char_offset: 0,
                     },
                 };
                 locations.push((location, text));
@@ -408,7 +535,7 @@ fn extract_scannable_locations(
                     .to_string();
                 let tool_text = tool.to_string();
                 locations.push((
-                    ArtifactLocation::ToolDefinition { tool_name },
+                    ArtifactLocation::ToolResult { tool_name: Some(tool_name) },
                     tool_text,
                 ));
             }
@@ -418,47 +545,129 @@ fn extract_scannable_locations(
     locations
 }
 
-/// Refine gating's matched_provider/matched_application using v3 signal-based
-/// classify_request_pair(). Resolves provider and application independently so
-/// both can be identified from matching_rules in a single pass. Falls back to
-/// gating output for whichever entity kind has no matching rule hit.
-fn refine_with_classify(
-    req: &RawRequest,
-    bundle: &DetectBundleSlice<'_>,
-) -> (Option<String>, Option<String>) {
-    let host = crate::util::header_value(&req.headers, "host")
-        .or_else(|| crate::util::header_value(&req.headers, ":authority"));
-    let (process_bundle_id, process_name, parent_process_name) =
-        match req.connection_meta.process_info.as_ref() {
-            Some(info) => (
-                info.bundle_id.as_deref(),
-                info.process_name.as_deref(),
-                info.parent_process_name.as_deref(),
-            ),
-            None => (None, None, None),
-        };
+/// Extract a content sample from the raw body for fallback scanning.
+/// Used when `extract_scannable_locations()` finds no structured messages.
+/// Mirrors the extraction logic the parsers previously wrote to
+/// `NormalizedRequest.content_sample`: tries standard JSON content paths,
+/// handles GraphQL variables and JSON-RPC params, then falls back to the
+/// longest-string heuristic (min 20 chars). Returns `None` for non-JSON
+/// bodies and for GraphQL bodies where only the query DSL is available.
+fn extract_content_sample(body: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
 
-    let pair = classify_request_pair(
-        host,
-        &req.path,
-        &req.headers,
-        process_bundle_id,
-        process_name,
-        parent_process_name,
-        bundle,
-    );
+    // Try first message content (most common for chat APIs)
+    if let Some(content) = json
+        .get("messages")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(content.to_string());
+    }
 
-    let provider = pair
-        .provider
-        .map(|r| r.entity_id)
-        .or_else(|| req.connection_meta.matched_provider.clone());
-    let application = pair
-        .application
-        .map(|r| r.entity_id)
-        .or_else(|| req.connection_meta.matched_application.clone());
+    // Simple top-level content paths
+    for key in &["prompt", "content", "message", "text", "input", "query"] {
+        if let Some(s) = json.get(*key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            // Skip GraphQL query DSL — it looks like code but isn't user content
+            if *key == "query" && (json.get("operationName").is_some() || json.get("variables").is_some()) {
+                continue;
+            }
+            if s != "[CONTENT_NOT_EXTRACTED]" {
+                return Some(s.to_string());
+            }
+        }
+    }
 
-    (provider, application)
+    // Nested content paths
+    if let Some(s) = json
+        .get("input")
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(s.to_string());
+    }
+    if let Some(s) = json
+        .get("request")
+        .and_then(|v| v.get("prompt"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(s.to_string());
+    }
+
+    // GraphQL: try variables.{input,prompt,message,content}[.content]
+    if json.get("operationName").is_some()
+        || (json.get("query").is_some() && json.get("variables").is_some())
+    {
+        if let Some(vars) = json.get("variables") {
+            for key in &["input", "prompt", "message", "content"] {
+                if let Some(inner) = vars.get(*key) {
+                    if let Some(s) = inner.as_str().filter(|s| !s.is_empty()) {
+                        return Some(s.to_string());
+                    }
+                    if let Some(s) = inner
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+        // Don't fall through to longest-string for GraphQL — the query DSL
+        // would be selected and misidentified as code.
+        return None;
+    }
+
+    // JSON-RPC: try params as string or params.content
+    if json.get("jsonrpc").is_some() {
+        if let Some(params) = json.get("params") {
+            if let Some(s) = params.as_str().filter(|s| !s.is_empty()) {
+                return Some(s.to_string());
+            }
+            if let Some(s) = params
+                .get("content")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(s.to_string());
+            }
+        }
+    }
+
+    // Longest string fallback (min 20 chars) — mirrors heuristic parser
+    let mut best: Option<String> = None;
+    visit_json_strings(&json, &mut |s| {
+        if s.len() >= 20 {
+            let better = best.as_ref().map_or(true, |b| s.len() > b.len());
+            if better {
+                best = Some(s.to_string());
+            }
+        }
+    });
+    best
 }
+
+fn visit_json_strings(value: &serde_json::Value, f: &mut dyn FnMut(&str)) {
+    match value {
+        serde_json::Value::String(s) => f(s),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                visit_json_strings(item, f);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                visit_json_strings(v, f);
+            }
+        }
+        _ => {}
+    }
+}
+
 
 fn parse_by_format(
     req: &RawRequest,
@@ -483,14 +692,14 @@ fn parse_by_format(
             let key = rest_key_for_format(&format);
             let descriptor = bundle.rest_formats.get(key);
             parse_rest(req, &provider_name, format.clone(), descriptor).map(|mut nr| {
-                nr.provider = Provider::new(provider_name.clone());
+                nr.provider = provider_name.clone();
                 nr
             })
         }
         DetectedFormat::CustomRest(ref key) => {
             let descriptor = bundle.rest_formats.get(key.as_str());
             parse_rest(req, &provider_name, format.clone(), descriptor).map(|mut nr| {
-                nr.provider = Provider::new(provider_name.clone());
+                nr.provider = provider_name.clone();
                 // Apply model_default when model wasn't extracted from request
                 if nr.model.is_none() {
                     if let Some(desc) = descriptor {
@@ -511,7 +720,7 @@ fn parse_by_format(
             outcome.normalized
         }),
         DetectedFormat::JsonRpc => parse_jsonrpc(req, &provider_name).map(|mut nr| {
-            nr.provider = Provider::new(provider_name.clone());
+            nr.provider = provider_name.clone();
             nr
         }),
         DetectedFormat::Unknown => Ok(heuristic::parse(req)),
@@ -519,7 +728,7 @@ fn parse_by_format(
 
     match result {
         Ok(normalized) => {
-            let source = parse_source_for_format(&format, &normalized.format_meta);
+            let source = parse_source_for_format(&format, &normalized.format_metadata);
             (normalized, source, warnings)
         }
         Err(error) => {
@@ -528,11 +737,11 @@ fn parse_by_format(
                 detail: format!("{error:?}"),
             });
             let mut normalized = heuristic::parse(req);
-            normalized.provider = Provider::new(provider_name);
+            normalized.provider = provider_name;
             normalized
                 .parse_warnings
-                .push(ParseWarning::ParserError(format!("{error:?}")));
-            normalized.canonical_hash = canonical_hash(&normalized);
+                .push(ParseWarning::ParserError { reason: format!("{error:?}") });
+            normalized.canonical_cache_key = canonical_hash(&normalized);
             (normalized, ParseSource::Heuristic, warnings)
         }
     }
@@ -555,7 +764,7 @@ fn provider_for_format(
 
     // Application entity: check api_format → provider_hint for correct attribution
     if let Some(app_id) = req.connection_meta.matched_application.as_deref() {
-        if let Some(app_entry) = bundle.applications.get(app_id) {
+        if let Some(app_entry) = bundle.products.get(app_id) {
             if let Some(api_format) = app_entry.api_format.as_deref() {
                 if let Some(descriptor) = bundle.rest_formats.get(api_format) {
                     if let Some(hint) = descriptor.provider_hint.as_deref() {
@@ -567,21 +776,19 @@ fn provider_for_format(
         return canonical_provider_candidate(app_id, format, bundle);
     }
 
+    // Last resort: domain_index lookup for host → provider mapping.
+    // Handles web apps (claude.ai, chatgpt.com) whose format definitions
+    // lack provider_hint but whose hosts are in the domain_index.
     let headers = &req.headers;
-    if let Some(host_provider) = host_provider_from_headers(headers, bundle) {
-        return canonical_provider_candidate(&host_provider, format, bundle);
+    if let Some(host) = crate::util::header_value(headers, "host")
+        .or_else(|| crate::util::header_value(headers, ":authority"))
+    {
+        if let Some(provider) = crate::util::lookup_domain_provider(bundle.domain_index, host) {
+            return canonical_provider_candidate(provider, format, bundle);
+        }
     }
 
     default_provider_for_format(format).to_string()
-}
-
-fn host_provider_from_headers(
-    headers: &crate::types::HeaderMap,
-    bundle: &DetectBundleSlice<'_>,
-) -> Option<String> {
-    let host = crate::util::header_value(headers, "host")
-        .or_else(|| crate::util::header_value(headers, ":authority"))?;
-    crate::util::lookup_domain_provider(bundle.domain_index, host).map(str::to_string)
 }
 
 fn canonical_provider_candidate(
@@ -616,9 +823,9 @@ fn canonical_provider_candidate(
 
 fn provider_entry_for<'a>(
     bundle: &'a DetectBundleSlice<'_>,
-    provider: &Provider,
+    provider: &str,
 ) -> Option<&'a ProviderEntry> {
-    let canonical = provider.canonical_name();
+    let canonical = provider;
     bundle.llm_providers.get(canonical).or_else(|| {
         bundle.llm_providers.values().find(|entry| {
             entry
@@ -746,52 +953,17 @@ fn rest_key_for_format(format: &DetectedFormat) -> &'static str {
     }
 }
 
-fn parse_source_for_format(format: &DetectedFormat, meta: &FormatMeta) -> ParseSource {
+fn parse_source_for_format(format: &DetectedFormat, _meta: &FormatMeta) -> ParseSource {
     match format {
-        DetectedFormat::OpenAIRest => ParseSource::OpenAI,
-        DetectedFormat::AnthropicRest => ParseSource::Anthropic,
-        DetectedFormat::CohereRest => ParseSource::Cohere,
-        DetectedFormat::GeminiRest => ParseSource::Google,
-        DetectedFormat::BedrockRest => ParseSource::Bedrock,
-        DetectedFormat::CustomRest(ref key) => ParseSource::AgentApp {
-            app_id: key.clone(),
-        },
-        DetectedFormat::GraphQL => {
-            if let FormatMeta::GraphQL { operation_name, .. } = meta {
-                ParseSource::GraphQL {
-                    operation_name: operation_name.clone(),
-                }
-            } else {
-                ParseSource::GraphQL {
-                    operation_name: None,
-                }
-            }
-        }
-        DetectedFormat::GrpcProtobuf => {
-            if let FormatMeta::Grpc {
-                service, method, ..
-            } = meta
-            {
-                ParseSource::Grpc {
-                    service: service.clone(),
-                    method: method.clone(),
-                }
-            } else {
-                ParseSource::Grpc {
-                    service: "unknown".to_string(),
-                    method: "unknown".to_string(),
-                }
-            }
-        }
-        DetectedFormat::JsonRpc => {
-            if let FormatMeta::JsonRpc { method, .. } = meta {
-                ParseSource::JsonRpc {
-                    method: method.clone(),
-                }
-            } else {
-                ParseSource::JsonRpc { method: None }
-            }
-        }
+        DetectedFormat::OpenAIRest => ParseSource::Rest { provider: DetectedProvider::OpenAi },
+        DetectedFormat::AnthropicRest => ParseSource::Rest { provider: DetectedProvider::Anthropic },
+        DetectedFormat::CohereRest => ParseSource::Rest { provider: DetectedProvider::Cohere },
+        DetectedFormat::GeminiRest => ParseSource::Rest { provider: DetectedProvider::Gemini },
+        DetectedFormat::BedrockRest => ParseSource::Rest { provider: DetectedProvider::Bedrock },
+        DetectedFormat::CustomRest(_) => ParseSource::AgentApp,
+        DetectedFormat::GraphQL => ParseSource::GraphQl,
+        DetectedFormat::GrpcProtobuf => ParseSource::Grpc,
+        DetectedFormat::JsonRpc => ParseSource::JsonRpc,
         DetectedFormat::Unknown => ParseSource::Heuristic,
     }
 }
@@ -809,10 +981,10 @@ fn parse_warning_to_detect_warning(warning: &ParseWarning) -> DetectWarning {
 
 pub fn to_core_detect_result(value: &DetectResult) -> soth_core::DetectResult {
     soth_core::DetectResult {
-        normalized: to_core_normalized(value),
-        artifacts: value.artifacts.iter().map(map_artifact).collect(),
+        normalized: value.normalized.clone(),
+        artifacts: value.artifacts.clone(),
         capture_mode: value.capture_mode,
-        parse_source: map_parse_source(&value.parse_source),
+        parse_source: value.parse_source,
         confidence: value.confidence,
         detect_latency_us: value.detect_latency_us,
         warnings: value.warnings.iter().map(map_detect_warning).collect(),
@@ -825,269 +997,14 @@ pub fn to_core_detect_result(value: &DetectResult) -> soth_core::DetectResult {
         is_repeated_code_context: value.is_repeated_code_context,
         ast_normalized_hash: value.ast_normalized_hash.clone(),
         first_blob_event_id: value.first_blob_event_id,
-        import_categories: value
-            .import_categories
-            .iter()
-            .map(map_import_category)
-            .collect(),
+        import_categories: value.import_categories.clone(),
+        user_prompt: value.normalized.user_prompt.clone(),
     }
 }
 
-fn to_core_normalized(value: &DetectResult) -> CoreNormalizedRequest {
-    let normalized = &value.normalized;
-    CoreNormalizedRequest {
-        parse_confidence: normalized.parse_confidence,
-        parser_id: normalized.parser_id.to_string(),
-        schema_version: normalized.schema_version.to_string(),
-        parse_warnings: normalized
-            .parse_warnings
-            .iter()
-            .map(map_parse_warning)
-            .collect(),
-        is_ai_call: normalized.is_ai_call,
-        provider: map_provider(normalized.provider.canonical_name()),
-        model: normalized.model.clone(),
-        endpoint_type: map_endpoint_type(&normalized.endpoint_type),
-        api_version: normalized.api_version.clone(),
-        system_prompt_hash: normalized.system_prompt_hash.clone(),
-        system_prompt_token_estimate: normalized.system_prompt_token_estimate,
-        user_content_hash: normalized.user_content_hash.clone(),
-        user_content_token_estimate: normalized.user_content_token_estimate,
-        conversation_hash: normalized.conversation_hash.clone(),
-        conversation_turn: normalized.conversation_turn,
-        has_tool_definitions: normalized.has_tool_definitions,
-        tool_definition_hash: normalized.tool_definition_hash.clone(),
-        temperature: normalized.temperature,
-        max_tokens: normalized.max_tokens,
-        stream: normalized.stream,
-        top_p: normalized.top_p,
-        stop_sequences: normalized.stop_sequences.clone(),
-        estimated_input_tokens: normalized.estimated_input_tokens,
-        estimated_cost_usd: normalized.estimated_cost_usd as f64,
-        parse_source: map_parse_source(&value.parse_source),
-        canonical_cache_key: normalized.canonical_hash.clone(),
-        format_metadata: map_format_metadata(&normalized.format_meta),
-        has_structured_output: false,
-        has_tool_results: false,
-        estimated_output_tokens: None,
-    }
-}
-
-fn map_provider(value: &str) -> DetectedProvider {
-    match value.to_ascii_lowercase().as_str() {
-        "anthropic" => DetectedProvider::Anthropic,
-        "openai" => DetectedProvider::OpenAi,
-        "azure_openai" => DetectedProvider::AzureOpenAi,
-        "gemini" | "google" | "google_vertex" => DetectedProvider::Gemini,
-        "cohere" => DetectedProvider::Cohere,
-        "bedrock" => DetectedProvider::Bedrock,
-        "mistral" => DetectedProvider::Mistral,
-        "groq" => DetectedProvider::Groq,
-        "together" => DetectedProvider::Together,
-        "fireworks" => DetectedProvider::Fireworks,
-        "ollama" => DetectedProvider::Ollama,
-        "vllm" => DetectedProvider::VLlm,
-        "lmstudio" => DetectedProvider::LmStudio,
-        "vertex_ai" => DetectedProvider::VertexAi,
-        _ => DetectedProvider::Unknown,
-    }
-}
-
-fn map_endpoint_type(value: &crate::types::EndpointType) -> CoreEndpointType {
-    match value {
-        crate::types::EndpointType::Chat => CoreEndpointType::ChatCompletion,
-        crate::types::EndpointType::Completion => CoreEndpointType::TextCompletion,
-        crate::types::EndpointType::Embedding => CoreEndpointType::Embedding,
-        crate::types::EndpointType::Unknown => CoreEndpointType::Unknown,
-    }
-}
-
-fn map_parse_source(value: &ParseSource) -> CoreParseSource {
-    match value {
-        ParseSource::OpenAI => CoreParseSource::Rest {
-            provider: DetectedProvider::OpenAi,
-        },
-        ParseSource::Anthropic => CoreParseSource::Rest {
-            provider: DetectedProvider::Anthropic,
-        },
-        ParseSource::Cohere => CoreParseSource::Rest {
-            provider: DetectedProvider::Cohere,
-        },
-        ParseSource::Google => CoreParseSource::Rest {
-            provider: DetectedProvider::Gemini,
-        },
-        ParseSource::Bedrock => CoreParseSource::Rest {
-            provider: DetectedProvider::Bedrock,
-        },
-        ParseSource::GraphQL { .. } => CoreParseSource::GraphQl,
-        ParseSource::Grpc { .. } => CoreParseSource::Grpc,
-        ParseSource::JsonRpc { .. } => CoreParseSource::JsonRpc,
-        ParseSource::AgentApp { .. } => CoreParseSource::AgentApp,
-        ParseSource::Heuristic => CoreParseSource::Heuristic,
-        ParseSource::Filtered => CoreParseSource::Filtered,
-    }
-}
-
-fn map_format_metadata(value: &FormatMeta) -> FormatMetadata {
-    match value {
-        FormatMeta::Rest { path } => FormatMetadata::Rest {
-            content_type: path.clone(),
-        },
-        FormatMeta::GraphQL {
-            operation_name,
-            operation_type,
-            mutation_field,
-        } => FormatMetadata::GraphQl {
-            operation_name: operation_name.clone(),
-            operation_type: match operation_type {
-                GqlOpType::Query => GraphQlOperationType::Query,
-                GqlOpType::Mutation => GraphQlOperationType::Mutation,
-                GqlOpType::Subscription => GraphQlOperationType::Subscription,
-                GqlOpType::Unknown => GraphQlOperationType::Unknown,
-            },
-            mutation_field: mutation_field.clone(),
-        },
-        FormatMeta::Grpc {
-            service,
-            method,
-            proto_package,
-        } => FormatMetadata::Grpc {
-            service: service.clone(),
-            method: method.clone(),
-            proto_package: proto_package.clone(),
-        },
-        FormatMeta::JsonRpc { method, is_batch } => FormatMetadata::JsonRpc {
-            method: method.clone().unwrap_or_default(),
-            is_batch: *is_batch,
-        },
-        FormatMeta::WebSocket { frame_kind_hint } => FormatMetadata::WebSocket {
-            frame_kind_hint: frame_kind_hint.clone(),
-        },
-        FormatMeta::Unknown { method, path } => FormatMetadata::Unknown {
-            method: method.clone(),
-            path: path.clone(),
-        },
-    }
-}
-
-fn map_parse_warning(value: &ParseWarning) -> CoreParseWarning {
-    match value {
-        ParseWarning::GraphQLUnknownOperation(operation_name) => {
-            CoreParseWarning::GraphQlUnknownOperation {
-                operation_name: operation_name.clone(),
-            }
-        }
-        ParseWarning::GrpcDescriptorMissing(svc) => CoreParseWarning::GrpcDescriptorMissing {
-            service: svc.clone(),
-        },
-        ParseWarning::ParserError(reason) => CoreParseWarning::ParserError {
-            reason: reason.clone(),
-        },
-        ParseWarning::MissingField(f) => CoreParseWarning::MissingField { field: f.clone() },
-        ParseWarning::NoParserForFormat(f) => {
-            CoreParseWarning::NoParserForFormat { format: f.clone() }
-        }
-        ParseWarning::InvalidJson => CoreParseWarning::InvalidJson,
-        ParseWarning::NonJsonBody => CoreParseWarning::NonJsonBody,
-        ParseWarning::LongestStringHeuristic => CoreParseWarning::LongestStringHeuristic,
-        ParseWarning::ContentNotExtracted => CoreParseWarning::ContentNotExtracted,
-        ParseWarning::GraphQLSyntaxError => CoreParseWarning::GraphQlSyntaxError,
-        ParseWarning::WebSocketBinaryUnparseable => CoreParseWarning::WebSocketBinaryUnparseable,
-        ParseWarning::TreeSitterPanic => CoreParseWarning::TreeSitterPanic,
-        ParseWarning::TreeSitterTimeout => CoreParseWarning::TreeSitterTimeout,
-        ParseWarning::FilteredByKeyword => CoreParseWarning::FilteredByKeyword,
-    }
-}
-
-fn map_detect_warning(value: &DetectWarning) -> CoreParseWarning {
-    CoreParseWarning::PartialBodyParse {
+fn map_detect_warning(value: &DetectWarning) -> ParseWarning {
+    ParseWarning::PartialBodyParse {
         reason: format!("{}: {}", value.code, value.detail),
-    }
-}
-
-pub fn map_artifact(value: &crate::types::SensitiveArtifact) -> SensitiveArtifact {
-    SensitiveArtifact {
-        kind: map_artifact_kind(&value.artifact_type),
-        severity: map_artifact_severity(&value.severity),
-        location: map_artifact_location(&value.location),
-        commitment: Some(value.commitment.clone()),
-        redacted_hint: value.redacted_hint.clone(),
-    }
-}
-
-pub fn map_artifact_kind(value: &ArtifactType) -> ArtifactKind {
-    match value {
-        ArtifactType::PrivateKey => ArtifactKind::PrivateKey,
-        ArtifactType::JwtToken => ArtifactKind::Jwt,
-        ArtifactType::ConnectionString => ArtifactKind::ConnectionString,
-        ArtifactType::CodeBlock { language } => ArtifactKind::CodeBlock {
-            language: language.clone(),
-        },
-        ArtifactType::OpenAIKey => ArtifactKind::ApiKey {
-            provider: Some(DetectedProvider::OpenAi),
-        },
-        ArtifactType::AnthropicKey => ArtifactKind::ApiKey {
-            provider: Some(DetectedProvider::Anthropic),
-        },
-        ArtifactType::AwsAccessKey => ArtifactKind::AwsAccessKey,
-        ArtifactType::GitHubPat => ArtifactKind::GitHubPat,
-        ArtifactType::GitLabToken => ArtifactKind::GitLabToken,
-        ArtifactType::SlackToken => ArtifactKind::SlackToken,
-        ArtifactType::StripeSecretKey => ArtifactKind::StripeSecretKey,
-        ArtifactType::UnknownCredential => ArtifactKind::UnknownCredential,
-        ArtifactType::AuthLogicFlag => ArtifactKind::AuthLogic,
-        ArtifactType::CryptoFlag => ArtifactKind::CryptoOperation,
-        ArtifactType::OrgPatternMatch { pattern_id } => ArtifactKind::OrgPattern {
-            pattern_id: *pattern_id,
-        },
-    }
-}
-
-pub fn map_artifact_severity(value: &crate::types::Severity) -> ArtifactSeverity {
-    match value {
-        crate::types::Severity::Critical => ArtifactSeverity::Critical,
-        crate::types::Severity::High => ArtifactSeverity::High,
-        crate::types::Severity::Medium => ArtifactSeverity::Medium,
-        crate::types::Severity::Low => ArtifactSeverity::Low,
-    }
-}
-
-pub fn map_artifact_location(value: &ArtifactLocation) -> CoreArtifactLocation {
-    match value {
-        ArtifactLocation::SystemPrompt => CoreArtifactLocation::SystemPrompt { char_offset: 0 },
-        ArtifactLocation::UserMessage { turn_index } => CoreArtifactLocation::UserContent {
-            turn: *turn_index,
-            char_offset: 0,
-        },
-        ArtifactLocation::AssistantMessage { turn_index } => {
-            CoreArtifactLocation::AssistantContent {
-                turn: *turn_index,
-                char_offset: 0,
-            }
-        }
-        ArtifactLocation::ToolDefinition { tool_name } => CoreArtifactLocation::ToolResult {
-            tool_name: Some(tool_name.clone()),
-        },
-        ArtifactLocation::Header { header_name } => CoreArtifactLocation::Header {
-            name: header_name.clone(),
-        },
-        ArtifactLocation::StreamChunk { sequence } => {
-            CoreArtifactLocation::StreamChunk { sequence: *sequence }
-        }
-        ArtifactLocation::Unknown => CoreArtifactLocation::Unknown,
-    }
-}
-
-pub fn map_import_category(
-    value: &DetectedImportCategory,
-) -> soth_core::ImportCategory {
-    match value {
-        DetectedImportCategory::Crypto => soth_core::ImportCategory::Crypto,
-        DetectedImportCategory::Auth => soth_core::ImportCategory::Auth,
-        DetectedImportCategory::Network => soth_core::ImportCategory::Network,
-        DetectedImportCategory::Database => soth_core::ImportCategory::Database,
-        DetectedImportCategory::FileSystem => soth_core::ImportCategory::Filesystem,
-        DetectedImportCategory::Serialization => soth_core::ImportCategory::Serialization,
     }
 }
 

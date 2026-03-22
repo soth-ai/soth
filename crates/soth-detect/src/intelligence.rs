@@ -1,6 +1,6 @@
 use crate::sensitive::redact_sensitive_bytes;
 use crate::types::{
-    DetectResult, DetectWarning, HeaderMap, ParseConfidence, ParseSource, RawRequest,
+    DetectResult, DetectWarning, FormatMeta, HeaderMap, ParseConfidence, ParseSource, RawRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -208,7 +208,7 @@ pub fn build_parse_quality_record(req: &RawRequest, result: &DetectResult) -> Pa
     ParseQualityRecord {
         event_uuid: req.connection_meta.connection_id.to_string(),
         created_at,
-        provider: result.normalized.provider.canonical_name().to_string(),
+        provider: result.normalized.provider.clone(),
         host,
         method: req.method.clone(),
         path: req.path.clone(),
@@ -216,7 +216,7 @@ pub fn build_parse_quality_record(req: &RawRequest, result: &DetectResult) -> Pa
         parse_source: parse_source_label(&result.parse_source),
         parser_id: result.normalized.parser_id.to_string(),
         schema_version: result.normalized.schema_version.to_string(),
-        canonical_hash: result.normalized.canonical_hash.clone(),
+        canonical_hash: result.normalized.canonical_cache_key.clone(),
         warnings,
         detect_latency_us: result.detect_latency_us,
         capture_mode: capture_mode_label(&result.capture_mode).to_string(),
@@ -239,9 +239,10 @@ pub fn extract_unknown_graphql_operation_record(
         return None;
     }
 
-    let operation_name = match &result.parse_source {
-        ParseSource::GraphQL {
+    let operation_name = match &result.normalized.format_metadata {
+        FormatMeta::GraphQl {
             operation_name: Some(operation_name),
+            ..
         } => operation_name.clone(),
         _ => "anonymous".to_string(),
     };
@@ -252,8 +253,8 @@ pub fn extract_unknown_graphql_operation_record(
         created_at: now_epoch_secs(),
         operation_name,
         host: extract_host(req),
-        provider: result.normalized.provider.canonical_name().to_string(),
-        canonical_hash: result.normalized.canonical_hash.clone(),
+        provider: result.normalized.provider.clone(),
+        canonical_hash: result.normalized.canonical_cache_key.clone(),
         warning_code: "graphql_unknown_operation".to_string(),
     })
 }
@@ -284,19 +285,11 @@ pub fn confidence_rank(value: &ParseConfidence) -> u8 {
 
 fn parse_source_label(value: &ParseSource) -> String {
     match value {
-        ParseSource::OpenAI => "openai".to_string(),
-        ParseSource::Anthropic => "anthropic".to_string(),
-        ParseSource::Cohere => "cohere".to_string(),
-        ParseSource::Google => "google".to_string(),
-        ParseSource::Bedrock => "bedrock".to_string(),
-        ParseSource::GraphQL { operation_name } => {
-            format!("graphql:{}", operation_name.clone().unwrap_or_default())
-        }
-        ParseSource::Grpc { service, method } => format!("grpc:{service}/{method}"),
-        ParseSource::JsonRpc { method } => {
-            format!("jsonrpc:{}", method.clone().unwrap_or_default())
-        }
-        ParseSource::AgentApp { app_id } => format!("agent_app:{app_id}"),
+        ParseSource::Rest { provider } => format!("rest:{}", provider.canonical_name()),
+        ParseSource::GraphQl => "graphql".to_string(),
+        ParseSource::Grpc => "grpc".to_string(),
+        ParseSource::JsonRpc => "jsonrpc".to_string(),
+        ParseSource::AgentApp => "agent_app".to_string(),
         ParseSource::Heuristic => "heuristic".to_string(),
         ParseSource::Filtered => "filtered".to_string(),
     }

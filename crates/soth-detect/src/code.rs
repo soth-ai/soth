@@ -1,8 +1,6 @@
 use crate::hash::sha256_hex;
-use crate::types::{
-    ArtifactLocation, ArtifactType, DetectWarning, DetectedImportCategory, SensitiveArtifact,
-    Severity,
-};
+use crate::types::{ArtifactLocation, DetectWarning, DetectedImportCategory, SensitiveArtifact};
+use soth_core::{ArtifactKind, ArtifactSeverity};
 #[cfg(feature = "tree-sitter")]
 use std::panic::catch_unwind;
 #[cfg(feature = "tree-sitter")]
@@ -38,6 +36,17 @@ static CODE_KEYWORDS: &[&str] = &[
 ];
 
 pub fn has_code_content(content: &str) -> bool {
+    use crate::util::{safe_prefix, safe_suffix, SAMPLING_THRESHOLD_BYTES, SAMPLE_PREFIX_BYTES, SAMPLE_SUFFIX_BYTES};
+
+    if content.len() <= SAMPLING_THRESHOLD_BYTES {
+        return has_code_content_inner(content);
+    }
+    let head = safe_prefix(content, SAMPLE_PREFIX_BYTES);
+    let tail = safe_suffix(content, SAMPLE_SUFFIX_BYTES);
+    has_code_content_inner(head) || has_code_content_inner(tail)
+}
+
+fn has_code_content_inner(content: &str) -> bool {
     let mut signals: u8 = 0;
 
     if content.contains("```") {
@@ -344,7 +353,7 @@ fn analyze_with_tree_sitter(content: &str, language: &str) -> Option<TreeSitterR
     let has_auth_logic = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Auth));
     let has_crypto_operations = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Crypto));
     let has_network_calls = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Network));
-    let has_file_io = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::FileSystem));
+    let has_file_io = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Filesystem));
 
     let complexity_estimate = estimate_complexity(function_count, &import_categories, has_auth_logic, has_crypto_operations, has_network_calls);
 
@@ -370,7 +379,7 @@ fn fallback_analysis(content: &str, language: &str) -> Option<TreeSitterResult> 
     let has_auth_logic = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Auth));
     let has_crypto_operations = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Crypto));
     let has_network_calls = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Network));
-    let has_file_io = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::FileSystem));
+    let has_file_io = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Filesystem));
 
     let _ = &text_lc; // suppress warning
 
@@ -472,7 +481,7 @@ fn classify_imports(imports: &[String]) -> Vec<DetectedImportCategory> {
         categories.push(DetectedImportCategory::Database);
     }
     if filesystem_keywords.iter().any(|k| joined.contains(k)) {
-        categories.push(DetectedImportCategory::FileSystem);
+        categories.push(DetectedImportCategory::Filesystem);
     }
     if serialization_keywords.iter().any(|k| joined.contains(k)) {
         categories.push(DetectedImportCategory::Serialization);
@@ -588,11 +597,11 @@ fn count_error_nodes(root: Node<'_>) -> u32 {
 
 fn code_artifact(content: &str, language: &str, location: ArtifactLocation) -> SensitiveArtifact {
     SensitiveArtifact {
-        artifact_type: ArtifactType::CodeBlock {
+        kind: ArtifactKind::CodeBlock {
             language: language.to_string(),
         },
-        commitment: sha256_hex(format!("code_block:{}:{}", language, content)),
-        severity: Severity::Low,
+        commitment: Some(sha256_hex(format!("code_block:{}:{}", language, content))),
+        severity: ArtifactSeverity::Low,
         location,
         redacted_hint: None,
     }

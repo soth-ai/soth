@@ -11,7 +11,7 @@
 use bytes::Bytes;
 use soth_core::{DetectedProvider, MatchingRule, SignalKind, SignalMatcher};
 use soth_core::{
-    ApplicationEntry, OwnedDetectBundle, ProviderEntry, RestFormatDescriptor, RestRequestPaths,
+    ProductEntry, OwnedDetectBundle, ProviderEntry, RestFormatDescriptor, RestRequestPaths,
 };
 use soth_detect::{
     build_registry, process_with_registry, ConnectionMeta, ProcessInfo, RawRequest,
@@ -249,7 +249,7 @@ fn build_v3_detect_bundle() -> OwnedDetectBundle {
     let mut applications = HashMap::new();
     applications.insert(
         "chatgpt".to_string(),
-        ApplicationEntry {
+        ProductEntry {
             app_id: Some("chatgpt".to_string()),
             name: Some("ChatGPT".to_string()),
             api_format: Some("chatgpt_web".to_string()),
@@ -264,7 +264,7 @@ fn build_v3_detect_bundle() -> OwnedDetectBundle {
     );
     applications.insert(
         "claude".to_string(),
-        ApplicationEntry {
+        ProductEntry {
             app_id: Some("claude".to_string()),
             name: Some("Claude".to_string()),
             api_format: Some("claude_web".to_string()),
@@ -279,7 +279,7 @@ fn build_v3_detect_bundle() -> OwnedDetectBundle {
     );
     applications.insert(
         "gemini".to_string(),
-        ApplicationEntry {
+        ProductEntry {
             app_id: Some("gemini".to_string()),
             name: Some("Gemini".to_string()),
             api_format: Some("gemini_web".to_string()),
@@ -294,7 +294,7 @@ fn build_v3_detect_bundle() -> OwnedDetectBundle {
     );
     applications.insert(
         "claude-code".to_string(),
-        ApplicationEntry {
+        ProductEntry {
             app_id: Some("claude-code".to_string()),
             name: Some("Claude Code".to_string()),
             matching_rules: vec![
@@ -316,7 +316,7 @@ fn build_v3_detect_bundle() -> OwnedDetectBundle {
     );
     applications.insert(
         "cursor".to_string(),
-        ApplicationEntry {
+        ProductEntry {
             app_id: Some("cursor".to_string()),
             name: Some("Cursor".to_string()),
             matching_rules: vec![
@@ -344,7 +344,7 @@ fn build_v3_detect_bundle() -> OwnedDetectBundle {
         rest_formats,
         domain_index,
         llm_providers,
-        applications,
+        products: applications,
         ..Default::default()
     }
 }
@@ -434,10 +434,10 @@ fn v3_wire_roundtrip_full_pipeline() {
     assert_eq!(openai.matching_rules.len(), 1, "openai should have 1 rule");
     assert_eq!(openai.matching_rules[0].rule_id, "openai-host");
 
-    let cursor = deserialized.applications.get("cursor").unwrap();
+    let cursor = deserialized.products.get("cursor").unwrap();
     assert_eq!(cursor.matching_rules.len(), 2, "cursor should have 2 rules");
 
-    let claude_code = deserialized.applications.get("claude-code").unwrap();
+    let claude_code = deserialized.products.get("claude-code").unwrap();
     assert_eq!(
         claude_code.matching_rules.len(),
         2,
@@ -458,7 +458,7 @@ fn v3_wire_roundtrip_full_pipeline() {
         );
 
         assert_eq!(
-            result.normalized.provider.canonical_name(),
+            result.normalized.provider.as_str(),
             case.expected_provider,
             "case '{}': provider mismatch",
             case.name,
@@ -521,7 +521,7 @@ fn v3_classify_refines_application_in_pipeline() {
 
     // Provider attribution: openai (format detection).
     assert_eq!(
-        result.normalized.provider.canonical_name(),
+        result.normalized.provider.as_str(),
         "openai",
         "cursor traffic should be attributed to openai provider"
     );
@@ -545,7 +545,7 @@ fn v2_bundle_no_matching_rules_still_works() {
     for (_, entry) in bundle.llm_providers.iter_mut() {
         entry.matching_rules.clear();
     }
-    for (_, entry) in bundle.applications.iter_mut() {
+    for (_, entry) in bundle.products.iter_mut() {
         entry.matching_rules.clear();
     }
 
@@ -580,7 +580,7 @@ fn v2_bundle_no_matching_rules_still_works() {
     };
 
     let result = process_with_registry(&registry, &request, &bundle.as_slice(), &snapshot);
-    assert_eq!(result.normalized.provider.canonical_name(), "openai");
+    assert_eq!(result.normalized.provider.as_str(), "openai");
     assert_eq!(
         result.parse_source,
         soth_core::ParseSource::Rest {

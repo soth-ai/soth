@@ -20,10 +20,7 @@ mod util;
 
 use once_cell::sync::Lazy;
 
-pub use engine::{
-    map_artifact, map_artifact_kind, map_artifact_location, map_artifact_severity,
-    map_import_category, process, process_with_registry, to_core_detect_result, ParserRegistry,
-};
+pub use engine::{process, process_with_registry, to_core_detect_result, ParserRegistry};
 pub use fingerprint::{
     classify_request, classify_request_pair, fingerprint, ClassifyPairResult, ClassifyResult,
 };
@@ -70,7 +67,10 @@ impl std::error::Error for DetectError {}
 
 pub fn build_registry(bundle: &DetectBundleSlice<'_>) -> Result<ParserRegistry, DetectError> {
     let apq_cache_capacity = bundle.graphql_operations.operations.len().clamp(512, 4096);
-    Ok(ParserRegistry::new(apq_cache_capacity))
+    Ok(ParserRegistry::with_org_patterns(
+        apq_cache_capacity,
+        bundle.org_patterns,
+    ))
 }
 
 pub fn process_chunk(
@@ -83,6 +83,46 @@ pub fn process_chunk(
 
 pub fn finalize_stream(state: StreamDetectState) -> soth_core::DetectResult {
     to_core_detect_result(&stream::finalize_stream_detect(state))
+}
+
+/// Resolve the `api_format` for a request by matching host + path against
+/// entity matching rules in the bundle. Used by WebSocket stream sessions
+/// where the initial GET has no body and format can't be fingerprinted.
+pub fn classify_request_format(
+    host: &str,
+    path: &str,
+    bundle: &DetectBundleSlice<'_>,
+) -> Option<String> {
+    let empty_headers = std::collections::BTreeMap::new();
+    let pair = fingerprint::classify_request_pair(
+        Some(host),
+        path,
+        &empty_headers,
+        None, None, None,
+        bundle,
+    );
+    // Prefer application match (more specific path rules) over provider
+    if let Some(app) = &pair.application {
+        if let Some(entry) = bundle.products.get(&app.entity_id) {
+            if let Some(fmt) = entry.api_format.as_deref() {
+                return Some(fmt.to_string());
+            }
+        }
+    }
+    if let Some(prov) = &pair.provider {
+        if let Some(entry) = bundle.llm_providers.get(&prov.entity_id) {
+            if let Some(fmt) = entry.api_format.as_deref() {
+                return Some(fmt.to_string());
+            }
+        }
+        // Provider might be in applications (product entities)
+        if let Some(entry) = bundle.products.get(&prov.entity_id) {
+            if let Some(fmt) = entry.api_format.as_deref() {
+                return Some(fmt.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -217,6 +257,7 @@ mod tests {
                 br#"{"operationName":"SendAIMessage","variables":{"input":{"content":"chunk hello"}}}"#,
             ),
             frame_kind: FrameKind::WebSocketText,
+            direction: None,
         };
 
         let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
@@ -226,7 +267,9 @@ mod tests {
     }
 
     #[test]
-    fn websocket_text_chunk_extracts_jsonrpc_delta_content() {
+    fn websocket_text_chunk_accumulates_jsonrpc_raw() {
+        // JSON-RPC streaming extraction was removed (no AI provider uses it).
+        // The raw JSON is still accumulated as a server WebSocket frame.
         let bundle = bundle_fixture();
         let mut session = StreamSession::new(Uuid::new_v4(), CaptureMode::MetadataOnly);
         let chunk = StreamChunk {
@@ -236,12 +279,14 @@ mod tests {
                 br#"{"jsonrpc":"2.0","method":"responses.delta","params":{"delta":{"content":"jsonrpc delta hello"}}}"#,
             ),
             frame_kind: FrameKind::WebSocketText,
+            direction: Some(soth_core::FrameDirection::ServerToClient),
         };
 
         let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         assert!(out.is_none());
         assert_eq!(session.delta_buffer.len(), 1);
-        assert_eq!(session.delta_buffer[0], "jsonrpc delta hello");
+        // Raw JSON accumulated (no JSON-RPC-specific extraction)
+        assert!(session.delta_buffer[0].contains("jsonrpc"));
     }
 
     #[test]
@@ -255,6 +300,7 @@ mod tests {
                 b"--chunk-boundary\r\nContent-Type: application/json\r\n\r\n{\"choices\":[{\"delta\":{\"content\":\"multipart chunk hello\"}}]}\r\n--chunk-boundary--\r\n",
             ),
             frame_kind: FrameKind::MultipartMixed,
+            direction: None,
         };
 
         let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
@@ -480,6 +526,7 @@ mod tests {
             sequence: 1,
             payload: Bytes::from(payload),
             frame_kind: FrameKind::GrpcMessage,
+            direction: None,
         };
 
         let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());

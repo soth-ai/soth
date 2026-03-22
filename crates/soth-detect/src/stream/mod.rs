@@ -1,16 +1,21 @@
 use crate::graphql::parse_graphql_payload_text;
 use crate::grpc::parse_grpc_chunk_payload;
 use crate::hash::hash_content;
-use crate::jsonrpc::parse_jsonrpc_payload_text;
+// JSON-RPC streaming fallback removed — no real-world AI provider uses
+// JSON-RPC for streaming responses. The jsonrpc parser is still available
+// for request-side detection via DetectedFormat::JsonRpc.
 use crate::sensitive::credential_scan;
 use crate::types::{
     ArtifactLocation, CaptureMode, ChunkArtifact, DetectBundleSlice, DetectResult, DetectWarning,
-    FrameKind, ParseConfidence, ParseSource, StreamChunk, StreamSession, StreamSummary,
+    FrameDirection, FrameKind, ParseConfidence, ParseSource, StreamChunk, StreamSession,
+    StreamSummary,
 };
 use bytes::Bytes;
 
 mod gemini;
 mod multipart;
+pub mod rules;
+mod socketio;
 mod sse;
 mod usage;
 mod websocket;
@@ -18,6 +23,7 @@ mod websocket;
 pub(crate) use gemini::extract_gemini_length_prefixed;
 
 use crate::types::RestFormatDescriptor;
+use soth_core::bundle::detect::FeatureResponseSpec;
 use multipart::parse_multipart_payload_text;
 use sse::extract_sse_rest_delta;
 use websocket::process_websocket_turn;
@@ -61,48 +67,127 @@ pub fn process_chunk_with_bundle(
             if let Some(fr) = sse.finish_reason {
                 session.last_finish_reason = Some(fr);
             }
-            // Prefer the SSE-extracted delta; fall back to GraphQL/JSON-RPC/Gemini parsers.
+            // Prefer the SSE-extracted delta; fall back to GraphQL/Gemini parsers.
             if let Some(delta) = sse
                 .delta
                 .or_else(|| parse_graphql_payload_text(&chunk.payload))
-                .or_else(|| parse_jsonrpc_payload_text(&chunk.payload))
                 .or_else(|| extract_gemini_length_prefixed(&chunk.payload))
             {
                 session.accumulate(delta);
             }
         }
         FrameKind::WebSocketText => {
-            // Single-pass: parse JSON once for model + usage + finish_reason + delta.
-            let sse = extract_all_from_sse_lines(
-                &chunk.payload,
-                session.model.is_none(),
-                descriptor,
-            );
-            if let Some(model) = sse.model {
-                session.model = Some(model);
-            }
-            if let Some(usage) = sse.usage {
-                session.last_usage = Some(usage);
-            }
-            if let Some(fr) = sse.finish_reason {
-                session.last_finish_reason = Some(fr);
-            }
+            // Check if payload is binary-encoded (protobuf/msgpack) despite
+            // being sent as a WebSocket text frame.
+            let is_binary_encoded = !chunk.payload.is_empty()
+                && std::str::from_utf8(&chunk.payload).is_err();
 
-            // For WebSocket streams, detect per-turn lifecycle events.
-            if session.is_websocket {
-                if let Some(turn) = process_websocket_turn(&chunk.payload, session) {
-                    return Some(ChunkEvent::TurnCompleted(turn));
+            if is_binary_encoded {
+                // Binary-encoded WebSocket frame (e.g. Codex protobuf).
+                // Try protobuf string extraction.
+                if looks_like_protobuf_payload(&chunk.payload) {
+                    if let Some(delta) = parse_grpc_chunk_payload(
+                        &chunk.payload,
+                        bundle,
+                        session.grpc_service.as_deref(),
+                        session.grpc_method.as_deref(),
+                    ) {
+                        session.accumulate(delta);
+                    }
                 }
-            }
+            } else {
+                // Socket.IO framing: if the payload starts with a Socket.IO
+                // packet prefix (e.g. `42["event", ...]`), unwrap it first
+                // and process only the inner JSON data.
+                if socketio::looks_like_socketio(&chunk.payload) {
+                    if let Some(socketio::SocketIoFrame::Event {
+                        data_json, ..
+                    }) = socketio::decode_socketio_frame(&chunk.payload)
+                    {
+                        let data_bytes = data_json.as_bytes();
+                        let sse = extract_all_from_sse_lines(
+                            data_bytes,
+                            session.model.is_none(),
+                            descriptor,
+                        );
+                        if let Some(model) = sse.model {
+                            session.model = Some(model);
+                        }
+                        if let Some(usage) = sse.usage {
+                            session.last_usage = Some(usage);
+                        }
+                        if let Some(fr) = sse.finish_reason {
+                            session.last_finish_reason = Some(fr);
+                        }
+                        if let Some(delta) = sse.delta {
+                            session.accumulate(delta);
+                        }
+                    }
+                    // Non-EVENT Socket.IO frames (PING, PONG, ACK) are ignored.
+                    return None;
+                }
 
-            if let Some(delta) = sse
-                .delta
-                .or_else(|| parse_multipart_payload_text(&chunk.payload))
-            {
-                session.accumulate(delta);
-            } else if let Ok(text) = std::str::from_utf8(&chunk.payload) {
-                if !text.trim().is_empty() {
-                    session.accumulate(text.to_string());
+                // JSON WebSocket frame — split by direction.
+                let is_client_frame =
+                    chunk.direction == Some(FrameDirection::ClientToServer);
+
+                let is_server_frame =
+                    chunk.direction == Some(FrameDirection::ServerToClient);
+
+                if is_client_frame {
+                    // CLIENT → SERVER: extract model from request frames.
+                    if let Some(turn) = process_websocket_turn(&chunk.payload, session)
+                    {
+                        return Some(ChunkEvent::TurnCompleted(turn));
+                    }
+                    let sse = extract_all_from_sse_lines(
+                        &chunk.payload,
+                        session.model.is_none(),
+                        descriptor,
+                    );
+                    if let Some(model) = sse.model {
+                        session.model = Some(model);
+                    }
+                } else {
+                    // SERVER → CLIENT (or direction unknown): extract response data.
+                    let sse = extract_all_from_sse_lines(
+                        &chunk.payload,
+                        session.model.is_none(),
+                        descriptor,
+                    );
+                    if let Some(model) = sse.model {
+                        session.model = Some(model);
+                    }
+                    if let Some(usage) = sse.usage {
+                        session.last_usage = Some(usage);
+                    }
+                    if let Some(fr) = sse.finish_reason {
+                        session.last_finish_reason = Some(fr);
+                    }
+
+                    if session.is_websocket {
+                        if let Some(turn) =
+                            process_websocket_turn(&chunk.payload, session)
+                        {
+                            return Some(ChunkEvent::TurnCompleted(turn));
+                        }
+                    }
+
+                    // Only accumulate content when we KNOW it's a server frame.
+                    // With direction=None (old mitm), skip accumulation to avoid
+                    // treating client prompts as response content.
+                    if is_server_frame {
+                        if let Some(delta) = sse
+                            .delta
+                            .or_else(|| parse_multipart_payload_text(&chunk.payload))
+                        {
+                            session.accumulate(delta);
+                        } else if let Ok(text) = std::str::from_utf8(&chunk.payload) {
+                            if !text.trim().is_empty() {
+                                session.accumulate(text.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -178,17 +263,17 @@ pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
     let summary = finalize_stream_summary(session.clone());
     let assembled = session.finalize_response_content();
 
-    let mut normalized = crate::types::NormalizedRequest::empty_heuristic("STREAM", "/stream");
+    let mut normalized = crate::types::empty_heuristic_request("STREAM", "/stream");
 
     // Carry through request context if available
     if let Some(provider) = &session.provider {
-        normalized.provider = crate::types::Provider::new(provider.clone());
+        normalized.provider = provider.clone();
     }
     if session.model.is_some() {
         normalized.model = session.model.clone();
     }
     if let Some(format) = &session.request_format {
-        normalized.format_meta = format.clone();
+        normalized.format_metadata = format.clone();
     }
     normalized.estimated_input_tokens = session.estimated_input_tokens;
 
@@ -197,23 +282,12 @@ pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
     normalized.user_content_hash = summary.response_hash.clone();
     normalized.user_content_token_estimate = token_estimate;
     normalized.conversation_hash = summary.response_hash.clone();
-    normalized.canonical_hash = summary.response_hash.clone();
-    normalized.content_sample = if assembled.is_empty() {
-        None
-    } else {
-        Some(assembled.clone())
-    };
-
+    normalized.canonical_cache_key = summary.response_hash.clone();
     let capture_mode = session.capture_mode;
-    let full_like = matches!(
-        capture_mode,
-        CaptureMode::Full | CaptureMode::SensitiveArtifacts | CaptureMode::FullContent
-    );
-    let artifacts = if full_like {
-        credential_scan(assembled.as_bytes(), ArtifactLocation::Unknown)
-    } else {
-        Vec::new()
-    };
+    // Always run credential scan — capture mode controls downstream storage,
+    // not detection. Policy rules like `detect.private_key_detected → Block`
+    // must fire regardless of capture mode.
+    let artifacts = credential_scan(assembled.as_bytes(), ArtifactLocation::Unknown);
 
     let mut warnings = Vec::new();
     warnings.push(DetectWarning {
@@ -259,6 +333,32 @@ fn extract_all_from_sse_lines(
     need_model: bool,
     descriptor: Option<&RestFormatDescriptor>,
 ) -> SseExtracted {
+    // If the descriptor has a chat feature with stream rules, use the
+    // data-driven rules engine instead of the hardcoded extraction below.
+    if let Some(desc) = descriptor {
+        if let Some(feature) = desc.features.iter().find(|f| f.feature_type == "chat") {
+            if let FeatureResponseSpec::Stream { ref stream } = feature.response {
+                let mut acc = rules::RulesAccumulator::new(&stream.accumulate);
+                let extracted = rules::extract_with_stream_rules(payload, stream, &mut acc);
+                // Also try to extract usage from the payload (rules don't cover usage yet)
+                let usage_result = std::str::from_utf8(payload).ok().and_then(|text| {
+                    text.lines().find_map(|line| {
+                        let json_str = line.trim().strip_prefix("data:").map(str::trim).unwrap_or(line.trim());
+                        if json_str.is_empty() { return None; }
+                        let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+                        usage::usage_from_json_value(&v)
+                    })
+                });
+                return SseExtracted {
+                    model: extracted.model,
+                    usage: usage_result,
+                    finish_reason: extracted.finish_reason,
+                    delta: extracted.content,
+                };
+            }
+        }
+    }
+
     let mut result = SseExtracted {
         model: None,
         usage: None,
@@ -319,32 +419,35 @@ fn extract_all_from_sse_lines(
 }
 
 fn looks_like_protobuf_payload(payload: &[u8]) -> bool {
-    if payload.is_empty() {
+    if payload.len() < 2 {
         return false;
     }
 
     let first = payload[0];
-    if first == 0 || first == 1 {
+    // gRPC framing: 0x00 (uncompressed) or 0x01 (compressed) followed by 4-byte length
+    if (first == 0 || first == 1) && payload.len() >= 5 {
         return true;
     }
 
-    // For unknown WS binary frames, we probe protobuf-like varint tag layout.
-    // Lower 3 bits are wire type and should typically be <= 5.
+    // Protobuf varint tag: require a small field number (1-15) with a common
+    // wire type (0=varint, 1=fixed64, 2=length-delimited). This avoids
+    // matching most ASCII text which the previous `wire <= 5` caught.
     let wire = first & 0x07;
-    wire <= 5
+    let field_number = first >> 3;
+    wire <= 2 && field_number >= 1 && field_number <= 15
 }
 
 fn extract_structured_text(payload: &[u8]) -> Option<String> {
     parse_graphql_payload_text(payload)
         .or_else(|| extract_sse_rest_delta(payload))
-        .or_else(|| parse_jsonrpc_payload_text(payload))
         .or_else(|| extract_gemini_length_prefixed(payload))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ArtifactType, OwnedDetectBundle};
+    use crate::types::OwnedDetectBundle;
+    use soth_core::ArtifactKind;
     use soth_parse::proto::scan_proto_strings;
     use uuid::Uuid;
 
@@ -359,6 +462,7 @@ mod tests {
                 b"data: {\"delta\":{\"content\":\"token sk-abcdefghijklmnopqrstuvwxyz1234\"}}\n\n",
             ),
             frame_kind: FrameKind::SseData,
+            direction: None,
         };
 
         let event = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
@@ -369,7 +473,7 @@ mod tests {
                 assert!(out
                     .artifacts
                     .iter()
-                    .any(|a| matches!(a.artifact_type, ArtifactType::OpenAIKey)));
+                    .any(|a| matches!(a.kind, ArtifactKind::ApiKey { .. })));
             }
             ChunkEvent::TurnCompleted(_) => panic!("expected Artifact, got TurnCompleted"),
         }
@@ -386,6 +490,7 @@ mod tests {
                 b"data: {\"delta\":{\"content\":\"token sk-abcdefghijklmnopqrstuvwxyz1234\"}}\n\n",
             ),
             frame_kind: FrameKind::SseData,
+            direction: None,
         };
 
         let out = process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
@@ -521,6 +626,7 @@ mod tests {
                 b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\"}}\n",
             ),
             frame_kind: FrameKind::SseData,
+            direction: None,
         };
         process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         assert_eq!(session.model.as_deref(), Some("claude-sonnet-4-6"));
@@ -539,6 +645,7 @@ mod tests {
                 b"data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n",
             ),
             frame_kind: FrameKind::SseData,
+            direction: None,
         };
         process_chunk_with_bundle(&chunk1, &mut session, &bundle.as_slice());
         assert_eq!(session.model.as_deref(), Some("gpt-4o"));
@@ -551,6 +658,7 @@ mod tests {
                 b"data: {\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n",
             ),
             frame_kind: FrameKind::SseData,
+            direction: None,
         };
         process_chunk_with_bundle(&chunk2, &mut session, &bundle.as_slice());
         assert_eq!(session.model.as_deref(), Some("gpt-4o"), "first model should win");
@@ -567,6 +675,7 @@ mod tests {
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"streaming content\"}}]}\n\n",
             ),
             frame_kind: FrameKind::SseData,
+            direction: None,
         };
 
         process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
@@ -773,6 +882,7 @@ mod tests {
                 br#"{"type":"response.created","response":{"id":"resp_1","model":"o3-pro"}}"#,
             ),
             frame_kind: FrameKind::WebSocketText,
+            direction: None,
         };
         process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         assert_eq!(session.model.as_deref(), Some("o3-pro"));
@@ -792,6 +902,7 @@ mod tests {
                 sequence: seq,
                 payload: Bytes::from(payload),
                 frame_kind: FrameKind::WebSocketText,
+                direction: Some(FrameDirection::ServerToClient),
             };
             process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         }
