@@ -77,12 +77,11 @@ fn parse_json_file(
         message: format!("read {}: {e}", path.display()),
     })?;
 
-    let doc: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-        ReaderError::Reader {
+    let doc: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| ReaderError::Reader {
             tool: playbook.tool.clone(),
             message: format!("parse {}: {e}", path.display()),
-        }
-    })?;
+        })?;
 
     let tool = AiTool::from_key(&playbook.tool);
     let extraction = &playbook.extraction;
@@ -113,12 +112,10 @@ fn parse_json_file(
 
     // Get the records array.
     let records = match &extraction.records.iterate {
-        RecordIterMethod::Field { path: field_path } => {
-            match resolve_path(&doc, field_path) {
-                Some(serde_json::Value::Array(arr)) => arr.clone(),
-                _ => return Ok(None),
-            }
-        }
+        RecordIterMethod::Field { path: field_path } => match resolve_path(&doc, field_path) {
+            Some(serde_json::Value::Array(arr)) => arr.clone(),
+            _ => return Ok(None),
+        },
         RecordIterMethod::Lines => {
             // For JSON files with Lines iteration, treat the whole doc as a single record.
             vec![doc.clone()]
@@ -148,7 +145,11 @@ fn parse_json_file(
         };
 
         // Extract timestamp.
-        let ts = parse_timestamp(record, &extraction.timestamp.field, &extraction.timestamp.format);
+        let ts = parse_timestamp(
+            record,
+            &extraction.timestamp.field,
+            &extraction.timestamp.format,
+        );
 
         // Apply `since` filter.
         if let (Some(since_ms), Some(msg_ts)) = (since, ts) {
@@ -210,11 +211,7 @@ fn parse_json_file(
 /// - `**/*.json` (recursive)
 /// - `tmp/*/chats/*.json` (specific structure)
 /// - `chats/*.json` (single level)
-fn collect_json_files(
-    root: &Path,
-    glob_pattern: &str,
-    exclude_dirs: &[String],
-) -> Vec<PathBuf> {
+fn collect_json_files(root: &Path, glob_pattern: &str, exclude_dirs: &[String]) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     // Parse the glob to determine search strategy.
@@ -237,7 +234,12 @@ fn collect_json_files(
     files
 }
 
-fn collect_recursive_json(dir: &Path, out: &mut Vec<PathBuf>, exclude_dirs: &[String], is_root: bool) {
+fn collect_recursive_json(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    exclude_dirs: &[String],
+    is_root: bool,
+) {
     if !is_root {
         let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if exclude_dirs.iter().any(|e| e == dir_name) {
@@ -333,7 +335,9 @@ mod tests {
             provider: "gemini".into(),
             discovery: PlaybookDiscovery {
                 roots: vec!["${HOME}/.gemini".into()],
-                detect: PlaybookDetect::GlobExists { pattern: "tmp/*/chats/*.json".into() },
+                detect: PlaybookDetect::GlobExists {
+                    pattern: "tmp/*/chats/*.json".into(),
+                },
                 exclude_dirs: vec!["antigravity".into()],
                 exclude_file_patterns: vec![],
             },
@@ -341,9 +345,13 @@ mod tests {
                 glob: "tmp/*/chats/*.json".into(),
             },
             extraction: PlaybookExtraction {
-                session_id: SessionIdConfig::Field { path: "sessionId".into() },
+                session_id: SessionIdConfig::Field {
+                    path: "sessionId".into(),
+                },
                 records: RecordsConfig {
-                    iterate: RecordIterMethod::Field { path: "messages".into() },
+                    iterate: RecordIterMethod::Field {
+                        path: "messages".into(),
+                    },
                     filters: vec![RecordFilter {
                         field: "type".into(),
                         include: vec!["user".into(), "gemini".into()],
@@ -363,7 +371,9 @@ mod tests {
                     session_start_field: Some("startTime".into()),
                     session_end_field: Some("lastUpdated".into()),
                 },
-                tokens: Some(TokenConfig { field: "tokens.total".into() }),
+                tokens: Some(TokenConfig {
+                    field: "tokens.total".into(),
+                }),
             },
         }
     }

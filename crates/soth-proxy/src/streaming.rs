@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use soth_core::StreamChunk;
 use soth_core::DetectBundleSlice;
+use soth_core::StreamChunk;
 use soth_detect::{ChunkEvent, StreamTurn};
 use uuid::Uuid;
 
@@ -62,8 +62,10 @@ impl StreamingStore {
         if self.inner.len() >= self.max_capacity {
             self.evict_oldest(self.max_capacity / 8);
         }
-        let mut detect_session =
-            soth_detect::StreamDetectState::new(pending.connection_id, pending.outcome.capture_mode);
+        let mut detect_session = soth_detect::StreamDetectState::new(
+            pending.connection_id,
+            pending.outcome.capture_mode,
+        );
         detect_session.is_websocket = pending.is_websocket;
 
         // Anchor timing to request arrival (stored_at) so that elapsed and TTFB
@@ -105,9 +107,7 @@ impl StreamingStore {
                     // matching_rules to find the most specific entity.
                     let host = state.pending.request_host.as_str();
                     let path = state.pending.request_path.as_str();
-                    let format_name = soth_detect::classify_request_format(
-                        host, path, bundle,
-                    );
+                    let format_name = soth_detect::classify_request_format(host, path, bundle);
                     if let Some(name) = format_name {
                         state.detect_session.set_format_name(name);
                     }
@@ -150,44 +150,39 @@ impl StreamingStore {
     }
 
     pub fn take(&self, connection_id: &Uuid) -> Option<CompletedStream> {
-        self.inner
-            .remove(connection_id)
-            .map(|(_, state)| {
-                let session = &state.detect_session;
-                // Merge finish_reason: prefer the independently-extracted one
-                // (always the most recent), falling back to the one co-located
-                // with usage data. Providers often send finish_reason in a
-                // separate chunk from usage, so the independent value is more
-                // reliable.
-                let merged_finish_reason = session
-                    .last_finish_reason
-                    .clone()
-                    .or_else(|| {
-                        session
-                            .last_usage
-                            .as_ref()
-                            .and_then(|u| u.finish_reason.clone())
-                    });
-                let usage = session.last_usage.as_ref().map(|u| UsageSummary {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    estimated_output_cost_usd: 0.0,
-                    finish_reason: merged_finish_reason,
-                });
-                let ttfb = state
-                    .first_chunk_at
-                    .and_then(|first| first.checked_duration_since(state.started_at));
-                CompletedStream {
-                    pending: state.pending,
-                    chunk_count: state.chunk_count,
-                    elapsed: state.started_at.elapsed(),
-                    usage,
-                    accumulated_payload_bytes: state.accumulated_payload_bytes,
-                    extracted_model: session.model.clone(),
-                    ttfb,
-                    stream_artifacts: state.stream_artifacts,
-                }
-            })
+        self.inner.remove(connection_id).map(|(_, state)| {
+            let session = &state.detect_session;
+            // Merge finish_reason: prefer the independently-extracted one
+            // (always the most recent), falling back to the one co-located
+            // with usage data. Providers often send finish_reason in a
+            // separate chunk from usage, so the independent value is more
+            // reliable.
+            let merged_finish_reason = session.last_finish_reason.clone().or_else(|| {
+                session
+                    .last_usage
+                    .as_ref()
+                    .and_then(|u| u.finish_reason.clone())
+            });
+            let usage = session.last_usage.as_ref().map(|u| UsageSummary {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                estimated_output_cost_usd: 0.0,
+                finish_reason: merged_finish_reason,
+            });
+            let ttfb = state
+                .first_chunk_at
+                .and_then(|first| first.checked_duration_since(state.started_at));
+            CompletedStream {
+                pending: state.pending,
+                chunk_count: state.chunk_count,
+                elapsed: state.started_at.elapsed(),
+                usage,
+                accumulated_payload_bytes: state.accumulated_payload_bytes,
+                extracted_model: session.model.clone(),
+                ttfb,
+                stream_artifacts: state.stream_artifacts,
+            }
+        })
     }
 
     pub fn evict_stale(&self, max_age: Duration, max_scan: usize) {
@@ -208,7 +203,9 @@ impl StreamingStore {
     }
 
     fn evict_oldest(&self, count: usize) {
-        let mut entries: Vec<(Uuid, Instant)> = self.inner.iter()
+        let mut entries: Vec<(Uuid, Instant)> = self
+            .inner
+            .iter()
             .map(|e| (*e.key(), e.value().started_at))
             .collect();
         entries.sort_by_key(|(_, ts)| *ts);

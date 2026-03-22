@@ -33,13 +33,11 @@ pub(crate) fn run(
     let started = Instant::now();
 
     // Use precomputed nonce from proxy if available, otherwise generate
-    let nonce = proxy_ctx
-        .precomputed_commitment_nonce
-        .unwrap_or_else(|| {
-            let mut n = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut n);
-            n
-        });
+    let nonce = proxy_ctx.precomputed_commitment_nonce.unwrap_or_else(|| {
+        let mut n = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut n);
+        n
+    });
 
     // Commitment hash: use precomputed from proxy, or empty until proxy ships it
     let commitment_hash = proxy_ctx
@@ -82,7 +80,11 @@ pub(crate) fn run(
         anomaly_flags: anomaly.flags.clone(),
         anomaly_score: Some(anomaly.score),
         policy_kind: Some(map_policy_kind(&policy.decision.kind)),
-        policy_rule_id: policy.decision.matched_rule.as_ref().map(|r| r.rule_id.clone()),
+        policy_rule_id: policy
+            .decision
+            .matched_rule
+            .as_ref()
+            .map(|r| r.rule_id.clone()),
         bundle_trust_level: proxy_ctx.bundle_trust_level,
         sensitive_code_flags: build_sensitive_code_flags(
             &detect_result.artifacts,
@@ -124,14 +126,8 @@ pub(crate) fn run(
         finish_reason: None,
         response_latency_ms: None,
         ttfb_ms: None,
-        session_request_count: proxy_ctx
-            .session_snapshot
-            .as_ref()
-            .map(|s| s.request_count),
-        session_total_tokens: proxy_ctx
-            .session_snapshot
-            .as_ref()
-            .map(|s| s.total_tokens),
+        session_request_count: proxy_ctx.session_snapshot.as_ref().map(|s| s.request_count),
+        session_total_tokens: proxy_ctx.session_snapshot.as_ref().map(|s| s.total_tokens),
         session_credential_alerts: proxy_ctx
             .session_snapshot
             .as_ref()
@@ -357,7 +353,10 @@ mod tests {
                     provider: soth_core::DetectedProvider::OpenAi,
                 },
                 canonical_cache_key: "cache-key".to_string(),
-                format_metadata: soth_core::FormatMetadata::Unknown { method: String::new(), path: String::new() },
+                format_metadata: soth_core::FormatMetadata::Unknown {
+                    method: String::new(),
+                    path: String::new(),
+                },
                 has_structured_output: false,
                 has_tool_results: false,
                 estimated_output_tokens: None,

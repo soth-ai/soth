@@ -1,4 +1,4 @@
-//! Direct conversion from [`soth_interface::NativeBundle`] to [`soth_core::GatingBundle`],
+//! Direct conversion from [`soth_core::native_bundle::NativeBundle`] to [`soth_core::GatingBundle`],
 //! bypassing the intermediate `OwnedDetectBundle` representation.
 //!
 //! This is the 1-hop path:
@@ -16,7 +16,7 @@
 //! # #[cfg(feature = "native-bundle")]
 //! # {
 //! use soth_bundle::gating_from_native;
-//! use soth_interface::NativeBundle;
+//! use soth_core::native_bundle::NativeBundle;
 //!
 //! let json = std::fs::read_to_string("bundle.json").unwrap();
 //! let bundle: NativeBundle = serde_json::from_str(&json).unwrap();
@@ -27,13 +27,12 @@
 
 use std::collections::HashSet;
 
+use soth_core::native_bundle::NativeBundle;
 use soth_core::{
-    normalize_bundle_host_pattern, BlacklistMatchType, EntityCatalog,
-    GateConfig, GateDefaults, GatingBundle, IdentityIndex,
-    NonCatalogedAction, Stage0Config, Stage1Config, Stage2Config,
+    normalize_bundle_host_pattern, BlacklistMatchType, EntityCatalog, GateConfig, GateDefaults,
+    GatingBundle, IdentityIndex, NonCatalogedAction, Stage0Config, Stage1Config, Stage2Config,
     Stage3Config, Stage4Config, Stage5Config, UnknownAppAction,
 };
-use soth_interface::NativeBundle;
 
 use crate::entity_helpers::source_entities;
 
@@ -62,7 +61,7 @@ pub fn gating_from_native(bundle: &NativeBundle) -> GatingBundle {
         }
     }
     // Also include entries from the domain_index.
-    for (host, _entries) in &bundle.domain_index {
+    for host in bundle.domain_index.keys() {
         if let Some(normalized) = normalize_bundle_host_pattern(host) {
             tls_intercept_hosts.insert(normalized);
         }
@@ -188,7 +187,7 @@ pub fn gating_from_native(bundle: &NativeBundle) -> GatingBundle {
 
 #[cfg(test)]
 mod tests {
-    use soth_interface::{
+    use soth_core::native_bundle::{
         NativeBundle, NativeBundleCapture, NativeBundleEntity, NativeBundleMetadata,
         NativeBundleRule, NativeBundleSignal,
     };
@@ -338,10 +337,7 @@ mod tests {
             Some("llm_provider"),
             Some("platform"),
             "metadata_only",
-            vec![rule(vec![signal(
-                "HttpHost",
-                "^.*\\.openai\\.com$",
-            )])],
+            vec![rule(vec![signal("HttpHost", "^.*\\.openai\\.com$")])],
         ));
 
         let gating = gating_from_native(&bundle);
@@ -360,7 +356,7 @@ mod tests {
     /// passthrough_domains setting is parsed from bundle.settings.
     #[test]
     fn passthrough_domains_from_settings() {
-        use soth_interface::NativeBundleSetting;
+        use soth_core::native_bundle::NativeBundleSetting;
 
         let mut bundle = empty_bundle();
         bundle.settings.push(NativeBundleSetting {
@@ -378,7 +374,7 @@ mod tests {
     /// path_keywords filter populates the stage3 blacklist.
     #[test]
     fn path_keywords_filter_populates_blacklist() {
-        use soth_interface::NativeBundleFilter;
+        use soth_core::native_bundle::NativeBundleFilter;
 
         let mut bundle = empty_bundle();
         bundle.filters.push(NativeBundleFilter {
@@ -456,7 +452,7 @@ mod tests {
     /// domain_index entries also contribute to tls_intercept_hosts.
     #[test]
     fn domain_index_contributes_to_tls_intercept_hosts() {
-        use soth_interface::NativeBundleDomainIndexEntry;
+        use soth_core::native_bundle::NativeBundleDomainIndexEntry;
         use std::collections::BTreeMap;
 
         let mut bundle = empty_bundle();

@@ -60,7 +60,7 @@ const SYNC_TELEMETRY_REGISTRY_VALIDATION_FAILED: &str = "sync.registry.validatio
 const REGISTRY_BUNDLE_DEGRADED_AGE_SECS: u64 = 24 * 60 * 60;
 
 const MIN_LIVE_EVENTS: usize = 25;
-const MIN_LIVE_COMPRESSED_BYTES: usize = 1 * 1024 * 1024;
+const MIN_LIVE_COMPRESSED_BYTES: usize = 1024 * 1024;
 const MIN_FRONTLOAD_EVENTS: usize = 50;
 const MIN_FRONTLOAD_COMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 
@@ -1151,7 +1151,7 @@ impl SyncAgent {
                             item.row.attempt_count,
                         )?;
                     }
-                    self.set_sync_error(&format!("exchange_upload_error:{}", error))?;
+                    self.set_sync_error(&format!("exchange_upload_error:{error}"))?;
                     return Err(error);
                 }
             }
@@ -1401,7 +1401,7 @@ fn ensure_exchange_sync_schema(conn: &Connection) -> anyhow::Result<()> {
 }
 
 fn run_exchange_uuid_cleanup_migration(conn: &Connection) -> anyhow::Result<()> {
-    if !sqlite_table_exists(&conn, "sync_state")? {
+    if !sqlite_table_exists(conn, "sync_state")? {
         return Ok(());
     }
     let already_done: Option<String> = conn
@@ -1417,13 +1417,13 @@ fn run_exchange_uuid_cleanup_migration(conn: &Connection) -> anyhow::Result<()> 
 
     let mut deleted_total = 0usize;
     for table in ["exchange_upload_queue", "exchange_events", "exchange_spool"] {
-        if sqlite_table_exists(&conn, table)? {
-            deleted_total += prune_non_uuid_exchange_ids(&conn, table)?;
+        if sqlite_table_exists(conn, table)? {
+            deleted_total += prune_non_uuid_exchange_ids(conn, table)?;
         }
     }
 
     write_sync_state(
-        &conn,
+        conn,
         SYNC_KEY_EXCHANGE_UUID_CLEANUP_V1,
         &format!("deleted={deleted_total}"),
     )?;
@@ -1450,7 +1450,7 @@ fn run_exchange_spool_stale_cleanup_once(
     max_age: Duration,
     limit: usize,
 ) -> anyhow::Result<()> {
-    if !sqlite_table_exists(&conn, "exchange_spool")? {
+    if !sqlite_table_exists(conn, "exchange_spool")? {
         return Ok(());
     }
 
@@ -1893,7 +1893,7 @@ fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<S
             let path = if path.is_empty() {
                 None
             } else {
-                Some(format!("/{}", path))
+                Some(format!("/{path}"))
             };
             return (Some(host.to_string()), path);
         }
@@ -1903,7 +1903,7 @@ fn split_endpoint_host_path(endpoint: Option<&str>) -> (Option<String>, Option<S
     if endpoint.contains('/') {
         let mut parts = endpoint.splitn(2, '/');
         let host = parts.next().unwrap_or_default();
-        let path = parts.next().map(|value| format!("/{}", value));
+        let path = parts.next().map(|value| format!("/{value}"));
         let host = if host.is_empty() {
             None
         } else {

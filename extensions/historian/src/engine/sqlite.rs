@@ -11,7 +11,7 @@ use crate::playbook::{Playbook, PlaybookSource, RecordIterMethod, SessionIdConfi
 use crate::types::{AiTool, Cursor, HistoricalMessage, HistoricalSession};
 
 use super::{
-    extract_content, extract_role, extract_tokens, passes_filters, parse_timestamp, resolve_path,
+    extract_content, extract_role, extract_tokens, parse_timestamp, passes_filters, resolve_path,
     resolve_string,
 };
 
@@ -40,14 +40,10 @@ pub fn read_sessions_sqlite<'a>(
     };
 
     // Snapshot the last rowid for incremental reads.
-    let since_rowid = cursor
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|c| match c {
-            Cursor::SqliteRowId { last_rowid, .. } => Some(*last_rowid),
-            _ => None,
-        });
+    let since_rowid = cursor.lock().unwrap().as_ref().and_then(|c| match c {
+        Cursor::SqliteRowId { last_rowid, .. } => Some(*last_rowid),
+        _ => None,
+    });
 
     Box::pin(async_stream::try_stream! {
         let db_path = resolve_db_path(&root, &db_file).ok_or_else(|| ReaderError::Reader {
@@ -105,7 +101,8 @@ fn open_readonly(db_path: &Path, tool: &str) -> Result<Connection, ReaderError> 
         message: format!("open {}: {e}", db_path.display()),
     })?;
 
-    conn.busy_timeout(std::time::Duration::from_millis(500)).ok();
+    conn.busy_timeout(std::time::Duration::from_millis(500))
+        .ok();
     Ok(conn)
 }
 
@@ -146,15 +143,11 @@ fn read_kv_sessions(
             rowid
         )
     } else {
-        format!(
-            "WHERE key LIKE '{}%'",
-            key_prefix.replace('\'', "''")
-        )
+        format!("WHERE key LIKE '{}%'", key_prefix.replace('\'', "''"))
     };
 
-    let sql = format!(
-        "SELECT {value_column}, rowid FROM {table} {where_clause} ORDER BY rowid ASC"
-    );
+    let sql =
+        format!("SELECT {value_column}, rowid FROM {table} {where_clause} ORDER BY rowid ASC");
 
     let mut stmt = conn.prepare(&sql).map_err(|e| ReaderError::Reader {
         tool: playbook.tool.clone(),
@@ -203,12 +196,10 @@ fn read_kv_sessions(
 
         // Get records array.
         let records = match &extraction.records.iterate {
-            RecordIterMethod::Field { path } => {
-                match resolve_path(&doc, path) {
-                    Some(serde_json::Value::Array(arr)) => arr.clone(),
-                    _ => continue,
-                }
-            }
+            RecordIterMethod::Field { path } => match resolve_path(&doc, path) {
+                Some(serde_json::Value::Array(arr)) => arr.clone(),
+                _ => continue,
+            },
             RecordIterMethod::Lines => vec![doc.clone()],
         };
 
@@ -236,8 +227,12 @@ fn read_kv_sessions(
                 None => continue,
             };
 
-            let ts = parse_timestamp(record, &extraction.timestamp.field, &extraction.timestamp.format)
-                .or(session_ts);
+            let ts = parse_timestamp(
+                record,
+                &extraction.timestamp.field,
+                &extraction.timestamp.format,
+            )
+            .or(session_ts);
 
             let token_estimate = extract_tokens(record, &extraction.tokens, &text);
 
@@ -282,7 +277,9 @@ mod tests {
             provider: "openai".into(),
             discovery: PlaybookDiscovery {
                 roots: vec!["${HOME}/Library/Application Support/Cursor/User/globalStorage".into()],
-                detect: PlaybookDetect::SqliteFile { filename: "state.vscdb".into() },
+                detect: PlaybookDetect::SqliteFile {
+                    filename: "state.vscdb".into(),
+                },
                 exclude_dirs: vec![],
                 exclude_file_patterns: vec![],
             },
@@ -293,9 +290,13 @@ mod tests {
                 value_column: "value".into(),
             },
             extraction: PlaybookExtraction {
-                session_id: SessionIdConfig::Field { path: "composerId".into() },
+                session_id: SessionIdConfig::Field {
+                    path: "composerId".into(),
+                },
                 records: RecordsConfig {
-                    iterate: RecordIterMethod::Field { path: "conversation".into() },
+                    iterate: RecordIterMethod::Field {
+                        path: "conversation".into(),
+                    },
                     filters: vec![],
                 },
                 role: RoleConfig {
@@ -303,9 +304,12 @@ mod tests {
                     value_map: [
                         ("1".to_string(), "user".to_string()),
                         ("2".to_string(), "assistant".to_string()),
-                    ].into(),
+                    ]
+                    .into(),
                 },
-                content: ContentConfig::Plain { field: "text".into() },
+                content: ContentConfig::Plain {
+                    field: "text".into(),
+                },
                 timestamp: TimestampConfig {
                     field: "createdAt".into(),
                     format: TimestampFormat::EpochMs,
@@ -320,10 +324,8 @@ mod tests {
     fn create_cursor_db(dir: &Path, rows: &[(&str, &str)]) -> PathBuf {
         let db_path = dir.join("state.vscdb");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
         for (key, value) in rows {
             conn.execute(
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
@@ -355,7 +357,11 @@ mod tests {
             &[
                 (
                     "composerData:s1",
-                    &composer_json("s1", 1732629531988, &[(1, "hello cursor"), (2, "hello user")]),
+                    &composer_json(
+                        "s1",
+                        1732629531988,
+                        &[(1, "hello cursor"), (2, "hello user")],
+                    ),
                 ),
                 (
                     "composerData:s2",
@@ -440,7 +446,7 @@ mod tests {
         assert!(c.is_some());
         match c.as_ref().unwrap() {
             Cursor::SqliteRowId { last_rowid, .. } => assert!(*last_rowid >= 1),
-            other => panic!("expected SqliteRowId, got {:?}", other),
+            other => panic!("expected SqliteRowId, got {other:?}"),
         }
     }
 
@@ -450,8 +456,14 @@ mod tests {
         let db_path = create_cursor_db(
             tmp.path(),
             &[
-                ("composerData:s1", &composer_json("s1", 1732629531988, &[(1, "first")])),
-                ("composerData:s2", &composer_json("s2", 1732629540000, &[(1, "second")])),
+                (
+                    "composerData:s1",
+                    &composer_json("s1", 1732629531988, &[(1, "first")]),
+                ),
+                (
+                    "composerData:s2",
+                    &composer_json("s2", 1732629540000, &[(1, "second")]),
+                ),
             ],
         );
 
@@ -493,7 +505,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("state.vscdb");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY)").unwrap();
+        conn.execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY)")
+            .unwrap();
         drop(conn);
 
         let pb = cursor_playbook();

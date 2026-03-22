@@ -283,9 +283,7 @@ pub struct FeatureRequestSpec {
 #[serde(untagged)]
 pub enum FeatureResponseSpec {
     /// Streaming response with conditional rules, accumulation, and finalization.
-    Stream {
-        stream: StreamRulesSpec,
-    },
+    Stream { stream: StreamRulesSpec },
     /// Non-streaming response: field name → JSON path.
     Direct(HashMap<String, String>),
 }
@@ -597,7 +595,7 @@ impl CaptureRules {
             return CaptureMode::Full;
         }
 
-        self.default_mode.clone()
+        self.default_mode
     }
 }
 
@@ -760,7 +758,7 @@ impl Filters {
     }
 }
 
-fn host_header<'a>(headers: &'a RequestHeaders) -> Option<&'a str> {
+fn host_header(headers: &RequestHeaders) -> Option<&str> {
     headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case(":authority"))

@@ -239,7 +239,8 @@ mod tests {
 
     #[test]
     fn try_extract_usage_gemini_length_prefixed() {
-        let body = b")]}'\n{\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":20}}";
+        let body =
+            b")]}'\n{\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":20}}";
         let usage = try_extract_usage(body).unwrap();
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 20);

@@ -1,4 +1,4 @@
-//! Adapter that converts a [`soth_interface::NativeBundle`] (the canonical
+//! Adapter that converts a [`soth_core::native_bundle::NativeBundle`] (the canonical
 //! cloud bundle format) into a [`soth_core::EntityIndex`] for O(1) identity
 //! resolution at proxy request time.
 //!
@@ -11,7 +11,7 @@
 //! # #[cfg(feature = "native-bundle")]
 //! # {
 //! use soth_bundle::entity_index::entity_index_from_native;
-//! use soth_interface::NativeBundle;
+//! use soth_core::native_bundle::NativeBundle;
 //!
 //! let json = std::fs::read_to_string("bundle.json").unwrap();
 //! let bundle: NativeBundle = serde_json::from_str(&json).unwrap();
@@ -24,9 +24,11 @@
 //! ```
 
 use soth_core::bundle::entity_index::{EntityIndex, EntityIndexEntry};
-use soth_interface::{NativeBundle, NativeBundleEntity};
+use soth_core::native_bundle::{NativeBundle, NativeBundleEntity};
 
-use crate::entity_helpers::{derive_kind, flatten_signals, primary_backend_provider, source_entities};
+use crate::entity_helpers::{
+    derive_kind, flatten_signals, primary_backend_provider, source_entities,
+};
 
 /// Convert a [`NativeBundle`] into a fully-built [`EntityIndex`].
 ///
@@ -117,10 +119,9 @@ fn build_host_rules_for_entity(
         .collect()
 }
 
-
 #[cfg(test)]
 mod tests {
-    use soth_interface::{
+    use soth_core::native_bundle::{
         NativeBundle, NativeBundleCapture, NativeBundleEntity, NativeBundleMetadata,
         NativeBundleProviderLink, NativeBundleRule, NativeBundleSignal,
     };
@@ -332,12 +333,26 @@ mod tests {
         assert_eq!(provider.id, "openai");
 
         let (app, source) = index
-            .resolve_tool(Some("com.todesktop.230313mzl4w4u92"), None, None, None, &soth_core::EnvIndex::default())
+            .resolve_tool(
+                Some("com.todesktop.230313mzl4w4u92"),
+                None,
+                None,
+                None,
+                &soth_core::EnvIndex::default(),
+            )
             .unwrap();
         assert_eq!(app.id, "cursor");
         assert_eq!(source, "bundle_id");
 
-        let (app2, source2) = index.resolve_tool(None, Some("Cursor"), None, None, &soth_core::EnvIndex::default()).unwrap();
+        let (app2, source2) = index
+            .resolve_tool(
+                None,
+                Some("Cursor"),
+                None,
+                None,
+                &soth_core::EnvIndex::default(),
+            )
+            .unwrap();
         assert_eq!(app2.id, "cursor");
         assert_eq!(source2, "process_name");
     }
@@ -352,7 +367,7 @@ mod tests {
             "cursor",
             "Cursor",
             Some("product"),
-            Some("ide"),   // fine-grained kind present
+            Some("ide"), // fine-grained kind present
             None,
             None,
             "metadata_only",
@@ -364,7 +379,7 @@ mod tests {
             "anthropic",
             "Anthropic",
             Some("llm_provider"),
-            None,           // no fine-grained kind
+            None, // no fine-grained kind
             None,
             None,
             "metadata_only",
@@ -415,9 +430,9 @@ mod tests {
             "metadata_only",
             vec![rule(vec![signal("HttpHost", "chatgpt.com")])],
             vec![
-                provider_link("some-other", "secondary"),        // not primary_backend
-                provider_link("openai", "primary_backend"),      // this one is used
-                provider_link("azure", "primary_backend"),       // duplicate — first wins
+                provider_link("some-other", "secondary"), // not primary_backend
+                provider_link("openai", "primary_backend"), // this one is used
+                provider_link("azure", "primary_backend"), // duplicate — first wins
             ],
         ));
 
@@ -440,7 +455,7 @@ mod tests {
             None,
             "metadata_only",
             vec![],
-            vec![provider_link("other", "related")],  // wrong relation_kind
+            vec![provider_link("other", "related")], // wrong relation_kind
         ));
 
         let index = entity_index_from_native(&bundle);
@@ -461,7 +476,7 @@ mod tests {
             None,
             "metadata_only",
             vec![rule(vec![
-                signal("HttpHost", "real.example.com"),           // should be indexed
+                signal("HttpHost", "real.example.com"), // should be indexed
                 negated_signal("HttpHost", "excluded.example.com"), // must NOT be indexed
             ])],
             vec![],
@@ -514,14 +529,17 @@ mod tests {
             Some("platform"),
             None,
             None,
-            "full",  // should parse to CaptureMode::Full
+            "full", // should parse to CaptureMode::Full
             vec![rule(vec![signal("HttpHost", "full.example.com")])],
             vec![],
         ));
 
         let index = entity_index_from_native(&bundle);
         let resolved = index.resolve_host("full.example.com").unwrap();
-        assert_eq!(resolved.capture_mode, soth_core::artifacts::CaptureMode::Full);
+        assert_eq!(
+            resolved.capture_mode,
+            soth_core::artifacts::CaptureMode::Full
+        );
     }
 
     /// An empty bundle produces an empty EntityIndex without panicking.

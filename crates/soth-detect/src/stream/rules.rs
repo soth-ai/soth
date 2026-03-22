@@ -81,10 +81,13 @@ impl RulesAccumulator {
 
     /// Push an extracted value for a field.
     pub fn push(&mut self, field: &str, value: &str) {
-        let entry = self.state.entry(field.to_string()).or_insert(AccumulatedField {
-            op: AccumulateKind::Concat,
-            value: None,
-        });
+        let entry = self
+            .state
+            .entry(field.to_string())
+            .or_insert(AccumulatedField {
+                op: AccumulateKind::Concat,
+                value: None,
+            });
 
         match entry.op {
             AccumulateKind::Concat => {
@@ -134,10 +137,7 @@ pub fn evaluate_condition(condition: &str, value: &Value) -> bool {
 
 fn evaluate_single_condition(cond: &str, value: &Value) -> bool {
     // $not($exists(path))
-    if let Some(inner) = cond
-        .strip_prefix("$not(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
+    if let Some(inner) = cond.strip_prefix("$not(").and_then(|s| s.strip_suffix(')')) {
         return !evaluate_single_condition(inner.trim(), value);
     }
 
@@ -146,8 +146,7 @@ fn evaluate_single_condition(cond: &str, value: &Value) -> bool {
         .strip_prefix("$exists(")
         .and_then(|s| s.strip_suffix(')'))
     {
-        return json_path(value, path.trim())
-            .map_or(false, |v| !v.is_null());
+        return json_path(value, path.trim()).is_some_and(|v| !v.is_null());
     }
 
     // $type(path) = 'type_name'
@@ -156,21 +155,16 @@ fn evaluate_single_condition(cond: &str, value: &Value) -> bool {
             let path = type_expr
                 .strip_prefix("$type(")
                 .and_then(|s| s.strip_suffix(')'));
-            let expected = expected
-                .trim()
-                .trim_matches('\'')
-                .trim_matches('"');
+            let expected = expected.trim().trim_matches('\'').trim_matches('"');
             if let Some(path) = path {
-                return json_path(value, path.trim()).map_or(false, |v| {
-                    match expected {
-                        "string" => v.is_string(),
-                        "number" => v.is_number(),
-                        "array" => v.is_array(),
-                        "object" => v.is_object(),
-                        "boolean" | "bool" => v.is_boolean(),
-                        "null" => v.is_null(),
-                        _ => false,
-                    }
+                return json_path(value, path.trim()).is_some_and(|v| match expected {
+                    "string" => v.is_string(),
+                    "number" => v.is_number(),
+                    "array" => v.is_array(),
+                    "object" => v.is_object(),
+                    "boolean" | "bool" => v.is_boolean(),
+                    "null" => v.is_null(),
+                    _ => false,
                 });
             }
         }
@@ -186,17 +180,15 @@ fn evaluate_single_condition(cond: &str, value: &Value) -> bool {
 
         // Boolean comparison: field = true / field = false
         if rhs == "true" {
-            return actual.map_or(false, |v| v.as_bool() == Some(true));
+            return actual.is_some_and(|v| v.as_bool() == Some(true));
         }
         if rhs == "false" {
-            return actual.map_or(false, |v| v.as_bool() == Some(false));
+            return actual.is_some_and(|v| v.as_bool() == Some(false));
         }
 
         // String comparison: field = 'value' or field = "value"
         let expected = rhs.trim_matches('\'').trim_matches('"');
-        return actual.map_or(false, |v| {
-            v.as_str().map_or(false, |s| s == expected)
-        });
+        return actual.is_some_and(|v| v.as_str() == Some(expected));
     }
 
     false
@@ -291,10 +283,7 @@ fn split_ndjson_chunks<'a>(text: &'a str, options: &StreamFormatOptions) -> Vec<
     }
 }
 
-fn split_length_prefixed_chunks<'a>(
-    text: &'a str,
-    options: &StreamFormatOptions,
-) -> Vec<&'a str> {
+fn split_length_prefixed_chunks<'a>(text: &'a str, options: &StreamFormatOptions) -> Vec<&'a str> {
     let stripped = if let Some(header) = options.header_strip.as_deref() {
         // Unescape the header_strip pattern (handle \\n → \n)
         let header_unescaped = header.replace("\\n", "\n");
@@ -376,7 +365,7 @@ pub fn extract_with_stream_rules(
         .format_options
         .encoding
         .as_deref()
-        .map_or(false, |e| e.eq_ignore_ascii_case("protobuf"));
+        .is_some_and(|e| e.eq_ignore_ascii_case("protobuf"));
 
     if is_protobuf {
         if let Some(content) = best_grpc_content(&scan_proto_strings(payload), 6) {
@@ -419,9 +408,7 @@ pub fn extract_with_stream_rules(
             };
 
             for (field, path) in &rule.extract {
-                if let Some(extracted) = json_path(&processed, path)
-                    .and_then(|v| extract_string(v))
-                {
+                if let Some(extracted) = json_path(&processed, path).and_then(extract_string) {
                     accumulator.push(field, &extracted);
                 }
             }
@@ -489,7 +476,8 @@ mod tests {
 
     #[test]
     fn condition_and() {
-        let v = json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}});
+        let v =
+            json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}});
         assert!(evaluate_condition(
             "type = 'content_block_delta' and delta.type = 'text_delta'",
             &v
@@ -510,10 +498,15 @@ mod tests {
 
     #[test]
     fn accumulator_concat() {
-        let spec: HashMap<String, AccumulateOp> = [("content".to_string(), AccumulateOp {
-            from: "content".to_string(),
-            op: "concat".to_string(),
-        })].into_iter().collect();
+        let spec: HashMap<String, AccumulateOp> = [(
+            "content".to_string(),
+            AccumulateOp {
+                from: "content".to_string(),
+                op: "concat".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
 
         let mut acc = RulesAccumulator::new(&spec);
         acc.push("content", "Hello");
@@ -523,10 +516,15 @@ mod tests {
 
     #[test]
     fn accumulator_first() {
-        let spec: HashMap<String, AccumulateOp> = [("model".to_string(), AccumulateOp {
-            from: "model".to_string(),
-            op: "first".to_string(),
-        })].into_iter().collect();
+        let spec: HashMap<String, AccumulateOp> = [(
+            "model".to_string(),
+            AccumulateOp {
+                from: "model".to_string(),
+                op: "first".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
 
         let mut acc = RulesAccumulator::new(&spec);
         acc.push("model", "gpt-4o");
@@ -536,10 +534,15 @@ mod tests {
 
     #[test]
     fn accumulator_last() {
-        let spec: HashMap<String, AccumulateOp> = [("status".to_string(), AccumulateOp {
-            from: "status".to_string(),
-            op: "last".to_string(),
-        })].into_iter().collect();
+        let spec: HashMap<String, AccumulateOp> = [(
+            "status".to_string(),
+            AccumulateOp {
+                from: "status".to_string(),
+                op: "last".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
 
         let mut acc = RulesAccumulator::new(&spec);
         acc.push("status", "running");
@@ -570,7 +573,11 @@ mod tests {
     fn split_sse_multiple_prefixes() {
         let payload = "data: {\"a\":1}\ndelta {\"b\":2}\nmessage {\"c\":3}\n";
         let opts = StreamFormatOptions {
-            prefixes: vec!["data: ".to_string(), "delta ".to_string(), "message ".to_string()],
+            prefixes: vec![
+                "data: ".to_string(),
+                "delta ".to_string(),
+                "message ".to_string(),
+            ],
             skip_values: vec![],
             ..Default::default()
         };
@@ -600,19 +607,40 @@ mod tests {
             rules: vec![
                 StreamRule {
                     when: "$exists(choices[0].delta.content)".to_string(),
-                    extract: [("content".to_string(), "choices[0].delta.content".to_string())].into_iter().collect(),
+                    extract: [(
+                        "content".to_string(),
+                        "choices[0].delta.content".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
                     preprocess: vec![],
                 },
                 StreamRule {
                     when: "$exists(model)".to_string(),
-                    extract: [("model".to_string(), "model".to_string())].into_iter().collect(),
+                    extract: [("model".to_string(), "model".to_string())]
+                        .into_iter()
+                        .collect(),
                     preprocess: vec![],
                 },
             ],
             accumulate: [
-                ("content".to_string(), AccumulateOp { from: "content".to_string(), op: "concat".to_string() }),
-                ("model".to_string(), AccumulateOp { from: "model".to_string(), op: "first".to_string() }),
-            ].into_iter().collect(),
+                (
+                    "content".to_string(),
+                    AccumulateOp {
+                        from: "content".to_string(),
+                        op: "concat".to_string(),
+                    },
+                ),
+                (
+                    "model".to_string(),
+                    AccumulateOp {
+                        from: "model".to_string(),
+                        op: "first".to_string(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
             finalize: HashMap::new(),
         };
 
@@ -636,24 +664,44 @@ mod tests {
             rules: vec![
                 StreamRule {
                     when: "type = 'message_start'".to_string(),
-                    extract: [("model".to_string(), "message.model".to_string())].into_iter().collect(),
+                    extract: [("model".to_string(), "message.model".to_string())]
+                        .into_iter()
+                        .collect(),
                     preprocess: vec![],
                 },
                 StreamRule {
                     when: "type = 'content_block_delta' and delta.type = 'text_delta'".to_string(),
-                    extract: [("content".to_string(), "delta.text".to_string())].into_iter().collect(),
+                    extract: [("content".to_string(), "delta.text".to_string())]
+                        .into_iter()
+                        .collect(),
                     preprocess: vec![],
                 },
                 StreamRule {
                     when: "type = 'message_delta'".to_string(),
-                    extract: [("stop_reason".to_string(), "delta.stop_reason".to_string())].into_iter().collect(),
+                    extract: [("stop_reason".to_string(), "delta.stop_reason".to_string())]
+                        .into_iter()
+                        .collect(),
                     preprocess: vec![],
                 },
             ],
             accumulate: [
-                ("content".to_string(), AccumulateOp { from: "content".to_string(), op: "concat".to_string() }),
-                ("model".to_string(), AccumulateOp { from: "model".to_string(), op: "first".to_string() }),
-            ].into_iter().collect(),
+                (
+                    "content".to_string(),
+                    AccumulateOp {
+                        from: "content".to_string(),
+                        op: "concat".to_string(),
+                    },
+                ),
+                (
+                    "model".to_string(),
+                    AccumulateOp {
+                        from: "model".to_string(),
+                        op: "first".to_string(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
             finalize: HashMap::new(),
         };
 
@@ -677,7 +725,9 @@ mod tests {
                     extract: [
                         ("content".to_string(), "message.content".to_string()),
                         ("model".to_string(), "model".to_string()),
-                    ].into_iter().collect(),
+                    ]
+                    .into_iter()
+                    .collect(),
                     preprocess: vec![],
                 },
                 StreamRule {
@@ -687,9 +737,23 @@ mod tests {
                 },
             ],
             accumulate: [
-                ("content".to_string(), AccumulateOp { from: "content".to_string(), op: "concat".to_string() }),
-                ("model".to_string(), AccumulateOp { from: "model".to_string(), op: "first".to_string() }),
-            ].into_iter().collect(),
+                (
+                    "content".to_string(),
+                    AccumulateOp {
+                        from: "content".to_string(),
+                        op: "concat".to_string(),
+                    },
+                ),
+                (
+                    "model".to_string(),
+                    AccumulateOp {
+                        from: "model".to_string(),
+                        op: "first".to_string(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
             finalize: HashMap::new(),
         };
 

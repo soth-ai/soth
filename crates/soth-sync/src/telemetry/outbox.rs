@@ -361,8 +361,8 @@ impl TelemetryOutbox {
         let conn = self.lock_db()?;
         let cutoff = Utc::now().timestamp().saturating_sub(max_age_secs);
 
-        let outbox_deleted: u64 = conn
-            .execute(
+        let outbox_deleted: u64 =
+            conn.execute(
                 "DELETE FROM telemetry_outbox
                  WHERE status IN (?1, ?2)
                    AND first_queued_at <= ?3",
@@ -370,8 +370,8 @@ impl TelemetryOutbox {
             )
             .context("purge completed telemetry outbox rows")? as u64;
 
-        let events_deleted: u64 = conn
-            .execute(
+        let events_deleted: u64 =
+            conn.execute(
                 "DELETE FROM transmitted_events
                  WHERE transmission_status IN (?1, ?2)
                    AND transmitted_at <= ?3",

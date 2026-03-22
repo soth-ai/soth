@@ -30,6 +30,12 @@ pub struct OpenClawReader {
     cursor: Mutex<Option<Cursor>>,
 }
 
+impl Default for OpenClawReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenClawReader {
     pub fn new() -> Self {
         Self {
@@ -129,7 +135,10 @@ fn parse_iso_timestamp(ts: &str) -> Option<i64> {
 ///
 /// Returns `Ok(None)` when the file contains no usable messages (e.g. only
 /// `event_msg` lines), so callers can skip it silently.
-fn parse_session(path: &Path, since: Option<i64>) -> Result<Option<HistoricalSession>, ReaderError> {
+fn parse_session(
+    path: &Path,
+    since: Option<i64>,
+) -> Result<Option<HistoricalSession>, ReaderError> {
     let content = std::fs::read_to_string(path).map_err(|e| ReaderError::Reader {
         tool: "openclaw".into(),
         message: format!("read {}: {e}", path.display()),
@@ -188,11 +197,10 @@ fn parse_session(path: &Path, since: Option<i64>) -> Result<Option<HistoricalSes
                     Some(v) => v,
                     None => continue,
                 };
-                let msg: MessagePayload =
-                    match serde_json::from_value(payload_val.clone()) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
+                let msg: MessagePayload = match serde_json::from_value(payload_val.clone()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
 
                 if msg.r#type.as_deref() != Some("message") {
                     continue;
@@ -203,11 +211,7 @@ fn parse_session(path: &Path, since: Option<i64>) -> Result<Option<HistoricalSes
                     _ => continue,
                 };
 
-                let text = msg
-                    .content
-                    .as_ref()
-                    .map(extract_text)
-                    .unwrap_or_default();
+                let text = msg.content.as_ref().map(extract_text).unwrap_or_default();
 
                 if text.is_empty() {
                     continue;
@@ -280,10 +284,7 @@ fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
             collect_recursive(&path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             // Skip soft-deleted sessions.
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if file_name.contains(".deleted.") {
                 continue;
             }
@@ -322,12 +323,7 @@ impl FormatReader for OpenClawReader {
             if path.is_dir() {
                 if let Ok(sub) = std::fs::read_dir(&path) {
                     for sub_entry in sub.flatten() {
-                        if sub_entry
-                            .path()
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            == Some("jsonl")
-                        {
+                        if sub_entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl") {
                             return true;
                         }
                     }

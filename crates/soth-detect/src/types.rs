@@ -8,8 +8,8 @@ pub use soth_parse::types::{
 
 // Transport types from soth-core — appear in soth-detect's public API signatures.
 pub use soth_core::{
-    AppIdentity, AppKind, CaptureMode, ConnectionMeta, FrameDirection, FrameKind,
-    ParseConfidence, ProcessInfo, RawRequest, RequestHeaders, SocketFamily, StreamChunk, TlsInfo,
+    AppIdentity, AppKind, CaptureMode, ConnectionMeta, FrameDirection, FrameKind, ParseConfidence,
+    ProcessInfo, RawRequest, RequestHeaders, SocketFamily, StreamChunk, TlsInfo,
 };
 
 // Bundle schema types from soth-core — available within this crate but NOT
@@ -18,9 +18,9 @@ pub use soth_core::{
 // modules consume these names via `crate::types::X`.
 #[allow(unused_imports)]
 pub(crate) use soth_core::{
-    AppPolicy, ApplicationEntry, ProductEntry, BrowserPolicies, CaptureOverrides, CaptureRules,
+    AppPolicy, ApplicationEntry, BrowserPolicies, CaptureOverrides, CaptureRules,
     DetectBundleSlice, Filters, GraphQLHeuristicPattern, GraphQLOperationRegistry,
     GraphQLOperationSpec, GrpcFieldSpec, GrpcServiceRegistry, GrpcServiceSpec, OwnedDetectBundle,
-    PreprocessOp, ProviderEntry, RequestEncoding, RestFormatDescriptor, RestRequestPaths,
-    RestResponsePaths, StreamFormat, StreamOptions,
+    PreprocessOp, ProductEntry, ProviderEntry, RequestEncoding, RestFormatDescriptor,
+    RestRequestPaths, RestResponsePaths, StreamFormat, StreamOptions,
 };

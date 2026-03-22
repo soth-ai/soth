@@ -44,7 +44,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 criterion = "0.5"
 soth-core = { workspace = true }
-soth-bundle = { workspace = true, features = ["native-bundle"] }
+soth-bundle = { workspace = true }
 
 [[bench]]
 name = "intelligence_bench"

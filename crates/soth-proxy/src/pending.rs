@@ -107,7 +107,9 @@ impl PendingStore {
 
     /// Force-evict the oldest N entries regardless of age.
     fn evict_oldest(&self, count: usize) {
-        let mut entries: Vec<(Uuid, Instant)> = self.inner.iter()
+        let mut entries: Vec<(Uuid, Instant)> = self
+            .inner
+            .iter()
             .map(|e| (*e.key(), e.value().stored_at))
             .collect();
         entries.sort_by_key(|(_, ts)| *ts);

@@ -25,8 +25,7 @@ static STRIPE_SECRET_RE: Lazy<Option<Regex>> =
     Lazy::new(|| Regex::new(r"\bsk_live_[A-Za-z0-9]{16,}\b").ok());
 static STRIPE_TEST_RE: Lazy<Option<Regex>> =
     Lazy::new(|| Regex::new(r"\bsk_test_[A-Za-z0-9]{16,}\b").ok());
-static HEX_KEY_RE: Lazy<Option<Regex>> =
-    Lazy::new(|| Regex::new(r"\b[0-9a-fA-F]{32,64}\b").ok());
+static HEX_KEY_RE: Lazy<Option<Regex>> = Lazy::new(|| Regex::new(r"\b[0-9a-fA-F]{32,64}\b").ok());
 
 pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<SensitiveArtifact> {
     let text = String::from_utf8_lossy(body);
@@ -34,50 +33,96 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
 
     // Scan Anthropic before OpenAI to avoid sk-ant- matching sk-
     scan_pattern(
-        &mut out, &text, &ANTHROPIC_KEY_RE,
-        ArtifactKind::ApiKey { provider: Some(DetectedProvider::Anthropic) },
-        ArtifactSeverity::Critical, location.clone(),
+        &mut out,
+        &text,
+        &ANTHROPIC_KEY_RE,
+        ArtifactKind::ApiKey {
+            provider: Some(DetectedProvider::Anthropic),
+        },
+        ArtifactSeverity::Critical,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &OPENAI_KEY_RE,
-        ArtifactKind::ApiKey { provider: Some(DetectedProvider::OpenAi) },
-        ArtifactSeverity::Critical, location.clone(),
+        &mut out,
+        &text,
+        &OPENAI_KEY_RE,
+        ArtifactKind::ApiKey {
+            provider: Some(DetectedProvider::OpenAi),
+        },
+        ArtifactSeverity::Critical,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &AWS_KEY_RE, ArtifactKind::AwsAccessKey,
-        ArtifactSeverity::High, location.clone(),
+        &mut out,
+        &text,
+        &AWS_KEY_RE,
+        ArtifactKind::AwsAccessKey,
+        ArtifactSeverity::High,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &GITHUB_PAT_RE, ArtifactKind::GitHubPat,
-        ArtifactSeverity::High, location.clone(),
+        &mut out,
+        &text,
+        &GITHUB_PAT_RE,
+        ArtifactKind::GitHubPat,
+        ArtifactSeverity::High,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &GITLAB_PAT_RE, ArtifactKind::GitLabToken,
-        ArtifactSeverity::High, location.clone(),
+        &mut out,
+        &text,
+        &GITLAB_PAT_RE,
+        ArtifactKind::GitLabToken,
+        ArtifactSeverity::High,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &SLACK_TOKEN_RE, ArtifactKind::SlackToken,
-        ArtifactSeverity::High, location.clone(),
+        &mut out,
+        &text,
+        &SLACK_TOKEN_RE,
+        ArtifactKind::SlackToken,
+        ArtifactSeverity::High,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &STRIPE_SECRET_RE, ArtifactKind::StripeSecretKey,
-        ArtifactSeverity::Critical, location.clone(),
+        &mut out,
+        &text,
+        &STRIPE_SECRET_RE,
+        ArtifactKind::StripeSecretKey,
+        ArtifactSeverity::Critical,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &STRIPE_TEST_RE, ArtifactKind::StripeSecretKey,
-        ArtifactSeverity::Medium, location.clone(),
+        &mut out,
+        &text,
+        &STRIPE_TEST_RE,
+        ArtifactKind::StripeSecretKey,
+        ArtifactSeverity::Medium,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &JWT_RE, ArtifactKind::Jwt,
-        ArtifactSeverity::Medium, location.clone(),
+        &mut out,
+        &text,
+        &JWT_RE,
+        ArtifactKind::Jwt,
+        ArtifactSeverity::Medium,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &PRIVATE_KEY_RE, ArtifactKind::PrivateKey,
-        ArtifactSeverity::Critical, location.clone(),
+        &mut out,
+        &text,
+        &PRIVATE_KEY_RE,
+        ArtifactKind::PrivateKey,
+        ArtifactSeverity::Critical,
+        location.clone(),
     );
     scan_pattern(
-        &mut out, &text, &CONNECTION_STRING_RE, ArtifactKind::ConnectionString,
-        ArtifactSeverity::High, location.clone(),
+        &mut out,
+        &text,
+        &CONNECTION_STRING_RE,
+        ArtifactKind::ConnectionString,
+        ArtifactSeverity::High,
+        location.clone(),
     );
 
     scan_hex_keys(&mut out, &text, location);
@@ -103,7 +148,9 @@ pub fn redact_sensitive_text(input: &str) -> String {
     output = replace_all(&output, &JWT_RE, "<REDACTED_JWT>");
     output = replace_all(&output, &PRIVATE_KEY_RE, "<REDACTED_PRIVATE_KEY_HEADER>");
     output = replace_all(
-        &output, &CONNECTION_STRING_RE, "<REDACTED_CONNECTION_STRING>",
+        &output,
+        &CONNECTION_STRING_RE,
+        "<REDACTED_CONNECTION_STRING>",
     );
     output
 }
@@ -118,7 +165,7 @@ pub fn structural_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     if has_auth_logic(&text_lc) {
         out.push(SensitiveArtifact {
             kind: ArtifactKind::AuthLogic,
-            commitment: Some(sha256_hex(format!("auth_logic:present:{:?}", location))),
+            commitment: Some(sha256_hex(format!("auth_logic:present:{location:?}"))),
             severity: ArtifactSeverity::Low,
             location: location.clone(),
             redacted_hint: None,
@@ -128,7 +175,7 @@ pub fn structural_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     if has_crypto_operations(&text_lc) {
         out.push(SensitiveArtifact {
             kind: ArtifactKind::CryptoOperation,
-            commitment: Some(sha256_hex(format!("crypto_op:present:{:?}", location))),
+            commitment: Some(sha256_hex(format!("crypto_op:present:{location:?}"))),
             severity: ArtifactSeverity::Low,
             location,
             redacted_hint: None,
@@ -160,7 +207,7 @@ pub fn org_pattern_scan(
             let pattern_id = idx as u32;
             out.push(SensitiveArtifact {
                 kind: ArtifactKind::OrgPattern { pattern_id },
-                commitment: Some(sha256_hex(format!("org_pattern:{}:detect-v1", pattern_id))),
+                commitment: Some(sha256_hex(format!("org_pattern:{pattern_id}:detect-v1"))),
                 severity: ArtifactSeverity::Medium,
                 location: location.clone(),
                 redacted_hint: None,
@@ -212,7 +259,7 @@ pub fn org_pattern_scan_compiled(
                 kind: ArtifactKind::OrgPattern {
                     pattern_id: *pattern_id,
                 },
-                commitment: Some(sha256_hex(format!("org_pattern:{}:detect-v1", pattern_id))),
+                commitment: Some(sha256_hex(format!("org_pattern:{pattern_id}:detect-v1"))),
                 severity: ArtifactSeverity::Medium,
                 location: location.clone(),
                 redacted_hint: None,
@@ -225,23 +272,65 @@ pub fn org_pattern_scan_compiled(
 
 fn has_auth_logic(text_lc: &str) -> bool {
     let auth_patterns = [
-        "authenticate", "authorization", "bearer ", "api_key", "apikey",
-        "access_token", "refresh_token", "oauth", "saml", "oidc",
-        "verify_password", "check_password", "login(", "logout(",
-        "session.set", "session.get", "is_authenticated", "require_auth",
-        "password_hash", "verify_token", "decode_jwt", "validate_token",
+        "authenticate",
+        "authorization",
+        "bearer ",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "oauth",
+        "saml",
+        "oidc",
+        "verify_password",
+        "check_password",
+        "login(",
+        "logout(",
+        "session.set",
+        "session.get",
+        "is_authenticated",
+        "require_auth",
+        "password_hash",
+        "verify_token",
+        "decode_jwt",
+        "validate_token",
     ];
-    auth_patterns.iter().filter(|p| text_lc.contains(*p)).count() >= 2
+    auth_patterns
+        .iter()
+        .filter(|p| text_lc.contains(*p))
+        .count()
+        >= 2
 }
 
 fn has_crypto_operations(text_lc: &str) -> bool {
     let crypto_patterns = [
-        "encrypt(", "decrypt(", "aes.new", "rsa.new", "cipher(", "decipher(",
-        "hmac(", "sha256(", "sha512(", "md5(", "bcrypt.", "argon2.",
-        "sign(", "verify(", "keypair", "private_key", "public_key",
-        "crypto.create", "openssl", "nacl.", "sodium.",
+        "encrypt(",
+        "decrypt(",
+        "aes.new",
+        "rsa.new",
+        "cipher(",
+        "decipher(",
+        "hmac(",
+        "sha256(",
+        "sha512(",
+        "md5(",
+        "bcrypt.",
+        "argon2.",
+        "sign(",
+        "verify(",
+        "keypair",
+        "private_key",
+        "public_key",
+        "crypto.create",
+        "openssl",
+        "nacl.",
+        "sodium.",
     ];
-    crypto_patterns.iter().filter(|p| text_lc.contains(*p)).count() >= 2
+    crypto_patterns
+        .iter()
+        .filter(|p| text_lc.contains(*p))
+        .count()
+        >= 2
 }
 
 fn scan_pattern(
@@ -274,11 +363,7 @@ fn scan_pattern(
     }
 }
 
-fn scan_hex_keys(
-    out: &mut Vec<SensitiveArtifact>,
-    haystack: &str,
-    location: ArtifactLocation,
-) {
+fn scan_hex_keys(out: &mut Vec<SensitiveArtifact>, haystack: &str, location: ArtifactLocation) {
     let Some(regex) = &*HEX_KEY_RE else { return };
 
     for m in regex.find_iter(haystack) {
@@ -288,14 +373,18 @@ fn scan_hex_keys(
             continue;
         }
 
-        if raw.len() == 40 && raw.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        if raw.len() == 40
+            && raw
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
             continue;
         }
 
-        let mixed_case = raw.chars().any(|c| c.is_uppercase())
-            && raw.chars().any(|c| c.is_lowercase());
+        let mixed_case =
+            raw.chars().any(|c| c.is_uppercase()) && raw.chars().any(|c| c.is_lowercase());
         if mixed_case || raw.len() >= 48 {
-            let commitment = sha256_hex(format!("hex_key:{}:detect-v1", raw));
+            let commitment = sha256_hex(format!("hex_key:{raw}:detect-v1"));
             out.push(SensitiveArtifact {
                 kind: ArtifactKind::UnknownCredential,
                 commitment: Some(commitment),
@@ -320,8 +409,12 @@ fn redacted_hint(raw: &str) -> Option<String> {
 
 fn artifact_kind_name(kind: &ArtifactKind) -> &'static str {
     match kind {
-        ArtifactKind::ApiKey { provider: Some(DetectedProvider::OpenAi) } => "openai_key",
-        ArtifactKind::ApiKey { provider: Some(DetectedProvider::Anthropic) } => "anthropic_key",
+        ArtifactKind::ApiKey {
+            provider: Some(DetectedProvider::OpenAi),
+        } => "openai_key",
+        ArtifactKind::ApiKey {
+            provider: Some(DetectedProvider::Anthropic),
+        } => "anthropic_key",
         ArtifactKind::ApiKey { .. } => "api_key",
         ArtifactKind::AwsAccessKey => "aws_access_key",
         ArtifactKind::GitHubPat => "github_pat",
@@ -365,28 +458,54 @@ db=postgres://user:pass@db.local:5432/app
 "#;
 
         let artifacts = credential_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(&a.kind, ArtifactKind::ApiKey { provider: Some(DetectedProvider::OpenAi) })));
-        assert!(artifacts.iter().any(|a| matches!(&a.kind, ArtifactKind::ApiKey { provider: Some(DetectedProvider::Anthropic) })));
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::AwsAccessKey)));
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::GitHubPat)));
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::GitLabToken)));
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::Jwt)));
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::ConnectionString)));
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::PrivateKey)));
+        assert!(artifacts.iter().any(|a| matches!(
+            &a.kind,
+            ArtifactKind::ApiKey {
+                provider: Some(DetectedProvider::OpenAi)
+            }
+        )));
+        assert!(artifacts.iter().any(|a| matches!(
+            &a.kind,
+            ArtifactKind::ApiKey {
+                provider: Some(DetectedProvider::Anthropic)
+            }
+        )));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::AwsAccessKey)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::GitHubPat)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::GitLabToken)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::Jwt)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::ConnectionString)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::PrivateKey)));
     }
 
     #[test]
     fn credential_scan_detects_slack_token() {
         let body = b"token=xoxb-1234567890-abcdef";
         let artifacts = credential_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::SlackToken)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::SlackToken)));
     }
 
     #[test]
     fn credential_scan_detects_stripe_keys() {
         let body = b"live=sk_live_abcdefghijklmnop test=sk_test_abcdefghijklmnop";
         let artifacts = credential_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::StripeSecretKey)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::StripeSecretKey)));
     }
 
     #[test]
@@ -418,14 +537,18 @@ db=postgres://user:pass@db.local:5432/app
     fn structural_scan_detects_auth_logic() {
         let body = b"user.authenticate(password); check_password(hash); bearer token";
         let artifacts = structural_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::AuthLogic)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::AuthLogic)));
     }
 
     #[test]
     fn structural_scan_detects_crypto_operations() {
         let body = b"let cipher = encrypt(data); let hash = sha256(input);";
         let artifacts = structural_scan(body, ArtifactLocation::Unknown);
-        assert!(artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::CryptoOperation)));
+        assert!(artifacts
+            .iter()
+            .any(|a| matches!(a.kind, ArtifactKind::CryptoOperation)));
     }
 
     #[test]
@@ -441,7 +564,10 @@ db=postgres://user:pass@db.local:5432/app
         let patterns = vec![r"\d{3}-\d{2}-\d{4}".to_string()];
         let artifacts = org_pattern_scan(body, &patterns, ArtifactLocation::Unknown);
         assert_eq!(artifacts.len(), 1);
-        assert!(matches!(artifacts[0].kind, ArtifactKind::OrgPattern { pattern_id: 0 }));
+        assert!(matches!(
+            artifacts[0].kind,
+            ArtifactKind::OrgPattern { pattern_id: 0 }
+        ));
         assert!(artifacts[0].redacted_hint.is_none());
     }
 
@@ -451,7 +577,10 @@ db=postgres://user:pass@db.local:5432/app
         let patterns = vec!["[invalid".to_string(), r"\btest\b".to_string()];
         let artifacts = org_pattern_scan(body, &patterns, ArtifactLocation::Unknown);
         assert_eq!(artifacts.len(), 1);
-        assert!(matches!(artifacts[0].kind, ArtifactKind::OrgPattern { pattern_id: 1 }));
+        assert!(matches!(
+            artifacts[0].kind,
+            ArtifactKind::OrgPattern { pattern_id: 1 }
+        ));
     }
 
     #[test]

@@ -1087,9 +1087,17 @@ mod tests {
         // Generate a real self-signed CA cert so fingerprint checks work.
         let status = std::process::Command::new("openssl")
             .args([
-                "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                "-nodes", "-days", "1",
-                "-subj", "/CN=soth-test-ca",
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=soth-test-ca",
                 "-keyout",
             ])
             .arg(&key_path)

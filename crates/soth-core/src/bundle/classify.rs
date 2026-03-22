@@ -32,6 +32,7 @@ pub struct ClassifyPairResult {
 ///
 /// Takes iterators of (entity_key, canonical_entity_id, matching_rules) for
 /// providers and applications respectively.
+#[allow(clippy::too_many_arguments)]
 pub fn classify_request_pair<'a>(
     host: Option<&str>,
     path: &str,
@@ -64,18 +65,16 @@ pub fn classify_request_pair<'a>(
                 process_bundle_id,
                 process_name,
                 parent_process_name,
-            ) {
-                if best_provider
-                    .as_ref()
-                    .map_or(true, |b| rule.priority > b.priority)
-                {
-                    best_provider = Some(ClassifyResult {
-                        entity_id: entity_id.to_string(),
-                        entity_kind: "provider",
-                        rule_id: rule.rule_id.clone(),
-                        priority: rule.priority,
-                    });
-                }
+            ) && best_provider
+                .as_ref()
+                .is_none_or(|b| rule.priority > b.priority)
+            {
+                best_provider = Some(ClassifyResult {
+                    entity_id: entity_id.to_string(),
+                    entity_kind: "provider",
+                    rule_id: rule.rule_id.clone(),
+                    priority: rule.priority,
+                });
             }
         }
     }
@@ -91,18 +90,16 @@ pub fn classify_request_pair<'a>(
                 process_bundle_id,
                 process_name,
                 parent_process_name,
-            ) {
-                if best_application
-                    .as_ref()
-                    .map_or(true, |b| rule.priority > b.priority)
-                {
-                    best_application = Some(ClassifyResult {
-                        entity_id: entity_id.to_string(),
-                        entity_kind: "application",
-                        rule_id: rule.rule_id.clone(),
-                        priority: rule.priority,
-                    });
-                }
+            ) && best_application
+                .as_ref()
+                .is_none_or(|b| rule.priority > b.priority)
+            {
+                best_application = Some(ClassifyResult {
+                    entity_id: entity_id.to_string(),
+                    entity_kind: "application",
+                    rule_id: rule.rule_id.clone(),
+                    priority: rule.priority,
+                });
             }
         }
     }
@@ -114,6 +111,7 @@ pub fn classify_request_pair<'a>(
 }
 
 /// Evaluate whether a single matching rule fires against the given request context.
+#[allow(clippy::too_many_arguments)]
 fn rule_matches(
     rule: &MatchingRule,
     host_lc: Option<&str>,
@@ -188,6 +186,7 @@ fn rule_matches(
 }
 
 /// Check if a single signal matches the request context.
+#[allow(clippy::too_many_arguments)]
 fn signal_matches(
     kind: &SignalKind,
     pattern: &str,
@@ -201,20 +200,17 @@ fn signal_matches(
 ) -> bool {
     let pattern_lc = pattern.to_ascii_lowercase();
     match kind {
-        SignalKind::HttpHost => {
-            host_lc.map_or(false, |host| glob_match(&pattern_lc, host))
-        }
+        SignalKind::HttpHost => host_lc.is_some_and(|host| glob_match(&pattern_lc, host)),
         SignalKind::HttpPath => {
             let path_only = path_lc.split('?').next().unwrap_or(path_lc);
             glob_match(&pattern_lc, path_only)
         }
         SignalKind::HttpMethod => {
-            header_value(headers, ":method")
-                .map_or(false, |m| m.eq_ignore_ascii_case(pattern))
+            header_value(headers, ":method").is_some_and(|m| m.eq_ignore_ascii_case(pattern))
         }
         SignalKind::HttpHeader => {
             if let Some((name, expected)) = pattern.split_once(':') {
-                header_value(headers, name.trim()).map_or(false, |v| {
+                header_value(headers, name.trim()).is_some_and(|v| {
                     v.to_ascii_lowercase()
                         .contains(&expected.trim().to_ascii_lowercase())
                 })
@@ -222,20 +218,14 @@ fn signal_matches(
                 header_value(headers, pattern.trim()).is_some()
             }
         }
-        SignalKind::ContentType => {
-            content_type.map_or(false, |ct| ct.contains(&pattern_lc))
-        }
-        SignalKind::TlsSni => {
-            host_lc.map_or(false, |host| glob_match(&pattern_lc, host))
-        }
+        SignalKind::ContentType => content_type.is_some_and(|ct| ct.contains(&pattern_lc)),
+        SignalKind::TlsSni => host_lc.is_some_and(|host| glob_match(&pattern_lc, host)),
         SignalKind::ProcessBundleId => {
-            process_bundle_id.map_or(false, |bid| bid.eq_ignore_ascii_case(pattern))
+            process_bundle_id.is_some_and(|bid| bid.eq_ignore_ascii_case(pattern))
         }
-        SignalKind::ProcessName => {
-            process_name.map_or(false, |pn| pn.eq_ignore_ascii_case(pattern))
-        }
+        SignalKind::ProcessName => process_name.is_some_and(|pn| pn.eq_ignore_ascii_case(pattern)),
         SignalKind::ParentProcessName => {
-            parent_process_name.map_or(false, |ppn| ppn.eq_ignore_ascii_case(pattern))
+            parent_process_name.is_some_and(|ppn| ppn.eq_ignore_ascii_case(pattern))
         }
         SignalKind::BodyStructure => {
             // Body structure matching requires deeper inspection; skip at this stage.
@@ -256,7 +246,12 @@ mod tests {
     use super::*;
     use crate::{MatchingRule, SignalKind, SignalMatcher};
 
-    fn make_rule(rule_id: &str, priority: u32, requires_all: bool, signals: Vec<SignalMatcher>) -> MatchingRule {
+    fn make_rule(
+        rule_id: &str,
+        priority: u32,
+        requires_all: bool,
+        signals: Vec<SignalMatcher>,
+    ) -> MatchingRule {
         MatchingRule {
             rule_id: rule_id.to_string(),
             priority,
@@ -284,18 +279,28 @@ mod tests {
 
     #[test]
     fn classify_by_host() {
-        let rules = vec![make_rule("openai-host", 900, false, vec![host_signal("api.openai.com")])];
-        let providers: Vec<(&str, &str, &[MatchingRule])> = vec![("openai", "openai", rules.as_slice())];
+        let rules = vec![make_rule(
+            "openai-host",
+            900,
+            false,
+            vec![host_signal("api.openai.com")],
+        )];
+        let providers: Vec<(&str, &str, &[MatchingRule])> =
+            vec![("openai", "openai", rules.as_slice())];
         let applications: Vec<(&str, &str, &[MatchingRule])> = vec![];
 
-        let headers = std::collections::BTreeMap::from([
-            ("host".to_string(), "api.openai.com".to_string()),
-        ]);
+        let headers =
+            std::collections::BTreeMap::from([("host".to_string(), "api.openai.com".to_string())]);
 
         let result = classify_request_pair(
-            Some("api.openai.com"), "/v1/chat/completions", &headers,
-            None, None, None,
-            providers.into_iter(), applications.into_iter(),
+            Some("api.openai.com"),
+            "/v1/chat/completions",
+            &headers,
+            None,
+            None,
+            None,
+            providers.into_iter(),
+            applications.into_iter(),
         );
 
         assert!(result.provider.is_some());
@@ -304,34 +309,49 @@ mod tests {
 
     #[test]
     fn classify_requires_all() {
-        let rules = vec![make_rule("cursor-api", 950, true, vec![
-            host_signal("api.openai.com"),
-            SignalMatcher {
-                kind: SignalKind::ProcessName,
-                pattern: "Cursor".to_string(),
-                ..Default::default()
-            },
-        ])];
-        let providers: Vec<(&str, &str, &[MatchingRule])> = vec![("openai", "openai", rules.as_slice())];
+        let rules = vec![make_rule(
+            "cursor-api",
+            950,
+            true,
+            vec![
+                host_signal("api.openai.com"),
+                SignalMatcher {
+                    kind: SignalKind::ProcessName,
+                    pattern: "Cursor".to_string(),
+                    ..Default::default()
+                },
+            ],
+        )];
+        let providers: Vec<(&str, &str, &[MatchingRule])> =
+            vec![("openai", "openai", rules.as_slice())];
         let apps: Vec<(&str, &str, &[MatchingRule])> = vec![];
 
-        let headers = std::collections::BTreeMap::from([
-            ("host".to_string(), "api.openai.com".to_string()),
-        ]);
+        let headers =
+            std::collections::BTreeMap::from([("host".to_string(), "api.openai.com".to_string())]);
 
         // Without process_name — should NOT match (requires_all)
         let result = classify_request_pair(
-            Some("api.openai.com"), "/v1/chat", &headers,
-            None, None, None,
-            providers.clone().into_iter(), apps.clone().into_iter(),
+            Some("api.openai.com"),
+            "/v1/chat",
+            &headers,
+            None,
+            None,
+            None,
+            providers.clone().into_iter(),
+            apps.clone().into_iter(),
         );
         assert!(result.provider.is_none());
 
         // With process_name — should match
         let result = classify_request_pair(
-            Some("api.openai.com"), "/v1/chat", &headers,
-            None, Some("Cursor"), None,
-            providers.into_iter(), apps.into_iter(),
+            Some("api.openai.com"),
+            "/v1/chat",
+            &headers,
+            None,
+            Some("Cursor"),
+            None,
+            providers.into_iter(),
+            apps.into_iter(),
         );
         assert!(result.provider.is_some());
         assert_eq!(result.provider.unwrap().entity_id, "openai");
@@ -340,7 +360,12 @@ mod tests {
     #[test]
     fn classify_highest_priority_wins() {
         let rules_low = vec![make_rule("generic", 100, false, vec![path_signal("/v1/*")])];
-        let rules_high = vec![make_rule("specific", 900, false, vec![host_signal("api.openai.com")])];
+        let rules_high = vec![make_rule(
+            "specific",
+            900,
+            false,
+            vec![host_signal("api.openai.com")],
+        )];
 
         let providers: Vec<(&str, &str, &[MatchingRule])> = vec![
             ("generic_llm", "generic_llm", rules_low.as_slice()),
@@ -348,14 +373,18 @@ mod tests {
         ];
         let apps: Vec<(&str, &str, &[MatchingRule])> = vec![];
 
-        let headers = std::collections::BTreeMap::from([
-            ("host".to_string(), "api.openai.com".to_string()),
-        ]);
+        let headers =
+            std::collections::BTreeMap::from([("host".to_string(), "api.openai.com".to_string())]);
 
         let result = classify_request_pair(
-            Some("api.openai.com"), "/v1/chat/completions", &headers,
-            None, None, None,
-            providers.into_iter(), apps.into_iter(),
+            Some("api.openai.com"),
+            "/v1/chat/completions",
+            &headers,
+            None,
+            None,
+            None,
+            providers.into_iter(),
+            apps.into_iter(),
         );
 
         assert_eq!(result.provider.unwrap().entity_id, "openai");

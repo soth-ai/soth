@@ -54,7 +54,8 @@ pub fn parse_graphql(
         normalized
             .parse_warnings
             .push(ParseWarning::GraphQlUnknownOperation {
-                operation_name: env.operation_name
+                operation_name: env
+                    .operation_name
                     .clone()
                     .unwrap_or_else(|| "anonymous".to_string()),
             });
@@ -197,7 +198,11 @@ pub fn parse_graphql(
             mutation_field,
         },
         api_version: None,
-        user_prompt: if content.is_empty() { None } else { Some(content.clone()) },
+        user_prompt: if content.is_empty() {
+            None
+        } else {
+            Some(content.clone())
+        },
     };
     normalized.canonical_cache_key = canonical_hash(&normalized);
 
@@ -465,7 +470,11 @@ fn heuristic_graphql_parse(env: &GraphQLEnvelope) -> NormalizedRequest {
             mutation_field: None,
         },
         api_version: None,
-        user_prompt: if content.is_empty() { None } else { Some(content.clone()) },
+        user_prompt: if content.is_empty() {
+            None
+        } else {
+            Some(content.clone())
+        },
     };
     normalized.canonical_cache_key = canonical_hash(&normalized);
     normalized

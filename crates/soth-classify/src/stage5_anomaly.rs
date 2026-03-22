@@ -272,7 +272,10 @@ mod tests {
                 provider: soth_core::DetectedProvider::OpenAi,
             },
             canonical_cache_key: "cache-key".to_string(),
-            format_metadata: soth_core::FormatMetadata::Unknown { method: String::new(), path: String::new() },
+            format_metadata: soth_core::FormatMetadata::Unknown {
+                method: String::new(),
+                path: String::new(),
+            },
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,

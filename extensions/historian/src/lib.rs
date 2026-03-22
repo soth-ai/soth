@@ -317,11 +317,7 @@ impl HistorianExtension {
                         progress.sessions_done,
                         progress.completed_at.is_some(),
                     ),
-                    _ => (
-                        tool_info.session_count_estimate.unwrap_or(0),
-                        0,
-                        false,
-                    ),
+                    _ => (tool_info.session_count_estimate.unwrap_or(0), 0, false),
                 };
 
             snapshot.total_sessions_estimated += sessions_total;

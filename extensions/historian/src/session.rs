@@ -70,14 +70,8 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         "message_count".to_string(),
         session.messages.len().to_string(),
     );
-    metadata.insert(
-        "user_content_hash".to_string(),
-        user_content_hash.clone(),
-    );
-    metadata.insert(
-        "conversation_hash".to_string(),
-        conversation_hash.clone(),
-    );
+    metadata.insert("user_content_hash".to_string(), user_content_hash.clone());
+    metadata.insert("conversation_hash".to_string(), conversation_hash.clone());
     metadata.insert("semantic_hash".to_string(), semantic_hash);
     if let Some(ref h) = system_prompt_hash {
         metadata.insert("system_prompt_hash".to_string(), h.clone());
@@ -111,9 +105,7 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         endpoint_type: EndpointType::ChatCompletion,
         api_version: None,
         system_prompt_hash,
-        system_prompt_token_estimate: system_prompt
-            .as_ref()
-            .map(|s| estimate_tokens(s)),
+        system_prompt_token_estimate: system_prompt.as_ref().map(|s| estimate_tokens(s)),
         user_content_hash,
         user_content_token_estimate: total_input_tokens,
         conversation_hash,
@@ -410,10 +402,7 @@ mod tests {
             !event.artifacts.is_empty(),
             "should detect API key credential"
         );
-        assert!(event
-            .artifacts
-            .iter()
-            .any(|a| a.is_credential()));
+        assert!(event.artifacts.iter().any(|a| a.is_credential()));
     }
 
     #[test]
@@ -440,10 +429,10 @@ mod tests {
         };
         let event = reconstruct_event(&session);
         assert!(
-            event.artifacts.iter().any(|a| matches!(
-                a.kind,
-                soth_core::artifacts::ArtifactKind::CodeBlock { .. }
-            )),
+            event
+                .artifacts
+                .iter()
+                .any(|a| matches!(a.kind, soth_core::artifacts::ArtifactKind::CodeBlock { .. })),
             "should detect code block in assistant response"
         );
     }
@@ -476,7 +465,9 @@ mod tests {
             session_id: "pkey-test".to_string(),
             messages: vec![HistoricalMessage {
                 role: "user".to_string(),
-                content: "here is my key:\n-----BEGIN PRIVATE KEY-----\nblah\n-----END PRIVATE KEY-----".to_string(),
+                content:
+                    "here is my key:\n-----BEGIN PRIVATE KEY-----\nblah\n-----END PRIVATE KEY-----"
+                        .to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 15,
             }],

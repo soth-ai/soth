@@ -3,9 +3,9 @@ use base64::Engine;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use ed25519_dalek::{Signer, SigningKey};
 use soth_core::{
-    AppType, CaptureMode, DeploymentModel, DetectedProvider, EndpointType, FormatMetadata,
-    NormalizedRequest, ParseConfidence, ParseSource, PolicyContext, ProcessMatchKind,
-    ProcessResolution, SessionSnapshot, TrafficClassification,
+    AppType, CaptureMode, DeploymentModel, EndpointType, FormatMetadata, NormalizedRequest,
+    ParseConfidence, ParseSource, PolicyContext, ProcessMatchKind, ProcessResolution,
+    SessionSnapshot, TrafficClassification,
 };
 use soth_policy::sync_policy::{
     evaluate, load_bundle_from_bytes, BudgetLimits, OrgPatterns, PolicyBundleMetadata,
@@ -71,7 +71,7 @@ fn fixture_request() -> NormalizedRequest {
         schema_version: "1".to_string(),
         parse_warnings: Vec::new(),
         is_ai_call: true,
-        provider: DetectedProvider::Anthropic,
+        provider: "anthropic".to_string(),
         model: Some("claude-3-5-sonnet-20241022".to_string()),
         endpoint_type: EndpointType::ChatCompletion,
         api_version: None,
@@ -92,10 +92,14 @@ fn fixture_request() -> NormalizedRequest {
         estimated_cost_usd: 0.21,
         parse_source: ParseSource::GraphQl,
         canonical_cache_key: String::new(),
-        format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
+        format_metadata: FormatMetadata::Unknown {
+            method: String::new(),
+            path: String::new(),
+        },
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
+        user_prompt: None,
     }
 }
 
@@ -117,7 +121,7 @@ fn fixture_context() -> PolicyContext {
         semantic: None,
         session: SessionSnapshot {
             total_tokens: 100_000,
-            total_cost_usd: 3.14,
+            total_cost_usd: 3.15,
             request_count: 42,
             credential_alerts: 0,
             ..Default::default()

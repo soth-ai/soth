@@ -55,7 +55,7 @@ pub fn verify_bundle_with_options(
         manifest
             .bundle_id
             .as_deref()
-            .unwrap_or_else(|| manifest.version.as_str()),
+            .unwrap_or(manifest.version.as_str()),
     ) {
         trust_level = BundleTrustLevel::Unverified;
     }

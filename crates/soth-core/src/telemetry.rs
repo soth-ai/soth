@@ -120,7 +120,7 @@ pub enum RequestMethod {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SensitiveCodeFlags {
     pub credential_pattern_detected: bool,
     pub auth_logic_detected: bool,
@@ -130,21 +130,6 @@ pub struct SensitiveCodeFlags {
     pub org_pattern_matches: Vec<String>,
     pub private_key_detected: bool,
     pub hardcoded_secret_detected: bool,
-}
-
-impl Default for SensitiveCodeFlags {
-    fn default() -> Self {
-        Self {
-            credential_pattern_detected: false,
-            auth_logic_detected: false,
-            crypto_operations_detected: false,
-            network_calls_detected: false,
-            file_io_detected: false,
-            org_pattern_matches: Vec::new(),
-            private_key_detected: false,
-            hardcoded_secret_detected: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,10 +388,7 @@ impl TelemetryEvent {
             .get("original_timestamp")
             .and_then(|s| s.parse::<i64>().ok());
 
-        let semantic_hash = meta
-            .get("semantic_hash")
-            .cloned()
-            .unwrap_or_default();
+        let semantic_hash = meta.get("semantic_hash").cloned().unwrap_or_default();
 
         let system_prompt_hash = meta.get("system_prompt_hash").cloned();
 
@@ -490,7 +472,7 @@ impl TelemetryEvent {
             parse_source: gov
                 .normalized
                 .as_ref()
-                .map(|n| n.parse_source.clone())
+                .map(|n| n.parse_source)
                 .unwrap_or(ParseSource::Heuristic),
             capture_mode: gov.capture_mode,
             request_method: RequestMethod::Post,

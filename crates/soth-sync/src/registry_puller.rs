@@ -219,7 +219,7 @@ impl RegistryPuller {
                 Ok(None) => continue,
                 Err(error) => {
                     last_error = Some(
-                        error.context(format!("registry pull failed via endpoint {}", endpoint)),
+                        error.context(format!("registry pull failed via endpoint {endpoint}")),
                     );
                     if endpoint != self.endpoint {
                         tracing::warn!(
@@ -620,8 +620,9 @@ fn build_projected_runtime_bundle(
         assets.insert(path, bytes);
     }
 
-    let native_bundle: soth_interface::NativeBundle = serde_json::from_value(normalized_bundle.clone())
-        .context("failed parsing registry payload as NativeBundle")?;
+    let native_bundle: soth_core::native_bundle::NativeBundle =
+        serde_json::from_value(normalized_bundle.clone())
+            .context("failed parsing registry payload as NativeBundle")?;
     let detect = soth_bundle::detect_from_native(&native_bundle);
     let gating = soth_bundle::gating_from_native(&native_bundle);
     let raw_registry_bundle =
@@ -851,9 +852,7 @@ fn verify_bundle_integrity(
                 return Ok(verified);
             }
             anyhow::bail!(
-                "registry bundle sha256 mismatch: metadata={} actual={}",
-                expected_hash,
-                actual_hash
+                "registry bundle sha256 mismatch: metadata={expected_hash} actual={actual_hash}"
             );
         }
         if size_mismatch {

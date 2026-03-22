@@ -23,9 +23,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "extensions")]
     let ext_registry = {
         let mut registry = ExtensionRegistry::empty();
-        registry.register(Arc::new(
-            soth_historian::HistorianExtension::with_defaults(),
-        ));
+        registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
         registry
     };
 
@@ -295,9 +293,7 @@ fn init_tracing(extension_targets: &[&str]) {
         tracing_subscriber::EnvFilter::new(base)
     });
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 fn init_rustls_provider() {

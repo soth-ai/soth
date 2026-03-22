@@ -118,14 +118,18 @@ impl ProxyHandler {
 
         // Bounded reap: scan at most 256 entries per tick to avoid GC pauses
         const MAX_REAP_SCAN: usize = 256;
-        self.pending.evict_stale(Duration::from_secs(300), MAX_REAP_SCAN);
-        self.streaming.evict_stale(Duration::from_secs(300), MAX_REAP_SCAN);
+        self.pending
+            .evict_stale(Duration::from_secs(300), MAX_REAP_SCAN);
+        self.streaming
+            .evict_stale(Duration::from_secs(300), MAX_REAP_SCAN);
         self.session_store.evict_stale(MAX_REAP_SCAN);
         self.expire_embeddings_if_due();
 
         // Evict stale pending_emit entries (classify completed but response never arrived).
         // Emit classify-only telemetry for these so they are not lost.
-        let stale_entries = self.pending_emit.evict_stale(Duration::from_secs(60), MAX_REAP_SCAN);
+        let stale_entries = self
+            .pending_emit
+            .evict_stale(Duration::from_secs(60), MAX_REAP_SCAN);
         for (connection_id, stale) in stale_entries {
             if let Some(mut classify_data) = stale.classify_data {
                 // Stamp session metadata even without response data
@@ -222,8 +226,7 @@ impl ProxyHandler {
         }
         // env_index is always rebuilt from the bundle's detect data; no
         // separate optional path needed — every LoadedBundle carries one.
-        self.env_index
-            .store(Arc::clone(&bundle.env_index));
+        self.env_index.store(Arc::clone(&bundle.env_index));
         tracing::info!(
             bundle_version = bundle.version,
             "bundle hot-swap applied; parser and gate evaluators rebuilt"
@@ -346,17 +349,17 @@ impl ProxyHandler {
                 // the telemetry record carries meaningful context even without a
                 // known entity match.  This branch also handles the IdePlugin
                 // case where the parent is not an IDE (resolve_tool returned None).
-                let parent_env_class = env_index.resolve_parent(parent_bundle_id, parent_process_name);
+                let parent_env_class =
+                    env_index.resolve_parent(parent_bundle_id, parent_process_name);
                 let surface = env_class_to_surface(parent_env_class);
                 (None, surface, true)
             }
         };
 
         // Derive session key and bind this connection
-        let session_key = self.session_store.derive_key(
-            &process_resolution,
-            outcome.matched_application.as_deref(),
-        );
+        let session_key = self
+            .session_store
+            .derive_key(&process_resolution, outcome.matched_application.as_deref());
         let session_result = self.session_store.get_or_create(&session_key);
         self.session_store
             .bind_connection(connection_id, session_key.clone());
@@ -371,8 +374,12 @@ impl ProxyHandler {
 
         let parser_registry = self.parser_registry.load();
         let pre_detect_snapshot = self.session_store.snapshot(&session_key);
-        let mut detect_result =
-            soth_detect::process_with_registry(parser_registry.as_ref(), &req, &detect_bundle, &pre_detect_snapshot);
+        let mut detect_result = soth_detect::process_with_registry(
+            parser_registry.as_ref(),
+            &req,
+            &detect_bundle,
+            &pre_detect_snapshot,
+        );
         if let Some((actual_bytes, limit_bytes)) = truncated_body_sizes {
             let warning = soth_core::ParseWarning::BodyTruncated {
                 actual_bytes: actual_bytes as u64,
@@ -499,9 +506,7 @@ impl ProxyHandler {
         // NOTE: soth-mitm strips the `Upgrade` header (hop-by-hop).  Use
         // `Sec-WebSocket-Version` which survives the strip pass and is
         // mandatory per RFC 6455 §4.1 for all WebSocket upgrade requests.
-        let is_websocket_upgrade = req
-            .headers
-            .contains_key("sec-websocket-version");
+        let is_websocket_upgrade = req.headers.contains_key("sec-websocket-version");
 
         if is_websocket_upgrade {
             // Seed provider from gating metadata so the DB record isn't "unknown".
@@ -553,29 +558,27 @@ impl ProxyHandler {
         }
 
         let policy_block_enforced = Arc::new(AtomicBool::new(false));
-        let mut block_rx = classify_task::spawn_classify_task(
-            classify_task::ClassifyTaskInput {
-                connection_id,
-                detect_result,
-                content_for_embedding,
-                proxy_ctx,
-                capture_mode: outcome.capture_mode,
-                matched_provider: outcome.matched_provider.clone(),
-                matched_application: outcome.matched_application.clone(),
-                raw_body_for_commitment: raw_body_for_db,
-                classify_bundle: bundle.classify.clone(),
-                policy_bundle: bundle.policy.clone(),
-                bundle_trust_level: bundle.trust_level,
-                classify_config: self.classify_config.clone(),
-                policy_block_enforced: policy_block_enforced.clone(),
-                session_store: self.session_store.clone(),
-                telemetry: self.telemetry.clone(),
-                observer_broadcast: self.observer_broadcast.clone(),
-                runtime: self.classify_runtime.clone(),
-                lane,
-                pending_emit_store: Some(self.pending_emit.clone()),
-            },
-        );
+        let mut block_rx = classify_task::spawn_classify_task(classify_task::ClassifyTaskInput {
+            connection_id,
+            detect_result,
+            content_for_embedding,
+            proxy_ctx,
+            capture_mode: outcome.capture_mode,
+            matched_provider: outcome.matched_provider.clone(),
+            matched_application: outcome.matched_application.clone(),
+            raw_body_for_commitment: raw_body_for_db,
+            classify_bundle: bundle.classify.clone(),
+            policy_bundle: bundle.policy.clone(),
+            bundle_trust_level: bundle.trust_level,
+            classify_config: self.classify_config.clone(),
+            policy_block_enforced: policy_block_enforced.clone(),
+            session_store: self.session_store.clone(),
+            telemetry: self.telemetry.clone(),
+            observer_broadcast: self.observer_broadcast.clone(),
+            runtime: self.classify_runtime.clone(),
+            lane,
+            pending_emit_store: Some(self.pending_emit.clone()),
+        });
 
         let timeout_ms = self.pipeline_config.block_signal_timeout_ms;
         if timeout_ms == 0 {
@@ -690,10 +693,7 @@ impl ProxyHandler {
         if usage.is_none() && !skip_body_parse && response_body_bytes > 256 {
             let estimated_output_tokens = estimate_output_tokens(response_body_bytes as u64);
             usage = Some(UsageSummary {
-                input_tokens: pending
-                    .detect_result
-                    .normalized
-                    .estimated_input_tokens as u64,
+                input_tokens: pending.detect_result.normalized.estimated_input_tokens as u64,
                 output_tokens: estimated_output_tokens,
                 estimated_output_cost_usd: 0.0,
                 finish_reason: None,
@@ -766,8 +766,7 @@ impl ProxyHandler {
                         pending.outcome.matched_provider.clone();
                     frame_req.connection_meta.matched_application =
                         pending.outcome.matched_application.clone();
-                    frame_req.connection_meta.capture_mode =
-                        Some(pending.outcome.capture_mode);
+                    frame_req.connection_meta.capture_mode = Some(pending.outcome.capture_mode);
                     let snapshot = soth_core::SessionSnapshot::default();
                     let result = soth_detect::process_with_registry(
                         parser_registry.as_ref(),
@@ -787,8 +786,8 @@ impl ProxyHandler {
                 };
 
                 let policy_block_enforced = Arc::new(AtomicBool::new(false));
-                let _block_rx = classify_task::spawn_classify_task(
-                    classify_task::ClassifyTaskInput {
+                let _block_rx =
+                    classify_task::spawn_classify_task(classify_task::ClassifyTaskInput {
                         connection_id: pending.connection_id,
                         detect_result: refreshed_detect,
                         content_for_embedding: deferred.content_for_embedding,
@@ -808,8 +807,7 @@ impl ProxyHandler {
                         runtime: self.classify_runtime.clone(),
                         lane: deferred.lane,
                         pending_emit_store: Some(self.pending_emit.clone()),
-                    },
-                );
+                    });
                 // Block signal is ignored — the WebSocket upgrade was already allowed.
             }
 
@@ -829,12 +827,7 @@ impl ProxyHandler {
                     turn.model.as_deref(),
                     &turn.usage,
                 );
-                crate::db::write_stream_turn(
-                    &self.db,
-                    chunk.connection_id,
-                    &turn,
-                    &state,
-                );
+                crate::db::write_stream_turn(&self.db, chunk.connection_id, &turn, &state);
                 // Per-turn usage is written to the DB via write_stream_turn above.
                 // Session token totals are NOT updated here — they are applied
                 // once at stream finalization (finalize_completed_stream) to avoid
@@ -911,7 +904,11 @@ impl ProxyHandler {
     /// Shared by `handle_stream_end` and `on_connection_close` — the two paths
     /// that can close a stream. The caller is responsible for taking the
     /// `CompletedStream` from the streaming store.
-    fn finalize_completed_stream(&self, connection_id: Uuid, mut completed: crate::streaming::CompletedStream) {
+    fn finalize_completed_stream(
+        &self,
+        connection_id: Uuid,
+        mut completed: crate::streaming::CompletedStream,
+    ) {
         // Merge streaming response artifacts (credentials found in response
         // chunks) into the detect result so they reach telemetry + DB.
         if !completed.stream_artifacts.is_empty() {
@@ -923,7 +920,8 @@ impl ProxyHandler {
         }
 
         let usage = completed.usage.unwrap_or_else(|| {
-            let estimated_output_tokens = estimate_output_tokens(completed.accumulated_payload_bytes);
+            let estimated_output_tokens =
+                estimate_output_tokens(completed.accumulated_payload_bytes);
             UsageSummary {
                 input_tokens: completed
                     .pending
@@ -943,7 +941,12 @@ impl ProxyHandler {
             Some(&usage),
             completed.pending.request_host.as_str(),
             completed.pending.request_path.as_str(),
-            completed.pending.detect_result.normalized.parser_id.as_str(),
+            completed
+                .pending
+                .detect_result
+                .normalized
+                .parser_id
+                .as_str(),
             completed.pending.outcome.matched_provider.as_deref(),
             completed.pending.outcome.matched_application.as_deref(),
         );
@@ -953,10 +956,12 @@ impl ProxyHandler {
             completed.elapsed.as_millis() as u64,
             Some(&usage),
             completed.pending.detect_result.normalized.provider.as_str(),
-            completed
-                .extracted_model
-                .as_deref()
-                .or(completed.pending.detect_result.normalized.model.as_deref()),
+            completed.extracted_model.as_deref().or(completed
+                .pending
+                .detect_result
+                .normalized
+                .model
+                .as_deref()),
             completed.pending.request_host.as_str(),
             completed.pending.request_path.as_str(),
         );

@@ -13,8 +13,16 @@ pub(super) fn usage_from_json_value(value: &serde_json::Value) -> Option<StreamU
     let input_tokens = usage
         .get("input_tokens")
         .and_then(serde_json::Value::as_u64)
-        .or_else(|| usage.get("prompt_tokens").and_then(serde_json::Value::as_u64))
-        .or_else(|| usage.get("promptTokenCount").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            usage
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .get("promptTokenCount")
+                .and_then(serde_json::Value::as_u64)
+        })
         .unwrap_or(0);
 
     let output_tokens = usage
@@ -74,10 +82,7 @@ pub(super) fn finish_reason_from_json_value(value: &serde_json::Value) -> Option
         return Some(fr.to_string());
     }
     // Anthropic: stop_reason
-    if let Some(fr) = value
-        .get("stop_reason")
-        .and_then(serde_json::Value::as_str)
-    {
+    if let Some(fr) = value.get("stop_reason").and_then(serde_json::Value::as_str) {
         return Some(fr.to_string());
     }
     // Anthropic message_delta: delta.stop_reason

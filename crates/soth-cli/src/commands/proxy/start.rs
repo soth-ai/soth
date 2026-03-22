@@ -70,7 +70,13 @@ pub async fn run(
         }
     }
 
-    supervise_proxy(&mut child, generated_path.as_path(), expected_port, foreground).await
+    supervise_proxy(
+        &mut child,
+        generated_path.as_path(),
+        expected_port,
+        foreground,
+    )
+    .await
 }
 
 fn ensure_ca_runtime_health(paths: &super::ca_health::ResolvedCaPaths, quiet: bool) -> Result<()> {
@@ -335,7 +341,10 @@ async fn monitor_listener_health(port: u16) -> Result<()> {
         interval.tick().await;
         if is_local_listener_ready(port) {
             if warned {
-                info!(port, "proxy listener recovered — accepting connections again");
+                info!(
+                    port,
+                    "proxy listener recovered — accepting connections again"
+                );
             }
             unhealthy_since = None;
             warned = false;

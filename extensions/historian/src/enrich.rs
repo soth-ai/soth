@@ -56,10 +56,7 @@ impl ClassifyEnricher {
     }
 
     /// Build from an existing bundle (useful when the proxy already has one).
-    pub fn with_bundle(
-        bundle: Arc<ClassifyBundle>,
-        ctx: &ExtensionRuntimeContext,
-    ) -> Self {
+    pub fn with_bundle(bundle: Arc<ClassifyBundle>, ctx: &ExtensionRuntimeContext) -> Self {
         Self {
             bundle,
             config: ClassifyConfig::default(),
@@ -118,10 +115,7 @@ impl ClassifyEnricher {
 /// Build a synthetic `DetectResult` from the GovernableEvent's already-parsed
 /// data.  This avoids re-running the soth-detect HTTP parsing pipeline.
 fn build_detect_result(event: &GovernableEvent) -> DetectResult {
-    let normalized = event
-        .normalized
-        .clone()
-        .unwrap_or_default();
+    let normalized = event.normalized.clone().unwrap_or_default();
 
     DetectResult {
         normalized,
@@ -130,7 +124,7 @@ fn build_detect_result(event: &GovernableEvent) -> DetectResult {
         parse_source: event
             .normalized
             .as_ref()
-            .map(|n| n.parse_source.clone())
+            .map(|n| n.parse_source)
             .unwrap_or(soth_core::ParseSource::Heuristic),
         confidence: event
             .normalized

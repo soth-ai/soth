@@ -77,7 +77,7 @@ pub fn save_backfill_progress(
     cursor: Option<&Cursor>,
 ) -> Result<(), HistorianError> {
     let cursor_json = cursor
-        .map(|c| serde_json::to_string(c))
+        .map(serde_json::to_string)
         .transpose()
         .map_err(|e| HistorianError::Json(e.to_string()))?;
 
@@ -203,7 +203,9 @@ mod tests {
         let conn = open_historian_db(&db_path).unwrap();
 
         // Initially no progress
-        assert!(load_backfill_progress(&conn, "claude_code").unwrap().is_none());
+        assert!(load_backfill_progress(&conn, "claude_code")
+            .unwrap()
+            .is_none());
 
         // Save progress without cursor
         let progress = BackfillProgress {
@@ -215,7 +217,9 @@ mod tests {
         };
         save_backfill_progress(&conn, "claude_code", &progress, None).unwrap();
 
-        let (loaded, cursor) = load_backfill_progress(&conn, "claude_code").unwrap().unwrap();
+        let (loaded, cursor) = load_backfill_progress(&conn, "claude_code")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.sessions_total, 100);
         assert_eq!(loaded.sessions_done, 42);
         assert_eq!(loaded.started_at, Some(1700000000));
@@ -242,11 +246,19 @@ mod tests {
         };
         save_backfill_progress(&conn, "gemini_cli", &progress, Some(&cursor)).unwrap();
 
-        let (loaded, loaded_cursor) = load_backfill_progress(&conn, "gemini_cli").unwrap().unwrap();
+        let (loaded, loaded_cursor) = load_backfill_progress(&conn, "gemini_cli")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.sessions_done, 50);
         assert!(loaded.completed_at.is_some());
         let c = loaded_cursor.unwrap();
-        assert!(matches!(c, Cursor::FileMtime { mtime: 1700000000000, .. }));
+        assert!(matches!(
+            c,
+            Cursor::FileMtime {
+                mtime: 1700000000000,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -303,7 +315,9 @@ mod tests {
         };
         save_backfill_progress(&conn, "claude_code", &p2, None).unwrap();
 
-        let (loaded, _) = load_backfill_progress(&conn, "claude_code").unwrap().unwrap();
+        let (loaded, _) = load_backfill_progress(&conn, "claude_code")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.sessions_done, 60, "should reflect latest save");
     }
 }

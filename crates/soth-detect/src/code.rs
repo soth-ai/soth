@@ -30,13 +30,34 @@ pub struct TreeSitterResult {
 }
 
 static CODE_KEYWORDS: &[&str] = &[
-    "fn ", "def ", "func ", "function ", "class ", "struct ", "impl ",
-    "import ", "require(", "include ", "return ", "const ", "let ", "var ",
-    "if (", "if let ", "while (", "for ", "switch ", "async ", "await ",
+    "fn ",
+    "def ",
+    "func ",
+    "function ",
+    "class ",
+    "struct ",
+    "impl ",
+    "import ",
+    "require(",
+    "include ",
+    "return ",
+    "const ",
+    "let ",
+    "var ",
+    "if (",
+    "if let ",
+    "while (",
+    "for ",
+    "switch ",
+    "async ",
+    "await ",
 ];
 
 pub fn has_code_content(content: &str) -> bool {
-    use crate::util::{safe_prefix, safe_suffix, SAMPLING_THRESHOLD_BYTES, SAMPLE_PREFIX_BYTES, SAMPLE_SUFFIX_BYTES};
+    use crate::util::{
+        safe_prefix, safe_suffix, SAMPLE_PREFIX_BYTES, SAMPLE_SUFFIX_BYTES,
+        SAMPLING_THRESHOLD_BYTES,
+    };
 
     if content.len() <= SAMPLING_THRESHOLD_BYTES {
         return has_code_content_inner(content);
@@ -62,7 +83,10 @@ fn has_code_content_inner(content: &str) -> bool {
         signals += 1;
     }
 
-    let keyword_count = CODE_KEYWORDS.iter().filter(|kw| content.contains(*kw)).count();
+    let keyword_count = CODE_KEYWORDS
+        .iter()
+        .filter(|kw| content.contains(*kw))
+        .count();
     if keyword_count >= 3 {
         signals += 1;
     }
@@ -174,60 +198,258 @@ pub fn heuristic_language(content: &str) -> Option<String> {
         };
     }
 
-    let rust_score = count_hits(&text, &["fn ", "impl ", "pub struct ", "use std::", "let mut ", "-> result", "unwrap()"]);
-    if rust_score >= 3 { score!("rust", rust_score); }
+    let rust_score = count_hits(
+        &text,
+        &[
+            "fn ",
+            "impl ",
+            "pub struct ",
+            "use std::",
+            "let mut ",
+            "-> result",
+            "unwrap()",
+        ],
+    );
+    if rust_score >= 3 {
+        score!("rust", rust_score);
+    }
 
-    let py_score = count_hits(&text, &["def ", "import ", "class ", "self.", "elif ", "print(", "__init__"]);
-    if py_score >= 3 { score!("python", py_score); }
+    let py_score = count_hits(
+        &text,
+        &[
+            "def ", "import ", "class ", "self.", "elif ", "print(", "__init__",
+        ],
+    );
+    if py_score >= 3 {
+        score!("python", py_score);
+    }
 
-    let ts_score = count_hits(&text, &[": string", ": number", ": boolean", "interface ", "type ", "=> {", "async function"]);
-    if ts_score >= 3 { score!("typescript", ts_score); }
+    let ts_score = count_hits(
+        &text,
+        &[
+            ": string",
+            ": number",
+            ": boolean",
+            "interface ",
+            "type ",
+            "=> {",
+            "async function",
+        ],
+    );
+    if ts_score >= 3 {
+        score!("typescript", ts_score);
+    }
 
-    let js_score = count_hits(&text, &["function ", "const ", "let ", "var ", "require(", "module.exports", "=>"]);
-    if js_score >= 3 && ts_score < 2 { score!("javascript", js_score); }
+    let js_score = count_hits(
+        &text,
+        &[
+            "function ",
+            "const ",
+            "let ",
+            "var ",
+            "require(",
+            "module.exports",
+            "=>",
+        ],
+    );
+    if js_score >= 3 && ts_score < 2 {
+        score!("javascript", js_score);
+    }
 
-    let go_score = count_hits(&text, &["func ", "package ", ":= ", "fmt.", "goroutine", "chan ", "go func"]);
-    if go_score >= 2 { score!("go", go_score); }
+    let go_score = count_hits(
+        &text,
+        &[
+            "func ",
+            "package ",
+            ":= ",
+            "fmt.",
+            "goroutine",
+            "chan ",
+            "go func",
+        ],
+    );
+    if go_score >= 2 {
+        score!("go", go_score);
+    }
 
-    let java_score = count_hits(&text, &["public class ", "private ", "void ", "system.out", "throws ", "extends ", "implements "]);
-    if java_score >= 2 { score!("java", java_score); }
+    let java_score = count_hits(
+        &text,
+        &[
+            "public class ",
+            "private ",
+            "void ",
+            "system.out",
+            "throws ",
+            "extends ",
+            "implements ",
+        ],
+    );
+    if java_score >= 2 {
+        score!("java", java_score);
+    }
 
-    let cpp_score = count_hits(&text, &["#include", "std::", "cout <<", "int main(", "namespace ", "::", "template<"]);
-    if cpp_score >= 2 { score!("cpp", cpp_score); }
+    let cpp_score = count_hits(
+        &text,
+        &[
+            "#include",
+            "std::",
+            "cout <<",
+            "int main(",
+            "namespace ",
+            "::",
+            "template<",
+        ],
+    );
+    if cpp_score >= 2 {
+        score!("cpp", cpp_score);
+    }
 
-    let c_score = count_hits(&text, &["#include", "int main(", "printf(", "malloc(", "sizeof(", "typedef ", "struct {"]);
-    if c_score >= 2 && cpp_score < 2 { score!("c", c_score); }
+    let c_score = count_hits(
+        &text,
+        &[
+            "#include",
+            "int main(",
+            "printf(",
+            "malloc(",
+            "sizeof(",
+            "typedef ",
+            "struct {",
+        ],
+    );
+    if c_score >= 2 && cpp_score < 2 {
+        score!("c", c_score);
+    }
 
-    let cs_score = count_hits(&text, &["using system", "namespace ", "public class ", "console.writeline", "async task", "var ", "=> {"]);
-    if cs_score >= 3 { score!("csharp", cs_score); }
+    let cs_score = count_hits(
+        &text,
+        &[
+            "using system",
+            "namespace ",
+            "public class ",
+            "console.writeline",
+            "async task",
+            "var ",
+            "=> {",
+        ],
+    );
+    if cs_score >= 3 {
+        score!("csharp", cs_score);
+    }
 
-    let rb_score = count_hits(&text, &["def ", "end\n", "puts ", "require ", "attr_", "do |", ".each"]);
-    if rb_score >= 3 { score!("ruby", rb_score); }
+    let rb_score = count_hits(
+        &text,
+        &[
+            "def ", "end\n", "puts ", "require ", "attr_", "do |", ".each",
+        ],
+    );
+    if rb_score >= 3 {
+        score!("ruby", rb_score);
+    }
 
-    let php_score = count_hits(&text, &["<?php", "echo ", "$", "function ", "->", "array(", "namespace "]);
-    if php_score >= 3 && text.contains('$') { score!("php", php_score); }
+    let php_score = count_hits(
+        &text,
+        &[
+            "<?php",
+            "echo ",
+            "$",
+            "function ",
+            "->",
+            "array(",
+            "namespace ",
+        ],
+    );
+    if php_score >= 3 && text.contains('$') {
+        score!("php", php_score);
+    }
 
-    let swift_score = count_hits(&text, &["func ", "var ", "let ", "guard ", "if let ", "class ", "struct "]);
-    if swift_score >= 3 && text.contains("guard ") { score!("swift", swift_score); }
+    let swift_score = count_hits(
+        &text,
+        &[
+            "func ", "var ", "let ", "guard ", "if let ", "class ", "struct ",
+        ],
+    );
+    if swift_score >= 3 && text.contains("guard ") {
+        score!("swift", swift_score);
+    }
 
-    let kt_score = count_hits(&text, &["fun ", "val ", "var ", "data class ", "companion object", "?.let", "coroutine"]);
-    if kt_score >= 2 { score!("kotlin", kt_score); }
+    let kt_score = count_hits(
+        &text,
+        &[
+            "fun ",
+            "val ",
+            "var ",
+            "data class ",
+            "companion object",
+            "?.let",
+            "coroutine",
+        ],
+    );
+    if kt_score >= 2 {
+        score!("kotlin", kt_score);
+    }
 
-    let sql_score = count_hits(&text, &["select ", " from ", "where ", "insert into", "create table", "join ", "group by"]);
-    if sql_score >= 2 { score!("sql", sql_score); }
+    let sql_score = count_hits(
+        &text,
+        &[
+            "select ",
+            " from ",
+            "where ",
+            "insert into",
+            "create table",
+            "join ",
+            "group by",
+        ],
+    );
+    if sql_score >= 2 {
+        score!("sql", sql_score);
+    }
 
-    let sh_score = count_hits(&text, &["#!/", "echo ", "export ", "if [ ", "fi\n", "for ", "grep "]);
-    if sh_score >= 2 || text.starts_with("#!/") { score!("bash", sh_score.max(2)); }
+    let sh_score = count_hits(
+        &text,
+        &["#!/", "echo ", "export ", "if [ ", "fi\n", "for ", "grep "],
+    );
+    if sh_score >= 2 || text.starts_with("#!/") {
+        score!("bash", sh_score.max(2));
+    }
 
-    let tf_score = count_hits(&text, &["resource \"", "variable \"", "provider \"", "terraform {", "data \"", ".tf\""]);
-    if tf_score >= 2 { score!("terraform", tf_score); }
+    let tf_score = count_hits(
+        &text,
+        &[
+            "resource \"",
+            "variable \"",
+            "provider \"",
+            "terraform {",
+            "data \"",
+            ".tf\"",
+        ],
+    );
+    if tf_score >= 2 {
+        score!("terraform", tf_score);
+    }
 
-    let sol_score = count_hits(&text, &["pragma solidity", "contract ", "function ", "mapping(", "address ", "emit ", "modifier "]);
-    if sol_score >= 2 && text.contains("pragma solidity") { score!("solidity", sol_score); }
+    let sol_score = count_hits(
+        &text,
+        &[
+            "pragma solidity",
+            "contract ",
+            "function ",
+            "mapping(",
+            "address ",
+            "emit ",
+            "modifier ",
+        ],
+    );
+    if sol_score >= 2 && text.contains("pragma solidity") {
+        score!("solidity", sol_score);
+    }
 
-    if is_yaml(&text) { score!("yaml", 3); }
+    if is_yaml(&text) {
+        score!("yaml", 3);
+    }
 
-    if is_likely_json(content) { score!("json", 2); }
+    if is_likely_json(content) {
+        score!("json", 2);
+    }
 
     best.map(|(lang, _)| lang)
 }
@@ -350,12 +572,26 @@ fn analyze_with_tree_sitter(content: &str, language: &str) -> Option<TreeSitterR
     let import_categories = classify_imports(&import_strings);
     let function_count = count_functions(root);
 
-    let has_auth_logic = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Auth));
-    let has_crypto_operations = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Crypto));
-    let has_network_calls = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Network));
-    let has_file_io = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Filesystem));
+    let has_auth_logic = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Auth));
+    let has_crypto_operations = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Crypto));
+    let has_network_calls = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Network));
+    let has_file_io = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Filesystem));
 
-    let complexity_estimate = estimate_complexity(function_count, &import_categories, has_auth_logic, has_crypto_operations, has_network_calls);
+    let complexity_estimate = estimate_complexity(
+        function_count,
+        &import_categories,
+        has_auth_logic,
+        has_crypto_operations,
+        has_network_calls,
+    );
 
     Some(TreeSitterResult {
         confirmed_language,
@@ -376,14 +612,28 @@ fn fallback_analysis(content: &str, language: &str) -> Option<TreeSitterResult> 
     let import_categories = classify_imports(&import_strings);
     let function_count = count_functions_regex(content, language);
 
-    let has_auth_logic = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Auth));
-    let has_crypto_operations = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Crypto));
-    let has_network_calls = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Network));
-    let has_file_io = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Filesystem));
+    let has_auth_logic = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Auth));
+    let has_crypto_operations = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Crypto));
+    let has_network_calls = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Network));
+    let has_file_io = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Filesystem));
 
     let _ = &text_lc; // suppress warning
 
-    let complexity_estimate = estimate_complexity(function_count, &import_categories, has_auth_logic, has_crypto_operations, has_network_calls);
+    let complexity_estimate = estimate_complexity(
+        function_count,
+        &import_categories,
+        has_auth_logic,
+        has_crypto_operations,
+        has_network_calls,
+    );
 
     Some(TreeSitterResult {
         confirmed_language: None,
@@ -406,11 +656,22 @@ fn extract_import_strings(root: Node<'_>, source: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "tree-sitter")]
-fn collect_import_nodes(node: Node<'_>, cursor: &mut tree_sitter::TreeCursor<'_>, source: &str, imports: &mut Vec<String>) {
+#[allow(clippy::only_used_in_recursion)]
+fn collect_import_nodes(
+    node: Node<'_>,
+    cursor: &mut tree_sitter::TreeCursor<'_>,
+    source: &str,
+    imports: &mut Vec<String>,
+) {
     let kind = node.kind();
-    if matches!(kind,
-        "use_declaration" | "import_statement" | "import_declaration" |
-        "import_spec" | "import_from_statement" | "package_clause"
+    if matches!(
+        kind,
+        "use_declaration"
+            | "import_statement"
+            | "import_declaration"
+            | "import_spec"
+            | "import_from_statement"
+            | "package_clause"
     ) {
         if let Ok(text) = node.utf8_text(source.as_bytes()) {
             imports.push(text.to_string());
@@ -455,16 +716,98 @@ fn extract_import_strings_regex(content: &str, language: &str) -> Vec<String> {
 fn classify_imports(imports: &[String]) -> Vec<DetectedImportCategory> {
     let mut categories = Vec::new();
 
-    let crypto_keywords = ["openssl", "crypto", "cipher", "aes", "rsa", "hmac", "sha", "bcrypt", "argon", "pbkdf",
-        "ed25519", "secp256k1", "nacl", "libsodium", "ring", "rustls", "mbedtls"];
-    let auth_keywords = ["oauth", "jwt", "auth", "session", "passport", "devise", "cancan", "pundit",
-        "firebase_auth", "cognito", "keycloak", "ldap", "saml", "openid"];
-    let network_keywords = ["http", "https", "fetch", "axios", "reqwest", "hyper", "curl", "socket", "tcp", "udp",
-        "websocket", "grpc", "net", "requests", "urllib", "aiohttp", "httpx"];
-    let database_keywords = ["sql", "postgres", "mysql", "sqlite", "mongodb", "redis", "dynamo", "cassandra",
-        "diesel", "sqlx", "prisma", "sequelize", "mongoose", "typeorm", "orm"];
-    let filesystem_keywords = ["fs", "file", "path", "std::fs", "tokio::fs", "os.path", "pathlib", "shutil"];
-    let serialization_keywords = ["serde", "json", "xml", "yaml", "protobuf", "msgpack", "avro", "cbor", "flatbuffers"];
+    let crypto_keywords = [
+        "openssl",
+        "crypto",
+        "cipher",
+        "aes",
+        "rsa",
+        "hmac",
+        "sha",
+        "bcrypt",
+        "argon",
+        "pbkdf",
+        "ed25519",
+        "secp256k1",
+        "nacl",
+        "libsodium",
+        "ring",
+        "rustls",
+        "mbedtls",
+    ];
+    let auth_keywords = [
+        "oauth",
+        "jwt",
+        "auth",
+        "session",
+        "passport",
+        "devise",
+        "cancan",
+        "pundit",
+        "firebase_auth",
+        "cognito",
+        "keycloak",
+        "ldap",
+        "saml",
+        "openid",
+    ];
+    let network_keywords = [
+        "http",
+        "https",
+        "fetch",
+        "axios",
+        "reqwest",
+        "hyper",
+        "curl",
+        "socket",
+        "tcp",
+        "udp",
+        "websocket",
+        "grpc",
+        "net",
+        "requests",
+        "urllib",
+        "aiohttp",
+        "httpx",
+    ];
+    let database_keywords = [
+        "sql",
+        "postgres",
+        "mysql",
+        "sqlite",
+        "mongodb",
+        "redis",
+        "dynamo",
+        "cassandra",
+        "diesel",
+        "sqlx",
+        "prisma",
+        "sequelize",
+        "mongoose",
+        "typeorm",
+        "orm",
+    ];
+    let filesystem_keywords = [
+        "fs",
+        "file",
+        "path",
+        "std::fs",
+        "tokio::fs",
+        "os.path",
+        "pathlib",
+        "shutil",
+    ];
+    let serialization_keywords = [
+        "serde",
+        "json",
+        "xml",
+        "yaml",
+        "protobuf",
+        "msgpack",
+        "avro",
+        "cbor",
+        "flatbuffers",
+    ];
 
     let joined = imports.join(" ").to_ascii_lowercase();
 
@@ -500,9 +843,14 @@ fn count_functions(root: Node<'_>) -> u32 {
 #[cfg(feature = "tree-sitter")]
 fn count_functions_recursive(node: Node<'_>, count: &mut u32) {
     let kind = node.kind();
-    if matches!(kind,
-        "function_item" | "function_definition" | "method_definition" |
-        "function_declaration" | "method_declaration" | "arrow_function"
+    if matches!(
+        kind,
+        "function_item"
+            | "function_definition"
+            | "method_definition"
+            | "function_declaration"
+            | "method_declaration"
+            | "arrow_function"
     ) {
         *count += 1;
     }
@@ -546,7 +894,9 @@ fn estimate_complexity(
     has_network: bool,
 ) -> u8 {
     let cat_count = import_categories.len();
-    let has_db = import_categories.iter().any(|c| matches!(c, DetectedImportCategory::Database));
+    let has_db = import_categories
+        .iter()
+        .any(|c| matches!(c, DetectedImportCategory::Database));
 
     if (function_count >= 40 && has_auth && has_crypto) || (has_network && has_db && has_auth) {
         return 5;
@@ -600,7 +950,7 @@ fn code_artifact(content: &str, language: &str, location: ArtifactLocation) -> S
         kind: ArtifactKind::CodeBlock {
             language: language.to_string(),
         },
-        commitment: Some(sha256_hex(format!("code_block:{}:{}", language, content))),
+        commitment: Some(sha256_hex(format!("code_block:{language}:{content}"))),
         severity: ArtifactSeverity::Low,
         location,
         redacted_hint: None,

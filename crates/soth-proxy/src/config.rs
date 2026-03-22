@@ -252,8 +252,8 @@ impl Default for MitmRuntimeConfig {
             handler_recover_from_panics: true,
             flow_dispatch_queue_capacity: None,
             closed_flow_lru_capacity: Some(32_768),
-            stale_flow_ttl_ms: Some(300_000),      // 5 min — LLM APIs can take 30-120s for first token
-            stale_reap_max_batch: Some(256),        // large batches to keep up with tunnel churn
+            stale_flow_ttl_ms: Some(300_000), // 5 min — LLM APIs can take 30-120s for first token
+            stale_reap_max_batch: Some(256),  // large batches to keep up with tunnel churn
             dispatch_queue_send_timeout_ms: None,
             dispatch_close_join_timeout_ms: None,
         }
@@ -504,7 +504,7 @@ impl TelemetryPipelineConfig {
             bundle_version,
             org_id,
             observation_queue_dir: None, // wired by extension registry when enabled
-            governance_queue_dir: None, // wired by extension registry when enabled
+            governance_queue_dir: None,  // wired by extension registry when enabled
         })
     }
 }

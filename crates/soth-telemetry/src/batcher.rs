@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use soth_core::{ClassificationFlag, GovernableEvent, PolicyDecision, PolicyDecisionKind, TelemetryEvent, TelemetryPolicyKind};
+use soth_core::{
+    ClassificationFlag, GovernableEvent, PolicyDecision, PolicyDecisionKind, TelemetryEvent,
+    TelemetryPolicyKind,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{EncryptionMode, TelemetryConfig};
@@ -112,7 +115,10 @@ pub(crate) async fn flush_batch(
 
     let mut all_events = events;
     if !governance_events.is_empty() {
-        tracing::info!(count = governance_events.len(), "drained governance queue events");
+        tracing::info!(
+            count = governance_events.len(),
+            "drained governance queue events"
+        );
         all_events.extend(governance_events);
     }
 
@@ -172,9 +178,7 @@ fn build_telemetry_batch(
 /// Each file is read line-by-line, parsed as `OwnedObservationQueueRecord`, and
 /// the underlying `ObservationEvent` is wrapped in `ObservationTelemetryRecord`.
 /// Successfully drained files are truncated to zero bytes.
-fn drain_observation_queues(
-    dir: Option<&std::path::Path>,
-) -> Vec<ObservationTelemetryRecord> {
+fn drain_observation_queues(dir: Option<&std::path::Path>) -> Vec<ObservationTelemetryRecord> {
     let dir = match dir {
         Some(d) if d.exists() => d,
         _ => return Vec::new(),

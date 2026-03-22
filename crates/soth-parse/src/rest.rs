@@ -1,8 +1,7 @@
 use crate::hash::{canonical_hash, estimate_tokens, hash_content};
 use crate::types::{
     DetectedFormat, EndpointType, FormatMeta, NormalizedRequest, ParseConfidence, ParseError,
-    ParseResult, ParseWarning, PreprocessOp, RawRequest, RequestEncoding,
-    RestFormatDescriptor,
+    ParseResult, ParseWarning, PreprocessOp, RawRequest, RequestEncoding, RestFormatDescriptor,
 };
 use crate::util::{extract_string, json_path, normalize_unicodeish};
 use serde_json::Value;
@@ -22,7 +21,9 @@ pub fn parse_rest(
 
     let model = extract_model(&json, desc, &req.path);
     if model.is_none() {
-        warnings.push(ParseWarning::MissingField { field: "model".to_string() });
+        warnings.push(ParseWarning::MissingField {
+            field: "model".to_string(),
+        });
     }
 
     let mut messages = extract_messages(&json, desc);
@@ -207,7 +208,11 @@ pub fn parse_rest(
             content_type: req.path.clone(),
         },
         api_version,
-        user_prompt: if user_content.is_empty() { None } else { Some(user_content.clone()) },
+        user_prompt: if user_content.is_empty() {
+            None
+        } else {
+            Some(user_content.clone())
+        },
     };
 
     normalized.canonical_cache_key = canonical_hash(&normalized);
@@ -550,7 +555,12 @@ fn extract_path_version(path: &str) -> Option<String> {
     for segment in path_lc.split('/') {
         if segment.starts_with('v') && segment.len() > 1 {
             let rest = &segment[1..];
-            if rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            if rest
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+            {
                 return Some(segment.to_string());
             }
         }
@@ -571,10 +581,7 @@ fn parser_id_for_format(format: &DetectedFormat) -> String {
 }
 
 /// Decode the request body according to the descriptor's encoding type.
-fn decode_request_body(
-    req: &RawRequest,
-    desc: &RestFormatDescriptor,
-) -> Result<Value, ParseError> {
+fn decode_request_body(req: &RawRequest, desc: &RestFormatDescriptor) -> Result<Value, ParseError> {
     let raw_json = match desc.encoding {
         RequestEncoding::Json => serde_json::from_slice(&req.body)
             .map_err(|e| ParseError::MalformedBody(e.to_string()))?,
@@ -583,9 +590,7 @@ fn decode_request_body(
                 .map_err(|e| ParseError::MalformedBody(e.to_string()))?;
             decode_form_body(body_str, desc.form_field.as_deref())?
         }
-        RequestEncoding::QueryParams => {
-            decode_query_params(&req.path)
-        }
+        RequestEncoding::QueryParams => decode_query_params(&req.path),
     };
 
     apply_preprocess(raw_json, &desc.preprocess)
@@ -633,10 +638,9 @@ fn percent_decode(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(byte);
                 i += 3;
                 continue;
@@ -664,11 +668,7 @@ fn apply_preprocess(mut value: Value, ops: &[PreprocessOp]) -> Result<Value, Par
                 }
             }
             "index" => {
-                let idx = op
-                    .value
-                    .as_ref()
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
+                let idx = op.value.as_ref().and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 value = value
                     .as_array()
                     .and_then(|arr| arr.get(idx).cloned())
@@ -730,8 +730,11 @@ mod tests {
             form_field: Some("variables".to_string()),
             ..Default::default()
         };
-        let req = raw("POST", "/api/graphql",
-            b"variables=%7B%22message%22%3A%22hello%22%7D&other=1");
+        let req = raw(
+            "POST",
+            "/api/graphql",
+            b"variables=%7B%22message%22%3A%22hello%22%7D&other=1",
+        );
         let json = decode_request_body(&req, &desc).unwrap();
         assert_eq!(json.get("message").unwrap().as_str().unwrap(), "hello");
     }
@@ -747,9 +750,18 @@ mod tests {
             encoding: RequestEncoding::Form,
             form_field: Some("f.req".to_string()),
             preprocess: vec![
-                PreprocessOp { op: "json_parse".to_string(), value: None },
-                PreprocessOp { op: "index".to_string(), value: Some(serde_json::json!(1)) },
-                PreprocessOp { op: "json_parse".to_string(), value: None },
+                PreprocessOp {
+                    op: "json_parse".to_string(),
+                    value: None,
+                },
+                PreprocessOp {
+                    op: "index".to_string(),
+                    value: Some(serde_json::json!(1)),
+                },
+                PreprocessOp {
+                    op: "json_parse".to_string(),
+                    value: None,
+                },
             ],
             ..Default::default()
         };
@@ -769,7 +781,10 @@ mod tests {
         let req = raw("GET", "/search?q=hello+world&selectedChatModel=gpt-4o", b"");
         let json = decode_request_body(&req, &desc).unwrap();
         assert_eq!(json.get("q").unwrap().as_str().unwrap(), "hello world");
-        assert_eq!(json.get("selectedChatModel").unwrap().as_str().unwrap(), "gpt-4o");
+        assert_eq!(
+            json.get("selectedChatModel").unwrap().as_str().unwrap(),
+            "gpt-4o"
+        );
     }
 
     #[test]
@@ -782,8 +797,14 @@ mod tests {
     #[test]
     fn preprocess_json_parse_and_index() {
         let ops = vec![
-            PreprocessOp { op: "json_parse".to_string(), value: None },
-            PreprocessOp { op: "index".to_string(), value: Some(serde_json::json!(0)) },
+            PreprocessOp {
+                op: "json_parse".to_string(),
+                value: None,
+            },
+            PreprocessOp {
+                op: "index".to_string(),
+                value: Some(serde_json::json!(0)),
+            },
         ];
         let input = Value::String(r#"["first","second"]"#.to_string());
         let result = apply_preprocess(input, &ops).unwrap();
@@ -799,7 +820,7 @@ mod tests {
                     out.push(byte as char);
                 }
                 _ => {
-                    out.push_str(&format!("%{:02X}", byte));
+                    out.push_str(&format!("%{byte:02X}"));
                 }
             }
         }

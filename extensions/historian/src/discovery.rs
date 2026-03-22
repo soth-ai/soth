@@ -135,7 +135,11 @@ impl ToolDiscovery {
                     }
                 }
                 let has_pb = root.join("antigravity").join("conversations").is_dir();
-                let estimate = if json_count > 0 { Some(json_count) } else { None };
+                let estimate = if json_count > 0 {
+                    Some(json_count)
+                } else {
+                    None
+                };
                 let format = if json_count > 0 {
                     StorageFormat::JsonFiles
                 } else if has_pb {
@@ -208,7 +212,11 @@ fn detect_tool_from_path(path: &Path) -> AiTool {
     } else if s.contains("openclaw") {
         AiTool::OpenClaw
     } else {
-        AiTool::Unknown(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+        AiTool::Unknown(
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        )
     }
 }
 

@@ -8,7 +8,7 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
-use tracing::{trace, info, warn};
+use tracing::{info, trace, warn};
 
 use soth_extensions::TelemetryQueueWriter;
 
@@ -198,11 +198,7 @@ impl WatchEngine {
                     .get("conversation_hash")
                     .cloned()
                     .unwrap_or_default();
-                let semantic_hash = event
-                    .context
-                    .metadata
-                    .get("semantic_hash")
-                    .cloned();
+                let semantic_hash = event.context.metadata.get("semantic_hash").cloned();
 
                 if self.dedup.is_duplicate(
                     &session.tool,
@@ -212,7 +208,9 @@ impl WatchEngine {
                     &content_hash,
                     session.started_at.unwrap_or(0),
                 ) {
-                    self.stats.duplicates_skipped.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .duplicates_skipped
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 

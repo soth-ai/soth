@@ -55,6 +55,12 @@ pub struct CodexReader {
     cursor: Mutex<Option<Cursor>>,
 }
 
+impl Default for CodexReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CodexReader {
     pub fn new() -> Self {
         Self {
@@ -346,7 +352,10 @@ fn parse_history_jsonl(
         if !groups.contains_key(&entry.session_id) {
             order.push(entry.session_id.clone());
         }
-        groups.entry(entry.session_id.clone()).or_default().push(entry);
+        groups
+            .entry(entry.session_id.clone())
+            .or_default()
+            .push(entry);
     }
 
     let mut sessions = Vec::new();
@@ -455,15 +464,10 @@ impl FormatReader for CodexReader {
         let root = root.to_path_buf();
 
         // Incorporate cursor mtime into the `since` filter.
-        let cursor_mtime = self
-            .cursor
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|c| match c {
-                Cursor::FileMtime { mtime, .. } => Some(*mtime),
-                _ => None,
-            });
+        let cursor_mtime = self.cursor.lock().unwrap().as_ref().and_then(|c| match c {
+            Cursor::FileMtime { mtime, .. } => Some(*mtime),
+            _ => None,
+        });
 
         let effective_since = match (since, cursor_mtime) {
             (Some(s), Some(c)) => Some(s.max(c)),
@@ -656,8 +660,7 @@ mod tests {
         let session = stream.next().await.unwrap().unwrap();
 
         assert_eq!(
-            session.session_id,
-            "019ad3a5-beef-dead-cafe-000000000001",
+            session.session_id, "019ad3a5-beef-dead-cafe-000000000001",
             "session_id should come from session_meta payload.id"
         );
         assert_eq!(session.tool, AiTool::OpenAiCodex);
@@ -860,10 +863,8 @@ mod tests {
             "unique history session should be present"
         );
         assert!(
-            !sessions
-                .iter()
-                .any(|s| s.session_id == "already-seen-id"
-                    && s.messages.iter().any(|m| m.content == "duplicate prompt")),
+            !sessions.iter().any(|s| s.session_id == "already-seen-id"
+                && s.messages.iter().any(|m| m.content == "duplicate prompt")),
             "history duplicate should not appear"
         );
     }

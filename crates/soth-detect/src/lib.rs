@@ -73,10 +73,7 @@ pub fn build_registry(bundle: &DetectBundleSlice<'_>) -> Result<ParserRegistry, 
     ))
 }
 
-pub fn process_chunk(
-    chunk: &StreamChunk,
-    state: &mut StreamDetectState,
-) -> Option<ChunkEvent> {
+pub fn process_chunk(chunk: &StreamChunk, state: &mut StreamDetectState) -> Option<ChunkEvent> {
     static EMPTY_BUNDLE: Lazy<OwnedDetectBundle> = Lazy::new(OwnedDetectBundle::default);
     stream::process_chunk_with_bundle(chunk, state, &EMPTY_BUNDLE.as_slice())
 }
@@ -98,7 +95,9 @@ pub fn classify_request_format(
         Some(host),
         path,
         &empty_headers,
-        None, None, None,
+        None,
+        None,
+        None,
         bundle,
     );
     // Prefer application match (more specific path rules) over provider
@@ -128,11 +127,11 @@ pub fn classify_request_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use soth_core::{
         CaptureRules, GraphQLOperationRegistry, GraphQLOperationSpec, GrpcServiceRegistry,
         OwnedDetectBundle, ProviderEntry, RestFormatDescriptor, RestRequestPaths,
     };
-    use bytes::Bytes;
     use std::collections::{BTreeMap, HashMap};
     use std::net::{Ipv4Addr, SocketAddrV4};
     use uuid::Uuid;
@@ -150,7 +149,11 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert!(matches!(out.parse_source, soth_core::ParseSource::Filtered));
         assert!(!out.normalized.is_ai_call);
     }
@@ -176,8 +179,16 @@ mod tests {
         let mut request_uds = request_tcp.clone();
         request_uds.connection_meta.socket_family = SocketFamily::UnixDomain { path: None };
 
-        let left = process(&request_tcp, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
-        let right = process(&request_uds, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let left = process(
+            &request_tcp,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
+        let right = process(
+            &request_uds,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
 
         assert_eq!(
             left.normalized.canonical_cache_key,
@@ -205,7 +216,11 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert!(!out.artifacts.is_empty());
     }
 
@@ -228,7 +243,11 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert!(!out.artifacts.is_empty());
     }
 
@@ -339,11 +358,17 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_eq!(out.confidence, ParseConfidence::Full);
         assert!(matches!(out.parse_source, soth_core::ParseSource::JsonRpc));
         assert_eq!(out.normalized.model.as_deref(), Some("gpt-4o-mini"));
-        if let soth_core::FormatMetadata::JsonRpc { method, is_batch } = &out.normalized.format_metadata {
+        if let soth_core::FormatMetadata::JsonRpc { method, is_batch } =
+            &out.normalized.format_metadata
+        {
             assert_eq!(method.as_str(), "chat.completions");
             assert!(!is_batch);
         } else {
@@ -374,7 +399,11 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert!(matches!(out.parse_source, soth_core::ParseSource::GraphQl));
         assert_eq!(out.confidence, ParseConfidence::Full);
     }
@@ -422,8 +451,18 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let first = process_with_registry(&registry, &full, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
-        let second = process_with_registry(&registry, &hash_only, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let first = process_with_registry(
+            &registry,
+            &full,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
+        let second = process_with_registry(
+            &registry,
+            &hash_only,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_eq!(first.confidence, ParseConfidence::Full);
         assert_eq!(second.confidence, ParseConfidence::Full);
         assert_eq!(
@@ -461,7 +500,11 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_eq!(out.confidence, ParseConfidence::Full);
         assert!(matches!(out.parse_source, soth_core::ParseSource::Grpc));
         assert_eq!(
@@ -501,7 +544,11 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_eq!(out.confidence, ParseConfidence::Heuristic);
         if let soth_core::FormatMetadata::Grpc {
             service, method, ..
@@ -663,12 +710,18 @@ mod tests {
         };
         request.connection_meta.capture_mode = Some(CaptureMode::Full);
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_eq!(out.capture_mode, CaptureMode::Full);
-        assert!(out
-            .artifacts
-            .iter()
-            .any(|a| matches!(a.kind, soth_core::ArtifactKind::ApiKey { provider: Some(soth_core::DetectedProvider::OpenAi) })));
+        assert!(out.artifacts.iter().any(|a| matches!(
+            a.kind,
+            soth_core::ArtifactKind::ApiKey {
+                provider: Some(soth_core::DetectedProvider::OpenAi)
+            }
+        )));
     }
 
     #[test]
@@ -691,7 +744,11 @@ mod tests {
         };
         request.connection_meta.capture_mode = Some(CaptureMode::MetadataOnly);
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_eq!(out.capture_mode, CaptureMode::MetadataOnly);
         // metadata_only still extracts artifacts; only the future extraction API is gated by `full`
         assert!(!out.artifacts.is_empty());
@@ -713,9 +770,16 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_eq!(out.confidence, ParseConfidence::Heuristic);
-        assert!(matches!(out.parse_source, soth_core::ParseSource::Heuristic));
+        assert!(matches!(
+            out.parse_source,
+            soth_core::ParseSource::Heuristic
+        ));
         assert!(out
             .warnings
             .iter()
@@ -745,12 +809,23 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let without_hint = process(&base, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
-        assert!(matches!(without_hint.parse_source, soth_core::ParseSource::Heuristic));
+        let without_hint = process(
+            &base,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
+        assert!(matches!(
+            without_hint.parse_source,
+            soth_core::ParseSource::Heuristic
+        ));
 
         let mut with_hint_req = base.clone();
         with_hint_req.connection_meta.matched_provider = Some("openai".to_string());
-        let with_hint = process(&with_hint_req, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let with_hint = process(
+            &with_hint_req,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert!(matches!(
             with_hint.parse_source,
             soth_core::ParseSource::Rest {
@@ -797,9 +872,15 @@ mod tests {
             connection_meta: connection_meta_tcp(),
         };
 
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_eq!(out.confidence, ParseConfidence::Full);
-        if let soth_core::FormatMetadata::JsonRpc { method, is_batch } = &out.normalized.format_metadata {
+        if let soth_core::FormatMetadata::JsonRpc { method, is_batch } =
+            &out.normalized.format_metadata
+        {
             assert_eq!(method.as_str(), "chat.completions");
             assert!(*is_batch);
         } else {
@@ -821,7 +902,11 @@ mod tests {
             ),
             connection_meta: connection_meta_tcp(),
         };
-        let out = process(&request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process(
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert!(!out.is_prefix_repeat);
         assert!(!out.is_repeated_code_context);
         assert_eq!(out.repeated_token_count, 0);

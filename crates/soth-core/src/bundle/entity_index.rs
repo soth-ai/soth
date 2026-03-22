@@ -147,7 +147,13 @@ pub struct EntityIndex {
     by_process_name: HashMap<String, usize>,
     by_host: HashMap<String, usize>,
     /// (pattern, entity_idx, methods, path_rules, specificity) — sorted descending by specificity
-    wildcard_hosts: Vec<(String, usize, Vec<String>, crate::bundle::gating::PathRules, usize)>,
+    wildcard_hosts: Vec<(
+        String,
+        usize,
+        Vec<String>,
+        crate::bundle::gating::PathRules,
+        usize,
+    )>,
     entities: Vec<ResolvedEntity>,
 }
 
@@ -161,7 +167,13 @@ impl EntityIndex {
         let mut by_bundle_id = HashMap::new();
         let mut by_process_name = HashMap::new();
         let mut by_host = HashMap::new();
-        let mut wildcard_hosts: Vec<(String, usize, Vec<String>, crate::bundle::gating::PathRules, usize)> = Vec::new();
+        let mut wildcard_hosts: Vec<(
+            String,
+            usize,
+            Vec<String>,
+            crate::bundle::gating::PathRules,
+            usize,
+        )> = Vec::new();
         let mut entities = Vec::with_capacity(entries.len());
 
         for entry in entries {
@@ -323,10 +335,10 @@ impl EntityIndex {
             };
 
             if is_provider {
-                if best_provider.as_ref().map_or(true, |b| *spec > b.specificity) {
+                if best_provider.as_ref().is_none_or(|b| *spec > b.specificity) {
                     best_provider = Some(matched);
                 }
-            } else if best_app.as_ref().map_or(true, |b| *spec > b.specificity) {
+            } else if best_app.as_ref().is_none_or(|b| *spec > b.specificity) {
                 best_app = Some(matched);
             }
         }
@@ -394,7 +406,9 @@ fn host_pattern_matches(pattern: &str, host: &str) -> bool {
         return crate::bundle::detect::glob_match(pattern, host);
     }
     // Suffix match: "openai.com" matches "openai.com" and "api.openai.com"
-    host == pattern || (host.ends_with(pattern) && host.as_bytes().get(host.len() - pattern.len() - 1) == Some(&b'.'))
+    host == pattern
+        || (host.ends_with(pattern)
+            && host.as_bytes().get(host.len() - pattern.len() - 1) == Some(&b'.'))
 }
 
 fn parse_capture_mode(s: &str) -> CaptureMode {
@@ -423,7 +437,10 @@ mod tests {
                 action: ProcessAction::Intercept,
                 host_rules: vec![],
                 signals: vec![
-                    ("ProcessBundleId".into(), "com.todesktop.230313mzl4w4u92".into()),
+                    (
+                        "ProcessBundleId".into(),
+                        "com.todesktop.230313mzl4w4u92".into(),
+                    ),
                     ("ProcessName".into(), "Cursor".into()),
                 ],
             },
@@ -481,7 +498,13 @@ mod tests {
         assert_eq!(idx.len(), 4);
 
         let (entity, source) = idx
-            .resolve_tool(Some("com.todesktop.230313mzl4w4u92"), None, None, None, &EnvIndex::default())
+            .resolve_tool(
+                Some("com.todesktop.230313mzl4w4u92"),
+                None,
+                None,
+                None,
+                &EnvIndex::default(),
+            )
             .unwrap();
         assert_eq!(entity.id, "cursor");
         assert_eq!(entity.name, "Cursor");
@@ -495,7 +518,9 @@ mod tests {
     fn resolve_by_process_name() {
         let idx = EntityIndex::build(sample_entries());
 
-        let (entity, source) = idx.resolve_tool(None, Some("claude-code"), None, None, &EnvIndex::default()).unwrap();
+        let (entity, source) = idx
+            .resolve_tool(None, Some("claude-code"), None, None, &EnvIndex::default())
+            .unwrap();
         assert_eq!(entity.id, "claude-code");
         assert_eq!(entity.kind, EntityKind::Cli);
         assert_eq!(source, "process_name");
@@ -519,7 +544,13 @@ mod tests {
         let idx = EntityIndex::build(sample_entries());
 
         let (entity, _) = idx
-            .resolve_tool(Some("COM.TODESKTOP.230313mzl4w4u92"), None, None, None, &EnvIndex::default())
+            .resolve_tool(
+                Some("COM.TODESKTOP.230313mzl4w4u92"),
+                None,
+                None,
+                None,
+                &EnvIndex::default(),
+            )
             .unwrap();
         assert_eq!(entity.id, "cursor");
 
@@ -530,7 +561,15 @@ mod tests {
     #[test]
     fn unknown_returns_none() {
         let idx = EntityIndex::build(sample_entries());
-        assert!(idx.resolve_tool(Some("com.unknown.app"), None, None, None, &EnvIndex::default()).is_none());
+        assert!(idx
+            .resolve_tool(
+                Some("com.unknown.app"),
+                None,
+                None,
+                None,
+                &EnvIndex::default()
+            )
+            .is_none());
         assert!(idx.resolve_host("unknown.example.com").is_none());
     }
 
@@ -552,24 +591,22 @@ mod tests {
     }
 
     fn ide_plugin_entries() -> Vec<EntityIndexEntry> {
-        vec![
-            EntityIndexEntry {
-                slug: "copilot".into(),
-                name: "GitHub Copilot".into(),
-                kind: "ide_plugin".into(),
-                category: Some("IDE Plugin".into()),
-                capture_mode: "metadata_only".into(),
-                api_format: None,
-                provider_id: Some("openai".into()),
-                vendor_slug: Some("github".into()),
-                action: ProcessAction::Intercept,
-                host_rules: vec![],
-                signals: vec![
-                    ("ProcessBundleId".into(), "com.github.copilot".into()),
-                    ("ProcessName".into(), "copilot".into()),
-                ],
-            },
-        ]
+        vec![EntityIndexEntry {
+            slug: "copilot".into(),
+            name: "GitHub Copilot".into(),
+            kind: "ide_plugin".into(),
+            category: Some("IDE Plugin".into()),
+            capture_mode: "metadata_only".into(),
+            api_format: None,
+            provider_id: Some("openai".into()),
+            vendor_slug: Some("github".into()),
+            action: ProcessAction::Intercept,
+            host_rules: vec![],
+            signals: vec![
+                ("ProcessBundleId".into(), "com.github.copilot".into()),
+                ("ProcessName".into(), "copilot".into()),
+            ],
+        }]
     }
 
     fn ide_env_index() -> EnvIndex {
@@ -611,14 +648,11 @@ mod tests {
         }]);
 
         // copilot invoked from a terminal — should be treated as shadow IT (None)
-        let result = idx.resolve_tool(
-            Some("com.github.copilot"),
-            None,
-            None,
-            Some("zsh"),
-            &env,
+        let result = idx.resolve_tool(Some("com.github.copilot"), None, None, Some("zsh"), &env);
+        assert!(
+            result.is_none(),
+            "IdePlugin must not match when parent is not an IDE"
         );
-        assert!(result.is_none(), "IdePlugin must not match when parent is not an IDE");
     }
 
     #[test]
@@ -632,7 +666,10 @@ mod tests {
             None,
             &EnvIndex::default(),
         );
-        assert!(result.is_none(), "IdePlugin must not match when parent environment is unknown");
+        assert!(
+            result.is_none(),
+            "IdePlugin must not match when parent environment is unknown"
+        );
     }
 
     #[test]
@@ -654,32 +691,68 @@ mod tests {
     #[test]
     fn entity_kind_round_trip() {
         assert_eq!(EntityKind::from_str_loose("ide"), EntityKind::Ide);
-        assert_eq!(EntityKind::from_str_loose("ide_plugin"), EntityKind::IdePlugin);
-        assert_eq!(EntityKind::from_str_loose("ide-plugin"), EntityKind::IdePlugin);
+        assert_eq!(
+            EntityKind::from_str_loose("ide_plugin"),
+            EntityKind::IdePlugin
+        );
+        assert_eq!(
+            EntityKind::from_str_loose("ide-plugin"),
+            EntityKind::IdePlugin
+        );
         assert_eq!(EntityKind::from_str_loose("CLI"), EntityKind::Cli);
         assert_eq!(EntityKind::from_str_loose("browser"), EntityKind::Browser);
         assert_eq!(EntityKind::from_str_loose("platform"), EntityKind::Platform);
-        assert_eq!(EntityKind::from_str_loose("agent-app"), EntityKind::AgentApp);
-        assert_eq!(EntityKind::from_str_loose("browser_app"), EntityKind::BrowserApp);
+        assert_eq!(
+            EntityKind::from_str_loose("agent-app"),
+            EntityKind::AgentApp
+        );
+        assert_eq!(
+            EntityKind::from_str_loose("browser_app"),
+            EntityKind::BrowserApp
+        );
         assert_eq!(EntityKind::from_str_loose("garbage"), EntityKind::Other);
     }
 
     #[test]
     fn entity_kind_to_app_type_via_surface() {
-        assert_eq!(EntityKind::Browser.to_surface_type().app_type(), AppType::Host);
-        assert_eq!(EntityKind::BrowserApp.to_surface_type().app_type(), AppType::Host);
-        assert_eq!(EntityKind::Ide.to_surface_type().app_type(), AppType::NonHost);
-        assert_eq!(EntityKind::IdePlugin.to_surface_type().app_type(), AppType::NonHost);
-        assert_eq!(EntityKind::Cli.to_surface_type().app_type(), AppType::NonHost);
-        assert_eq!(EntityKind::Platform.to_surface_type().app_type(), AppType::NonHost);
-        assert_eq!(EntityKind::Other.to_surface_type().app_type(), AppType::Unknown);
+        assert_eq!(
+            EntityKind::Browser.to_surface_type().app_type(),
+            AppType::Host
+        );
+        assert_eq!(
+            EntityKind::BrowserApp.to_surface_type().app_type(),
+            AppType::Host
+        );
+        assert_eq!(
+            EntityKind::Ide.to_surface_type().app_type(),
+            AppType::NonHost
+        );
+        assert_eq!(
+            EntityKind::IdePlugin.to_surface_type().app_type(),
+            AppType::NonHost
+        );
+        assert_eq!(
+            EntityKind::Cli.to_surface_type().app_type(),
+            AppType::NonHost
+        );
+        assert_eq!(
+            EntityKind::Platform.to_surface_type().app_type(),
+            AppType::NonHost
+        );
+        assert_eq!(
+            EntityKind::Other.to_surface_type().app_type(),
+            AppType::Unknown
+        );
     }
 
     #[test]
     fn ide_vs_ide_plugin_surface_type() {
         use crate::classify::SurfaceType;
         assert_eq!(EntityKind::Ide.to_surface_type(), SurfaceType::Ide);
-        assert_eq!(EntityKind::IdePlugin.to_surface_type(), SurfaceType::IdePlugin);
+        assert_eq!(
+            EntityKind::IdePlugin.to_surface_type(),
+            SurfaceType::IdePlugin
+        );
     }
 
     #[test]

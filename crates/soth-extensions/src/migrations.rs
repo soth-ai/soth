@@ -46,9 +46,7 @@ impl MigrationRunner {
 
                 if !already {
                     conn.execute_batch(sql).map_err(|e| {
-                        ExtensionError::Migration(format!(
-                            "{ext_name} migration {idx} failed: {e}"
-                        ))
+                        ExtensionError::Migration(format!("{ext_name} migration {idx} failed: {e}"))
                     })?;
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -59,9 +57,7 @@ impl MigrationRunner {
                          VALUES (?1, ?2, ?3)",
                         params![ext_name, idx as i64, now],
                     )
-                    .map_err(|e| {
-                        ExtensionError::Migration(format!("record migration: {e}"))
-                    })?;
+                    .map_err(|e| ExtensionError::Migration(format!("record migration: {e}")))?;
                 }
             }
         }

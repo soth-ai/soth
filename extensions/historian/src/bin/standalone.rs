@@ -48,7 +48,9 @@ fn default_db_path() -> PathBuf {
 fn build_readers() -> Vec<Box<dyn soth_historian::reader::FormatReader>> {
     default_playbooks()
         .into_iter()
-        .map(|pb| Box::new(PlaybookReader::new(pb)) as Box<dyn soth_historian::reader::FormatReader>)
+        .map(|pb| {
+            Box::new(PlaybookReader::new(pb)) as Box<dyn soth_historian::reader::FormatReader>
+        })
         .collect()
 }
 

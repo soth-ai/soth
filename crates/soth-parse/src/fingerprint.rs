@@ -36,10 +36,8 @@ pub fn fingerprint(
                 if bundle.rest_formats.contains_key(api_format) {
                     return DetectedFormat::CustomRest(api_format.to_string());
                 }
-                let synthetic = provider_entry_to_format(
-                    api_format,
-                    bundle.llm_providers.get(api_format),
-                );
+                let synthetic =
+                    provider_entry_to_format(api_format, bundle.llm_providers.get(api_format));
                 if synthetic != DetectedFormat::Unknown {
                     return synthetic;
                 }
@@ -138,7 +136,6 @@ pub fn fingerprint(
 
     DetectedFormat::Unknown
 }
-
 
 fn is_openai_like_path(path: &str) -> bool {
     if path.contains("/v1/chat/completions")
@@ -602,16 +599,16 @@ mod tests {
         let detected = fingerprint(
             "POST",
             "/api/organizations/org123/chat_conversations/conv456/completion",
-            &headers(&[
-                ("host", "claude.ai"),
-                ("content-type", "application/json"),
-            ]),
+            &headers(&[("host", "claude.ai"), ("content-type", "application/json")]),
             br#"{"model":"claude-sonnet-4-6"}"#,
             None,
             Some("claude"),
             &bundle.as_slice(),
         );
-        assert_eq!(detected, DetectedFormat::CustomRest("claude_web".to_string()));
+        assert_eq!(
+            detected,
+            DetectedFormat::CustomRest("claude_web".to_string())
+        );
     }
 
     #[test]
@@ -771,31 +768,33 @@ mod tests {
     #[test]
     fn classify_request_highest_priority_wins() {
         let mut bundle = bundle_fixture();
-        bundle.llm_providers.get_mut("openai").unwrap().matching_rules = vec![
-            soth_core::MatchingRule {
-                rule_id: "openai-host-path".to_string(),
-                priority: 900,
-                requires_all: true,
-                notes: None,
-                metadata: serde_json::json!({}),
-                signals: vec![
-                    soth_core::SignalMatcher {
-                        kind: SignalKind::HttpHost,
-                        pattern: "api.openai.com".to_string(),
-                        name: None,
-                        is_negated: false,
-                        metadata: serde_json::json!({}),
-                    },
-                    soth_core::SignalMatcher {
-                        kind: SignalKind::HttpPath,
-                        pattern: "/v1/chat/completions".to_string(),
-                        name: None,
-                        is_negated: false,
-                        metadata: serde_json::json!({}),
-                    },
-                ],
-            },
-        ];
+        bundle
+            .llm_providers
+            .get_mut("openai")
+            .unwrap()
+            .matching_rules = vec![soth_core::MatchingRule {
+            rule_id: "openai-host-path".to_string(),
+            priority: 900,
+            requires_all: true,
+            notes: None,
+            metadata: serde_json::json!({}),
+            signals: vec![
+                soth_core::SignalMatcher {
+                    kind: SignalKind::HttpHost,
+                    pattern: "api.openai.com".to_string(),
+                    name: None,
+                    is_negated: false,
+                    metadata: serde_json::json!({}),
+                },
+                soth_core::SignalMatcher {
+                    kind: SignalKind::HttpPath,
+                    pattern: "/v1/chat/completions".to_string(),
+                    name: None,
+                    is_negated: false,
+                    metadata: serde_json::json!({}),
+                },
+            ],
+        }];
         bundle.llm_providers.insert(
             "anthropic".to_string(),
             ProviderEntry {
@@ -839,31 +838,33 @@ mod tests {
     #[test]
     fn classify_request_requires_all_signals() {
         let mut bundle = bundle_fixture();
-        bundle.llm_providers.get_mut("openai").unwrap().matching_rules = vec![
-            soth_core::MatchingRule {
-                rule_id: "openai-host-path".to_string(),
-                priority: 900,
-                requires_all: true,
-                notes: None,
-                metadata: serde_json::json!({}),
-                signals: vec![
-                    soth_core::SignalMatcher {
-                        kind: SignalKind::HttpHost,
-                        pattern: "api.openai.com".to_string(),
-                        name: None,
-                        is_negated: false,
-                        metadata: serde_json::json!({}),
-                    },
-                    soth_core::SignalMatcher {
-                        kind: SignalKind::HttpPath,
-                        pattern: "/v1/chat/completions".to_string(),
-                        name: None,
-                        is_negated: false,
-                        metadata: serde_json::json!({}),
-                    },
-                ],
-            },
-        ];
+        bundle
+            .llm_providers
+            .get_mut("openai")
+            .unwrap()
+            .matching_rules = vec![soth_core::MatchingRule {
+            rule_id: "openai-host-path".to_string(),
+            priority: 900,
+            requires_all: true,
+            notes: None,
+            metadata: serde_json::json!({}),
+            signals: vec![
+                soth_core::SignalMatcher {
+                    kind: SignalKind::HttpHost,
+                    pattern: "api.openai.com".to_string(),
+                    name: None,
+                    is_negated: false,
+                    metadata: serde_json::json!({}),
+                },
+                soth_core::SignalMatcher {
+                    kind: SignalKind::HttpPath,
+                    pattern: "/v1/chat/completions".to_string(),
+                    name: None,
+                    is_negated: false,
+                    metadata: serde_json::json!({}),
+                },
+            ],
+        }];
 
         // Wrong path → requires_all fails
         let result = classify_request(
@@ -881,31 +882,33 @@ mod tests {
     #[test]
     fn classify_request_negated_signal() {
         let mut bundle = bundle_fixture();
-        bundle.llm_providers.get_mut("openai").unwrap().matching_rules = vec![
-            soth_core::MatchingRule {
-                rule_id: "openai-not-internal".to_string(),
-                priority: 800,
-                requires_all: true,
-                notes: None,
-                metadata: serde_json::json!({}),
-                signals: vec![
-                    soth_core::SignalMatcher {
-                        kind: SignalKind::HttpHost,
-                        pattern: "api.openai.com".to_string(),
-                        name: None,
-                        is_negated: false,
-                        metadata: serde_json::json!({}),
-                    },
-                    soth_core::SignalMatcher {
-                        kind: SignalKind::HttpPath,
-                        pattern: "/internal/*".to_string(),
-                        name: None,
-                        is_negated: true,
-                        metadata: serde_json::json!({}),
-                    },
-                ],
-            },
-        ];
+        bundle
+            .llm_providers
+            .get_mut("openai")
+            .unwrap()
+            .matching_rules = vec![soth_core::MatchingRule {
+            rule_id: "openai-not-internal".to_string(),
+            priority: 800,
+            requires_all: true,
+            notes: None,
+            metadata: serde_json::json!({}),
+            signals: vec![
+                soth_core::SignalMatcher {
+                    kind: SignalKind::HttpHost,
+                    pattern: "api.openai.com".to_string(),
+                    name: None,
+                    is_negated: false,
+                    metadata: serde_json::json!({}),
+                },
+                soth_core::SignalMatcher {
+                    kind: SignalKind::HttpPath,
+                    pattern: "/internal/*".to_string(),
+                    name: None,
+                    is_negated: true,
+                    metadata: serde_json::json!({}),
+                },
+            ],
+        }];
 
         // /internal path → negated signal matches → overall rule fails
         let result = classify_request(

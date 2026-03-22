@@ -80,7 +80,12 @@ fn detect_output_corpus_matches_expected_contract() {
 
     for case in corpus {
         let request = build_request(&case.request);
-        let out = process_with_registry(&registry, &request, &bundle.as_slice(), &soth_core::SessionSnapshot::default());
+        let out = process_with_registry(
+            &registry,
+            &request,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+        );
         assert_case(&case.id, &case.expect, &out);
     }
 }
@@ -165,8 +170,7 @@ fn assert_case(case_id: &str, expect: &CorpusExpect, out: &DetectResult) {
     for required in &expect.required_artifact_kinds {
         assert!(
             artifact_labels.contains(required),
-            "case {case_id}: missing expected artifact kind '{required}', got {:?}",
-            artifact_labels
+            "case {case_id}: missing expected artifact kind '{required}', got {artifact_labels:?}"
         );
     }
 }

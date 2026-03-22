@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 mod common;
 
 fn private_key_artifact() -> soth_core::SensitiveArtifact {

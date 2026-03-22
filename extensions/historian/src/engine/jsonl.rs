@@ -173,7 +173,11 @@ fn parse_jsonl_file(
         content_pass += 1;
 
         // Extract timestamp.
-        let ts = parse_timestamp(&parsed, &extraction.timestamp.field, &extraction.timestamp.format);
+        let ts = parse_timestamp(
+            &parsed,
+            &extraction.timestamp.field,
+            &extraction.timestamp.format,
+        );
 
         // Apply `since` filter.
         if let (Some(since_ms), Some(msg_ts)) = (since, ts) {
@@ -239,13 +243,17 @@ fn collect_files(
     exclude_dirs: &[String],
     exclude_file_patterns: &[String],
 ) -> Vec<PathBuf> {
-    let ext = glob_pattern
-        .rsplit('.')
-        .next()
-        .unwrap_or("jsonl");
+    let ext = glob_pattern.rsplit('.').next().unwrap_or("jsonl");
 
     let mut files = Vec::new();
-    collect_recursive(root, ext, exclude_dirs, exclude_file_patterns, &mut files, true);
+    collect_recursive(
+        root,
+        ext,
+        exclude_dirs,
+        exclude_file_patterns,
+        &mut files,
+        true,
+    );
 
     // Sort by mtime ascending (oldest first).
     files.sort_by(|a, b| {
@@ -283,7 +291,10 @@ fn collect_recursive(
         } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
             // Check exclude file patterns.
             let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if exclude_file_patterns.iter().any(|p| filename.contains(p.as_str())) {
+            if exclude_file_patterns
+                .iter()
+                .any(|p| filename.contains(p.as_str()))
+            {
                 continue;
             }
             out.push(path);
@@ -296,7 +307,11 @@ fn truncate_for_log(s: &str, max: usize) -> String {
     if clean.len() <= max {
         clean
     } else {
-        let end = clean.char_indices().nth(max).map(|(i, _)| i).unwrap_or(clean.len());
+        let end = clean
+            .char_indices()
+            .nth(max)
+            .map(|(i, _)| i)
+            .unwrap_or(clean.len());
         format!("{}...", &clean[..end])
     }
 }
@@ -324,7 +339,9 @@ mod tests {
             provider: "anthropic".into(),
             discovery: PlaybookDiscovery {
                 roots: vec!["${HOME}/.claude/projects".into()],
-                detect: PlaybookDetect::GlobExists { pattern: "**/*.jsonl".into() },
+                detect: PlaybookDetect::GlobExists {
+                    pattern: "**/*.jsonl".into(),
+                },
                 exclude_dirs: vec!["memory".into(), "subagents".into()],
                 exclude_file_patterns: vec![],
             },
@@ -369,7 +386,9 @@ mod tests {
             provider: "openai".into(),
             discovery: PlaybookDiscovery {
                 roots: vec!["${HOME}/.codex".into()],
-                detect: PlaybookDetect::GlobExists { pattern: "**/*.jsonl".into() },
+                detect: PlaybookDetect::GlobExists {
+                    pattern: "**/*.jsonl".into(),
+                },
                 exclude_dirs: vec![],
                 exclude_file_patterns: vec![],
             },
@@ -500,8 +519,16 @@ mod tests {
     #[tokio::test]
     async fn excludes_memory_dir() {
         let tmp = TempDir::new().unwrap();
-        write_file(tmp.path(), "memory/notes.jsonl", r#"{"type":"user","message":{"role":"user","content":"should not appear"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
-        write_file(tmp.path(), "session.jsonl", r#"{"type":"user","message":{"role":"user","content":"hello"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
+        write_file(
+            tmp.path(),
+            "memory/notes.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"should not appear"},"timestamp":"2026-01-01T00:00:00.000Z"}"#,
+        );
+        write_file(
+            tmp.path(),
+            "session.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"hello"},"timestamp":"2026-01-01T00:00:00.000Z"}"#,
+        );
 
         let pb = claude_code_playbook();
         let cursor = Mutex::new(None);
@@ -536,7 +563,11 @@ mod tests {
     #[tokio::test]
     async fn cursor_updated_after_read() {
         let tmp = TempDir::new().unwrap();
-        write_file(tmp.path(), "s.jsonl", r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
+        write_file(
+            tmp.path(),
+            "s.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-01-01T00:00:00.000Z"}"#,
+        );
 
         let pb = claude_code_playbook();
         let cursor = Mutex::new(None);
@@ -573,7 +604,10 @@ mod tests {
         // Should skip: tool_result (user), thinking (assistant), tool_use (assistant), progress
         assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[0].role, "user");
-        assert_eq!(session.messages[0].content, "Your task is to refactor the auth module");
+        assert_eq!(
+            session.messages[0].content,
+            "Your task is to refactor the auth module"
+        );
         assert_eq!(session.messages[1].role, "assistant");
         assert!(session.messages[1].content.contains("middleware"));
         assert_eq!(session.messages[2].role, "assistant");
@@ -585,10 +619,16 @@ mod tests {
         // Subagent files are AI-to-AI conversations that duplicate content
         // already captured in the parent session — they should be excluded.
         let tmp = TempDir::new().unwrap();
-        write_file(tmp.path(), "subagents/agent-a1234.jsonl",
-            r#"{"type":"user","message":{"role":"user","content":"delegated task"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
-        write_file(tmp.path(), "session.jsonl",
-            r#"{"type":"user","message":{"role":"user","content":"real user msg"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
+        write_file(
+            tmp.path(),
+            "subagents/agent-a1234.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"delegated task"},"timestamp":"2026-01-01T00:00:00.000Z"}"#,
+        );
+        write_file(
+            tmp.path(),
+            "session.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"real user msg"},"timestamp":"2026-01-01T00:00:00.000Z"}"#,
+        );
 
         let pb = claude_code_playbook();
         let cursor = Mutex::new(None);
@@ -622,8 +662,16 @@ mod tests {
     #[tokio::test]
     async fn exclude_file_patterns_work() {
         let tmp = TempDir::new().unwrap();
-        write_file(tmp.path(), "session.deleted.20251130.jsonl", r#"{"type":"user","message":{"role":"user","content":"deleted"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
-        write_file(tmp.path(), "live.jsonl", r#"{"type":"user","message":{"role":"user","content":"alive"},"timestamp":"2026-01-01T00:00:00.000Z"}"#);
+        write_file(
+            tmp.path(),
+            "session.deleted.20251130.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"deleted"},"timestamp":"2026-01-01T00:00:00.000Z"}"#,
+        );
+        write_file(
+            tmp.path(),
+            "live.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"alive"},"timestamp":"2026-01-01T00:00:00.000Z"}"#,
+        );
 
         let mut pb = claude_code_playbook();
         pb.discovery.exclude_file_patterns = vec![".deleted.".into()];

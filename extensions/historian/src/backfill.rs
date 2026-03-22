@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
-use tracing::{trace, info, warn};
+use tracing::{info, trace, warn};
 
 use soth_extensions::TelemetryQueueWriter;
 

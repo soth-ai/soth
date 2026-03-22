@@ -196,11 +196,7 @@ pub fn extract_url_segment(url: &str, index: i32) -> Option<String> {
 
 /// Resolve a DSL extraction path, which may be a json_path, `$_query_param('name')`,
 /// or `$_url_segment(-2)`.
-pub fn resolve_path<'a>(
-    path: &str,
-    body: &'a Value,
-    url: Option<&str>,
-) -> Option<Value> {
+pub fn resolve_path(path: &str, body: &Value, url: Option<&str>) -> Option<Value> {
     // $_query_param('name')
     if let Some(inner) = path
         .strip_prefix("$_query_param('")
@@ -258,9 +254,8 @@ pub fn normalize_unicodeish(input: &str) -> String {
 
 pub fn extract_grpc_service_method(path: &str) -> Option<(String, String)> {
     let trimmed = path.trim_start_matches('/');
-    let mut parts = trimmed.rsplitn(2, '/');
-    let method = parts.next()?;
-    let service = parts.next()?;
+    let (service, method) = trimmed.rsplit_once('/')?;
+
     if service.is_empty() || method.is_empty() {
         return None;
     }
@@ -293,4 +288,3 @@ fn parse_indexed_segment(segment: &str) -> Option<(&str, i64)> {
     let index = idx_str.parse::<i64>().ok()?;
     Some((field, index))
 }
-

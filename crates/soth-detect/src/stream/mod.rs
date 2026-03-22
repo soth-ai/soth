@@ -23,8 +23,8 @@ mod websocket;
 pub(crate) use gemini::extract_gemini_length_prefixed;
 
 use crate::types::RestFormatDescriptor;
-use soth_core::bundle::detect::FeatureResponseSpec;
 use multipart::parse_multipart_payload_text;
+use soth_core::bundle::detect::FeatureResponseSpec;
 use sse::extract_sse_rest_delta;
 use websocket::process_websocket_turn;
 
@@ -53,11 +53,8 @@ pub fn process_chunk_with_bundle(
     match chunk.frame_kind {
         FrameKind::SseData | FrameKind::NdjsonLine => {
             // Single-pass: parse JSON once, extract model + usage + finish_reason + delta.
-            let sse = extract_all_from_sse_lines(
-                &chunk.payload,
-                session.model.is_none(),
-                descriptor,
-            );
+            let sse =
+                extract_all_from_sse_lines(&chunk.payload, session.model.is_none(), descriptor);
             if let Some(model) = sse.model {
                 session.model = Some(model);
             }
@@ -79,8 +76,8 @@ pub fn process_chunk_with_bundle(
         FrameKind::WebSocketText => {
             // Check if payload is binary-encoded (protobuf/msgpack) despite
             // being sent as a WebSocket text frame.
-            let is_binary_encoded = !chunk.payload.is_empty()
-                && std::str::from_utf8(&chunk.payload).is_err();
+            let is_binary_encoded =
+                !chunk.payload.is_empty() && std::str::from_utf8(&chunk.payload).is_err();
 
             if is_binary_encoded {
                 // Binary-encoded WebSocket frame (e.g. Codex protobuf).
@@ -100,9 +97,8 @@ pub fn process_chunk_with_bundle(
                 // packet prefix (e.g. `42["event", ...]`), unwrap it first
                 // and process only the inner JSON data.
                 if socketio::looks_like_socketio(&chunk.payload) {
-                    if let Some(socketio::SocketIoFrame::Event {
-                        data_json, ..
-                    }) = socketio::decode_socketio_frame(&chunk.payload)
+                    if let Some(socketio::SocketIoFrame::Event { data_json, .. }) =
+                        socketio::decode_socketio_frame(&chunk.payload)
                     {
                         let data_bytes = data_json.as_bytes();
                         let sse = extract_all_from_sse_lines(
@@ -128,16 +124,13 @@ pub fn process_chunk_with_bundle(
                 }
 
                 // JSON WebSocket frame — split by direction.
-                let is_client_frame =
-                    chunk.direction == Some(FrameDirection::ClientToServer);
+                let is_client_frame = chunk.direction == Some(FrameDirection::ClientToServer);
 
-                let is_server_frame =
-                    chunk.direction == Some(FrameDirection::ServerToClient);
+                let is_server_frame = chunk.direction == Some(FrameDirection::ServerToClient);
 
                 if is_client_frame {
                     // CLIENT → SERVER: extract model from request frames.
-                    if let Some(turn) = process_websocket_turn(&chunk.payload, session)
-                    {
+                    if let Some(turn) = process_websocket_turn(&chunk.payload, session) {
                         return Some(ChunkEvent::TurnCompleted(turn));
                     }
                     let sse = extract_all_from_sse_lines(
@@ -166,9 +159,7 @@ pub fn process_chunk_with_bundle(
                     }
 
                     if session.is_websocket {
-                        if let Some(turn) =
-                            process_websocket_turn(&chunk.payload, session)
-                        {
+                        if let Some(turn) = process_websocket_turn(&chunk.payload, session) {
                             return Some(ChunkEvent::TurnCompleted(turn));
                         }
                     }
@@ -289,11 +280,10 @@ pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
     // must fire regardless of capture mode.
     let artifacts = credential_scan(assembled.as_bytes(), ArtifactLocation::Unknown);
 
-    let mut warnings = Vec::new();
-    warnings.push(DetectWarning {
+    let warnings = vec![DetectWarning {
         code: "stream_finalize_heuristic",
         detail: "stream finalized using heuristic normalization".to_string(),
-    });
+    }];
 
     DetectResult {
         normalized,
@@ -343,8 +333,14 @@ fn extract_all_from_sse_lines(
                 // Also try to extract usage from the payload (rules don't cover usage yet)
                 let usage_result = std::str::from_utf8(payload).ok().and_then(|text| {
                     text.lines().find_map(|line| {
-                        let json_str = line.trim().strip_prefix("data:").map(str::trim).unwrap_or(line.trim());
-                        if json_str.is_empty() { return None; }
+                        let json_str = line
+                            .trim()
+                            .strip_prefix("data:")
+                            .map(str::trim)
+                            .unwrap_or(line.trim());
+                        if json_str.is_empty() {
+                            return None;
+                        }
                         let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
                         usage::usage_from_json_value(&v)
                     })
@@ -434,7 +430,7 @@ fn looks_like_protobuf_payload(payload: &[u8]) -> bool {
     // matching most ASCII text which the previous `wire <= 5` caught.
     let wire = first & 0x07;
     let field_number = first >> 3;
-    wire <= 2 && field_number >= 1 && field_number <= 15
+    wire <= 2 && (1..=15).contains(&field_number)
 }
 
 fn extract_structured_text(payload: &[u8]) -> Option<String> {
@@ -580,7 +576,8 @@ mod tests {
 
     #[test]
     fn extract_sse_model_openai_top_level() {
-        let payload = b"data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n";
+        let payload =
+            b"data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n";
         let model = super::sse::extract_sse_model(payload);
         assert_eq!(model.as_deref(), Some("gpt-4o"));
     }
@@ -661,7 +658,11 @@ mod tests {
             direction: None,
         };
         process_chunk_with_bundle(&chunk2, &mut session, &bundle.as_slice());
-        assert_eq!(session.model.as_deref(), Some("gpt-4o"), "first model should win");
+        assert_eq!(
+            session.model.as_deref(),
+            Some("gpt-4o"),
+            "first model should win"
+        );
     }
 
     #[test]
@@ -680,7 +681,10 @@ mod tests {
 
         process_chunk_with_bundle(&chunk, &mut session, &bundle.as_slice());
         let content = session.finalize_response_content();
-        assert!(content.contains("streaming content"), "SSE content should be accumulated, got: {content}");
+        assert!(
+            content.contains("streaming content"),
+            "SSE content should be accumulated, got: {content}"
+        );
     }
 
     // --- Web app streaming tests ---
@@ -842,7 +846,8 @@ mod tests {
 
     #[test]
     fn extract_responses_api_delta_sse() {
-        let payload = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello world\"}\n";
+        let payload =
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello world\"}\n";
         let result = super::sse::extract_sse_rest_delta(payload);
         assert_eq!(result.as_deref(), Some("Hello world"));
     }
@@ -865,7 +870,8 @@ mod tests {
     #[test]
     fn extract_responses_api_model_bare_json() {
         // WebSocket mode
-        let payload = br#"{"type":"response.created","response":{"id":"resp_123","model":"o3-pro"}}"#;
+        let payload =
+            br#"{"type":"response.created","response":{"id":"resp_123","model":"o3-pro"}}"#;
         let model = super::sse::extract_sse_model(payload);
         assert_eq!(model.as_deref(), Some("o3-pro"));
     }
@@ -894,9 +900,7 @@ mod tests {
         let mut session = StreamSession::new(Uuid::new_v4(), CaptureMode::MetadataOnly);
 
         for (seq, text) in [(1, "Hello"), (2, " world")] {
-            let payload = format!(
-                r#"{{"type":"response.output_text.delta","delta":"{text}"}}"#,
-            );
+            let payload = format!(r#"{{"type":"response.output_text.delta","delta":"{text}"}}"#,);
             let chunk = StreamChunk {
                 connection_id: session.connection_id,
                 sequence: seq,

@@ -9,7 +9,7 @@
 /// AWS Bedrock, Groq, Mistral, Fireworks, xAI.
 use serde_json::json;
 use soth_core::{MatchingRule, SignalKind, SignalMatcher};
-use soth_core::{ProductEntry, OwnedDetectBundle, ProviderEntry};
+use soth_core::{OwnedDetectBundle, ProductEntry, ProviderEntry};
 use soth_detect::{classify_request, fingerprint, DetectedFormat};
 use std::collections::{BTreeMap, HashMap};
 
@@ -217,7 +217,8 @@ fn application_golden_cases() -> Vec<GoldenCase> {
                 ("content-type", "application/json"),
                 ("anthropic-version", "2024-06-01"),
             ],
-            body: br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}"#,
+            body:
+                br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}"#,
             process_bundle_id: Some("com.anthropic.claude-code"),
             process_name: Some("claude"),
             expected_format: DetectedFormat::AnthropicRest,
@@ -232,7 +233,8 @@ fn application_golden_cases() -> Vec<GoldenCase> {
                 ("content-type", "application/json"),
                 ("anthropic-version", "2024-06-01"),
             ],
-            body: br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}"#,
+            body:
+                br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}"#,
             process_bundle_id: Some("com.anthropic.claudefordesktop"),
             process_name: None,
             expected_format: DetectedFormat::AnthropicRest,
@@ -354,149 +356,322 @@ fn build_v3_bundle() -> OwnedDetectBundle {
     }
 
     // Provider matching rules.
-    set_provider_rules(&mut bundle, "openai", vec![
-        mr("openai-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "api.openai.com"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "anthropic", vec![
-        mr("anthropic-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "api.anthropic.com"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "google", vec![
-        mr("google-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "generativelanguage.googleapis.com"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "cohere", vec![
-        mr("cohere-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "api.cohere.ai"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "azure_openai", vec![
-        mr("azure-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "*.openai.azure.com"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "aws_bedrock", vec![
-        mr("bedrock-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "bedrock-runtime.*.amazonaws.com"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "groq", vec![
-        mr("groq-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "api.groq.com"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "mistral", vec![
-        mr("mistral-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "api.mistral.ai"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "fireworks", vec![
-        mr("fireworks-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "api.fireworks.ai"),
-        ]),
-    ]);
-    set_provider_rules(&mut bundle, "xai", vec![
-        mr("xai-host", 850, true, vec![
-            sig(SignalKind::HttpHost, "api.x.ai"),
-        ]),
-    ]);
+    set_provider_rules(
+        &mut bundle,
+        "openai",
+        vec![mr(
+            "openai-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "api.openai.com")],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "anthropic",
+        vec![mr(
+            "anthropic-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "api.anthropic.com")],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "google",
+        vec![mr(
+            "google-host",
+            850,
+            true,
+            vec![sig(
+                SignalKind::HttpHost,
+                "generativelanguage.googleapis.com",
+            )],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "cohere",
+        vec![mr(
+            "cohere-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "api.cohere.ai")],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "azure_openai",
+        vec![mr(
+            "azure-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "*.openai.azure.com")],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "aws_bedrock",
+        vec![mr(
+            "bedrock-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "bedrock-runtime.*.amazonaws.com")],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "groq",
+        vec![mr(
+            "groq-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "api.groq.com")],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "mistral",
+        vec![mr(
+            "mistral-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "api.mistral.ai")],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "fireworks",
+        vec![mr(
+            "fireworks-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "api.fireworks.ai")],
+        )],
+    );
+    set_provider_rules(
+        &mut bundle,
+        "xai",
+        vec![mr(
+            "xai-host",
+            850,
+            true,
+            vec![sig(SignalKind::HttpHost, "api.x.ai")],
+        )],
+    );
 
     // Application matching rules.
-    set_app_rules(&mut bundle, "chatgpt", vec![
-        mr("chatgpt-host", 900, true, vec![
-            sig(SignalKind::HttpHost, "chatgpt.com"),
-        ]),
-        mr("chatgpt-host-alt", 900, true, vec![
-            sig(SignalKind::HttpHost, "chat.openai.com"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "claude", vec![
-        mr("claude-host", 900, true, vec![
-            sig(SignalKind::HttpHost, "claude.ai"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "claude-code", vec![
-        mr("claude-code-bundle-id", 1000, false, vec![
-            sig(SignalKind::ProcessBundleId, "com.anthropic.claude-code"),
-        ]),
-        mr("claude-code-process", 950, false, vec![
-            sig(SignalKind::ProcessName, "claude"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "claude-desktop", vec![
-        mr("claude-desktop-bundle-id", 1000, false, vec![
-            sig(SignalKind::ProcessBundleId, "com.anthropic.claudefordesktop"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "codex", vec![
-        mr("codex-process", 950, false, vec![
-            sig(SignalKind::ProcessName, "codex"),
-        ]),
-        mr("codex-host-path", 960, true, vec![
-            sig(SignalKind::HttpHost, "chatgpt.com"),
-            sig(SignalKind::HttpPath, "/backend-api/codex/*"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "gemini", vec![
-        mr("gemini-host", 900, true, vec![
-            sig(SignalKind::HttpHost, "gemini.google.com"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "cursor", vec![
-        mr("cursor-bundle-id-1", 1000, false, vec![
-            sig(SignalKind::ProcessBundleId, "com.todesktop.230313mzl4w4u92"),
-        ]),
-        mr("cursor-bundle-id-2", 1000, false, vec![
-            sig(SignalKind::ProcessBundleId, "com.todesktop.cursor"),
-        ]),
-        mr("cursor-process", 950, false, vec![
-            sig(SignalKind::ProcessName, "Cursor"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "windsurf", vec![
-        mr("windsurf-bundle-id-1", 1000, false, vec![
-            sig(SignalKind::ProcessBundleId, "com.codeium.windsurf"),
-        ]),
-        mr("windsurf-bundle-id-2", 1000, false, vec![
-            sig(SignalKind::ProcessBundleId, "codeium.windsurf"),
-        ]),
-        mr("windsurf-process", 950, false, vec![
-            sig(SignalKind::ProcessName, "Windsurf"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "github-copilot", vec![
-        mr("copilot-process", 950, false, vec![
-            sig(SignalKind::ProcessName, "copilot"),
-        ]),
-        mr("copilot-host", 900, true, vec![
-            sig(SignalKind::HttpHost, "copilot-proxy.githubusercontent.com"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "deepseek", vec![
-        mr("deepseek-host", 900, true, vec![
-            sig(SignalKind::HttpHost, "chat.deepseek.com"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "grok", vec![
-        mr("grok-host", 900, true, vec![
-            sig(SignalKind::HttpHost, "grok.com"),
-        ]),
-        mr("grok-host-alt", 900, true, vec![
-            sig(SignalKind::HttpHost, "grok.x.ai"),
-        ]),
-    ]);
-    set_app_rules(&mut bundle, "perplexity", vec![
-        mr("perplexity-host", 900, true, vec![
-            sig(SignalKind::HttpHost, "perplexity.ai"),
-        ]),
-        mr("perplexity-host-www", 900, true, vec![
-            sig(SignalKind::HttpHost, "www.perplexity.ai"),
-        ]),
-    ]);
+    set_app_rules(
+        &mut bundle,
+        "chatgpt",
+        vec![
+            mr(
+                "chatgpt-host",
+                900,
+                true,
+                vec![sig(SignalKind::HttpHost, "chatgpt.com")],
+            ),
+            mr(
+                "chatgpt-host-alt",
+                900,
+                true,
+                vec![sig(SignalKind::HttpHost, "chat.openai.com")],
+            ),
+        ],
+    );
+    set_app_rules(
+        &mut bundle,
+        "claude",
+        vec![mr(
+            "claude-host",
+            900,
+            true,
+            vec![sig(SignalKind::HttpHost, "claude.ai")],
+        )],
+    );
+    set_app_rules(
+        &mut bundle,
+        "claude-code",
+        vec![
+            mr(
+                "claude-code-bundle-id",
+                1000,
+                false,
+                vec![sig(
+                    SignalKind::ProcessBundleId,
+                    "com.anthropic.claude-code",
+                )],
+            ),
+            mr(
+                "claude-code-process",
+                950,
+                false,
+                vec![sig(SignalKind::ProcessName, "claude")],
+            ),
+        ],
+    );
+    set_app_rules(
+        &mut bundle,
+        "claude-desktop",
+        vec![mr(
+            "claude-desktop-bundle-id",
+            1000,
+            false,
+            vec![sig(
+                SignalKind::ProcessBundleId,
+                "com.anthropic.claudefordesktop",
+            )],
+        )],
+    );
+    set_app_rules(
+        &mut bundle,
+        "codex",
+        vec![
+            mr(
+                "codex-process",
+                950,
+                false,
+                vec![sig(SignalKind::ProcessName, "codex")],
+            ),
+            mr(
+                "codex-host-path",
+                960,
+                true,
+                vec![
+                    sig(SignalKind::HttpHost, "chatgpt.com"),
+                    sig(SignalKind::HttpPath, "/backend-api/codex/*"),
+                ],
+            ),
+        ],
+    );
+    set_app_rules(
+        &mut bundle,
+        "gemini",
+        vec![mr(
+            "gemini-host",
+            900,
+            true,
+            vec![sig(SignalKind::HttpHost, "gemini.google.com")],
+        )],
+    );
+    set_app_rules(
+        &mut bundle,
+        "cursor",
+        vec![
+            mr(
+                "cursor-bundle-id-1",
+                1000,
+                false,
+                vec![sig(
+                    SignalKind::ProcessBundleId,
+                    "com.todesktop.230313mzl4w4u92",
+                )],
+            ),
+            mr(
+                "cursor-bundle-id-2",
+                1000,
+                false,
+                vec![sig(SignalKind::ProcessBundleId, "com.todesktop.cursor")],
+            ),
+            mr(
+                "cursor-process",
+                950,
+                false,
+                vec![sig(SignalKind::ProcessName, "Cursor")],
+            ),
+        ],
+    );
+    set_app_rules(
+        &mut bundle,
+        "windsurf",
+        vec![
+            mr(
+                "windsurf-bundle-id-1",
+                1000,
+                false,
+                vec![sig(SignalKind::ProcessBundleId, "com.codeium.windsurf")],
+            ),
+            mr(
+                "windsurf-bundle-id-2",
+                1000,
+                false,
+                vec![sig(SignalKind::ProcessBundleId, "codeium.windsurf")],
+            ),
+            mr(
+                "windsurf-process",
+                950,
+                false,
+                vec![sig(SignalKind::ProcessName, "Windsurf")],
+            ),
+        ],
+    );
+    set_app_rules(
+        &mut bundle,
+        "github-copilot",
+        vec![
+            mr(
+                "copilot-process",
+                950,
+                false,
+                vec![sig(SignalKind::ProcessName, "copilot")],
+            ),
+            mr(
+                "copilot-host",
+                900,
+                true,
+                vec![sig(
+                    SignalKind::HttpHost,
+                    "copilot-proxy.githubusercontent.com",
+                )],
+            ),
+        ],
+    );
+    set_app_rules(
+        &mut bundle,
+        "deepseek",
+        vec![mr(
+            "deepseek-host",
+            900,
+            true,
+            vec![sig(SignalKind::HttpHost, "chat.deepseek.com")],
+        )],
+    );
+    set_app_rules(
+        &mut bundle,
+        "grok",
+        vec![
+            mr(
+                "grok-host",
+                900,
+                true,
+                vec![sig(SignalKind::HttpHost, "grok.com")],
+            ),
+            mr(
+                "grok-host-alt",
+                900,
+                true,
+                vec![sig(SignalKind::HttpHost, "grok.x.ai")],
+            ),
+        ],
+    );
+    set_app_rules(
+        &mut bundle,
+        "perplexity",
+        vec![
+            mr(
+                "perplexity-host",
+                900,
+                true,
+                vec![sig(SignalKind::HttpHost, "perplexity.ai")],
+            ),
+            mr(
+                "perplexity-host-www",
+                900,
+                true,
+                vec![sig(SignalKind::HttpHost, "www.perplexity.ai")],
+            ),
+        ],
+    );
 
     bundle
 }
@@ -533,9 +708,7 @@ fn build_v2_bundle() -> OwnedDetectBundle {
         ("*.codeium.com", "windsurf"),
     ];
     for (host, id) in domain_mappings {
-        bundle
-            .domain_index
-            .insert(host.to_string(), id.to_string());
+        bundle.domain_index.insert(host.to_string(), id.to_string());
     }
 
     // Provider detection JSON (v2 style).
@@ -688,13 +861,34 @@ fn build_shared_base() -> OwnedDetectBundle {
             ..Default::default()
         },
     );
-    rest_formats.insert("chatgpt_web".to_string(), soth_core::RestFormatDescriptor::default());
-    rest_formats.insert("claude_web".to_string(), soth_core::RestFormatDescriptor::default());
-    rest_formats.insert("gemini_web".to_string(), soth_core::RestFormatDescriptor::default());
-    rest_formats.insert("deepseek_web".to_string(), soth_core::RestFormatDescriptor::default());
-    rest_formats.insert("grok_web".to_string(), soth_core::RestFormatDescriptor::default());
-    rest_formats.insert("perplexity_web".to_string(), soth_core::RestFormatDescriptor::default());
-    rest_formats.insert("codex_web".to_string(), soth_core::RestFormatDescriptor::default());
+    rest_formats.insert(
+        "chatgpt_web".to_string(),
+        soth_core::RestFormatDescriptor::default(),
+    );
+    rest_formats.insert(
+        "claude_web".to_string(),
+        soth_core::RestFormatDescriptor::default(),
+    );
+    rest_formats.insert(
+        "gemini_web".to_string(),
+        soth_core::RestFormatDescriptor::default(),
+    );
+    rest_formats.insert(
+        "deepseek_web".to_string(),
+        soth_core::RestFormatDescriptor::default(),
+    );
+    rest_formats.insert(
+        "grok_web".to_string(),
+        soth_core::RestFormatDescriptor::default(),
+    );
+    rest_formats.insert(
+        "perplexity_web".to_string(),
+        soth_core::RestFormatDescriptor::default(),
+    );
+    rest_formats.insert(
+        "codex_web".to_string(),
+        soth_core::RestFormatDescriptor::default(),
+    );
 
     let mut llm_providers = HashMap::new();
     for (id, fmt) in &[
@@ -811,11 +1005,7 @@ fn set_app_rules(bundle: &mut OwnedDetectBundle, id: &str, rules: Vec<MatchingRu
     }
 }
 
-fn set_provider_detection(
-    bundle: &mut OwnedDetectBundle,
-    id: &str,
-    detection: serde_json::Value,
-) {
+fn set_provider_detection(bundle: &mut OwnedDetectBundle, id: &str, detection: serde_json::Value) {
     if let Some(entry) = bundle.llm_providers.get_mut(id) {
         entry.detection = Some(detection);
     }
@@ -907,16 +1097,63 @@ fn v3_provider_fingerprint_via_domain_index() {
     // still resolve correctly via detection hints or path heuristics.
     let cases_with_heuristic = vec![
         // These work via path heuristics (openai-like, anthropic header, etc.)
-        ("openai-chat", "api.openai.com", "/v1/chat/completions", vec![("content-type", "application/json")], DetectedFormat::OpenAIRest),
-        ("anthropic", "api.anthropic.com", "/v1/messages", vec![("content-type", "application/json"), ("anthropic-version", "2024-06-01")], DetectedFormat::AnthropicRest),
-        ("gemini-api", "generativelanguage.googleapis.com", "/v1/models/gemini-1.5-pro:generateContent", vec![("content-type", "application/json"), ("x-goog-api-key", "AIza...")], DetectedFormat::GeminiRest),
-        ("cohere", "api.cohere.ai", "/v2/chat", vec![("content-type", "application/json")], DetectedFormat::CohereRest),
-        ("bedrock", "bedrock-runtime.us-east-1.amazonaws.com", "/model/anthropic.claude-3-sonnet/invoke", vec![("content-type", "application/json")], DetectedFormat::BedrockRest),
+        (
+            "openai-chat",
+            "api.openai.com",
+            "/v1/chat/completions",
+            vec![("content-type", "application/json")],
+            DetectedFormat::OpenAIRest,
+        ),
+        (
+            "anthropic",
+            "api.anthropic.com",
+            "/v1/messages",
+            vec![
+                ("content-type", "application/json"),
+                ("anthropic-version", "2024-06-01"),
+            ],
+            DetectedFormat::AnthropicRest,
+        ),
+        (
+            "gemini-api",
+            "generativelanguage.googleapis.com",
+            "/v1/models/gemini-1.5-pro:generateContent",
+            vec![
+                ("content-type", "application/json"),
+                ("x-goog-api-key", "AIza..."),
+            ],
+            DetectedFormat::GeminiRest,
+        ),
+        (
+            "cohere",
+            "api.cohere.ai",
+            "/v2/chat",
+            vec![("content-type", "application/json")],
+            DetectedFormat::CohereRest,
+        ),
+        (
+            "bedrock",
+            "bedrock-runtime.us-east-1.amazonaws.com",
+            "/model/anthropic.claude-3-sonnet/invoke",
+            vec![("content-type", "application/json")],
+            DetectedFormat::BedrockRest,
+        ),
     ];
     for (name, _host, path, hdr_pairs, expected) in cases_with_heuristic {
         let headers = make_headers(&hdr_pairs);
-        let format = fingerprint("POST", path, &headers, b"{}", None, None, &bundle.as_slice());
-        assert_eq!(format, expected, "v3 fingerprint heuristic mismatch for '{name}'");
+        let format = fingerprint(
+            "POST",
+            path,
+            &headers,
+            b"{}",
+            None,
+            None,
+            &bundle.as_slice(),
+        );
+        assert_eq!(
+            format, expected,
+            "v3 fingerprint heuristic mismatch for '{name}'"
+        );
     }
 }
 
@@ -965,10 +1202,7 @@ fn v2_application_fingerprint_golden_corpus() {
         // In the real pipeline, gating resolves both the application and provider.
         // Desktop apps (cursor, windsurf, etc.) with no api_format need the
         // matched_provider hint from domain_index to resolve the correct format.
-        let matched_provider = bundle
-            .domain_index
-            .get(case.host)
-            .map(|s| s.as_str());
+        let matched_provider = bundle.domain_index.get(case.host).map(|s| s.as_str());
         // Only pass matched_provider if it resolves to a known llm_provider.
         let provider_hint = matched_provider.filter(|pid| bundle.llm_providers.contains_key(*pid));
         let format = fingerprint(

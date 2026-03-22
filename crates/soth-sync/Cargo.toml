@@ -7,8 +7,7 @@ license.workspace = true
 
 [dependencies]
 soth-core = { workspace = true }
-soth-bundle = { workspace = true, features = ["native-bundle"] }
-soth-interface = { path = "../../../soth-cloud/crates/soth-interface" }
+soth-bundle = { workspace = true }
 soth-telemetry = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["json", "multipart"] }

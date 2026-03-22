@@ -36,7 +36,12 @@ pub fn replay_heuristic_events(
         let old_confidence = parse_confidence_from_label(&candidate.old_confidence);
         let old_rank = confidence_rank(&old_confidence);
 
-        let new_result = process_with_registry(registry, &request, bundle, &soth_core::SessionSnapshot::default());
+        let new_result = process_with_registry(
+            registry,
+            &request,
+            bundle,
+            &soth_core::SessionSnapshot::default(),
+        );
         let new_rank = confidence_rank(&new_result.confidence);
 
         let status = if new_rank > old_rank {

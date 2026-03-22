@@ -160,25 +160,46 @@ mod tests {
     }
 
     fn empty_native_bundle_bytes() -> Vec<u8> {
-        serde_json::to_vec(&soth_interface::NativeBundle {
+        serde_json::to_vec(&soth_core::native_bundle::NativeBundle {
             schema_version: 4,
-            metadata: soth_interface::NativeBundleMetadata {
-                version: "test".into(), compiled_at: "2026-01-01T00:00:00Z".into(),
-                compiled_by: "test".into(), notes: None, vendor_count: 0,
-                llm_provider_count: 0, product_count: 0, rule_count: 0,
-                format_count: 0, filter_count: 0, settings_count: 0,
-                entity_count: 0, tool_catalog_count: 0,
+            metadata: soth_core::native_bundle::NativeBundleMetadata {
+                version: "test".into(),
+                compiled_at: "2026-01-01T00:00:00Z".into(),
+                compiled_by: "test".into(),
+                notes: None,
+                vendor_count: 0,
+                llm_provider_count: 0,
+                product_count: 0,
+                rule_count: 0,
+                format_count: 0,
+                filter_count: 0,
+                settings_count: 0,
+                entity_count: 0,
+                tool_catalog_count: 0,
             },
-            vendors: vec![], llm_providers: vec![], products: vec![],
-            formats: vec![], filters: vec![], settings: vec![],
-            domain_index: Default::default(), entities: vec![], tool_catalog: vec![],
-        }).expect("native bundle json")
+            vendors: vec![],
+            llm_providers: vec![],
+            products: vec![],
+            formats: vec![],
+            filters: vec![],
+            settings: vec![],
+            domain_index: Default::default(),
+            entities: vec![],
+            tool_catalog: vec![],
+        })
+        .expect("native bundle json")
     }
 
     fn test_assets() -> HashMap<String, Vec<u8>> {
         HashMap::from([
-            ("policy/policy_bundle.json".to_string(), signed_policy_bundle_bytes()),
-            ("detect/bundle.json".to_string(), empty_native_bundle_bytes()),
+            (
+                "policy/policy_bundle.json".to_string(),
+                signed_policy_bundle_bytes(),
+            ),
+            (
+                "detect/bundle.json".to_string(),
+                empty_native_bundle_bytes(),
+            ),
         ])
     }
 
@@ -279,8 +300,14 @@ mod tests {
         .expect("watcher");
 
         let bad_assets = HashMap::from([
-            ("policy/policy_bundle.json".to_string(), b"tampered".to_vec()),
-            ("detect/bundle.json".to_string(), empty_native_bundle_bytes()),
+            (
+                "policy/policy_bundle.json".to_string(),
+                b"tampered".to_vec(),
+            ),
+            (
+                "detect/bundle.json".to_string(),
+                empty_native_bundle_bytes(),
+            ),
         ]);
         let bad_manifest = signed_manifest_bytes("bundle-v2", &bad_assets, &vendor);
         let err = watcher.install(bad_manifest.as_slice(), bad_assets);

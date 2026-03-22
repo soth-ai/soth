@@ -112,18 +112,17 @@ fn detect_bundle_with_codex_catalog() -> soth_core::OwnedDetectBundle {
     detect
 }
 
-fn websocket_upgrade_request(
-    connection_id: Uuid,
-    host: &str,
-    path: &str,
-) -> soth_mitm::RawRequest {
+fn websocket_upgrade_request(connection_id: Uuid, host: &str, path: &str) -> soth_mitm::RawRequest {
     let mut headers = HeaderMap::new();
     headers.insert(
         "host",
         HeaderValue::from_str(host).expect("valid host header"),
     );
     headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
-    headers.insert("sec-websocket-key", HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="));
+    headers.insert(
+        "sec-websocket-key",
+        HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+    );
     headers.insert("connection", HeaderValue::from_static("Upgrade"));
 
     soth_mitm::RawRequest {
@@ -137,7 +136,10 @@ fn websocket_upgrade_request(
 
 fn websocket_101_response(connection_id: Uuid) -> soth_mitm::RawResponse {
     let mut headers = HeaderMap::new();
-    headers.insert("sec-websocket-accept", HeaderValue::from_static("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+    headers.insert(
+        "sec-websocket-accept",
+        HeaderValue::from_static("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+    );
     soth_mitm::RawResponse {
         status: 101,
         headers,
@@ -687,11 +689,7 @@ async fn handler_contract_codex_websocket_turn_lifecycle() {
     let connection_id = Uuid::new_v4();
 
     // 1. WebSocket upgrade request (empty body, Codex via Responses API)
-    let request = websocket_upgrade_request(
-        connection_id,
-        "api.openai.com",
-        "/v1/realtime",
-    );
+    let request = websocket_upgrade_request(connection_id, "api.openai.com", "/v1/realtime");
 
     use soth_mitm::InterceptHandler;
     let decision = handler.on_request(&request).await;
@@ -716,9 +714,7 @@ async fn handler_contract_codex_websocket_turn_lifecycle() {
     // 4. Server streams content deltas
     let delta_frame = soth_mitm::StreamChunk {
         connection_id,
-        payload: Bytes::from_static(
-            br#"{"type":"response.output_text.delta","delta":"Hello, "}"#,
-        ),
+        payload: Bytes::from_static(br#"{"type":"response.output_text.delta","delta":"Hello, "}"#),
         sequence: 2,
         frame_kind: soth_mitm::FrameKind::WebSocketText,
         direction: Some(soth_mitm::FrameDirection::ServerToClient),

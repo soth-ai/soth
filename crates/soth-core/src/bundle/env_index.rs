@@ -23,7 +23,7 @@ pub struct BundleEnvironment {
 
 /// O(1) lookup index mapping parent process identifiers to their environment class.
 /// Built at bundle load time from the `environments` array in the detect bundle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EnvIndex {
     entries: HashMap<String, EnvironmentClass>,
 }
@@ -80,14 +80,6 @@ impl EnvIndex {
     }
 }
 
-impl Default for EnvIndex {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,10 +130,7 @@ mod tests {
             Some(EnvironmentClass::Browser)
         );
         // Unknown
-        assert_eq!(
-            idx.resolve_parent(None, Some("unknown-proc")),
-            None
-        );
+        assert_eq!(idx.resolve_parent(None, Some("unknown-proc")), None);
         // Case insensitive
         assert_eq!(
             idx.resolve_parent(Some("COM.MICROSOFT.VSCODE"), None),

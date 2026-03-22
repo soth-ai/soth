@@ -67,9 +67,7 @@ impl SessionManager {
                     .or(process_resolution.process_name.as_deref())
                     .unwrap_or("unknown-browser")
                     .to_string();
-                let ai_origin = matched_application
-                    .unwrap_or("unknown-origin")
-                    .to_string();
+                let ai_origin = matched_application.unwrap_or("unknown-origin").to_string();
                 SessionAppIdentity::BrowserSession { browser, ai_origin }
             }
             _ => {
@@ -255,10 +253,7 @@ impl SessionManager {
             .request_timestamps_ms
             .retain(|ts| *ts >= current_ts - ONE_HOUR_MS);
 
-        let requests_per_hour = entry
-            .request_timestamps_ms
-            .len()
-            .min(u32::MAX as usize) as f32;
+        let requests_per_hour = entry.request_timestamps_ms.len().min(u32::MAX as usize) as f32;
 
         let s = &mut entry.session;
         s.stats.request_count = s.stats.request_count.saturating_add(1);
@@ -351,10 +346,8 @@ impl SessionManager {
 
     fn entry_to_snapshot(&self, entry: &SessionEntry) -> SessionSnapshot {
         let session = &entry.session;
-        let request_count_this_hour = entry
-            .request_timestamps_ms
-            .len()
-            .min(u32::MAX as usize) as u32;
+        let request_count_this_hour =
+            entry.request_timestamps_ms.len().min(u32::MAX as usize) as u32;
         let credential_alerts_24h = entry
             .credential_timestamps_ms
             .len()
@@ -577,10 +570,7 @@ mod tests {
         };
         let key = mgr.derive_key(&process_resolution, Some("chatgpt.com"));
         match &key.app_identity {
-            SessionAppIdentity::BrowserSession {
-                browser,
-                ai_origin,
-            } => {
+            SessionAppIdentity::BrowserSession { browser, ai_origin } => {
                 assert_eq!(browser, "com.google.chrome");
                 assert_eq!(ai_origin, "chatgpt.com");
             }

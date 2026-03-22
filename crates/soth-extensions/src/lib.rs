@@ -1,3 +1,13 @@
+#![allow(
+    clippy::result_large_err,
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::large_enum_variant,
+    clippy::if_same_then_else,
+    clippy::field_reassign_with_default,
+    clippy::approx_constant,
+    clippy::duplicated_attributes
+)]
 #![forbid(unsafe_code)]
 
 pub mod context;
@@ -19,9 +29,7 @@ pub use observation_queue::{
     ObservationQueueRecord, ObservationQueueWriter, OwnedObservationQueueRecord,
 };
 pub use registry::ExtensionRegistry;
-pub use status::{
-    BackfillProgressSnapshot, ExtensionStatus, LifecycleState, ToolBackfillProgress,
-};
+pub use status::{BackfillProgressSnapshot, ExtensionStatus, LifecycleState, ToolBackfillProgress};
 pub use telemetry_queue::{
     GovernableQueueRecord, OwnedGovernableQueueRecord, TelemetryQueueWriter,
 };

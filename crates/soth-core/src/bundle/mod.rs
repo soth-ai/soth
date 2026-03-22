@@ -5,7 +5,7 @@ pub mod env_index;
 pub mod gating;
 pub mod matching;
 
-pub use classify::{ClassifyPairResult, ClassifyResult, classify_request_pair};
+pub use classify::{classify_request_pair, ClassifyPairResult, ClassifyResult};
 pub use detect::*;
 pub use entity_index::*;
 pub use env_index::*;

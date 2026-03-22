@@ -76,12 +76,7 @@ pub trait Extension: Send + Sync + 'static {
     ///
     /// Must return quickly — offload any heavy work to a background thread.
     /// Governance extensions leave this as the default no-op.
-    fn observe_telemetry_event(
-        &self,
-        _event: &PreEmitEvent,
-        _ctx: &ExtensionRuntimeContext,
-    ) {
-    }
+    fn observe_telemetry_event(&self, _event: &PreEmitEvent, _ctx: &ExtensionRuntimeContext) {}
 
     /// Called periodically at observation_interval() cadence by soth-cli.
     /// Drains the in-memory signal buffer, aggregates into ObservationEvents,

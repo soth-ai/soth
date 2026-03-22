@@ -104,11 +104,7 @@ pub fn evaluate_path_rules(
     // Path rules are defined on the path component only — strip any query string
     // so that `/v1/messages?beta=true` matches the allow pattern `/v1/messages`.
     // Lowercase both sides for case-insensitive matching (matching fingerprint convention).
-    let path_only = path
-        .split('?')
-        .next()
-        .unwrap_or(path)
-        .to_ascii_lowercase();
+    let path_only = path.split('?').next().unwrap_or(path).to_ascii_lowercase();
 
     if rules
         .deny_exact
@@ -117,9 +113,11 @@ pub fn evaluate_path_rules(
     {
         return Some(DecisionReason::PathDeniedExact);
     }
-    if rules.deny_glob.iter().any(|pattern| {
-        glob_match(&pattern.to_ascii_lowercase(), &path_only)
-    }) {
+    if rules
+        .deny_glob
+        .iter()
+        .any(|pattern| glob_match(&pattern.to_ascii_lowercase(), &path_only))
+    {
         return Some(DecisionReason::PathDeniedGlob);
     }
 

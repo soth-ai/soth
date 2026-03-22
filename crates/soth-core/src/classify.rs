@@ -110,7 +110,6 @@ pub struct ProcessResolution {
     // ── Unified registry resolved fields (v6+) ──
     // Pre-resolved at the edge so the cloud can use them directly
     // without catalog lookup or COALESCE fallback chains.
-
     /// Human-readable display name (e.g. "Cursor", "Claude Code").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -196,8 +195,9 @@ impl SurfaceType {
     pub fn app_type(&self) -> AppType {
         match self {
             Self::WebApp | Self::BrowserExtension => AppType::Host,
-            Self::Ide | Self::IdePlugin | Self::Cli | Self::Agent
-            | Self::Desktop | Self::Sdk => AppType::NonHost,
+            Self::Ide | Self::IdePlugin | Self::Cli | Self::Agent | Self::Desktop | Self::Sdk => {
+                AppType::NonHost
+            }
             Self::Unknown => AppType::Unknown,
         }
     }

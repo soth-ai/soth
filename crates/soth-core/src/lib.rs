@@ -9,6 +9,7 @@ pub mod error;
 pub mod extensions;
 pub mod gating;
 pub mod identity;
+pub mod native_bundle;
 pub mod normalized;
 pub mod observation;
 pub mod policy;

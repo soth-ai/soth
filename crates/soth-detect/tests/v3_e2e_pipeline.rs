@@ -11,7 +11,7 @@
 use bytes::Bytes;
 use soth_core::{DetectedProvider, MatchingRule, SignalKind, SignalMatcher};
 use soth_core::{
-    ProductEntry, OwnedDetectBundle, ProviderEntry, RestFormatDescriptor, RestRequestPaths,
+    OwnedDetectBundle, ProductEntry, ProviderEntry, RestFormatDescriptor, RestRequestPaths,
 };
 use soth_detect::{
     build_registry, process_with_registry, ConnectionMeta, ProcessInfo, RawRequest,
@@ -67,7 +67,8 @@ fn e2e_cases() -> Vec<E2eCase> {
                 ("content-type", "application/json"),
                 ("anthropic-version", "2024-06-01"),
             ],
-            body: br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}"#,
+            body:
+                br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}"#,
             process_bundle_id: None,
             process_name: None,
             expected_provider: "anthropic",
@@ -99,7 +100,8 @@ fn e2e_cases() -> Vec<E2eCase> {
                 ("content-type", "application/json"),
                 ("anthropic-version", "2024-06-01"),
             ],
-            body: br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}"#,
+            body:
+                br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}"#,
             process_bundle_id: Some("com.anthropic.claude-code"),
             process_name: Some("claude"),
             expected_provider: "anthropic",
@@ -128,10 +130,7 @@ fn e2e_cases() -> Vec<E2eCase> {
             method: "POST",
             host: "claude.ai",
             path: "/api/organizations/org-123/chat_conversations/conv-456/completion",
-            headers: vec![
-                ("host", "claude.ai"),
-                ("content-type", "application/json"),
-            ],
+            headers: vec![("host", "claude.ai"), ("content-type", "application/json")],
             body: br#"{"model":"claude-sonnet-4-6"}"#,
             process_bundle_id: None,
             process_name: None,
@@ -199,15 +198,14 @@ fn build_v3_detect_bundle() -> OwnedDetectBundle {
     domain_index.insert("claude.ai".to_string(), "claude".to_string());
     domain_index.insert("gemini.google.com".to_string(), "gemini".to_string());
 
-    let mr = |id: &str, priority: u32, requires_all: bool, signals: Vec<SignalMatcher>| {
-        MatchingRule {
+    let mr =
+        |id: &str, priority: u32, requires_all: bool, signals: Vec<SignalMatcher>| MatchingRule {
             rule_id: id.to_string(),
             priority,
             requires_all,
             signals,
             ..Default::default()
-        }
-    };
+        };
     let sig = |kind: SignalKind, pattern: &str| SignalMatcher {
         kind,
         pattern: pattern.to_string(),
@@ -302,7 +300,10 @@ fn build_v3_detect_bundle() -> OwnedDetectBundle {
                     "cc-bid",
                     1000,
                     false,
-                    vec![sig(SignalKind::ProcessBundleId, "com.anthropic.claude-code")],
+                    vec![sig(
+                        SignalKind::ProcessBundleId,
+                        "com.anthropic.claude-code",
+                    )],
                 ),
                 mr(
                     "cc-pname",
@@ -450,12 +451,8 @@ fn v3_wire_roundtrip_full_pipeline() {
 
     for case in e2e_cases() {
         let request = build_request(&case);
-        let result = process_with_registry(
-            &registry,
-            &request,
-            &deserialized.as_slice(),
-            &snapshot,
-        );
+        let result =
+            process_with_registry(&registry, &request, &deserialized.as_slice(), &snapshot);
 
         assert_eq!(
             result.normalized.provider.as_str(),
@@ -511,8 +508,7 @@ fn v3_classify_refines_application_in_pipeline() {
             ("content-type".to_string(), "application/json".to_string()),
         ]),
         body: Bytes::from(
-            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"write tests"}]}"#
-                .to_vec(),
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"write tests"}]}"#.to_vec(),
         ),
         connection_meta: meta,
     };

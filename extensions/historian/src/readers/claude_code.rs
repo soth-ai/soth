@@ -36,6 +36,12 @@ pub struct ClaudeCodeReader {
     cursor: Mutex<Option<Cursor>>,
 }
 
+impl Default for ClaudeCodeReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClaudeCodeReader {
     pub fn new() -> Self {
         Self {
@@ -102,10 +108,8 @@ fn extract_text(value: &serde_json::Value) -> String {
                         // They contain internal reasoning not user-facing content.
                         _ => None,
                     }
-                } else if let Some(s) = v.as_str() {
-                    Some(s.to_string())
                 } else {
-                    None
+                    v.as_str().map(|s| s.to_string())
                 }
             })
             .collect::<Vec<_>>()
@@ -209,11 +213,7 @@ fn parse_session(
         };
 
         let role = msg.role.as_deref().unwrap_or(line_type).to_string();
-        let text = msg
-            .content
-            .as_ref()
-            .map(extract_text)
-            .unwrap_or_default();
+        let text = msg.content.as_ref().map(extract_text).unwrap_or_default();
 
         if text.is_empty() {
             continue;
@@ -288,12 +288,7 @@ impl FormatReader for ClaudeCodeReader {
             if path.is_dir() {
                 if let Ok(sub) = std::fs::read_dir(&path) {
                     for sub_entry in sub.flatten() {
-                        if sub_entry
-                            .path()
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            == Some("jsonl")
-                        {
+                        if sub_entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl") {
                             return true;
                         }
                     }
@@ -544,11 +539,7 @@ mod tests {
     #[tokio::test]
     async fn skips_memory_directory() {
         let tmp = TempDir::new().unwrap();
-        write_file(
-            tmp.path(),
-            "memory/MEMORY.md",
-            "# Memory\nSome notes",
-        );
+        write_file(tmp.path(), "memory/MEMORY.md", "# Memory\nSome notes");
         write_file(
             tmp.path(),
             "session.jsonl",

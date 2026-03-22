@@ -546,10 +546,7 @@ pub fn write_stream_turn(
     };
 
     let event_id = Uuid::new_v4().to_string();
-    let model = turn
-        .model
-        .as_deref()
-        .unwrap_or("unknown");
+    let model = turn.model.as_deref().unwrap_or("unknown");
     let provider = pending.detect_result.normalized.provider.as_str();
     let capture_mode = format!("{:?}", pending.outcome.capture_mode);
     let now_ms = Utc::now().timestamp_millis();

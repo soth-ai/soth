@@ -835,12 +835,14 @@ fn extract_prompts(body: &[u8]) -> (String, String) {
         .get("system")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .or_else(|| json.get("systemInstruction")
-            .and_then(|v| v.get("parts"))
-            .and_then(|v| v.get(0))
-            .and_then(|v| v.get("text"))
-            .and_then(|v| v.as_str())
-            .map(String::from))
+        .or_else(|| {
+            json.get("systemInstruction")
+                .and_then(|v| v.get("parts"))
+                .and_then(|v| v.get(0))
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
         .or_else(|| {
             json.get("messages")
                 .and_then(|v| v.as_array())
@@ -862,7 +864,11 @@ fn extract_prompts(body: &[u8]) -> (String, String) {
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         })
         .and_then(|m| extract_message_content(m))
-        .or_else(|| json.get("prompt").and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| {
+            json.get("prompt")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
         .or_else(|| json.get("input").and_then(|v| v.as_str()).map(String::from))
         // Gemini: contents[last].parts[0].text
         .or_else(|| {
@@ -921,7 +927,11 @@ fn format_trace_block(text: &str, max_chars: usize) -> String {
         return "│ (none)\n".to_string();
     }
     let display = if text.len() > max_chars {
-        let end = text.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(text.len());
+        let end = text
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
         format!("{}... ({} chars truncated)", &text[..end], text.len() - end)
     } else {
         text.to_string()
@@ -958,7 +968,11 @@ pub(crate) fn dev_verify_response(
     let max = dev_verify_max_body();
     let body_text = truncate_body(response_body, max);
     let (input_tokens, output_tokens, finish_reason) = if let Some(u) = usage {
-        (u.input_tokens, u.output_tokens, u.finish_reason.as_deref().unwrap_or("-"))
+        (
+            u.input_tokens,
+            u.output_tokens,
+            u.finish_reason.as_deref().unwrap_or("-"),
+        )
     } else {
         (0, 0, "-")
     };
@@ -1031,7 +1045,11 @@ pub(crate) fn dev_verify_stream_complete(
     }
 
     let (input_tokens, output_tokens, finish_reason) = if let Some(u) = usage {
-        (u.input_tokens, u.output_tokens, u.finish_reason.as_deref().unwrap_or("-"))
+        (
+            u.input_tokens,
+            u.output_tokens,
+            u.finish_reason.as_deref().unwrap_or("-"),
+        )
     } else {
         (0, 0, "-")
     };

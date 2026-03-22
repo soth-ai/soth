@@ -1,10 +1,12 @@
 use bytes::Bytes;
-use soth_core::{DetectResult, ParseSource};
 use soth_core::{
     CaptureMode, CaptureRules, GraphQLOperationRegistry, GrpcServiceRegistry, OwnedDetectBundle,
     ProviderEntry, RestFormatDescriptor, RestRequestPaths,
 };
-use soth_detect::{process_with_registry, ConnectionMeta, ParserRegistry, RawRequest, SocketFamily};
+use soth_core::{DetectResult, ParseSource};
+use soth_detect::{
+    process_with_registry, ConnectionMeta, ParserRegistry, RawRequest, SocketFamily,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
@@ -55,15 +57,20 @@ fn run_ac01() -> i32 {
         };
         let request = random_request(case_idx, socket, &mut rng);
         let result = std::panic::catch_unwind(|| {
-            let _ = process_with_registry(&registry, &request, &bundle_slice, &soth_core::SessionSnapshot::default());
+            let _ = process_with_registry(
+                &registry,
+                &request,
+                &bundle_slice,
+                &soth_core::SessionSnapshot::default(),
+            );
         });
         if result.is_err() {
             panic_count += 1;
         }
     }
 
-    println!("AC-01 fuzz cases: {}", AC01_CASES);
-    println!("AC-01 panic count: {}", panic_count);
+    println!("AC-01 fuzz cases: {AC01_CASES}");
+    println!("AC-01 panic count: {panic_count}");
     println!("AC-01 allocation audit: not covered by this runner (heaptrack required)");
 
     if panic_count == 0 {
@@ -87,7 +94,12 @@ fn run_ac14() -> i32 {
 
     for request in &fixtures {
         let started = Instant::now();
-        let out = process_with_registry(&registry, request, &bundle_slice, &soth_core::SessionSnapshot::default());
+        let out = process_with_registry(
+            &registry,
+            request,
+            &bundle_slice,
+            &soth_core::SessionSnapshot::default(),
+        );
         latencies_ms.push(started.elapsed().as_secs_f64() * 1000.0);
 
         let key = parse_source_name(&out);
@@ -108,16 +120,15 @@ fn run_ac14() -> i32 {
     let max = latencies_ms.last().copied().unwrap_or(0.0);
 
     println!("AC-14 fixture count: {}", fixtures.len());
-    println!("AC-14 p95_ms: {:.3}", p95);
-    println!("AC-14 p99_ms: {:.3}", p99);
-    println!("AC-14 max_ms: {:.3}", max);
+    println!("AC-14 p95_ms: {p95:.3}");
+    println!("AC-14 p99_ms: {p99:.3}");
+    println!("AC-14 max_ms: {max:.3}");
     println!(
-        "AC-14 capture modes: full={}, metadata_only={}",
-        full_capture_count, metadata_capture_count
+        "AC-14 capture modes: full={full_capture_count}, metadata_only={metadata_capture_count}"
     );
     println!("AC-14 parse source distribution:");
     for (source, count) in &parse_counts {
-        println!("  {}: {}", source, count);
+        println!("  {source}: {count}");
     }
 
     let pass = p95 < 25.0 && p99 < 45.0 && max < 90.0;
@@ -151,7 +162,12 @@ fn run_ac15() -> i32 {
             _ => SocketKind::UnixDomain,
         };
         let request = benchmark_request(idx, socket);
-        let out = process_with_registry(&registry, &request, &bundle_slice, &soth_core::SessionSnapshot::default());
+        let out = process_with_registry(
+            &registry,
+            &request,
+            &bundle_slice,
+            &soth_core::SessionSnapshot::default(),
+        );
         checksum = checksum
             .wrapping_add(out.detect_latency_us)
             .wrapping_add(out.normalized.user_content_token_estimate as u64);
@@ -201,7 +217,7 @@ fn build_fixtures(count: usize) -> Vec<RawRequest> {
 }
 
 fn benchmark_request(idx: usize, socket: SocketKind) -> RawRequest {
-    let content = format!("closeout fixture {}", idx);
+    let content = format!("closeout fixture {idx}");
     match idx % 7 {
         0 => rest_openai_request(&content, socket),
         1 => rest_anthropic_request(&content, socket),
@@ -276,8 +292,7 @@ fn rest_openai_request(content: &str, socket: SocketKind) -> RawRequest {
         path: "/v1/chat/completions".to_string(),
         headers,
         body: Bytes::from(format!(
-            "{{\"model\":\"gpt-4o\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}],\"temperature\":0.2}}",
-            content
+            "{{\"model\":\"gpt-4o\",\"messages\":[{{\"role\":\"user\",\"content\":\"{content}\"}}],\"temperature\":0.2}}"
         )),
         connection_meta: connection_meta(socket, 1),
     }
@@ -293,8 +308,7 @@ fn rest_anthropic_request(content: &str, socket: SocketKind) -> RawRequest {
         path: "/v1/messages".to_string(),
         headers,
         body: Bytes::from(format!(
-            "{{\"model\":\"claude-3-7-sonnet\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}]}}",
-            content
+            "{{\"model\":\"claude-3-7-sonnet\",\"messages\":[{{\"role\":\"user\",\"content\":\"{content}\"}}]}}"
         )),
         connection_meta: connection_meta(socket, 2),
     }
@@ -310,8 +324,7 @@ fn graphql_known_request(content: &str, socket: SocketKind) -> RawRequest {
         path: "/graphql".to_string(),
         headers,
         body: Bytes::from(format!(
-            "{{\"operationName\":\"SendAIMessage\",\"query\":\"mutation SendAIMessage($input: AIMessageInput!) {{ sendAIMessage(input: $input) {{ id content model }} }}\",\"variables\":{{\"input\":{{\"content\":\"{}\",\"model\":\"gpt-4o-mini\",\"sessionId\":\"sess-1\"}}}}}}",
-            content
+            "{{\"operationName\":\"SendAIMessage\",\"query\":\"mutation SendAIMessage($input: AIMessageInput!) {{ sendAIMessage(input: $input) {{ id content model }} }}\",\"variables\":{{\"input\":{{\"content\":\"{content}\",\"model\":\"gpt-4o-mini\",\"sessionId\":\"sess-1\"}}}}}}"
         )),
         connection_meta: connection_meta(socket, 3),
     }
@@ -327,8 +340,7 @@ fn graphql_unknown_request(content: &str, socket: SocketKind) -> RawRequest {
         path: "/graphql".to_string(),
         headers,
         body: Bytes::from(format!(
-            "{{\"operationName\":\"CustomPrompt\",\"query\":\"mutation CustomPrompt($input: PromptInput!) {{ customPrompt(input: $input) {{ id response }} }}\",\"variables\":{{\"input\":{{\"promptText\":\"{}\",\"model\":\"gpt-4o-mini\",\"sessionId\":\"sess-2\"}}}}}}",
-            content
+            "{{\"operationName\":\"CustomPrompt\",\"query\":\"mutation CustomPrompt($input: PromptInput!) {{ customPrompt(input: $input) {{ id response }} }}\",\"variables\":{{\"input\":{{\"promptText\":\"{content}\",\"model\":\"gpt-4o-mini\",\"sessionId\":\"sess-2\"}}}}}}"
         )),
         connection_meta: connection_meta(socket, 4),
     }
@@ -401,7 +413,7 @@ fn connection_meta(socket: SocketKind, salt: usize) -> ConnectionMeta {
             remote: SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0),
         },
         SocketKind::UnixDomain => SocketFamily::UnixDomain {
-            path: Some(PathBuf::from(format!("/tmp/soth-closeout-{}.sock", salt))),
+            path: Some(PathBuf::from(format!("/tmp/soth-closeout-{salt}.sock"))),
         },
     };
 

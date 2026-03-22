@@ -626,8 +626,8 @@ fn telemetry_event_new_fields_serde_roundtrip() {
 #[test]
 fn from_governable_enriches_languages_and_classification_flags() {
     use soth_core::{
-        ArtifactKind, ArtifactLocation, ArtifactSeverity, ClassificationFlag,
-        ProgrammingLanguage, SensitiveArtifact,
+        ArtifactKind, ArtifactLocation, ArtifactSeverity, ClassificationFlag, ProgrammingLanguage,
+        SensitiveArtifact,
     };
 
     let event = GovernableEvent {
@@ -721,7 +721,10 @@ fn from_governable_enriches_languages_and_classification_flags() {
     // Token estimates from normalized
     assert_eq!(telemetry.estimated_input_tokens, Some(42));
     assert_eq!(telemetry.estimated_cost_usd, Some(0.01));
-    assert_eq!(telemetry.tool_definition_hash, Some("tool-hash".to_string()));
+    assert_eq!(
+        telemetry.tool_definition_hash,
+        Some("tool-hash".to_string())
+    );
 }
 
 #[test]
@@ -803,22 +806,10 @@ fn from_governable_reads_classify_metadata() {
         "classify.volatility_class".to_string(),
         "\"dynamic\"".to_string(),
     );
-    metadata.insert(
-        "classify.dynamic_fraction".to_string(),
-        "0.42".to_string(),
-    );
-    metadata.insert(
-        "classify.anomaly_score".to_string(),
-        "0.15".to_string(),
-    );
-    metadata.insert(
-        "classify.complexity_score".to_string(),
-        "3".to_string(),
-    );
-    metadata.insert(
-        "classify.topic_cluster_id".to_string(),
-        "17".to_string(),
-    );
+    metadata.insert("classify.dynamic_fraction".to_string(), "0.42".to_string());
+    metadata.insert("classify.anomaly_score".to_string(), "0.15".to_string());
+    metadata.insert("classify.complexity_score".to_string(), "3".to_string());
+    metadata.insert("classify.topic_cluster_id".to_string(), "17".to_string());
 
     let event = GovernableEvent {
         event_id: Uuid::new_v4(),

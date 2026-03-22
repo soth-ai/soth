@@ -60,7 +60,8 @@ fn request_for_api_format(api_format: &str) -> Option<TestRequest> {
                 "model": "gpt-4o-mini",
                 "messages": [{"role": "user", "content": "corpus test openai"}],
                 "stream": false,
-            })).unwrap(),
+            }))
+            .unwrap(),
             path: "/v1/chat/completions",
             expected_model: "gpt-4o-mini",
             content_type: "application/json",
@@ -71,7 +72,8 @@ fn request_for_api_format(api_format: &str) -> Option<TestRequest> {
                 "model": "claude-sonnet-4-6",
                 "messages": [{"role": "user", "content": "corpus test anthropic"}],
                 "system": "You are helpful",
-            })).unwrap(),
+            }))
+            .unwrap(),
             path: "/v1/messages",
             expected_model: "claude-sonnet-4-6",
             content_type: "application/json",
@@ -82,7 +84,8 @@ fn request_for_api_format(api_format: &str) -> Option<TestRequest> {
                 "model": "command-r-plus",
                 "message": "corpus test cohere",
                 "chat_history": [{"role": "SYSTEM", "message": "You are helpful"}],
-            })).unwrap(),
+            }))
+            .unwrap(),
             path: "/v2/chat",
             expected_model: "command-r-plus",
             content_type: "application/json",
@@ -92,7 +95,8 @@ fn request_for_api_format(api_format: &str) -> Option<TestRequest> {
             body: serde_json::to_vec(&json!({
                 "contents": [{"parts": [{"text": "corpus test gemini"}]}],
                 "generationConfig": {"temperature": 0.2},
-            })).unwrap(),
+            }))
+            .unwrap(),
             path: "/v1/models/gemini-2.5-pro:generateContent",
             expected_model: "gemini-2.5-pro",
             content_type: "application/json",
@@ -103,7 +107,8 @@ fn request_for_api_format(api_format: &str) -> Option<TestRequest> {
                 "modelId": "anthropic.claude-3-sonnet",
                 "messages": [{"role": "user", "content": "corpus test bedrock"}],
                 "max_tokens": 128,
-            })).unwrap(),
+            }))
+            .unwrap(),
             path: "/model/anthropic.claude-3-sonnet/invoke",
             expected_model: "anthropic.claude-3-sonnet",
             content_type: "application/json",
@@ -142,7 +147,11 @@ fn materialize_host(pattern: &str) -> String {
     while host.contains("..") {
         host = host.replace("..", ".");
     }
-    if host.is_empty() { "localhost".to_string() } else { host }
+    if host.is_empty() {
+        "localhost".to_string()
+    } else {
+        host
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +163,9 @@ fn materialize_host(pattern: &str) -> String {
 /// and verify model extraction + is_ai_call.
 #[test]
 fn realworld_provider_corpus_model_extraction() {
-    let Some(native) = load_native_bundle() else { return };
+    let Some(native) = load_native_bundle() else {
+        return;
+    };
 
     let detect = soth_bundle::detect_from_native(&native);
     let gating = soth_bundle::gating_from_native(&native);
@@ -170,18 +181,26 @@ fn realworld_provider_corpus_model_extraction() {
     for (provider_id, entry) in &detect.llm_providers {
         let api_format = match entry.api_format.as_deref() {
             Some(f) => f,
-            None => { skipped_no_format += 1; continue; }
+            None => {
+                skipped_no_format += 1;
+                continue;
+            }
         };
 
         let test_req = match request_for_api_format(api_format) {
             Some(r) => r,
-            None => { skipped_no_format += 1; continue; }
+            None => {
+                skipped_no_format += 1;
+                continue;
+            }
         };
 
         // Find an exact (non-wildcard) host from domain_index for this provider.
         // In production, the gating layer resolves the real host; here we use
         // the exact domain entry to avoid wildcard materialization issues.
-        let host = detect.domain_index.iter()
+        let host = detect
+            .domain_index
+            .iter()
             .find(|(domain, slug)| slug.as_str() == provider_id && !domain.contains('*'))
             .map(|(domain, _)| domain.clone());
 
@@ -197,7 +216,10 @@ fn realworld_provider_corpus_model_extraction() {
         // Build request with matched_provider set from gating (like the proxy does)
         let mut headers = BTreeMap::new();
         headers.insert("host".to_string(), host.clone());
-        headers.insert("content-type".to_string(), test_req.content_type.to_string());
+        headers.insert(
+            "content-type".to_string(),
+            test_req.content_type.to_string(),
+        );
         for (k, v) in &test_req.extra_headers {
             headers.insert(k.to_string(), v.to_string());
         }
@@ -213,8 +235,8 @@ fn realworld_provider_corpus_model_extraction() {
         );
 
         // Resolve matched_provider from gating — same as the proxy's gating layer
-        meta.matched_provider = resolve_provider_from_gating(&gating, &host)
-            .or_else(|| Some(provider_id.clone()));
+        meta.matched_provider =
+            resolve_provider_from_gating(&gating, &host).or_else(|| Some(provider_id.clone()));
 
         let request = RawRequest {
             method: "POST".to_string(),
@@ -247,28 +269,32 @@ fn realworld_provider_corpus_model_extraction() {
         // Content hash should be non-empty
         assert!(
             !out.normalized.user_content_hash.is_empty(),
-            "{}: user_content_hash empty", provider_id
+            "{provider_id}: user_content_hash empty"
         );
     }
 
     eprintln!(
-        "\n[Provider corpus] tested={} model={}/{} ai_call={}/{} skipped={}",
-        tested, model_ok, tested, ai_call_ok, tested, skipped_no_format,
+        "\n[Provider corpus] tested={tested} model={model_ok}/{tested} ai_call={ai_call_ok}/{tested} skipped={skipped_no_format}",
     );
     if !failures.is_empty() {
         eprintln!("Failures ({}):", failures.len());
         for f in &failures[..failures.len().min(15)] {
-            eprintln!("  {}", f);
+            eprintln!("  {f}");
         }
     }
 
-    assert!(tested >= 20, "expected at least 20 testable providers, got {}", tested);
+    assert!(
+        tested >= 20,
+        "expected at least 20 testable providers, got {tested}"
+    );
 
     // AI call detection should be near-perfect
     assert!(
         ai_call_ok * 100 / tested >= 95,
         "AI call detection rate: {}/{} ({:.0}%)",
-        ai_call_ok, tested, ai_call_ok as f64 / tested as f64 * 100.0
+        ai_call_ok,
+        tested,
+        ai_call_ok as f64 / tested as f64 * 100.0
     );
 
     // Model extraction currently works for providers where the detect engine
@@ -278,8 +304,7 @@ fn realworld_provider_corpus_model_extraction() {
     // alone — this is a known gap in the detect pipeline to address.
     assert!(
         model_ok >= 3,
-        "model extraction should work for at least core providers, got {}/{}",
-        model_ok, tested,
+        "model extraction should work for at least core providers, got {model_ok}/{tested}",
     );
 }
 
@@ -287,7 +312,9 @@ fn realworld_provider_corpus_model_extraction() {
 /// with a domain should be resolvable through the gating pipeline.
 #[test]
 fn realworld_domain_index_coverage() {
-    let Some(native) = load_native_bundle() else { return };
+    let Some(native) = load_native_bundle() else {
+        return;
+    };
 
     let detect = soth_bundle::detect_from_native(&native);
     let gating = soth_bundle::gating_from_native(&native);
@@ -307,27 +334,31 @@ fn realworld_domain_index_coverage() {
         if resolve_provider_from_gating(&gating, &host).is_some() {
             covered += 1;
         } else {
-            uncovered.push(format!("{} → {}", domain, provider_slug));
+            uncovered.push(format!("{domain} → {provider_slug}"));
         }
     }
 
     let total = covered + uncovered.len();
     eprintln!(
         "\n[Domain coverage] {}/{} domains resolvable via gating ({} uncovered)",
-        covered, total, uncovered.len()
+        covered,
+        total,
+        uncovered.len()
     );
 
     // At least 50% of domains should resolve (wildcards may not match materialized hosts)
     assert!(
         total == 0 || covered * 100 / total >= 50,
-        "domain resolution too low: {}/{}", covered, total
+        "domain resolution too low: {covered}/{total}"
     );
 }
 
 /// Verify that the detect bundle has rest_formats for all standard api_formats.
 #[test]
 fn realworld_rest_format_coverage() {
-    let Some(native) = load_native_bundle() else { return };
+    let Some(native) = load_native_bundle() else {
+        return;
+    };
 
     let detect = soth_bundle::detect_from_native(&native);
 
@@ -335,59 +366,91 @@ fn realworld_rest_format_coverage() {
     for fmt in &required_formats {
         assert!(
             detect.rest_formats.contains_key(*fmt),
-            "rest_formats missing required format: {}", fmt
+            "rest_formats missing required format: {fmt}"
         );
     }
 
     eprintln!(
         "\n[Format coverage] {} rest_formats loaded (required: {})",
-        detect.rest_formats.len(), required_formats.len()
+        detect.rest_formats.len(),
+        required_formats.len()
     );
 }
 
 #[test]
 fn classify_codex_format_from_bundle() {
-    let Some(native) = load_native_bundle() else { return };
+    let Some(native) = load_native_bundle() else {
+        return;
+    };
     let detect = soth_bundle::detect_from_native(&native);
-    
+
     // Verify codex is in applications
-    assert!(detect.products.contains_key("codex"), "codex not in applications");
-    assert_eq!(detect.products["codex"].api_format.as_deref(), Some("codex"), "codex api_format wrong");
-    
+    assert!(
+        detect.products.contains_key("codex"),
+        "codex not in applications"
+    );
+    assert_eq!(
+        detect.products["codex"].api_format.as_deref(),
+        Some("codex"),
+        "codex api_format wrong"
+    );
+
     // Verify codex format in rest_formats
-    assert!(detect.rest_formats.contains_key("codex"), "codex not in rest_formats");
-    
+    assert!(
+        detect.rest_formats.contains_key("codex"),
+        "codex not in rest_formats"
+    );
+
     // Test classify_request_format
     let result = soth_detect::classify_request_format(
         "chatgpt.com",
         "/backend-api/codex/responses",
         &detect.as_slice(),
     );
-    eprintln!("classify_request_format result: {:?}", result);
-    assert_eq!(result.as_deref(), Some("codex"), "classify_request_format should return codex");
+    eprintln!("classify_request_format result: {result:?}");
+    assert_eq!(
+        result.as_deref(),
+        Some("codex"),
+        "classify_request_format should return codex"
+    );
 }
 
 #[test]
 fn codex_format_features_survive_deserialization() {
-    let Some(native) = load_native_bundle() else { return };
+    let Some(native) = load_native_bundle() else {
+        return;
+    };
     let detect = soth_bundle::detect_from_native(&native);
-    
-    let desc = detect.rest_formats.get("codex").expect("codex in rest_formats");
+
+    let desc = detect
+        .rest_formats
+        .get("codex")
+        .expect("codex in rest_formats");
     eprintln!("codex features count: {}", desc.features.len());
-    assert!(!desc.features.is_empty(), "codex should have features after deserialization");
-    
+    assert!(
+        !desc.features.is_empty(),
+        "codex should have features after deserialization"
+    );
+
     let chat = &desc.features[0];
     eprintln!("feature id: {}, type: {}", chat.id, chat.feature_type);
     assert_eq!(chat.feature_type, "chat");
-    
+
     // Check if FeatureResponseSpec::Stream variant was parsed
     match &chat.response {
         soth_core::bundle::detect::FeatureResponseSpec::Stream { stream } => {
-            eprintln!("stream format: {:?}, rules: {}", stream.format, stream.rules.len());
+            eprintln!(
+                "stream format: {:?}, rules: {}",
+                stream.format,
+                stream.rules.len()
+            );
             assert!(!stream.rules.is_empty(), "stream rules should be non-empty");
         }
         soth_core::bundle::detect::FeatureResponseSpec::Direct(map) => {
-            panic!("expected Stream variant, got Direct with keys: {:?}", map.keys().collect::<Vec<_>>());
+            panic!(
+                "expected Stream variant, got Direct with keys: {:?}",
+                map.keys().collect::<Vec<_>>()
+            );
         }
     }
 }

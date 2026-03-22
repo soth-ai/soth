@@ -537,7 +537,7 @@ fn parse_legacy_raw_registry_cache(
             llm_provider_count,
             domain_count,
             format_count,
-            size_bytes: content.as_bytes().len() as u64,
+            size_bytes: content.len() as u64,
             manifest: manifest.clone(),
             channel: None,
         },

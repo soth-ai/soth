@@ -88,7 +88,9 @@ fn corpus_event(index: usize, threshold_mode: bool) -> TelemetryEvent {
     let provider = provider_enum.canonical_name().to_string();
     let endpoint = endpoints[index % endpoints.len()];
     let parse_source = match index % 4 {
-        0 => ParseSource::Rest { provider: provider_enum },
+        0 => ParseSource::Rest {
+            provider: provider_enum,
+        },
         1 => ParseSource::JsonRpc,
         2 => ParseSource::Grpc,
         _ => ParseSource::GraphQl,
@@ -324,7 +326,7 @@ async fn telemetry_signed_mode_e2e_contract() {
                     seen.insert(event.event_id);
                 }
             }
-            other => panic!("expected signed batch, got {:?}", other),
+            other => panic!("expected signed batch, got {other:?}"),
         }
     }
     assert_eq!(seen.len(), total_events);
@@ -383,7 +385,7 @@ async fn telemetry_large_realworld_corpus_encrypted_e2e() {
                     seen.insert(event.event_id);
                 }
             }
-            other => panic!("expected encrypted batch, got {:?}", other),
+            other => panic!("expected encrypted batch, got {other:?}"),
         }
     }
     assert_eq!(seen.len(), total_events);

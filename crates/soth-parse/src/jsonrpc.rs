@@ -63,7 +63,9 @@ pub fn parse_jsonrpc(req: &RawRequest, provider_id: &str) -> ParseResult<Normali
 
     let mut parse_warnings = Vec::new();
     if method.is_none() {
-        parse_warnings.push(ParseWarning::MissingField { field: "method".to_string() });
+        parse_warnings.push(ParseWarning::MissingField {
+            field: "method".to_string(),
+        });
     }
     if content.is_none() {
         parse_warnings.push(ParseWarning::ContentNotExtracted);

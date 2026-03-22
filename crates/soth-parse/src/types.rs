@@ -8,15 +8,14 @@ use uuid::Uuid;
 
 // Re-export bundle schema types from soth-core (moved in B5 type unification).
 pub use soth_core::{
-    AppPolicy, ApplicationEntry, ProductEntry, BrowserPolicies, CaptureOverrides, CaptureRules,
-    DetectBundleSlice, Filters, GrpcFieldSpec, GrpcServiceRegistry, GrpcServiceSpec,
-    GraphQLHeuristicPattern, GraphQLOperationRegistry, GraphQLOperationSpec, OwnedDetectBundle,
-    PreprocessOp, ProviderEntry, RequestEncoding, RestFormatDescriptor, RestRequestPaths,
-    RestResponsePaths, StreamFormat, StreamOptions,
+    AppPolicy, ApplicationEntry, BrowserPolicies, CaptureOverrides, CaptureRules,
+    DetectBundleSlice, Filters, GraphQLHeuristicPattern, GraphQLOperationRegistry,
+    GraphQLOperationSpec, GrpcFieldSpec, GrpcServiceRegistry, GrpcServiceSpec, OwnedDetectBundle,
+    PreprocessOp, ProductEntry, ProviderEntry, RequestEncoding, RestFormatDescriptor,
+    RestRequestPaths, RestResponsePaths, StreamFormat, StreamOptions,
 };
 
 pub type HeaderMap = RequestHeaders;
-
 
 pub use soth_core::EndpointType;
 
@@ -134,7 +133,7 @@ impl DetectResult {
         };
 
         Self {
-            confidence: normalized.parse_confidence.clone(),
+            confidence: normalized.parse_confidence,
             normalized,
             artifacts: Vec::new(),
             capture_mode: CaptureMode::MetadataOnly,

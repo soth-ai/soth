@@ -117,7 +117,12 @@ fn run_detect(capture_mode: CaptureMode) -> soth_core::DetectResult {
             "stream":false
         }"#,
     );
-    soth_detect::process_with_registry(&registry, &request, &bundle.as_slice(), &soth_core::SessionSnapshot::default())
+    soth_detect::process_with_registry(
+        &registry,
+        &request,
+        &bundle.as_slice(),
+        &soth_core::SessionSnapshot::default(),
+    )
 }
 
 #[test]

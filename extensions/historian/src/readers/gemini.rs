@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio_stream::Stream;
-use tracing::{trace, info, warn};
+use tracing::{info, trace, warn};
 
 use crate::error::ReaderError;
 use crate::reader::FormatReader;
@@ -33,6 +33,12 @@ use crate::types::{AiTool, Cursor, HistoricalMessage, HistoricalSession};
 /// This reader supports the Gemini CLI JSON format only.
 pub struct GeminiReader {
     cursor: Mutex<Option<Cursor>>,
+}
+
+impl Default for GeminiReader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GeminiReader {
@@ -128,10 +134,8 @@ fn extract_content_text(value: &serde_json::Value) -> String {
             .filter_map(|item| {
                 if let Some(obj) = item.as_object() {
                     obj.get("text").and_then(|v| v.as_str()).map(String::from)
-                } else if let Some(s) = item.as_str() {
-                    Some(s.to_string())
                 } else {
-                    None
+                    item.as_str().map(|s| s.to_string())
                 }
             })
             .collect::<Vec<_>>()
@@ -166,12 +170,11 @@ fn parse_conversation_json(
         message: format!("read {}: {e}", path.display()),
     })?;
 
-    let record: ConversationRecord = serde_json::from_str(&content).map_err(|e| {
-        ReaderError::Reader {
+    let record: ConversationRecord =
+        serde_json::from_str(&content).map_err(|e| ReaderError::Reader {
             tool: "gemini_cli".into(),
             message: format!("parse {}: {e}", path.display()),
-        }
-    })?;
+        })?;
 
     let mut messages = Vec::new();
     let mut min_ts: Option<i64> = None;
@@ -242,10 +245,7 @@ fn parse_conversation_json(
         min_ts = record.start_time.as_deref().and_then(parse_iso_timestamp);
     }
     if max_ts.is_none() {
-        max_ts = record
-            .last_updated
-            .as_deref()
-            .and_then(parse_iso_timestamp);
+        max_ts = record.last_updated.as_deref().and_then(parse_iso_timestamp);
     }
 
     Ok(Some(HistoricalSession {
@@ -568,9 +568,7 @@ mod tests {
         );
 
         assert_eq!(session.messages[1].role, "assistant");
-        assert!(session.messages[1]
-            .content
-            .contains("poll-based model"));
+        assert!(session.messages[1].content.contains("poll-based model"));
 
         // Info messages should be skipped
         assert_eq!(session.messages[2].role, "user");

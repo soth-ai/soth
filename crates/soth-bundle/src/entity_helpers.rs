@@ -5,8 +5,10 @@
 //! bundle converters (detect_from_native, gating_from_native, entity_index)
 //! import from here instead of defining their own copies.
 
+use soth_core::native_bundle::{
+    NativeBundle, NativeBundleEntity, NativeBundleRule, NativeBundleSignal,
+};
 use soth_core::{AppType, MatchingRule, SignalKind, SignalMatcher};
-use soth_interface::{NativeBundleEntity, NativeBundleRule, NativeBundleSignal, NativeBundle};
 
 // ── V3/V4 entity source selection ────────────────────────────────────────────
 
@@ -30,21 +32,26 @@ pub fn source_entities(bundle: &NativeBundle) -> Vec<&NativeBundleEntity> {
 
 /// Returns `true` if the entity is an LLM provider (not a product/application).
 pub fn is_provider(entity: &NativeBundleEntity) -> bool {
-    matches!(entity.entity_kind.as_deref(), Some("llm_provider") | Some("provider"))
-        || (entity.entity_kind.is_none()
-            && entity
-                .kind
-                .as_deref()
-                .map_or(false, |k| matches!(k, "platform" | "provider" | "llm_provider")))
+    matches!(
+        entity.entity_kind.as_deref(),
+        Some("llm_provider") | Some("provider")
+    ) || (entity.entity_kind.is_none()
+        && entity
+            .kind
+            .as_deref()
+            .is_some_and(|k| matches!(k, "platform" | "provider" | "llm_provider")))
 }
 
 /// Returns `true` if the entity is a product/application (not a provider).
 pub fn is_product(entity: &NativeBundleEntity) -> bool {
-    matches!(entity.entity_kind.as_deref(), Some("product") | Some("application"))
-        || (entity.entity_kind.is_none()
-            && entity.kind.as_deref().map_or(false, |k| {
-                !matches!(k, "platform" | "provider" | "llm_provider")
-            }))
+    matches!(
+        entity.entity_kind.as_deref(),
+        Some("product") | Some("application")
+    ) || (entity.entity_kind.is_none()
+        && entity
+            .kind
+            .as_deref()
+            .is_some_and(|k| !matches!(k, "platform" | "provider" | "llm_provider")))
 }
 
 /// Derive the fine-grained kind string for an entity.
@@ -168,7 +175,7 @@ pub fn flatten_signals(entity: &NativeBundleEntity) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soth_interface::NativeBundleCapture;
+    use soth_core::native_bundle::NativeBundleCapture;
 
     fn make_entity(
         slug: &str,
@@ -206,49 +213,99 @@ mod tests {
 
     #[test]
     fn provider_classification() {
-        assert!(is_provider(&make_entity("openai", Some("llm_provider"), Some("platform"))));
+        assert!(is_provider(&make_entity(
+            "openai",
+            Some("llm_provider"),
+            Some("platform")
+        )));
         assert!(is_provider(&make_entity("openai", Some("provider"), None)));
         assert!(is_provider(&make_entity("openai", None, Some("platform"))));
-        assert!(!is_provider(&make_entity("cursor", Some("product"), Some("ide"))));
+        assert!(!is_provider(&make_entity(
+            "cursor",
+            Some("product"),
+            Some("ide")
+        )));
         assert!(!is_provider(&make_entity("cursor", None, Some("ide"))));
     }
 
     #[test]
     fn product_classification() {
-        assert!(is_product(&make_entity("cursor", Some("product"), Some("ide"))));
-        assert!(is_product(&make_entity("cursor", Some("application"), None)));
+        assert!(is_product(&make_entity(
+            "cursor",
+            Some("product"),
+            Some("ide")
+        )));
+        assert!(is_product(&make_entity(
+            "cursor",
+            Some("application"),
+            None
+        )));
         assert!(is_product(&make_entity("cursor", None, Some("ide"))));
-        assert!(!is_product(&make_entity("openai", Some("llm_provider"), Some("platform"))));
+        assert!(!is_product(&make_entity(
+            "openai",
+            Some("llm_provider"),
+            Some("platform")
+        )));
     }
 
     #[test]
     fn derive_kind_priority() {
         // kind field takes priority
-        assert_eq!(derive_kind(&make_entity("x", Some("llm_provider"), Some("ide"))), "ide");
+        assert_eq!(
+            derive_kind(&make_entity("x", Some("llm_provider"), Some("ide"))),
+            "ide"
+        );
         // Falls back to entity_kind mapping
-        assert_eq!(derive_kind(&make_entity("x", Some("llm_provider"), None)), "platform");
-        assert_eq!(derive_kind(&make_entity("x", Some("product"), None)), "other");
+        assert_eq!(
+            derive_kind(&make_entity("x", Some("llm_provider"), None)),
+            "platform"
+        );
+        assert_eq!(
+            derive_kind(&make_entity("x", Some("product"), None)),
+            "other"
+        );
     }
 
     #[test]
     fn derive_app_type_browser_vs_non_host() {
-        assert_eq!(derive_app_type(&make_entity("x", None, Some("browser"))), AppType::Host);
-        assert_eq!(derive_app_type(&make_entity("x", None, Some("browser_app"))), AppType::Host);
-        assert_eq!(derive_app_type(&make_entity("x", None, Some("ide"))), AppType::NonHost);
-        assert_eq!(derive_app_type(&make_entity("x", None, None)), AppType::NonHost);
+        assert_eq!(
+            derive_app_type(&make_entity("x", None, Some("browser"))),
+            AppType::Host
+        );
+        assert_eq!(
+            derive_app_type(&make_entity("x", None, Some("browser_app"))),
+            AppType::Host
+        );
+        assert_eq!(
+            derive_app_type(&make_entity("x", None, Some("ide"))),
+            AppType::NonHost
+        );
+        assert_eq!(
+            derive_app_type(&make_entity("x", None, None)),
+            AppType::NonHost
+        );
     }
 
     #[test]
     fn capture_mode_parsing() {
-        assert_eq!(parse_capture_mode("full"), Some(soth_core::CaptureMode::Full));
-        assert_eq!(parse_capture_mode("METADATA_ONLY"), Some(soth_core::CaptureMode::MetadataOnly));
+        assert_eq!(
+            parse_capture_mode("full"),
+            Some(soth_core::CaptureMode::Full)
+        );
+        assert_eq!(
+            parse_capture_mode("METADATA_ONLY"),
+            Some(soth_core::CaptureMode::MetadataOnly)
+        );
         assert_eq!(parse_capture_mode("garbage"), None);
     }
 
     #[test]
     fn signal_kind_round_trip() {
         assert_eq!(parse_signal_kind("HttpHost"), Some(SignalKind::HttpHost));
-        assert_eq!(parse_signal_kind("ProcessBundleId"), Some(SignalKind::ProcessBundleId));
+        assert_eq!(
+            parse_signal_kind("ProcessBundleId"),
+            Some(SignalKind::ProcessBundleId)
+        );
         assert_eq!(parse_signal_kind("FutureKind"), None);
     }
 }

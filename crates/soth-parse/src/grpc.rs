@@ -184,7 +184,9 @@ fn parse_with_descriptor(
         parse_warnings: if model.is_some() {
             Vec::new()
         } else {
-            vec![ParseWarning::MissingField { field: "model".to_string() }]
+            vec![ParseWarning::MissingField {
+                field: "model".to_string(),
+            }]
         },
         is_ai_call: true,
         provider: spec.provider_hint.as_deref().unwrap_or("grpc").to_string(),
@@ -216,7 +218,11 @@ fn parse_with_descriptor(
             proto_package: spec.proto_package.clone(),
         },
         api_version: None,
-        user_prompt: if content.is_empty() { None } else { Some(content.clone()) },
+        user_prompt: if content.is_empty() {
+            None
+        } else {
+            Some(content.clone())
+        },
     };
     normalized.canonical_cache_key = canonical_hash(&normalized);
 
@@ -277,7 +283,11 @@ fn parse_with_string_scan(
             proto_package: descriptor.and_then(|spec| spec.proto_package.clone()),
         },
         api_version: None,
-        user_prompt: if content.is_empty() { None } else { Some(content.clone()) },
+        user_prompt: if content.is_empty() {
+            None
+        } else {
+            Some(content.clone())
+        },
     };
     normalized.canonical_cache_key = canonical_hash(&normalized);
 

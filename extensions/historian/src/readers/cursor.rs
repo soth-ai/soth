@@ -26,6 +26,12 @@ pub struct CursorReader {
     cursor: Mutex<Option<Cursor>>,
 }
 
+impl Default for CursorReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorReader {
     pub fn new() -> Self {
         Self {
@@ -85,7 +91,11 @@ impl CursorReader {
             .join("User")
             .join("globalStorage")
             .join("state.vscdb");
-        if path.exists() { Some(path) } else { None }
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
     }
 
     fn open_readonly(db_path: &Path) -> Result<Connection, ReaderError> {
@@ -100,7 +110,8 @@ impl CursorReader {
 
         // Short busy timeout — WAL contention with a live Cursor process is
         // expected; we prefer a fast skip over a long stall.
-        conn.busy_timeout(std::time::Duration::from_millis(500)).ok();
+        conn.busy_timeout(std::time::Duration::from_millis(500))
+            .ok();
 
         Ok(conn)
     }
@@ -172,9 +183,7 @@ fn read_cursor_sessions(
         "WHERE key LIKE 'composerData:%'".to_string()
     };
 
-    let sql = format!(
-        "SELECT value, rowid FROM cursorDiskKV {where_clause} ORDER BY rowid ASC"
-    );
+    let sql = format!("SELECT value, rowid FROM cursorDiskKV {where_clause} ORDER BY rowid ASC");
 
     let mut stmt = conn.prepare(&sql).map_err(|e| ReaderError::Reader {
         tool: "cursor".into(),
@@ -277,15 +286,10 @@ impl FormatReader for CursorReader {
         let root = root.to_path_buf();
 
         // Snapshot the last rowid before we move into the async block.
-        let since_rowid = self
-            .cursor
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|c| match c {
-                Cursor::SqliteRowId { last_rowid, .. } => Some(*last_rowid),
-                _ => None,
-            });
+        let since_rowid = self.cursor.lock().unwrap().as_ref().and_then(|c| match c {
+            Cursor::SqliteRowId { last_rowid, .. } => Some(*last_rowid),
+            _ => None,
+        });
 
         Box::pin(async_stream::try_stream! {
             let db_path = CursorReader::resolve_db_path(&root).ok_or_else(|| ReaderError::Reader {
@@ -345,10 +349,8 @@ mod tests {
     fn create_cursor_db(dir: &Path, rows: &[(&str, &str)]) -> PathBuf {
         let db_path = dir.join("state.vscdb");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
         for (key, value) in rows {
             conn.execute(
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
@@ -543,12 +545,15 @@ mod tests {
         while stream.next().await.is_some() {}
 
         let cursor = reader.last_cursor();
-        assert!(cursor.is_some(), "cursor should be set after a successful read");
+        assert!(
+            cursor.is_some(),
+            "cursor should be set after a successful read"
+        );
         match cursor.unwrap() {
             Cursor::SqliteRowId { last_rowid, .. } => {
                 assert!(last_rowid >= 1, "rowid must be at least 1");
             }
-            other => panic!("expected SqliteRowId cursor, got {:?}", other),
+            other => panic!("expected SqliteRowId cursor, got {other:?}"),
         }
     }
 

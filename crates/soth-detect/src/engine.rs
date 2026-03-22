@@ -61,7 +61,13 @@ impl ParserRegistry {
         bundle: &DetectBundleSlice<'_>,
         snapshot: &soth_core::SessionSnapshot,
     ) -> soth_core::DetectResult {
-        to_core_detect_result(&process_inner(req, bundle, self, &self.compiled_org, snapshot))
+        to_core_detect_result(&process_inner(
+            req,
+            bundle,
+            self,
+            &self.compiled_org,
+            snapshot,
+        ))
     }
 }
 
@@ -197,7 +203,7 @@ fn parse_request(
 
     let provider_entry = provider_entry_for(bundle, &normalized.provider);
 
-    let capture_mode = req.connection_meta.capture_mode.clone().unwrap_or_else(|| {
+    let capture_mode = req.connection_meta.capture_mode.unwrap_or_else(|| {
         bundle
             .capture_rules
             .mode_for_with_entry(&normalized.provider, provider_entry)
@@ -285,7 +291,10 @@ fn scan_content(
         if let Some(content_sample) = scan_input.fallback_content.as_deref() {
             let code_result = detect_code_artifacts(
                 content_sample,
-                ArtifactLocation::UserContent { turn: 0, char_offset: 0 },
+                ArtifactLocation::UserContent {
+                    turn: 0,
+                    char_offset: 0,
+                },
             );
             artifacts.extend(code_result.artifacts);
             warnings.extend(code_result.warnings);
@@ -293,15 +302,12 @@ fn scan_content(
                 import_categories.extend(ts.import_categories.iter().cloned());
             }
             if ast_normalized_hash.is_none() {
-                let lang = code_result
-                    .detected_language
-                    .as_deref()
-                    .or_else(|| {
-                        code_result
-                            .tree_sitter
-                            .as_ref()
-                            .and_then(|ts| ts.confirmed_language.as_deref())
-                    });
+                let lang = code_result.detected_language.as_deref().or_else(|| {
+                    code_result
+                        .tree_sitter
+                        .as_ref()
+                        .and_then(|ts| ts.confirmed_language.as_deref())
+                });
                 if let Some(lang) = lang {
                     ast_normalized_hash = code::ast_normalized_hash(content_sample, lang);
                 }
@@ -320,15 +326,12 @@ fn scan_content(
                 }
 
                 if ast_normalized_hash.is_none() {
-                    let lang = code_result
-                        .detected_language
-                        .as_deref()
-                        .or_else(|| {
-                            code_result
-                                .tree_sitter
-                                .as_ref()
-                                .and_then(|ts| ts.confirmed_language.as_deref())
-                        });
+                    let lang = code_result.detected_language.as_deref().or_else(|| {
+                        code_result
+                            .tree_sitter
+                            .as_ref()
+                            .and_then(|ts| ts.confirmed_language.as_deref())
+                    });
                     if let Some(lang) = lang {
                         ast_normalized_hash = code::ast_normalized_hash(text, lang);
                     }
@@ -384,7 +387,7 @@ fn process_inner(
 
     // Phase 2: Scan
     let scan_input = build_scan_input(&req.body, &normalized);
-    let scan = scan_content(&req.body, &scan_input, &compiled_org);
+    let scan = scan_content(&req.body, &scan_input, compiled_org);
 
     let artifacts = scan.artifacts;
     warnings.extend(scan.warnings);
@@ -397,8 +400,13 @@ fn process_inner(
     let _ = capture_mode; // will gate the extraction API in a future release
 
     // Phase 3: Prefix repeat + session mutations
-    let (is_prefix_repeat, novel_token_count, repeated_token_count, novel_tail_start_idx, prefix_hash) =
-        compute_prefix_repeat(&normalized, snapshot);
+    let (
+        is_prefix_repeat,
+        novel_token_count,
+        repeated_token_count,
+        novel_tail_start_idx,
+        prefix_hash,
+    ) = compute_prefix_repeat(&normalized, snapshot);
 
     let is_repeated_code_context = ast_normalized_hash
         .as_deref()
@@ -420,7 +428,7 @@ fn process_inner(
         ..soth_core::SessionMutations::default()
     };
 
-    let confidence = normalized.parse_confidence.clone();
+    let confidence = normalized.parse_confidence;
 
     // Phase 4: Assemble DetectResult
     DetectResult {
@@ -482,30 +490,28 @@ fn extract_scannable_locations(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        locations.push((ArtifactLocation::SystemPrompt { char_offset: 0 }, system.to_string()));
+        locations.push((
+            ArtifactLocation::SystemPrompt { char_offset: 0 },
+            system.to_string(),
+        ));
     }
 
     // Messages array
     if let Some(messages) = json.get("messages").and_then(|v| v.as_array()) {
         for (idx, msg) in messages.iter().enumerate() {
-            let role = msg
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("user");
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let content = msg
                 .get("content")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| {
-                    msg.get("content")
-                        .and_then(|v| v.as_array())
-                        .map(|parts| {
-                            parts
-                                .iter()
-                                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
+                    msg.get("content").and_then(|v| v.as_array()).map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
                 });
 
             if let Some(text) = content.filter(|s| !s.is_empty()) {
@@ -535,7 +541,9 @@ fn extract_scannable_locations(
                     .to_string();
                 let tool_text = tool.to_string();
                 locations.push((
-                    ArtifactLocation::ToolResult { tool_name: Some(tool_name) },
+                    ArtifactLocation::ToolResult {
+                        tool_name: Some(tool_name),
+                    },
                     tool_text,
                 ));
             }
@@ -568,9 +576,15 @@ fn extract_content_sample(body: &[u8]) -> Option<String> {
 
     // Simple top-level content paths
     for key in &["prompt", "content", "message", "text", "input", "query"] {
-        if let Some(s) = json.get(*key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(s) = json
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             // Skip GraphQL query DSL — it looks like code but isn't user content
-            if *key == "query" && (json.get("operationName").is_some() || json.get("variables").is_some()) {
+            if *key == "query"
+                && (json.get("operationName").is_some() || json.get("variables").is_some())
+            {
                 continue;
             }
             if s != "[CONTENT_NOT_EXTRACTED]" {
@@ -668,7 +682,6 @@ fn visit_json_strings(value: &serde_json::Value, f: &mut dyn FnMut(&str)) {
     }
 }
 
-
 fn parse_by_format(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
@@ -738,9 +751,9 @@ fn parse_by_format(
             });
             let mut normalized = heuristic::parse(req);
             normalized.provider = provider_name;
-            normalized
-                .parse_warnings
-                .push(ParseWarning::ParserError { reason: format!("{error:?}") });
+            normalized.parse_warnings.push(ParseWarning::ParserError {
+                reason: format!("{error:?}"),
+            });
             normalized.canonical_cache_key = canonical_hash(&normalized);
             (normalized, ParseSource::Heuristic, warnings)
         }
@@ -955,11 +968,21 @@ fn rest_key_for_format(format: &DetectedFormat) -> &'static str {
 
 fn parse_source_for_format(format: &DetectedFormat, _meta: &FormatMeta) -> ParseSource {
     match format {
-        DetectedFormat::OpenAIRest => ParseSource::Rest { provider: DetectedProvider::OpenAi },
-        DetectedFormat::AnthropicRest => ParseSource::Rest { provider: DetectedProvider::Anthropic },
-        DetectedFormat::CohereRest => ParseSource::Rest { provider: DetectedProvider::Cohere },
-        DetectedFormat::GeminiRest => ParseSource::Rest { provider: DetectedProvider::Gemini },
-        DetectedFormat::BedrockRest => ParseSource::Rest { provider: DetectedProvider::Bedrock },
+        DetectedFormat::OpenAIRest => ParseSource::Rest {
+            provider: DetectedProvider::OpenAi,
+        },
+        DetectedFormat::AnthropicRest => ParseSource::Rest {
+            provider: DetectedProvider::Anthropic,
+        },
+        DetectedFormat::CohereRest => ParseSource::Rest {
+            provider: DetectedProvider::Cohere,
+        },
+        DetectedFormat::GeminiRest => ParseSource::Rest {
+            provider: DetectedProvider::Gemini,
+        },
+        DetectedFormat::BedrockRest => ParseSource::Rest {
+            provider: DetectedProvider::Bedrock,
+        },
         DetectedFormat::CustomRest(_) => ParseSource::AgentApp,
         DetectedFormat::GraphQL => ParseSource::GraphQl,
         DetectedFormat::GrpcProtobuf => ParseSource::Grpc,

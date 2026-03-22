@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 use soth_core::{
     AppType, CaptureMode, ClassificationSource, DetectResult, DetectedProvider, EndpointType,
     FormatMetadata, NormalizedRequest, ParseConfidence, ParseSource, ProcessMatchKind,
@@ -22,7 +23,7 @@ fn main() {
             schema_version: "1".to_string(),
             parse_warnings: Vec::new(),
             is_ai_call: true,
-            provider: DetectedProvider::OpenAi,
+            provider: "openai".to_string(),
             model: Some("gpt-4o-mini".to_string()),
             endpoint_type: EndpointType::ChatCompletion,
             api_version: None,
@@ -45,10 +46,14 @@ fn main() {
                 provider: DetectedProvider::OpenAi,
             },
             canonical_cache_key: "cache-key".to_string(),
-            format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
+            format_metadata: FormatMetadata::Unknown {
+                method: String::new(),
+                path: String::new(),
+            },
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
+            user_prompt: None,
         },
         artifacts: Vec::new(),
         capture_mode: CaptureMode::MetadataOnly,
@@ -68,6 +73,7 @@ fn main() {
         ast_normalized_hash: None,
         first_blob_event_id: None,
         import_categories: Vec::new(),
+        raw_body_bytes: None,
     };
 
     let mut session = SessionSnapshot::default();

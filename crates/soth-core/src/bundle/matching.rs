@@ -30,7 +30,11 @@ pub struct SignalMatcher {
     pub kind: SignalKind,
     #[serde(alias = "signal_pattern")]
     pub pattern: String,
-    #[serde(alias = "signal_name", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "signal_name",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub name: Option<String>,
     #[serde(default)]
     pub is_negated: bool,
@@ -42,24 +46,19 @@ pub struct SignalMatcher {
 ///
 /// String representations match the cloud's NativeBundle format exactly
 /// (e.g. `"HttpHost"`, `"ProcessBundleId"`).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum SignalKind {
     TlsSni,
     ProcessBundleId,
     ProcessName,
     ParentProcessName,
+    #[default]
     HttpHost,
     HttpPath,
     HttpMethod,
     HttpHeader,
     ContentType,
     BodyStructure,
-}
-
-impl Default for SignalKind {
-    fn default() -> Self {
-        SignalKind::HttpHost
-    }
 }
 
 #[cfg(test)]

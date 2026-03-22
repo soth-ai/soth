@@ -129,7 +129,7 @@ const NATIVE_BUNDLE_PATHS: &[&str] = &[
 /// Load and parse a NativeBundle from assets, trying known paths in order.
 fn load_native_bundle(
     assets: &HashMap<String, Vec<u8>>,
-) -> Result<soth_interface::NativeBundle, BundleError> {
+) -> Result<soth_core::native_bundle::NativeBundle, BundleError> {
     let native_bytes = NATIVE_BUNDLE_PATHS
         .iter()
         .find_map(|path| assets.get(*path))
@@ -140,14 +140,13 @@ fn load_native_bundle(
             ))
         })?;
 
-    serde_json::from_slice(native_bytes).map_err(|e| {
-        BundleError::DetectLoadFailed(format!("NativeBundle parse failed: {e}"))
-    })
+    serde_json::from_slice(native_bytes)
+        .map_err(|e| BundleError::DetectLoadFailed(format!("NativeBundle parse failed: {e}")))
 }
 
 /// Build all bundle projections from a NativeBundle.
 fn build_projections(
-    native_bundle: &soth_interface::NativeBundle,
+    native_bundle: &soth_core::native_bundle::NativeBundle,
 ) -> (
     Arc<soth_core::OwnedDetectBundle>,
     Arc<soth_core::GatingBundle>,
@@ -228,7 +227,6 @@ fn load_policy_bundle(assets: &HashMap<String, Vec<u8>>) -> Result<Arc<PolicyBun
     Ok(Arc::new(loaded))
 }
 
-
 fn empty_policy_bundle() -> PolicyBundle {
     use soth_policy::sync_policy::{BudgetLimits, CompiledRuleSet, OrgPatterns};
     PolicyBundle {
@@ -261,9 +259,9 @@ mod tests {
     use crate::verify::sha256_hex;
 
     fn empty_native_bundle_bytes() -> Vec<u8> {
-        let bundle = soth_interface::NativeBundle {
+        let bundle = soth_core::native_bundle::NativeBundle {
             schema_version: 4,
-            metadata: soth_interface::NativeBundleMetadata {
+            metadata: soth_core::native_bundle::NativeBundleMetadata {
                 version: "test-0.0.1".into(),
                 compiled_at: "2026-03-19T00:00:00Z".into(),
                 compiled_by: "test".into(),
@@ -364,7 +362,10 @@ mod tests {
 
         let assets = HashMap::from([
             ("policy/policy_bundle.json".to_string(), policy_bytes),
-            ("detect/bundle.json".to_string(), empty_native_bundle_bytes()),
+            (
+                "detect/bundle.json".to_string(),
+                empty_native_bundle_bytes(),
+            ),
             (
                 "classify/embedding.onnx".to_string(),
                 b"stub-model".to_vec(),
@@ -424,7 +425,7 @@ mod tests {
 
     #[test]
     fn load_native_bundle_builds_identity_index_from_process_signals() {
-        use soth_interface::*;
+        use soth_core::native_bundle::*;
 
         let vendor = SigningKey::from_bytes(&[33u8; 32]);
 
@@ -460,11 +461,22 @@ mod tests {
                     kind: Some("browser".into()),
                     vendor_slug: None,
                     name: "Chrome".into(),
-                    category: None, subtype: None, api_format: None,
-                    description: None, notes: None, primary_url: None,
-                    docs_url: None, logo_url: None, primary_domain: None,
-                    risk_level: None, risk_score: None,
-                    capture: NativeBundleCapture { mode: "metadata_only".into(), methods: vec![], enabled: true },
+                    category: None,
+                    subtype: None,
+                    api_format: None,
+                    description: None,
+                    notes: None,
+                    primary_url: None,
+                    docs_url: None,
+                    logo_url: None,
+                    primary_domain: None,
+                    risk_level: None,
+                    risk_score: None,
+                    capture: NativeBundleCapture {
+                        mode: "metadata_only".into(),
+                        methods: vec![],
+                        enabled: true,
+                    },
                     metadata: serde_json::Value::Null,
                     details: serde_json::Value::Null,
                     matching_rules: vec![NativeBundleRule {
@@ -489,11 +501,22 @@ mod tests {
                     kind: Some("ide".into()),
                     vendor_slug: None,
                     name: "Cursor".into(),
-                    category: None, subtype: None, api_format: None,
-                    description: None, notes: None, primary_url: None,
-                    docs_url: None, logo_url: None, primary_domain: None,
-                    risk_level: None, risk_score: None,
-                    capture: NativeBundleCapture { mode: "metadata_only".into(), methods: vec![], enabled: true },
+                    category: None,
+                    subtype: None,
+                    api_format: None,
+                    description: None,
+                    notes: None,
+                    primary_url: None,
+                    docs_url: None,
+                    logo_url: None,
+                    primary_domain: None,
+                    risk_level: None,
+                    risk_score: None,
+                    capture: NativeBundleCapture {
+                        mode: "metadata_only".into(),
+                        methods: vec![],
+                        enabled: true,
+                    },
                     metadata: serde_json::Value::Null,
                     details: serde_json::Value::Null,
                     matching_rules: vec![NativeBundleRule {
@@ -517,9 +540,15 @@ mod tests {
         let native_bytes = serde_json::to_vec(&bundle).expect("native json");
 
         let assets = HashMap::from([
-            ("policy/policy_bundle.json".to_string(), signed_policy_bundle_bytes()),
+            (
+                "policy/policy_bundle.json".to_string(),
+                signed_policy_bundle_bytes(),
+            ),
             ("detect/bundle.json".to_string(), native_bytes),
-            ("classify/embedding.onnx".to_string(), b"stub-model".to_vec()),
+            (
+                "classify/embedding.onnx".to_string(),
+                b"stub-model".to_vec(),
+            ),
         ]);
         let manifest_bytes = signed_manifest_bytes(&assets, BundleScope::default(), &vendor);
         let org = OrgSignedConfig {

@@ -290,10 +290,8 @@ impl IntelligenceStore {
                     let provider: String = row.get(8)?;
                     let host: Option<String> = row.get(9)?;
 
-                    let headers = match serde_json::from_str::<HeaderMap>(&headers_json) {
-                        Ok(value) => value,
-                        Err(_) => HeaderMap::new(),
-                    };
+                    let headers =
+                        serde_json::from_str::<HeaderMap>(&headers_json).unwrap_or_default();
 
                     Ok(ReplayCandidate {
                         parse_event_id,

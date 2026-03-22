@@ -195,7 +195,9 @@ pub struct ClassifyTaskInput {
     pub pending_emit_store: Option<Arc<PendingEmitStore>>,
 }
 
-pub fn spawn_classify_task(input: ClassifyTaskInput) -> oneshot::Receiver<soth_core::PolicyDecisionKind> {
+pub fn spawn_classify_task(
+    input: ClassifyTaskInput,
+) -> oneshot::Receiver<soth_core::PolicyDecisionKind> {
     let ClassifyTaskInput {
         connection_id,
         detect_result,

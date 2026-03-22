@@ -278,9 +278,7 @@ fn install_trust_macos(cert_path: &Path) -> Result<()> {
         style::warning("Admin trust command succeeded but SSL verification still fails.");
     } else {
         let stderr = String::from_utf8_lossy(&elevate.stderr);
-        if stderr.to_ascii_lowercase().contains("user canceled")
-            || stderr.contains("-128")
-        {
+        if stderr.to_ascii_lowercase().contains("user canceled") || stderr.contains("-128") {
             style::warning("Administrator elevation was cancelled.");
         } else {
             style::warning(&format!("Admin elevation failed: {}", stderr.trim()));

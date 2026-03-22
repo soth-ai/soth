@@ -60,10 +60,7 @@ pub fn install_with_backup<T: InstallTarget>(
 fn backup_file(source: &Path, backup_dir: &Path) -> Result<PathBuf, ExtensionError> {
     std::fs::create_dir_all(backup_dir)
         .map_err(|e| ExtensionError::Install(format!("create backup dir: {e}")))?;
-    let filename = source
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let filename = source.file_name().unwrap_or_default().to_string_lossy();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

@@ -1,4 +1,4 @@
-//! Converts a [`soth_interface::NativeBundle`] into a [`soth_core::OwnedDetectBundle`],
+//! Converts a [`soth_core::native_bundle::NativeBundle`] into a [`soth_core::OwnedDetectBundle`],
 //! providing the detect-layer view of the bundle for format detection, capture rules,
 //! and process/host identity resolution.
 //!
@@ -8,7 +8,7 @@
 //! # #[cfg(feature = "native-bundle")]
 //! # {
 //! use soth_bundle::detect_from_native;
-//! use soth_interface::NativeBundle;
+//! use soth_core::native_bundle::NativeBundle;
 //!
 //! let json = std::fs::read_to_string("bundle.json").unwrap();
 //! let bundle: NativeBundle = serde_json::from_str(&json).unwrap();
@@ -19,13 +19,15 @@
 
 use std::collections::HashMap;
 
+use soth_core::native_bundle::NativeBundle;
 use soth_core::{
-    ProductEntry, BundleEnvironment, CaptureMode, CaptureRules, Filters,
-    OwnedDetectBundle, ProviderEntry, RestFormatDescriptor,
+    BundleEnvironment, CaptureMode, CaptureRules, Filters, OwnedDetectBundle, ProductEntry,
+    ProviderEntry, RestFormatDescriptor,
 };
-use soth_interface::NativeBundle;
 
-use crate::entity_helpers::{convert_rules, is_product, is_provider, parse_capture_mode, source_entities};
+use crate::entity_helpers::{
+    convert_rules, is_product, is_provider, parse_capture_mode, source_entities,
+};
 
 /// Convert a [`NativeBundle`] into an [`OwnedDetectBundle`] suitable for the
 /// detect layer (format matching, capture rules, process/host identity).
@@ -77,8 +79,7 @@ pub fn detect_from_native(bundle: &NativeBundle) -> OwnedDetectBundle {
             };
             if let Some(descriptor) = rest_formats.get(&f.format_key) {
                 if !descriptor.features.is_empty() {
-                    features_by_entity
-                        .insert(slug.to_string(), descriptor.features.clone());
+                    features_by_entity.insert(slug.to_string(), descriptor.features.clone());
                 }
             }
         }
@@ -93,7 +94,7 @@ pub fn detect_from_native(bundle: &NativeBundle) -> OwnedDetectBundle {
             };
             let needs_merge = rest_formats
                 .get(api_format)
-                .map_or(false, |d| d.features.is_empty());
+                .is_some_and(|d| d.features.is_empty());
             if !needs_merge {
                 continue;
             }
@@ -132,10 +133,7 @@ pub fn detect_from_native(bundle: &NativeBundle) -> OwnedDetectBundle {
             provider_id: Some(entity.slug.clone()),
             name: Some(entity.name.clone()),
             api_format: entity.api_format.clone(),
-            provider_type: entity
-                .kind
-                .clone()
-                .or_else(|| entity.entity_kind.clone()),
+            provider_type: entity.kind.clone().or_else(|| entity.entity_kind.clone()),
             pricing: None,
             capture: Some(serde_json::json!({ "mode": entity.capture.mode })),
             detection: None,
@@ -173,10 +171,7 @@ pub fn detect_from_native(bundle: &NativeBundle) -> OwnedDetectBundle {
         process_names.sort_unstable();
         process_names.dedup();
 
-        let app_type = entity
-            .kind
-            .clone()
-            .or_else(|| entity.entity_kind.clone());
+        let app_type = entity.kind.clone().or_else(|| entity.entity_kind.clone());
 
         let entry = ProductEntry {
             app_id: Some(entity.slug.clone()),
@@ -236,7 +231,9 @@ pub fn detect_from_native(bundle: &NativeBundle) -> OwnedDetectBundle {
     // Providers that have `full` capture mode go into full_capture_providers.
     let mut full_capture_providers: Vec<String> = Vec::new();
     for entity in &entities {
-        if is_provider(entity) && parse_capture_mode(&entity.capture.mode) == Some(CaptureMode::Full) {
+        if is_provider(entity)
+            && parse_capture_mode(&entity.capture.mode) == Some(CaptureMode::Full)
+        {
             full_capture_providers.push(entity.slug.clone());
         }
     }
@@ -326,10 +323,7 @@ fn try_fixup_legacy_format(defn: &serde_json::Value) -> Option<RestFormatDescrip
                         })
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    top.insert(
-                        "request".to_string(),
-                        serde_json::Value::Object(clean_req),
-                    );
+                    top.insert("request".to_string(), serde_json::Value::Object(clean_req));
                 }
             }
         }
@@ -350,7 +344,7 @@ fn try_fixup_legacy_format(defn: &serde_json::Value) -> Option<RestFormatDescrip
 
 #[cfg(test)]
 mod tests {
-    use soth_interface::{
+    use soth_core::native_bundle::{
         NativeBundle, NativeBundleCapture, NativeBundleEntity, NativeBundleFilter,
         NativeBundleFormat, NativeBundleMetadata, NativeBundleRule, NativeBundleSetting,
         NativeBundleSignal,
@@ -512,7 +506,9 @@ mod tests {
             .products
             .get("cursor")
             .expect("cursor should be in products");
-        assert!(app.bundle_ids.contains(&"com.todesktop.230313mzl4w4u92".to_string()));
+        assert!(app
+            .bundle_ids
+            .contains(&"com.todesktop.230313mzl4w4u92".to_string()));
         assert!(app.process_names.contains(&"Cursor".to_string()));
     }
 
@@ -545,7 +541,7 @@ mod tests {
 
     #[test]
     fn domain_index_flattened_to_highest_priority() {
-        use soth_interface::NativeBundleDomainIndexEntry;
+        use soth_core::native_bundle::NativeBundleDomainIndexEntry;
         use std::collections::BTreeMap;
 
         let mut bundle = empty_bundle();
@@ -571,7 +567,10 @@ mod tests {
 
         let detect = detect_from_native(&bundle);
         assert_eq!(
-            detect.domain_index.get("api.openai.com").map(String::as_str),
+            detect
+                .domain_index
+                .get("api.openai.com")
+                .map(String::as_str),
             Some("openai-high"),
             "highest-priority entry should win"
         );
@@ -609,8 +608,12 @@ mod tests {
         });
 
         let detect = detect_from_native(&bundle);
-        assert!(detect.passthrough_domains.contains(&"icloud.com".to_string()));
-        assert!(detect.passthrough_domains.contains(&"apple.com".to_string()));
+        assert!(detect
+            .passthrough_domains
+            .contains(&"icloud.com".to_string()));
+        assert!(detect
+            .passthrough_domains
+            .contains(&"apple.com".to_string()));
     }
 
     #[test]

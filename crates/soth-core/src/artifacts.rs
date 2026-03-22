@@ -122,23 +122,38 @@ pub enum ParseSource {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParseWarning {
     InvalidJson,
-    MissingField { field: String },
+    MissingField {
+        field: String,
+    },
     NonJsonBody,
     LongestStringHeuristic,
     ContentNotExtracted,
     GraphQlSyntaxError,
-    GraphQlUnknownOperation { operation_name: String },
-    GrpcDescriptorMissing { service: String },
+    GraphQlUnknownOperation {
+        operation_name: String,
+    },
+    GrpcDescriptorMissing {
+        service: String,
+    },
     GrpcNoDescriptor,
     WebSocketBinaryUnparseable,
     TreeSitterPanic,
     TreeSitterTimeout,
-    ParserError { reason: String },
-    NoParserForFormat { format: String },
+    ParserError {
+        reason: String,
+    },
+    NoParserForFormat {
+        format: String,
+    },
     FilteredByKeyword,
     CodeDetectionSkipped,
-    PartialBodyParse { reason: String },
+    PartialBodyParse {
+        reason: String,
+    },
     #[serde(alias = "oversize_body")]
-    BodyTruncated { actual_bytes: u64, limit_bytes: u64 },
+    BodyTruncated {
+        actual_bytes: u64,
+        limit_bytes: u64,
+    },
     EncodingError,
 }

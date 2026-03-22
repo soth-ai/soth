@@ -60,11 +60,7 @@ pub fn passes_filters(record: &serde_json::Value, filters: &[RecordFilter]) -> b
 /// Extract the message role from a record, applying the value_map.
 pub fn extract_role(record: &serde_json::Value, config: &RoleConfig) -> Option<String> {
     let raw = resolve_string(record, &config.field)?;
-    let mapped = config
-        .value_map
-        .get(&raw)
-        .cloned()
-        .unwrap_or(raw);
+    let mapped = config.value_map.get(&raw).cloned().unwrap_or(raw);
     if mapped.is_empty() {
         None
     } else {
@@ -78,7 +74,11 @@ pub fn extract_content(record: &serde_json::Value, config: &ContentConfig) -> Op
         ContentConfig::Plain { field } => {
             let v = resolve_path(record, field)?;
             let text = value_to_string(v);
-            if text.is_empty() { None } else { Some(text) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         }
         ContentConfig::TextBlocks {
             field,
@@ -88,7 +88,11 @@ pub fn extract_content(record: &serde_json::Value, config: &ContentConfig) -> Op
         } => {
             let v = resolve_path(record, field)?;
             let text = extract_text_blocks(v, type_field, text_field, include_types);
-            if text.is_empty() { None } else { Some(text) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         }
         ContentConfig::PreferDisplay {
             display_field,
@@ -104,7 +108,11 @@ pub fn extract_content(record: &serde_json::Value, config: &ContentConfig) -> Op
             // Fallback to content field.
             let v = resolve_path(record, fallback_field)?;
             let text = extract_generic_text(v);
-            if text.is_empty() { None } else { Some(text) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         }
     }
 }
@@ -124,7 +132,9 @@ fn extract_text_blocks(
                 let obj = item.as_object()?;
                 let block_type = obj.get(type_field).and_then(|t| t.as_str()).unwrap_or("");
                 if include_types.iter().any(|t| t == block_type) {
-                    obj.get(text_field).and_then(|t| t.as_str()).map(String::from)
+                    obj.get(text_field)
+                        .and_then(|t| t.as_str())
+                        .map(String::from)
                 } else {
                     None
                 }
@@ -172,16 +182,18 @@ fn value_to_string(v: &serde_json::Value) -> String {
 }
 
 /// Parse a timestamp from a JSON value given a format config.
-pub fn parse_timestamp(value: &serde_json::Value, path: &str, format: &TimestampFormat) -> Option<i64> {
+pub fn parse_timestamp(
+    value: &serde_json::Value,
+    path: &str,
+    format: &TimestampFormat,
+) -> Option<i64> {
     let v = resolve_path(value, path)?;
     match format {
         TimestampFormat::Iso8601 => {
             let s = v.as_str()?;
             parse_iso_timestamp(s)
         }
-        TimestampFormat::EpochMs => {
-            v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
-        }
+        TimestampFormat::EpochMs => v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)),
         TimestampFormat::EpochS => {
             let secs = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))?;
             Some(secs * 1000)
@@ -190,7 +202,11 @@ pub fn parse_timestamp(value: &serde_json::Value, path: &str, format: &Timestamp
 }
 
 /// Extract token count from a record if token config is set.
-pub fn extract_tokens(record: &serde_json::Value, config: &Option<TokenConfig>, content: &str) -> u32 {
+pub fn extract_tokens(
+    record: &serde_json::Value,
+    config: &Option<TokenConfig>,
+    content: &str,
+) -> u32 {
     if let Some(tc) = config {
         if let Some(v) = resolve_path(record, &tc.field) {
             if let Some(n) = v.as_u64() {
@@ -305,10 +321,7 @@ fn detect_glob_exists(root: &Path, pattern: &str, exclude_dirs: &[String]) -> bo
         return false;
     }
     // Simple recursive check using the glob's file extension.
-    let ext = pattern
-        .rsplit('.')
-        .next()
-        .unwrap_or("");
+    let ext = pattern.rsplit('.').next().unwrap_or("");
     has_files_with_ext(root, ext, exclude_dirs, 0)
 }
 
@@ -364,20 +377,34 @@ mod tests {
 
     #[test]
     fn passes_filters_all_match() {
-        let v: serde_json::Value = serde_json::json!({"type": "response_item", "payload": {"type": "message"}});
+        let v: serde_json::Value =
+            serde_json::json!({"type": "response_item", "payload": {"type": "message"}});
         let filters = vec![
-            RecordFilter { field: "type".into(), include: vec!["response_item".into()] },
-            RecordFilter { field: "payload.type".into(), include: vec!["message".into()] },
+            RecordFilter {
+                field: "type".into(),
+                include: vec!["response_item".into()],
+            },
+            RecordFilter {
+                field: "payload.type".into(),
+                include: vec!["message".into()],
+            },
         ];
         assert!(passes_filters(&v, &filters));
     }
 
     #[test]
     fn passes_filters_one_fails() {
-        let v: serde_json::Value = serde_json::json!({"type": "response_item", "payload": {"type": "reasoning"}});
+        let v: serde_json::Value =
+            serde_json::json!({"type": "response_item", "payload": {"type": "reasoning"}});
         let filters = vec![
-            RecordFilter { field: "type".into(), include: vec!["response_item".into()] },
-            RecordFilter { field: "payload.type".into(), include: vec!["message".into()] },
+            RecordFilter {
+                field: "type".into(),
+                include: vec!["response_item".into()],
+            },
+            RecordFilter {
+                field: "payload.type".into(),
+                include: vec!["message".into()],
+            },
         ];
         assert!(!passes_filters(&v, &filters));
     }
@@ -385,7 +412,9 @@ mod tests {
     #[test]
     fn extract_content_plain() {
         let v: serde_json::Value = serde_json::json!({"text": "hello world"});
-        let config = ContentConfig::Plain { field: "text".into() };
+        let config = ContentConfig::Plain {
+            field: "text".into(),
+        };
         assert_eq!(extract_content(&v, &config), Some("hello world".into()));
     }
 

@@ -35,7 +35,7 @@ pub struct PolicyBundleMetadata {
     pub signed_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct BudgetLimits {
     pub max_tokens_per_session: Option<u64>,
     pub max_cost_usd_per_session: Option<f64>,
@@ -44,33 +44,15 @@ pub struct BudgetLimits {
     pub max_cost_usd_per_day: Option<f64>,
 }
 
-impl Default for BudgetLimits {
-    fn default() -> Self {
-        Self {
-            max_tokens_per_session: None,
-            max_cost_usd_per_session: None,
-            max_requests_per_session: None,
-            max_tokens_per_day: None,
-            max_cost_usd_per_day: None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct OrgPatterns {
     #[serde(default)]
     pub patterns: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CompiledRuleSet {
     pub rules: Vec<CompiledRule>,
-}
-
-impl Default for CompiledRuleSet {
-    fn default() -> Self {
-        Self { rules: Vec::new() }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -267,7 +249,7 @@ fn compile_rule_set(
         rules.push(CompiledRule {
             rule_id: rule.rule_id.clone(),
             rule_name: rule.rule_name.clone(),
-            rule_kind: kind.clone(),
+            rule_kind: kind,
             cel_expr: rule.cel_expr.clone(),
             compiled_expr,
             action: rule.action.clone(),
@@ -864,10 +846,7 @@ fn evaluate_org_rules(
     for rule in &bundle.org_rules.rules {
         match eval_rule_predicate(rule, &scope) {
             Ok(true) => {
-                return (
-                    Some(decision_from_rule(rule.rule_kind.clone(), rule)),
-                    warnings,
-                );
+                return (Some(decision_from_rule(rule.rule_kind, rule)), warnings);
             }
             Ok(false) => {}
             Err(error) => warnings.push(PolicyWarning::RuleError {
@@ -1409,7 +1388,7 @@ fn max_artifact_severity(artifacts: &[SensitiveArtifact]) -> Option<String> {
             soth_core::artifacts::ArtifactSeverity::Low => ("low", 1),
         };
         let rank = match rank {
-            4 | 3 | 2 | 1 => rank,
+            1..=4 => rank,
             _ => 0,
         };
         if rank == 0 {
@@ -1591,9 +1570,9 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use soth_core::{
-        ArtifactKind, ArtifactLocation, ArtifactSeverity, CaptureMode,
-        EndpointType, FormatMetadata, ParseConfidence, ParseSource, ProcessMatchKind,
-        ProcessResolution, SessionSnapshot as SessionBudget,
+        ArtifactKind, ArtifactLocation, ArtifactSeverity, CaptureMode, EndpointType,
+        FormatMetadata, ParseConfidence, ParseSource, ProcessMatchKind, ProcessResolution,
+        SessionSnapshot as SessionBudget,
     };
 
     fn signed_bundle_bytes(payload: PolicyBundlePayload) -> Vec<u8> {
@@ -1680,7 +1659,10 @@ mod tests {
             estimated_cost_usd: 0.04,
             parse_source: ParseSource::GraphQl,
             canonical_cache_key: String::new(),
-            format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
+            format_metadata: FormatMetadata::Unknown {
+                method: String::new(),
+                path: String::new(),
+            },
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
@@ -2433,7 +2415,7 @@ mod tests {
         let p95 = samples[idx(0.95)];
         let p99 = samples[idx(0.99)];
 
-        assert!(p95 < 3_000, "p95 latency {}us exceeded 3000us target", p95);
-        assert!(p99 < 5_000, "p99 latency {}us exceeded 5000us target", p99);
+        assert!(p95 < 3_000, "p95 latency {p95}us exceeded 3000us target");
+        assert!(p99 < 5_000, "p99 latency {p99}us exceeded 5000us target");
     }
 }

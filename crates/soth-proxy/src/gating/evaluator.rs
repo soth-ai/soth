@@ -547,15 +547,14 @@ impl GateEvaluator {
         // Signal rules (requires_all with host + path + process) are more precise
         // than the host-only EntityCatalog match used by match_entities.
         if let Some(db) = detect_bundle {
-            let (proc_bid, proc_name, parent_name) =
-                match process_info.as_ref() {
-                    Some(info) => (
-                        info.bundle_id.as_deref(),
-                        info.process_name.as_deref(),
-                        info.parent_process_name.as_deref(),
-                    ),
-                    None => (None, None, None),
-                };
+            let (proc_bid, proc_name, parent_name) = match process_info.as_ref() {
+                Some(info) => (
+                    info.bundle_id.as_deref(),
+                    info.process_name.as_deref(),
+                    info.parent_process_name.as_deref(),
+                ),
+                None => (None, None, None),
+            };
             let providers = db.llm_providers.iter().map(|(key, entry)| {
                 let eid = entry.provider_id.as_deref().unwrap_or(key.as_str());
                 (key.as_str(), eid, entry.matching_rules.as_slice())
@@ -795,9 +794,7 @@ mod tests {
                     allow: vec!["/v1/chat/completions".into()],
                 },
             )],
-            signals: vec![
-                ("HttpHost".into(), "api.openai.com".into()),
-            ],
+            signals: vec![("HttpHost".into(), "api.openai.com".into())],
         }])
     }
 
@@ -880,7 +877,14 @@ mod tests {
             parent_bundle_id: None,
         });
 
-        let outcome = evaluator.evaluate_http(&req, &process_info, GateOverrides::default(), None, &ei, &env);
+        let outcome = evaluator.evaluate_http(
+            &req,
+            &process_info,
+            GateOverrides::default(),
+            None,
+            &ei,
+            &env,
+        );
         assert!(matches!(outcome.decision, GateDecision::Skip));
         assert_eq!(outcome.reason, DecisionReason::UnknownAppPolicy);
         assert_eq!(outcome.terminal_stage, GateStage::Stage1AppOrigin);
@@ -893,7 +897,8 @@ mod tests {
         let env = EnvIndex::default();
         let req = request_for("api.openai.com");
 
-        let outcome = evaluator.evaluate_http(&req, &None, GateOverrides::default(), None, &ei, &env);
+        let outcome =
+            evaluator.evaluate_http(&req, &None, GateOverrides::default(), None, &ei, &env);
         assert!(matches!(outcome.decision, GateDecision::Intercept));
         assert_eq!(outcome.reason, DecisionReason::Intercept);
         assert_eq!(outcome.terminal_stage, GateStage::Intercept);
@@ -918,7 +923,8 @@ mod tests {
         req.body = bytes::Bytes::from_static(b"contains token marker");
 
         let before = counter_value("edge.blacklist.keyword_dropped_total");
-        let outcome = evaluator.evaluate_http(&req, &None, GateOverrides::default(), None, &ei, &env);
+        let outcome =
+            evaluator.evaluate_http(&req, &None, GateOverrides::default(), None, &ei, &env);
         let after = counter_value("edge.blacklist.keyword_dropped_total");
 
         assert!(matches!(outcome.decision, GateDecision::Skip));

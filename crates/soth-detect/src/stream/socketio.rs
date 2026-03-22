@@ -147,7 +147,11 @@ fn decode_event(rest: &str) -> Option<SocketIoFrame<'_>> {
     let after_name = inner[end_quote + 1..].trim_start();
     let data_json = if let Some(after_comma) = after_name.strip_prefix(',') {
         let trimmed = after_comma.trim();
-        if trimmed.is_empty() { "{}" } else { trimmed }
+        if trimmed.is_empty() {
+            "{}"
+        } else {
+            trimmed
+        }
     } else {
         "{}"
     };
@@ -243,14 +247,8 @@ mod tests {
 
     #[test]
     fn decode_ping_pong() {
-        assert_eq!(
-            decode_socketio_frame(b"2").unwrap(),
-            SocketIoFrame::Control
-        );
-        assert_eq!(
-            decode_socketio_frame(b"3").unwrap(),
-            SocketIoFrame::Control
-        );
+        assert_eq!(decode_socketio_frame(b"2").unwrap(), SocketIoFrame::Control);
+        assert_eq!(decode_socketio_frame(b"3").unwrap(), SocketIoFrame::Control);
     }
 
     #[test]
@@ -278,7 +276,7 @@ mod tests {
                 assert_eq!(event_name, "message");
                 assert_eq!(data_json, r#"{"text":"hello world"}"#);
             }
-            other => panic!("Expected Event, got {:?}", other),
+            other => panic!("Expected Event, got {other:?}"),
         }
     }
 
@@ -294,7 +292,7 @@ mod tests {
                 assert_eq!(event_name, "message");
                 assert_eq!(data_json, r#"{"text":"hi"}"#);
             }
-            other => panic!("Expected Event, got {:?}", other),
+            other => panic!("Expected Event, got {other:?}"),
         }
     }
 
@@ -311,7 +309,7 @@ mod tests {
                 assert_eq!(event_name, "_socketio_escaped");
                 assert_eq!(data_json, r#"{"data":1}"#);
             }
-            other => panic!("Expected Event, got {:?}", other),
+            other => panic!("Expected Event, got {other:?}"),
         }
     }
 
@@ -328,16 +326,13 @@ mod tests {
                 assert_eq!(event_name, "ping");
                 assert_eq!(data_json, "{}");
             }
-            other => panic!("Expected Event, got {:?}", other),
+            other => panic!("Expected Event, got {other:?}"),
         }
     }
 
     #[test]
     fn decode_ack() {
-        assert_eq!(
-            decode_socketio_frame(b"43").unwrap(),
-            SocketIoFrame::Ack
-        );
+        assert_eq!(decode_socketio_frame(b"43").unwrap(), SocketIoFrame::Ack);
     }
 
     #[test]

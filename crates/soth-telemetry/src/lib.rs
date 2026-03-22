@@ -1,3 +1,13 @@
+#![allow(
+    clippy::result_large_err,
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::large_enum_variant,
+    clippy::if_same_then_else,
+    clippy::field_reassign_with_default,
+    clippy::approx_constant,
+    clippy::duplicated_attributes
+)]
 #![forbid(unsafe_code)]
 
 mod batcher;
@@ -346,7 +356,7 @@ mod tests {
         sink.yield_until_batches(1).await;
         let batches = sink.batches().await;
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].batch_id().is_nil(), false);
+        assert!(!batches[0].batch_id().is_nil());
 
         let shutdown = pipeline.shutdown().await;
         assert!(shutdown.is_ok());

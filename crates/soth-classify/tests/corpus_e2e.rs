@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
@@ -8,8 +9,8 @@ use soth_core::{
     ClassificationFlag, ClassificationSource, DetectResult, DetectedProvider, EndpointType,
     FormatMetadata, NormalizedRequest, ParseConfidence, ParseSource, PolicyDecisionKind,
     ProcessMatchKind, ProcessResolution, ProgrammingLanguage, ProxyContext, RedactTarget,
-    RerouteTarget, SensitiveArtifact, SessionSnapshot, TelemetryPolicyKind, TrafficClassification,
-    SurfaceType, UseCaseLabel, VolatilityClass,
+    RerouteTarget, SensitiveArtifact, SessionSnapshot, SurfaceType, TelemetryPolicyKind,
+    TrafficClassification, UseCaseLabel, VolatilityClass,
 };
 use soth_policy::sync_policy::{
     BudgetLimits, OrgPatterns, PolicyBundleMetadata, PolicyBundlePayload, RuleAction,
@@ -460,7 +461,10 @@ fn build_detect_result(request: &RequestInput, context: &ContextInput) -> Detect
             provider: DetectedProvider::OpenAi,
         },
         canonical_cache_key: "cache-key".to_string(),
-        format_metadata: FormatMetadata::Unknown { method: String::new(), path: String::new() },
+        format_metadata: FormatMetadata::Unknown {
+            method: String::new(),
+            path: String::new(),
+        },
         has_structured_output: false,
         has_tool_results: false,
         estimated_output_tokens: None,
@@ -848,7 +852,7 @@ fn assert_anomaly_flags(
     for required in &expect.required_anomaly_flags {
         let parsed = parse_anomaly_flag(required.as_str());
         assert!(
-            out.anomaly_flags.iter().any(|flag| *flag == parsed),
+            out.anomaly_flags.contains(&parsed),
             "case {case_id}: missing anomaly flag {parsed:?}, got {:?}",
             out.anomaly_flags
         );
@@ -863,10 +867,7 @@ fn assert_classification_flags(
     for required in &expect.required_classification_flags {
         let parsed = parse_classification_flag(required.as_str());
         assert!(
-            out.telemetry_event
-                .classification_flags
-                .iter()
-                .any(|flag| *flag == parsed),
+            out.telemetry_event.classification_flags.contains(&parsed),
             "case {case_id}: missing classification flag {parsed:?}, got {:?}",
             out.telemetry_event.classification_flags
         );
@@ -874,10 +875,7 @@ fn assert_classification_flags(
     for forbidden in &expect.forbidden_classification_flags {
         let parsed = parse_classification_flag(forbidden.as_str());
         assert!(
-            !out.telemetry_event
-                .classification_flags
-                .iter()
-                .any(|flag| *flag == parsed),
+            !out.telemetry_event.classification_flags.contains(&parsed),
             "case {case_id}: found forbidden classification flag {parsed:?}, got {:?}",
             out.telemetry_event.classification_flags
         );
@@ -888,10 +886,7 @@ fn assert_languages(case_id: &str, expect: &CorpusExpect, out: &soth_classify::C
     for required in &expect.required_languages {
         let parsed = parse_language(required.as_str());
         assert!(
-            out.telemetry_event
-                .languages
-                .iter()
-                .any(|language| *language == parsed),
+            out.telemetry_event.languages.contains(&parsed),
             "case {case_id}: missing language {parsed:?}, got {:?}",
             out.telemetry_event.languages
         );
@@ -974,7 +969,9 @@ fn assert_stable_subset(
 
     // timestamp_epoch_ms is wall-clock; allow small divergence between runs
     assert!(
-        (first.telemetry_event.timestamp_epoch_ms - second.telemetry_event.timestamp_epoch_ms).unsigned_abs() < 1000,
+        (first.telemetry_event.timestamp_epoch_ms - second.telemetry_event.timestamp_epoch_ms)
+            .unsigned_abs()
+            < 1000,
         "case {case_id}: telemetry timestamps diverged by more than 1s across identical runs"
     );
     assert_eq!(

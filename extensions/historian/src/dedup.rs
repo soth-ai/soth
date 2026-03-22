@@ -100,7 +100,14 @@ impl DedupChecker {
         event_id: Uuid,
         content_hash: &str,
     ) -> Result<(), HistorianError> {
-        self.mark_processed_with_semantic(tool, session_id, message_index, event_id, content_hash, None)
+        self.mark_processed_with_semantic(
+            tool,
+            session_id,
+            message_index,
+            event_id,
+            content_hash,
+            None,
+        )
     }
 
     /// Record with optional semantic hash for near-duplicate detection.
@@ -146,11 +153,9 @@ impl DedupChecker {
     /// Total count of all processed entries across all tools.
     pub fn total_processed(&self) -> u64 {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM already_processed",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
+        conn.query_row("SELECT COUNT(*) FROM already_processed", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap_or(0) as u64
     }
 
@@ -251,8 +256,12 @@ mod tests {
         // Mark with semantic hash
         checker
             .mark_processed_with_semantic(
-                &AiTool::ClaudeCode, "s1", 0, Uuid::new_v4(),
-                "content_a", Some("semantic_x"),
+                &AiTool::ClaudeCode,
+                "s1",
+                0,
+                Uuid::new_v4(),
+                "content_a",
+                Some("semantic_x"),
             )
             .unwrap();
 
@@ -274,21 +283,18 @@ mod tests {
 
         checker
             .mark_processed_with_semantic(
-                &AiTool::ClaudeCode, "s1", 0, Uuid::new_v4(),
-                "content_a", Some("semantic_x"),
+                &AiTool::ClaudeCode,
+                "s1",
+                0,
+                Uuid::new_v4(),
+                "content_a",
+                Some("semantic_x"),
             )
             .unwrap();
 
         // Without semantic hash, should not match via semantic dedup
         // (but content_b is different from content_a, so no tertiary match either)
-        assert!(!checker.is_duplicate(
-            &AiTool::GeminiCli,
-            "s_new",
-            0,
-            None,
-            "content_b",
-            now,
-        ));
+        assert!(!checker.is_duplicate(&AiTool::GeminiCli, "s_new", 0, None, "content_b", now,));
     }
 
     #[test]
@@ -351,7 +357,11 @@ mod tests {
 
         let event = reconstruct_event(&session);
         let content_hash = event.context.metadata.get("conversation_hash").unwrap();
-        let semantic_hash = event.context.metadata.get("semantic_hash").map(|s| s.as_str());
+        let semantic_hash = event
+            .context
+            .metadata
+            .get("semantic_hash")
+            .map(|s| s.as_str());
 
         // First time: not a duplicate
         assert!(!checker.is_duplicate(

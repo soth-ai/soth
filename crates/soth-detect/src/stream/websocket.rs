@@ -61,14 +61,8 @@ fn emit_turn_from_response(
 
     let usage = if let Some(u) = response.get("usage") {
         StreamUsage {
-            input_tokens: u
-                .get("input_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            output_tokens: u
-                .get("output_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            input_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            output_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
             finish_reason: Some(finish_reason.to_string()),
         }
     } else {

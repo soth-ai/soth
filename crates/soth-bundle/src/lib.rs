@@ -1,20 +1,16 @@
 #![forbid(unsafe_code)]
 
 mod db;
+mod detect_from_native;
+pub mod entity_helpers;
+pub mod entity_index;
 mod error;
+mod gating_from_native;
 mod loader;
 mod manifest;
 mod scope_check;
 mod verify;
 mod watcher;
-#[cfg(feature = "native-bundle")]
-pub mod entity_helpers;
-#[cfg(feature = "native-bundle")]
-pub mod entity_index;
-#[cfg(feature = "native-bundle")]
-mod gating_from_native;
-#[cfg(feature = "native-bundle")]
-mod detect_from_native;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,21 +18,17 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 pub use crate::db::{mark_superseded, record_bundle_installed, record_policy_config};
+pub use crate::detect_from_native::detect_from_native;
+pub use crate::entity_index::entity_index_from_native;
 pub use crate::error::BundleError;
+pub use crate::gating_from_native::gating_from_native;
 pub use crate::loader::{
     load_from_bytes, load_from_bytes_with_options, load_from_dir, load_from_dir_with_options,
 };
 pub use crate::manifest::{AssetEntry, BundleManifest, BundleScope, OrgSignedConfig};
 pub use crate::scope_check::check_scope;
 pub use crate::watcher::{BundleHandle, BundleWatcher};
-#[cfg(feature = "native-bundle")]
-pub use crate::entity_index::entity_index_from_native;
-#[cfg(feature = "native-bundle")]
-pub use crate::gating_from_native::gating_from_native;
-#[cfg(feature = "native-bundle")]
-pub use crate::detect_from_native::detect_from_native;
-#[cfg(feature = "native-bundle")]
-pub use soth_interface::NativeBundle;
+pub use soth_core::native_bundle::NativeBundle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerificationOptions {
@@ -80,8 +72,6 @@ pub struct LoadedBundle {
     pub detect: Arc<soth_core::OwnedDetectBundle>,
     pub gating: Arc<soth_core::GatingBundle>,
     pub env_index: Arc<soth_core::EnvIndex>,
-    /// Pre-built entity index for O(1) product/provider identity resolution.
-    /// Built from NativeBundle.entities at bundle load time.
     pub entity_index: Arc<soth_core::EntityIndex>,
     pub manifest: BundleManifest,
 }

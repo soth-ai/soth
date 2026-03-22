@@ -263,10 +263,26 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         } else {
             Some(event.session_key_hash.clone())
         },
-        is_prefix_repeat: if event.is_prefix_repeat { Some(true) } else { None },
-        is_code_context_repeat: if event.is_code_context_repeat { Some(true) } else { None },
-        novel_token_count: if event.novel_token_count > 0 { Some(u64::from(event.novel_token_count)) } else { None },
-        repeated_token_count: if event.repeated_token_count > 0 { Some(u64::from(event.repeated_token_count)) } else { None },
+        is_prefix_repeat: if event.is_prefix_repeat {
+            Some(true)
+        } else {
+            None
+        },
+        is_code_context_repeat: if event.is_code_context_repeat {
+            Some(true)
+        } else {
+            None
+        },
+        novel_token_count: if event.novel_token_count > 0 {
+            Some(u64::from(event.novel_token_count))
+        } else {
+            None
+        },
+        repeated_token_count: if event.repeated_token_count > 0 {
+            Some(u64::from(event.repeated_token_count))
+        } else {
+            None
+        },
         first_step_event_id: event.first_step_event_id.clone(),
         original_event_id: event.original_event_id.clone(),
         data_source: enum_name(&event.data_source),

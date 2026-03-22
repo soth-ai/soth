@@ -80,7 +80,7 @@ impl OnnxEmbeddingRuntime {
             .try_extract_tensor::<f32>()
             .map_err(|error| format!("extract tensor: {error}"))?;
         if shape.len() < 3 {
-            return Err(format!("unexpected output rank: {:?}", shape));
+            return Err(format!("unexpected output rank: {shape:?}"));
         }
         let token_count = shape[1] as usize;
         let hidden_size = shape[2] as usize;

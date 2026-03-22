@@ -27,8 +27,8 @@ pub fn default_playbooks() -> Vec<Playbook> {
 /// unknown tools are appended (enabling server-pushed new tool support).
 pub fn load_playbooks() -> Vec<Playbook> {
     let mut playbooks = default_playbooks();
-    let override_dir = dirs::home_dir()
-        .map(|h| h.join(".soth").join("historian").join("playbooks"));
+    let override_dir =
+        dirs::home_dir().map(|h| h.join(".soth").join("historian").join("playbooks"));
 
     if let Some(dir) = override_dir {
         if dir.is_dir() {
@@ -241,9 +241,7 @@ fn cursor() -> Playbook {
         version: 1,
         provider: "openai".into(),
         discovery: PlaybookDiscovery {
-            roots: vec![
-                "${HOME}/Library/Application Support/Cursor/User/globalStorage".into(),
-            ],
+            roots: vec!["${HOME}/Library/Application Support/Cursor/User/globalStorage".into()],
             detect: PlaybookDetect::SqliteFile {
                 filename: "state.vscdb".into(),
             },

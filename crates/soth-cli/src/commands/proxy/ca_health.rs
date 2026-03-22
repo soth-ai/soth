@@ -191,7 +191,10 @@ fn check_macos_trust(cert_path: &Path) -> Result<OsTrustCheck> {
             "certificate is in {location} keychain but lacks SSL trust policy. \
              Run `soth setup-ca` to set trust."
         ),
-        Ok(None) => "certificate not found in any keychain. Run `soth setup-ca` to install and trust.".to_string(),
+        Ok(None) => {
+            "certificate not found in any keychain. Run `soth setup-ca` to install and trust."
+                .to_string()
+        }
         Err(_) => format!("verify-cert failed: {}", stderr.trim()),
     };
 
