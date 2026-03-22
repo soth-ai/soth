@@ -7,7 +7,6 @@ use crate::artifacts::CaptureMode;
 use crate::classify::AnomalyFlag;
 use crate::normalized::EndpointType;
 use crate::policy::PolicyDecisionKind;
-use crate::providers::DetectedProvider;
 use crate::telemetry::{TelemetryPolicyKind, UseCaseLabel};
 
 // ---------------------------------------------------------------------------
@@ -31,7 +30,7 @@ pub struct PreEmitEvent {
     pub timestamp_epoch_ms: i64,
 
     // ── Provider / model ──────────────────────────────────────────────────
-    pub provider: DetectedProvider,
+    pub provider: String,
     pub model: Option<String>,
     pub endpoint_type: EndpointType,
     pub capture_mode: CaptureMode,
@@ -82,7 +81,7 @@ impl PreEmitEvent {
             event_id: te.event_id,
             connection_id: te.connection_id,
             timestamp_epoch_ms: te.timestamp_epoch_ms,
-            provider: te.provider,
+            provider: te.provider.clone(),
             model: te.model.clone(),
             endpoint_type: te.endpoint_type,
             capture_mode,
@@ -111,7 +110,7 @@ impl Default for PreEmitEvent {
             event_id: Uuid::nil(),
             connection_id: None,
             timestamp_epoch_ms: 0,
-            provider: DetectedProvider::Unknown,
+            provider: "unknown".to_string(),
             model: None,
             endpoint_type: EndpointType::Unknown,
             capture_mode: CaptureMode::MetadataOnly,

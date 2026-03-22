@@ -1,7 +1,7 @@
 use crate::hash::{canonical_hash, estimate_tokens, hash_content};
 use crate::types::{
     DetectedFormat, EndpointType, FormatMeta, NormalizedRequest, ParseConfidence, ParseError,
-    ParseResult, ParseWarning, PreprocessOp, Provider, RawRequest, RequestEncoding,
+    ParseResult, ParseWarning, PreprocessOp, RawRequest, RequestEncoding,
     RestFormatDescriptor,
 };
 use crate::util::{extract_string, json_path, normalize_unicodeish};
@@ -22,7 +22,7 @@ pub fn parse_rest(
 
     let model = extract_model(&json, desc, &req.path);
     if model.is_none() {
-        warnings.push(ParseWarning::MissingField("model".to_string()));
+        warnings.push(ParseWarning::MissingField { field: "model".to_string() });
     }
 
     let mut messages = extract_messages(&json, desc);
@@ -144,13 +144,28 @@ pub fn parse_rest(
     let user_content_token_estimate = estimate_tokens(&user_content);
     let conversation_hash = hash_content(&conversation);
 
-    let estimated_input_tokens = estimate_tokens(
-        &[
-            system_prompt.clone().unwrap_or_default(),
-            user_content.clone(),
-        ]
-        .join("\n"),
-    );
+    // Estimate from the full conversation context (all turns, not just the first
+    // user message). For multi-turn conversations this can be 5-20x larger than
+    // system_prompt + first_user_content alone.
+    let mut input_parts = Vec::new();
+    if let Some(ref sp) = system_prompt {
+        if !sp.is_empty() {
+            input_parts.push(sp.as_str());
+        }
+    }
+    if !conversation.is_empty() {
+        input_parts.push(conversation.as_str());
+    }
+    // Tool definitions contribute tokens but were previously uncounted.
+    let tool_token_estimate = desc
+        .request
+        .tools
+        .as_ref()
+        .and_then(|path| json_path(&json, path))
+        .filter(|value| !value.is_null())
+        .map(|value| estimate_tokens(&value.to_string()))
+        .unwrap_or(0);
+    let estimated_input_tokens = estimate_tokens(&input_parts.join("\n")) + tool_token_estimate;
 
     let api_version = extract_api_version(&req.headers, &req.path, &format);
     let parser_id = parser_id_for_format(&format);
@@ -162,10 +177,10 @@ pub fn parse_rest(
             ParseConfidence::Partial
         },
         parser_id,
-        schema_version: "1",
+        schema_version: "1".to_string(),
         parse_warnings: warnings,
         is_ai_call: true,
-        provider: Provider::new(provider_id),
+        provider: provider_id.to_string(),
         model,
         endpoint_type: infer_endpoint_type(&req.path),
         system_prompt_hash,
@@ -183,19 +198,19 @@ pub fn parse_rest(
         stop_sequences,
         estimated_input_tokens,
         estimated_cost_usd: 0.0,
-        canonical_hash: String::new(),
-        format_meta: FormatMeta::Rest {
-            path: req.path.clone(),
+        parse_source: crate::types::ParseSource::Heuristic,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
+        canonical_cache_key: String::new(),
+        format_metadata: FormatMeta::Rest {
+            content_type: req.path.clone(),
         },
         api_version,
-        content_sample: if user_content.is_empty() {
-            None
-        } else {
-            Some(user_content)
-        },
+        user_prompt: if user_content.is_empty() { None } else { Some(user_content.clone()) },
     };
 
-    normalized.canonical_hash = canonical_hash(&normalized);
+    normalized.canonical_cache_key = canonical_hash(&normalized);
     Ok(normalized)
 }
 
@@ -209,6 +224,7 @@ fn extract_model(json: &Value, desc: &RestFormatDescriptor, path: &str) -> Optio
         .as_ref()
         .and_then(|json_path_expr| json_path(json, json_path_expr))
         .and_then(extract_string)
+        .or_else(|| desc.model_default.clone())
 }
 
 fn extract_model_from_url(path: &str, marker: Option<&str>) -> Option<String> {
@@ -267,7 +283,19 @@ fn extract_messages(json: &Value, desc: &RestFormatDescriptor) -> Vec<(String, S
         return Vec::new();
     };
 
-    let Some(values) = json_path(json, path).and_then(|value| value.as_array()) else {
+    let resolved = json_path(json, path);
+
+    // If the path resolves to a plain string (not an array of message
+    // objects), treat it as a single user message.  This handles formats
+    // like Gemini web where the prompt is extracted via preprocess into
+    // a scalar value.
+    if let Some(scalar) = resolved.as_ref().and_then(|v| extract_string(v)) {
+        if !scalar.is_empty() {
+            return vec![("user".to_string(), normalize_unicodeish(&scalar))];
+        }
+    }
+
+    let Some(values) = resolved.and_then(|value| value.as_array()) else {
         return Vec::new();
     };
 
@@ -492,10 +520,10 @@ fn infer_endpoint_type(path: &str) -> EndpointType {
         || lower.contains("generatecontent")
         || lower.contains("streamgeneratecontent")
     {
-        return EndpointType::Chat;
+        return EndpointType::ChatCompletion;
     }
     if lower.contains("completion") {
-        return EndpointType::Completion;
+        return EndpointType::TextCompletion;
     }
     EndpointType::Unknown
 }

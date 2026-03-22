@@ -30,6 +30,15 @@ pub struct StreamChunk {
     pub payload: Bytes,
     pub sequence: u64,
     pub frame_kind: FrameKind,
+    /// WebSocket frame direction. `None` for SSE/NDJSON/gRPC (always server→client).
+    pub direction: Option<FrameDirection>,
+}
+
+/// Direction of a WebSocket frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameDirection {
+    ClientToServer,
+    ServerToClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

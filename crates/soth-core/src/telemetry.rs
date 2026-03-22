@@ -2,9 +2,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::artifacts::{CaptureMode, ParseConfidence, ParseSource};
-use crate::classify::{AnomalyFlag, ProcessResolution, TrafficClassification};
+use crate::classify::{AnomalyFlag, ProcessResolution, SurfaceType, TrafficClassification};
 use crate::normalized::EndpointType;
-use crate::providers::DetectedProvider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,7 +175,7 @@ pub struct TelemetryEvent {
     pub event_id: Uuid,
     pub timestamp_epoch_ms: i64,
     pub connection_id: Option<Uuid>,
-    pub provider: DetectedProvider,
+    pub provider: String,
     pub model: Option<String>,
     pub endpoint_type: EndpointType,
     pub parse_confidence: ParseConfidence,
@@ -284,6 +283,16 @@ pub struct TelemetryEvent {
     // WebSocket turn number
     #[serde(default)]
     pub ws_turn_number: Option<u64>,
+
+    // Product/Surface taxonomy (populated by catalog lookup)
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    #[serde(default)]
+    pub surface_type: SurfaceType,
+    #[serde(default)]
+    pub is_shadow_it: bool,
 }
 
 impl Default for TelemetryEvent {
@@ -292,7 +301,7 @@ impl Default for TelemetryEvent {
             event_id: Uuid::nil(),
             timestamp_epoch_ms: 0,
             connection_id: None,
-            provider: DetectedProvider::Unknown,
+            provider: "unknown".to_string(),
             model: None,
             endpoint_type: EndpointType::Unknown,
             parse_confidence: ParseConfidence::Heuristic,
@@ -354,6 +363,10 @@ impl Default for TelemetryEvent {
             session_credential_alerts: None,
             conversation_turn: None,
             ws_turn_number: None,
+            session_id: None,
+            product_id: None,
+            surface_type: SurfaceType::Unknown,
+            is_shadow_it: false,
         }
     }
 }
@@ -466,7 +479,7 @@ impl TelemetryEvent {
             event_id: gov.event_id,
             timestamp_epoch_ms: gov.timestamp_epoch_ms,
             connection_id: None,
-            provider: gov.provider,
+            provider: gov.provider.clone(),
             model: gov.model.clone(),
             endpoint_type: gov.endpoint_type,
             parse_confidence: gov

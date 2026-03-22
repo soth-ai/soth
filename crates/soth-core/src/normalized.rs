@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{ParseConfidence, ParseSource, ParseWarning};
-use crate::providers::DetectedProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedRequest {
@@ -11,7 +10,7 @@ pub struct NormalizedRequest {
     pub parse_warnings: Vec<ParseWarning>,
     pub is_ai_call: bool,
 
-    pub provider: DetectedProvider,
+    pub provider: String,
     pub model: Option<String>,
     pub endpoint_type: EndpointType,
     pub api_version: Option<String>,
@@ -43,6 +42,10 @@ pub struct NormalizedRequest {
 
     pub canonical_cache_key: String,
     pub format_metadata: FormatMetadata,
+
+    /// Extracted user content for embedding/classify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_prompt: Option<String>,
 }
 
 impl Default for NormalizedRequest {
@@ -53,7 +56,7 @@ impl Default for NormalizedRequest {
             schema_version: String::new(),
             parse_warnings: Vec::new(),
             is_ai_call: false,
-            provider: DetectedProvider::Unknown,
+            provider: "unknown".to_string(),
             model: None,
             endpoint_type: EndpointType::Unknown,
             api_version: None,
@@ -81,6 +84,7 @@ impl Default for NormalizedRequest {
                 method: String::new(),
                 path: String::new(),
             },
+            user_prompt: None,
         }
     }
 }

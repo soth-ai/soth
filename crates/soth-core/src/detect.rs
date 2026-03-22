@@ -35,6 +35,11 @@ pub struct DetectResult {
     pub first_blob_event_id: Option<Uuid>,
     #[serde(default)]
     pub import_categories: Vec<crate::ImportCategory>,
+    /// The user's actual prompt text extracted from the parsed request body.
+    /// NOT the raw HTTP body or system prompt — just what the user typed.
+    /// Populated by the detect layer for embedding/classify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_prompt: Option<String>,
 }
 
 impl Default for DetectResult {
@@ -57,6 +62,7 @@ impl Default for DetectResult {
             ast_normalized_hash: None,
             first_blob_event_id: None,
             import_categories: Vec::new(),
+            user_prompt: None,
         }
     }
 }

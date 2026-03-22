@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 use crate::artifacts::{CaptureMode, SensitiveArtifact};
 use crate::normalized::{EndpointType, NormalizedRequest};
-use crate::providers::DetectedProvider;
 
 // ---------------------------------------------------------------------------
 // GovernableEvent — normalized event shape governance extensions produce
@@ -16,7 +15,7 @@ pub struct GovernableEvent {
     pub event_id: Uuid,
     pub timestamp_epoch_ms: i64,
     pub source: EventSource,
-    pub provider: DetectedProvider,
+    pub provider: String,
     pub model: Option<String>,
     pub endpoint_type: EndpointType,
     pub normalized: Option<NormalizedRequest>,

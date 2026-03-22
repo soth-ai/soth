@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::{AppKind, CaptureMode, MatchingRule, RequestHeaders};
+use crate::{AppKind, BundleEnvironment, CaptureMode, MatchingRule, RequestHeaders};
 
 // ── Utility functions ────────────────────────────────────────────────
 
@@ -54,6 +54,12 @@ pub fn host_without_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
 }
 
+/// Canonical specificity score for a glob pattern.
+/// Returns the count of non-wildcard characters (higher = more specific).
+pub fn pattern_specificity(pattern: &str) -> usize {
+    pattern.chars().filter(|ch| *ch != '*').count()
+}
+
 // ── OwnedDetectBundle ────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -63,26 +69,18 @@ pub struct OwnedDetectBundle {
     pub grpc_services: GrpcServiceRegistry,
     pub capture_rules: CaptureRules,
     pub domain_index: HashMap<String, String>,
-    pub detection_index: HashMap<String, String>,
     pub llm_providers: HashMap<String, ProviderEntry>,
-    pub applications: HashMap<String, ApplicationEntry>,
+    #[serde(alias = "applications")]
+    pub products: HashMap<String, ProductEntry>,
     pub filters: Filters,
-    pub app_policies: HashMap<String, AppPolicy>,
-    pub browser_policies: BrowserPolicies,
     #[serde(default)]
     pub passthrough_domains: Vec<String>,
     #[serde(default)]
-    pub collectors: HashMap<String, JsonValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_metadata: Option<JsonValue>,
-    #[serde(default)]
     pub org_patterns: Vec<String>,
-    /// Process names that are script runtimes / interpreters (e.g. "node", "python3").
-    /// When a connection originates from a script runtime, identity resolution
-    /// falls back to the parent process. Server-pushable; when empty the edge
-    /// uses a built-in default list.
+    /// Known environments (IDEs, terminals, browsers) used to classify the
+    /// parent process of an AI tool. Drives `EnvIndex` at bundle load time.
     #[serde(default)]
-    pub script_runtimes: Vec<String>,
+    pub environments: Vec<BundleEnvironment>,
 }
 
 impl OwnedDetectBundle {
@@ -93,17 +91,12 @@ impl OwnedDetectBundle {
             grpc_services: &self.grpc_services,
             capture_rules: &self.capture_rules,
             domain_index: &self.domain_index,
-            detection_index: &self.detection_index,
             llm_providers: &self.llm_providers,
-            applications: &self.applications,
+            products: &self.products,
             filters: &self.filters,
-            app_policies: &self.app_policies,
-            browser_policies: &self.browser_policies,
             passthrough_domains: self.passthrough_domains.as_slice(),
-            collectors: &self.collectors,
-            source_metadata: self.source_metadata.as_ref(),
             org_patterns: &self.org_patterns,
-            script_runtimes: &self.script_runtimes,
+            environments: &self.environments,
         }
     }
 }
@@ -117,17 +110,12 @@ pub struct DetectBundleSlice<'a> {
     pub grpc_services: &'a GrpcServiceRegistry,
     pub capture_rules: &'a CaptureRules,
     pub domain_index: &'a HashMap<String, String>,
-    pub detection_index: &'a HashMap<String, String>,
     pub llm_providers: &'a HashMap<String, ProviderEntry>,
-    pub applications: &'a HashMap<String, ApplicationEntry>,
+    pub products: &'a HashMap<String, ProductEntry>,
     pub filters: &'a Filters,
-    pub app_policies: &'a HashMap<String, AppPolicy>,
-    pub browser_policies: &'a BrowserPolicies,
     pub passthrough_domains: &'a [String],
-    pub collectors: &'a HashMap<String, JsonValue>,
-    pub source_metadata: Option<&'a JsonValue>,
     pub org_patterns: &'a [String],
-    pub script_runtimes: &'a [String],
+    pub environments: &'a [BundleEnvironment],
 }
 
 // ── REST format descriptors ──────────────────────────────────────────
@@ -155,6 +143,10 @@ pub enum StreamFormat {
     Sse,
     Ndjson,
     LengthPrefixed,
+    /// WebSocket-native streaming (e.g. OpenAI Responses API, Socket.IO).
+    /// Chunks arrive as WebSocketText/WebSocketBinary frames rather than
+    /// HTTP streaming bytes.
+    WebSocket,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -215,6 +207,155 @@ pub struct RestFormatDescriptor {
     /// Stream format-specific options
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// Rich feature descriptors from the parser DSL. When non-empty, the proxy
+    /// uses the first matching chat feature's rules instead of the flat
+    /// request/response paths above. The flat fields are kept for backward
+    /// compatibility with bundles that don't carry features.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<FeatureDescriptor>,
+}
+
+// ── Parser DSL feature types ─────────────────────────────────────────
+
+/// A parseable feature on an entity (chat, embed, translate, etc.).
+///
+/// Each feature describes one logical API surface: how to match requests
+/// to it, how to parse the request body, and how to extract content from
+/// the response (streaming or direct).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FeatureDescriptor {
+    /// Feature identifier (e.g. "chat", "embed", "translate").
+    pub id: String,
+    /// "chat" or "metadata". Proxy v1 only processes "chat".
+    #[serde(default = "default_feature_type")]
+    pub feature_type: String,
+    /// Wire protocol: "rest", "graphql", "grpc", "websocket".
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    /// URL glob patterns this feature matches.
+    #[serde(default)]
+    pub patterns: Vec<FeaturePattern>,
+    /// Request body extraction spec.
+    #[serde(default)]
+    pub request: FeatureRequestSpec,
+    /// Response extraction — streaming rules or flat field paths.
+    #[serde(default)]
+    pub response: FeatureResponseSpec,
+}
+
+fn default_feature_type() -> String {
+    "chat".to_string()
+}
+
+fn default_protocol() -> String {
+    "rest".to_string()
+}
+
+/// A URL pattern + HTTP method for matching requests to a feature.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FeaturePattern {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+/// Request-side extraction spec from the parser DSL.
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct FeatureRequestSpec {
+    /// Semantic field name → extraction path.
+    /// Paths can be JSON dot-notation, `$_query_param('name')`, or `$_url_segment(-2)`.
+    #[serde(default)]
+    pub fields: HashMap<String, String>,
+    /// Request body encoding.
+    #[serde(default)]
+    pub encoding: RequestEncoding,
+    /// Form field name for form-encoded requests (e.g. "f.req").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_field: Option<String>,
+    /// Request body preprocessing pipeline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preprocess: Vec<PreprocessOp>,
+}
+
+/// Response extraction — either streaming with a rules engine, or direct
+/// (non-streaming) with flat field-to-path mappings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FeatureResponseSpec {
+    /// Streaming response with conditional rules, accumulation, and finalization.
+    Stream {
+        stream: StreamRulesSpec,
+    },
+    /// Non-streaming response: field name → JSON path.
+    Direct(HashMap<String, String>),
+}
+
+impl Default for FeatureResponseSpec {
+    fn default() -> Self {
+        Self::Direct(HashMap::new())
+    }
+}
+
+/// Complete streaming rules specification from the parser DSL.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StreamRulesSpec {
+    /// Stream wire format.
+    pub format: StreamFormat,
+    /// Format-specific options (prefixes, delimiters, skip values).
+    #[serde(default)]
+    pub format_options: StreamFormatOptions,
+    /// Ordered list of conditional extraction rules.
+    #[serde(default)]
+    pub rules: Vec<StreamRule>,
+    /// Per-field accumulation operators across chunks.
+    #[serde(default)]
+    pub accumulate: HashMap<String, AccumulateOp>,
+    /// Final field mapping from accumulated state. Supports ternary:
+    /// `"accumulated.a ? accumulated.a : accumulated.b"`.
+    #[serde(default)]
+    pub finalize: HashMap<String, String>,
+}
+
+/// Format-specific options for stream chunk parsing.
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct StreamFormatOptions {
+    /// Line prefixes to strip (e.g. `["data: ", "delta ", "message "]`).
+    #[serde(default)]
+    pub prefixes: Vec<String>,
+    /// Values to skip entirely (e.g. `["[DONE]"]`).
+    #[serde(default)]
+    pub skip_values: Vec<String>,
+    /// Custom chunk delimiter for NDJSON (e.g. `"}{"`). Newline if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    /// Header to strip from length-prefixed payloads (e.g. `")]}'\\n"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_strip: Option<String>,
+    /// Encoding hint for length-prefixed (e.g. "protobuf").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+}
+
+/// A single conditional extraction rule evaluated against each parsed chunk.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StreamRule {
+    /// Condition expression. See `rules::evaluate_condition()` for syntax.
+    pub when: String,
+    /// Fields to extract when the condition matches: field_name → json_path.
+    #[serde(default)]
+    pub extract: HashMap<String, String>,
+    /// Per-rule preprocessing applied before extraction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preprocess: Vec<PreprocessOp>,
+}
+
+/// Accumulation operator for merging extracted values across stream chunks.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AccumulateOp {
+    /// Source field name to accumulate from.
+    pub from: String,
+    /// Accumulation strategy: "concat", "first", or "last".
+    pub op: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -509,6 +650,8 @@ pub struct ProviderEntry {
     pub pricing: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<JsonValue>,
+    /// Deprecated: legacy detection hints (path_patterns, header_hints, hosts).
+    /// Superseded by `matching_rules` (signal-based). Kept for cache/serde compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection: Option<JsonValue>,
     /// Signal-based matching rules from NativeBundle v3.
@@ -518,7 +661,7 @@ pub struct ProviderEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
-pub struct ApplicationEntry {
+pub struct ProductEntry {
     pub app_id: Option<String>,
     pub name: Option<String>,
     #[serde(default)]
@@ -531,6 +674,8 @@ pub struct ApplicationEntry {
     pub pricing: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<JsonValue>,
+    /// Deprecated: legacy detection hints. Superseded by `matching_rules`.
+    /// Kept for cache/serde compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,6 +685,9 @@ pub struct ApplicationEntry {
     #[serde(default)]
     pub matching_rules: Vec<MatchingRule>,
 }
+
+/// Deprecated alias — use [`ProductEntry`] instead.
+pub type ApplicationEntry = ProductEntry;
 
 // ── Filters ──────────────────────────────────────────────────────────
 

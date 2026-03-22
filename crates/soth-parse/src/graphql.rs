@@ -2,7 +2,7 @@ use crate::hash::{canonical_hash, estimate_tokens, hash_content};
 use crate::types::{
     DetectBundleSlice, DetectWarning, FormatMeta, GqlOpType, GraphQLOperationRegistry,
     GraphQLOperationSpec, NormalizedRequest, ParseConfidence, ParseError, ParseResult,
-    ParseWarning, Provider, RawRequest,
+    ParseWarning, RawRequest,
 };
 use crate::util::{extract_string, json_path, normalize_unicodeish};
 use graphql_parser::query as gql;
@@ -53,12 +53,12 @@ pub fn parse_graphql(
         let mut normalized = heuristic_graphql_parse(&env);
         normalized
             .parse_warnings
-            .push(ParseWarning::GraphQLUnknownOperation(
-                env.operation_name
+            .push(ParseWarning::GraphQlUnknownOperation {
+                operation_name: env.operation_name
                     .clone()
                     .unwrap_or_else(|| "anonymous".to_string()),
-            ));
-        normalized.canonical_hash = canonical_hash(&normalized);
+            });
+        normalized.canonical_cache_key = canonical_hash(&normalized);
         return Ok(GraphQLParseOutcome {
             normalized,
             warnings: vec![DetectWarning {
@@ -91,12 +91,12 @@ pub fn parse_graphql(
         let mut normalized = heuristic_graphql_parse(&env);
         normalized
             .parse_warnings
-            .push(ParseWarning::GraphQLUnknownOperation(
-                operation_name
+            .push(ParseWarning::GraphQlUnknownOperation {
+                operation_name: operation_name
                     .clone()
                     .unwrap_or_else(|| "anonymous".to_string()),
-            ));
-        normalized.canonical_hash = canonical_hash(&normalized);
+            });
+        normalized.canonical_cache_key = canonical_hash(&normalized);
         return Ok(GraphQLParseOutcome {
             normalized,
             warnings: vec![DetectWarning {
@@ -165,12 +165,12 @@ pub fn parse_graphql(
     let mut normalized = NormalizedRequest {
         parse_confidence: ParseConfidence::Full,
         parser_id: "graphql-v1".to_string(),
-        schema_version: "1",
+        schema_version: "1".to_string(),
         parse_warnings: Vec::new(),
         is_ai_call: true,
-        provider: Provider::new(provider),
+        provider: provider.to_string(),
         model,
-        endpoint_type: crate::types::EndpointType::Chat,
+        endpoint_type: crate::types::EndpointType::ChatCompletion,
         system_prompt_hash,
         system_prompt_token_estimate,
         user_content_hash,
@@ -186,16 +186,20 @@ pub fn parse_graphql(
         stop_sequences: Vec::new(),
         estimated_input_tokens,
         estimated_cost_usd: 0.0,
-        canonical_hash: String::new(),
-        format_meta: FormatMeta::GraphQL {
+        parse_source: crate::types::ParseSource::Heuristic,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
+        canonical_cache_key: String::new(),
+        format_metadata: FormatMeta::GraphQl {
             operation_name,
             operation_type,
             mutation_field,
         },
         api_version: None,
-        content_sample: Some(content),
+        user_prompt: if content.is_empty() { None } else { Some(content.clone()) },
     };
-    normalized.canonical_hash = canonical_hash(&normalized);
+    normalized.canonical_cache_key = canonical_hash(&normalized);
 
     Ok(GraphQLParseOutcome {
         normalized,
@@ -429,12 +433,12 @@ fn heuristic_graphql_parse(env: &GraphQLEnvelope) -> NormalizedRequest {
     let mut normalized = NormalizedRequest {
         parse_confidence: ParseConfidence::Heuristic,
         parser_id: "graphql-heuristic-v1".to_string(),
-        schema_version: "1",
+        schema_version: "1".to_string(),
         parse_warnings: Vec::new(),
         is_ai_call: true,
-        provider: Provider::new("graphql"),
+        provider: "graphql".to_string(),
         model,
-        endpoint_type: crate::types::EndpointType::Chat,
+        endpoint_type: crate::types::EndpointType::ChatCompletion,
         system_prompt_hash: None,
         system_prompt_token_estimate: None,
         user_content_hash: user_content_hash.clone(),
@@ -450,19 +454,19 @@ fn heuristic_graphql_parse(env: &GraphQLEnvelope) -> NormalizedRequest {
         stop_sequences: Vec::new(),
         estimated_input_tokens: estimate_tokens(&content),
         estimated_cost_usd: 0.0,
-        canonical_hash: String::new(),
-        format_meta: FormatMeta::GraphQL {
+        parse_source: crate::types::ParseSource::Heuristic,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
+        canonical_cache_key: String::new(),
+        format_metadata: FormatMeta::GraphQl {
             operation_name: env.operation_name.clone(),
             operation_type: GqlOpType::Unknown,
             mutation_field: None,
         },
         api_version: None,
-        content_sample: if content == "[CONTENT_NOT_EXTRACTED]" {
-            None
-        } else {
-            Some(content)
-        },
+        user_prompt: if content.is_empty() { None } else { Some(content.clone()) },
     };
-    normalized.canonical_hash = canonical_hash(&normalized);
+    normalized.canonical_cache_key = canonical_hash(&normalized);
     normalized
 }

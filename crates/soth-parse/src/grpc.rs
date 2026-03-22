@@ -4,7 +4,7 @@ use crate::proto::scan_proto_strings;
 use crate::types::{
     DetectBundleSlice, DetectWarning, EndpointType, FormatMeta, GrpcServiceRegistry,
     GrpcServiceSpec, NormalizedRequest, ParseConfidence, ParseError, ParseResult, ParseWarning,
-    Provider, RawRequest,
+    RawRequest,
 };
 use crate::util::{extract_grpc_service_method, grpc_request_path, normalize_unicodeish};
 use std::collections::HashMap;
@@ -53,8 +53,8 @@ pub fn parse_grpc(
     let grpc_path = grpc_request_path(&req.headers, &req.path);
     let Some((service, method)) = extract_grpc_service_method(grpc_path) else {
         let mut fallback = heuristic::parse(req);
-        fallback.provider = Provider::new("grpc");
-        fallback.format_meta = FormatMeta::Grpc {
+        fallback.provider = "grpc".to_string();
+        fallback.format_metadata = FormatMeta::Grpc {
             service: "unknown".to_string(),
             method: "unknown".to_string(),
             proto_package: None,
@@ -62,10 +62,10 @@ pub fn parse_grpc(
         fallback.parse_confidence = ParseConfidence::Heuristic;
         fallback
             .parse_warnings
-            .push(ParseWarning::GrpcDescriptorMissing(
-                "unknown/unknown".to_string(),
-            ));
-        fallback.canonical_hash = canonical_hash(&fallback);
+            .push(ParseWarning::GrpcDescriptorMissing {
+                service: "unknown/unknown".to_string(),
+            });
+        fallback.canonical_cache_key = canonical_hash(&fallback);
         return Ok(GrpcParseOutcome {
             normalized: fallback,
             warnings,
@@ -109,8 +109,8 @@ pub fn parse_grpc(
         .unwrap_or("grpc");
 
     let mut fallback = heuristic::parse(req);
-    fallback.provider = Provider::new(provider_hint);
-    fallback.format_meta = FormatMeta::Grpc {
+    fallback.provider = provider_hint.to_string();
+    fallback.format_metadata = FormatMeta::Grpc {
         service: service.clone(),
         method: method.clone(),
         proto_package: descriptor.and_then(|spec| spec.proto_package.clone()),
@@ -118,10 +118,10 @@ pub fn parse_grpc(
     fallback.parse_confidence = ParseConfidence::Heuristic;
     fallback
         .parse_warnings
-        .push(ParseWarning::GrpcDescriptorMissing(format!(
-            "{service}/{method}"
-        )));
-    fallback.canonical_hash = canonical_hash(&fallback);
+        .push(ParseWarning::GrpcDescriptorMissing {
+            service: format!("{service}/{method}"),
+        });
+    fallback.canonical_cache_key = canonical_hash(&fallback);
 
     Ok(GrpcParseOutcome {
         normalized: fallback,
@@ -180,16 +180,16 @@ fn parse_with_descriptor(
     let mut normalized = NormalizedRequest {
         parse_confidence,
         parser_id: "grpc-v1".to_string(),
-        schema_version: "1",
+        schema_version: "1".to_string(),
         parse_warnings: if model.is_some() {
             Vec::new()
         } else {
-            vec![ParseWarning::MissingField("model".to_string())]
+            vec![ParseWarning::MissingField { field: "model".to_string() }]
         },
         is_ai_call: true,
-        provider: Provider::new(spec.provider_hint.as_deref().unwrap_or("grpc")),
+        provider: spec.provider_hint.as_deref().unwrap_or("grpc").to_string(),
         model,
-        endpoint_type: EndpointType::Chat,
+        endpoint_type: EndpointType::ChatCompletion,
         system_prompt_hash: None,
         system_prompt_token_estimate: None,
         user_content_hash: user_content_hash.clone(),
@@ -205,16 +205,20 @@ fn parse_with_descriptor(
         stop_sequences: Vec::new(),
         estimated_input_tokens: estimate_tokens(&content),
         estimated_cost_usd: 0.0,
-        canonical_hash: String::new(),
-        format_meta: FormatMeta::Grpc {
+        parse_source: crate::types::ParseSource::Heuristic,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
+        canonical_cache_key: String::new(),
+        format_metadata: FormatMeta::Grpc {
             service: service.to_string(),
             method: method.to_string(),
             proto_package: spec.proto_package.clone(),
         },
         api_version: None,
-        content_sample: Some(content),
+        user_prompt: if content.is_empty() { None } else { Some(content.clone()) },
     };
-    normalized.canonical_hash = canonical_hash(&normalized);
+    normalized.canonical_cache_key = canonical_hash(&normalized);
 
     Some(normalized)
 }
@@ -239,14 +243,14 @@ fn parse_with_string_scan(
     let mut normalized = NormalizedRequest {
         parse_confidence: ParseConfidence::Heuristic,
         parser_id: "grpc-heuristic-v1".to_string(),
-        schema_version: "1",
-        parse_warnings: vec![ParseWarning::GrpcDescriptorMissing(format!(
-            "{service}/{method}"
-        ))],
+        schema_version: "1".to_string(),
+        parse_warnings: vec![ParseWarning::GrpcDescriptorMissing {
+            service: format!("{service}/{method}"),
+        }],
         is_ai_call: true,
-        provider: Provider::new(provider_hint),
+        provider: provider_hint.to_string(),
         model,
-        endpoint_type: EndpointType::Chat,
+        endpoint_type: EndpointType::ChatCompletion,
         system_prompt_hash: None,
         system_prompt_token_estimate: None,
         user_content_hash: user_content_hash.clone(),
@@ -262,16 +266,20 @@ fn parse_with_string_scan(
         stop_sequences: Vec::new(),
         estimated_input_tokens: estimate_tokens(&content),
         estimated_cost_usd: 0.0,
-        canonical_hash: String::new(),
-        format_meta: FormatMeta::Grpc {
+        parse_source: crate::types::ParseSource::Heuristic,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
+        canonical_cache_key: String::new(),
+        format_metadata: FormatMeta::Grpc {
             service: service.to_string(),
             method: method.to_string(),
             proto_package: descriptor.and_then(|spec| spec.proto_package.clone()),
         },
         api_version: None,
-        content_sample: Some(content),
+        user_prompt: if content.is_empty() { None } else { Some(content.clone()) },
     };
-    normalized.canonical_hash = canonical_hash(&normalized);
+    normalized.canonical_cache_key = canonical_hash(&normalized);
 
     Some(normalized)
 }

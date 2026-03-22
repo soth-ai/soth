@@ -3,6 +3,14 @@ use sha3::Sha3_256;
 
 use crate::normalized::NormalizedRequest;
 
+/// SHA-256 hex digest of arbitrary bytes. Single authority for all
+/// hashing across the proxy codebase.
+pub fn sha256_hex(input: impl AsRef<[u8]>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_ref());
+    hex::encode(hasher.finalize())
+}
+
 pub fn commitment_hash(body_bytes: &[u8], nonce: &[u8; 32]) -> String {
     let mut hasher = Sha3_256::new();
     hasher.update(nonce);
@@ -33,7 +41,7 @@ pub fn derive_proxy_signing_seed(device_id_hash: &str) -> [u8; 32] {
 pub fn cache_key_from_normalized(nr: &NormalizedRequest) -> String {
     let mut hasher = Sha256::new();
 
-    hasher.update(nr.provider.canonical_name().as_bytes());
+    hasher.update(nr.provider.as_bytes());
     hasher.update(b"|");
     hasher.update(nr.model.as_deref().unwrap_or(""));
     hasher.update(b"|");
@@ -108,7 +116,7 @@ mod tests {
             schema_version: "1".to_string(),
             parse_warnings: Vec::new(),
             is_ai_call: true,
-            provider: DetectedProvider::Anthropic,
+            provider: "anthropic".to_string(),
             model: Some("claude-3-5-sonnet".to_string()),
             endpoint_type: EndpointType::ChatCompletion,
             api_version: None,
@@ -133,6 +141,7 @@ mod tests {
             has_structured_output: false,
             has_tool_results: false,
             estimated_output_tokens: None,
+            user_prompt: None,
         }
     }
 }

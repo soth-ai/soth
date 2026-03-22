@@ -1,6 +1,7 @@
 use crate::artifacts::CaptureMode;
 use crate::telemetry::RequestMethod;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyContext {
@@ -24,6 +25,20 @@ pub struct ProxyContext {
     pub precomputed_commitment_nonce: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precomputed_commitment_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_trust_level: Option<crate::telemetry::BundleTrustLevel>,
+
+    // ── Product taxonomy & session (v7+) ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    #[serde(default)]
+    pub surface_type: SurfaceType,
+    #[serde(default)]
+    pub is_shadow_it: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +156,51 @@ pub struct SessionSnapshot {
     pub seen_code_hashes: Vec<String>,
     #[serde(default)]
     pub session_key_hash: String,
+}
+
+/// Product delivery mechanism — how an AI tool reaches the user.
+///
+/// Aligned with `EntityKind` in the bundle: each entity kind maps 1:1 to a
+/// surface type so cloud analytics can break down by delivery mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceType {
+    /// IDE / code editor (e.g. VS Code, JetBrains, Neovim)
+    Ide,
+    /// IDE plugin / extension that runs inside an IDE host
+    #[serde(rename = "ide_plugin")]
+    IdePlugin,
+    /// CLI tool (e.g. `gh copilot`, `aider`)
+    #[serde(rename = "cli")]
+    Cli,
+    /// Autonomous agent application (e.g. Devin, SWE-Agent)
+    Agent,
+    /// Desktop application (e.g. ChatGPT.app)
+    Desktop,
+    /// Web application accessed via browser (e.g. chat.openai.com)
+    WebApp,
+    /// Browser extension (e.g. Monica, Merlin)
+    BrowserExtension,
+    /// Platform / SDK integration (e.g. LangChain, direct API)
+    #[serde(rename = "sdk")]
+    Sdk,
+    #[default]
+    Unknown,
+}
+
+impl SurfaceType {
+    /// Derive the coarse `AppType` from the delivery surface.
+    ///
+    /// Web-delivered surfaces (`WebApp`, `BrowserExtension`) are `Host`; everything
+    /// that runs as a standalone process or embedded tool is `NonHost`.
+    pub fn app_type(&self) -> AppType {
+        match self {
+            Self::WebApp | Self::BrowserExtension => AppType::Host,
+            Self::Ide | Self::IdePlugin | Self::Cli | Self::Agent
+            | Self::Desktop | Self::Sdk => AppType::NonHost,
+            Self::Unknown => AppType::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

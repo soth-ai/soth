@@ -1,13 +1,14 @@
 use crate::hash::{canonical_hash, estimate_tokens, hash_content};
 use crate::types::{
-    EndpointType, NormalizedRequest, ParseConfidence, ParseWarning, Provider, RawRequest,
+    empty_heuristic_request, EndpointType, NormalizedRequest, ParseConfidence, ParseWarning,
+    RawRequest,
 };
 use crate::util::{extract_string, json_path};
 use serde_json::Value;
 
 pub fn parse(req: &RawRequest) -> NormalizedRequest {
-    let mut nr = NormalizedRequest::empty_heuristic(&req.method, &req.path);
-    nr.provider = Provider::new("unknown");
+    let mut nr = empty_heuristic_request(&req.method, &req.path);
+    nr.provider = "unknown".to_string();
     nr.endpoint_type = EndpointType::Unknown;
 
     match serde_json::from_slice::<Value>(&req.body) {
@@ -46,11 +47,6 @@ pub fn parse(req: &RawRequest) -> NormalizedRequest {
             nr.user_content_token_estimate = estimate_tokens(&content);
             nr.estimated_input_tokens = nr.user_content_token_estimate;
             nr.conversation_hash = hash_content(&content);
-            nr.content_sample = if content == "[CONTENT_NOT_EXTRACTED]" {
-                None
-            } else {
-                Some(content)
-            };
         }
         Err(_) => {
             nr.parse_warnings.push(ParseWarning::NonJsonBody);
@@ -60,7 +56,7 @@ pub fn parse(req: &RawRequest) -> NormalizedRequest {
     }
 
     nr.parse_confidence = ParseConfidence::Heuristic;
-    nr.canonical_hash = canonical_hash(&nr);
+    nr.canonical_cache_key = canonical_hash(&nr);
     nr
 }
 

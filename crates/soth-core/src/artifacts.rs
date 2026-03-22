@@ -136,6 +136,7 @@ pub enum ParseWarning {
     ParserError { reason: String },
     NoParserForFormat { format: String },
     FilteredByKeyword,
+    CodeDetectionSkipped,
     PartialBodyParse { reason: String },
     #[serde(alias = "oversize_body")]
     BodyTruncated { actual_bytes: u64, limit_bytes: u64 },

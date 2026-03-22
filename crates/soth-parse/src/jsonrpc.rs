@@ -1,7 +1,18 @@
+//! JSON-RPC 2.0 request parser.
+//!
+//! **Deprecated**: This parser was originally built for MCP (Model Context
+//! Protocol) traffic which used JSON-RPC 2.0 as its wire format.  MCP
+//! interception has been removed from SOTH.  No AI provider in the parser
+//! registry uses JSON-RPC for chat/inference endpoints.
+//!
+//! The module is kept for backward compatibility with bundles that reference
+//! `DetectedFormat::JsonRpc` and for the `ParseSource::JsonRpc` enum
+//! variant, but it is no longer called in the streaming hot path.
+
 use crate::hash::{canonical_hash, estimate_tokens, hash_content};
 use crate::types::{
     EndpointType, FormatMeta, NormalizedRequest, ParseConfidence, ParseError, ParseResult,
-    ParseWarning, Provider, RawRequest,
+    ParseWarning, RawRequest,
 };
 use crate::util::{extract_string, json_path, normalize_unicodeish};
 use serde_json::Value;
@@ -52,7 +63,7 @@ pub fn parse_jsonrpc(req: &RawRequest, provider_id: &str) -> ParseResult<Normali
 
     let mut parse_warnings = Vec::new();
     if method.is_none() {
-        parse_warnings.push(ParseWarning::MissingField("method".to_string()));
+        parse_warnings.push(ParseWarning::MissingField { field: "method".to_string() });
     }
     if content.is_none() {
         parse_warnings.push(ParseWarning::ContentNotExtracted);
@@ -129,10 +140,10 @@ pub fn parse_jsonrpc(req: &RawRequest, provider_id: &str) -> ParseResult<Normali
     let mut normalized = NormalizedRequest {
         parse_confidence,
         parser_id: "jsonrpc-v1".to_string(),
-        schema_version: "1",
+        schema_version: "1".to_string(),
         parse_warnings,
         is_ai_call,
-        provider: Provider::new(provider_id),
+        provider: provider_id.to_string(),
         model,
         endpoint_type: infer_endpoint_type(method.as_deref(), &req.path),
         system_prompt_hash,
@@ -150,20 +161,24 @@ pub fn parse_jsonrpc(req: &RawRequest, provider_id: &str) -> ParseResult<Normali
         stop_sequences,
         estimated_input_tokens,
         estimated_cost_usd: 0.0,
-        canonical_hash: String::new(),
-        format_meta: FormatMeta::JsonRpc {
-            method: method.clone(),
+        parse_source: crate::types::ParseSource::Heuristic,
+        has_structured_output: false,
+        has_tool_results: false,
+        estimated_output_tokens: None,
+        canonical_cache_key: String::new(),
+        format_metadata: FormatMeta::JsonRpc {
+            method: method.clone().unwrap_or_default(),
             is_batch: matches!(json, Value::Array(_)),
         },
         api_version: None,
-        content_sample: if content_value == "[CONTENT_NOT_EXTRACTED]" {
+        user_prompt: if content_value.is_empty() || content_value == "[CONTENT_NOT_EXTRACTED]" {
             None
         } else {
-            Some(content_value)
+            Some(content_value.clone())
         },
     };
 
-    normalized.canonical_hash = canonical_hash(&normalized);
+    normalized.canonical_cache_key = canonical_hash(&normalized);
     Ok(normalized)
 }
 
@@ -347,10 +362,10 @@ fn infer_endpoint_type(method: Option<&str>, path: &str) -> EndpointType {
         || lower.contains("generate")
         || lower.contains("prompt")
     {
-        return EndpointType::Chat;
+        return EndpointType::ChatCompletion;
     }
     if lower.contains("completion") {
-        return EndpointType::Completion;
+        return EndpointType::TextCompletion;
     }
 
     let path_lc = path.to_ascii_lowercase();
@@ -362,10 +377,10 @@ fn infer_endpoint_type(method: Option<&str>, path: &str) -> EndpointType {
         || path_lc.contains("response")
         || path_lc.contains("conversation")
     {
-        return EndpointType::Chat;
+        return EndpointType::ChatCompletion;
     }
     if path_lc.contains("completion") {
-        return EndpointType::Completion;
+        return EndpointType::TextCompletion;
     }
     EndpointType::Unknown
 }

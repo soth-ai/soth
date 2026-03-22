@@ -1,7 +1,7 @@
 use crate::types::{DetectBundleSlice, DetectedFormat, HeaderMap, ProviderEntry};
-use crate::util::{header_value, host_without_port, lookup_domain_provider};
-use serde_json::Value as JsonValue;
-use soth_core::{MatchingRule, SignalKind};
+use crate::util::{header_value, lookup_domain_provider};
+// Re-export classify types from soth-core (canonical location after SOLID refactor).
+pub use soth_core::bundle::classify::{ClassifyPairResult, ClassifyResult};
 
 pub fn fingerprint(
     method: &str,
@@ -31,7 +31,7 @@ pub fn fingerprint(
     // like gemini.google.com use a different format (form-encoded) than the
     // provider API (JSON), so the app-specific descriptor must win.
     if let Some(app_id) = matched_application {
-        if let Some(app_entry) = bundle.applications.get(app_id) {
+        if let Some(app_entry) = bundle.products.get(app_id) {
             if let Some(api_format) = app_entry.api_format.as_deref() {
                 if bundle.rest_formats.contains_key(api_format) {
                     return DetectedFormat::CustomRest(api_format.to_string());
@@ -55,11 +55,6 @@ pub fn fingerprint(
         if bundle.rest_formats.contains_key(provider_id) {
             return DetectedFormat::CustomRest(provider_id.to_string());
         }
-    } else if let Some(provider_id) = match_provider_by_detection_hints(path, headers, bundle) {
-        let hinted = provider_entry_to_format(provider_id, bundle.llm_providers.get(provider_id));
-        if hinted != DetectedFormat::Unknown {
-            return hinted;
-        }
     }
 
     if header_value(headers, "anthropic-version").is_some() {
@@ -72,7 +67,6 @@ pub fn fingerprint(
 
     let path_lc = path.to_ascii_lowercase();
     let body = String::from_utf8_lossy(body_prefix).to_ascii_lowercase();
-    let looks_jsonrpc = body.contains("\"jsonrpc\"") && body.contains("\"method\"");
 
     if is_openai_like_path(&path_lc) {
         return DetectedFormat::OpenAIRest;
@@ -96,11 +90,9 @@ pub fn fingerprint(
         return DetectedFormat::BedrockRest;
     }
 
-    if path_lc.contains("jsonrpc")
-        || ((path_lc.ends_with("/rpc") || path_lc.contains("/rpc/")) && looks_jsonrpc)
-    {
-        return DetectedFormat::JsonRpc;
-    }
+    // JSON-RPC heuristic detection removed — no AI provider uses JSON-RPC
+    // for inference. Explicit Content-Type and bundle api_format hints are
+    // still honoured via provider_entry_to_format().
 
     if let Some(host) =
         header_value(headers, "host").or_else(|| header_value(headers, ":authority"))
@@ -118,7 +110,7 @@ pub fn fingerprint(
             // Domain maps to an application with api_format (e.g. chatgpt.com → chatgpt → chatgpt_web).
             // Skip if a more specific matched_application was already resolved by gating.
             if matched_application.is_none() {
-                if let Some(app_entry) = bundle.applications.get(provider_id) {
+                if let Some(app_entry) = bundle.products.get(provider_id) {
                     if let Some(api_format) = app_entry.api_format.as_deref() {
                         if bundle.rest_formats.contains_key(api_format) {
                             return DetectedFormat::CustomRest(api_format.to_string());
@@ -144,202 +136,9 @@ pub fn fingerprint(
         return DetectedFormat::GraphQL;
     }
 
-    if looks_jsonrpc {
-        return DetectedFormat::JsonRpc;
-    }
-
     DetectedFormat::Unknown
 }
 
-fn match_provider_by_detection_hints<'a>(
-    path: &str,
-    headers: &HeaderMap,
-    bundle: &'a DetectBundleSlice<'_>,
-) -> Option<&'a str> {
-    let path_lc = path.to_ascii_lowercase();
-    let host_lc = header_value(headers, "host")
-        .or_else(|| header_value(headers, ":authority"))
-        .map(|host| {
-            host_without_port(host)
-                .trim_end_matches('.')
-                .to_ascii_lowercase()
-        });
-    let mut best: Option<(&str, usize)> = None;
-
-    for (provider_id, entry) in bundle.llm_providers.iter() {
-        let Some(score) = detection_match_score(
-            entry.detection.as_ref(),
-            &path_lc,
-            host_lc.as_deref(),
-            headers,
-        ) else {
-            continue;
-        };
-
-        match best {
-            Some((best_provider, best_score))
-                if best_score > score
-                    || (best_score == score && best_provider <= provider_id.as_str()) => {}
-            _ => best = Some((provider_id.as_str(), score)),
-        }
-    }
-
-    best.map(|(provider_id, _)| provider_id)
-}
-
-fn detection_match_score(
-    detection: Option<&JsonValue>,
-    path_lc: &str,
-    host_lc: Option<&str>,
-    headers: &HeaderMap,
-) -> Option<usize> {
-    let detection = detection?;
-    let mut matched = false;
-    let mut score = 0usize;
-
-    if let Some(patterns) = detection.get("path_patterns").and_then(JsonValue::as_array) {
-        let mut best_path_score = 0usize;
-        for pattern in patterns.iter().filter_map(JsonValue::as_str) {
-            if pattern.is_empty() {
-                continue;
-            }
-            let pattern_lc = pattern.to_ascii_lowercase();
-            if glob_match(&pattern_lc, path_lc) {
-                matched = true;
-                best_path_score = best_path_score.max(non_wildcard_len(&pattern_lc) + 20);
-            }
-        }
-        score += best_path_score;
-    }
-
-    if let Some(header_hints) = detection.get("header_hints") {
-        let mut header_hits = 0usize;
-        match header_hints {
-            JsonValue::Object(map) => {
-                for (name, hint_value) in map {
-                    if let Some(header_val) = header_value(headers, name) {
-                        if header_hint_matches(hint_value, header_val) {
-                            header_hits += 1;
-                        }
-                    }
-                }
-            }
-            JsonValue::Array(items) => {
-                for item in items.iter().filter_map(JsonValue::as_str) {
-                    if header_value(headers, item).is_some() {
-                        header_hits += 1;
-                    }
-                }
-            }
-            _ => {}
-        }
-        if header_hits > 0 {
-            matched = true;
-            score += header_hits * 10;
-        }
-    }
-
-    if let (Some(host), Some(hosts)) = (
-        host_lc,
-        detection.get("hosts").and_then(JsonValue::as_array),
-    ) {
-        let mut best_host_score = 0usize;
-        for host_rule in hosts {
-            let Some(pattern) = host_rule.get("pattern").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let pattern_lc = pattern.to_ascii_lowercase();
-            if !glob_match(&pattern_lc, host) {
-                continue;
-            }
-            if !host_rule_allows_path(host_rule, path_lc) {
-                continue;
-            }
-            let host_score = non_wildcard_len(&pattern_lc) + 100;
-            best_host_score = best_host_score.max(host_score);
-        }
-        if best_host_score > 0 {
-            matched = true;
-            score += best_host_score;
-        }
-    }
-
-    if matched {
-        Some(score)
-    } else {
-        None
-    }
-}
-
-fn host_rule_allows_path(host_rule: &JsonValue, path_lc: &str) -> bool {
-    let Some(paths) = host_rule.get("paths") else {
-        return true;
-    };
-    let deny_exact = paths
-        .get("deny_exact")
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(JsonValue::as_str)
-        .map(|value| value.to_ascii_lowercase());
-    if deny_exact.into_iter().any(|deny| deny == path_lc) {
-        return false;
-    }
-
-    let deny_glob = paths
-        .get("deny_glob")
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(JsonValue::as_str)
-        .map(|value| value.to_ascii_lowercase());
-    if deny_glob.into_iter().any(|deny| glob_match(&deny, path_lc)) {
-        return false;
-    }
-
-    let allow = paths
-        .get("allow")
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(JsonValue::as_str)
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    if allow.is_empty() {
-        return true;
-    }
-    allow.iter().any(|allowed| glob_match(allowed, path_lc))
-}
-
-fn header_hint_matches(hint: &JsonValue, header_value_raw: &str) -> bool {
-    let header_lc = header_value_raw.to_ascii_lowercase();
-    match hint {
-        JsonValue::String(expected) => {
-            let expected_lc = expected.to_ascii_lowercase();
-            expected_lc.is_empty() || expected_lc == "*" || header_lc.contains(&expected_lc)
-        }
-        JsonValue::Bool(flag) => *flag,
-        JsonValue::Array(values) => values
-            .iter()
-            .any(|value| header_hint_matches(value, header_value_raw)),
-        JsonValue::Object(map) => {
-            if let Some(expected) = map.get("contains").and_then(JsonValue::as_str) {
-                return header_lc.contains(&expected.to_ascii_lowercase());
-            }
-            if let Some(expected) = map.get("equals").and_then(JsonValue::as_str) {
-                return header_lc == expected.to_ascii_lowercase();
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
-fn non_wildcard_len(pattern: &str) -> usize {
-    pattern.chars().filter(|ch| *ch != '*').count()
-}
-
-use crate::util::glob_match;
 
 fn is_openai_like_path(path: &str) -> bool {
     if path.contains("/v1/chat/completions")
@@ -385,30 +184,10 @@ fn is_cohere_like_path(path: &str) -> bool {
         || path.contains("/v1/embed")
 }
 
-/// Result of signal-based entity classification.
-#[derive(Debug, Clone)]
-pub struct ClassifyResult {
-    /// Matched entity identifier (provider_id or app_id).
-    pub entity_id: String,
-    /// Whether the match is a provider ("provider") or application ("application").
-    pub entity_kind: &'static str,
-    /// The matching rule that fired.
-    pub rule_id: String,
-    /// Priority of the matching rule (higher = more specific).
-    pub priority: u32,
-}
-
-/// Paired result returning the best provider AND best application match independently.
-#[derive(Debug, Clone, Default)]
-pub struct ClassifyPairResult {
-    pub provider: Option<ClassifyResult>,
-    pub application: Option<ClassifyResult>,
-}
-
 /// Classify a request using signal-based matching rules on providers and applications.
 ///
-/// Evaluates all matching rules across all entities, picking the highest-priority
-/// match. Falls back to `None` when no rules match (caller should use legacy detection).
+/// Thin wrapper over `soth_core::classify_request_pair` that adapts
+/// `DetectBundleSlice` provider/application iterators.
 pub fn classify_request(
     host: Option<&str>,
     path: &str,
@@ -427,7 +206,6 @@ pub fn classify_request(
         parent_process_name,
         bundle,
     );
-    // Return the single highest-priority match for backward compat.
     match (&pair.provider, &pair.application) {
         (Some(p), Some(a)) => {
             if p.priority >= a.priority {
@@ -443,7 +221,7 @@ pub fn classify_request(
 }
 
 /// Classify a request returning the best provider AND best application match
-/// independently. This allows both to be resolved from matching_rules in a single pass.
+/// independently. Delegates to `soth_core::classify_request_pair`.
 pub fn classify_request_pair(
     host: Option<&str>,
     path: &str,
@@ -453,198 +231,25 @@ pub fn classify_request_pair(
     parent_process_name: Option<&str>,
     bundle: &DetectBundleSlice<'_>,
 ) -> ClassifyPairResult {
-    let host_lc = host.map(|h| {
-        host_without_port(h)
-            .trim_end_matches('.')
-            .to_ascii_lowercase()
+    let providers = bundle.llm_providers.iter().map(|(key, entry)| {
+        let entity_id = entry.provider_id.as_deref().unwrap_or(key.as_str());
+        (key.as_str(), entity_id, entry.matching_rules.as_slice())
     });
-    let path_lc = path.to_ascii_lowercase();
-    let content_type = header_value(headers, "content-type").map(|v| v.to_ascii_lowercase());
+    let applications = bundle.products.iter().map(|(key, entry)| {
+        let entity_id = entry.app_id.as_deref().unwrap_or(key.as_str());
+        (key.as_str(), entity_id, entry.matching_rules.as_slice())
+    });
 
-    let mut best_provider: Option<ClassifyResult> = None;
-    let mut best_application: Option<ClassifyResult> = None;
-
-    // Evaluate provider matching rules.
-    for (provider_key, entry) in bundle.llm_providers.iter() {
-        let entity_id = entry
-            .provider_id
-            .as_deref()
-            .unwrap_or(provider_key.as_str());
-
-        for rule in &entry.matching_rules {
-            if rule_matches(
-                rule,
-                host_lc.as_deref(),
-                &path_lc,
-                headers,
-                content_type.as_deref(),
-                process_bundle_id,
-                process_name,
-                parent_process_name,
-            ) {
-                if best_provider
-                    .as_ref()
-                    .map_or(true, |b| rule.priority > b.priority)
-                {
-                    best_provider = Some(ClassifyResult {
-                        entity_id: entity_id.to_string(),
-                        entity_kind: "provider",
-                        rule_id: rule.rule_id.clone(),
-                        priority: rule.priority,
-                    });
-                }
-            }
-        }
-    }
-
-    // Evaluate application matching rules.
-    for (app_key, entry) in bundle.applications.iter() {
-        let entity_id = entry.app_id.as_deref().unwrap_or(app_key.as_str());
-
-        for rule in &entry.matching_rules {
-            if rule_matches(
-                rule,
-                host_lc.as_deref(),
-                &path_lc,
-                headers,
-                content_type.as_deref(),
-                process_bundle_id,
-                process_name,
-                parent_process_name,
-            ) {
-                if best_application
-                    .as_ref()
-                    .map_or(true, |b| rule.priority > b.priority)
-                {
-                    best_application = Some(ClassifyResult {
-                        entity_id: entity_id.to_string(),
-                        entity_kind: "application",
-                        rule_id: rule.rule_id.clone(),
-                        priority: rule.priority,
-                    });
-                }
-            }
-        }
-    }
-
-    ClassifyPairResult {
-        provider: best_provider,
-        application: best_application,
-    }
-}
-
-/// Evaluate whether a single matching rule fires against the given request context.
-fn rule_matches(
-    rule: &MatchingRule,
-    host_lc: Option<&str>,
-    path_lc: &str,
-    headers: &HeaderMap,
-    content_type: Option<&str>,
-    process_bundle_id: Option<&str>,
-    process_name: Option<&str>,
-    parent_process_name: Option<&str>,
-) -> bool {
-    if rule.signals.is_empty() {
-        return false;
-    }
-
-    if rule.requires_all {
-        // AND: every signal must match (respecting negation).
-        rule.signals.iter().all(|signal| {
-            let raw_match = signal_matches(
-                &signal.kind,
-                &signal.pattern,
-                host_lc,
-                path_lc,
-                headers,
-                content_type,
-                process_bundle_id,
-                process_name,
-                parent_process_name,
-            );
-            if signal.is_negated {
-                !raw_match
-            } else {
-                raw_match
-            }
-        })
-    } else {
-        // OR: any signal match suffices.
-        rule.signals.iter().any(|signal| {
-            let raw_match = signal_matches(
-                &signal.kind,
-                &signal.pattern,
-                host_lc,
-                path_lc,
-                headers,
-                content_type,
-                process_bundle_id,
-                process_name,
-                parent_process_name,
-            );
-            if signal.is_negated {
-                !raw_match
-            } else {
-                raw_match
-            }
-        })
-    }
-}
-
-/// Check if a single signal matches the request context.
-fn signal_matches(
-    kind: &SignalKind,
-    pattern: &str,
-    host_lc: Option<&str>,
-    path_lc: &str,
-    headers: &HeaderMap,
-    content_type: Option<&str>,
-    process_bundle_id: Option<&str>,
-    process_name: Option<&str>,
-    parent_process_name: Option<&str>,
-) -> bool {
-    let pattern_lc = pattern.to_ascii_lowercase();
-    match kind {
-        SignalKind::HttpHost => {
-            host_lc.map_or(false, |host| glob_match(&pattern_lc, host))
-        }
-        SignalKind::HttpPath => glob_match(&pattern_lc, path_lc),
-        SignalKind::HttpMethod => {
-            // Method comes from headers in our model (or could be passed separately).
-            // Check :method pseudo-header or fall back to common method header.
-            header_value(headers, ":method")
-                .map_or(false, |m| m.eq_ignore_ascii_case(pattern))
-        }
-        SignalKind::HttpHeader => {
-            // Pattern format: "header-name" (presence check) or "header-name:value" (value match).
-            if let Some((name, expected)) = pattern.split_once(':') {
-                header_value(headers, name.trim())
-                    .map_or(false, |v| v.to_ascii_lowercase().contains(&expected.trim().to_ascii_lowercase()))
-            } else {
-                header_value(headers, pattern.trim()).is_some()
-            }
-        }
-        SignalKind::ContentType => {
-            content_type.map_or(false, |ct| ct.contains(&pattern_lc))
-        }
-        SignalKind::TlsSni => {
-            // SNI is typically the same as the host for HTTPS connections.
-            host_lc.map_or(false, |host| glob_match(&pattern_lc, host))
-        }
-        SignalKind::ProcessBundleId => {
-            process_bundle_id.map_or(false, |bid| bid.eq_ignore_ascii_case(pattern))
-        }
-        SignalKind::ProcessName => {
-            process_name.map_or(false, |pn| pn.eq_ignore_ascii_case(pattern))
-        }
-        SignalKind::ParentProcessName => {
-            parent_process_name.map_or(false, |ppn| ppn.eq_ignore_ascii_case(pattern))
-        }
-        SignalKind::BodyStructure => {
-            // Body structure matching requires deeper inspection; skip at fingerprint stage.
-            false
-        }
-    }
+    soth_core::classify_request_pair(
+        host,
+        path,
+        headers,
+        process_bundle_id,
+        process_name,
+        parent_process_name,
+        providers,
+        applications,
+    )
 }
 
 fn provider_entry_to_format(provider_id: &str, entry: Option<&ProviderEntry>) -> DetectedFormat {
@@ -706,6 +311,7 @@ fn provider_entry_to_format(provider_id: &str, entry: Option<&ProviderEntry>) ->
 mod tests {
     use super::*;
     use crate::types::OwnedDetectBundle;
+    use soth_core::SignalKind;
     use std::collections::BTreeMap;
 
     fn bundle_fixture() -> OwnedDetectBundle {
@@ -983,9 +589,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        bundle.applications.insert(
+        bundle.products.insert(
             "claude".to_string(),
-            crate::types::ApplicationEntry {
+            crate::types::ProductEntry {
                 app_id: Some("claude".to_string()),
                 name: Some("Claude Web".to_string()),
                 api_format: Some("claude_web".to_string()),
@@ -1011,9 +617,9 @@ mod tests {
     #[test]
     fn app_entity_without_api_format_falls_to_heuristic() {
         let mut bundle = bundle_fixture();
-        bundle.applications.insert(
+        bundle.products.insert(
             "chatgpt".to_string(),
-            crate::types::ApplicationEntry {
+            crate::types::ProductEntry {
                 app_id: Some("chatgpt".to_string()),
                 name: Some("ChatGPT".to_string()),
                 api_format: None,
@@ -1048,9 +654,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        bundle.applications.insert(
+        bundle.products.insert(
             "codex".to_string(),
-            crate::types::ApplicationEntry {
+            crate::types::ProductEntry {
                 app_id: Some("codex".to_string()),
                 name: Some("OpenAI Codex".to_string()),
                 api_format: Some("codex_web".to_string()),
@@ -1123,9 +729,9 @@ mod tests {
     #[test]
     fn classify_request_matches_app_by_process_bundle_id() {
         let mut bundle = bundle_fixture();
-        bundle.applications.insert(
+        bundle.products.insert(
             "cursor".to_string(),
-            crate::types::ApplicationEntry {
+            crate::types::ProductEntry {
                 app_id: Some("cursor".to_string()),
                 name: Some("Cursor IDE".to_string()),
                 matching_rules: vec![soth_core::MatchingRule {
@@ -1354,9 +960,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        bundle.applications.insert(
+        bundle.products.insert(
             "chatgpt".to_string(),
-            crate::types::ApplicationEntry {
+            crate::types::ProductEntry {
                 app_id: Some("chatgpt".to_string()),
                 name: Some("ChatGPT".to_string()),
                 api_format: Some("chatgpt_web".to_string()),

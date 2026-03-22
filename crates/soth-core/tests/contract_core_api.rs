@@ -10,8 +10,8 @@ use soth_core::{
     ExtensionContext, ExtensionSource, FrameKind, GovernableEvent, NormalizedRequest,
     ParseConfidence, ParseSource, PolicyContext, PolicyDecisionKind, ProcessMatchKind,
     ProcessResolution, ProxyContext, RequestMethod, Session, SessionAppIdentity, SessionKey,
-    SessionMutations, SessionSnapshot, SocketFamily, TelemetryEvent, TelemetryPolicyKind,
-    TrafficClassification, UseCaseLabel, VolatilityClass,
+    SessionMutations, SessionSnapshot, SocketFamily, SurfaceType, TelemetryEvent,
+    TelemetryPolicyKind, TrafficClassification, UseCaseLabel, VolatilityClass,
 };
 
 fn sample_connection_meta() -> ConnectionMeta {
@@ -132,6 +132,12 @@ fn proxy_context_and_policy_context_semantic_extension_contract() {
         deployment_context: None,
         precomputed_commitment_nonce: None,
         precomputed_commitment_hash: None,
+        connection_id: None,
+        bundle_trust_level: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     };
     assert_eq!(proxy_ctx.org_id, "org-test");
     assert_eq!(proxy_ctx.capture_mode, CaptureMode::SensitiveArtifacts);
@@ -218,6 +224,19 @@ fn telemetry_event_surface_excludes_raw_content_fields() {
         collision_response_stability: None,
         commitment_hash: String::new(),
         code_fraction: 0.0,
+        actual_output_tokens: None,
+        finish_reason: None,
+        response_latency_ms: None,
+        ttfb_ms: None,
+        session_request_count: None,
+        session_total_tokens: None,
+        session_credential_alerts: None,
+        conversation_turn: None,
+        ws_turn_number: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     };
 
     let value = serde_json::to_value(event).expect("serialize telemetry event");
@@ -574,6 +593,19 @@ fn telemetry_event_new_fields_serde_roundtrip() {
         collision_response_stability: None,
         commitment_hash: String::new(),
         code_fraction: 0.0,
+        actual_output_tokens: None,
+        finish_reason: None,
+        response_latency_ms: None,
+        ttfb_ms: None,
+        session_request_count: None,
+        session_total_tokens: None,
+        session_credential_alerts: None,
+        conversation_turn: None,
+        ws_turn_number: None,
+        session_id: None,
+        product_id: None,
+        surface_type: SurfaceType::Unknown,
+        is_shadow_it: false,
     };
 
     let json = serde_json::to_string(&event).expect("serialize");

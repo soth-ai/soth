@@ -1,11 +1,7 @@
 use crate::types::NormalizedRequest;
-use sha2::{Digest, Sha256};
 
-pub fn sha256_hex(input: impl AsRef<[u8]>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_ref());
-    format!("{:x}", hasher.finalize())
-}
+// Re-export from soth-core (single authority for hashing).
+pub use soth_core::sha256_hex;
 
 pub fn hash_content(content: &str) -> String {
     sha256_hex(content.as_bytes())
@@ -14,7 +10,7 @@ pub fn hash_content(content: &str) -> String {
 pub fn canonical_hash(nr: &NormalizedRequest) -> String {
     let line = format!(
         "{}|{}|{}|{}|{}|{:.4}|{}|{}",
-        nr.provider.canonical_name(),
+        nr.provider,
         nr.model.as_deref().unwrap_or(""),
         nr.system_prompt_hash.as_deref().unwrap_or(""),
         nr.user_content_hash,
