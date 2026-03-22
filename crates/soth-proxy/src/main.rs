@@ -69,8 +69,11 @@ async fn main() -> Result<()> {
         let sync_config = config.sync_config();
         let (agent, telemetry_sink) =
             soth_sync::SyncAgent::new(sync_config, db.clone()).context("initialize sync agent")?;
-        let allow_registry_projection_install = !bundle_verification.verify_vendor_signature
-            && !bundle_verification.require_verified_bundle;
+        // Allow registry projection installs when verified bundles are not
+        // strictly required.  Registry-projected bundles don't carry a vendor
+        // signature, so they can't pass signature verification — but they are
+        // still useful for hot-reloading format/entity updates from the cloud.
+        let allow_registry_projection_install = !bundle_verification.require_verified_bundle;
         let install_hook = Arc::new(bundle_runtime::BundleWatcherInstallHook::new(
             bundle_watcher.clone(),
             allow_registry_projection_install,
