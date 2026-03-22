@@ -1,5 +1,2 @@
 [alias]
-bench-proxy = "bench -p soth-proxy --bench pipeline_bench --bench layer_microbench"
-bench-proxy-quick = "bench -p soth-proxy --bench layer_microbench -- --sample-size 20 --measurement-time 5"
-bench-proxy-full = "bench -p soth-proxy --bench pipeline_bench --bench layer_microbench -- --sample-size 60 --measurement-time 15"
 build-release = "build -p soth-cli --release"
