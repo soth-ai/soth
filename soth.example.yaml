@@ -2,25 +2,6 @@
 # Copy this file to soth.yaml and customize for your environment
 version: "1.0"
 
-# Server configuration
-server:
-  listen:
-    address: "127.0.0.1"
-    port: 3000
-  transport: "stdio"  # Options: stdio | sse | http
-
-# Upstream MCP server configuration
-# This is the server that SOTH proxies requests to
-upstream:
-  command: "npx"
-  args:
-    - "-y"
-    - "@modelcontextprotocol/server-filesystem"
-    - "/tmp"
-  # Alternative: spawn a custom server
-  # command: "python"
-  # args: ["-m", "my_mcp_server"]
-
 # Identity configuration
 # Controls cryptographic identity verification for agents
 identity:
@@ -49,7 +30,6 @@ observe:
   pii_detection: true      # Detect and redact PII in logs
   pii_scopes:
     ai_inference: true     # Direct provider/API inference traffic
-    mcp: true              # MCP JSON-RPC traffic
     agent_apps: true       # Agent app traffic (ChatGPT, Claude, etc.)
   log_requests: true       # Log inbound requests
   log_responses: true      # Log outbound responses
@@ -59,7 +39,6 @@ observe:
     path: "./logs/observations.db"
     retention:
       ai_proxy_days: 7
-      mcp_days: 7
       agent_app_days: 1
       clusters_days: 14
       rollups_days: 90
@@ -124,12 +103,6 @@ exchange_v2:
   upload_queue_max_items: 20000
   upload_queue_max_bytes: 536870912
   recover_inflight_on_start: true
-
-# Dashboard configuration
-# Real-time metrics dashboard with 4 panels
-dashboard:
-  enabled: true
-  port: 3001  # Dashboard will be available at http://localhost:3001
 
 # Forward Proxy configuration
 # HTTP/HTTPS proxy for intercepting AI provider traffic (OpenAI, Anthropic, Google)

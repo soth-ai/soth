@@ -9,7 +9,7 @@
 /// No synthetic heuristics — the bundle's own data is the ground truth.
 use bytes::Bytes;
 use serde_json::json;
-use soth_core::{ConnectionMeta, GatingBundle, OwnedDetectBundle, SocketFamily};
+use soth_core::{ConnectionMeta, GatingBundle, SocketFamily};
 use soth_detect::{build_registry, process_with_registry, RawRequest};
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4};

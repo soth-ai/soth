@@ -168,7 +168,7 @@ pub fn flatten_signals(entity: &NativeBundleEntity) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soth_interface::{NativeBundleCapture, NativeBundleRule, NativeBundleSignal};
+    use soth_interface::NativeBundleCapture;
 
     fn make_entity(
         slug: &str,

@@ -272,7 +272,6 @@ fn read_kv_sessions(
 mod tests {
     use super::*;
     use crate::playbook::*;
-    use std::collections::HashMap;
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
 

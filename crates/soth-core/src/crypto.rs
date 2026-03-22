@@ -82,8 +82,6 @@ mod tests {
     use super::*;
     use crate::artifacts::{ParseConfidence, ParseSource};
     use crate::normalized::{EndpointType, FormatMetadata, NormalizedRequest};
-    use crate::providers::DetectedProvider;
-
     #[test]
     fn commitment_hash_is_stable() {
         let nonce = [7u8; 32];

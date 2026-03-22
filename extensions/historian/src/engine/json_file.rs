@@ -315,7 +315,6 @@ fn collect_glob_segments(dir: &Path, segments: &[&str], out: &mut Vec<PathBuf>) 
 mod tests {
     use super::*;
     use crate::playbook::*;
-    use std::collections::HashMap;
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
 

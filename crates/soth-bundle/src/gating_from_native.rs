@@ -233,16 +233,6 @@ mod tests {
         }
     }
 
-    fn negated_signal(kind: &str, pattern: &str) -> NativeBundleSignal {
-        NativeBundleSignal {
-            kind: kind.into(),
-            name: None,
-            pattern: pattern.into(),
-            is_negated: true,
-            metadata: serde_json::Value::Null,
-        }
-    }
-
     fn rule(signals: Vec<NativeBundleSignal>) -> NativeBundleRule {
         NativeBundleRule {
             rule_id: uuid::Uuid::new_v4().to_string(),
