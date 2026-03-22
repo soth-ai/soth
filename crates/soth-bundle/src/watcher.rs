@@ -159,6 +159,29 @@ mod tests {
         serde_json::to_vec(&envelope).expect("serialize envelope")
     }
 
+    fn empty_native_bundle_bytes() -> Vec<u8> {
+        serde_json::to_vec(&soth_interface::NativeBundle {
+            schema_version: 4,
+            metadata: soth_interface::NativeBundleMetadata {
+                version: "test".into(), compiled_at: "2026-01-01T00:00:00Z".into(),
+                compiled_by: "test".into(), notes: None, vendor_count: 0,
+                llm_provider_count: 0, product_count: 0, rule_count: 0,
+                format_count: 0, filter_count: 0, settings_count: 0,
+                entity_count: 0, tool_catalog_count: 0,
+            },
+            vendors: vec![], llm_providers: vec![], products: vec![],
+            formats: vec![], filters: vec![], settings: vec![],
+            domain_index: Default::default(), entities: vec![], tool_catalog: vec![],
+        }).expect("native bundle json")
+    }
+
+    fn test_assets() -> HashMap<String, Vec<u8>> {
+        HashMap::from([
+            ("policy/policy_bundle.json".to_string(), signed_policy_bundle_bytes()),
+            ("detect/bundle.json".to_string(), empty_native_bundle_bytes()),
+        ])
+    }
+
     fn signed_manifest_bytes(
         version: &str,
         assets: &HashMap<String, Vec<u8>>,
@@ -198,10 +221,7 @@ mod tests {
         let vendor = SigningKey::from_bytes(&[41u8; 32]);
         let org = OrgSignedConfig::default();
 
-        let initial_assets = HashMap::from([(
-            "policy/policy_bundle.json".to_string(),
-            signed_policy_bundle_bytes(),
-        )]);
+        let initial_assets = test_assets();
         let initial_manifest = signed_manifest_bytes("bundle-v1", &initial_assets, &vendor);
         let initial = loader::load_from_bytes(
             initial_manifest.as_slice(),
@@ -222,10 +242,7 @@ mod tests {
         )
         .expect("watcher");
 
-        let next_assets = HashMap::from([(
-            "policy/policy_bundle.json".to_string(),
-            signed_policy_bundle_bytes(),
-        )]);
+        let next_assets = test_assets();
         let next_manifest = signed_manifest_bytes("bundle-v2", &next_assets, &vendor);
         watcher
             .install(next_manifest.as_slice(), next_assets)
@@ -240,10 +257,7 @@ mod tests {
         let vendor = SigningKey::from_bytes(&[42u8; 32]);
         let org = OrgSignedConfig::default();
 
-        let assets = HashMap::from([(
-            "policy/policy_bundle.json".to_string(),
-            signed_policy_bundle_bytes(),
-        )]);
+        let assets = test_assets();
         let manifest = signed_manifest_bytes("bundle-v1", &assets, &vendor);
         let initial = loader::load_from_bytes(
             manifest.as_slice(),
@@ -264,10 +278,10 @@ mod tests {
         )
         .expect("watcher");
 
-        let bad_assets = HashMap::from([(
-            "policy/policy_bundle.json".to_string(),
-            b"tampered".to_vec(),
-        )]);
+        let bad_assets = HashMap::from([
+            ("policy/policy_bundle.json".to_string(), b"tampered".to_vec()),
+            ("detect/bundle.json".to_string(), empty_native_bundle_bytes()),
+        ]);
         let bad_manifest = signed_manifest_bytes("bundle-v2", &bad_assets, &vendor);
         let err = watcher.install(bad_manifest.as_slice(), bad_assets);
         assert!(err.is_err());
@@ -279,10 +293,7 @@ mod tests {
         let vendor = SigningKey::from_bytes(&[43u8; 32]);
         let org = OrgSignedConfig::default();
 
-        let initial_assets = HashMap::from([(
-            "policy/policy_bundle.json".to_string(),
-            signed_policy_bundle_bytes(),
-        )]);
+        let initial_assets = test_assets();
         let initial_manifest = signed_manifest_bytes("bundle-v1", &initial_assets, &vendor);
         let initial = loader::load_from_bytes(
             initial_manifest.as_slice(),
@@ -306,10 +317,7 @@ mod tests {
 
         drop(handle);
 
-        let next_assets = HashMap::from([(
-            "policy/policy_bundle.json".to_string(),
-            signed_policy_bundle_bytes(),
-        )]);
+        let next_assets = test_assets();
         let next_manifest = signed_manifest_bytes("bundle-v2", &next_assets, &vendor);
 
         let result = watcher.install(next_manifest.as_slice(), next_assets);

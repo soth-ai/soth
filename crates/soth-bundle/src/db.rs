@@ -152,6 +152,8 @@ mod tests {
             }),
             detect: Arc::new(soth_core::OwnedDetectBundle::default()),
             gating: Arc::new(soth_core::GatingBundle::default()),
+            env_index: Arc::new(soth_core::EnvIndex::default()),
+            entity_index: Arc::new(soth_core::EntityIndex::build(vec![])),
             manifest,
         }
     }

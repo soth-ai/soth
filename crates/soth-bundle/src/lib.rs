@@ -8,7 +8,13 @@ mod scope_check;
 mod verify;
 mod watcher;
 #[cfg(feature = "native-bundle")]
+pub mod entity_helpers;
+#[cfg(feature = "native-bundle")]
 pub mod entity_index;
+#[cfg(feature = "native-bundle")]
+mod gating_from_native;
+#[cfg(feature = "native-bundle")]
+mod detect_from_native;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -25,6 +31,12 @@ pub use crate::scope_check::check_scope;
 pub use crate::watcher::{BundleHandle, BundleWatcher};
 #[cfg(feature = "native-bundle")]
 pub use crate::entity_index::entity_index_from_native;
+#[cfg(feature = "native-bundle")]
+pub use crate::gating_from_native::gating_from_native;
+#[cfg(feature = "native-bundle")]
+pub use crate::detect_from_native::detect_from_native;
+#[cfg(feature = "native-bundle")]
+pub use soth_interface::NativeBundle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerificationOptions {
@@ -67,6 +79,10 @@ pub struct LoadedBundle {
     pub policy: Arc<soth_policy::sync_policy::PolicyBundle>,
     pub detect: Arc<soth_core::OwnedDetectBundle>,
     pub gating: Arc<soth_core::GatingBundle>,
+    pub env_index: Arc<soth_core::EnvIndex>,
+    /// Pre-built entity index for O(1) product/provider identity resolution.
+    /// Built from NativeBundle.entities at bundle load time.
+    pub entity_index: Arc<soth_core::EntityIndex>,
     pub manifest: BundleManifest,
 }
 

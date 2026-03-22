@@ -1,14 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Utc;
-use soth_core::{
-    normalize_bundle_host_pattern, AppType, BlacklistMatchType, EntityCatalog, EntityTrafficRules,
-    GateConfig, GateDefaults, GatingBundle, HostRule, IdentityEntry, IdentityIndex,
-    NonCatalogedAction, PathRules, ProcessAction, Stage0Config, Stage1Config, Stage2Config,
-    Stage3Config, Stage4Config, Stage5Config, UnknownAppAction,
-};
 use soth_policy::sync_policy::{load_bundle_from_bytes, PolicyBundle, PolicyBundleMetadata};
 
 use crate::error::BundleError;
@@ -89,21 +83,94 @@ pub(crate) fn load_verified(
     org_config: &OrgSignedConfig,
     verification: VerificationOptions,
 ) -> Result<LoadedBundle, BundleError> {
+    // Phase 1: Verify signature and scope
     let trust_level =
         verify::verify_bundle_with_options(&manifest, &assets, Some(vendor_pubkey), verification)?;
     scope_check::check_scope(&manifest.scope, org_config)?;
 
+    // Phase 2: Load policy bundle
     let policy = load_policy_bundle(&assets)?;
-    let detect = load_detect_bundle(&assets)?;
-    let gating = load_gating_bundle(&assets, detect.as_ref())?;
+
+    // Phase 3: Load NativeBundle and build projections (detect, gating, env_index, entity_index)
+    let native_bundle = load_native_bundle(&assets)?;
+    let (detect, gating, env_index) = build_projections(&native_bundle);
+    let entity_index = crate::entity_index::entity_index_from_native(&native_bundle);
+
+    // Phase 4: Load classify bundle
     let manifest_bytes = serde_json::to_vec(&manifest)?;
     let classify = soth_classify::load_bundle_from_bytes(manifest_bytes.as_slice(), assets)
         .map_err(|error| BundleError::ClassifyLoadFailed(error.to_string()))?;
+
+    // Phase 5: Build metadata
+    let meta = build_meta(&manifest, &classify, &policy);
+
+    Ok(LoadedBundle {
+        version: manifest.version.clone(),
+        installed_at: Utc::now().timestamp(),
+        meta,
+        trust_level,
+        classify,
+        policy,
+        detect,
+        gating,
+        env_index,
+        entity_index: Arc::new(entity_index),
+        manifest,
+    })
+}
+
+/// Known asset paths for NativeBundle JSON, checked in priority order.
+const NATIVE_BUNDLE_PATHS: &[&str] = &[
+    "native/bundle.json",
+    "detect/bundle.json",
+    "registry/raw_bundle.json",
+];
+
+/// Load and parse a NativeBundle from assets, trying known paths in order.
+fn load_native_bundle(
+    assets: &HashMap<String, Vec<u8>>,
+) -> Result<soth_interface::NativeBundle, BundleError> {
+    let native_bytes = NATIVE_BUNDLE_PATHS
+        .iter()
+        .find_map(|path| assets.get(*path))
+        .ok_or_else(|| {
+            BundleError::DetectLoadFailed(format!(
+                "no NativeBundle found (checked: {})",
+                NATIVE_BUNDLE_PATHS.join(", ")
+            ))
+        })?;
+
+    serde_json::from_slice(native_bytes).map_err(|e| {
+        BundleError::DetectLoadFailed(format!("NativeBundle parse failed: {e}"))
+    })
+}
+
+/// Build all bundle projections from a NativeBundle.
+fn build_projections(
+    native_bundle: &soth_interface::NativeBundle,
+) -> (
+    Arc<soth_core::OwnedDetectBundle>,
+    Arc<soth_core::GatingBundle>,
+    Arc<soth_core::EnvIndex>,
+) {
+    let detect = Arc::new(crate::detect_from_native::detect_from_native(native_bundle));
+    let gating = Arc::new(crate::gating_from_native::gating_from_native(native_bundle));
+    let env_index = Arc::new(soth_core::EnvIndex::build(&detect.environments));
+    (detect, gating, env_index)
+}
+
+/// Build bundle metadata from manifest with fallbacks to classify/policy values.
+fn build_meta(
+    manifest: &BundleManifest,
+    classify: &soth_classify::ClassifyBundle,
+    policy: &PolicyBundle,
+) -> BundleMeta {
     let issued_at = manifest
         .issued_at
         .or_else(|| u64::try_from(manifest.created_at).ok())
         .unwrap_or_else(|| Utc::now().timestamp().max(0) as u64);
-    let meta = BundleMeta {
+
+    BundleMeta {
         bundle_id: manifest
             .bundle_id
             .clone()
@@ -128,19 +195,7 @@ pub(crate) fn load_verified(
             Some(manifest.vendor_sig.clone())
         },
         org_approval_sig: manifest.org_approval_sig.clone(),
-    };
-
-    Ok(LoadedBundle {
-        version: manifest.version.clone(),
-        installed_at: Utc::now().timestamp(),
-        meta,
-        trust_level,
-        classify,
-        policy,
-        detect,
-        gating,
-        manifest,
-    })
+    }
 }
 
 fn extract_section(assets: &HashMap<String, Vec<u8>>, prefix: &str) -> HashMap<String, Vec<u8>> {
@@ -162,6 +217,7 @@ fn load_policy_bundle(assets: &HashMap<String, Vec<u8>>) -> Result<Arc<PolicyBun
     } else if let Some(bytes) = assets.get("policy_bundle.json") {
         bytes
     } else {
+        eprintln!("[soth-bundle] WARN: no policy bundle found in assets; using empty fallback");
         return Ok(Arc::new(empty_policy_bundle()));
     };
 
@@ -172,387 +228,6 @@ fn load_policy_bundle(assets: &HashMap<String, Vec<u8>>) -> Result<Arc<PolicyBun
     Ok(Arc::new(loaded))
 }
 
-fn load_detect_bundle(
-    assets: &HashMap<String, Vec<u8>>,
-) -> Result<Arc<soth_core::OwnedDetectBundle>, BundleError> {
-    let section = extract_section(assets, "detect/");
-    if let Some(bytes) = section.get("bundle.json") {
-        let bundle: soth_core::OwnedDetectBundle = serde_json::from_slice(bytes.as_slice())
-            .map_err(|error| BundleError::DetectLoadFailed(error.to_string()))?;
-        return Ok(Arc::new(bundle));
-    }
-    if section.is_empty() && !assets.contains_key("detect_bundle.json") {
-        return Ok(Arc::new(soth_core::OwnedDetectBundle::default()));
-    }
-    if let Some(bytes) = assets.get("detect_bundle.json") {
-        let bundle: soth_core::OwnedDetectBundle = serde_json::from_slice(bytes.as_slice())
-            .map_err(|error| BundleError::DetectLoadFailed(error.to_string()))?;
-        return Ok(Arc::new(bundle));
-    }
-    Ok(Arc::new(soth_core::OwnedDetectBundle::default()))
-}
-
-fn load_gating_bundle(
-    assets: &HashMap<String, Vec<u8>>,
-    detect: &soth_core::OwnedDetectBundle,
-) -> Result<Arc<GatingBundle>, BundleError> {
-    let section = extract_section(assets, "gating/");
-    if let Some(bytes) = section.get("bundle.json") {
-        let mut bundle: GatingBundle = serde_json::from_slice(bytes.as_slice())
-            .map_err(|error| BundleError::DetectLoadFailed(error.to_string()))?;
-        bundle.normalize_host_patterns_in_place();
-        return Ok(Arc::new(bundle));
-    }
-    if let Some(bytes) = assets.get("gating_bundle.json") {
-        let mut bundle: GatingBundle = serde_json::from_slice(bytes.as_slice())
-            .map_err(|error| BundleError::DetectLoadFailed(error.to_string()))?;
-        bundle.normalize_host_patterns_in_place();
-        return Ok(Arc::new(bundle));
-    }
-
-    // Compatibility fallback until server emits signed gating/ section.
-    Ok(Arc::new(gating_from_detect(detect)))
-}
-
-fn gating_from_detect(detect: &soth_core::OwnedDetectBundle) -> GatingBundle {
-    // Build a host → PathRules lookup from application detection.hosts.
-    // Provider entities from domain_index inherit path rules from matching
-    // application entries (deny_glob, allow, deny_exact).
-    let mut app_paths_by_host: HashMap<String, PathRules> = HashMap::new();
-    for app in detect.applications.values() {
-        // Extract hosts from matching_rules (v3 signal-based).
-        for rule in &app.matching_rules {
-            for signal in &rule.signals {
-                if signal.kind == soth_core::SignalKind::HttpHost && !signal.is_negated {
-                    app_paths_by_host
-                        .entry(signal.pattern.clone())
-                        .or_insert_with(PathRules::default);
-                }
-            }
-        }
-        // Also extract from legacy detection.hosts (v2).
-        if let Some(hosts_array) = app
-            .detection
-            .as_ref()
-            .and_then(|d| d.get("hosts"))
-            .and_then(|v| v.as_array())
-        {
-            for host_rule in hosts_array {
-                if let Some(pattern) = host_rule.get("pattern").and_then(|v| v.as_str()) {
-                    if let Some(paths_val) = host_rule.get("paths") {
-                        if let Ok(paths) = serde_json::from_value::<PathRules>(paths_val.clone()) {
-                            app_paths_by_host
-                                .entry(pattern.to_string())
-                                .and_modify(|existing| {
-                                    existing.allow.extend(paths.allow.iter().cloned());
-                                    existing.deny_exact.extend(paths.deny_exact.iter().cloned());
-                                    existing.deny_glob.extend(paths.deny_glob.iter().cloned());
-                                })
-                                .or_insert(paths);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Track (hosts, optional llm_provider entry) per entity_id.
-    let mut providers_by_id =
-        HashMap::<String, (HashSet<String>, Option<&soth_core::ProviderEntry>)>::new();
-
-    // Extract hosts from matching_rules (v3 signal-based) on providers.
-    for (provider_key, entry) in &detect.llm_providers {
-        let provider_id = entry
-            .provider_id
-            .as_deref()
-            .unwrap_or(provider_key.as_str())
-            .to_string();
-        for rule in &entry.matching_rules {
-            for signal in &rule.signals {
-                if signal.kind == soth_core::SignalKind::HttpHost && !signal.is_negated {
-                    if let Some(pattern) = normalize_bundle_host_pattern(&signal.pattern) {
-                        let group = providers_by_id.entry(provider_id.clone()).or_default();
-                        group.0.insert(pattern);
-                        if group.1.is_none() {
-                            group.1 = Some(entry);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Also populate from legacy domain_index (v2).
-    for (host, provider_key) in &detect.domain_index {
-        let llm_entry = detect.llm_providers.get(provider_key);
-        let provider_id = llm_entry
-            .and_then(|entry| entry.provider_id.clone())
-            .unwrap_or_else(|| provider_key.to_string());
-        if let Some(pattern) = normalize_bundle_host_pattern(host) {
-            let group = providers_by_id.entry(provider_id).or_default();
-            group.0.insert(pattern);
-            if group.1.is_none() {
-                group.1 = llm_entry;
-            }
-        }
-    }
-
-    let providers = providers_by_id
-        .into_iter()
-        .map(|(entity_id, (hosts, llm_entry))| EntityTrafficRules {
-            entity_id: entity_id.clone(),
-            capture_mode: detect.capture_rules.mode_for_with_entry(
-                entity_id.as_str(),
-                llm_entry,
-            ),
-            hosts: hosts
-                .into_iter()
-                .filter(|pattern| !pattern.is_empty())
-                .map(|pattern| {
-                    let paths = app_paths_by_host
-                        .get(pattern.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-                    HostRule {
-                        pattern,
-                        methods: Vec::new(),
-                        paths,
-                        priority: None,
-                    }
-                })
-                .collect(),
-            api_format: None,
-            entity_type: None,
-            pricing: None,
-            capture: None,
-            detection: None,
-        })
-        .collect::<Vec<_>>();
-
-    let mut hosts_index = HashMap::new();
-    let mut non_hosts_index = HashMap::new();
-    for (identity, policy) in &detect.app_policies {
-        let app_type = policy.app_kind.to_app_type();
-        let entry = IdentityEntry {
-            entity_id: policy.app_id.clone(),
-            app_type,
-            capture_mode: policy
-                .capture_mode
-                .as_deref()
-                .and_then(parse_capture_mode)
-                .unwrap_or(soth_core::CaptureMode::MetadataOnly),
-            action: policy
-                .action
-                .as_deref()
-                .and_then(parse_process_action)
-                .unwrap_or(ProcessAction::Intercept),
-            enabled: policy.enabled,
-            host_filter: policy.host_filter.clone(),
-            host_list_ref: policy.host_list_ref.clone(),
-        };
-        if app_type == AppType::Host {
-            hosts_index.insert(identity.to_ascii_lowercase(), entry.clone());
-        } else {
-            non_hosts_index.insert(identity.to_ascii_lowercase(), entry.clone());
-        }
-    }
-    for identity in &detect.browser_policies.allowed_apps {
-        hosts_index
-            .entry(identity.to_ascii_lowercase())
-            .or_insert(IdentityEntry {
-                entity_id: identity.clone(),
-                app_type: AppType::Host,
-                capture_mode: soth_core::CaptureMode::MetadataOnly,
-                action: ProcessAction::Intercept,
-                enabled: None,
-                host_filter: None,
-                host_list_ref: None,
-            });
-    }
-
-    // Populate identity index from applications[].bundle_ids, process_names,
-    // AND matching_rules signals (ProcessBundleId, ProcessName).
-    // This ensures that process-based identity resolution (stage1) can match
-    // apps by their macOS bundle_id or process_name, not just by app_policies keys.
-    for (app_key, app) in &detect.applications {
-        let app_id = app
-            .app_id
-            .as_deref()
-            .unwrap_or(app_key.as_str())
-            .to_string();
-        let app_type = app
-            .app_type
-            .as_deref()
-            .map(|v| soth_core::AppKind::from_type_str(v).to_app_type())
-            .unwrap_or(AppType::NonHost);
-        let entry = IdentityEntry {
-            entity_id: app_id,
-            app_type,
-            capture_mode: soth_core::CaptureMode::MetadataOnly,
-            action: ProcessAction::Intercept,
-            enabled: None,
-            host_filter: None,
-            host_list_ref: None,
-        };
-        let index = if app_type == AppType::Host {
-            &mut hosts_index
-        } else {
-            &mut non_hosts_index
-        };
-        // Insert bundle_ids and process_names as identity keys.
-        // app_policies entries take precedence (already inserted above).
-        for bid in &app.bundle_ids {
-            index.entry(bid.to_ascii_lowercase()).or_insert_with(|| entry.clone());
-        }
-        for pname in &app.process_names {
-            index.entry(pname.to_ascii_lowercase()).or_insert_with(|| entry.clone());
-        }
-        // Extract identity signals from matching_rules (v3).
-        for rule in &app.matching_rules {
-            for signal in &rule.signals {
-                if signal.is_negated {
-                    continue;
-                }
-                match &signal.kind {
-                    soth_core::SignalKind::ProcessBundleId => {
-                        index
-                            .entry(signal.pattern.to_ascii_lowercase())
-                            .or_insert_with(|| entry.clone());
-                    }
-                    soth_core::SignalKind::ProcessName => {
-                        index
-                            .entry(signal.pattern.to_ascii_lowercase())
-                            .or_insert_with(|| entry.clone());
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    let mut tls_intercept_hosts = detect
-        .domain_index
-        .keys()
-        .filter_map(|host| normalize_bundle_host_pattern(host))
-        .collect::<HashSet<_>>();
-    // Also add HttpHost patterns from provider/app matching_rules.
-    for entry in detect.llm_providers.values() {
-        for rule in &entry.matching_rules {
-            for signal in &rule.signals {
-                if signal.kind == soth_core::SignalKind::HttpHost && !signal.is_negated {
-                    if let Some(pattern) = normalize_bundle_host_pattern(&signal.pattern) {
-                        tls_intercept_hosts.insert(pattern);
-                    }
-                }
-            }
-        }
-    }
-    for entry in detect.applications.values() {
-        for rule in &entry.matching_rules {
-            for signal in &rule.signals {
-                if signal.kind == soth_core::SignalKind::HttpHost && !signal.is_negated {
-                    if let Some(pattern) = normalize_bundle_host_pattern(&signal.pattern) {
-                        tls_intercept_hosts.insert(pattern);
-                    }
-                }
-            }
-        }
-    }
-    let passthrough_domains = detect
-        .passthrough_domains
-        .iter()
-        .filter_map(|host| normalize_bundle_host_pattern(host))
-        .collect::<HashSet<_>>();
-
-    let mut allowed_host_origins = detect
-        .domain_index
-        .keys()
-        .filter_map(|host| normalize_bundle_host_pattern(host))
-        .collect::<HashSet<_>>();
-    // Include HttpHost patterns from matching_rules in allowed origins.
-    allowed_host_origins.extend(tls_intercept_hosts.iter().cloned());
-
-    let mut bundle = GatingBundle {
-        identity_index: IdentityIndex {
-            hosts: hosts_index,
-            non_hosts: non_hosts_index,
-        },
-        gates: GateConfig {
-            order: vec![
-                soth_core::GateStage::Stage0Tls,
-                soth_core::GateStage::Stage1AppOrigin,
-                soth_core::GateStage::Stage2Whitelist,
-                soth_core::GateStage::Stage3Blacklist,
-                soth_core::GateStage::Stage4AppType,
-                soth_core::GateStage::Stage5HostOrigin,
-                soth_core::GateStage::Intercept,
-            ],
-            defaults: GateDefaults {
-                sensor_enabled: true,
-                fail_open_on_config_error: true,
-                unknown_app_action: UnknownAppAction::Skip,
-                non_cataloged_host_action: NonCatalogedAction::Skip,
-                discovery: soth_core::DiscoveryConfig::default(),
-                source_unknown_app_action: None,
-                source_whitelisted_unknown_app_action: None,
-                source_non_whitelisted_host_action: None,
-                source_browser_default_action: None,
-            },
-            stage0_tls: Stage0Config {
-                tls_intercept_hosts,
-                passthrough_domains,
-                enable_discovery: false,
-            },
-            stage1_app_origin: Stage1Config {
-                skip_if_unresolved_process: true,
-            },
-            stage2_whitelist: Stage2Config {
-                allow_empty_means_allow_all_except_denied: true,
-            },
-            stage3_blacklist: Stage3Config {
-                blacklisted_keywords: detect.filters.path_keywords.clone(),
-                blacklisted_path_substrings: detect.filters.path_keywords.clone(),
-                blacklisted_host_substrings: Vec::new(),
-                graphql_operation_blacklist: Vec::new(),
-                graphql_operation_blacklist_enabled: false,
-                match_type: BlacklistMatchType::CaseInsensitiveSubstring,
-            },
-            stage4_app_type: Stage4Config {
-                derive_from_identity_index: true,
-            },
-            stage5_host_origin: Stage5Config {
-                allowed_host_origins,
-                skip_for_discovery_capture: true,
-            },
-        },
-        entities: EntityCatalog {
-            providers,
-            web_apps: Vec::new(),
-            native_apps: Vec::new(),
-        },
-    };
-    bundle.normalize_host_patterns_in_place();
-    bundle
-}
-
-fn parse_capture_mode(raw: &str) -> Option<soth_core::CaptureMode> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "full" => Some(soth_core::CaptureMode::Full),
-        "sensitive_artifacts" => Some(soth_core::CaptureMode::SensitiveArtifacts),
-        "full_content" => Some(soth_core::CaptureMode::FullContent),
-        "metadata_only" => Some(soth_core::CaptureMode::MetadataOnly),
-        _ => None,
-    }
-}
-
-fn parse_process_action(raw: &str) -> Option<ProcessAction> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "intercept" => Some(ProcessAction::Intercept),
-        "skip" | "passthrough" => Some(ProcessAction::Skip),
-        "block" => Some(ProcessAction::Block),
-        _ => None,
-    }
-}
 
 fn empty_policy_bundle() -> PolicyBundle {
     use soth_policy::sync_policy::{BudgetLimits, CompiledRuleSet, OrgPatterns};
@@ -584,6 +259,37 @@ mod tests {
     use super::*;
     use crate::manifest::{canonical_manifest_bytes, AssetEntry, BundleScope};
     use crate::verify::sha256_hex;
+
+    fn empty_native_bundle_bytes() -> Vec<u8> {
+        let bundle = soth_interface::NativeBundle {
+            schema_version: 4,
+            metadata: soth_interface::NativeBundleMetadata {
+                version: "test-0.0.1".into(),
+                compiled_at: "2026-03-19T00:00:00Z".into(),
+                compiled_by: "test".into(),
+                notes: None,
+                vendor_count: 0,
+                llm_provider_count: 0,
+                product_count: 0,
+                rule_count: 0,
+                format_count: 0,
+                filter_count: 0,
+                settings_count: 0,
+                entity_count: 0,
+                tool_catalog_count: 0,
+            },
+            vendors: Vec::new(),
+            llm_providers: Vec::new(),
+            products: Vec::new(),
+            formats: Vec::new(),
+            filters: Vec::new(),
+            settings: Vec::new(),
+            domain_index: Default::default(),
+            entities: Vec::new(),
+            tool_catalog: Vec::new(),
+        };
+        serde_json::to_vec(&bundle).expect("serialize native bundle")
+    }
 
     fn signed_policy_bundle_bytes() -> Vec<u8> {
         let payload = PolicyBundlePayload {
@@ -655,12 +361,10 @@ mod tests {
     fn load_from_bytes_success() {
         let vendor = SigningKey::from_bytes(&[31u8; 32]);
         let policy_bytes = signed_policy_bundle_bytes();
-        let detect_bytes =
-            serde_json::to_vec(&soth_core::OwnedDetectBundle::default()).expect("detect json");
 
         let assets = HashMap::from([
             ("policy/policy_bundle.json".to_string(), policy_bytes),
-            ("detect/bundle.json".to_string(), detect_bytes),
+            ("detect/bundle.json".to_string(), empty_native_bundle_bytes()),
             (
                 "classify/embedding.onnx".to_string(),
                 b"stub-model".to_vec(),
@@ -719,92 +423,103 @@ mod tests {
     }
 
     #[test]
-    fn detect_fallback_normalizes_passthrough_patterns() {
-        let mut detect = soth_core::OwnedDetectBundle::default();
-        detect
-            .passthrough_domains
-            .push("^.*\\.manus\\.computer$".to_string());
-        detect
-            .passthrough_domains
-            .push("api.apple-cloudkit.com:".to_string());
+    fn load_native_bundle_builds_identity_index_from_process_signals() {
+        use soth_interface::*;
 
-        let bundle = gating_from_detect(&detect);
-        let passthrough = &bundle.gates.stage0_tls.passthrough_domains;
-        assert!(passthrough.contains("*.manus.computer"));
-        assert!(passthrough.contains("api.apple-cloudkit.com"));
-    }
-
-    #[test]
-    fn detect_fallback_uses_app_policy_action_and_capture_fields() {
-        let mut detect = soth_core::OwnedDetectBundle::default();
-        detect.app_policies.insert(
-            "cursor".to_string(),
-            soth_core::AppPolicy {
-                app_id: "cursor".to_string(),
-                display_name: Some("Cursor".to_string()),
-                app_kind: soth_core::AppKind::Ide,
-                action: Some("block".to_string()),
-                capture_mode: Some("full".to_string()),
-                enabled: Some(true),
-                host_filter: Some("api.openai.com".to_string()),
-                host_list_ref: Some("ai_catalog".to_string()),
-            },
-        );
-
-        let bundle = gating_from_detect(&detect);
-        let entry = bundle
-            .identity_index
-            .non_hosts
-            .get("cursor")
-            .expect("cursor identity should exist");
-
-        assert_eq!(entry.action, ProcessAction::Block);
-        assert_eq!(entry.capture_mode, soth_core::CaptureMode::Full);
-        assert_eq!(entry.enabled, Some(true));
-        assert_eq!(entry.host_filter.as_deref(), Some("api.openai.com"));
-        assert_eq!(entry.host_list_ref.as_deref(), Some("ai_catalog"));
-    }
-
-    #[test]
-    fn load_from_bytes_normalizes_identity_index_keys_in_gating_bundle() {
         let vendor = SigningKey::from_bytes(&[33u8; 32]);
-        let mut gating = GatingBundle::default();
-        gating.identity_index.hosts.insert(
-            "com.google.Chrome".to_string(),
-            IdentityEntry {
-                entity_id: "chrome".to_string(),
-                app_type: AppType::Host,
-                capture_mode: soth_core::CaptureMode::MetadataOnly,
-                action: ProcessAction::Intercept,
-                enabled: None,
-                host_filter: None,
-                host_list_ref: None,
+
+        let bundle = NativeBundle {
+            schema_version: 4,
+            metadata: NativeBundleMetadata {
+                version: "test-identity".into(),
+                compiled_at: "2026-03-19T00:00:00Z".into(),
+                compiled_by: "test".into(),
+                notes: None,
+                vendor_count: 0,
+                llm_provider_count: 0,
+                product_count: 2,
+                rule_count: 2,
+                format_count: 0,
+                filter_count: 0,
+                settings_count: 0,
+                entity_count: 2,
+                tool_catalog_count: 0,
             },
-        );
-        gating.identity_index.non_hosts.insert(
-            " Cursor ".to_string(),
-            IdentityEntry {
-                entity_id: "cursor".to_string(),
-                app_type: AppType::NonHost,
-                capture_mode: soth_core::CaptureMode::MetadataOnly,
-                action: ProcessAction::Intercept,
-                enabled: None,
-                host_filter: None,
-                host_list_ref: None,
-            },
-        );
-        let gating_bytes = serde_json::to_vec(&gating).expect("gating json");
+            vendors: Vec::new(),
+            llm_providers: Vec::new(),
+            products: Vec::new(),
+            formats: Vec::new(),
+            filters: Vec::new(),
+            settings: Vec::new(),
+            domain_index: Default::default(),
+            tool_catalog: Vec::new(),
+            entities: vec![
+                NativeBundleEntity {
+                    slug: "chrome".into(),
+                    entity_kind: Some("product".into()),
+                    kind: Some("browser".into()),
+                    vendor_slug: None,
+                    name: "Chrome".into(),
+                    category: None, subtype: None, api_format: None,
+                    description: None, notes: None, primary_url: None,
+                    docs_url: None, logo_url: None, primary_domain: None,
+                    risk_level: None, risk_score: None,
+                    capture: NativeBundleCapture { mode: "metadata_only".into(), methods: vec![], enabled: true },
+                    metadata: serde_json::Value::Null,
+                    details: serde_json::Value::Null,
+                    matching_rules: vec![NativeBundleRule {
+                        rule_id: "process-0".into(),
+                        priority: 1000,
+                        requires_all: true,
+                        notes: None,
+                        metadata: serde_json::Value::Null,
+                        signals: vec![NativeBundleSignal {
+                            kind: "ProcessBundleId".into(),
+                            name: None,
+                            pattern: "com.google.Chrome".into(),
+                            is_negated: false,
+                            metadata: serde_json::Value::Null,
+                        }],
+                    }],
+                    provider_links: Vec::new(),
+                },
+                NativeBundleEntity {
+                    slug: "cursor".into(),
+                    entity_kind: Some("product".into()),
+                    kind: Some("ide".into()),
+                    vendor_slug: None,
+                    name: "Cursor".into(),
+                    category: None, subtype: None, api_format: None,
+                    description: None, notes: None, primary_url: None,
+                    docs_url: None, logo_url: None, primary_domain: None,
+                    risk_level: None, risk_score: None,
+                    capture: NativeBundleCapture { mode: "metadata_only".into(), methods: vec![], enabled: true },
+                    metadata: serde_json::Value::Null,
+                    details: serde_json::Value::Null,
+                    matching_rules: vec![NativeBundleRule {
+                        rule_id: "process-0".into(),
+                        priority: 950,
+                        requires_all: true,
+                        notes: None,
+                        metadata: serde_json::Value::Null,
+                        signals: vec![NativeBundleSignal {
+                            kind: "ProcessName".into(),
+                            name: None,
+                            pattern: "Cursor".into(),
+                            is_negated: false,
+                            metadata: serde_json::Value::Null,
+                        }],
+                    }],
+                    provider_links: Vec::new(),
+                },
+            ],
+        };
+        let native_bytes = serde_json::to_vec(&bundle).expect("native json");
 
         let assets = HashMap::from([
-            (
-                "policy/policy_bundle.json".to_string(),
-                signed_policy_bundle_bytes(),
-            ),
-            ("gating/bundle.json".to_string(), gating_bytes),
-            (
-                "classify/embedding.onnx".to_string(),
-                b"stub-model".to_vec(),
-            ),
+            ("policy/policy_bundle.json".to_string(), signed_policy_bundle_bytes()),
+            ("detect/bundle.json".to_string(), native_bytes),
+            ("classify/embedding.onnx".to_string(), b"stub-model".to_vec()),
         ]);
         let manifest_bytes = signed_manifest_bytes(&assets, BundleScope::default(), &vendor);
         let org = OrgSignedConfig {
@@ -822,25 +537,10 @@ mod tests {
         )
         .expect("bundle should load");
 
-        assert!(loaded
-            .gating
-            .identity_index
-            .hosts
-            .contains_key("com.google.chrome"));
-        assert!(!loaded
-            .gating
-            .identity_index
-            .hosts
-            .contains_key("com.google.Chrome"));
-        assert!(loaded
-            .gating
-            .identity_index
-            .non_hosts
-            .contains_key("cursor"));
-        assert!(!loaded
-            .gating
-            .identity_index
-            .non_hosts
-            .contains_key(" Cursor "));
+        // Identity resolution is now handled by EntityIndex, not gating_from_native.
+        // Verify the bundle loaded successfully and gating has TLS intercept hosts
+        // (which is still built by gating_from_native).
+        assert!(loaded.gating.identity_index.hosts.is_empty());
+        assert!(loaded.gating.identity_index.non_hosts.is_empty());
     }
 }

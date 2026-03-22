@@ -24,14 +24,16 @@
 //! ```
 
 use soth_core::bundle::entity_index::{EntityIndex, EntityIndexEntry};
-use soth_interface::{NativeBundleEntity, NativeBundle};
+use soth_interface::{NativeBundle, NativeBundleEntity};
+
+use crate::entity_helpers::{derive_kind, flatten_signals, primary_backend_provider, source_entities};
 
 /// Convert a [`NativeBundle`] into a fully-built [`EntityIndex`].
 ///
 /// **Entity source selection** (v4 forward-compat):
 /// - If `bundle.entities` is non-empty (schema_version ≥ 4), it is used as
 ///   the single authoritative list.
-/// - Otherwise the function chains `bundle.providers` + `bundle.applications`
+/// - Otherwise the function chains `bundle.llm_providers` + `bundle.products`
 ///   for backward compatibility with schema_version 3 bundles.
 ///
 /// **Kind derivation** (when `entity.kind` is absent):
@@ -46,26 +48,10 @@ use soth_interface::{NativeBundleEntity, NativeBundle};
 /// emitted as `(signal.kind, signal.pattern)` pairs.  Negated signals are
 /// skipped because they cannot serve as positive index keys.
 pub fn entity_index_from_native(bundle: &NativeBundle) -> EntityIndex {
-    let source: &[NativeBundleEntity] = if !bundle.entities.is_empty() {
-        &bundle.entities
-    } else {
-        // Safety: We return immediately below if neither slice is used;
-        // this branch only executes for v3 bundles.  We avoid an
-        // intermediate Vec allocation by iterating each list in turn.
-        &[]
-    };
-
-    let entries: Vec<EntityIndexEntry> = if !bundle.entities.is_empty() {
-        source.iter().map(entity_to_entry).collect()
-    } else {
-        bundle
-            .providers
-            .iter()
-            .chain(bundle.applications.iter())
-            .map(entity_to_entry)
-            .collect()
-    };
-
+    let entries: Vec<EntityIndexEntry> = source_entities(bundle)
+        .into_iter()
+        .map(entity_to_entry)
+        .collect();
     EntityIndex::build(entries)
 }
 
@@ -73,6 +59,7 @@ fn entity_to_entry(entity: &NativeBundleEntity) -> EntityIndexEntry {
     let kind = derive_kind(entity);
     let provider_id = primary_backend_provider(entity);
     let signals = flatten_signals(entity);
+    let host_rules = build_host_rules_for_entity(entity);
 
     EntityIndexEntry {
         slug: entity.slug.clone(),
@@ -82,48 +69,54 @@ fn entity_to_entry(entity: &NativeBundleEntity) -> EntityIndexEntry {
         capture_mode: entity.capture.mode.clone(),
         api_format: entity.api_format.clone(),
         provider_id,
+        vendor_slug: entity.vendor_slug.clone(),
+        action: soth_core::ProcessAction::Intercept,
         signals,
+        host_rules,
     }
 }
 
-/// Derive the fine-grained kind string for an entity.
-///
-/// Priority:
-/// 1. `entity.kind` if present (most specific, e.g. `"ide"`, `"cli"`).
-/// 2. Coarse mapping of `entity.entity_kind`:
-///    - `"provider"` → `"platform"`
-///    - anything else (incl. `"application"`) → `"other"`
-fn derive_kind(entity: &NativeBundleEntity) -> String {
-    if let Some(k) = entity.kind.as_deref().filter(|s| !s.is_empty()) {
-        return k.to_string();
-    }
-    match entity.entity_kind.as_deref() {
-        Some("provider") => "platform".to_string(),
-        _ => "other".to_string(),
-    }
-}
+/// Build host rules with path constraints from an entity's matching rules.
+/// Collects all HttpHost patterns and their associated HttpPath allow/deny rules
+/// across all matching rules on the entity.
+fn build_host_rules_for_entity(
+    entity: &NativeBundleEntity,
+) -> Vec<(String, Vec<String>, soth_core::PathRules)> {
+    let mut hosts: Vec<String> = Vec::new();
+    let mut paths = soth_core::PathRules::default();
 
-/// Return the `provider_slug` of the first `provider_links` entry whose
-/// `relation_kind` is `"primary_backend"`, or `None` if no such link exists.
-fn primary_backend_provider(entity: &NativeBundleEntity) -> Option<String> {
-    entity
-        .provider_links
-        .iter()
-        .find(|link| link.relation_kind == "primary_backend")
-        .map(|link| link.provider_slug.clone())
-}
+    for rule in &entity.matching_rules {
+        for signal in &rule.signals {
+            match signal.kind.as_str() {
+                "HttpHost" | "TlsSni" if !signal.is_negated => {
+                    let normalized = soth_core::normalize_bundle_host_pattern(&signal.pattern)
+                        .unwrap_or_else(|| signal.pattern.to_ascii_lowercase());
+                    if !hosts.contains(&normalized) {
+                        hosts.push(normalized);
+                    }
+                }
+                "HttpPath" => {
+                    if signal.is_negated {
+                        if signal.pattern.contains('*') {
+                            paths.deny_glob.push(signal.pattern.clone());
+                        } else {
+                            paths.deny_exact.push(signal.pattern.clone());
+                        }
+                    } else {
+                        paths.allow.push(signal.pattern.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 
-/// Flatten all `matching_rules[*].signals` into `(kind, pattern)` pairs,
-/// skipping negated signals (they cannot serve as positive lookup keys).
-fn flatten_signals(entity: &NativeBundleEntity) -> Vec<(String, String)> {
-    entity
-        .matching_rules
-        .iter()
-        .flat_map(|rule| rule.signals.iter())
-        .filter(|signal| !signal.is_negated)
-        .map(|signal| (signal.kind.clone(), signal.pattern.clone()))
+    hosts
+        .into_iter()
+        .map(|host| (host, Vec::new(), paths.clone()))
         .collect()
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -143,13 +136,14 @@ mod tests {
             compiled_by: "test".into(),
             notes: None,
             vendor_count: 0,
-            provider_count: 0,
-            application_count: 0,
+            llm_provider_count: 0,
+            product_count: 0,
             rule_count: 0,
             format_count: 0,
             filter_count: 0,
             settings_count: 0,
             entity_count: 0,
+            tool_catalog_count: 0,
         }
     }
 
@@ -205,13 +199,14 @@ mod tests {
             schema_version: 4,
             metadata: minimal_metadata(),
             vendors: Vec::new(),
-            providers: Vec::new(),
-            applications: Vec::new(),
+            llm_providers: Vec::new(),
+            products: Vec::new(),
             formats: Vec::new(),
             filters: Vec::new(),
             settings: Vec::new(),
             domain_index: Default::default(),
             entities: Vec::new(),
+            tool_catalog: Vec::new(),
         }
     }
 
@@ -259,10 +254,10 @@ mod tests {
         let mut bundle = empty_bundle();
 
         // Put something in the legacy lists to confirm they are ignored.
-        bundle.providers.push(entity(
+        bundle.llm_providers.push(entity(
             "legacy-provider",
             "Legacy",
-            Some("provider"),
+            Some("llm_provider"),
             None,
             None,
             None,
@@ -274,7 +269,7 @@ mod tests {
         bundle.entities.push(entity(
             "anthropic",
             "Anthropic",
-            Some("provider"),
+            Some("llm_provider"),
             Some("platform"),
             Some("AI Platform"),
             Some("anthropic"),
@@ -303,10 +298,10 @@ mod tests {
         bundle.schema_version = 3;
         // entities stays empty
 
-        bundle.providers.push(entity(
+        bundle.llm_providers.push(entity(
             "openai",
             "OpenAI",
-            Some("provider"),
+            Some("llm_provider"),
             Some("platform"),
             Some("AI Platform"),
             Some("openai"),
@@ -314,10 +309,10 @@ mod tests {
             vec![rule(vec![signal("HttpHost", "api.openai.com")])],
             vec![],
         ));
-        bundle.applications.push(entity(
+        bundle.products.push(entity(
             "cursor",
             "Cursor",
-            Some("application"),
+            Some("product"),
             Some("ide"),
             Some("Code Editor"),
             None,
@@ -337,12 +332,12 @@ mod tests {
         assert_eq!(provider.id, "openai");
 
         let (app, source) = index
-            .resolve_tool(Some("com.todesktop.230313mzl4w4u92"), None)
+            .resolve_tool(Some("com.todesktop.230313mzl4w4u92"), None, None, None, &soth_core::EnvIndex::default())
             .unwrap();
         assert_eq!(app.id, "cursor");
         assert_eq!(source, "bundle_id");
 
-        let (app2, source2) = index.resolve_tool(None, Some("Cursor")).unwrap();
+        let (app2, source2) = index.resolve_tool(None, Some("Cursor"), None, None, &soth_core::EnvIndex::default()).unwrap();
         assert_eq!(app2.id, "cursor");
         assert_eq!(source2, "process_name");
     }
@@ -356,7 +351,7 @@ mod tests {
         bundle.entities.push(entity(
             "cursor",
             "Cursor",
-            Some("application"),
+            Some("product"),
             Some("ide"),   // fine-grained kind present
             None,
             None,
@@ -368,7 +363,7 @@ mod tests {
         bundle.entities.push(entity(
             "anthropic",
             "Anthropic",
-            Some("provider"),
+            Some("llm_provider"),
             None,           // no fine-grained kind
             None,
             None,
@@ -413,7 +408,7 @@ mod tests {
         bundle.entities.push(entity(
             "chatgpt",
             "ChatGPT",
-            Some("application"),
+            Some("product"),
             Some("browser_app"),
             Some("AI Chat"),
             None,
@@ -439,7 +434,7 @@ mod tests {
         bundle.entities.push(entity(
             "standalone",
             "Standalone",
-            Some("provider"),
+            Some("llm_provider"),
             Some("platform"),
             None,
             None,
@@ -460,7 +455,7 @@ mod tests {
         bundle.entities.push(entity(
             "selective",
             "Selective",
-            Some("provider"),
+            Some("llm_provider"),
             Some("platform"),
             None,
             None,
@@ -489,7 +484,7 @@ mod tests {
         bundle.entities.push(entity(
             "openai",
             "OpenAI",
-            Some("provider"),
+            Some("llm_provider"),
             Some("platform"),
             Some("AI Platform"),
             Some("openai"),
@@ -515,7 +510,7 @@ mod tests {
         bundle.entities.push(entity(
             "full-cap",
             "Full Cap",
-            Some("provider"),
+            Some("llm_provider"),
             Some("platform"),
             None,
             None,
