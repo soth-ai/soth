@@ -313,10 +313,10 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .unwrap_or_else(|| "unknown".to_string())
     );
     if let Some(detail) = &report.ca.os_trust_detail {
-        println!("Trust detail:   {}", detail);
+        println!("Trust detail:   {detail}");
     }
     if let Some(err) = &report.ca.cert_parse_error {
-        println!("Parse error:    {}", err);
+        println!("Parse error:    {err}");
     }
 
     println!();
@@ -332,7 +332,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
         }
     );
     for line in &report.loopback_bindings.details {
-        println!("  - {}", line);
+        println!("  - {line}");
     }
 
     println!();
@@ -790,7 +790,7 @@ fn collect_loopback_details(port: u16) -> Vec<String> {
                 "No active macOS network services with loopback web/secure proxy on port {port}."
             ));
         }
-        return details;
+        details
     }
     #[cfg(target_os = "linux")]
     {
@@ -843,7 +843,7 @@ fn macos_loopback_services() -> Vec<String> {
         if web.as_ref().map(is_loopback_enabled).unwrap_or(false)
             || secure.as_ref().map(is_loopback_enabled).unwrap_or(false)
         {
-            services.push(format!("{} (loopback proxy enabled)", service));
+            services.push(format!("{service} (loopback proxy enabled)"));
         }
     }
     services

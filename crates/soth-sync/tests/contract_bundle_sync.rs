@@ -100,7 +100,7 @@ async fn start_registry_server(state: RegistryState) -> Option<String> {
         let _ = axum::serve(listener, app).await;
     });
 
-    Some(format!("http://{}", addr))
+    Some(format!("http://{addr}"))
 }
 
 #[derive(Clone)]
@@ -181,7 +181,7 @@ fn canonical_manifest_bytes(manifest: &Value) -> Vec<u8> {
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push_str(format!("{:02x}", byte).as_str());
+        out.push_str(format!("{byte:02x}").as_str());
     }
     out
 }

@@ -47,7 +47,7 @@ async fn start_telemetry_server(state: TelemetryServerState) -> Option<String> {
         let _ = axum::serve(listener, app).await;
     });
 
-    Some(format!("http://{}", addr))
+    Some(format!("http://{addr}"))
 }
 
 fn sample_event(event_id: Uuid) -> TelemetryEvent {

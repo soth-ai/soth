@@ -262,7 +262,7 @@ async fn exchange_enroll_token(
         .context("failed reading enrollment response body")?;
 
     if !status.is_success() {
-        anyhow::bail!("enrollment exchange failed: HTTP {} - {}", status, text);
+        anyhow::bail!("enrollment exchange failed: HTTP {status} - {text}");
     }
 
     serde_json::from_str::<Value>(&text)

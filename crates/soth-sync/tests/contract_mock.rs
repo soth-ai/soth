@@ -743,7 +743,7 @@ async fn start_mock_server(state: SharedState) -> Option<String> {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    Some(format!("http://{}", addr))
+    Some(format!("http://{addr}"))
 }
 
 async fn exchange_batch_handler(
@@ -944,7 +944,7 @@ async fn registry_version_handler(
             llm_provider_count: 3,
             domain_count: 10,
             format_count: 5,
-            size_bytes: TEST_BUNDLE_JSON.as_bytes().len() as u64,
+            size_bytes: TEST_BUNDLE_JSON.len() as u64,
             manifest: None,
             channel: Some("stable".to_string()),
         }),

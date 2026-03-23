@@ -44,7 +44,7 @@ fn canonical_manifest_bytes(manifest: &BundleManifest) -> Vec<u8> {
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push_str(format!("{:02x}", byte).as_str());
+        out.push_str(format!("{byte:02x}").as_str());
     }
     out
 }
@@ -106,10 +106,9 @@ fn detect_bundle_with_openai_catalog() -> soth_core::OwnedDetectBundle {
 }
 
 fn detect_bundle_with_codex_catalog() -> soth_core::OwnedDetectBundle {
-    let detect = detect_bundle_with_openai_catalog();
     // Codex goes through api.openai.com using the Responses API.
     // The /v1/responses path is recognized by is_openai_like_path().
-    detect
+    detect_bundle_with_openai_catalog()
 }
 
 fn websocket_upgrade_request(connection_id: Uuid, host: &str, path: &str) -> soth_mitm::RawRequest {

@@ -12,6 +12,7 @@ pub const DEFAULT_DEVICE_ID_FILE: &str = "device_id";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SothConfig {
     pub forward_proxy: ForwardProxyConfig,
     pub cloud: CloudConfig,
@@ -20,19 +21,6 @@ pub struct SothConfig {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub pipeline: PipelineOverrides,
-}
-
-impl Default for SothConfig {
-    fn default() -> Self {
-        Self {
-            forward_proxy: ForwardProxyConfig::default(),
-            cloud: CloudConfig::default(),
-            exchange: ExchangeConfig::default(),
-            bundle: BundleConfig::default(),
-            proxy: ProxyConfig::default(),
-            pipeline: PipelineOverrides::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,18 +234,10 @@ impl Default for CloudConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ExchangeConfig {
     pub enabled: bool,
     pub legacy_upload_enabled: bool,
-}
-
-impl Default for ExchangeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            legacy_upload_enabled: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

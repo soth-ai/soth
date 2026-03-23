@@ -15,7 +15,7 @@ use crate::types::{ObservationTelemetryRecord, TelemetryBatch, TransmittedBatch}
 use crate::{TelemetryError, TelemetrySink};
 
 pub(crate) enum BatcherMessage {
-    Event(TelemetryEvent),
+    Event(Box<TelemetryEvent>),
     FlushNow(oneshot::Sender<Result<(), TelemetryError>>),
     Shutdown(oneshot::Sender<Result<(), TelemetryError>>),
 }
@@ -47,7 +47,7 @@ pub(crate) async fn run_batcher(
                 match message {
                     Some(BatcherMessage::Event(event)) => {
                         let is_threshold = is_threshold_event(&event, &config);
-                        batch.push(event);
+                        batch.push(*event);
                         if is_threshold || batch.len() >= config.max_batch_size {
                             if let Err(error) = flush_batch(&mut batch, &config, db_pool.as_ref(), sink.as_ref()).await {
                                 tracing::warn!(error = %error, "telemetry threshold flush failed");

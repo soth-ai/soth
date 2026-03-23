@@ -110,9 +110,7 @@ impl PendingEmitStore {
         {
             let mut entry = self.inner.get_mut(&connection_id)?;
             entry.classify_data = Some(data);
-            if entry.response_data.is_none() {
-                return None;
-            }
+            entry.response_data.as_ref()?;
         }
         // Both halves present — atomically remove and move data out.
         self.remove_resolved(&connection_id)
@@ -128,9 +126,7 @@ impl PendingEmitStore {
         {
             let mut entry = self.inner.get_mut(&connection_id)?;
             entry.response_data = Some(data);
-            if entry.classify_data.is_none() {
-                return None;
-            }
+            entry.classify_data.as_ref()?;
         }
         // Both halves present — atomically remove and move data out.
         self.remove_resolved(&connection_id)

@@ -45,7 +45,7 @@ pub async fn run(
     let proxy_addr = format!("http://{}", config.forward_proxy.socket_addr());
 
     if ca_only {
-        println!("{}", ca_path);
+        println!("{ca_path}");
         return Ok(());
     }
 
@@ -55,89 +55,89 @@ pub async fn run(
                 println!("unset {}", ENV_VARS.join(" "));
                 println!("# Run: eval \"$(soth env --unset)\"");
             } else {
-                println!("export HTTP_PROXY={}", proxy_addr);
-                println!("export HTTPS_PROXY={}", proxy_addr);
-                println!("export http_proxy={}", proxy_addr);
-                println!("export https_proxy={}", proxy_addr);
+                println!("export HTTP_PROXY={proxy_addr}");
+                println!("export HTTPS_PROXY={proxy_addr}");
+                println!("export http_proxy={proxy_addr}");
+                println!("export https_proxy={proxy_addr}");
                 println!("export NO_PROXY=localhost,127.0.0.1,::1");
                 println!("export no_proxy=localhost,127.0.0.1,::1");
-                println!("export SSL_CERT_FILE={}", ca_path);
-                println!("export REQUESTS_CA_BUNDLE={}", ca_path);
-                println!("export NODE_EXTRA_CA_CERTS={}", ca_path);
-                println!("export CURL_CA_BUNDLE={}", ca_path);
+                println!("export SSL_CERT_FILE={ca_path}");
+                println!("export REQUESTS_CA_BUNDLE={ca_path}");
+                println!("export NODE_EXTRA_CA_CERTS={ca_path}");
+                println!("export CURL_CA_BUNDLE={ca_path}");
                 println!("# Run: eval \"$(soth env)\"");
             }
         }
         "fish" => {
             if unset {
                 for key in ENV_VARS {
-                    println!("set -e {}", key);
-                    println!("set -e -g {}", key);
-                    println!("set -e -U {}", key);
+                    println!("set -e {key}");
+                    println!("set -e -g {key}");
+                    println!("set -e -U {key}");
                 }
                 println!("# Run: eval (soth env --shell fish --unset)");
             } else {
-                println!("set -gx HTTP_PROXY {}", proxy_addr);
-                println!("set -gx HTTPS_PROXY {}", proxy_addr);
-                println!("set -gx http_proxy {}", proxy_addr);
-                println!("set -gx https_proxy {}", proxy_addr);
+                println!("set -gx HTTP_PROXY {proxy_addr}");
+                println!("set -gx HTTPS_PROXY {proxy_addr}");
+                println!("set -gx http_proxy {proxy_addr}");
+                println!("set -gx https_proxy {proxy_addr}");
                 println!("set -gx NO_PROXY localhost,127.0.0.1,::1");
                 println!("set -gx no_proxy localhost,127.0.0.1,::1");
-                println!("set -gx SSL_CERT_FILE {}", ca_path);
-                println!("set -gx REQUESTS_CA_BUNDLE {}", ca_path);
-                println!("set -gx NODE_EXTRA_CA_CERTS {}", ca_path);
-                println!("set -gx CURL_CA_BUNDLE {}", ca_path);
+                println!("set -gx SSL_CERT_FILE {ca_path}");
+                println!("set -gx REQUESTS_CA_BUNDLE {ca_path}");
+                println!("set -gx NODE_EXTRA_CA_CERTS {ca_path}");
+                println!("set -gx CURL_CA_BUNDLE {ca_path}");
                 println!("# Run: eval (soth env --shell fish)");
             }
         }
         "powershell" | "pwsh" => {
             if unset {
                 for key in ENV_VARS {
-                    println!("Remove-Item Env:{} -ErrorAction SilentlyContinue", key);
+                    println!("Remove-Item Env:{key} -ErrorAction SilentlyContinue");
                 }
                 println!("# Run in PowerShell to clear variables");
             } else {
-                println!("$env:HTTP_PROXY = \"{}\"", proxy_addr);
-                println!("$env:HTTPS_PROXY = \"{}\"", proxy_addr);
+                println!("$env:HTTP_PROXY = \"{proxy_addr}\"");
+                println!("$env:HTTPS_PROXY = \"{proxy_addr}\"");
                 println!("$env:NO_PROXY = \"localhost,127.0.0.1,::1\"");
                 println!("$env:no_proxy = \"localhost,127.0.0.1,::1\"");
-                println!("$env:SSL_CERT_FILE = \"{}\"", ca_path);
-                println!("$env:REQUESTS_CA_BUNDLE = \"{}\"", ca_path);
-                println!("$env:NODE_EXTRA_CA_CERTS = \"{}\"", ca_path);
-                println!("$env:CURL_CA_BUNDLE = \"{}\"", ca_path);
+                println!("$env:SSL_CERT_FILE = \"{ca_path}\"");
+                println!("$env:REQUESTS_CA_BUNDLE = \"{ca_path}\"");
+                println!("$env:NODE_EXTRA_CA_CERTS = \"{ca_path}\"");
+                println!("$env:CURL_CA_BUNDLE = \"{ca_path}\"");
                 println!("# Run in PowerShell to set variables");
             }
         }
         "cmd" => {
             if unset {
                 for key in ENV_VARS {
-                    println!("set {}=", key);
+                    println!("set {key}=");
                 }
                 println!("REM Run each line in Command Prompt to clear variables");
             } else {
-                println!("set HTTP_PROXY={}", proxy_addr);
-                println!("set HTTPS_PROXY={}", proxy_addr);
+                println!("set HTTP_PROXY={proxy_addr}");
+                println!("set HTTPS_PROXY={proxy_addr}");
                 println!("set NO_PROXY=localhost,127.0.0.1,::1");
                 println!("set no_proxy=localhost,127.0.0.1,::1");
-                println!("set SSL_CERT_FILE={}", ca_path);
-                println!("set REQUESTS_CA_BUNDLE={}", ca_path);
-                println!("set NODE_EXTRA_CA_CERTS={}", ca_path);
-                println!("set CURL_CA_BUNDLE={}", ca_path);
+                println!("set SSL_CERT_FILE={ca_path}");
+                println!("set REQUESTS_CA_BUNDLE={ca_path}");
+                println!("set NODE_EXTRA_CA_CERTS={ca_path}");
+                println!("set CURL_CA_BUNDLE={ca_path}");
                 println!("REM Run each line in Command Prompt");
             }
         }
         _ => {
-            println!("# Unknown shell: {}", shell);
+            println!("# Unknown shell: {shell}");
             println!("# Environment variables needed:");
             if unset {
                 println!("# unset {}", ENV_VARS.join(" "));
             } else {
-                println!("# HTTP_PROXY={}", proxy_addr);
-                println!("# HTTPS_PROXY={}", proxy_addr);
-                println!("# SSL_CERT_FILE={}", ca_path);
-                println!("# REQUESTS_CA_BUNDLE={}", ca_path);
-                println!("# NODE_EXTRA_CA_CERTS={}", ca_path);
-                println!("# CURL_CA_BUNDLE={}", ca_path);
+                println!("# HTTP_PROXY={proxy_addr}");
+                println!("# HTTPS_PROXY={proxy_addr}");
+                println!("# SSL_CERT_FILE={ca_path}");
+                println!("# REQUESTS_CA_BUNDLE={ca_path}");
+                println!("# NODE_EXTRA_CA_CERTS={ca_path}");
+                println!("# CURL_CA_BUNDLE={ca_path}");
             }
         }
     }

@@ -299,9 +299,7 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
             launchctl_require_success(&["bootstrap", &user_domain, &plist_path_str]).map_err(
                 |user_error| {
                     anyhow!(
-                        "failed to bootstrap launchd service in both gui and user domains.\nGUI error: {}\nUSER error: {}",
-                        gui_error,
-                        user_error
+                        "failed to bootstrap launchd service in both gui and user domains.\nGUI error: {gui_error}\nUSER error: {user_error}"
                     )
                 },
             )?;
@@ -318,11 +316,7 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
     if let Err(primary_error) = launchctl_require_success(&["enable", primary_target]) {
         launchctl_require_success(&["enable", secondary_target]).map_err(|secondary_error| {
             anyhow!(
-                "failed to enable launchd service.\nPrimary ({}) error: {}\nSecondary ({}) error: {}",
-                primary_target,
-                primary_error,
-                secondary_target,
-                secondary_error
+                "failed to enable launchd service.\nPrimary ({primary_target}) error: {primary_error}\nSecondary ({secondary_target}) error: {secondary_error}"
             )
         })?;
     }
@@ -331,11 +325,7 @@ fn ensure_macos_launch_agent(exe: &Path, args: &[String]) -> Result<String> {
         launchctl_require_success(&["kickstart", "-k", secondary_target]).map_err(
             |secondary_error| {
                 anyhow!(
-                    "failed to kickstart launchd service.\nPrimary ({}) error: {}\nSecondary ({}) error: {}",
-                    primary_target,
-                    primary_error,
-                    secondary_target,
-                    secondary_error
+                    "failed to kickstart launchd service.\nPrimary ({primary_target}) error: {primary_error}\nSecondary ({secondary_target}) error: {secondary_error}"
                 )
             },
         )?;

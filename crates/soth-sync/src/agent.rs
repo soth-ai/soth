@@ -209,7 +209,7 @@ impl AdaptiveBatchState {
 
 #[derive(Debug, Clone)]
 enum PreparedRowResult {
-    Prepared(PreparedExchangeQueueRow),
+    Prepared(Box<PreparedExchangeQueueRow>),
     Drop { reason: String },
 }
 
@@ -822,8 +822,8 @@ impl SyncAgent {
         for row in rows {
             match self.prepare_exchange_queue_row(row.clone()).await {
                 Ok(PreparedRowResult::Prepared(prepared)) => match prepared.mode {
-                    ExchangeSyncMode::Live => live_rows.push(prepared),
-                    ExchangeSyncMode::Frontload => frontload_rows.push(prepared),
+                    ExchangeSyncMode::Live => live_rows.push(*prepared),
+                    ExchangeSyncMode::Frontload => frontload_rows.push(*prepared),
                 },
                 Ok(PreparedRowResult::Drop { reason }) => {
                     self.drop_exchange_row(&row, &reason, &mut stats)?;
@@ -906,12 +906,14 @@ impl SyncAgent {
         let mut metadata = exchange_event_to_metadata(&event, global_device_id.as_deref());
         metadata.tags = merge_tags_for_exchange(&self.config.global_tags, event.tags.as_ref());
         let mode = exchange_sync_mode(metadata.tags.as_ref(), self.config.frontload_enabled);
-        Ok(PreparedRowResult::Prepared(PreparedExchangeQueueRow {
-            row,
-            metadata,
-            mode,
-            blob_uploaded: 0,
-        }))
+        Ok(PreparedRowResult::Prepared(Box::new(
+            PreparedExchangeQueueRow {
+                row,
+                metadata,
+                mode,
+                blob_uploaded: 0,
+            },
+        )))
     }
 
     fn target_limits_for_mode(&self, mode: ExchangeSyncMode) -> ExchangeBatchLimits {
@@ -2360,7 +2362,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Some(format!("http://{}", addr))
+        Some(format!("http://{addr}"))
     }
 
     #[derive(Serialize)]
@@ -2405,7 +2407,7 @@ mod tests {
     fn startup_hex_encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);
         for byte in bytes {
-            out.push_str(format!("{:02x}", byte).as_str());
+            out.push_str(format!("{byte:02x}").as_str());
         }
         out
     }

@@ -916,7 +916,7 @@ impl ProxyHandler {
                 .pending
                 .detect_result
                 .artifacts
-                .extend(completed.stream_artifacts.drain(..));
+                .append(&mut completed.stream_artifacts);
         }
 
         let usage = completed.usage.unwrap_or_else(|| {

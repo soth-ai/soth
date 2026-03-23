@@ -1,3 +1,8 @@
+#![allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::manual_clamp
+)]
 //! SOTH sync runtime.
 //!
 //! Public contract surface is intentionally small:

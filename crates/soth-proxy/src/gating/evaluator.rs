@@ -214,7 +214,7 @@ impl GateEvaluator {
                     entry: soth_core::IdentityEntry {
                         entity_id: entity.id.clone(),
                         app_type: entity.app_type,
-                        capture_mode: entity.capture_mode.clone(),
+                        capture_mode: entity.capture_mode,
                         action: entity.action,
                         enabled: None,
                         host_filter: None,
@@ -351,7 +351,7 @@ impl GateEvaluator {
                 EntityMatch {
                     kind: EntityMatchKind::Provider,
                     entity_id: entity.id.clone(),
-                    capture_mode: entity.capture_mode.clone(),
+                    capture_mode: entity.capture_mode,
                     host_rule: soth_core::HostRule {
                         pattern: m.host_pattern,
                         methods: m.methods,
@@ -365,7 +365,7 @@ impl GateEvaluator {
                 EntityMatch {
                     kind: EntityMatchKind::Application,
                     entity_id: entity.id.clone(),
-                    capture_mode: entity.capture_mode.clone(),
+                    capture_mode: entity.capture_mode,
                     host_rule: soth_core::HostRule {
                         pattern: m.host_pattern,
                         methods: m.methods,
@@ -931,7 +931,7 @@ mod tests {
 
         assert!(matches!(outcome.decision, GateDecision::Skip));
         assert_eq!(outcome.reason, DecisionReason::BlacklistedKeyword);
-        assert!(after >= before + 1);
+        assert!(after > before);
     }
 
     #[test]
@@ -952,7 +952,7 @@ mod tests {
 
         assert!(matches!(first, GateDecision::Intercept));
         assert!(matches!(second, GateDecision::Intercept));
-        assert!(after_intercept >= before_intercept + 1);
-        assert!(after_seen_skip >= before_seen_skip + 1);
+        assert!(after_intercept > before_intercept);
+        assert!(after_seen_skip > before_seen_skip);
     }
 }

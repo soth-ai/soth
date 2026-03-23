@@ -1,13 +1,4 @@
-#![allow(
-    clippy::result_large_err,
-    clippy::type_complexity,
-    clippy::too_many_arguments,
-    clippy::large_enum_variant,
-    clippy::if_same_then_else,
-    clippy::field_reassign_with_default,
-    clippy::approx_constant,
-    clippy::duplicated_attributes
-)]
+#![allow(clippy::duplicated_attributes)]
 #![forbid(unsafe_code)]
 
 mod batcher;
@@ -89,7 +80,11 @@ impl TelemetryPipeline {
     }
 
     pub fn push(&self, event: soth_core::TelemetryEvent) {
-        if self.tx.send(batcher::BatcherMessage::Event(event)).is_err() {
+        if self
+            .tx
+            .send(batcher::BatcherMessage::Event(Box::new(event)))
+            .is_err()
+        {
             tracing::warn!("telemetry event dropped because batcher channel is closed");
         }
     }

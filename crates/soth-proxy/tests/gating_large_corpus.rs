@@ -758,10 +758,7 @@ async fn gating_large_corpus_proxy_handler_subset_e2e() {
     if expected_intercepts > 0 {
         wait_for_intercept_rows(db_path.as_path(), expected_intercepts).await;
     }
-    println!(
-        "gating corpus proxy_subset_expected_intercepts={}",
-        expected_intercepts
-    );
+    println!("gating corpus proxy_subset_expected_intercepts={expected_intercepts}");
     assert!(intercept_row_count(db_path.as_path()) >= expected_intercepts);
     let _ = std::fs::remove_file(db_path);
 }

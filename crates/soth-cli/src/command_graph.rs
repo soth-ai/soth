@@ -743,8 +743,7 @@ async fn ensure_ca_for_up(config_path: Option<PathBuf>, quiet: bool) -> anyhow::
             Err(error) => {
                 if !quiet {
                     style::warning(&format!(
-                        "Unable to verify OS trust state for CA (continuing): {}",
-                        error
+                        "Unable to verify OS trust state for CA (continuing): {error}"
                     ));
                 }
                 return Ok(());
@@ -906,7 +905,7 @@ async fn ensure_bundle_for_bootstrap(
 
     if !quiet {
         if let Some(version) = outcome.version.as_deref() {
-            style::success(&format!("Bootstrap bundle ready: {}", version));
+            style::success(&format!("Bootstrap bundle ready: {version}"));
         } else {
             style::success("Bootstrap bundle ready.");
         }
@@ -957,7 +956,7 @@ fn install_runtime_bundle_files(
                 .components()
                 .any(|component| component == std::path::Component::ParentDir)
         {
-            anyhow::bail!("bundle asset path is not safe: {}", relative_path);
+            anyhow::bail!("bundle asset path is not safe: {relative_path}");
         }
 
         let full_path = bundle_dir.join(rel);

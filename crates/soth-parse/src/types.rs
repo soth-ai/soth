@@ -343,7 +343,7 @@ pub enum ParseError {
     GraphQLUnknownOperation(String),
     GrpcDescriptorMissing(String),
     NotAnAICall,
-    PartialParse(NormalizedRequest, Vec<ParseWarning>),
+    PartialParse(Box<NormalizedRequest>, Vec<ParseWarning>),
 }
 
 pub type ParseResult<T> = Result<T, ParseError>;

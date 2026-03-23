@@ -115,7 +115,7 @@ pub async fn enable(port: Option<u16>) -> Result<()> {
 
 async fn enable_internal(port: Option<u16>, print_user_output: bool) -> Result<()> {
     let proxy_port = port.unwrap_or(DEFAULT_PROXY_PORT);
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     #[cfg(target_os = "linux")]
     let mut managed_apply = true;
     #[cfg(not(target_os = "linux"))]
@@ -701,7 +701,7 @@ fn run_networksetup(args: &[&str]) -> Result<()> {
     let output = Command::new("networksetup")
         .args(args)
         .output()
-        .with_context(|| format!("Failed to run networksetup {:?}", args))?;
+        .with_context(|| format!("Failed to run networksetup {args:?}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -726,7 +726,7 @@ fn run_networksetup_read(args: &[&str]) -> Result<String> {
     let output = Command::new("networksetup")
         .args(args)
         .output()
-        .with_context(|| format!("Failed to run networksetup {:?}", args))?;
+        .with_context(|| format!("Failed to run networksetup {args:?}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);

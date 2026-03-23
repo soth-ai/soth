@@ -248,14 +248,14 @@ fn render_restore_commands(
             (ShellKind::Bash | ShellKind::Zsh, Some(value)) => {
                 commands.push(format!("export {}={}", key, shell_quote(value.as_str())))
             }
-            (ShellKind::Bash | ShellKind::Zsh, None) => commands.push(format!("unset {}", key)),
+            (ShellKind::Bash | ShellKind::Zsh, None) => commands.push(format!("unset {key}")),
             (ShellKind::Fish, Some(value)) => {
                 commands.push(format!("set -gx {} {}", key, fish_quote(value.as_str())))
             }
             (ShellKind::Fish, None) => {
-                commands.push(format!("set -e {}", key));
-                commands.push(format!("set -e -g {}", key));
-                commands.push(format!("set -e -U {}", key));
+                commands.push(format!("set -e {key}"));
+                commands.push(format!("set -e -g {key}"));
+                commands.push(format!("set -e -U {key}"));
             }
         }
     }
@@ -264,12 +264,12 @@ fn render_restore_commands(
 
 fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{}'", escaped)
+    format!("'{escaped}'")
 }
 
 fn fish_quote(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
-    format!("'{}'", escaped)
+    format!("'{escaped}'")
 }
 
 fn write_patch_file(path: &Path, commands: &[String]) -> Result<()> {
