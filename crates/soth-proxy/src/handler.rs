@@ -518,6 +518,11 @@ impl ProxyHandler {
             detect_result.normalized.stream = true;
         }
 
+        // Wrap in Arc after all mutations are complete. Cloning into PendingCapture
+        // and ClassifyTaskInput is now a cheap refcount bump instead of a deep copy.
+        let detect_result = Arc::new(detect_result);
+        let proxy_ctx = Arc::new(proxy_ctx);
+
         // ── Phase 5: Insert PendingCapture (unified WS + HTTP path) ─────────
         let deferred_classify = if is_websocket_upgrade {
             Some(crate::pending::DeferredClassify {
@@ -541,8 +546,8 @@ impl ProxyHandler {
             request_path: req.path.clone(),
             request_body_bytes: original_body_len,
             outcome: outcome.clone(),
-            detect_result: detect_result.clone(),
-            proxy_ctx: proxy_ctx.clone(),
+            detect_result: Arc::clone(&detect_result),
+            proxy_ctx: Arc::clone(&proxy_ctx),
             raw_body: raw_body_for_commitment,
             deferred_classify,
             is_websocket: is_websocket_upgrade,
@@ -777,12 +782,12 @@ impl ProxyHandler {
                     // Only use the refreshed result if it has better confidence
                     // than the stale upgrade-request detect.
                     if result.confidence != soth_core::ParseConfidence::Heuristic {
-                        result
+                        Arc::new(result)
                     } else {
-                        pending.detect_result.clone()
+                        Arc::clone(&pending.detect_result)
                     }
                 } else {
-                    pending.detect_result.clone()
+                    Arc::clone(&pending.detect_result)
                 };
 
                 let policy_block_enforced = Arc::new(AtomicBool::new(false));
@@ -791,7 +796,7 @@ impl ProxyHandler {
                         connection_id: pending.connection_id,
                         detect_result: refreshed_detect,
                         content_for_embedding: deferred.content_for_embedding,
-                        proxy_ctx: pending.proxy_ctx.clone(),
+                        proxy_ctx: Arc::clone(&pending.proxy_ctx),
                         capture_mode: pending.outcome.capture_mode,
                         matched_provider: pending.outcome.matched_provider.clone(),
                         matched_application: pending.outcome.matched_application.clone(),
@@ -911,10 +916,10 @@ impl ProxyHandler {
     ) {
         // Merge streaming response artifacts (credentials found in response
         // chunks) into the detect result so they reach telemetry + DB.
+        // Arc::make_mut gives us exclusive ownership by cloning only when other
+        // references exist; when this is the sole reference it mutates in place.
         if !completed.stream_artifacts.is_empty() {
-            completed
-                .pending
-                .detect_result
+            Arc::make_mut(&mut completed.pending.detect_result)
                 .artifacts
                 .append(&mut completed.stream_artifacts);
         }

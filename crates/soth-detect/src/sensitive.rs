@@ -28,14 +28,16 @@ static STRIPE_TEST_RE: Lazy<Option<Regex>> =
     Lazy::new(|| Regex::new(r"\bsk_test_[A-Za-z0-9]{16,}\b").ok());
 static HEX_KEY_RE: Lazy<Option<Regex>> = Lazy::new(|| Regex::new(r"\b[0-9a-fA-F]{32,64}\b").ok());
 
-pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<SensitiveArtifact> {
-    let text = String::from_utf8_lossy(body);
+/// Scan a pre-decoded `&str` for credentials. Prefer this over
+/// [`credential_scan`] when you already hold a UTF-8 view of the body to
+/// avoid a redundant `String::from_utf8_lossy` allocation.
+pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<SensitiveArtifact> {
     let mut out = Vec::new();
 
     // Scan Anthropic before OpenAI to avoid sk-ant- matching sk-
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &ANTHROPIC_KEY_RE,
         ArtifactKind::ApiKey {
             provider: Some(DetectedProvider::Anthropic),
@@ -45,7 +47,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &OPENAI_KEY_RE,
         ArtifactKind::ApiKey {
             provider: Some(DetectedProvider::OpenAi),
@@ -55,7 +57,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &AWS_KEY_RE,
         ArtifactKind::AwsAccessKey,
         ArtifactSeverity::High,
@@ -63,7 +65,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &GITHUB_PAT_RE,
         ArtifactKind::GitHubPat,
         ArtifactSeverity::High,
@@ -71,7 +73,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &GITLAB_PAT_RE,
         ArtifactKind::GitLabToken,
         ArtifactSeverity::High,
@@ -79,7 +81,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &SLACK_TOKEN_RE,
         ArtifactKind::SlackToken,
         ArtifactSeverity::High,
@@ -87,7 +89,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &STRIPE_SECRET_RE,
         ArtifactKind::StripeSecretKey,
         ArtifactSeverity::Critical,
@@ -95,7 +97,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &STRIPE_TEST_RE,
         ArtifactKind::StripeSecretKey,
         ArtifactSeverity::Medium,
@@ -103,7 +105,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &JWT_RE,
         ArtifactKind::Jwt,
         ArtifactSeverity::Medium,
@@ -111,7 +113,7 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &PRIVATE_KEY_RE,
         ArtifactKind::PrivateKey,
         ArtifactSeverity::Critical,
@@ -119,16 +121,25 @@ pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     );
     scan_pattern(
         &mut out,
-        &text,
+        text,
         &CONNECTION_STRING_RE,
         ArtifactKind::ConnectionString,
         ArtifactSeverity::High,
         location.clone(),
     );
 
-    scan_hex_keys(&mut out, &text, location);
+    scan_hex_keys(&mut out, text, location);
 
     out
+}
+
+/// Scan raw bytes for credentials. Decodes `body` as UTF-8 (lossy) then
+/// delegates to [`credential_scan_str`]. When the caller already has a
+/// `&str` view of the same bytes, use [`credential_scan_str`] directly to
+/// skip the extra allocation.
+pub fn credential_scan(body: &[u8], location: ArtifactLocation) -> Vec<SensitiveArtifact> {
+    let text = String::from_utf8_lossy(body);
+    credential_scan_str(&text, location)
 }
 
 pub fn redact_sensitive_bytes(input: &[u8]) -> Vec<u8> {
@@ -156,10 +167,11 @@ pub fn redact_sensitive_text(input: &str) -> String {
     output
 }
 
-/// Second-pass structural scan. Detects auth and crypto logic patterns
-/// without capturing any content. Only emits presence-flag artifacts.
-pub fn structural_scan(body: &[u8], location: ArtifactLocation) -> Vec<SensitiveArtifact> {
-    let text = String::from_utf8_lossy(body);
+/// Second-pass structural scan over a pre-decoded `&str`. Detects auth and
+/// crypto logic patterns without capturing any content. Only emits
+/// presence-flag artifacts. Prefer this over [`structural_scan`] when you
+/// already hold a UTF-8 view of the body.
+pub fn structural_scan_str(text: &str, location: ArtifactLocation) -> Vec<SensitiveArtifact> {
     let text_lc = text.to_ascii_lowercase();
     let mut out = Vec::new();
 
@@ -184,6 +196,17 @@ pub fn structural_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     }
 
     out
+}
+
+/// Second-pass structural scan. Detects auth and crypto logic patterns
+/// without capturing any content. Only emits presence-flag artifacts.
+/// Decodes `body` as UTF-8 (lossy) then delegates to
+/// [`structural_scan_str`]. When the caller already has a `&str` view of
+/// the same bytes, use [`structural_scan_str`] directly to skip the extra
+/// allocation.
+pub fn structural_scan(body: &[u8], location: ArtifactLocation) -> Vec<SensitiveArtifact> {
+    let text = String::from_utf8_lossy(body);
+    structural_scan_str(&text, location)
 }
 
 /// Maximum number of org-configured patterns accepted. Patterns beyond this
@@ -307,9 +330,12 @@ impl CompiledOrgPatterns {
     }
 }
 
-/// Like `org_pattern_scan` but takes pre-compiled regexes.
-pub fn org_pattern_scan_compiled(
-    body: &[u8],
+/// Like `org_pattern_scan` but takes pre-compiled regexes and a pre-decoded
+/// `&str`. Prefer this over [`org_pattern_scan_compiled`] when you already
+/// hold a UTF-8 view of the body to avoid a redundant
+/// `String::from_utf8_lossy` allocation.
+pub fn org_pattern_scan_compiled_str(
+    text: &str,
     compiled: &CompiledOrgPatterns,
     location: ArtifactLocation,
 ) -> Vec<SensitiveArtifact> {
@@ -317,11 +343,10 @@ pub fn org_pattern_scan_compiled(
         return Vec::new();
     }
 
-    let text = String::from_utf8_lossy(body);
     let mut out = Vec::new();
 
     for (pattern_id, regex) in &compiled.patterns {
-        if regex.is_match(&text) {
+        if regex.is_match(text) {
             out.push(SensitiveArtifact {
                 kind: ArtifactKind::OrgPattern {
                     pattern_id: *pattern_id,
@@ -335,6 +360,23 @@ pub fn org_pattern_scan_compiled(
     }
 
     out
+}
+
+/// Like `org_pattern_scan` but takes pre-compiled regexes. Decodes `body`
+/// as UTF-8 (lossy) then delegates to [`org_pattern_scan_compiled_str`].
+/// When the caller already has a `&str` view of the same bytes, use
+/// [`org_pattern_scan_compiled_str`] directly to skip the extra allocation.
+pub fn org_pattern_scan_compiled(
+    body: &[u8],
+    compiled: &CompiledOrgPatterns,
+    location: ArtifactLocation,
+) -> Vec<SensitiveArtifact> {
+    if compiled.is_empty() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(body);
+    org_pattern_scan_compiled_str(&text, compiled, location)
 }
 
 fn has_auth_logic(text_lc: &str) -> bool {

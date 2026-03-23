@@ -222,6 +222,37 @@ pub fn write_intercept_record(
     matched_provider: Option<&str>,
     matched_application: Option<&str>,
 ) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+    write_intercept_record_with_conn(
+        &conn,
+        connection_id,
+        result,
+        embedding,
+        detect_result,
+        proxy_ctx,
+        raw_body_for_commitment,
+        capture_mode,
+        matched_provider,
+        matched_application,
+    )
+}
+
+/// Same as [`write_intercept_record`] but accepts a pre-locked [`rusqlite::Connection`]
+/// directly. Use this when the caller already holds the connection (e.g. inside a
+/// batched transaction) to avoid re-locking the mutex for every row.
+#[allow(clippy::too_many_arguments)]
+pub fn write_intercept_record_with_conn(
+    conn: &rusqlite::Connection,
+    connection_id: Uuid,
+    result: &ClassifiedResult,
+    embedding: Option<&[f32]>,
+    detect_result: &DetectResult,
+    proxy_ctx: &ProxyContext,
+    raw_body_for_commitment: Option<&[u8]>,
+    capture_mode: CaptureMode,
+    matched_provider: Option<&str>,
+    matched_application: Option<&str>,
+) -> Result<()> {
     let telemetry_json = serde_json::to_string(&result.telemetry_event)
         .context("failed to serialize telemetry event")?;
     let classification_flags =
@@ -300,7 +331,6 @@ pub fn write_intercept_record(
         .transpose()
         .context("failed to serialize embedding for sqlite storage")?;
 
-    let conn = db.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
     let inserted_rows = conn.execute(
         "
         INSERT OR IGNORE INTO intercept_records (

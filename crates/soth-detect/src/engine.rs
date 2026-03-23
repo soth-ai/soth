@@ -11,7 +11,7 @@ use crate::intelligence::{
 use crate::jsonrpc::parse_jsonrpc;
 use crate::rest::parse_rest;
 use crate::sensitive::{
-    credential_scan, org_pattern_scan_compiled, structural_scan, CompiledOrgPatterns,
+    credential_scan_str, org_pattern_scan_compiled_str, structural_scan_str, CompiledOrgPatterns,
 };
 use crate::types::{
     ArtifactLocation, CaptureMode, DetectBundleSlice, DetectWarning, DetectedFormat,
@@ -240,10 +240,14 @@ fn parse_request(
 // Phase 2a: build_scan_input — extract scannable locations with fallback
 // ---------------------------------------------------------------------------
 
-fn build_scan_input(body: &[u8], normalized: &NormalizedRequest) -> ScanInput {
-    let segments = extract_scannable_locations(body, normalized);
+fn build_scan_input(
+    body: &[u8],
+    normalized: &NormalizedRequest,
+    parsed_body: Option<&JsonValue>,
+) -> ScanInput {
+    let segments = extract_scannable_locations(body, normalized, parsed_body);
     let fallback_content = if segments.is_empty() {
-        extract_content_sample(body)
+        extract_content_sample(body, parsed_body)
     } else {
         None
     };
@@ -267,14 +271,17 @@ fn scan_content(
     let mut ast_normalized_hash: Option<String> = None;
     let mut import_categories: Vec<DetectedImportCategory> = Vec::new();
 
-    // Body-level scans
-    artifacts.extend(credential_scan(body, ArtifactLocation::Unknown));
-    artifacts.extend(structural_scan(body, ArtifactLocation::Unknown));
-    artifacts.extend(org_pattern_scan_compiled(
-        body,
+    // Decode body once; all three body-level scanners reuse this view.
+    let body_text = String::from_utf8_lossy(body);
+    artifacts.extend(credential_scan_str(&body_text, ArtifactLocation::Unknown));
+    artifacts.extend(structural_scan_str(&body_text, ArtifactLocation::Unknown));
+    artifacts.extend(org_pattern_scan_compiled_str(
+        &body_text,
         compiled_org,
         ArtifactLocation::Unknown,
     ));
+    // body_text is no longer needed after this point.
+    drop(body_text);
 
     // Per-location scans (multi-turn aware)
     if scan_input.segments.is_empty() {
@@ -315,7 +322,8 @@ fn scan_content(
         }
     } else {
         for (location, text) in &scan_input.segments {
-            artifacts.extend(credential_scan(text.as_bytes(), location.clone()));
+            // `text` is already a `String`; pass it as `&str` directly.
+            artifacts.extend(credential_scan_str(text, location.clone()));
 
             if matches!(location, ArtifactLocation::UserContent { .. }) {
                 let code_result = detect_code_artifacts(text, location.clone());
@@ -385,8 +393,13 @@ fn process_inner(
         capture_mode,
     } = parse_request(req, bundle, apq_store);
 
+    // Parse the body once here so the scan phase can reuse it without
+    // re-parsing.  Non-JSON bodies (gRPC, form, etc.) will produce None and
+    // the scan helpers fall back to their existing raw-byte paths.
+    let parsed_body: Option<JsonValue> = serde_json::from_slice(&req.body).ok();
+
     // Phase 2: Scan
-    let scan_input = build_scan_input(&req.body, &normalized);
+    let scan_input = build_scan_input(&req.body, &normalized, parsed_body.as_ref());
     let scan = scan_content(&req.body, &scan_input, compiled_org);
 
     let artifacts = scan.artifacts;
@@ -475,9 +488,20 @@ fn compute_prefix_repeat(
 fn extract_scannable_locations(
     body: &[u8],
     normalized: &NormalizedRequest,
+    parsed_body: Option<&JsonValue>,
 ) -> Vec<(ArtifactLocation, String)> {
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return Vec::new();
+    // Use the pre-parsed value when available; otherwise parse now (handles
+    // callers that don't go through process_inner, e.g. tests).
+    let owned;
+    let json: &JsonValue = match parsed_body {
+        Some(v) => v,
+        None => {
+            let Ok(v) = serde_json::from_slice::<JsonValue>(body) else {
+                return Vec::new();
+            };
+            owned = v;
+            &owned
+        }
     };
 
     let mut locations = Vec::new();
@@ -560,8 +584,18 @@ fn extract_scannable_locations(
 /// handles GraphQL variables and JSON-RPC params, then falls back to the
 /// longest-string heuristic (min 20 chars). Returns `None` for non-JSON
 /// bodies and for GraphQL bodies where only the query DSL is available.
-fn extract_content_sample(body: &[u8]) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+///
+/// `parsed_body` is an optional pre-parsed value to avoid a redundant
+/// `serde_json::from_slice` call on the hot path.
+fn extract_content_sample(body: &[u8], parsed_body: Option<&JsonValue>) -> Option<String> {
+    let owned;
+    let json: &JsonValue = match parsed_body {
+        Some(v) => v,
+        None => {
+            owned = serde_json::from_slice(body).ok()?;
+            &owned
+        }
+    };
 
     // Try first message content (most common for chat APIs)
     if let Some(content) = json
@@ -654,7 +688,7 @@ fn extract_content_sample(body: &[u8]) -> Option<String> {
 
     // Longest string fallback (min 20 chars) — mirrors heuristic parser
     let mut best: Option<String> = None;
-    visit_json_strings(&json, &mut |s| {
+    visit_json_strings(json, &mut |s| {
         if s.len() >= 20 {
             let better = best.as_ref().map_or(true, |b| s.len() > b.len());
             if better {
