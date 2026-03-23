@@ -2,12 +2,7 @@
 // must call sqlite3_auto_extension via FFI. deny (not forbid) is used so that
 // the per-module allow override on sqlite_vec is permitted.
 #![deny(unsafe_code)]
-#![allow(
-    clippy::field_reassign_with_default,
-    clippy::too_many_arguments,
-    clippy::manual_is_variant_check,
-    clippy::struct_field_names
-)]
+#![allow(clippy::too_many_arguments)]
 
 pub mod classify_task;
 pub mod config;

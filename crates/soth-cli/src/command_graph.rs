@@ -1155,10 +1155,12 @@ mod tests {
     fn up_rolls_back_when_on_fails() {
         with_temp_home(|temp| {
             let config_path = write_config_with_ca(temp);
-            let mut behavior = ProxyBehavior::default();
-            behavior.start_results = VecDeque::from([Ok(())]);
-            behavior.on_results = VecDeque::from([Err("enable failed".to_string())]);
-            behavior.stop_results = VecDeque::from([Ok(())]);
+            let behavior = ProxyBehavior {
+                start_results: VecDeque::from([Ok(())]),
+                on_results: VecDeque::from([Err("enable failed".to_string())]),
+                stop_results: VecDeque::from([Ok(())]),
+                ..Default::default()
+            };
             let _hooks = install_hooks(behavior);
 
             let rt = build_runtime();
@@ -1194,10 +1196,12 @@ mod tests {
     fn up_reports_when_on_and_rollback_stop_fail() {
         with_temp_home(|temp| {
             let config_path = write_config_with_ca(temp);
-            let mut behavior = ProxyBehavior::default();
-            behavior.start_results = VecDeque::from([Ok(())]);
-            behavior.on_results = VecDeque::from([Err("enable failed".to_string())]);
-            behavior.stop_results = VecDeque::from([Err("stop failed".to_string())]);
+            let behavior = ProxyBehavior {
+                start_results: VecDeque::from([Ok(())]),
+                on_results: VecDeque::from([Err("enable failed".to_string())]),
+                stop_results: VecDeque::from([Err("stop failed".to_string())]),
+                ..Default::default()
+            };
             let _hooks = install_hooks(behavior);
 
             let rt = build_runtime();
@@ -1233,9 +1237,11 @@ mod tests {
     fn up_success_does_not_stop() {
         with_temp_home(|temp| {
             let config_path = write_config_with_ca(temp);
-            let mut behavior = ProxyBehavior::default();
-            behavior.start_results = VecDeque::from([Ok(())]);
-            behavior.on_results = VecDeque::from([Ok(())]);
+            let behavior = ProxyBehavior {
+                start_results: VecDeque::from([Ok(())]),
+                on_results: VecDeque::from([Ok(())]),
+                ..Default::default()
+            };
             let _hooks = install_hooks(behavior);
 
             let rt = build_runtime();
@@ -1265,9 +1271,11 @@ mod tests {
     #[test]
     fn down_calls_stop_then_off() {
         with_temp_home(|_| {
-            let mut behavior = ProxyBehavior::default();
-            behavior.stop_results = VecDeque::from([Ok(())]);
-            behavior.off_results = VecDeque::from([Ok(())]);
+            let behavior = ProxyBehavior {
+                stop_results: VecDeque::from([Ok(())]),
+                off_results: VecDeque::from([Ok(())]),
+                ..Default::default()
+            };
             let _hooks = install_hooks(behavior);
 
             let rt = build_runtime();

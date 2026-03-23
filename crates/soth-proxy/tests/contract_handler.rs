@@ -369,8 +369,10 @@ fn handler_contract_connect_gate_skips_non_catalog_tls() {
 #[test]
 fn handler_contract_connect_gate_intercepts_catalog_tls() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -387,8 +389,10 @@ fn handler_contract_connect_gate_intercepts_catalog_tls() {
 #[tokio::test]
 async fn handler_contract_intercepts_and_records_request_response_flow() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -422,8 +426,10 @@ async fn handler_contract_intercepts_and_records_request_response_flow() {
 #[tokio::test]
 async fn handler_contract_streaming_callbacks_complete() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -468,8 +474,10 @@ async fn handler_contract_streaming_callbacks_complete() {
 #[tokio::test]
 async fn handler_contract_stream_end_without_chunks_is_safe() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -571,8 +579,10 @@ fn handler_contract_intercept_schema_contains_reference_columns() {
 #[tokio::test]
 async fn handler_contract_intercept_row_persists_reference_fields() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -676,8 +686,10 @@ async fn handler_contract_intercept_row_persists_reference_fields() {
 #[tokio::test]
 async fn handler_contract_codex_websocket_turn_lifecycle() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),

@@ -296,16 +296,14 @@ impl SessionManager {
     pub fn evict_stale(&self, max_scan: usize) {
         // Bounded scan of sessions
         let max_inactive = std::time::Duration::from_secs(self.config.window_secs * 2);
-        let mut scanned = 0;
         let mut to_remove_sessions: Vec<SessionKey> = Vec::new();
-        for entry in self.sessions.iter() {
+        for (scanned, entry) in self.sessions.iter().enumerate() {
             if scanned >= max_scan {
                 break;
             }
             if entry.value().last_active.elapsed() > max_inactive {
                 to_remove_sessions.push(entry.key().clone());
             }
-            scanned += 1;
         }
         for key in to_remove_sessions {
             self.sessions.remove(&key);
@@ -313,16 +311,14 @@ impl SessionManager {
 
         // Bounded scan of connection_map
         let max_binding_age = std::time::Duration::from_secs(self.config.window_secs * 3);
-        let mut scanned = 0;
         let mut to_remove_bindings: Vec<Uuid> = Vec::new();
-        for entry in self.connection_map.iter() {
+        for (scanned, entry) in self.connection_map.iter().enumerate() {
             if scanned >= max_scan {
                 break;
             }
             if entry.value().bound_at.elapsed() > max_binding_age {
                 to_remove_bindings.push(*entry.key());
             }
-            scanned += 1;
         }
         for id in to_remove_bindings {
             self.connection_map.remove(&id);

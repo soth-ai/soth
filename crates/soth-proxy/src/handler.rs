@@ -1204,7 +1204,6 @@ fn process_resolution_from_outcome(
         tool_kind,
         tool_category,
         provider_id,
-        ..Default::default()
     }
 }
 

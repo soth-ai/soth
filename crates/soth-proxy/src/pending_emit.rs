@@ -142,16 +142,14 @@ impl PendingEmitStore {
     /// response data (for partial emission).
     pub fn evict_stale(&self, max_age: Duration, max_scan: usize) -> Vec<(Uuid, ResolvedEmit)> {
         let mut stale = Vec::new();
-        let mut scanned = 0;
         let mut to_remove = Vec::new();
-        for entry in self.inner.iter() {
+        for (scanned, entry) in self.inner.iter().enumerate() {
             if scanned >= max_scan {
                 break;
             }
             if entry.value().created_at.elapsed() > max_age {
                 to_remove.push(*entry.key());
             }
-            scanned += 1;
         }
         for id in to_remove {
             if let Some((_, entry)) = self.inner.remove(&id) {

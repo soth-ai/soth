@@ -175,8 +175,7 @@ async fn contract_sync_endpoints_and_cursors() {
     assert!(
         telemetry
             .counters
-            .get("sync.registry.bundle_age_seconds")
-            .is_some(),
+            .contains_key("sync.registry.bundle_age_seconds"),
         "heartbeat should include registry bundle age telemetry"
     );
     let registry = captured.heartbeat_requests[0]

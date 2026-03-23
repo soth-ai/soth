@@ -186,16 +186,14 @@ impl StreamingStore {
     }
 
     pub fn evict_stale(&self, max_age: Duration, max_scan: usize) {
-        let mut scanned = 0;
         let mut to_remove = Vec::new();
-        for entry in self.inner.iter() {
+        for (scanned, entry) in self.inner.iter().enumerate() {
             if scanned >= max_scan {
                 break;
             }
             if entry.value().started_at.elapsed() > max_age {
                 to_remove.push(*entry.key());
             }
-            scanned += 1;
         }
         for id in to_remove {
             self.inner.remove(&id);
