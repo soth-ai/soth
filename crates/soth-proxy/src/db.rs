@@ -696,6 +696,44 @@ pub fn expire_embeddings(db: &Arc<Mutex<rusqlite::Connection>>, days: u32) -> Re
     Ok(nulled_rows)
 }
 
+pub fn enforce_retention(db: &Arc<Mutex<rusqlite::Connection>>, max_age_days: u32) {
+    if max_age_days == 0 {
+        return; // 0 = disabled
+    }
+    let cutoff_ms = chrono::Utc::now().timestamp_millis() - (max_age_days as i64 * 86_400_000);
+    match db.lock() {
+        Ok(conn) => {
+            match conn.execute(
+                "DELETE FROM intercept_records WHERE timestamp_utc < ?1",
+                rusqlite::params![cutoff_ms],
+            ) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(
+                            deleted,
+                            max_age_days,
+                            "retention enforcement: purged old records"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "retention enforcement failed"),
+            }
+        }
+        Err(_) => tracing::warn!("retention enforcement: db lock poisoned"),
+    }
+}
+
+pub fn wal_checkpoint(db: &Arc<Mutex<rusqlite::Connection>>) {
+    match db.lock() {
+        Ok(conn) => {
+            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+                tracing::warn!(error = %e, "WAL checkpoint failed");
+            }
+        }
+        Err(_) => tracing::warn!("WAL checkpoint: db lock poisoned"),
+    }
+}
+
 fn ensure_intercept_columns(conn: &rusqlite::Connection) -> Result<()> {
     let existing = table_columns(conn, "intercept_records")?;
     for (name, definition) in REQUIRED_INTERCEPT_COLUMNS {

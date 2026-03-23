@@ -81,6 +81,25 @@ pub enum Commands {
         #[command(subcommand)]
         action: commands::bundle::BundleCommands,
     },
+
+    /// Validate configuration without starting the proxy
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommands {
+    /// Parse and sanity-check the config file (exits 1 on errors)
+    Validate(ConfigValidateArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct ConfigValidateArgs {
+    /// Config file path (defaults to ~/.soth/soth.yaml)
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -345,6 +364,9 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
         Commands::Bundle { action } => {
             commands::bundle::run(action, global_config).await?;
         }
+        Commands::Config { action } => {
+            run_config_command(action, global_config)?;
+        }
     }
 
     Ok(())
@@ -539,6 +561,20 @@ mod proxy_test_hooks {
         }
         guard.calls.push(ProxyCall::Stop);
         Some(next_result(&mut guard.behavior.stop_results))
+    }
+}
+
+fn run_config_command(
+    action: ConfigCommands,
+    global_config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    match action {
+        ConfigCommands::Validate(args) => {
+            let path =
+                cli_config::resolve_config_path(args.config.as_ref(), global_config.as_ref())
+                    .unwrap_or_else(cli_config::default_config_path);
+            commands::config::validate(&path)
+        }
     }
 }
 

@@ -747,6 +747,13 @@ pub struct PipelineConfig {
     pub unknown_app_action: Option<GateAction>,
     pub non_cataloged_host_action: Option<GateAction>,
     pub session: SessionConfig,
+    /// Number of days to retain intercept records in the local SQLite database.
+    /// Set to `0` to disable automatic purging.
+    #[serde(default = "PipelineConfig::default_retention_days")]
+    pub retention_days: u32,
+    /// Bind address for the lightweight ops HTTP server (`/healthz`, `/readyz`, `/metrics`).
+    /// Set to an empty string to disable.
+    pub ops_bind: String,
 }
 
 impl Default for PipelineConfig {
@@ -758,7 +765,15 @@ impl Default for PipelineConfig {
             unknown_app_action: None,
             non_cataloged_host_action: None,
             session: SessionConfig::default(),
+            retention_days: Self::default_retention_days(),
+            ops_bind: "127.0.0.1:9090".to_string(),
         }
+    }
+}
+
+impl PipelineConfig {
+    fn default_retention_days() -> u32 {
+        30
     }
 }
 

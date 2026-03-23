@@ -16,6 +16,10 @@ struct StreamAccumulator {
     started_at: Instant,
     /// Timestamp of the first chunk received (for TTFB calculation).
     first_chunk_at: Option<Instant>,
+    /// Timestamp of the most recent chunk received. Used by `evict_stale` so
+    /// that long-lived WebSocket sessions are not evicted while they are still
+    /// actively receiving data.
+    last_chunk_at: Option<Instant>,
     accumulated_payload_bytes: u64,
     /// Detect-layer stream session that owns model extraction, usage
     /// extraction, turn lifecycle, and content accumulation.
@@ -79,6 +83,7 @@ impl StreamingStore {
                 chunk_count: 0,
                 started_at: request_time,
                 first_chunk_at: None,
+                last_chunk_at: None,
                 accumulated_payload_bytes: 0,
                 detect_session,
                 stream_artifacts: Vec::new(),
@@ -113,6 +118,7 @@ impl StreamingStore {
                     }
                 }
             }
+            state.last_chunk_at = Some(Instant::now());
             state.chunk_count = state.chunk_count.saturating_add(1);
             state.accumulated_payload_bytes = state
                 .accumulated_payload_bytes
@@ -191,7 +197,11 @@ impl StreamingStore {
             if scanned >= max_scan {
                 break;
             }
-            if entry.value().started_at.elapsed() > max_age {
+            let last_active = entry
+                .value()
+                .last_chunk_at
+                .unwrap_or(entry.value().started_at);
+            if last_active.elapsed() > max_age {
                 to_remove.push(*entry.key());
             }
         }

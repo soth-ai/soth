@@ -125,6 +125,10 @@ impl ProxyHandler {
         self.session_store.evict_stale(MAX_REAP_SCAN);
         self.expire_embeddings_if_due();
 
+        // Run retention + WAL checkpoint on the same daily cadence
+        crate::db::enforce_retention(&self.db, self.pipeline_config.retention_days);
+        crate::db::wal_checkpoint(&self.db);
+
         // Evict stale pending_emit entries (classify completed but response never arrived).
         // Emit classify-only telemetry for these so they are not lost.
         let stale_entries = self

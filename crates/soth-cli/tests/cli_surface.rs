@@ -17,7 +17,7 @@ fn help_lists_supported_commands() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     for token in [
         "start", "stop", "up", "down", "on", "off", "logs", "status", "init", "enroll", "setup-ca",
-        "doctor", "env", "events", "bundle",
+        "doctor", "env", "events", "bundle", "config",
     ] {
         assert!(
             stdout.contains(token),
@@ -56,6 +56,18 @@ fn bundle_help_lists_status_and_verify() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("status"));
     assert!(stdout.contains("verify"));
+}
+
+#[test]
+fn config_validate_help_lists_config_flag() {
+    let out = run_cli(&["config", "validate", "--help"]);
+    assert!(out.status.success());
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--config"),
+        "expected `config validate --help` to mention --config"
+    );
 }
 
 #[test]

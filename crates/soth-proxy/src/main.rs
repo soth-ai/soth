@@ -2,7 +2,7 @@ mod bundle_runtime;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rustls::crypto::{self, CryptoProvider};
@@ -169,6 +169,40 @@ async fn main() -> Result<()> {
         config.user_hmac_secret.as_str().to_string(),
     );
 
+    // ── Ops HTTP server ───────────────────────────────────────────────────────
+    // Runs on a separate port from the MITM proxy. A bind failure is non-fatal:
+    // we log a warning and continue so the proxy itself is never blocked.
+    let ops_task = {
+        let ops_bind = config.pipeline.ops_bind.clone();
+        let ops_state = Arc::new(soth_proxy::ops_server::OpsState {
+            startup_time: Instant::now(),
+            db_path: config.db_path.clone(),
+        });
+        tokio::spawn(async move {
+            if ops_bind.is_empty() {
+                tracing::info!("ops server disabled (pipeline.ops_bind is empty)");
+                return;
+            }
+            match tokio::net::TcpListener::bind(&ops_bind).await {
+                Ok(listener) => {
+                    tracing::info!(bind = %ops_bind, "ops server started");
+                    if let Err(e) =
+                        axum::serve(listener, soth_proxy::ops_server::build_router(ops_state)).await
+                    {
+                        tracing::warn!(error = %e, "ops server exited unexpectedly");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        bind = %ops_bind,
+                        "ops server failed to bind; continuing without ops endpoint"
+                    );
+                }
+            }
+        })
+    };
+
     let handler_for_bundle_watch = handler.clone();
     let mut bundle_watch_handle = bundle_handle.clone();
     let bundle_watch_task = tokio::spawn(async move {
@@ -252,6 +286,7 @@ async fn main() -> Result<()> {
         .await
         .context("shutdown mitm proxy")?;
 
+    ops_task.abort();
     if let Some(task) = sync_task {
         task.abort();
     }
