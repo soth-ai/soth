@@ -262,7 +262,7 @@ async fn exchange_enroll_token(
         .context("failed reading enrollment response body")?;
 
     if !status.is_success() {
-        anyhow::bail!("enrollment exchange failed: HTTP {} - {}", status, text);
+        anyhow::bail!("enrollment exchange failed: HTTP {status} - {text}");
     }
 
     serde_json::from_str::<Value>(&text)
@@ -364,7 +364,11 @@ fn default_machine_name() -> String {
 }
 
 fn proxy_public_key_base64(device_id_hash: &str) -> String {
-    let seed = derive_proxy_signing_seed(device_id_hash);
+    // The enroll command derives the public key without access to the proxy's
+    // user_hmac_secret, so local_secret is empty. This is only used to display
+    // the public key identity for enrollment — the actual proxy uses
+    // user_hmac_secret mixed in at runtime.
+    let seed = derive_proxy_signing_seed(device_id_hash, &[]);
     let signing_key = SigningKey::from_bytes(&seed);
     BASE64_STANDARD.encode(signing_key.verifying_key().as_bytes())
 }

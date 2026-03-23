@@ -57,7 +57,13 @@ pub fn read_sessions_json<'a>(
         }
 
         if let Some(mtime) = latest_mtime {
-            let mut guard = cursor.lock().unwrap();
+            let mut guard = match cursor.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    tracing::warn!("json_file cursor mutex poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
             *guard = Some(Cursor::FileMtime {
                 path: root,
                 mtime,

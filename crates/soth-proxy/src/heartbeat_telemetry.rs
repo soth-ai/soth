@@ -3,12 +3,114 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use soth_sync::api_types::HeartbeatTelemetry;
 
 const REGISTRY_SOURCE_DEGRADED_EMBEDDED: u64 = 0;
 const REGISTRY_SOURCE_DEGRADED_CACHED: u64 = 1;
 const REGISTRY_SOURCE_HEALTHY_CLOUD: u64 = 2;
 const REGISTRY_STALE_AFTER_SECS: u64 = 24 * 60 * 60;
+
+// ── Latency histogram ─────────────────────────────────────────────────────────
+
+/// Bucket boundaries in microseconds: 0.1ms … 5 s.
+pub static LATENCY_BOUNDARIES_US: &[u64] = &[
+    100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+];
+
+/// A lock-free latency histogram built from `AtomicU64` counters.
+///
+/// Observations are bucketed in **O(log n)** time via binary search, then
+/// recorded with a single relaxed atomic add. The overflow bucket captures
+/// anything above the highest boundary.
+pub struct AtomicHistogram {
+    boundaries: &'static [u64],
+    /// `boundaries.len() + 1` buckets — the last element is the overflow bucket.
+    buckets: Vec<AtomicU64>,
+    sum_us: AtomicU64,
+    count: AtomicU64,
+}
+
+impl AtomicHistogram {
+    /// Create a new histogram with the given microsecond boundaries.
+    pub fn new(boundaries: &'static [u64]) -> Self {
+        let n = boundaries.len() + 1; // +1 for overflow
+        let buckets = (0..n).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            boundaries,
+            buckets,
+            sum_us: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a single observation of `value_us` microseconds.
+    pub fn record_us(&self, value_us: u64) {
+        // Binary search for the first boundary that value_us fits under.
+        let bucket = self.boundaries.partition_point(|&b| value_us > b);
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(value_us, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot the histogram for exposition.  Returns per-bucket (not
+    /// cumulative) counts so that the caller can decide the exposition format.
+    pub fn snapshot(&self) -> HistogramSnapshot {
+        let bucket_counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
+        let sum_us = self.sum_us.load(Ordering::Relaxed);
+        let count = self.count.load(Ordering::Relaxed);
+        HistogramSnapshot {
+            boundaries: self.boundaries,
+            bucket_counts,
+            sum_seconds: sum_us as f64 / 1_000_000.0,
+            count,
+        }
+    }
+}
+
+/// A point-in-time snapshot of an [`AtomicHistogram`].
+pub struct HistogramSnapshot {
+    /// Bucket boundaries in microseconds (same slice as the source histogram).
+    pub boundaries: &'static [u64],
+    /// Per-bucket counts in the same order as `boundaries` plus one overflow
+    /// bucket at the end.  These are **not** cumulative.
+    pub bucket_counts: Vec<u64>,
+    /// Sum of all observed values, converted to seconds.
+    pub sum_seconds: f64,
+    /// Total number of observations.
+    pub count: u64,
+}
+
+static DETECT_LATENCY: Lazy<AtomicHistogram> =
+    Lazy::new(|| AtomicHistogram::new(LATENCY_BOUNDARIES_US));
+static CLASSIFY_LATENCY: Lazy<AtomicHistogram> =
+    Lazy::new(|| AtomicHistogram::new(LATENCY_BOUNDARIES_US));
+
+/// Record a single detect-stage latency observation (in microseconds).
+pub fn record_detect_latency_us(us: u64) {
+    DETECT_LATENCY.record_us(us);
+}
+
+/// Record a single classify-stage latency observation (in microseconds).
+pub fn record_classify_latency_us(us: u64) {
+    CLASSIFY_LATENCY.record_us(us);
+}
+
+/// Return a point-in-time snapshot of the detect latency histogram.
+pub fn detect_latency_snapshot() -> HistogramSnapshot {
+    DETECT_LATENCY.snapshot()
+}
+
+/// Return a point-in-time snapshot of the classify latency histogram.
+pub fn classify_latency_snapshot() -> HistogramSnapshot {
+    CLASSIFY_LATENCY.snapshot()
+}
+
+// ── Heartbeat counters ────────────────────────────────────────────────────────
 
 static BLACKLIST_KEYWORD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLACKLIST_GRAPHQL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -273,7 +375,7 @@ mod tests {
         record_bundle_trust_level, record_classify_in_flight_finished,
         record_classify_in_flight_started, record_classify_overload_drop,
         record_db_write_queue_fallback, record_discovery_catalog_intercept,
-        record_policy_enforced_false,
+        record_policy_enforced_false, AtomicHistogram, LATENCY_BOUNDARIES_US,
     };
 
     #[test]
@@ -433,5 +535,84 @@ mod tests {
             .copied()
             .unwrap_or(0);
         assert_eq!(unverified, 1);
+    }
+
+    // ── AtomicHistogram tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn histogram_empty_snapshot_is_all_zeros() {
+        let h = AtomicHistogram::new(LATENCY_BOUNDARIES_US);
+        let snap = h.snapshot();
+        assert_eq!(snap.count, 0);
+        assert_eq!(snap.sum_seconds, 0.0);
+        assert!(snap.bucket_counts.iter().all(|&c| c == 0));
+        // Number of buckets = boundaries + 1 overflow
+        assert_eq!(snap.bucket_counts.len(), LATENCY_BOUNDARIES_US.len() + 1);
+    }
+
+    #[test]
+    fn histogram_records_below_first_boundary() {
+        let h = AtomicHistogram::new(LATENCY_BOUNDARIES_US);
+        // 50 µs < 100 µs (first boundary) → bucket 0
+        h.record_us(50);
+        let snap = h.snapshot();
+        assert_eq!(snap.count, 1);
+        assert_eq!(snap.bucket_counts[0], 1);
+        // All other buckets should be zero.
+        for &c in &snap.bucket_counts[1..] {
+            assert_eq!(c, 0);
+        }
+    }
+
+    #[test]
+    fn histogram_records_above_last_boundary() {
+        let h = AtomicHistogram::new(LATENCY_BOUNDARIES_US);
+        // 10_000_000 µs > 5_000_000 µs (last boundary) → overflow bucket
+        h.record_us(10_000_000);
+        let snap = h.snapshot();
+        assert_eq!(snap.count, 1);
+        let overflow_idx = LATENCY_BOUNDARIES_US.len();
+        assert_eq!(snap.bucket_counts[overflow_idx], 1);
+    }
+
+    #[test]
+    fn histogram_records_at_exact_boundary() {
+        let h = AtomicHistogram::new(LATENCY_BOUNDARIES_US);
+        // 1_000 µs == boundary[2] (1ms); partition_point finds first b where value > b,
+        // so exactly equal goes into bucket at that index (value is NOT > boundary).
+        h.record_us(1_000);
+        let snap = h.snapshot();
+        assert_eq!(snap.count, 1);
+        // 1_000 is not > 1_000, so partition_point returns index 2 (the 1_000 boundary).
+        assert_eq!(snap.bucket_counts[2], 1);
+    }
+
+    #[test]
+    fn histogram_sum_and_count_accumulate() {
+        let h = AtomicHistogram::new(LATENCY_BOUNDARIES_US);
+        h.record_us(200); // 0.0002 s
+        h.record_us(800); // 0.0008 s
+        h.record_us(2_000); // 0.002 s
+        let snap = h.snapshot();
+        assert_eq!(snap.count, 3);
+        let expected_sum = (200 + 800 + 2_000) as f64 / 1_000_000.0;
+        // Allow small floating-point rounding.
+        assert!((snap.sum_seconds - expected_sum).abs() < 1e-9);
+    }
+
+    #[test]
+    fn histogram_public_fns_record_and_snapshot() {
+        // Exercise the module-level helpers against the shared statics.
+        // We can't assert exact values because other tests may have already
+        // incremented the counters, but we can confirm count increases.
+        let before = super::detect_latency_snapshot().count;
+        super::record_detect_latency_us(500);
+        let after = super::detect_latency_snapshot().count;
+        assert_eq!(after, before + 1);
+
+        let before = super::classify_latency_snapshot().count;
+        super::record_classify_latency_us(1_500);
+        let after = super::classify_latency_snapshot().count;
+        assert_eq!(after, before + 1);
     }
 }

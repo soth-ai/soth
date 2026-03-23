@@ -125,6 +125,10 @@ impl ProxyHandler {
         self.session_store.evict_stale(MAX_REAP_SCAN);
         self.expire_embeddings_if_due();
 
+        // Run retention + WAL checkpoint on the same daily cadence
+        crate::db::enforce_retention(&self.db, self.pipeline_config.retention_days);
+        crate::db::wal_checkpoint(&self.db);
+
         // Evict stale pending_emit entries (classify completed but response never arrived).
         // Emit classify-only telemetry for these so they are not lost.
         let stale_entries = self
@@ -270,10 +274,10 @@ impl ProxyHandler {
             &outcome,
         );
         if self.pipeline_config.non_cataloged_host_action == Some(crate::config::GateAction::Block)
-            && matches!(outcome.reason, soth_core::DecisionReason::NotInCatalog)
+            && matches!(outcome.reason, crate::gating::DecisionReason::NotInCatalog)
             && matches!(
                 outcome.decision,
-                soth_core::GateDecision::Skip | soth_core::GateDecision::Passthrough
+                crate::gating::GateDecision::Skip | crate::gating::GateDecision::Passthrough
             )
         {
             crate::trace::handler_decision(
@@ -288,18 +292,18 @@ impl ProxyHandler {
         }
 
         match &outcome.decision {
-            soth_core::GateDecision::Skip | soth_core::GateDecision::Passthrough => {
+            crate::gating::GateDecision::Skip | crate::gating::GateDecision::Passthrough => {
                 crate::trace::handler_decision(connection_id, "allow", "gate skip/passthrough");
                 return soth_mitm::HandlerDecision::Allow;
             }
-            soth_core::GateDecision::Block { status, message } => {
+            crate::gating::GateDecision::Block { status, message } => {
                 crate::trace::handler_decision(connection_id, "block", "gate block");
                 return soth_mitm::HandlerDecision::Block {
                     status: *status,
                     body: Bytes::from(message.clone()),
                 };
             }
-            soth_core::GateDecision::Intercept => {}
+            crate::gating::GateDecision::Intercept => {}
         }
 
         let entity_index = self.entity_index.load();
@@ -420,6 +424,7 @@ impl ProxyHandler {
             truncated_body_sizes,
             &detect_result,
         );
+        crate::heartbeat_telemetry::record_detect_latency_us(detect_result.detect_latency_us);
         crate::trace::dev_verify_request(
             connection_id,
             req.method.as_str(),
@@ -439,9 +444,12 @@ impl ProxyHandler {
             // Prefer parsed content (system prompt + user message) over raw body.
             // Raw body includes JSON structure, API params, temperature, etc. that
             // would pollute the embedding vector.
+            // Both paths are capped at MAX_EMBEDDING_INPUT_BYTES so the tokenizer
+            // never scans more than ~1 000 tokens before truncating to 128.
             _ => detect_result
                 .user_prompt
                 .clone()
+                .map(truncate_for_embedding)
                 .or_else(|| extract_content_for_embedding(&req.body)),
         };
 
@@ -518,6 +526,11 @@ impl ProxyHandler {
             detect_result.normalized.stream = true;
         }
 
+        // Wrap in Arc after all mutations are complete. Cloning into PendingCapture
+        // and ClassifyTaskInput is now a cheap refcount bump instead of a deep copy.
+        let detect_result = Arc::new(detect_result);
+        let proxy_ctx = Arc::new(proxy_ctx);
+
         // ── Phase 5: Insert PendingCapture (unified WS + HTTP path) ─────────
         let deferred_classify = if is_websocket_upgrade {
             Some(crate::pending::DeferredClassify {
@@ -541,8 +554,8 @@ impl ProxyHandler {
             request_path: req.path.clone(),
             request_body_bytes: original_body_len,
             outcome: outcome.clone(),
-            detect_result: detect_result.clone(),
-            proxy_ctx: proxy_ctx.clone(),
+            detect_result: Arc::clone(&detect_result),
+            proxy_ctx: Arc::clone(&proxy_ctx),
             raw_body: raw_body_for_commitment,
             deferred_classify,
             is_websocket: is_websocket_upgrade,
@@ -777,21 +790,35 @@ impl ProxyHandler {
                     // Only use the refreshed result if it has better confidence
                     // than the stale upgrade-request detect.
                     if result.confidence != soth_core::ParseConfidence::Heuristic {
-                        result
+                        Arc::new(result)
                     } else {
-                        pending.detect_result.clone()
+                        Arc::clone(&pending.detect_result)
                     }
                 } else {
-                    pending.detect_result.clone()
+                    Arc::clone(&pending.detect_result)
                 };
+
+                // The WebSocket upgrade request has an empty body (HTTP GET),
+                // so deferred.content_for_embedding is None. Use the first
+                // frame's payload as embedding content instead — it typically
+                // contains `response.create` JSON with the model and system
+                // instructions, which is exactly what we want to embed.
+                let first_frame_text = if !chunk.payload.is_empty() {
+                    std::str::from_utf8(&chunk.payload)
+                        .ok()
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+                let content_for_embedding = first_frame_text.or(deferred.content_for_embedding);
 
                 let policy_block_enforced = Arc::new(AtomicBool::new(false));
                 let _block_rx =
                     classify_task::spawn_classify_task(classify_task::ClassifyTaskInput {
                         connection_id: pending.connection_id,
                         detect_result: refreshed_detect,
-                        content_for_embedding: deferred.content_for_embedding,
-                        proxy_ctx: pending.proxy_ctx.clone(),
+                        content_for_embedding,
+                        proxy_ctx: Arc::clone(&pending.proxy_ctx),
                         capture_mode: pending.outcome.capture_mode,
                         matched_provider: pending.outcome.matched_provider.clone(),
                         matched_application: pending.outcome.matched_application.clone(),
@@ -911,12 +938,12 @@ impl ProxyHandler {
     ) {
         // Merge streaming response artifacts (credentials found in response
         // chunks) into the detect result so they reach telemetry + DB.
+        // Arc::make_mut gives us exclusive ownership by cloning only when other
+        // references exist; when this is the sole reference it mutates in place.
         if !completed.stream_artifacts.is_empty() {
-            completed
-                .pending
-                .detect_result
+            Arc::make_mut(&mut completed.pending.detect_result)
                 .artifacts
-                .extend(completed.stream_artifacts.drain(..));
+                .append(&mut completed.stream_artifacts);
         }
 
         let usage = completed.usage.unwrap_or_else(|| {
@@ -1016,7 +1043,7 @@ impl soth_mitm::InterceptHandler for ProxyHandler {
     ) -> bool {
         let decision = self.gate_evaluator.load().evaluate_tls(host);
         crate::trace::tls_gate(host, &decision);
-        matches!(decision, soth_core::GateDecision::Intercept)
+        matches!(decision, crate::gating::GateDecision::Intercept)
     }
 
     fn on_request(
@@ -1110,10 +1137,29 @@ fn extract_host(header_host: Option<&str>, path: &str) -> String {
     "unknown".to_string()
 }
 
+/// Maximum byte length of text fed into the embedding pipeline.
+/// 4096 bytes is ~1 000 tokens at average English density, comfortably
+/// above the 128-token tokenizer window while preventing the tokenizer
+/// from scanning multi-megabyte bodies before truncating.  Kept at 1 MB
+/// so agentic coding prompts (full repo context, multi-file pastes) are
+/// not truncated — the tokenizer handles its own efficient truncation.
+const MAX_EMBEDDING_INPUT_BYTES: usize = 1024 * 1024;
+
 fn extract_content_for_embedding(body: &Bytes) -> Option<String> {
-    std::str::from_utf8(body.as_ref())
-        .ok()
-        .map(std::string::ToString::to_string)
+    let text = std::str::from_utf8(body.as_ref()).ok()?;
+    if text.len() > MAX_EMBEDDING_INPUT_BYTES {
+        Some(text[..MAX_EMBEDDING_INPUT_BYTES].to_string())
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn truncate_for_embedding(text: String) -> String {
+    if text.len() > MAX_EMBEDDING_INPUT_BYTES {
+        text[..MAX_EMBEDDING_INPUT_BYTES].to_string()
+    } else {
+        text
+    }
 }
 
 fn sha256_hex(input: &[u8]) -> String {
@@ -1147,7 +1193,7 @@ fn build_user_id_hmac(meta: &soth_core::ConnectionMeta, secret: &[u8]) -> String
 }
 
 fn process_resolution_from_outcome(
-    outcome: &soth_core::GateOutcome,
+    outcome: &crate::gating::GateOutcome,
     process_info: Option<&soth_core::ProcessInfo>,
     entity_index: Option<&soth_core::EntityIndex>,
 ) -> soth_core::ProcessResolution {
@@ -1204,7 +1250,6 @@ fn process_resolution_from_outcome(
         tool_kind,
         tool_category,
         provider_id,
-        ..Default::default()
     }
 }
 

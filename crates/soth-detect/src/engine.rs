@@ -1,5 +1,5 @@
 use crate::code::{self, detect_code_artifacts};
-use crate::fingerprint::fingerprint;
+use crate::fingerprint_mod::fingerprint;
 use crate::graphql::{parse_graphql, ApqStore};
 use crate::grpc::parse_grpc;
 use crate::hash::canonical_hash;
@@ -11,12 +11,12 @@ use crate::intelligence::{
 use crate::jsonrpc::parse_jsonrpc;
 use crate::rest::parse_rest;
 use crate::sensitive::{
-    credential_scan, org_pattern_scan_compiled, structural_scan, CompiledOrgPatterns,
+    credential_scan_str, org_pattern_scan_compiled_str, structural_scan_str, CompiledOrgPatterns,
 };
 use crate::types::{
-    ArtifactLocation, CaptureMode, DetectBundleSlice, DetectResult, DetectWarning, DetectedFormat,
-    DetectedImportCategory, FormatMeta, NormalizedRequest, ParseSource, ParseWarning,
-    ProviderEntry, RawRequest,
+    ArtifactLocation, CaptureMode, DetectBundleSlice, DetectWarning, DetectedFormat,
+    DetectedImportCategory, FormatMeta, NormalizedRequest, ParseDetectResult, ParseSource,
+    ParseWarning, ProviderEntry, RawRequest,
 };
 use lru::LruCache;
 use serde_json::Value as JsonValue;
@@ -159,6 +159,10 @@ struct ParsePhaseResult {
     parse_source: ParseSource,
     warnings: Vec<DetectWarning>,
     capture_mode: CaptureMode,
+    /// JSON body already parsed during the parse phase (REST formats only).
+    /// Carried forward so process_inner can hand it to the scan phase
+    /// without a second serde_json::from_slice call.
+    parsed_body: Option<JsonValue>,
 }
 
 struct ScanInput {
@@ -182,6 +186,13 @@ fn parse_request(
     bundle: &DetectBundleSlice<'_>,
     apq_store: &dyn ApqStore,
 ) -> ParsePhaseResult {
+    // Parse the JSON body once here, at the earliest point, so that all
+    // downstream format parsers (REST, GraphQL, JSON-RPC, heuristic) can reuse
+    // the already-allocated Value instead of each calling from_slice again.
+    // gRPC bodies are binary protobuf and will not parse as JSON; that is
+    // expected and the None is handled gracefully by every format parser.
+    let pre_parsed_json: Option<JsonValue> = serde_json::from_slice(&req.body).ok();
+
     // Use gating's answers directly — classify_request_pair is now called
     // in the evaluator with full signal-based matching, so no re-derivation needed.
     let format = fingerprint(
@@ -194,8 +205,13 @@ fn parse_request(
         bundle,
     );
 
-    let (mut normalized, parse_source, mut warnings) =
-        parse_by_format(req, bundle, format.clone(), apq_store);
+    let (mut normalized, parse_source, mut warnings, parsed_body) = parse_by_format(
+        req,
+        bundle,
+        format.clone(),
+        apq_store,
+        pre_parsed_json.as_ref(),
+    );
 
     if normalized.canonical_cache_key.is_empty() {
         normalized.canonical_cache_key = canonical_hash(&normalized);
@@ -233,6 +249,7 @@ fn parse_request(
         parse_source,
         warnings,
         capture_mode,
+        parsed_body,
     }
 }
 
@@ -240,10 +257,14 @@ fn parse_request(
 // Phase 2a: build_scan_input — extract scannable locations with fallback
 // ---------------------------------------------------------------------------
 
-fn build_scan_input(body: &[u8], normalized: &NormalizedRequest) -> ScanInput {
-    let segments = extract_scannable_locations(body, normalized);
+fn build_scan_input(
+    body: &[u8],
+    normalized: &NormalizedRequest,
+    parsed_body: Option<&JsonValue>,
+) -> ScanInput {
+    let segments = extract_scannable_locations(body, normalized, parsed_body);
     let fallback_content = if segments.is_empty() {
-        extract_content_sample(body)
+        extract_content_sample(body, parsed_body)
     } else {
         None
     };
@@ -267,14 +288,17 @@ fn scan_content(
     let mut ast_normalized_hash: Option<String> = None;
     let mut import_categories: Vec<DetectedImportCategory> = Vec::new();
 
-    // Body-level scans
-    artifacts.extend(credential_scan(body, ArtifactLocation::Unknown));
-    artifacts.extend(structural_scan(body, ArtifactLocation::Unknown));
-    artifacts.extend(org_pattern_scan_compiled(
-        body,
+    // Decode body once; all three body-level scanners reuse this view.
+    let body_text = String::from_utf8_lossy(body);
+    artifacts.extend(credential_scan_str(&body_text, ArtifactLocation::Unknown));
+    artifacts.extend(structural_scan_str(&body_text, ArtifactLocation::Unknown));
+    artifacts.extend(org_pattern_scan_compiled_str(
+        &body_text,
         compiled_org,
         ArtifactLocation::Unknown,
     ));
+    // body_text is no longer needed after this point.
+    drop(body_text);
 
     // Per-location scans (multi-turn aware)
     if scan_input.segments.is_empty() {
@@ -315,7 +339,8 @@ fn scan_content(
         }
     } else {
         for (location, text) in &scan_input.segments {
-            artifacts.extend(credential_scan(text.as_bytes(), location.clone()));
+            // `text` is already a `String`; pass it as `&str` directly.
+            artifacts.extend(credential_scan_str(text, location.clone()));
 
             if matches!(location, ArtifactLocation::UserContent { .. }) {
                 let code_result = detect_code_artifacts(text, location.clone());
@@ -368,25 +393,30 @@ fn process_inner(
     apq_store: &dyn ApqStore,
     compiled_org: &CompiledOrgPatterns,
     snapshot: &soth_core::SessionSnapshot,
-) -> DetectResult {
+) -> ParseDetectResult {
     let started = Instant::now();
 
     if bundle.filters.matches(&req.path, &req.headers) {
-        let mut out = DetectResult::filtered();
+        let mut out = ParseDetectResult::filtered();
         out.detect_latency_us = started.elapsed().as_micros() as u64;
         return out;
     }
 
-    // Phase 1: Parse
+    // Phase 1: Parse — the parsed JSON body is threaded out of parse_request
+    // for REST formats so the scan phase can reuse it without a second
+    // serde_json::from_slice call.  Non-JSON formats (gRPC, GraphQL, etc.)
+    // leave parsed_body as None and the scan helpers fall back to their
+    // existing raw-byte paths.
     let ParsePhaseResult {
         normalized,
         parse_source,
         mut warnings,
         capture_mode,
+        parsed_body,
     } = parse_request(req, bundle, apq_store);
 
     // Phase 2: Scan
-    let scan_input = build_scan_input(&req.body, &normalized);
+    let scan_input = build_scan_input(&req.body, &normalized, parsed_body.as_ref());
     let scan = scan_content(&req.body, &scan_input, compiled_org);
 
     let artifacts = scan.artifacts;
@@ -430,8 +460,8 @@ fn process_inner(
 
     let confidence = normalized.parse_confidence;
 
-    // Phase 4: Assemble DetectResult
-    DetectResult {
+    // Phase 4: Assemble ParseDetectResult
+    ParseDetectResult {
         normalized,
         artifacts,
         capture_mode,
@@ -475,9 +505,20 @@ fn compute_prefix_repeat(
 fn extract_scannable_locations(
     body: &[u8],
     normalized: &NormalizedRequest,
+    parsed_body: Option<&JsonValue>,
 ) -> Vec<(ArtifactLocation, String)> {
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return Vec::new();
+    // Use the pre-parsed value when available; otherwise parse now (handles
+    // callers that don't go through process_inner, e.g. tests).
+    let owned;
+    let json: &JsonValue = match parsed_body {
+        Some(v) => v,
+        None => {
+            let Ok(v) = serde_json::from_slice::<JsonValue>(body) else {
+                return Vec::new();
+            };
+            owned = v;
+            &owned
+        }
     };
 
     let mut locations = Vec::new();
@@ -560,8 +601,18 @@ fn extract_scannable_locations(
 /// handles GraphQL variables and JSON-RPC params, then falls back to the
 /// longest-string heuristic (min 20 chars). Returns `None` for non-JSON
 /// bodies and for GraphQL bodies where only the query DSL is available.
-fn extract_content_sample(body: &[u8]) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+///
+/// `parsed_body` is an optional pre-parsed value to avoid a redundant
+/// `serde_json::from_slice` call on the hot path.
+fn extract_content_sample(body: &[u8], parsed_body: Option<&JsonValue>) -> Option<String> {
+    let owned;
+    let json: &JsonValue = match parsed_body {
+        Some(v) => v,
+        None => {
+            owned = serde_json::from_slice(body).ok()?;
+            &owned
+        }
+    };
 
     // Try first message content (most common for chat APIs)
     if let Some(content) = json
@@ -654,7 +705,7 @@ fn extract_content_sample(body: &[u8]) -> Option<String> {
 
     // Longest string fallback (min 20 chars) — mirrors heuristic parser
     let mut best: Option<String> = None;
-    visit_json_strings(&json, &mut |s| {
+    visit_json_strings(json, &mut |s| {
         if s.len() >= 20 {
             let better = best.as_ref().map_or(true, |b| s.len() > b.len());
             if better {
@@ -687,16 +738,25 @@ fn parse_by_format(
     bundle: &DetectBundleSlice<'_>,
     format: DetectedFormat,
     apq_store: &dyn ApqStore,
+    pre_parsed: Option<&JsonValue>,
 ) -> (
     crate::types::NormalizedRequest,
     ParseSource,
     Vec<DetectWarning>,
+    Option<JsonValue>,
 ) {
     let mut warnings = Vec::new();
 
     let provider_name = provider_for_format(&format, req, bundle);
 
-    let result = match format {
+    // parsed_json carries the Value for this request so process_inner can
+    // reuse it in the scan phase.  For REST formats this is the post-parse
+    // value returned by parse_rest (which may have gone through preprocess
+    // transforms); for all other formats it is the same pre-parsed value
+    // threaded from parse_request.
+    let mut parsed_json: Option<JsonValue> = None;
+
+    let result: Result<crate::types::NormalizedRequest, _> = match format {
         DetectedFormat::OpenAIRest
         | DetectedFormat::AnthropicRest
         | DetectedFormat::CohereRest
@@ -704,58 +764,77 @@ fn parse_by_format(
         | DetectedFormat::BedrockRest => {
             let key = rest_key_for_format(&format);
             let descriptor = bundle.rest_formats.get(key);
-            parse_rest(req, &provider_name, format.clone(), descriptor).map(|mut nr| {
-                nr.provider = provider_name.clone();
-                nr
-            })
+            parse_rest(req, &provider_name, format.clone(), descriptor, pre_parsed).map(
+                |(mut nr, json)| {
+                    parsed_json = Some(json);
+                    nr.provider = provider_name.clone();
+                    nr
+                },
+            )
         }
         DetectedFormat::CustomRest(ref key) => {
             let descriptor = bundle.rest_formats.get(key.as_str());
-            parse_rest(req, &provider_name, format.clone(), descriptor).map(|mut nr| {
-                nr.provider = provider_name.clone();
-                // Apply model_default when model wasn't extracted from request
-                if nr.model.is_none() {
-                    if let Some(desc) = descriptor {
-                        if let Some(default_model) = desc.model_default.as_deref() {
-                            nr.model = Some(default_model.to_string());
+            parse_rest(req, &provider_name, format.clone(), descriptor, pre_parsed).map(
+                |(mut nr, json)| {
+                    parsed_json = Some(json);
+                    nr.provider = provider_name.clone();
+                    // Apply model_default when model wasn't extracted from request
+                    if nr.model.is_none() {
+                        if let Some(desc) = descriptor {
+                            if let Some(default_model) = desc.model_default.as_deref() {
+                                nr.model = Some(default_model.to_string());
+                            }
                         }
                     }
-                }
-                nr
+                    nr
+                },
+            )
+        }
+        DetectedFormat::GraphQL => {
+            parse_graphql(req, bundle, apq_store, pre_parsed).map(|outcome| {
+                parsed_json = pre_parsed.cloned();
+                warnings.extend(outcome.warnings);
+                outcome.normalized
             })
         }
-        DetectedFormat::GraphQL => parse_graphql(req, bundle, apq_store).map(|outcome| {
-            warnings.extend(outcome.warnings);
-            outcome.normalized
-        }),
         DetectedFormat::GrpcProtobuf => parse_grpc(req, bundle).map(|outcome| {
             warnings.extend(outcome.warnings);
             outcome.normalized
         }),
-        DetectedFormat::JsonRpc => parse_jsonrpc(req, &provider_name).map(|mut nr| {
+        DetectedFormat::JsonRpc => parse_jsonrpc(req, &provider_name, pre_parsed).map(|mut nr| {
+            parsed_json = pre_parsed.cloned();
             nr.provider = provider_name.clone();
             nr
         }),
-        DetectedFormat::Unknown => Ok(heuristic::parse(req)),
+        DetectedFormat::Unknown => {
+            let nr = heuristic::parse(req, pre_parsed);
+            parsed_json = pre_parsed.cloned();
+            Ok(nr)
+        }
     };
 
     match result {
         Ok(normalized) => {
             let source = parse_source_for_format(&format, &normalized.format_metadata);
-            (normalized, source, warnings)
+            (normalized, source, warnings, parsed_json)
         }
         Err(error) => {
             warnings.push(DetectWarning {
                 code: "parser_error",
                 detail: format!("{error:?}"),
             });
-            let mut normalized = heuristic::parse(req);
+            let mut normalized = heuristic::parse(req, pre_parsed);
             normalized.provider = provider_name;
             normalized.parse_warnings.push(ParseWarning::ParserError {
                 reason: format!("{error:?}"),
             });
             normalized.canonical_cache_key = canonical_hash(&normalized);
-            (normalized, ParseSource::Heuristic, warnings)
+            (
+                normalized,
+                ParseSource::Heuristic,
+                warnings,
+                pre_parsed.cloned(),
+            )
         }
     }
 }
@@ -999,10 +1078,10 @@ fn parse_warning_to_detect_warning(warning: &ParseWarning) -> DetectWarning {
 }
 
 // ---------------------------------------------------------------------------
-// Conversion from internal DetectResult to soth_core::DetectResult
+// Conversion from internal ParseDetectResult to soth_core::DetectResult
 // ---------------------------------------------------------------------------
 
-pub fn to_core_detect_result(value: &DetectResult) -> soth_core::DetectResult {
+pub fn to_core_detect_result(value: &ParseDetectResult) -> soth_core::DetectResult {
     soth_core::DetectResult {
         normalized: value.normalized.clone(),
         artifacts: value.artifacts.clone(),
@@ -1032,7 +1111,7 @@ fn map_detect_warning(value: &DetectWarning) -> ParseWarning {
 }
 
 #[cfg(feature = "intelligence")]
-fn emit_intelligence(req: &RawRequest, result: &DetectResult, sink: &dyn IntelligenceSink) {
+fn emit_intelligence(req: &RawRequest, result: &ParseDetectResult, sink: &dyn IntelligenceSink) {
     let parse_event = build_parse_quality_record(req, result);
     let parse_event_id = sink.record_parse_event(&parse_event).ok();
 

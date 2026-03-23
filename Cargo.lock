@@ -3129,7 +3129,6 @@ dependencies = [
  "sha2",
  "soth-classify",
  "soth-core",
- "soth-detect",
  "soth-policy",
  "tempfile",
  "thiserror 1.0.69",
@@ -3208,6 +3207,7 @@ dependencies = [
  "sha3",
  "thiserror 1.0.69",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3227,6 +3227,7 @@ dependencies = [
  "soth-bundle",
  "soth-core",
  "soth-parse",
+ "tracing",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-java",
@@ -3358,6 +3359,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "axum",
  "bytes",
  "chrono",
  "dashmap 5.5.3",
@@ -3366,6 +3368,9 @@ dependencies = [
  "hex",
  "hmac",
  "http",
+ "libc",
+ "once_cell",
+ "rand 0.8.5",
  "rusqlite",
  "rustls",
  "serde",
@@ -3380,23 +3385,17 @@ dependencies = [
  "soth-mitm",
  "soth-parse",
  "soth-policy",
- "soth-sqlite-vec",
  "soth-sync",
  "soth-telemetry",
+ "sqlite-vec",
  "thiserror 1.0.69",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "soth-sqlite-vec"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "sqlite-vec",
+ "zeroize",
 ]
 
 [[package]]
@@ -3425,6 +3424,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3449,6 +3449,7 @@ dependencies = [
  "tracing",
  "uuid",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -4961,6 +4962,7 @@ version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

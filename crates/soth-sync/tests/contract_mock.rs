@@ -112,6 +112,7 @@ async fn contract_sync_endpoints_and_cursors() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
         heartbeat_telemetry: None,
@@ -175,8 +176,7 @@ async fn contract_sync_endpoints_and_cursors() {
     assert!(
         telemetry
             .counters
-            .get("sync.registry.bundle_age_seconds")
-            .is_some(),
+            .contains_key("sync.registry.bundle_age_seconds"),
         "heartbeat should include registry bundle age telemetry"
     );
     let registry = captured.heartbeat_requests[0]
@@ -293,6 +293,7 @@ async fn contract_blob_queue_entries_do_not_block_exchange_upload() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -378,6 +379,7 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -440,6 +442,7 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -526,6 +529,7 @@ async fn contract_frontload_and_live_batches_are_separated() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -620,6 +624,7 @@ async fn contract_frontload_override_path_is_ignored_for_edge_contract() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -691,6 +696,7 @@ async fn contract_exchange_upload_ignores_legacy_flag() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
         telemetry: TelemetrySyncConfig {
@@ -743,7 +749,7 @@ async fn start_mock_server(state: SharedState) -> Option<String> {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    Some(format!("http://{}", addr))
+    Some(format!("http://{addr}"))
 }
 
 async fn exchange_batch_handler(
@@ -944,7 +950,7 @@ async fn registry_version_handler(
             llm_provider_count: 3,
             domain_count: 10,
             format_count: 5,
-            size_bytes: TEST_BUNDLE_JSON.as_bytes().len() as u64,
+            size_bytes: TEST_BUNDLE_JSON.len() as u64,
             manifest: None,
             channel: Some("stable".to_string()),
         }),

@@ -11,11 +11,12 @@ pub fn parse_rest(
     provider_id: &str,
     format: DetectedFormat,
     descriptor: Option<&RestFormatDescriptor>,
-) -> ParseResult<NormalizedRequest> {
+    pre_parsed: Option<&Value>,
+) -> ParseResult<(NormalizedRequest, Value)> {
     let desc =
         descriptor.ok_or_else(|| ParseError::MissingRequiredField("rest_format".to_string()))?;
 
-    let json: Value = decode_request_body(req, desc)?;
+    let json: Value = decode_request_body(req, desc, pre_parsed)?;
 
     let mut warnings = Vec::new();
 
@@ -216,7 +217,7 @@ pub fn parse_rest(
     };
 
     normalized.canonical_cache_key = canonical_hash(&normalized);
-    Ok(normalized)
+    Ok((normalized, json))
 }
 
 fn extract_model(json: &Value, desc: &RestFormatDescriptor, path: &str) -> Option<String> {
@@ -581,7 +582,23 @@ fn parser_id_for_format(format: &DetectedFormat) -> String {
 }
 
 /// Decode the request body according to the descriptor's encoding type.
-fn decode_request_body(req: &RawRequest, desc: &RestFormatDescriptor) -> Result<Value, ParseError> {
+///
+/// `pre_parsed` is an optional pre-parsed JSON value.  When the encoding is
+/// `Json` and there are no preprocess operations the caller's already-parsed
+/// value is cloned (shallow, O(1) for references) instead of re-parsing from
+/// bytes.  For all other encodings, or when a preprocess pipeline must
+/// transform the raw value, the full decode path is taken.
+fn decode_request_body(
+    req: &RawRequest,
+    desc: &RestFormatDescriptor,
+    pre_parsed: Option<&Value>,
+) -> Result<Value, ParseError> {
+    if let (RequestEncoding::Json, Some(v), true) =
+        (&desc.encoding, pre_parsed, desc.preprocess.is_empty())
+    {
+        return Ok(v.clone());
+    }
+
     let raw_json = match desc.encoding {
         RequestEncoding::Json => serde_json::from_slice(&req.body)
             .map_err(|e| ParseError::MalformedBody(e.to_string()))?,
@@ -719,8 +736,19 @@ mod tests {
     fn decode_json_body_default() {
         let desc = RestFormatDescriptor::default();
         let req = raw("POST", "/v1/chat", br#"{"model":"gpt-4o","messages":[]}"#);
-        let json = decode_request_body(&req, &desc).unwrap();
+        let json = decode_request_body(&req, &desc, None).unwrap();
         assert_eq!(json.get("model").unwrap().as_str().unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn decode_json_body_uses_pre_parsed() {
+        let desc = RestFormatDescriptor::default();
+        let req = raw("POST", "/v1/chat", b"THIS IS NOT VALID JSON");
+        // pre_parsed takes precedence over the raw bytes when encoding=Json and
+        // preprocess is empty.
+        let pre = serde_json::json!({"model": "gpt-4o-pre"});
+        let json = decode_request_body(&req, &desc, Some(&pre)).unwrap();
+        assert_eq!(json.get("model").unwrap().as_str().unwrap(), "gpt-4o-pre");
     }
 
     #[test]
@@ -735,7 +763,7 @@ mod tests {
             "/api/graphql",
             b"variables=%7B%22message%22%3A%22hello%22%7D&other=1",
         );
-        let json = decode_request_body(&req, &desc).unwrap();
+        let json = decode_request_body(&req, &desc, None).unwrap();
         assert_eq!(json.get("message").unwrap().as_str().unwrap(), "hello");
     }
 
@@ -766,7 +794,7 @@ mod tests {
             ..Default::default()
         };
         let req = raw("POST", "/generate", encoded.as_bytes());
-        let json = decode_request_body(&req, &desc).unwrap();
+        let json = decode_request_body(&req, &desc, None).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr[0].as_str().unwrap(), "prompt text");
         assert_eq!(arr[1].as_str().unwrap(), "conv-id");
@@ -779,7 +807,7 @@ mod tests {
             ..Default::default()
         };
         let req = raw("GET", "/search?q=hello+world&selectedChatModel=gpt-4o", b"");
-        let json = decode_request_body(&req, &desc).unwrap();
+        let json = decode_request_body(&req, &desc, None).unwrap();
         assert_eq!(json.get("q").unwrap().as_str().unwrap(), "hello world");
         assert_eq!(
             json.get("selectedChatModel").unwrap().as_str().unwrap(),

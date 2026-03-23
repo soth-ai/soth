@@ -14,13 +14,11 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use soth_bundle::{AssetEntry, BundleManifest, BundleScope, OrgSignedConfig};
-use soth_core::{
-    DecisionReason, GateDecision, GateOutcome, GatingBundle, HostRule, ProcessInfo, RequestHeaders,
-    Stage3Config,
-};
+use soth_core::{GatingBundle, HostRule, ProcessInfo, RequestHeaders, Stage3Config};
 use soth_proxy::config::{GateAction, PipelineConfig};
 use soth_proxy::gating::evaluator::{GateEvaluator, GateOverrides};
 use soth_proxy::gating::stage0_tls::HostMatcher;
+use soth_proxy::gating::{DecisionReason, GateDecision, GateOutcome};
 use soth_proxy::{db, ProxyHandler};
 
 #[derive(Serialize)]
@@ -710,8 +708,10 @@ async fn gating_large_corpus_proxy_handler_subset_e2e() {
 
     let db_path =
         std::env::temp_dir().join(format!("soth-proxy-gating-corpus-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
     let handler = build_handler(db_path.as_path(), pipeline, &bundles);
 
     use soth_mitm::InterceptHandler;
@@ -760,10 +760,7 @@ async fn gating_large_corpus_proxy_handler_subset_e2e() {
     if expected_intercepts > 0 {
         wait_for_intercept_rows(db_path.as_path(), expected_intercepts).await;
     }
-    println!(
-        "gating corpus proxy_subset_expected_intercepts={}",
-        expected_intercepts
-    );
+    println!("gating corpus proxy_subset_expected_intercepts={expected_intercepts}");
     assert!(intercept_row_count(db_path.as_path()) >= expected_intercepts);
     let _ = std::fs::remove_file(db_path);
 }

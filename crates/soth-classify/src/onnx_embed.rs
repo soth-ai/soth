@@ -6,9 +6,11 @@ use tokenizers::tokenizer::TruncationDirection;
 use tokenizers::Tokenizer;
 
 /// Maximum token sequence length for the ONNX embedding model. Inputs
-/// longer than this are truncated from the right. Align with the model's
-/// training truncation length when retraining.
-const TOKENIZER_MAX_LENGTH: usize = 256;
+/// longer than this are truncated from the right. Must match the
+/// `max_length` declared in the tokenizer config (currently 128); the
+/// tokenizer pads to this value regardless of what the constant says,
+/// so keeping them in sync avoids wasted processing on phantom tokens.
+const TOKENIZER_MAX_LENGTH: usize = 128;
 
 pub(crate) struct OnnxEmbeddingRuntime {
     session: Mutex<Session>,

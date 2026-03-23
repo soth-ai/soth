@@ -211,6 +211,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn entity(
         slug: &str,
         name: &str,

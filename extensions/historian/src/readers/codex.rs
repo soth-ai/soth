@@ -464,7 +464,15 @@ impl FormatReader for CodexReader {
         let root = root.to_path_buf();
 
         // Incorporate cursor mtime into the `since` filter.
-        let cursor_mtime = self.cursor.lock().unwrap().as_ref().and_then(|c| match c {
+        let cursor_mtime = match self.cursor.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("cursor mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        }
+        .as_ref()
+        .and_then(|c| match c {
             Cursor::FileMtime { mtime, .. } => Some(*mtime),
             _ => None,
         });
@@ -537,8 +545,14 @@ impl FormatReader for CodexReader {
             // 3. Update cursor
             // ---------------------------------------------------------------
             if let Some(mtime) = latest_mtime {
-                let mut cursor = self.cursor.lock().unwrap();
-                *cursor = Some(Cursor::FileMtime {
+                let mut guard = match self.cursor.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        tracing::warn!("cursor mutex poisoned, recovering");
+                        poisoned.into_inner()
+                    }
+                };
+                *guard = Some(Cursor::FileMtime {
                     path: root,
                     mtime,
                 });
@@ -547,7 +561,13 @@ impl FormatReader for CodexReader {
     }
 
     fn last_cursor(&self) -> Option<Cursor> {
-        self.cursor.lock().unwrap().clone()
+        match self.cursor.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                tracing::warn!("cursor mutex poisoned, recovering");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 }
 

@@ -52,7 +52,7 @@ pub fn parse_grpc(
 
     let grpc_path = grpc_request_path(&req.headers, &req.path);
     let Some((service, method)) = extract_grpc_service_method(grpc_path) else {
-        let mut fallback = heuristic::parse(req);
+        let mut fallback = heuristic::parse(req, None);
         fallback.provider = "grpc".to_string();
         fallback.format_metadata = FormatMeta::Grpc {
             service: "unknown".to_string(),
@@ -108,7 +108,7 @@ pub fn parse_grpc(
         .and_then(|spec| spec.provider_hint.as_deref())
         .unwrap_or("grpc");
 
-    let mut fallback = heuristic::parse(req);
+    let mut fallback = heuristic::parse(req, None);
     fallback.provider = provider_hint.to_string();
     fallback.format_metadata = FormatMeta::Grpc {
         service: service.clone(),

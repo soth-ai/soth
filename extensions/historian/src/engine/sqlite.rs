@@ -40,7 +40,15 @@ pub fn read_sessions_sqlite<'a>(
     };
 
     // Snapshot the last rowid for incremental reads.
-    let since_rowid = cursor.lock().unwrap().as_ref().and_then(|c| match c {
+    let since_rowid = match cursor.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::warn!("sqlite cursor mutex poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+    .as_ref()
+    .and_then(|c| match c {
         Cursor::SqliteRowId { last_rowid, .. } => Some(*last_rowid),
         _ => None,
     });
@@ -57,7 +65,13 @@ pub fn read_sessions_sqlite<'a>(
                     yield session;
                 }
                 if let Some(rowid) = max_rowid {
-                    let mut guard = cursor.lock().unwrap();
+                    let mut guard = match cursor.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => {
+                            tracing::warn!("sqlite cursor mutex poisoned, recovering");
+                            poisoned.into_inner()
+                        }
+                    };
                     *guard = Some(Cursor::SqliteRowId {
                         db_path: db_path.clone(),
                         last_rowid: rowid,

@@ -54,6 +54,22 @@ pub async fn run(
     if !cert_path.exists() || !key_path.exists() {
         anyhow::bail!("CA certificate not found. Run `soth setup-ca` first.");
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let key_meta = std::fs::metadata(&key_path)?;
+        let mode = key_meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path = %key_path.display(),
+                mode = format!("{:o}", mode),
+                "CA private key has overly permissive file permissions. \
+                 Expected 0600, got {:o}. Run: chmod 600 {}",
+                mode,
+                key_path.display()
+            );
+        }
+    }
     ensure_ca_runtime_health(&ca_paths, quiet)?;
 
     let generated_path = write_proxy_config(&config, port)?;
@@ -63,11 +79,9 @@ pub async fn run(
         .context("spawn soth-proxy process")?;
     wait_for_listener_start(&mut child, expected_port).await?;
 
-    if !quiet {
-        if foreground {
-            style::success("Proxy started in foreground mode.");
-            style::info("Press Ctrl+C to stop.");
-        }
+    if !quiet && foreground {
+        style::success("Proxy started in foreground mode.");
+        style::info("Press Ctrl+C to stop.");
     }
 
     supervise_proxy(
@@ -210,8 +224,7 @@ async fn supervise_proxy(
 
         if consecutive_failures > MAX_RESTART_ATTEMPTS {
             anyhow::bail!(
-                "soth-proxy failed {} consecutive times — giving up. Check logs for root cause.",
-                MAX_RESTART_ATTEMPTS
+                "soth-proxy failed {MAX_RESTART_ATTEMPTS} consecutive times — giving up. Check logs for root cause."
             );
         }
 
@@ -367,9 +380,7 @@ async fn monitor_listener_health(port: u16) -> Result<()> {
 
         if elapsed >= failure_window {
             anyhow::bail!(
-                "proxy listener on 127.0.0.1:{} stopped accepting connections for >= {}ms",
-                port,
-                LISTENER_HEALTH_FAILURE_WINDOW_MS
+                "proxy listener on 127.0.0.1:{port} stopped accepting connections for >= {LISTENER_HEALTH_FAILURE_WINDOW_MS}ms"
             );
         }
     }
@@ -664,8 +675,8 @@ fn ensure_fd_budget() {
             return;
         }
 
-        let initial_soft = limits.rlim_cur as u64;
-        let hard = limits.rlim_max as u64;
+        let initial_soft = limits.rlim_cur;
+        let hard = limits.rlim_max;
 
         if initial_soft < requested_min_soft {
             let target = std::cmp::min(hard, requested_min_soft) as libc::rlim_t;
@@ -694,8 +705,8 @@ fn ensure_fd_budget() {
             rlim_max: 0,
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut verify) == 0 {
-            let effective_soft = verify.rlim_cur as u64;
-            let effective_hard = verify.rlim_max as u64;
+            let effective_soft = verify.rlim_cur;
+            let effective_hard = verify.rlim_max;
             if effective_soft < warn_soft {
                 warn!(
                     soft_limit = effective_soft,

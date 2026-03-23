@@ -2,7 +2,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
@@ -57,12 +57,72 @@ impl Runtime {
             db_conn,
         });
 
-        let writer_runtime = runtime.clone();
+        let writer_db_conn = runtime.db_conn.clone();
         let _ = std::thread::Builder::new()
             .name("soth-proxy-db-writer".to_string())
             .spawn(move || {
-                while let Ok(job) = db_write_rx.recv() {
-                    writer_runtime.write_db_job_sync(job);
+                const BATCH_CAPACITY: usize = 32;
+                let mut batch: Vec<DbWriteJob> = Vec::with_capacity(BATCH_CAPACITY);
+                loop {
+                    // Block until at least one job arrives (or the channel closes).
+                    match db_write_rx.recv() {
+                        Ok(job) => batch.push(job),
+                        Err(_) => break, // all senders dropped; shut down
+                    }
+                    // Drain any jobs that accumulated while we were idle.
+                    while batch.len() < BATCH_CAPACITY {
+                        match db_write_rx.try_recv() {
+                            Ok(job) => batch.push(job),
+                            Err(_) => break,
+                        }
+                    }
+                    // Execute the whole batch inside a single transaction.
+                    match writer_db_conn.lock() {
+                        Ok(conn) => {
+                            let _ = conn.execute_batch("BEGIN");
+                            for job in batch.drain(..) {
+                                let connection_id = job.connection_id;
+                                let event_id = job.result.telemetry_event.event_id;
+                                match db::write_intercept_record_with_conn(
+                                    &conn,
+                                    job.connection_id,
+                                    &job.result,
+                                    job.result.embedding.as_deref(),
+                                    &job.detect_result,
+                                    &job.proxy_ctx,
+                                    job.raw_body_for_commitment.as_deref(),
+                                    job.capture_mode,
+                                    job.matched_provider.as_deref(),
+                                    job.matched_application.as_deref(),
+                                ) {
+                                    Ok(()) => {
+                                        crate::trace::db_write_ok(connection_id, event_id);
+                                    }
+                                    Err(error) => {
+                                        crate::trace::db_write_err(
+                                            connection_id,
+                                            event_id,
+                                            error.to_string().as_str(),
+                                        );
+                                        warn!(
+                                            connection_id = %connection_id,
+                                            event_id = %event_id,
+                                            error = %error,
+                                            "failed writing intercept record"
+                                        );
+                                        crate::heartbeat_telemetry::record_runtime_error_if_emfile(
+                                            error.to_string().as_str(),
+                                        );
+                                    }
+                                }
+                            }
+                            let _ = conn.execute_batch("COMMIT");
+                        }
+                        Err(_) => {
+                            warn!("db writer: sqlite mutex poisoned; dropping batch");
+                            batch.clear();
+                        }
+                    }
                 }
             });
 
@@ -162,8 +222,8 @@ impl Drop for InFlightPermit {
 struct DbWriteJob {
     connection_id: Uuid,
     result: soth_classify::ClassifiedResult,
-    detect_result: soth_core::DetectResult,
-    proxy_ctx: soth_core::ProxyContext,
+    detect_result: Arc<soth_core::DetectResult>,
+    proxy_ctx: Arc<soth_core::ProxyContext>,
     raw_body_for_commitment: Option<Bytes>,
     capture_mode: soth_core::CaptureMode,
     matched_provider: Option<String>,
@@ -175,9 +235,9 @@ struct DbWriteJob {
 /// function signature with a single struct.
 pub struct ClassifyTaskInput {
     pub connection_id: Uuid,
-    pub detect_result: soth_core::DetectResult,
+    pub detect_result: Arc<soth_core::DetectResult>,
     pub content_for_embedding: Option<String>,
-    pub proxy_ctx: soth_core::ProxyContext,
+    pub proxy_ctx: Arc<soth_core::ProxyContext>,
     pub capture_mode: soth_core::CaptureMode,
     pub matched_provider: Option<String>,
     pub matched_application: Option<String>,
@@ -245,6 +305,7 @@ pub fn spawn_classify_task(
                 let classify_bundle_for_classify = classify_bundle.clone();
                 let classify_config_for_classify = classify_config.clone();
 
+                let classify_start = Instant::now();
                 match tokio::task::spawn_blocking(move || {
                     soth_classify::classify(
                         &detect_for_classify,
@@ -256,7 +317,12 @@ pub fn spawn_classify_task(
                 })
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        crate::heartbeat_telemetry::record_classify_latency_us(
+                            classify_start.elapsed().as_micros() as u64,
+                        );
+                        result
+                    }
                     Err(error) => {
                         warn!(
                             connection_id = %connection_id,
@@ -334,6 +400,7 @@ pub fn spawn_classify_task(
             let classify_bundle_for_classify = classify_bundle.clone();
             let classify_config_for_classify = classify_config.clone();
 
+            let classify_start = Instant::now();
             match tokio::task::spawn_blocking(move || {
                 soth_classify::classify(
                     &detect_for_classify,
@@ -345,7 +412,12 @@ pub fn spawn_classify_task(
             })
             .await
             {
-                Ok(result) => result,
+                Ok(result) => {
+                    crate::heartbeat_telemetry::record_classify_latency_us(
+                        classify_start.elapsed().as_micros() as u64,
+                    );
+                    result
+                }
                 Err(error) => {
                     warn!(
                         connection_id = %connection_id,

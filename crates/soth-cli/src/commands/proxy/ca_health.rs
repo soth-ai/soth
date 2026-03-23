@@ -82,7 +82,7 @@ pub(crate) fn cert_matches_key(cert_path: &Path, key_path: &Path) -> Result<bool
 pub(crate) fn check_os_trust(cert_path: &Path) -> Result<OsTrustCheck> {
     #[cfg(target_os = "macos")]
     {
-        return check_macos_trust(cert_path);
+        check_macos_trust(cert_path)
     }
 
     #[cfg(not(target_os = "macos"))]

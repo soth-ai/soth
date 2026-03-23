@@ -43,9 +43,17 @@ pub fn parse_graphql(
     req: &RawRequest,
     bundle: &DetectBundleSlice<'_>,
     apq: &dyn ApqStore,
+    pre_parsed: Option<&Value>,
 ) -> ParseResult<GraphQLParseOutcome> {
-    let env: GraphQLEnvelope =
-        serde_json::from_slice(&req.body).map_err(|e| ParseError::MalformedBody(e.to_string()))?;
+    // Deserialise into the typed envelope.  When a pre-parsed Value is
+    // available we convert it (zero extra bytes allocation) instead of
+    // re-parsing the raw body.
+    let env: GraphQLEnvelope = match pre_parsed {
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| ParseError::MalformedBody(e.to_string()))?,
+        None => serde_json::from_slice(&req.body)
+            .map_err(|e| ParseError::MalformedBody(e.to_string()))?,
+    };
 
     let apq_hash = persisted_query_hash(env.extensions.as_ref());
     let query_text = resolve_query_text(&env, apq_hash.as_deref(), apq);

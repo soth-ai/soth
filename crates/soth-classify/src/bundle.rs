@@ -12,9 +12,11 @@ use crate::config::VolatilityConfig;
 use crate::fallback::{KeywordClassifier, StaticAnomalyScorer};
 use crate::model::build_model_providers;
 use crate::onnx_embed::OnnxEmbeddingRuntime;
+use crate::stage6_policy::PolicyBundleRef;
 use crate::traits::{AnomalyScorer, ClassificationProvider};
 
 const MANIFEST_CANDIDATES: [&str; 2] = ["manifest.json", "classify/manifest.json"];
+#[cfg(feature = "policy")]
 const POLICY_BUNDLE_CANDIDATES: [&str; 3] = [
     "policy/policy_bundle.json",
     "policy/bundle.json",
@@ -38,7 +40,7 @@ pub struct ClassifyBundle {
     pub(crate) classifier: Arc<dyn ClassificationProvider>,
     #[allow(dead_code)]
     pub(crate) anomaly_scorer: Arc<dyn AnomalyScorer>,
-    pub(crate) policy_bundle: Arc<soth_policy::PolicyBundle>,
+    pub(crate) policy_bundle: Arc<PolicyBundleRef>,
     pub(crate) embedding_onnx: Option<Arc<Vec<u8>>>,
     pub(crate) tokenizer_json: Option<Arc<Vec<u8>>>,
     pub(crate) use_case_mlp: Option<Arc<Vec<u8>>>,
@@ -106,16 +108,21 @@ impl ClassifyBundle {
     }
 
     pub fn fallback() -> Arc<Self> {
-        Self::fallback_with_policy_bundle(
+        Self::fallback_inner(
             Arc::new(fallback_policy_bundle()),
             "fallback-0.0.0".to_string(),
         )
     }
 
+    #[cfg(feature = "policy")]
     pub fn fallback_with_policy_bundle(
         policy_bundle: Arc<soth_policy::PolicyBundle>,
         bundle_version: String,
     ) -> Arc<Self> {
+        Self::fallback_inner(policy_bundle, bundle_version)
+    }
+
+    fn fallback_inner(policy_bundle: Arc<PolicyBundleRef>, bundle_version: String) -> Arc<Self> {
         Arc::new(Self {
             classifier: Arc::new(KeywordClassifier),
             anomaly_scorer: Arc::new(StaticAnomalyScorer),
@@ -195,6 +202,16 @@ impl ClassifyBundle {
     }
 }
 
+/// Returns a default `PolicyBundleRef` value for use in tests and fallback paths.
+///
+/// With the `policy` feature this is a valid empty `PolicyBundle`.
+/// Without the feature this is `()`.
+#[cfg(test)]
+pub(crate) fn build_fallback_policy_bundle_ref() -> PolicyBundleRef {
+    fallback_policy_bundle()
+}
+
+#[cfg(feature = "policy")]
 fn fallback_policy_bundle() -> soth_policy::PolicyBundle {
     use soth_policy::{
         sync_policy::{BudgetLimits, CompiledRuleSet, OrgPatterns, PolicyBundleMetadata},
@@ -214,6 +231,9 @@ fn fallback_policy_bundle() -> soth_policy::PolicyBundle {
         budget_limits: BudgetLimits::default(),
     }
 }
+
+#[cfg(not(feature = "policy"))]
+fn fallback_policy_bundle() -> () {}
 
 #[derive(Debug, Clone, Deserialize)]
 struct BundleManifest {
@@ -275,6 +295,7 @@ fn collect_known_assets(
     bundle_dir: &Path,
     out: &mut HashMap<String, Vec<u8>>,
 ) -> Result<(), BundleLoadError> {
+    #[cfg(feature = "policy")]
     for candidate in POLICY_BUNDLE_CANDIDATES {
         let path = bundle_dir.join(candidate);
         if path.exists() {
@@ -333,6 +354,7 @@ fn verify_assets(
     Ok(())
 }
 
+#[cfg(feature = "policy")]
 fn load_policy_bundle(
     assets: &HashMap<String, Vec<u8>>,
 ) -> Result<Arc<soth_policy::PolicyBundle>, BundleLoadError> {
@@ -344,6 +366,11 @@ fn load_policy_bundle(
     }
 
     Ok(Arc::new(fallback_policy_bundle()))
+}
+
+#[cfg(not(feature = "policy"))]
+fn load_policy_bundle(_assets: &HashMap<String, Vec<u8>>) -> Result<Arc<()>, BundleLoadError> {
+    Ok(Arc::new(()))
 }
 
 fn load_optional_asset(assets: &HashMap<String, Vec<u8>>, path: &str) -> Option<Arc<Vec<u8>>> {
@@ -615,6 +642,7 @@ pub enum BundleLoadError {
     InvalidCentroidShape { rows: usize, cols: usize },
     #[error("invalid lsh projection shape: expected (128, 384), got ({rows}, {cols})")]
     InvalidLshProjectionShape { rows: usize, cols: usize },
+    #[cfg(feature = "policy")]
     #[error("policy bundle error: {0}")]
     PolicyBundle(#[from] soth_policy::PolicyError),
     #[error("unsupported: {0}")]
@@ -624,44 +652,6 @@ pub enum BundleLoadError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine;
-    use ed25519_dalek::{Signer, SigningKey};
-    use soth_policy::sync_policy::{
-        BudgetLimits, OrgPatterns, PolicyBundleMetadata, PolicyBundlePayload, RuleAction,
-        RuleDefinition, SignedPolicyBundle,
-    };
-
-    fn signed_policy_bundle_bytes() -> Vec<u8> {
-        let payload = PolicyBundlePayload {
-            metadata: PolicyBundleMetadata {
-                bundle_version: "policy-test-v1".to_string(),
-                schema_version: "1".to_string(),
-                org_id: "test-org".to_string(),
-                signed_at: 1_772_300_000,
-            },
-            system_rules: vec![RuleDefinition {
-                rule_id: "sys_test".to_string(),
-                rule_name: "sys_test".to_string(),
-                cel_expr: "false".to_string(),
-                action: RuleAction::Flag {
-                    reason: "test".to_string(),
-                },
-            }],
-            org_rules: Vec::new(),
-            org_patterns: OrgPatterns::default(),
-            budget_limits: BudgetLimits::default(),
-        };
-        let key = SigningKey::from_bytes(&[17u8; 32]);
-        let payload_bytes = serde_json::to_vec(&payload).expect("serialize payload");
-        let signature = key.sign(payload_bytes.as_slice());
-        let envelope = SignedPolicyBundle {
-            payload,
-            signature: B64.encode(signature.to_bytes()),
-            public_key: B64.encode(key.verifying_key().to_bytes()),
-        };
-        serde_json::to_vec(&envelope).expect("serialize signed policy")
-    }
 
     fn model_assets() -> HashMap<String, Vec<u8>> {
         HashMap::from([
@@ -733,7 +723,173 @@ mod tests {
     }
 
     #[test]
-    fn load_from_bytes_with_manifest_and_assets() {
+    fn load_from_bytes_detects_hash_mismatch() {
+        let assets = model_assets();
+        let manifest = manifest_bytes("bundle-test-v1", &assets);
+        let mut tampered = assets.clone();
+        tampered.insert("classify/embedding.onnx".to_string(), b"tampered".to_vec());
+
+        let err = match ClassifyBundle::load_from_bytes(manifest.as_slice(), tampered) {
+            Ok(_) => panic!("mismatch should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(err, BundleLoadError::AssetHashMismatch { .. }));
+    }
+
+    #[test]
+    fn load_from_dir_without_manifest_supports_ml_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assets = model_assets();
+        for (path, bytes) in assets {
+            let local_name = path
+                .strip_prefix("classify/")
+                .expect("classify asset prefix expected");
+            std::fs::write(dir.path().join(local_name), bytes).expect("write local model asset");
+        }
+
+        let bundle = ClassifyBundle::load(dir.path()).expect("bundle should load from ml layout");
+        assert_eq!(bundle.bundle_version, LOCAL_UNVERIFIED_BUNDLE_VERSION);
+        assert!(bundle.has_real_models);
+        assert_eq!(
+            bundle.classifier.bundle_version(),
+            LOCAL_UNVERIFIED_BUNDLE_VERSION
+        );
+        assert_eq!(bundle.centroids.len(), 2);
+        assert_eq!(bundle.lsh_projection.len(), LSH_PROJECTION_ROWS);
+    }
+
+    #[test]
+    fn parse_bundle_volatility_config_accepts_root_or_nested_table() {
+        let root = br#"
+temporal_keywords = ["today", "latest"]
+pronoun_keywords = ["my ", "our "]
+static_threshold = 0.2
+low_volatile_threshold = 0.4
+dynamic_threshold = 0.8
+"#;
+        let parsed_root = parse_bundle_volatility_config(root).expect("root config should parse");
+        assert_eq!(parsed_root.temporal_keywords, vec!["today", "latest"]);
+        assert_eq!(parsed_root.pronoun_keywords, vec!["my ", "our "]);
+        assert!((parsed_root.static_threshold - 0.2).abs() < f32::EPSILON);
+        assert!((parsed_root.low_volatile_threshold - 0.4).abs() < f32::EPSILON);
+        assert!((parsed_root.dynamic_threshold - 0.8).abs() < f32::EPSILON);
+
+        let nested = br#"
+[volatility]
+temporal_keywords = ["recently"]
+dynamic_threshold = 0.75
+"#;
+        let parsed_nested =
+            parse_bundle_volatility_config(nested).expect("nested config should parse");
+        assert_eq!(parsed_nested.temporal_keywords, vec!["recently"]);
+        assert!((parsed_nested.dynamic_threshold - 0.75).abs() < f32::EPSILON);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "policy")]
+mod tests_with_policy {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use soth_policy::sync_policy::{
+        BudgetLimits, OrgPatterns, PolicyBundleMetadata, PolicyBundlePayload, RuleAction,
+        RuleDefinition, SignedPolicyBundle,
+    };
+
+    fn signed_policy_bundle_bytes() -> Vec<u8> {
+        let payload = PolicyBundlePayload {
+            metadata: PolicyBundleMetadata {
+                bundle_version: "policy-test-v1".to_string(),
+                schema_version: "1".to_string(),
+                org_id: "test-org".to_string(),
+                signed_at: 1_772_300_000,
+            },
+            system_rules: vec![RuleDefinition {
+                rule_id: "sys_test".to_string(),
+                rule_name: "sys_test".to_string(),
+                cel_expr: "false".to_string(),
+                action: RuleAction::Flag {
+                    reason: "test".to_string(),
+                },
+            }],
+            org_rules: Vec::new(),
+            org_patterns: OrgPatterns::default(),
+            budget_limits: BudgetLimits::default(),
+        };
+        let key = SigningKey::from_bytes(&[17u8; 32]);
+        let payload_bytes = serde_json::to_vec(&payload).expect("serialize payload");
+        let signature = key.sign(payload_bytes.as_slice());
+        let envelope = SignedPolicyBundle {
+            payload,
+            signature: B64.encode(signature.to_bytes()),
+            public_key: B64.encode(key.verifying_key().to_bytes()),
+        };
+        serde_json::to_vec(&envelope).expect("serialize signed policy")
+    }
+
+    fn model_assets() -> HashMap<String, Vec<u8>> {
+        use super::EMBEDDING_DIM;
+        use super::LSH_PROJECTION_ROWS;
+        let mut centroids = Vec::new();
+        for row in 0..2usize {
+            for col in 0..EMBEDDING_DIM {
+                let value = if row == 0 && col == 0 {
+                    1.0f32
+                } else if row == 1 && col == 1 {
+                    1.0f32
+                } else {
+                    0.0f32
+                };
+                centroids.extend_from_slice(value.to_le_bytes().as_slice());
+            }
+        }
+        let mut lsh = Vec::new();
+        for row in 0..LSH_PROJECTION_ROWS {
+            for col in 0..EMBEDDING_DIM {
+                let value = ((row + col) as f32 / 10_000.0) - 0.5;
+                lsh.extend_from_slice(value.to_le_bytes().as_slice());
+            }
+        }
+        HashMap::from([
+            ("classify/embedding.onnx".to_string(), b"onnx".to_vec()),
+            ("classify/centroids.bin".to_string(), centroids),
+            ("classify/lsh_projection.bin".to_string(), lsh),
+            ("classify/use_case_mlp.bin".to_string(), b"mlp".to_vec()),
+        ])
+    }
+
+    fn manifest_bytes(version: &str, assets: &HashMap<String, Vec<u8>>) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Manifest<'a> {
+            version: &'a str,
+            assets: Vec<Entry<'a>>,
+        }
+        #[derive(serde::Serialize)]
+        struct Entry<'a> {
+            path: &'a str,
+            sha256: String,
+            size_bytes: u64,
+        }
+        let mut entries = assets
+            .iter()
+            .map(|(path, bytes)| Entry {
+                path: path.as_str(),
+                sha256: sha256_hex(bytes.as_slice()),
+                size_bytes: bytes.len() as u64,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.path.cmp(b.path));
+        serde_json::to_vec(&Manifest {
+            version,
+            assets: entries,
+        })
+        .expect("serialize manifest")
+    }
+
+    #[test]
+    fn load_from_bytes_with_manifest_and_assets_includes_policy_version() {
         let mut assets = model_assets();
         assets.insert(
             "policy/policy_bundle.json".to_string(),
@@ -766,24 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn load_from_bytes_detects_hash_mismatch() {
-        let mut assets = model_assets();
-        assets.insert(
-            "policy/policy_bundle.json".to_string(),
-            signed_policy_bundle_bytes(),
-        );
-        let manifest = manifest_bytes("bundle-test-v1", &assets);
-        assets.insert("classify/embedding.onnx".to_string(), b"tampered".to_vec());
-
-        let err = match ClassifyBundle::load_from_bytes(manifest.as_slice(), assets) {
-            Ok(_) => panic!("mismatch should fail"),
-            Err(error) => error,
-        };
-        assert!(matches!(err, BundleLoadError::AssetHashMismatch { .. }));
-    }
-
-    #[test]
-    fn load_from_dir_reads_manifest_and_assets() {
+    fn load_from_dir_reads_manifest_and_policy_version() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut assets = model_assets();
         assets.insert(
@@ -814,28 +953,6 @@ mod tests {
     }
 
     #[test]
-    fn load_from_dir_without_manifest_supports_ml_layout() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let assets = model_assets();
-        for (path, bytes) in assets {
-            let local_name = path
-                .strip_prefix("classify/")
-                .expect("classify asset prefix expected");
-            std::fs::write(dir.path().join(local_name), bytes).expect("write local model asset");
-        }
-
-        let bundle = ClassifyBundle::load(dir.path()).expect("bundle should load from ml layout");
-        assert_eq!(bundle.bundle_version, LOCAL_UNVERIFIED_BUNDLE_VERSION);
-        assert!(bundle.has_real_models);
-        assert_eq!(
-            bundle.classifier.bundle_version(),
-            LOCAL_UNVERIFIED_BUNDLE_VERSION
-        );
-        assert_eq!(bundle.centroids.len(), 2);
-        assert_eq!(bundle.lsh_projection.len(), LSH_PROJECTION_ROWS);
-    }
-
-    #[test]
     fn load_without_policy_falls_back_to_empty_policy_bundle() {
         let assets = model_assets();
         let manifest = manifest_bytes("bundle-no-policy-v1", &assets);
@@ -847,32 +964,5 @@ mod tests {
             bundle.policy_bundle.metadata.bundle_version,
             "fallback-0.0.0"
         );
-    }
-
-    #[test]
-    fn parse_bundle_volatility_config_accepts_root_or_nested_table() {
-        let root = br#"
-temporal_keywords = ["today", "latest"]
-pronoun_keywords = ["my ", "our "]
-static_threshold = 0.2
-low_volatile_threshold = 0.4
-dynamic_threshold = 0.8
-"#;
-        let parsed_root = parse_bundle_volatility_config(root).expect("root config should parse");
-        assert_eq!(parsed_root.temporal_keywords, vec!["today", "latest"]);
-        assert_eq!(parsed_root.pronoun_keywords, vec!["my ", "our "]);
-        assert!((parsed_root.static_threshold - 0.2).abs() < f32::EPSILON);
-        assert!((parsed_root.low_volatile_threshold - 0.4).abs() < f32::EPSILON);
-        assert!((parsed_root.dynamic_threshold - 0.8).abs() < f32::EPSILON);
-
-        let nested = br#"
-[volatility]
-temporal_keywords = ["recently"]
-dynamic_threshold = 0.75
-"#;
-        let parsed_nested =
-            parse_bundle_volatility_config(nested).expect("nested config should parse");
-        assert_eq!(parsed_nested.temporal_keywords, vec!["recently"]);
-        assert!((parsed_nested.dynamic_threshold - 0.75).abs() < f32::EPSILON);
     }
 }

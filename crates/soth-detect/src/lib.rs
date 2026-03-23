@@ -1,35 +1,42 @@
 pub mod code;
 mod engine;
-mod fingerprint;
-mod graphql;
-mod grpc;
-mod hash;
-mod heuristic;
 #[cfg(feature = "intelligence")]
 mod intelligence;
 #[cfg(feature = "intelligence")]
 mod intelligence_store;
-mod jsonrpc;
 #[cfg(feature = "intelligence")]
 mod replay;
-mod rest;
 pub mod sensitive;
 mod stream;
 mod types;
 mod util;
 
+// Crate-visible module aliases so internal modules can keep using
+// `crate::X::item` paths without modification.
+//
+// `fingerprint_mod` is the alias for `soth_parse::fingerprint`; `engine.rs`
+// and `lib.rs` use this name to avoid a name clash with the public `fingerprint`
+// function re-exported into the crate root below.
+pub(crate) use soth_parse::fingerprint as fingerprint_mod;
+pub(crate) use soth_parse::graphql;
+pub(crate) use soth_parse::grpc;
+pub(crate) use soth_parse::hash;
+pub(crate) use soth_parse::heuristic;
+pub(crate) use soth_parse::jsonrpc;
+pub(crate) use soth_parse::rest;
+
 use once_cell::sync::Lazy;
 
 pub use engine::{process, process_with_registry, to_core_detect_result, ParserRegistry};
-pub use fingerprint::{
-    classify_request, classify_request_pair, fingerprint, ClassifyPairResult, ClassifyResult,
-};
 #[cfg(feature = "intelligence")]
 pub use intelligence::*;
 #[cfg(feature = "intelligence")]
 pub use intelligence_store::IntelligenceStore;
 #[cfg(feature = "intelligence")]
 pub use replay::replay_heuristic_events;
+pub use soth_parse::fingerprint::{
+    classify_request, classify_request_pair, fingerprint, ClassifyPairResult, ClassifyResult,
+};
 pub use soth_parse::proto::scan_proto_strings;
 pub use stream::{finalize_stream_summary, process_chunk_with_bundle, ChunkEvent};
 pub use types::*;
@@ -91,7 +98,7 @@ pub fn classify_request_format(
     bundle: &DetectBundleSlice<'_>,
 ) -> Option<String> {
     let empty_headers = std::collections::BTreeMap::new();
-    let pair = fingerprint::classify_request_pair(
+    let pair = fingerprint_mod::classify_request_pair(
         Some(host),
         path,
         &empty_headers,

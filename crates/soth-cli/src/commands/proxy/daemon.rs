@@ -22,7 +22,7 @@ const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 12;
 const MIN_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 3;
 const MAX_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_PROXY_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
-const MIN_PROXY_LOG_MAX_BYTES: u64 = 1 * 1024 * 1024;
+const MIN_PROXY_LOG_MAX_BYTES: u64 = 1024 * 1024;
 const MAX_PROXY_LOG_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_PROXY_LOG_MAX_BACKUPS: usize = 5;
 const MAX_PROXY_LOG_MAX_BACKUPS: usize = 20;
@@ -222,6 +222,7 @@ fn acquire_lifecycle_lock() -> anyhow::Result<DaemonLifecycleLock> {
     }
     let file = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .open(&path)
@@ -864,8 +865,7 @@ fn adopt_running_daemon_state(expected_port: u16, quiet: bool) -> anyhow::Result
     let _ = write_pid_metadata(pid, expected_port, &owner_token);
     if !quiet {
         style::warning(&format!(
-            "Recovered missing daemon pid state from running listener (pid {}, port {}).",
-            pid, expected_port
+            "Recovered missing daemon pid state from running listener (pid {pid}, port {expected_port})."
         ));
     }
     Ok(Some(pid))
@@ -901,8 +901,7 @@ pub async fn run_start_daemon(
                             style::info(&format!("Startup autostart ensured: {details}"))
                         }
                         Err(error) => style::warning(&format!(
-                            "Could not register startup autostart (continuing): {}",
-                            error
+                            "Could not register startup autostart (continuing): {error}"
                         )),
                     }
                 } else {
@@ -913,8 +912,7 @@ pub async fn run_start_daemon(
         }
         if !quiet {
             style::warning(&format!(
-                "Ignoring stale or untrusted pid file entry for pid {}.",
-                pid
+                "Ignoring stale or untrusted pid file entry for pid {pid}."
             ));
         }
         remove_pid_artifacts();
@@ -987,14 +985,12 @@ pub async fn run_start_daemon(
                 Err(error) => {
                     if !allow_daemon_child_fallback {
                         return Err(anyhow!(
-                            "managed startup unavailable and daemon-child fallback is disabled. Pass --allow-daemon-child-fallback to force legacy mode. Root cause: {}",
-                            error
+                            "managed startup unavailable and daemon-child fallback is disabled. Pass --allow-daemon-child-fallback to force legacy mode. Root cause: {error}"
                         ));
                     }
                     if !quiet {
                         style::warning(&format!(
-                            "Managed startup unavailable (falling back to daemon-child): {}",
-                            error
+                            "Managed startup unavailable (falling back to daemon-child): {error}"
                         ));
                     }
                 }
@@ -1015,10 +1011,7 @@ pub async fn run_start_daemon(
     let (log_max_bytes, log_max_backups) = proxy_log_rotation_limits();
     if let Err(error) = rotate_proxy_log_if_needed(&log_file_path, log_max_bytes, log_max_backups) {
         if !quiet {
-            style::warning(&format!(
-                "Failed to rotate proxy log (continuing): {}",
-                error
-            ));
+            style::warning(&format!("Failed to rotate proxy log (continuing): {error}"));
         }
     }
 
@@ -1131,8 +1124,7 @@ pub async fn run_start_daemon(
             Err(error) => {
                 if !quiet {
                     style::warning(&format!(
-                        "Could not register startup autostart (continuing): {}",
-                        error
+                        "Could not register startup autostart (continuing): {error}"
                     ));
                 }
             }
@@ -1153,8 +1145,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
         Ok(Some(details)) => style::info(&format!("Managed runtime stop: {details}")),
         Ok(None) => {}
         Err(error) => style::warning(&format!(
-            "Could not stop managed runtime cleanly (continuing): {}",
-            error
+            "Could not stop managed runtime cleanly (continuing): {error}"
         )),
     }
 
@@ -1200,8 +1191,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
 
     if !is_expected_daemon_process(pid) {
         style::warning(&format!(
-            "Pid file points to non-daemon process (pid {}); refusing to signal it.",
-            pid
+            "Pid file points to non-daemon process (pid {pid}); refusing to signal it."
         ));
         remove_pid_artifacts();
         style::warning("Proxy daemon pid file was stale; cleaned up.");
@@ -1211,8 +1201,7 @@ pub async fn run_stop() -> anyhow::Result<()> {
     }
     if !pid_matches_owned_artifacts(pid) {
         style::warning(&format!(
-            "Refusing to signal pid {} because daemon ownership token/metadata does not match.",
-            pid
+            "Refusing to signal pid {pid} because daemon ownership token/metadata does not match."
         ));
         remove_pid_artifacts();
         let _ = super::system::disable_quiet().await;
@@ -1268,7 +1257,7 @@ pub async fn run_logs(follow: bool, lines: usize) -> anyhow::Result<()> {
 
     match tail.status() {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(anyhow!("tail exited with status {}", status)),
+        Ok(status) => Err(anyhow!("tail exited with status {status}")),
         Err(_) => {
             print_last_lines(&path, lines)?;
             if follow {

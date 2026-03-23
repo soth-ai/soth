@@ -1,3 +1,9 @@
+#![allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::doc_lazy_continuation,
+    clippy::ptr_arg
+)]
 pub mod backfill;
 pub mod db;
 pub mod dedup;

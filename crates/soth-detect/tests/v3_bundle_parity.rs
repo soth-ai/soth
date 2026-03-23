@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 /// TDD parity test suite: verifies that v3 signal-based matching_rules produce
 /// identical fingerprinting and classification results as v2 legacy detection
 /// for all major providers and applications.

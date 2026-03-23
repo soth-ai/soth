@@ -38,31 +38,42 @@ mod tests {
 
     #[test]
     fn code_context_repeat_without_credential_maps_to_code_repeat_lane() {
-        let mut detect = soth_core::DetectResult::default();
-        detect.is_repeated_code_context = true;
+        let detect = soth_core::DetectResult {
+            is_repeated_code_context: true,
+            ..Default::default()
+        };
         assert_eq!(determine_lane(&detect), Lane::CodeContextRepeat);
     }
 
     #[test]
     fn code_context_repeat_with_credential_maps_to_full_lane() {
-        let mut detect = soth_core::DetectResult::default();
-        detect.is_repeated_code_context = true;
-        detect.session_mutations.credential_alert = true;
+        let detect = soth_core::DetectResult {
+            is_repeated_code_context: true,
+            session_mutations: soth_core::SessionMutations {
+                credential_alert: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert_eq!(determine_lane(&detect), Lane::Full);
     }
 
     #[test]
     fn prefix_repeat_with_novel_tail_maps_to_agent_loop_step() {
-        let mut detect = soth_core::DetectResult::default();
-        detect.is_prefix_repeat = true;
-        detect.novel_tail_start_idx = Some(5);
+        let detect = soth_core::DetectResult {
+            is_prefix_repeat: true,
+            novel_tail_start_idx: Some(5),
+            ..Default::default()
+        };
         assert_eq!(determine_lane(&detect), Lane::AgentLoopStep);
     }
 
     #[test]
     fn prefix_repeat_without_novel_tail_maps_to_full() {
-        let mut detect = soth_core::DetectResult::default();
-        detect.is_prefix_repeat = true;
+        let detect = soth_core::DetectResult {
+            is_prefix_repeat: true,
+            ..Default::default()
+        };
         assert_eq!(determine_lane(&detect), Lane::Full);
     }
 }

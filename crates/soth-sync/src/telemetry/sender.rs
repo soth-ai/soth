@@ -4,8 +4,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use soth_core::{derive_proxy_signing_seed, ClassificationFlag, TelemetryPolicyKind};
 use soth_telemetry::{SignedBatch, TransmittedBatch};
 use std::collections::HashMap;
+use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use crate::api_types::{TelemetryBatchRequest, TelemetryEvent};
+use crate::circuit_breaker::CircuitBreaker;
 use crate::http_client::SothHttpClient;
 
 #[derive(Debug, Clone)]
@@ -15,12 +18,19 @@ pub enum TelemetrySendOutcome {
     NonRetryable { reason: String },
 }
 
+/// Defaults used when no explicit circuit-breaker config is provided.
+const DEFAULT_CB_FAILURE_THRESHOLD: u32 = 5;
+const DEFAULT_CB_OPEN_DURATION_MS: u64 = 30_000; // 30 s
+const DEFAULT_CB_SUCCESS_THRESHOLD: u32 = 3;
+
 #[derive(Clone)]
 pub struct TelemetrySender {
     cloud: SothHttpClient,
     endpoint_path: String,
     device_id_hash: String,
     signing_key: SigningKey,
+    /// Shared across clones so all copies of a sender observe the same breaker state.
+    circuit: Arc<CircuitBreaker>,
 }
 
 impl TelemetrySender {
@@ -30,25 +40,44 @@ impl TelemetrySender {
         endpoint_path: impl Into<String>,
         device_id_hash: impl Into<String>,
         telemetry_signing_key_hex: Option<String>,
+        local_secret: &[u8],
     ) -> Result<Self> {
         let endpoint_path = normalize_endpoint_path(endpoint_path.into());
         let device_id_hash = normalize_device_id_hash(device_id_hash.into());
         let signing_key = build_signing_key(
             telemetry_signing_key_hex.as_deref(),
             device_id_hash.as_str(),
+            local_secret,
         )?;
         Ok(Self {
             cloud: SothHttpClient::new(endpoint, api_key),
             endpoint_path,
             device_id_hash,
             signing_key,
+            circuit: Arc::new(CircuitBreaker::new(
+                DEFAULT_CB_FAILURE_THRESHOLD,
+                DEFAULT_CB_OPEN_DURATION_MS,
+                DEFAULT_CB_SUCCESS_THRESHOLD,
+            )),
         })
     }
 
     pub async fn send_batch(&self, batch: &TransmittedBatch) -> TelemetrySendOutcome {
+        if !self.circuit.allow_request() {
+            tracing::debug!(
+                state = self.circuit.state_label(),
+                "telemetry circuit breaker open, skipping batch send"
+            );
+            return TelemetrySendOutcome::Retryable {
+                reason: "telemetry circuit breaker open".to_string(),
+            };
+        }
+
         let request = match self.batch_to_request(batch) {
             Ok(request) => request,
             Err(error) => {
+                // Serialization / key errors are non-retryable and should not
+                // count as network failures against the circuit breaker.
                 return TelemetrySendOutcome::NonRetryable {
                     reason: error.to_string(),
                 };
@@ -67,12 +96,17 @@ impl TelemetrySender {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
+                    self.circuit.record_success();
                     TelemetrySendOutcome::Sent
                 } else if is_retryable_status(status) {
+                    self.circuit.record_failure();
                     TelemetrySendOutcome::Retryable {
                         reason: format!("telemetry batch rejected with status {}", status.as_u16()),
                     }
                 } else {
+                    // Non-retryable HTTP errors (4xx auth/validation) should not
+                    // penalise the circuit breaker — they indicate a protocol or
+                    // configuration problem rather than an infra outage.
                     TelemetrySendOutcome::NonRetryable {
                         reason: format!("telemetry batch rejected with status {}", status.as_u16()),
                     }
@@ -81,6 +115,7 @@ impl TelemetrySender {
             Err(error) => {
                 if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
                 {
+                    self.circuit.record_failure();
                     TelemetrySendOutcome::Retryable {
                         reason: error.to_string(),
                     }
@@ -334,10 +369,11 @@ fn normalize_device_id_hash(raw: String) -> String {
 fn build_signing_key(
     telemetry_signing_key_hex: Option<&str>,
     device_id_hash: &str,
+    local_secret: &[u8],
 ) -> Result<SigningKey> {
-    let seed = match telemetry_signing_key_hex {
-        Some(raw) if !raw.trim().is_empty() => parse_signing_key_hex(raw)?,
-        _ => derive_proxy_signing_seed(device_id_hash),
+    let seed: Zeroizing<[u8; 32]> = match telemetry_signing_key_hex {
+        Some(raw) if !raw.trim().is_empty() => Zeroizing::new(parse_signing_key_hex(raw)?),
+        _ => derive_proxy_signing_seed(device_id_hash, local_secret),
     };
     Ok(SigningKey::from_bytes(&seed))
 }

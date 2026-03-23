@@ -1,13 +1,4 @@
-#![allow(
-    clippy::result_large_err,
-    clippy::type_complexity,
-    clippy::too_many_arguments,
-    clippy::large_enum_variant,
-    clippy::if_same_then_else,
-    clippy::field_reassign_with_default,
-    clippy::approx_constant,
-    clippy::duplicated_attributes
-)]
+#![allow(clippy::type_complexity)]
 #![forbid(unsafe_code)]
 
 pub mod context;

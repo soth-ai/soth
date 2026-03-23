@@ -69,8 +69,15 @@ pub fn empty_heuristic_request(method: &str, path: &str) -> NormalizedRequest {
     }
 }
 
+/// The parse-layer detect result produced by `soth-detect`'s internal pipeline.
+///
+/// This is distinct from [`soth_core::DetectResult`], which is the
+/// serialisable, public-API type that crosses crate boundaries.  The internal
+/// type carries extra fields (e.g. `raw_body_bytes`, `DetectWarning` list)
+/// that are stripped or mapped when converting via
+/// `soth_detect::engine::to_core_detect_result`.
 #[derive(Clone, Debug)]
-pub struct DetectResult {
+pub struct ParseDetectResult {
     pub normalized: NormalizedRequest,
     pub artifacts: Vec<SensitiveArtifact>,
     pub capture_mode: CaptureMode,
@@ -93,7 +100,15 @@ pub struct DetectResult {
     pub import_categories: Vec<DetectedImportCategory>,
 }
 
-impl DetectResult {
+/// Backwards-compatibility alias.  New code should use [`ParseDetectResult`]
+/// to avoid confusion with [`soth_core::DetectResult`].
+#[deprecated(
+    since = "0.1.0",
+    note = "use `ParseDetectResult` to avoid confusion with `soth_core::DetectResult`"
+)]
+pub type DetectResult = ParseDetectResult;
+
+impl ParseDetectResult {
     pub fn filtered() -> Self {
         let normalized = NormalizedRequest {
             parse_confidence: ParseConfidence::Heuristic,
@@ -185,12 +200,15 @@ pub struct DetectWarning {
     pub detail: String,
 }
 
+const MAX_ACCUMULATED_BYTES: usize = 2 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct StreamSession {
     pub connection_id: Uuid,
     pub capture_mode: CaptureMode,
     pub delta_buffer: Vec<String>,
     pub chunk_count: u64,
+    pub accumulated_bytes: usize,
     pub start_time: Instant,
     pub grpc_service: Option<String>,
     pub grpc_method: Option<String>,
@@ -244,6 +262,7 @@ impl StreamSession {
             capture_mode,
             delta_buffer: Vec::new(),
             chunk_count: 0,
+            accumulated_bytes: 0,
             start_time: Instant::now(),
             grpc_service: None,
             grpc_method: None,
@@ -261,7 +280,12 @@ impl StreamSession {
     }
 
     pub fn accumulate(&mut self, value: impl Into<String>) {
-        self.delta_buffer.push(value.into());
+        let s = value.into();
+        if self.accumulated_bytes + s.len() <= MAX_ACCUMULATED_BYTES {
+            self.accumulated_bytes += s.len();
+            self.delta_buffer.push(s);
+        }
+        // Always count chunks even if content is dropped
     }
 
     /// Called by soth-proxy after parsing the request to populate context.
@@ -328,7 +352,7 @@ pub enum ParseError {
     GraphQLUnknownOperation(String),
     GrpcDescriptorMissing(String),
     NotAnAICall,
-    PartialParse(NormalizedRequest, Vec<ParseWarning>),
+    PartialParse(Box<NormalizedRequest>, Vec<ParseWarning>),
 }
 
 pub type ParseResult<T> = Result<T, ParseError>;

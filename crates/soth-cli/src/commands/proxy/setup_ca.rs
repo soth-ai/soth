@@ -59,9 +59,7 @@ pub async fn run(
         }
         _ => {
             anyhow::bail!(
-                "CA files are inconsistent: cert exists={}, key exists={}. Refusing implicit rotation. Remove stale file(s) and re-run `soth setup-ca`.",
-                cert_exists,
-                key_exists
+                "CA files are inconsistent: cert exists={cert_exists}, key exists={key_exists}. Refusing implicit rotation. Remove stale file(s) and re-run `soth setup-ca`."
             );
         }
     }
@@ -164,7 +162,7 @@ fn generate_ca_files(cert_path: &Path, key_path: &Path) -> Result<()> {
 fn install_trust(cert_path: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return install_trust_macos(cert_path);
+        install_trust_macos(cert_path)
     }
 
     #[cfg(target_os = "windows")]

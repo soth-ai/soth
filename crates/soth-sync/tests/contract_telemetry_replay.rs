@@ -47,7 +47,7 @@ async fn start_telemetry_server(state: TelemetryServerState) -> Option<String> {
         let _ = axum::serve(listener, app).await;
     });
 
-    Some(format!("http://{}", addr))
+    Some(format!("http://{addr}"))
 }
 
 fn sample_event(event_id: Uuid) -> TelemetryEvent {
@@ -231,6 +231,7 @@ async fn telemetry_replay_contract_transitions_to_sent() {
         "/v1/edge/telemetry/batch",
         "device-hash-test",
         None,
+        &[],
     )
     .expect("sender");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -284,6 +285,7 @@ async fn telemetry_replay_contract_transitions_to_dead_after_retry_cap() {
         "/v1/edge/telemetry/batch",
         "device-hash-test",
         None,
+        &[],
     )
     .expect("sender");
     let cfg = TelemetrySyncConfig {

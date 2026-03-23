@@ -3,6 +3,7 @@ use crate::api_types::{
     HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest, HeartbeatTelemetry,
 };
 use crate::cache;
+use crate::circuit_breaker::CircuitBreaker;
 use crate::config::TelemetrySyncConfig;
 use crate::config_puller::ConfigPuller;
 use crate::db::{
@@ -97,6 +98,10 @@ pub struct SyncAgentConfig {
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
     pub telemetry: TelemetrySyncConfig,
     pub telemetry_signing_key_hex: Option<String>,
+    /// Per-device local secret mixed into the Ed25519 signing key derivation.
+    /// Never transmitted off-device.  Defaults to empty (no extra entropy) when
+    /// not supplied by the caller (e.g. in tests).
+    pub local_secret: Vec<u8>,
 }
 
 pub struct SyncAgent {
@@ -119,6 +124,7 @@ pub struct SyncAgent {
     adaptive_batch_state: Mutex<AdaptiveBatchState>,
     telemetry_runtime: tokio::sync::Mutex<Option<TelemetrySyncRuntime>>,
     shutdown_requested: AtomicBool,
+    heartbeat_circuit: CircuitBreaker,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,7 +215,7 @@ impl AdaptiveBatchState {
 
 #[derive(Debug, Clone)]
 enum PreparedRowResult {
-    Prepared(PreparedExchangeQueueRow),
+    Prepared(Box<PreparedExchangeQueueRow>),
     Drop { reason: String },
 }
 
@@ -404,6 +410,7 @@ impl SyncAgent {
             adaptive_batch_state,
             telemetry_runtime: tokio::sync::Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
+            heartbeat_circuit: CircuitBreaker::new(5, 30_000, 3),
         })
     }
 
@@ -599,6 +606,14 @@ impl SyncAgent {
     }
 
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
+        if !self.heartbeat_circuit.allow_request() {
+            tracing::debug!(
+                state = self.heartbeat_circuit.state_label(),
+                "heartbeat circuit breaker open, skipping"
+            );
+            return Ok(false);
+        }
+
         let config_version = self.cached_config_version();
         let registry = self.collect_registry_heartbeat_details();
         let telemetry = self.compose_heartbeat_telemetry(registry.as_ref());
@@ -622,6 +637,7 @@ impl SyncAgent {
 
         match self.heartbeat_sender.send(&request).await {
             Ok(Some(response)) => {
+                self.heartbeat_circuit.record_success();
                 if response.config_changed {
                     let puller = match self.config_puller.lock() {
                         Ok(guard) => guard.clone(),
@@ -641,8 +657,13 @@ impl SyncAgent {
                 }
                 Ok(true)
             }
-            Ok(None) => Ok(false),
+            Ok(None) => {
+                // Server responded but rejected the heartbeat (non-2xx).
+                self.heartbeat_circuit.record_failure();
+                Ok(false)
+            }
             Err(error) => {
+                self.heartbeat_circuit.record_failure();
                 self.set_sync_error(&format!("heartbeat_error: {error}"))?;
                 Err(error)
             }
@@ -822,8 +843,8 @@ impl SyncAgent {
         for row in rows {
             match self.prepare_exchange_queue_row(row.clone()).await {
                 Ok(PreparedRowResult::Prepared(prepared)) => match prepared.mode {
-                    ExchangeSyncMode::Live => live_rows.push(prepared),
-                    ExchangeSyncMode::Frontload => frontload_rows.push(prepared),
+                    ExchangeSyncMode::Live => live_rows.push(*prepared),
+                    ExchangeSyncMode::Frontload => frontload_rows.push(*prepared),
                 },
                 Ok(PreparedRowResult::Drop { reason }) => {
                     self.drop_exchange_row(&row, &reason, &mut stats)?;
@@ -906,12 +927,14 @@ impl SyncAgent {
         let mut metadata = exchange_event_to_metadata(&event, global_device_id.as_deref());
         metadata.tags = merge_tags_for_exchange(&self.config.global_tags, event.tags.as_ref());
         let mode = exchange_sync_mode(metadata.tags.as_ref(), self.config.frontload_enabled);
-        Ok(PreparedRowResult::Prepared(PreparedExchangeQueueRow {
-            row,
-            metadata,
-            mode,
-            blob_uploaded: 0,
-        }))
+        Ok(PreparedRowResult::Prepared(Box::new(
+            PreparedExchangeQueueRow {
+                row,
+                metadata,
+                mode,
+                blob_uploaded: 0,
+            },
+        )))
     }
 
     fn target_limits_for_mode(&self, mode: ExchangeSyncMode) -> ExchangeBatchLimits {
@@ -2309,6 +2332,7 @@ mod tests {
             heartbeat_telemetry: None,
             telemetry: TelemetrySyncConfig::default(),
             telemetry_signing_key_hex: None,
+            local_secret: vec![],
         };
         let agent = SyncAgent::new_with_config_puller(config, None).expect("sync agent");
         (dir, agent)
@@ -2360,7 +2384,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Some(format!("http://{}", addr))
+        Some(format!("http://{addr}"))
     }
 
     #[derive(Serialize)]
@@ -2405,7 +2429,7 @@ mod tests {
     fn startup_hex_encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);
         for byte in bytes {
-            out.push_str(format!("{:02x}", byte).as_str());
+            out.push_str(format!("{byte:02x}").as_str());
         }
         out
     }

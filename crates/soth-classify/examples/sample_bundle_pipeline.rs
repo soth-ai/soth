@@ -1,4 +1,3 @@
-#![allow(clippy::all)]
 use soth_core::{
     AppType, CaptureMode, ClassificationSource, DetectResult, DetectedProvider, EndpointType,
     FormatMetadata, NormalizedRequest, ParseConfidence, ParseSource, ProcessMatchKind,

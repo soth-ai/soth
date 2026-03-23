@@ -183,7 +183,7 @@ fn emit(event: &str, payload: Value) {
 }
 
 #[cfg(feature = "dev-pipeline-trace")]
-pub(crate) fn tls_gate(host: &str, decision: &soth_core::GateDecision) {
+pub(crate) fn tls_gate(host: &str, decision: &crate::gating::GateDecision) {
     emit(
         "tls_gate_decision",
         json!({
@@ -195,10 +195,15 @@ pub(crate) fn tls_gate(host: &str, decision: &soth_core::GateDecision) {
 
 #[cfg(not(feature = "dev-pipeline-trace"))]
 #[inline(always)]
-pub(crate) fn tls_gate(_host: &str, _decision: &soth_core::GateDecision) {}
+pub(crate) fn tls_gate(_host: &str, _decision: &crate::gating::GateDecision) {}
 
 #[cfg(feature = "dev-pipeline-trace")]
-pub(crate) fn tls_stage(host: &str, verdict: &str, reason: soth_core::DecisionReason, note: &str) {
+pub(crate) fn tls_stage(
+    host: &str,
+    verdict: &str,
+    reason: crate::gating::DecisionReason,
+    note: &str,
+) {
     emit(
         "tls_stage",
         json!({
@@ -215,7 +220,7 @@ pub(crate) fn tls_stage(host: &str, verdict: &str, reason: soth_core::DecisionRe
 pub(crate) fn tls_stage(
     _host: &str,
     _verdict: &str,
-    _reason: soth_core::DecisionReason,
+    _reason: crate::gating::DecisionReason,
     _note: &str,
 ) {
 }
@@ -225,7 +230,7 @@ pub(crate) fn gate_stage(
     connection_id: Uuid,
     stage: soth_core::GateStage,
     verdict: &str,
-    reason: Option<soth_core::DecisionReason>,
+    reason: Option<crate::gating::DecisionReason>,
     note: &str,
 ) {
     emit(
@@ -246,7 +251,7 @@ pub(crate) fn gate_stage(
     _connection_id: Uuid,
     _stage: soth_core::GateStage,
     _verdict: &str,
-    _reason: Option<soth_core::DecisionReason>,
+    _reason: Option<crate::gating::DecisionReason>,
     _note: &str,
 ) {
 }
@@ -314,7 +319,7 @@ pub(crate) fn http_gate(
     method: &str,
     host: &str,
     path: &str,
-    outcome: &soth_core::GateOutcome,
+    outcome: &crate::gating::GateOutcome,
 ) {
     emit(
         "http_gate_outcome",
@@ -342,7 +347,7 @@ pub(crate) fn http_gate(
     _method: &str,
     _host: &str,
     _path: &str,
-    _outcome: &soth_core::GateOutcome,
+    _outcome: &crate::gating::GateOutcome,
 ) {
 }
 

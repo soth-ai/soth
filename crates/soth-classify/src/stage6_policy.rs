@@ -1,8 +1,9 @@
+#[cfg(feature = "policy")]
 use std::time::Instant;
 
-use soth_core::{
-    ClassificationSource, DeploymentModel, PolicyContext, PolicyDecision, SemanticPolicyContext,
-};
+use soth_core::PolicyDecision;
+#[cfg(not(feature = "policy"))]
+use soth_core::PolicyDecisionKind;
 
 use crate::stage2_cluster::ClusterOutput;
 use crate::stage3_usecase::UsecaseOutput;
@@ -14,6 +15,18 @@ pub(crate) struct PolicyOutput {
     pub decision: PolicyDecision,
 }
 
+/// The policy bundle type used by this stage.
+///
+/// When the `policy` feature is enabled this is the real `soth_policy::PolicyBundle`.
+/// When the feature is disabled the type alias resolves to `()` and the `run`
+/// function returns an unconditional allow decision.
+#[cfg(feature = "policy")]
+pub(crate) type PolicyBundleRef = soth_policy::PolicyBundle;
+
+#[cfg(not(feature = "policy"))]
+pub(crate) type PolicyBundleRef = ();
+
+#[cfg(feature = "policy")]
 pub(crate) fn run(
     detect_result: &soth_core::DetectResult,
     proxy_ctx: &soth_core::ProxyContext,
@@ -23,6 +36,8 @@ pub(crate) fn run(
     cluster: &ClusterOutput,
     policy_bundle: &soth_policy::PolicyBundle,
 ) -> (PolicyOutput, u64) {
+    use soth_core::{PolicyContext, SemanticPolicyContext};
+
     let started = Instant::now();
 
     let skip_org_rules = matches!(
@@ -61,17 +76,19 @@ pub(crate) fn run(
     )
 }
 
-fn build_deployment_model(proxy_ctx: &soth_core::ProxyContext) -> DeploymentModel {
+#[cfg(feature = "policy")]
+fn build_deployment_model(proxy_ctx: &soth_core::ProxyContext) -> soth_core::DeploymentModel {
+    use soth_core::ClassificationSource;
     match proxy_ctx.classification_source {
-        ClassificationSource::Proxy => DeploymentModel::Proxy,
+        ClassificationSource::Proxy => soth_core::DeploymentModel::Proxy,
         ClassificationSource::Sidecar => {
             if let Some(ctx) = &proxy_ctx.deployment_context {
-                DeploymentModel::Sidecar {
+                soth_core::DeploymentModel::Sidecar {
                     service_name: ctx.service_name.clone(),
                     environment: ctx.environment.clone(),
                 }
             } else {
-                DeploymentModel::Sidecar {
+                soth_core::DeploymentModel::Sidecar {
                     service_name: "unknown".to_string(),
                     environment: "unknown".to_string(),
                 }
@@ -79,12 +96,12 @@ fn build_deployment_model(proxy_ctx: &soth_core::ProxyContext) -> DeploymentMode
         }
         ClassificationSource::Sdk => {
             if let Some(ctx) = &proxy_ctx.deployment_context {
-                DeploymentModel::Sdk {
+                soth_core::DeploymentModel::Sdk {
                     service_name: ctx.service_name.clone(),
                     environment: ctx.environment.clone(),
                 }
             } else {
-                DeploymentModel::Sdk {
+                soth_core::DeploymentModel::Sdk {
                     service_name: "unknown".to_string(),
                     environment: "unknown".to_string(),
                 }
@@ -93,7 +110,29 @@ fn build_deployment_model(proxy_ctx: &soth_core::ProxyContext) -> DeploymentMode
     }
 }
 
+/// No-op stub used when the `policy` feature is disabled.
+/// Always returns an unconditional allow decision with zero latency.
+#[cfg(not(feature = "policy"))]
+pub(crate) fn run(
+    _detect_result: &soth_core::DetectResult,
+    _proxy_ctx: &soth_core::ProxyContext,
+    _usecase: &UsecaseOutput,
+    _anomaly: &AnomalyOutput,
+    _volatility: &VolatilityOutput,
+    _cluster: &ClusterOutput,
+    _policy_bundle: &(),
+) -> (PolicyOutput, u64) {
+    let decision = PolicyDecision {
+        kind: PolicyDecisionKind::Allow,
+        matched_rule: None,
+        warnings: Vec::new(),
+        eval_latency_us: 0,
+    };
+    (PolicyOutput { decision }, 0)
+}
+
 #[cfg(test)]
+#[cfg(feature = "policy")]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;

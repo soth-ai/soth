@@ -105,7 +105,7 @@ const REQUIRED_INTERCEPT_COLUMNS: &[(&str, &str)] = &[
 ];
 
 pub fn open(db_path: &Path) -> Result<rusqlite::Connection> {
-    soth_sqlite_vec::register_auto_extension();
+    crate::sqlite_vec::register_auto_extension();
 
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -222,6 +222,37 @@ pub fn write_intercept_record(
     matched_provider: Option<&str>,
     matched_application: Option<&str>,
 ) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+    write_intercept_record_with_conn(
+        &conn,
+        connection_id,
+        result,
+        embedding,
+        detect_result,
+        proxy_ctx,
+        raw_body_for_commitment,
+        capture_mode,
+        matched_provider,
+        matched_application,
+    )
+}
+
+/// Same as [`write_intercept_record`] but accepts a pre-locked [`rusqlite::Connection`]
+/// directly. Use this when the caller already holds the connection (e.g. inside a
+/// batched transaction) to avoid re-locking the mutex for every row.
+#[allow(clippy::too_many_arguments)]
+pub fn write_intercept_record_with_conn(
+    conn: &rusqlite::Connection,
+    connection_id: Uuid,
+    result: &ClassifiedResult,
+    embedding: Option<&[f32]>,
+    detect_result: &DetectResult,
+    proxy_ctx: &ProxyContext,
+    raw_body_for_commitment: Option<&[u8]>,
+    capture_mode: CaptureMode,
+    matched_provider: Option<&str>,
+    matched_application: Option<&str>,
+) -> Result<()> {
     let telemetry_json = serde_json::to_string(&result.telemetry_event)
         .context("failed to serialize telemetry event")?;
     let classification_flags =
@@ -300,7 +331,6 @@ pub fn write_intercept_record(
         .transpose()
         .context("failed to serialize embedding for sqlite storage")?;
 
-    let conn = db.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
     let inserted_rows = conn.execute(
         "
         INSERT OR IGNORE INTO intercept_records (
@@ -664,6 +694,44 @@ pub fn expire_embeddings(db: &Arc<Mutex<rusqlite::Connection>>, days: u32) -> Re
         .context("failed to clear expired embedding blobs")?;
 
     Ok(nulled_rows)
+}
+
+pub fn enforce_retention(db: &Arc<Mutex<rusqlite::Connection>>, max_age_days: u32) {
+    if max_age_days == 0 {
+        return; // 0 = disabled
+    }
+    let cutoff_ms = chrono::Utc::now().timestamp_millis() - (max_age_days as i64 * 86_400_000);
+    match db.lock() {
+        Ok(conn) => {
+            match conn.execute(
+                "DELETE FROM intercept_records WHERE timestamp_utc < ?1",
+                rusqlite::params![cutoff_ms],
+            ) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(
+                            deleted,
+                            max_age_days,
+                            "retention enforcement: purged old records"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "retention enforcement failed"),
+            }
+        }
+        Err(_) => tracing::warn!("retention enforcement: db lock poisoned"),
+    }
+}
+
+pub fn wal_checkpoint(db: &Arc<Mutex<rusqlite::Connection>>) {
+    match db.lock() {
+        Ok(conn) => {
+            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+                tracing::warn!(error = %e, "WAL checkpoint failed");
+            }
+        }
+        Err(_) => tracing::warn!("WAL checkpoint: db lock poisoned"),
+    }
 }
 
 fn ensure_intercept_columns(conn: &rusqlite::Connection) -> Result<()> {

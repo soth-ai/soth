@@ -1,3 +1,8 @@
+#![allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::manual_clamp
+)]
 //! SOTH sync runtime.
 //!
 //! Public contract surface is intentionally small:
@@ -12,6 +17,7 @@ pub mod agent;
 pub mod api_types;
 pub mod body_uploader;
 pub mod cache;
+pub mod circuit_breaker;
 pub mod config;
 pub mod config_puller;
 pub mod db;

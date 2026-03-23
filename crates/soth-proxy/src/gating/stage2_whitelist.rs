@@ -1,4 +1,6 @@
-use soth_core::{DecisionReason, EntityCatalog, HostRule};
+use soth_core::{EntityCatalog, HostRule};
+
+use crate::gating::types::DecisionReason;
 
 use crate::gating::stage0_tls::host_pattern_matches;
 

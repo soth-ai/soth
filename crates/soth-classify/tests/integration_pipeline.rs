@@ -27,6 +27,7 @@ fn credential_artifact() -> soth_core::SensitiveArtifact {
 }
 
 #[test]
+#[cfg(feature = "policy")]
 fn classify_end_to_end_system_block_sets_policy_triggered() {
     let bundle = soth_classify::ClassifyBundle::fallback();
     let config = soth_classify::ClassifyConfig::default();

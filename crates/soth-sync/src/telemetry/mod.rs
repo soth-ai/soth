@@ -25,6 +25,7 @@ pub struct TelemetryRuntimeConfig {
     pub telemetry_signing_key_hex: Option<String>,
     pub db: Arc<Mutex<Connection>>,
     pub telemetry: TelemetrySyncConfig,
+    pub local_secret: Vec<u8>,
 }
 
 impl TelemetryRuntimeConfig {
@@ -36,6 +37,7 @@ impl TelemetryRuntimeConfig {
             telemetry_signing_key_hex: config.telemetry_signing_key_hex.clone(),
             db,
             telemetry: config.telemetry.clone().sanitize(),
+            local_secret: config.local_secret.clone(),
         }
     }
 }
@@ -58,6 +60,7 @@ impl TelemetrySyncRuntime {
             telemetry.endpoint_path.clone(),
             config.device_id_hash,
             config.telemetry_signing_key_hex,
+            &config.local_secret,
         )?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let worker =

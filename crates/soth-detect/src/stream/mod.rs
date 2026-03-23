@@ -6,8 +6,8 @@ use crate::hash::hash_content;
 // for request-side detection via DetectedFormat::JsonRpc.
 use crate::sensitive::credential_scan;
 use crate::types::{
-    ArtifactLocation, CaptureMode, ChunkArtifact, DetectBundleSlice, DetectResult, DetectWarning,
-    FrameDirection, FrameKind, ParseConfidence, ParseSource, StreamChunk, StreamSession,
+    ArtifactLocation, CaptureMode, ChunkArtifact, DetectBundleSlice, DetectWarning, FrameDirection,
+    FrameKind, ParseConfidence, ParseDetectResult, ParseSource, StreamChunk, StreamSession,
     StreamSummary,
 };
 use bytes::Bytes;
@@ -250,7 +250,7 @@ pub fn finalize_stream_summary(session: StreamSession) -> StreamSummary {
     }
 }
 
-pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
+pub fn finalize_stream_detect(session: StreamSession) -> ParseDetectResult {
     let summary = finalize_stream_summary(session.clone());
     let assembled = session.finalize_response_content();
 
@@ -285,7 +285,7 @@ pub fn finalize_stream_detect(session: StreamSession) -> DetectResult {
         detail: "stream finalized using heuristic normalization".to_string(),
     }];
 
-    DetectResult {
+    ParseDetectResult {
         normalized,
         artifacts,
         capture_mode,

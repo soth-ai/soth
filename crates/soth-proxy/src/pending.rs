@@ -33,9 +33,9 @@ pub struct PendingCapture {
     pub request_host: String,
     pub request_path: String,
     pub request_body_bytes: usize,
-    pub outcome: soth_core::GateOutcome,
-    pub detect_result: soth_core::DetectResult,
-    pub proxy_ctx: soth_core::ProxyContext,
+    pub outcome: crate::gating::GateOutcome,
+    pub detect_result: Arc<soth_core::DetectResult>,
+    pub proxy_ctx: Arc<soth_core::ProxyContext>,
     pub raw_body: Option<Bytes>,
     /// When set, classify_task was not spawned at request time and should be
     /// triggered after the first WebSocket frame enriches the detect result.
@@ -89,16 +89,14 @@ impl PendingStore {
     }
 
     pub fn evict_stale(&self, max_age: Duration, max_scan: usize) {
-        let mut scanned = 0;
         let mut to_remove = Vec::new();
-        for entry in self.inner.iter() {
+        for (scanned, entry) in self.inner.iter().enumerate() {
             if scanned >= max_scan {
                 break;
             }
             if entry.value().stored_at.elapsed() > max_age {
                 to_remove.push(*entry.key());
             }
-            scanned += 1;
         }
         for id in to_remove {
             self.inner.remove(&id);

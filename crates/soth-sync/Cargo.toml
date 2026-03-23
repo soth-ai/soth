@@ -26,6 +26,7 @@ uuid = { workspace = true, features = ["v5"] }
 rand = { workspace = true }
 flate2 = "1.0"
 ed25519-dalek = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

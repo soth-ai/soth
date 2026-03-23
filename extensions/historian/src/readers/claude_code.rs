@@ -334,8 +334,14 @@ impl FormatReader for ClaudeCodeReader {
 
             // Update cursor to latest file mtime
             if let Some(mtime) = latest_mtime {
-                let mut cursor = self.cursor.lock().unwrap();
-                *cursor = Some(Cursor::FileMtime {
+                let mut guard = match self.cursor.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        tracing::warn!("cursor mutex poisoned, recovering");
+                        poisoned.into_inner()
+                    }
+                };
+                *guard = Some(Cursor::FileMtime {
                     path: root,
                     mtime,
                 });
@@ -344,7 +350,13 @@ impl FormatReader for ClaudeCodeReader {
     }
 
     fn last_cursor(&self) -> Option<Cursor> {
-        self.cursor.lock().unwrap().clone()
+        match self.cursor.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                tracing::warn!("cursor mutex poisoned, recovering");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 }
 

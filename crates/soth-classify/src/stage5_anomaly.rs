@@ -181,26 +181,17 @@ fn score_rule_based(
 }
 
 fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
-    if left.is_empty() || left.len() != right.len() {
-        return 0.0;
+    if left.len() != right.len() || left.is_empty() {
+        return 1.0; // max distance for invalid input
     }
-
-    let mut dot = 0.0f32;
-    let mut left_norm = 0.0f32;
-    let mut right_norm = 0.0f32;
-
-    for (l, r) in left.iter().zip(right.iter()) {
-        dot += l * r;
-        left_norm += l * l;
-        right_norm += r * r;
-    }
-
-    if left_norm <= 1e-9 || right_norm <= 1e-9 {
-        return 0.0;
-    }
-
-    let cosine = dot / (left_norm.sqrt() * right_norm.sqrt());
-    (1.0 - cosine).clamp(0.0, 1.0)
+    debug_assert!(
+        (left.iter().map(|x| x * x).sum::<f32>().sqrt() - 1.0).abs() < 0.01,
+        "cosine_distance expects L2-normalized vectors"
+    );
+    let dot: f32 = left.iter().zip(right.iter()).map(|(l, r)| l * r).sum();
+    // For L2-normalized vectors, cosine similarity = dot product.
+    // Clamp to handle floating-point imprecision near the boundaries.
+    (1.0 - dot).clamp(0.0, 2.0)
 }
 
 fn dedupe_flags(flags: &mut Vec<AnomalyFlag>) {

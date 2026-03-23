@@ -1,4 +1,3 @@
-#![allow(clippy::all)]
 use criterion::{criterion_group, criterion_main, Criterion};
 
 fn bench_classify_fallback(c: &mut Criterion) {

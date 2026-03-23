@@ -81,6 +81,25 @@ pub enum Commands {
         #[command(subcommand)]
         action: commands::bundle::BundleCommands,
     },
+
+    /// Validate configuration without starting the proxy
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommands {
+    /// Parse and sanity-check the config file (exits 1 on errors)
+    Validate(ConfigValidateArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct ConfigValidateArgs {
+    /// Config file path (defaults to ~/.soth/soth.yaml)
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -345,6 +364,9 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
         Commands::Bundle { action } => {
             commands::bundle::run(action, global_config).await?;
         }
+        Commands::Config { action } => {
+            run_config_command(action, global_config)?;
+        }
     }
 
     Ok(())
@@ -539,6 +561,20 @@ mod proxy_test_hooks {
         }
         guard.calls.push(ProxyCall::Stop);
         Some(next_result(&mut guard.behavior.stop_results))
+    }
+}
+
+fn run_config_command(
+    action: ConfigCommands,
+    global_config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    match action {
+        ConfigCommands::Validate(args) => {
+            let path =
+                cli_config::resolve_config_path(args.config.as_ref(), global_config.as_ref())
+                    .unwrap_or_else(cli_config::default_config_path);
+            commands::config::validate(&path)
+        }
     }
 }
 
@@ -743,8 +779,7 @@ async fn ensure_ca_for_up(config_path: Option<PathBuf>, quiet: bool) -> anyhow::
             Err(error) => {
                 if !quiet {
                     style::warning(&format!(
-                        "Unable to verify OS trust state for CA (continuing): {}",
-                        error
+                        "Unable to verify OS trust state for CA (continuing): {error}"
                     ));
                 }
                 return Ok(());
@@ -906,7 +941,7 @@ async fn ensure_bundle_for_bootstrap(
 
     if !quiet {
         if let Some(version) = outcome.version.as_deref() {
-            style::success(&format!("Bootstrap bundle ready: {}", version));
+            style::success(&format!("Bootstrap bundle ready: {version}"));
         } else {
             style::success("Bootstrap bundle ready.");
         }
@@ -957,7 +992,7 @@ fn install_runtime_bundle_files(
                 .components()
                 .any(|component| component == std::path::Component::ParentDir)
         {
-            anyhow::bail!("bundle asset path is not safe: {}", relative_path);
+            anyhow::bail!("bundle asset path is not safe: {relative_path}");
         }
 
         let full_path = bundle_dir.join(rel);
@@ -1156,10 +1191,12 @@ mod tests {
     fn up_rolls_back_when_on_fails() {
         with_temp_home(|temp| {
             let config_path = write_config_with_ca(temp);
-            let mut behavior = ProxyBehavior::default();
-            behavior.start_results = VecDeque::from([Ok(())]);
-            behavior.on_results = VecDeque::from([Err("enable failed".to_string())]);
-            behavior.stop_results = VecDeque::from([Ok(())]);
+            let behavior = ProxyBehavior {
+                start_results: VecDeque::from([Ok(())]),
+                on_results: VecDeque::from([Err("enable failed".to_string())]),
+                stop_results: VecDeque::from([Ok(())]),
+                ..Default::default()
+            };
             let _hooks = install_hooks(behavior);
 
             let rt = build_runtime();
@@ -1195,10 +1232,12 @@ mod tests {
     fn up_reports_when_on_and_rollback_stop_fail() {
         with_temp_home(|temp| {
             let config_path = write_config_with_ca(temp);
-            let mut behavior = ProxyBehavior::default();
-            behavior.start_results = VecDeque::from([Ok(())]);
-            behavior.on_results = VecDeque::from([Err("enable failed".to_string())]);
-            behavior.stop_results = VecDeque::from([Err("stop failed".to_string())]);
+            let behavior = ProxyBehavior {
+                start_results: VecDeque::from([Ok(())]),
+                on_results: VecDeque::from([Err("enable failed".to_string())]),
+                stop_results: VecDeque::from([Err("stop failed".to_string())]),
+                ..Default::default()
+            };
             let _hooks = install_hooks(behavior);
 
             let rt = build_runtime();
@@ -1234,9 +1273,11 @@ mod tests {
     fn up_success_does_not_stop() {
         with_temp_home(|temp| {
             let config_path = write_config_with_ca(temp);
-            let mut behavior = ProxyBehavior::default();
-            behavior.start_results = VecDeque::from([Ok(())]);
-            behavior.on_results = VecDeque::from([Ok(())]);
+            let behavior = ProxyBehavior {
+                start_results: VecDeque::from([Ok(())]),
+                on_results: VecDeque::from([Ok(())]),
+                ..Default::default()
+            };
             let _hooks = install_hooks(behavior);
 
             let rt = build_runtime();
@@ -1266,9 +1307,11 @@ mod tests {
     #[test]
     fn down_calls_stop_then_off() {
         with_temp_home(|_| {
-            let mut behavior = ProxyBehavior::default();
-            behavior.stop_results = VecDeque::from([Ok(())]);
-            behavior.off_results = VecDeque::from([Ok(())]);
+            let behavior = ProxyBehavior {
+                stop_results: VecDeque::from([Ok(())]),
+                off_results: VecDeque::from([Ok(())]),
+                ..Default::default()
+            };
             let _hooks = install_hooks(behavior);
 
             let rt = build_runtime();

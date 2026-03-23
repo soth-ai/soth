@@ -5,6 +5,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::types::{EncryptedBatch, SignedBatch};
 
@@ -28,11 +29,18 @@ pub fn encrypt_batch(
     signed: &SignedBatch,
     vendor_static_pubkey: &[u8; 32],
 ) -> Result<EncryptedBatch, EncryptionError> {
-    let mut ephemeral_secret = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut ephemeral_secret);
-    let ephemeral_pubkey = x25519(ephemeral_secret, X25519_BASEPOINT_BYTES);
-    let shared_secret = x25519(ephemeral_secret, *vendor_static_pubkey);
-    let aead_key = derive_aead_key(&shared_secret)?;
+    // Generate a fresh ephemeral Curve25519 scalar and immediately derive
+    // both outputs before zeroing it so the raw secret never lingers.
+    let mut ephemeral_secret = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(ephemeral_secret.as_mut());
+    let ephemeral_pubkey = x25519(*ephemeral_secret, X25519_BASEPOINT_BYTES);
+    let mut shared_secret = Zeroizing::new(x25519(*ephemeral_secret, *vendor_static_pubkey));
+    // ephemeral_secret is no longer needed; zero it before continuing.
+    ephemeral_secret.zeroize();
+
+    let aead_key = derive_aead_key(&shared_secret, &ephemeral_pubkey)?;
+    // shared_secret is no longer needed once the AEAD key is derived.
+    shared_secret.zeroize();
 
     let plaintext = rmp_serde::to_vec_named(signed)
         .map_err(|error| EncryptionError::Serialization(error.to_string()))?;
@@ -40,7 +48,8 @@ pub fn encrypt_batch(
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
 
-    let cipher = ChaCha20Poly1305::new_from_slice(&aead_key)
+    // aead_key is Zeroizing<[u8;32]> and will be wiped when it goes out of scope.
+    let cipher = ChaCha20Poly1305::new_from_slice(aead_key.as_ref())
         .map_err(|_| EncryptionError::CipherInitFailed)?;
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_slice())
@@ -63,9 +72,11 @@ pub(crate) fn decrypt_batch_for_tests(
     encrypted: &EncryptedBatch,
     vendor_static_secret: &[u8; 32],
 ) -> Result<SignedBatch, EncryptionError> {
-    let shared_secret = x25519(*vendor_static_secret, encrypted.ephemeral_pubkey);
-    let aead_key = derive_aead_key(&shared_secret)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&aead_key)
+    let mut shared_secret =
+        Zeroizing::new(x25519(*vendor_static_secret, encrypted.ephemeral_pubkey));
+    let aead_key = derive_aead_key(&shared_secret, &encrypted.ephemeral_pubkey)?;
+    shared_secret.zeroize();
+    let cipher = ChaCha20Poly1305::new_from_slice(aead_key.as_ref())
         .map_err(|_| EncryptionError::CipherInitFailed)?;
     let plaintext = cipher
         .decrypt(
@@ -77,10 +88,21 @@ pub(crate) fn decrypt_batch_for_tests(
         .map_err(|error| EncryptionError::Deserialization(error.to_string()))
 }
 
-fn derive_aead_key(shared_secret: &[u8; 32]) -> Result<[u8; 32], EncryptionError> {
-    let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
-    let mut out = [0u8; 32];
-    hkdf.expand(b"soth-telemetry-v1", &mut out)
+/// Derives the ChaCha20-Poly1305 AEAD key from a Diffie-Hellman shared secret
+/// using HKDF-SHA256 with the ephemeral public key as the salt.
+///
+/// Using the ephemeral public key as the salt is the standard ECIES construction:
+/// it provides domain separation between different ephemeral key pairs so that
+/// even if two ephemeral secrets coincidentally produced the same DH output, the
+/// derived AEAD keys would still differ.  Returns the key wrapped in [`Zeroizing`]
+/// so it is automatically overwritten when the value is dropped.
+fn derive_aead_key(
+    shared_secret: &[u8; 32],
+    ephemeral_pubkey: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, EncryptionError> {
+    let hkdf = Hkdf::<Sha256>::new(Some(ephemeral_pubkey.as_slice()), shared_secret);
+    let mut out = Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"soth-telemetry-v1", out.as_mut())
         .map_err(|_| EncryptionError::HkdfExpandFailed)?;
     Ok(out)
 }

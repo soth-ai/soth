@@ -39,7 +39,13 @@ impl DedupChecker {
         content_hash: &str,
         timestamp: i64,
     ) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("dedup mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
 
         // Primary: exact (tool, session, index) match
         let primary: Option<i64> = conn
@@ -120,7 +126,13 @@ impl DedupChecker {
         content_hash: &str,
         semantic_hash: Option<&str>,
     ) -> Result<(), HistorianError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("dedup mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT OR IGNORE INTO already_processed
@@ -141,7 +153,13 @@ impl DedupChecker {
 
     /// Count of processed entries for a given tool.
     pub fn processed_count(&self, tool: &AiTool) -> u64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("dedup mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         conn.query_row(
             "SELECT COUNT(*) FROM already_processed WHERE tool_type = ?1",
             params![tool.key()],
@@ -152,7 +170,13 @@ impl DedupChecker {
 
     /// Total count of all processed entries across all tools.
     pub fn total_processed(&self) -> u64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("dedup mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         conn.query_row("SELECT COUNT(*) FROM already_processed", [], |row| {
             row.get::<_, i64>(0)
         })
@@ -161,16 +185,32 @@ impl DedupChecker {
 
     /// Per-tool breakdown of processed counts.
     pub fn stats_by_tool(&self) -> Vec<(String, u64)> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT tool_type, COUNT(*) FROM already_processed GROUP BY tool_type ORDER BY tool_type")
-            .unwrap();
-        stmt.query_map([], |row| {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("dedup mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT tool_type, COUNT(*) FROM already_processed GROUP BY tool_type ORDER BY tool_type",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(err = %e, "dedup stats_by_tool: prepare failed");
+                return Vec::new();
+            }
+        };
+        let result: Vec<(String, u64)> = match stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                tracing::warn!(err = %e, "dedup stats_by_tool: query_map failed");
+                Vec::new()
+            }
+        };
+        result
     }
 }
 

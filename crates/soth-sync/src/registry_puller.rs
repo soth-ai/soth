@@ -718,6 +718,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[allow(clippy::large_enum_variant)]
 enum BundleFetchResultWithMetadata {
     NotModified {
         version: Option<String>,
@@ -1103,7 +1104,7 @@ mod tests {
     fn verify_bundle_integrity_accepts_matching_sha_and_size() {
         let payload = br#"{"ok":true}"#;
         let digest = Sha256::digest(payload);
-        let metadata = sample_metadata(&format!("{:x}", digest), payload.len() as u64);
+        let metadata = sample_metadata(&format!("{digest:x}"), payload.len() as u64);
         let verified = verify_bundle_integrity(&metadata, payload, None).unwrap();
         assert_eq!(verified.sha256, metadata.sha256);
     }
@@ -1112,7 +1113,7 @@ mod tests {
     fn verify_bundle_integrity_accepts_size_mismatch_when_sha_matches() {
         let payload = br#"{"ok":true}"#;
         let digest = Sha256::digest(payload);
-        let metadata = sample_metadata(&format!("{:x}", digest), payload.len() as u64 + 1);
+        let metadata = sample_metadata(&format!("{digest:x}"), payload.len() as u64 + 1);
         let verified = verify_bundle_integrity(&metadata, payload, None).unwrap();
         assert_eq!(verified.size_bytes as usize, payload.len());
     }
@@ -1138,9 +1139,9 @@ mod tests {
         let payload = br#"{"ok":true}"#;
         let digest = Sha256::digest(payload);
         let metadata = sample_metadata("deadbeef", payload.len() as u64);
-        let etag = format!("\"{:x}\"", digest);
+        let etag = format!("\"{digest:x}\"");
         let verified = verify_bundle_integrity(&metadata, payload, Some(&etag)).unwrap();
-        assert_eq!(verified.sha256, format!("{:x}", digest));
+        assert_eq!(verified.sha256, format!("{digest:x}"));
         assert_eq!(verified.size_bytes as usize, payload.len());
     }
 

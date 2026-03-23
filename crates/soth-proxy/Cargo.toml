@@ -12,15 +12,20 @@ extensions = ["dep:soth-extensions", "dep:soth-historian"]
 
 [dependencies]
 anyhow.workspace = true
+once_cell.workspace = true
 arc-swap = "1"
 async-trait.workspace = true
+axum.workspace = true
 bytes = "1"
+libc = "0.2"
 chrono.workspace = true
 dashmap.workspace = true
 dirs.workspace = true
 ed25519-dalek.workspace = true
 hex = "0.4"
 hmac = "0.12"
+rand.workspace = true
+zeroize = { workspace = true }
 http = "1"
 rusqlite.workspace = true
 rustls.workspace = true
@@ -38,8 +43,8 @@ soth-core = { workspace = true }
 soth-bundle = { workspace = true }
 soth-detect = { workspace = true, features = ["tree-sitter", "intelligence"] }
 soth-parse = { workspace = true }
-soth-classify = { workspace = true }
-soth-sqlite-vec = { workspace = true }
+soth-classify = { workspace = true, features = ["policy"] }
+sqlite-vec = "0.1"
 soth-telemetry = { workspace = true }
 soth-policy = { workspace = true }
 soth-sync = { workspace = true }
@@ -47,3 +52,6 @@ soth-sync = { workspace = true }
 soth-extensions = { workspace = true, optional = true }
 soth-historian = { workspace = true, optional = true }
 soth-mitm = "0.2.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

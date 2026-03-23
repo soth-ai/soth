@@ -44,7 +44,7 @@ fn canonical_manifest_bytes(manifest: &BundleManifest) -> Vec<u8> {
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push_str(format!("{:02x}", byte).as_str());
+        out.push_str(format!("{byte:02x}").as_str());
     }
     out
 }
@@ -106,10 +106,9 @@ fn detect_bundle_with_openai_catalog() -> soth_core::OwnedDetectBundle {
 }
 
 fn detect_bundle_with_codex_catalog() -> soth_core::OwnedDetectBundle {
-    let detect = detect_bundle_with_openai_catalog();
     // Codex goes through api.openai.com using the Responses API.
     // The /v1/responses path is recognized by is_openai_like_path().
-    detect
+    detect_bundle_with_openai_catalog()
 }
 
 fn websocket_upgrade_request(connection_id: Uuid, host: &str, path: &str) -> soth_mitm::RawRequest {
@@ -370,8 +369,10 @@ fn handler_contract_connect_gate_skips_non_catalog_tls() {
 #[test]
 fn handler_contract_connect_gate_intercepts_catalog_tls() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -388,8 +389,10 @@ fn handler_contract_connect_gate_intercepts_catalog_tls() {
 #[tokio::test]
 async fn handler_contract_intercepts_and_records_request_response_flow() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -423,8 +426,10 @@ async fn handler_contract_intercepts_and_records_request_response_flow() {
 #[tokio::test]
 async fn handler_contract_streaming_callbacks_complete() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -469,8 +474,10 @@ async fn handler_contract_streaming_callbacks_complete() {
 #[tokio::test]
 async fn handler_contract_stream_end_without_chunks_is_safe() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -572,8 +579,10 @@ fn handler_contract_intercept_schema_contains_reference_columns() {
 #[tokio::test]
 async fn handler_contract_intercept_row_persists_reference_fields() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),
@@ -677,8 +686,10 @@ async fn handler_contract_intercept_row_persists_reference_fields() {
 #[tokio::test]
 async fn handler_contract_codex_websocket_turn_lifecycle() {
     let db_path = std::env::temp_dir().join(format!("soth-proxy-handler-{}.db", Uuid::new_v4()));
-    let mut pipeline = PipelineConfig::default();
-    pipeline.unknown_app_action = Some(GateAction::Intercept);
+    let pipeline = PipelineConfig {
+        unknown_app_action: Some(GateAction::Intercept),
+        ..Default::default()
+    };
 
     let handler = build_handler(
         db_path.as_path(),

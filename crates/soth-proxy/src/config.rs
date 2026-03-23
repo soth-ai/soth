@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
+use rand::Rng;
 use serde::Deserialize;
 use soth_core::derive_proxy_signing_seed;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     pub mitm: MitmRuntimeConfig,
@@ -23,13 +25,35 @@ pub struct ProxyConfig {
     pub org_id: String,
     pub team_id: String,
     pub device_id_hash: String,
-    pub user_hmac_secret: String,
+    pub user_hmac_secret: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("mitm", &self.mitm)
+            .field("bundle", &self.bundle)
+            .field("telemetry", &self.telemetry)
+            .field("sync", &self.sync)
+            .field("classify", &self.classify)
+            .field("pipeline", &self.pipeline)
+            .field("db_path", &self.db_path)
+            .field("org_id", &self.org_id)
+            .field("team_id", &self.team_id)
+            .field("device_id_hash", &self.device_id_hash)
+            .field("user_hmac_secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let logs_dir = home.join(".soth").join("logs");
+
+        let mut secret_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut secret_bytes);
+        let user_hmac_secret = Zeroizing::new(hex::encode(secret_bytes));
 
         Self {
             mitm: MitmRuntimeConfig::default(),
@@ -42,7 +66,7 @@ impl Default for ProxyConfig {
             org_id: "local-org".to_string(),
             team_id: "local-team".to_string(),
             device_id_hash: "local-device".to_string(),
-            user_hmac_secret: "local-dev-secret".to_string(),
+            user_hmac_secret,
         }
     }
 }
@@ -124,6 +148,7 @@ impl ProxyConfig {
             self.org_id.clone(),
             bundle_version,
             self.device_id_hash.clone(),
+            self.user_hmac_secret.as_bytes(),
         )?;
         Ok(Some(config))
     }
@@ -134,6 +159,7 @@ impl ProxyConfig {
             self.bundle.bundle_dir.clone(),
             self.device_id_hash.clone(),
             self.telemetry.signing_key_hex.clone(),
+            self.user_hmac_secret.as_bytes().to_vec(),
         )
     }
 }
@@ -442,7 +468,7 @@ impl ClassifyRuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct TelemetryPipelineConfig {
     pub enabled: bool,
@@ -452,6 +478,23 @@ pub struct TelemetryPipelineConfig {
     pub signing_key_hex: Option<String>,
     pub encryption: TelemetryEncryptionConfig,
     pub proxy_version: String,
+}
+
+impl std::fmt::Debug for TelemetryPipelineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryPipelineConfig")
+            .field("enabled", &self.enabled)
+            .field("batch_window_secs", &self.batch_window_secs)
+            .field("max_batch_size", &self.max_batch_size)
+            .field("anomaly_threshold", &self.anomaly_threshold)
+            .field(
+                "signing_key_hex",
+                &self.signing_key_hex.as_deref().map(|_| "[REDACTED]"),
+            )
+            .field("encryption", &self.encryption)
+            .field("proxy_version", &self.proxy_version)
+            .finish()
+    }
 }
 
 impl Default for TelemetryPipelineConfig {
@@ -474,12 +517,14 @@ impl TelemetryPipelineConfig {
         org_id: String,
         bundle_version: String,
         device_id_hash: String,
+        local_secret: &[u8],
     ) -> Result<soth_telemetry::TelemetryConfig> {
-        let signing_key_bytes = match &self.signing_key_hex {
-            Some(hex) if !hex.trim().is_empty() => {
-                parse_fixed_hex::<32>(hex.as_str(), "telemetry.signing_key_hex")?
-            }
-            _ => derive_proxy_signing_seed(device_id_hash.as_str()),
+        let signing_key_bytes: Zeroizing<[u8; 32]> = match &self.signing_key_hex {
+            Some(hex) if !hex.trim().is_empty() => Zeroizing::new(parse_fixed_hex::<32>(
+                hex.as_str(),
+                "telemetry.signing_key_hex",
+            )?),
+            _ => derive_proxy_signing_seed(device_id_hash.as_str(), local_secret),
         };
         let signing_key = SigningKey::from_bytes(&signing_key_bytes);
 
@@ -522,7 +567,7 @@ impl Default for TelemetryEncryptionConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct SyncRuntimeConfig {
     pub enabled: bool,
@@ -548,6 +593,60 @@ pub struct SyncRuntimeConfig {
     pub body_upload_max_bytes: usize,
     pub telemetry_enabled: bool,
     pub telemetry_signing_key_hex: Option<String>,
+}
+
+impl std::fmt::Debug for SyncRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncRuntimeConfig")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &"[REDACTED]")
+            .field("cache_path", &self.cache_path)
+            .field("registry_cache_path", &self.registry_cache_path)
+            .field("agent_instance_id", &self.agent_instance_id)
+            .field("retry_queue_dir", &self.retry_queue_dir)
+            .field("retry_queue_max_bytes", &self.retry_queue_max_bytes)
+            .field("sync_interval_secs", &self.sync_interval_secs)
+            .field("batch_size", &self.batch_size)
+            .field("body_batch_size", &self.body_batch_size)
+            .field("body_upload_enabled", &self.body_upload_enabled)
+            .field(
+                "metadata_max_events_per_batch",
+                &self.metadata_max_events_per_batch,
+            )
+            .field(
+                "metadata_max_compressed_batch_bytes",
+                &self.metadata_max_compressed_batch_bytes,
+            )
+            .field("frontload_enabled", &self.frontload_enabled)
+            .field(
+                "frontload_max_events_per_batch",
+                &self.frontload_max_events_per_batch,
+            )
+            .field(
+                "frontload_max_compressed_batch_bytes",
+                &self.frontload_max_compressed_batch_bytes,
+            )
+            .field("frontload_hard_events_cap", &self.frontload_hard_events_cap)
+            .field(
+                "frontload_hard_compressed_cap_bytes",
+                &self.frontload_hard_compressed_cap_bytes,
+            )
+            .field(
+                "legacy_exchange_upload_enabled",
+                &self.legacy_exchange_upload_enabled,
+            )
+            .field("body_upload_max_bytes", &self.body_upload_max_bytes)
+            .field("telemetry_enabled", &self.telemetry_enabled)
+            .field(
+                "telemetry_signing_key_hex",
+                &self
+                    .telemetry_signing_key_hex
+                    .as_deref()
+                    .map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl Default for SyncRuntimeConfig {
@@ -589,6 +688,7 @@ impl SyncRuntimeConfig {
         bundle_dir: PathBuf,
         device_id_hash: String,
         telemetry_signing_key_hex: Option<String>,
+        local_secret: Vec<u8>,
     ) -> soth_sync::SyncAgentConfig {
         let registry_cache_path = self
             .registry_cache_path
@@ -633,6 +733,7 @@ impl SyncRuntimeConfig {
                 ..soth_sync::TelemetrySyncConfig::default()
             },
             telemetry_signing_key_hex,
+            local_secret,
         }
     }
 }
@@ -646,6 +747,13 @@ pub struct PipelineConfig {
     pub unknown_app_action: Option<GateAction>,
     pub non_cataloged_host_action: Option<GateAction>,
     pub session: SessionConfig,
+    /// Number of days to retain intercept records in the local SQLite database.
+    /// Set to `0` to disable automatic purging.
+    #[serde(default = "PipelineConfig::default_retention_days")]
+    pub retention_days: u32,
+    /// Bind address for the lightweight ops HTTP server (`/healthz`, `/readyz`, `/metrics`).
+    /// Set to an empty string to disable.
+    pub ops_bind: String,
 }
 
 impl Default for PipelineConfig {
@@ -657,7 +765,15 @@ impl Default for PipelineConfig {
             unknown_app_action: None,
             non_cataloged_host_action: None,
             session: SessionConfig::default(),
+            retention_days: Self::default_retention_days(),
+            ops_bind: "127.0.0.1:9090".to_string(),
         }
+    }
+}
+
+impl PipelineConfig {
+    fn default_retention_days() -> u32 {
+        30
     }
 }
 
