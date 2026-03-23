@@ -72,10 +72,11 @@ serde_json = "1"
 serde_yaml = "0.9"
 
 # Cryptography
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
+zeroize = { version = "1", features = ["derive", "serde"] }
 
 # HTTP
 axum = { version = "0.7", features = ["ws"] }

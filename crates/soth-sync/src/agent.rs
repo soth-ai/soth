@@ -97,6 +97,10 @@ pub struct SyncAgentConfig {
     pub heartbeat_telemetry: Option<HeartbeatTelemetryProvider>,
     pub telemetry: TelemetrySyncConfig,
     pub telemetry_signing_key_hex: Option<String>,
+    /// Per-device local secret mixed into the Ed25519 signing key derivation.
+    /// Never transmitted off-device.  Defaults to empty (no extra entropy) when
+    /// not supplied by the caller (e.g. in tests).
+    pub local_secret: Vec<u8>,
 }
 
 pub struct SyncAgent {
@@ -2311,6 +2315,7 @@ mod tests {
             heartbeat_telemetry: None,
             telemetry: TelemetrySyncConfig::default(),
             telemetry_signing_key_hex: None,
+            local_secret: vec![],
         };
         let agent = SyncAgent::new_with_config_puller(config, None).expect("sync agent");
         (dir, agent)

@@ -112,6 +112,7 @@ async fn contract_sync_endpoints_and_cursors() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::from([("project".to_string(), "sync-test".to_string())]),
         heartbeat_telemetry: None,
@@ -292,6 +293,7 @@ async fn contract_blob_queue_entries_do_not_block_exchange_upload() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -377,6 +379,7 @@ async fn contract_shutdown_flush_drains_multiple_rounds() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -439,6 +442,7 @@ async fn contract_shutdown_flush_surfaces_sync_failure() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -525,6 +529,7 @@ async fn contract_frontload_and_live_batches_are_separated() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -619,6 +624,7 @@ async fn contract_frontload_override_path_is_ignored_for_edge_contract() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
 
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
@@ -690,6 +696,7 @@ async fn contract_exchange_upload_ignores_legacy_flag() {
         body_upload_max_bytes: 15 * 1024 * 1024,
         device_id_hash: "device-test".to_string(),
         telemetry_signing_key_hex: None,
+        local_secret: vec![],
         global_tags: BTreeMap::new(),
         heartbeat_telemetry: None,
         telemetry: TelemetrySyncConfig {

@@ -1,5 +1,6 @@
 use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Sha3_256;
+use zeroize::Zeroizing;
 
 use crate::normalized::NormalizedRequest;
 
@@ -19,11 +20,20 @@ pub fn commitment_hash(body_bytes: &[u8], nonce: &[u8; 32]) -> String {
     hex::encode(digest)
 }
 
-/// Deterministically derives a per-device Ed25519 seed from the device identity.
+/// Deterministically derives a per-device Ed25519 seed from the device identity
+/// mixed with a locally-generated persistent secret.
 ///
-/// The output is stable for the same device id hash and safe to pass into
-/// `ed25519_dalek::SigningKey::from_bytes`.
-pub fn derive_proxy_signing_seed(device_id_hash: &str) -> [u8; 32] {
+/// `device_id_hash` is the public device identifier (transmitted in API requests).
+/// `local_secret` is a per-device random value that never leaves the device (e.g.
+/// the `user_hmac_secret` from `ProxyConfig`).  Mixing in `local_secret` ensures
+/// that knowing the `device_id_hash` alone is not sufficient to reconstruct the
+/// signing key.
+///
+/// The return value is wrapped in [`Zeroizing`] so the seed bytes are
+/// automatically overwritten when the caller's binding is dropped.  Callers
+/// that copy the bytes out (e.g. into `SigningKey::from_bytes`) should ensure
+/// their own copy is also zeroized after use.
+pub fn derive_proxy_signing_seed(device_id_hash: &str, local_secret: &[u8]) -> Zeroizing<[u8; 32]> {
     let normalized = if device_id_hash.trim().is_empty() {
         "local-device"
     } else {
@@ -32,8 +42,10 @@ pub fn derive_proxy_signing_seed(device_id_hash: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"soth.proxy.ed25519.seed.v1|");
     hasher.update(normalized.as_bytes());
+    hasher.update(b"|");
+    hasher.update(local_secret);
     let digest = hasher.finalize();
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&digest);
     out
 }
@@ -92,10 +104,21 @@ mod tests {
 
     #[test]
     fn derive_proxy_signing_seed_is_stable() {
-        let left = derive_proxy_signing_seed("device-test-123");
-        let right = derive_proxy_signing_seed("device-test-123");
-        assert_eq!(left, right);
-        assert_ne!(left, derive_proxy_signing_seed("device-test-456"));
+        let secret = b"test-local-secret";
+        let left = derive_proxy_signing_seed("device-test-123", secret);
+        let right = derive_proxy_signing_seed("device-test-123", secret);
+        assert_eq!(*left, *right);
+        assert_ne!(*left, *derive_proxy_signing_seed("device-test-456", secret));
+    }
+
+    #[test]
+    fn derive_proxy_signing_seed_differs_with_different_local_secret() {
+        let a = derive_proxy_signing_seed("device-test-123", b"secret-a");
+        let b = derive_proxy_signing_seed("device-test-123", b"secret-b");
+        assert_ne!(
+            *a, *b,
+            "different local secrets must produce different seeds"
+        );
     }
 
     #[test]

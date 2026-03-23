@@ -10,6 +10,7 @@ use rand::Rng;
 use serde::Deserialize;
 use soth_core::derive_proxy_signing_seed;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Deserialize)]
 #[serde(default)]
@@ -24,7 +25,7 @@ pub struct ProxyConfig {
     pub org_id: String,
     pub team_id: String,
     pub device_id_hash: String,
-    pub user_hmac_secret: String,
+    pub user_hmac_secret: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for ProxyConfig {
@@ -52,7 +53,7 @@ impl Default for ProxyConfig {
 
         let mut secret_bytes = [0u8; 32];
         rand::thread_rng().fill(&mut secret_bytes);
-        let user_hmac_secret = hex::encode(secret_bytes);
+        let user_hmac_secret = Zeroizing::new(hex::encode(secret_bytes));
 
         Self {
             mitm: MitmRuntimeConfig::default(),
@@ -147,6 +148,7 @@ impl ProxyConfig {
             self.org_id.clone(),
             bundle_version,
             self.device_id_hash.clone(),
+            self.user_hmac_secret.as_bytes(),
         )?;
         Ok(Some(config))
     }
@@ -157,6 +159,7 @@ impl ProxyConfig {
             self.bundle.bundle_dir.clone(),
             self.device_id_hash.clone(),
             self.telemetry.signing_key_hex.clone(),
+            self.user_hmac_secret.as_bytes().to_vec(),
         )
     }
 }
@@ -514,12 +517,14 @@ impl TelemetryPipelineConfig {
         org_id: String,
         bundle_version: String,
         device_id_hash: String,
+        local_secret: &[u8],
     ) -> Result<soth_telemetry::TelemetryConfig> {
-        let signing_key_bytes = match &self.signing_key_hex {
-            Some(hex) if !hex.trim().is_empty() => {
-                parse_fixed_hex::<32>(hex.as_str(), "telemetry.signing_key_hex")?
-            }
-            _ => derive_proxy_signing_seed(device_id_hash.as_str()),
+        let signing_key_bytes: Zeroizing<[u8; 32]> = match &self.signing_key_hex {
+            Some(hex) if !hex.trim().is_empty() => Zeroizing::new(parse_fixed_hex::<32>(
+                hex.as_str(),
+                "telemetry.signing_key_hex",
+            )?),
+            _ => derive_proxy_signing_seed(device_id_hash.as_str(), local_secret),
         };
         let signing_key = SigningKey::from_bytes(&signing_key_bytes);
 
@@ -683,6 +688,7 @@ impl SyncRuntimeConfig {
         bundle_dir: PathBuf,
         device_id_hash: String,
         telemetry_signing_key_hex: Option<String>,
+        local_secret: Vec<u8>,
     ) -> soth_sync::SyncAgentConfig {
         let registry_cache_path = self
             .registry_cache_path
@@ -727,6 +733,7 @@ impl SyncRuntimeConfig {
                 ..soth_sync::TelemetrySyncConfig::default()
             },
             telemetry_signing_key_hex,
+            local_secret,
         }
     }
 }

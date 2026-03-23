@@ -4,6 +4,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use soth_core::{derive_proxy_signing_seed, ClassificationFlag, TelemetryPolicyKind};
 use soth_telemetry::{SignedBatch, TransmittedBatch};
 use std::collections::HashMap;
+use zeroize::Zeroizing;
 
 use crate::api_types::{TelemetryBatchRequest, TelemetryEvent};
 use crate::http_client::SothHttpClient;
@@ -30,12 +31,14 @@ impl TelemetrySender {
         endpoint_path: impl Into<String>,
         device_id_hash: impl Into<String>,
         telemetry_signing_key_hex: Option<String>,
+        local_secret: &[u8],
     ) -> Result<Self> {
         let endpoint_path = normalize_endpoint_path(endpoint_path.into());
         let device_id_hash = normalize_device_id_hash(device_id_hash.into());
         let signing_key = build_signing_key(
             telemetry_signing_key_hex.as_deref(),
             device_id_hash.as_str(),
+            local_secret,
         )?;
         Ok(Self {
             cloud: SothHttpClient::new(endpoint, api_key),
@@ -334,10 +337,11 @@ fn normalize_device_id_hash(raw: String) -> String {
 fn build_signing_key(
     telemetry_signing_key_hex: Option<&str>,
     device_id_hash: &str,
+    local_secret: &[u8],
 ) -> Result<SigningKey> {
-    let seed = match telemetry_signing_key_hex {
-        Some(raw) if !raw.trim().is_empty() => parse_signing_key_hex(raw)?,
-        _ => derive_proxy_signing_seed(device_id_hash),
+    let seed: Zeroizing<[u8; 32]> = match telemetry_signing_key_hex {
+        Some(raw) if !raw.trim().is_empty() => Zeroizing::new(parse_signing_key_hex(raw)?),
+        _ => derive_proxy_signing_seed(device_id_hash, local_secret),
     };
     Ok(SigningKey::from_bytes(&seed))
 }

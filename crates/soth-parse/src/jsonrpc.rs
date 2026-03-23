@@ -32,11 +32,24 @@ const JSONRPC_CONTENT_PATHS: [&str; 12] = [
     "$.choices[0].delta.content",
 ];
 
-pub fn parse_jsonrpc(req: &RawRequest, provider_id: &str) -> ParseResult<NormalizedRequest> {
-    let json: Value = serde_json::from_slice(&req.body)
-        .map_err(|error| ParseError::MalformedBody(error.to_string()))?;
+pub fn parse_jsonrpc(
+    req: &RawRequest,
+    provider_id: &str,
+    pre_parsed: Option<&Value>,
+) -> ParseResult<NormalizedRequest> {
+    // Reuse the caller's pre-parsed value when available to avoid a second
+    // serde_json::from_slice call on the hot path.
+    let owned;
+    let json: &Value = match pre_parsed {
+        Some(v) => v,
+        None => {
+            owned = serde_json::from_slice(&req.body)
+                .map_err(|error| ParseError::MalformedBody(error.to_string()))?;
+            &owned
+        }
+    };
 
-    let calls = jsonrpc_calls(&json);
+    let calls = jsonrpc_calls(json);
     if calls.is_empty() {
         return Err(ParseError::MalformedBody(
             "json-rpc payload is not an object or batch array".to_string(),

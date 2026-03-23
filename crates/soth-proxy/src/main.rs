@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 
     let config = ProxyConfig::from_env_or_default().context("load proxy config")?;
 
-    if config.user_hmac_secret == "local-dev-secret" {
+    if config.user_hmac_secret.as_str() == "local-dev-secret" {
         warn!(
             "user_hmac_secret is set to the insecure default value \"local-dev-secret\"; \
              all proxies sharing this value will produce identical user pseudonyms, \
@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
         config.org_id.clone(),
         config.team_id.clone(),
         config.device_id_hash.clone(),
-        config.user_hmac_secret.clone(),
+        config.user_hmac_secret.as_str().to_string(),
     );
 
     let handler_for_bundle_watch = handler.clone();

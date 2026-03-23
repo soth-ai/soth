@@ -6,17 +6,31 @@ use crate::types::{
 use crate::util::{extract_string, json_path};
 use serde_json::Value;
 
-pub fn parse(req: &RawRequest) -> NormalizedRequest {
+pub fn parse(req: &RawRequest, pre_parsed: Option<&Value>) -> NormalizedRequest {
     let mut nr = empty_heuristic_request(&req.method, &req.path);
     nr.provider = "unknown".to_string();
     nr.endpoint_type = EndpointType::Unknown;
 
-    match serde_json::from_slice::<Value>(&req.body) {
-        Ok(json) => {
-            nr.model = try_extract_model(&json);
+    // Use the pre-parsed value when available to avoid a redundant
+    // serde_json::from_slice call on the hot path.
+    let owned;
+    let parsed: Option<&Value> = match pre_parsed {
+        Some(v) => Some(v),
+        None => match serde_json::from_slice::<Value>(&req.body) {
+            Ok(v) => {
+                owned = v;
+                Some(&owned)
+            }
+            Err(_) => None,
+        },
+    };
+
+    match parsed {
+        Some(json) => {
+            nr.model = try_extract_model(json);
 
             let content = try_paths(
-                &json,
+                json,
                 &[
                     "$.messages[0].content",
                     "$.prompt",
@@ -34,7 +48,7 @@ pub fn parse(req: &RawRequest) -> NormalizedRequest {
                 Some(value) if !value.is_empty() => value,
                 _ => {
                     nr.parse_warnings.push(ParseWarning::ContentNotExtracted);
-                    find_longest_string(&json, 20)
+                    find_longest_string(json, 20)
                         .map(|value| {
                             nr.parse_warnings.push(ParseWarning::LongestStringHeuristic);
                             value
@@ -48,7 +62,7 @@ pub fn parse(req: &RawRequest) -> NormalizedRequest {
             nr.estimated_input_tokens = nr.user_content_token_estimate;
             nr.conversation_hash = hash_content(&content);
         }
-        Err(_) => {
+        None => {
             nr.parse_warnings.push(ParseWarning::NonJsonBody);
             nr.user_content_hash = hash_content("[NON_JSON_BODY]");
             nr.conversation_hash = nr.user_content_hash.clone();

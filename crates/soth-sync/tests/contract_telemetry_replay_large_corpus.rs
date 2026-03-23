@@ -325,6 +325,7 @@ async fn telemetry_replay_large_corpus_startup_drain_matrix() {
             Connection::open(&db_path).expect("open runtime db"),
         )),
         telemetry: TelemetrySyncConfig::default(),
+        local_secret: vec![],
     })
     .expect("start telemetry runtime");
 
@@ -426,6 +427,7 @@ async fn telemetry_replay_large_corpus_retry_deadletter_matrix() {
             backoff_max_ms: 10,
             dead_letter_after_hours: 72,
         },
+        local_secret: vec![],
     })
     .expect("start telemetry runtime");
 

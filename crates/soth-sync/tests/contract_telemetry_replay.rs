@@ -231,6 +231,7 @@ async fn telemetry_replay_contract_transitions_to_sent() {
         "/v1/edge/telemetry/batch",
         "device-hash-test",
         None,
+        &[],
     )
     .expect("sender");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -284,6 +285,7 @@ async fn telemetry_replay_contract_transitions_to_dead_after_retry_cap() {
         "/v1/edge/telemetry/batch",
         "device-hash-test",
         None,
+        &[],
     )
     .expect("sender");
     let cfg = TelemetrySyncConfig {
