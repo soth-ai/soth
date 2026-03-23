@@ -72,3 +72,5 @@ docs/
 
 # Local test corpora (machine-specific fixtures)
 crates/*/tests/corpus/
+.cargo/
+.claude/

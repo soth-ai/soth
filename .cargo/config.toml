@@ -1,2 +1,0 @@
-[alias]
-build-release = "build -p soth-cli --release"
