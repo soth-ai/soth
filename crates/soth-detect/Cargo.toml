@@ -35,6 +35,7 @@ tree-sitter-go = { version = "0.23", optional = true }
 tree-sitter-java = { version = "0.23", optional = true }
 once_cell = { workspace = true }
 regex = { workspace = true }
+tracing = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

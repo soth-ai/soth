@@ -35,6 +35,23 @@ async fn main() -> Result<()> {
     init_tracing(&ext_tracing_targets);
 
     let config = ProxyConfig::from_env_or_default().context("load proxy config")?;
+
+    if config.user_hmac_secret == "local-dev-secret" {
+        warn!(
+            "user_hmac_secret is set to the insecure default value \"local-dev-secret\"; \
+             all proxies sharing this value will produce identical user pseudonyms, \
+             defeating pseudonymization — set a unique secret in your config file"
+        );
+    }
+
+    if !config.mitm.verify_upstream_tls {
+        tracing::warn!(
+            "SECURITY WARNING: upstream TLS verification is DISABLED. \
+             The proxy will not verify AI provider certificates. \
+             Set forward_proxy.tls.verify_upstream_tls: true in production."
+        );
+    }
+
     let db_conn = db::open(config.db_path.as_path())?;
     let db = Arc::new(Mutex::new(db_conn));
 

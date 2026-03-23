@@ -54,6 +54,22 @@ pub async fn run(
     if !cert_path.exists() || !key_path.exists() {
         anyhow::bail!("CA certificate not found. Run `soth setup-ca` first.");
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let key_meta = std::fs::metadata(&key_path)?;
+        let mode = key_meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path = %key_path.display(),
+                mode = format!("{:o}", mode),
+                "CA private key has overly permissive file permissions. \
+                 Expected 0600, got {:o}. Run: chmod 600 {}",
+                mode,
+                key_path.display()
+            );
+        }
+    }
     ensure_ca_runtime_health(&ca_paths, quiet)?;
 
     let generated_path = write_proxy_config(&config, port)?;

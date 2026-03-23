@@ -3,6 +3,7 @@ use crate::types::{ArtifactLocation, SensitiveArtifact};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use soth_core::{ArtifactKind, ArtifactSeverity, DetectedProvider};
+use tracing;
 
 static OPENAI_KEY_RE: Lazy<Option<Regex>> =
     Lazy::new(|| Regex::new(r"\bsk-[A-Za-z0-9\-_]{16,}\b").ok());
@@ -185,6 +186,50 @@ pub fn structural_scan(body: &[u8], location: ArtifactLocation) -> Vec<Sensitive
     out
 }
 
+/// Maximum number of org-configured patterns accepted. Patterns beyond this
+/// limit are silently dropped after a warning is emitted.
+const ORG_PATTERN_MAX_COUNT: usize = 100;
+
+/// Maximum byte length of a single org-configured pattern string. Patterns
+/// exceeding this length are rejected after a warning.
+const ORG_PATTERN_MAX_LEN: usize = 1_000;
+
+/// Maximum compiled NFA size (bytes) allowed per org pattern.
+const ORG_PATTERN_SIZE_LIMIT: usize = 1_000_000;
+
+/// Maximum compiled DFA size (bytes) allowed per org pattern.
+const ORG_PATTERN_DFA_SIZE_LIMIT: usize = 1_000_000;
+
+/// Compile a single org pattern string with safety limits applied.
+/// Returns `None` and logs a warning if the pattern is rejected.
+fn compile_org_pattern(idx: usize, pattern_str: &str) -> Option<Regex> {
+    if pattern_str.len() > ORG_PATTERN_MAX_LEN {
+        tracing::warn!(
+            pattern_index = idx,
+            pattern_len = pattern_str.len(),
+            max_len = ORG_PATTERN_MAX_LEN,
+            "org pattern rejected: pattern string exceeds maximum length"
+        );
+        return None;
+    }
+
+    match regex::RegexBuilder::new(pattern_str)
+        .size_limit(ORG_PATTERN_SIZE_LIMIT)
+        .dfa_size_limit(ORG_PATTERN_DFA_SIZE_LIMIT)
+        .build()
+    {
+        Ok(re) => Some(re),
+        Err(err) => {
+            tracing::warn!(
+                pattern_index = idx,
+                error = %err,
+                "org pattern rejected: failed to compile (invalid regex or size limit exceeded)"
+            );
+            None
+        }
+    }
+}
+
 /// Scan body against org-configured regex patterns.
 pub fn org_pattern_scan(
     body: &[u8],
@@ -195,11 +240,22 @@ pub fn org_pattern_scan(
         return Vec::new();
     }
 
+    let capped = if org_patterns.len() > ORG_PATTERN_MAX_COUNT {
+        tracing::warn!(
+            supplied = org_patterns.len(),
+            max = ORG_PATTERN_MAX_COUNT,
+            "org patterns truncated: too many patterns supplied"
+        );
+        &org_patterns[..ORG_PATTERN_MAX_COUNT]
+    } else {
+        org_patterns
+    };
+
     let text = String::from_utf8_lossy(body);
     let mut out = Vec::new();
 
-    for (idx, pattern_str) in org_patterns.iter().enumerate() {
-        let Ok(regex) = regex::Regex::new(pattern_str) else {
+    for (idx, pattern_str) in capped.iter().enumerate() {
+        let Some(regex) = compile_org_pattern(idx, pattern_str) else {
             continue;
         };
 
@@ -225,11 +281,22 @@ pub struct CompiledOrgPatterns {
 
 impl CompiledOrgPatterns {
     pub fn compile(org_patterns: &[String]) -> Self {
-        let patterns = org_patterns
+        let capped = if org_patterns.len() > ORG_PATTERN_MAX_COUNT {
+            tracing::warn!(
+                supplied = org_patterns.len(),
+                max = ORG_PATTERN_MAX_COUNT,
+                "org patterns truncated: too many patterns supplied"
+            );
+            &org_patterns[..ORG_PATTERN_MAX_COUNT]
+        } else {
+            org_patterns
+        };
+
+        let patterns = capped
             .iter()
             .enumerate()
             .filter_map(|(idx, pattern_str)| {
-                Regex::new(pattern_str).ok().map(|re| (idx as u32, re))
+                compile_org_pattern(idx, pattern_str).map(|re| (idx as u32, re))
             })
             .collect();
         Self { patterns }

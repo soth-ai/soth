@@ -311,7 +311,13 @@ impl FormatReader for PlaybookReader {
     }
 
     fn last_cursor(&self) -> Option<Cursor> {
-        self.cursor.lock().unwrap().clone()
+        match self.cursor.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                tracing::warn!("PlaybookReader cursor mutex poisoned, recovering");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 }
 

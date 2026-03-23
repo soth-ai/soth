@@ -21,6 +21,7 @@ dirs.workspace = true
 ed25519-dalek.workspace = true
 hex = "0.4"
 hmac = "0.12"
+rand.workspace = true
 http = "1"
 rusqlite.workspace = true
 rustls.workspace = true

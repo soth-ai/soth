@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
+use rand::Rng;
 use serde::Deserialize;
 use soth_core::derive_proxy_signing_seed;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     pub mitm: MitmRuntimeConfig,
@@ -26,10 +27,32 @@ pub struct ProxyConfig {
     pub user_hmac_secret: String,
 }
 
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("mitm", &self.mitm)
+            .field("bundle", &self.bundle)
+            .field("telemetry", &self.telemetry)
+            .field("sync", &self.sync)
+            .field("classify", &self.classify)
+            .field("pipeline", &self.pipeline)
+            .field("db_path", &self.db_path)
+            .field("org_id", &self.org_id)
+            .field("team_id", &self.team_id)
+            .field("device_id_hash", &self.device_id_hash)
+            .field("user_hmac_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let logs_dir = home.join(".soth").join("logs");
+
+        let mut secret_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut secret_bytes);
+        let user_hmac_secret = hex::encode(secret_bytes);
 
         Self {
             mitm: MitmRuntimeConfig::default(),
@@ -42,7 +65,7 @@ impl Default for ProxyConfig {
             org_id: "local-org".to_string(),
             team_id: "local-team".to_string(),
             device_id_hash: "local-device".to_string(),
-            user_hmac_secret: "local-dev-secret".to_string(),
+            user_hmac_secret,
         }
     }
 }
@@ -442,7 +465,7 @@ impl ClassifyRuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct TelemetryPipelineConfig {
     pub enabled: bool,
@@ -452,6 +475,23 @@ pub struct TelemetryPipelineConfig {
     pub signing_key_hex: Option<String>,
     pub encryption: TelemetryEncryptionConfig,
     pub proxy_version: String,
+}
+
+impl std::fmt::Debug for TelemetryPipelineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryPipelineConfig")
+            .field("enabled", &self.enabled)
+            .field("batch_window_secs", &self.batch_window_secs)
+            .field("max_batch_size", &self.max_batch_size)
+            .field("anomaly_threshold", &self.anomaly_threshold)
+            .field(
+                "signing_key_hex",
+                &self.signing_key_hex.as_deref().map(|_| "[REDACTED]"),
+            )
+            .field("encryption", &self.encryption)
+            .field("proxy_version", &self.proxy_version)
+            .finish()
+    }
 }
 
 impl Default for TelemetryPipelineConfig {
@@ -522,7 +562,7 @@ impl Default for TelemetryEncryptionConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct SyncRuntimeConfig {
     pub enabled: bool,
@@ -548,6 +588,60 @@ pub struct SyncRuntimeConfig {
     pub body_upload_max_bytes: usize,
     pub telemetry_enabled: bool,
     pub telemetry_signing_key_hex: Option<String>,
+}
+
+impl std::fmt::Debug for SyncRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncRuntimeConfig")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &"[REDACTED]")
+            .field("cache_path", &self.cache_path)
+            .field("registry_cache_path", &self.registry_cache_path)
+            .field("agent_instance_id", &self.agent_instance_id)
+            .field("retry_queue_dir", &self.retry_queue_dir)
+            .field("retry_queue_max_bytes", &self.retry_queue_max_bytes)
+            .field("sync_interval_secs", &self.sync_interval_secs)
+            .field("batch_size", &self.batch_size)
+            .field("body_batch_size", &self.body_batch_size)
+            .field("body_upload_enabled", &self.body_upload_enabled)
+            .field(
+                "metadata_max_events_per_batch",
+                &self.metadata_max_events_per_batch,
+            )
+            .field(
+                "metadata_max_compressed_batch_bytes",
+                &self.metadata_max_compressed_batch_bytes,
+            )
+            .field("frontload_enabled", &self.frontload_enabled)
+            .field(
+                "frontload_max_events_per_batch",
+                &self.frontload_max_events_per_batch,
+            )
+            .field(
+                "frontload_max_compressed_batch_bytes",
+                &self.frontload_max_compressed_batch_bytes,
+            )
+            .field("frontload_hard_events_cap", &self.frontload_hard_events_cap)
+            .field(
+                "frontload_hard_compressed_cap_bytes",
+                &self.frontload_hard_compressed_cap_bytes,
+            )
+            .field(
+                "legacy_exchange_upload_enabled",
+                &self.legacy_exchange_upload_enabled,
+            )
+            .field("body_upload_max_bytes", &self.body_upload_max_bytes)
+            .field("telemetry_enabled", &self.telemetry_enabled)
+            .field(
+                "telemetry_signing_key_hex",
+                &self
+                    .telemetry_signing_key_hex
+                    .as_deref()
+                    .map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl Default for SyncRuntimeConfig {

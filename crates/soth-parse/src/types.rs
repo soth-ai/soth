@@ -200,12 +200,15 @@ pub struct DetectWarning {
     pub detail: String,
 }
 
+const MAX_ACCUMULATED_BYTES: usize = 2 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct StreamSession {
     pub connection_id: Uuid,
     pub capture_mode: CaptureMode,
     pub delta_buffer: Vec<String>,
     pub chunk_count: u64,
+    pub accumulated_bytes: usize,
     pub start_time: Instant,
     pub grpc_service: Option<String>,
     pub grpc_method: Option<String>,
@@ -259,6 +262,7 @@ impl StreamSession {
             capture_mode,
             delta_buffer: Vec::new(),
             chunk_count: 0,
+            accumulated_bytes: 0,
             start_time: Instant::now(),
             grpc_service: None,
             grpc_method: None,
@@ -276,7 +280,12 @@ impl StreamSession {
     }
 
     pub fn accumulate(&mut self, value: impl Into<String>) {
-        self.delta_buffer.push(value.into());
+        let s = value.into();
+        if self.accumulated_bytes + s.len() <= MAX_ACCUMULATED_BYTES {
+            self.accumulated_bytes += s.len();
+            self.delta_buffer.push(s);
+        }
+        // Always count chunks even if content is dropped
     }
 
     /// Called by soth-proxy after parsing the request to populate context.
