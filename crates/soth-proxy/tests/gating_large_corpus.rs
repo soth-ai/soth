@@ -14,13 +14,11 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use soth_bundle::{AssetEntry, BundleManifest, BundleScope, OrgSignedConfig};
-use soth_core::{
-    DecisionReason, GateDecision, GateOutcome, GatingBundle, HostRule, ProcessInfo, RequestHeaders,
-    Stage3Config,
-};
+use soth_core::{GatingBundle, HostRule, ProcessInfo, RequestHeaders, Stage3Config};
 use soth_proxy::config::{GateAction, PipelineConfig};
 use soth_proxy::gating::evaluator::{GateEvaluator, GateOverrides};
 use soth_proxy::gating::stage0_tls::HostMatcher;
+use soth_proxy::gating::{DecisionReason, GateDecision, GateOutcome};
 use soth_proxy::{db, ProxyHandler};
 
 #[derive(Serialize)]

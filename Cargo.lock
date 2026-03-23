@@ -3129,7 +3129,6 @@ dependencies = [
  "sha2",
  "soth-classify",
  "soth-core",
- "soth-detect",
  "soth-policy",
  "tempfile",
  "thiserror 1.0.69",

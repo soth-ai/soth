@@ -69,8 +69,15 @@ pub fn empty_heuristic_request(method: &str, path: &str) -> NormalizedRequest {
     }
 }
 
+/// The parse-layer detect result produced by `soth-detect`'s internal pipeline.
+///
+/// This is distinct from [`soth_core::DetectResult`], which is the
+/// serialisable, public-API type that crosses crate boundaries.  The internal
+/// type carries extra fields (e.g. `raw_body_bytes`, `DetectWarning` list)
+/// that are stripped or mapped when converting via
+/// `soth_detect::engine::to_core_detect_result`.
 #[derive(Clone, Debug)]
-pub struct DetectResult {
+pub struct ParseDetectResult {
     pub normalized: NormalizedRequest,
     pub artifacts: Vec<SensitiveArtifact>,
     pub capture_mode: CaptureMode,
@@ -93,7 +100,15 @@ pub struct DetectResult {
     pub import_categories: Vec<DetectedImportCategory>,
 }
 
-impl DetectResult {
+/// Backwards-compatibility alias.  New code should use [`ParseDetectResult`]
+/// to avoid confusion with [`soth_core::DetectResult`].
+#[deprecated(
+    since = "0.1.0",
+    note = "use `ParseDetectResult` to avoid confusion with `soth_core::DetectResult`"
+)]
+pub type DetectResult = ParseDetectResult;
+
+impl ParseDetectResult {
     pub fn filtered() -> Self {
         let normalized = NormalizedRequest {
             parse_confidence: ParseConfidence::Heuristic,

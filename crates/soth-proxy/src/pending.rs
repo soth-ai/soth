@@ -33,7 +33,7 @@ pub struct PendingCapture {
     pub request_host: String,
     pub request_path: String,
     pub request_body_bytes: usize,
-    pub outcome: soth_core::GateOutcome,
+    pub outcome: crate::gating::GateOutcome,
     pub detect_result: soth_core::DetectResult,
     pub proxy_ctx: soth_core::ProxyContext,
     pub raw_body: Option<Bytes>,

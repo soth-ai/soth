@@ -1,9 +1,10 @@
 // soth-parse internal types — part of soth-detect's public API.
 pub use soth_parse::types::{
     empty_heuristic_request, ArtifactLocation, ArtifactType, ChunkArtifact, CoreArtifactLocation,
-    DetectResult, DetectWarning, DetectedFormat, DetectedImportCategory, EndpointType, FormatMeta,
-    GqlOpType, HeaderMap, NormalizedRequest, ParseError, ParseResult, ParseSource, ParseWarning,
-    SensitiveArtifact, Severity, StreamSession, StreamSummary, StreamTurn, StreamUsage,
+    DetectWarning, DetectedFormat, DetectedImportCategory, EndpointType, FormatMeta, GqlOpType,
+    HeaderMap, NormalizedRequest, ParseDetectResult, ParseError, ParseResult, ParseSource,
+    ParseWarning, SensitiveArtifact, Severity, StreamSession, StreamSummary, StreamTurn,
+    StreamUsage,
 };
 
 // Transport types from soth-core — appear in soth-detect's public API signatures.

@@ -6,9 +6,11 @@ use soth_core::bundle::detect::DetectBundleSlice;
 use soth_core::bundle::entity_index::EntityIndex;
 use soth_core::bundle::env_index::EnvIndex;
 use soth_core::{
-    AppType, CaptureMode, DecisionReason, GateDecision, GateOutcome, GateStage, GatingBundle,
-    NonCatalogedAction, ProcessAction, ProcessInfo, TrafficClassification, UnknownAppAction,
+    AppType, CaptureMode, GateStage, GatingBundle, NonCatalogedAction, ProcessAction, ProcessInfo,
+    TrafficClassification, UnknownAppAction,
 };
+
+use crate::gating::types::{DecisionReason, GateDecision, GateOutcome};
 
 use crate::gating::stage0_tls::{normalize_sni, HostMatcher};
 use crate::gating::stage1_app_origin::IdentityMatch;

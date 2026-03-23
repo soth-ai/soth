@@ -270,10 +270,10 @@ impl ProxyHandler {
             &outcome,
         );
         if self.pipeline_config.non_cataloged_host_action == Some(crate::config::GateAction::Block)
-            && matches!(outcome.reason, soth_core::DecisionReason::NotInCatalog)
+            && matches!(outcome.reason, crate::gating::DecisionReason::NotInCatalog)
             && matches!(
                 outcome.decision,
-                soth_core::GateDecision::Skip | soth_core::GateDecision::Passthrough
+                crate::gating::GateDecision::Skip | crate::gating::GateDecision::Passthrough
             )
         {
             crate::trace::handler_decision(
@@ -288,18 +288,18 @@ impl ProxyHandler {
         }
 
         match &outcome.decision {
-            soth_core::GateDecision::Skip | soth_core::GateDecision::Passthrough => {
+            crate::gating::GateDecision::Skip | crate::gating::GateDecision::Passthrough => {
                 crate::trace::handler_decision(connection_id, "allow", "gate skip/passthrough");
                 return soth_mitm::HandlerDecision::Allow;
             }
-            soth_core::GateDecision::Block { status, message } => {
+            crate::gating::GateDecision::Block { status, message } => {
                 crate::trace::handler_decision(connection_id, "block", "gate block");
                 return soth_mitm::HandlerDecision::Block {
                     status: *status,
                     body: Bytes::from(message.clone()),
                 };
             }
-            soth_core::GateDecision::Intercept => {}
+            crate::gating::GateDecision::Intercept => {}
         }
 
         let entity_index = self.entity_index.load();
@@ -1016,7 +1016,7 @@ impl soth_mitm::InterceptHandler for ProxyHandler {
     ) -> bool {
         let decision = self.gate_evaluator.load().evaluate_tls(host);
         crate::trace::tls_gate(host, &decision);
-        matches!(decision, soth_core::GateDecision::Intercept)
+        matches!(decision, crate::gating::GateDecision::Intercept)
     }
 
     fn on_request(
@@ -1147,7 +1147,7 @@ fn build_user_id_hmac(meta: &soth_core::ConnectionMeta, secret: &[u8]) -> String
 }
 
 fn process_resolution_from_outcome(
-    outcome: &soth_core::GateOutcome,
+    outcome: &crate::gating::GateOutcome,
     process_info: Option<&soth_core::ProcessInfo>,
     entity_index: Option<&soth_core::EntityIndex>,
 ) -> soth_core::ProcessResolution {

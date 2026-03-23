@@ -1,5 +1,5 @@
 use crate::code::{self, detect_code_artifacts};
-use crate::fingerprint::fingerprint;
+use crate::fingerprint_mod::fingerprint;
 use crate::graphql::{parse_graphql, ApqStore};
 use crate::grpc::parse_grpc;
 use crate::hash::canonical_hash;
@@ -14,9 +14,9 @@ use crate::sensitive::{
     credential_scan, org_pattern_scan_compiled, structural_scan, CompiledOrgPatterns,
 };
 use crate::types::{
-    ArtifactLocation, CaptureMode, DetectBundleSlice, DetectResult, DetectWarning, DetectedFormat,
-    DetectedImportCategory, FormatMeta, NormalizedRequest, ParseSource, ParseWarning,
-    ProviderEntry, RawRequest,
+    ArtifactLocation, CaptureMode, DetectBundleSlice, DetectWarning, DetectedFormat,
+    DetectedImportCategory, FormatMeta, NormalizedRequest, ParseDetectResult, ParseSource,
+    ParseWarning, ProviderEntry, RawRequest,
 };
 use lru::LruCache;
 use serde_json::Value as JsonValue;
@@ -368,11 +368,11 @@ fn process_inner(
     apq_store: &dyn ApqStore,
     compiled_org: &CompiledOrgPatterns,
     snapshot: &soth_core::SessionSnapshot,
-) -> DetectResult {
+) -> ParseDetectResult {
     let started = Instant::now();
 
     if bundle.filters.matches(&req.path, &req.headers) {
-        let mut out = DetectResult::filtered();
+        let mut out = ParseDetectResult::filtered();
         out.detect_latency_us = started.elapsed().as_micros() as u64;
         return out;
     }
@@ -430,8 +430,8 @@ fn process_inner(
 
     let confidence = normalized.parse_confidence;
 
-    // Phase 4: Assemble DetectResult
-    DetectResult {
+    // Phase 4: Assemble ParseDetectResult
+    ParseDetectResult {
         normalized,
         artifacts,
         capture_mode,
@@ -999,10 +999,10 @@ fn parse_warning_to_detect_warning(warning: &ParseWarning) -> DetectWarning {
 }
 
 // ---------------------------------------------------------------------------
-// Conversion from internal DetectResult to soth_core::DetectResult
+// Conversion from internal ParseDetectResult to soth_core::DetectResult
 // ---------------------------------------------------------------------------
 
-pub fn to_core_detect_result(value: &DetectResult) -> soth_core::DetectResult {
+pub fn to_core_detect_result(value: &ParseDetectResult) -> soth_core::DetectResult {
     soth_core::DetectResult {
         normalized: value.normalized.clone(),
         artifacts: value.artifacts.clone(),
@@ -1032,7 +1032,7 @@ fn map_detect_warning(value: &DetectWarning) -> ParseWarning {
 }
 
 #[cfg(feature = "intelligence")]
-fn emit_intelligence(req: &RawRequest, result: &DetectResult, sink: &dyn IntelligenceSink) {
+fn emit_intelligence(req: &RawRequest, result: &ParseDetectResult, sink: &dyn IntelligenceSink) {
     let parse_event = build_parse_quality_record(req, result);
     let parse_event_id = sink.record_parse_event(&parse_event).ok();
 

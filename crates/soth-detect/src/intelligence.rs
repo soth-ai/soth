@@ -1,6 +1,7 @@
 use crate::sensitive::redact_sensitive_bytes;
 use crate::types::{
-    DetectResult, DetectWarning, FormatMeta, HeaderMap, ParseConfidence, ParseSource, RawRequest,
+    DetectWarning, FormatMeta, HeaderMap, ParseConfidence, ParseDetectResult, ParseSource,
+    RawRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -187,7 +188,10 @@ pub trait IntelligenceSink: Send + Sync {
     ) -> IntelligenceResult<()>;
 }
 
-pub fn build_parse_quality_record(req: &RawRequest, result: &DetectResult) -> ParseQualityRecord {
+pub fn build_parse_quality_record(
+    req: &RawRequest,
+    result: &ParseDetectResult,
+) -> ParseQualityRecord {
     let created_at = now_epoch_secs();
     let host = extract_host(req);
     let headers_json = serde_json::to_string(&req.headers).unwrap_or_else(|_| "{}".to_string());
@@ -227,7 +231,7 @@ pub fn build_parse_quality_record(req: &RawRequest, result: &DetectResult) -> Pa
 
 pub fn extract_unknown_graphql_operation_record(
     req: &RawRequest,
-    result: &DetectResult,
+    result: &ParseDetectResult,
     parse_event_id: Option<i64>,
 ) -> Option<UnknownGraphQLOperationRecord> {
     let has_unknown_warning = result

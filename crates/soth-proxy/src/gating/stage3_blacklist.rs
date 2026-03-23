@@ -1,4 +1,6 @@
-use soth_core::{BlacklistMatchType, DecisionReason, Stage3Config};
+use soth_core::{BlacklistMatchType, Stage3Config};
+
+use crate::gating::types::DecisionReason;
 
 pub fn evaluate(cfg: &Stage3Config, host: &str, path: &str, body: &[u8]) -> Option<DecisionReason> {
     if matches!(cfg.match_type, BlacklistMatchType::CaseInsensitiveSubstring) {
@@ -53,8 +55,10 @@ fn extract_graphql_operation_name(body: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use soth_core::{BlacklistMatchType, Stage3Config};
+
     use super::evaluate;
-    use soth_core::{BlacklistMatchType, DecisionReason, Stage3Config};
+    use crate::gating::types::DecisionReason;
 
     fn stage3() -> Stage3Config {
         Stage3Config {
