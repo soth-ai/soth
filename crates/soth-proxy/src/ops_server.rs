@@ -82,11 +82,48 @@ async fn metrics(State(state): State<Arc<OpsState>>) -> impl IntoResponse {
         writeln!(out, "{prom_name} {value}").ok();
     }
 
+    // Latency histograms
+    write_histogram(
+        &mut out,
+        "soth_detect_latency_seconds",
+        &crate::heartbeat_telemetry::detect_latency_snapshot(),
+    );
+    write_histogram(
+        &mut out,
+        "soth_classify_latency_seconds",
+        &crate::heartbeat_telemetry::classify_latency_snapshot(),
+    );
+
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         out,
     )
+}
+
+/// Write a single Prometheus histogram in text exposition format.
+///
+/// Bucket counts in the snapshot are per-bucket (not cumulative); this
+/// function accumulates them before writing so the output is spec-compliant.
+fn write_histogram(
+    out: &mut String,
+    name: &str,
+    snap: &crate::heartbeat_telemetry::HistogramSnapshot,
+) {
+    writeln!(out, "# HELP {name} Latency histogram").ok();
+    writeln!(out, "# TYPE {name} histogram").ok();
+    let mut cumulative: u64 = 0;
+    for (i, boundary) in snap.boundaries.iter().enumerate() {
+        cumulative += snap.bucket_counts[i];
+        // Convert microsecond boundary to seconds for Prometheus.
+        let le = *boundary as f64 / 1_000_000.0;
+        writeln!(out, "{name}_bucket{{le=\"{le}\"}} {cumulative}").ok();
+    }
+    // Overflow bucket (+Inf) includes every observation.
+    cumulative += snap.bucket_counts[snap.boundaries.len()];
+    writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cumulative}").ok();
+    writeln!(out, "{name}_sum {}", snap.sum_seconds).ok();
+    writeln!(out, "{name}_count {}", snap.count).ok();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -231,6 +268,49 @@ mod tests {
         assert!(
             text.contains("edge_blacklist_keyword_dropped_total"),
             "missing heartbeat counter"
+        );
+        assert!(
+            text.contains("soth_detect_latency_seconds_bucket"),
+            "missing detect latency histogram"
+        );
+        assert!(
+            text.contains("soth_classify_latency_seconds_bucket"),
+            "missing classify latency histogram"
+        );
+        assert!(
+            text.contains("le=\"+Inf\""),
+            "histogram missing +Inf bucket"
+        );
+    }
+
+    #[test]
+    fn write_histogram_produces_cumulative_buckets() {
+        use crate::heartbeat_telemetry::{AtomicHistogram, LATENCY_BOUNDARIES_US};
+
+        let h = AtomicHistogram::new(LATENCY_BOUNDARIES_US);
+        // Record one observation in each of the first two buckets.
+        h.record_us(50); // bucket 0 (<100 µs)
+        h.record_us(200); // bucket 1 (<500 µs)
+        h.record_us(20_000_000); // overflow
+        let snap = h.snapshot();
+
+        let mut out = String::new();
+        super::write_histogram(&mut out, "test_hist", &snap);
+
+        // The +Inf bucket must equal total count (3).
+        assert!(
+            out.contains("test_hist_bucket{le=\"+Inf\"} 3"),
+            "unexpected +Inf count in:\n{out}"
+        );
+        // _count must equal 3.
+        assert!(
+            out.contains("test_hist_count 3"),
+            "unexpected count in:\n{out}"
+        );
+        // _sum should be positive.
+        assert!(
+            out.contains("test_hist_sum "),
+            "missing sum line in:\n{out}"
         );
     }
 }

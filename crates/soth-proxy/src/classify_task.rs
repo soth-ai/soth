@@ -2,7 +2,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
@@ -305,6 +305,7 @@ pub fn spawn_classify_task(
                 let classify_bundle_for_classify = classify_bundle.clone();
                 let classify_config_for_classify = classify_config.clone();
 
+                let classify_start = Instant::now();
                 match tokio::task::spawn_blocking(move || {
                     soth_classify::classify(
                         &detect_for_classify,
@@ -316,7 +317,12 @@ pub fn spawn_classify_task(
                 })
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        crate::heartbeat_telemetry::record_classify_latency_us(
+                            classify_start.elapsed().as_micros() as u64,
+                        );
+                        result
+                    }
                     Err(error) => {
                         warn!(
                             connection_id = %connection_id,
@@ -394,6 +400,7 @@ pub fn spawn_classify_task(
             let classify_bundle_for_classify = classify_bundle.clone();
             let classify_config_for_classify = classify_config.clone();
 
+            let classify_start = Instant::now();
             match tokio::task::spawn_blocking(move || {
                 soth_classify::classify(
                     &detect_for_classify,
@@ -405,7 +412,12 @@ pub fn spawn_classify_task(
             })
             .await
             {
-                Ok(result) => result,
+                Ok(result) => {
+                    crate::heartbeat_telemetry::record_classify_latency_us(
+                        classify_start.elapsed().as_micros() as u64,
+                    );
+                    result
+                }
                 Err(error) => {
                     warn!(
                         connection_id = %connection_id,

@@ -3,6 +3,7 @@ use crate::api_types::{
     HeartbeatHostDetails, HeartbeatRegistryDetails, HeartbeatRequest, HeartbeatTelemetry,
 };
 use crate::cache;
+use crate::circuit_breaker::CircuitBreaker;
 use crate::config::TelemetrySyncConfig;
 use crate::config_puller::ConfigPuller;
 use crate::db::{
@@ -123,6 +124,7 @@ pub struct SyncAgent {
     adaptive_batch_state: Mutex<AdaptiveBatchState>,
     telemetry_runtime: tokio::sync::Mutex<Option<TelemetrySyncRuntime>>,
     shutdown_requested: AtomicBool,
+    heartbeat_circuit: CircuitBreaker,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -408,6 +410,7 @@ impl SyncAgent {
             adaptive_batch_state,
             telemetry_runtime: tokio::sync::Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
+            heartbeat_circuit: CircuitBreaker::new(5, 30_000, 3),
         })
     }
 
@@ -603,6 +606,14 @@ impl SyncAgent {
     }
 
     pub async fn send_heartbeat(&self) -> anyhow::Result<bool> {
+        if !self.heartbeat_circuit.allow_request() {
+            tracing::debug!(
+                state = self.heartbeat_circuit.state_label(),
+                "heartbeat circuit breaker open, skipping"
+            );
+            return Ok(false);
+        }
+
         let config_version = self.cached_config_version();
         let registry = self.collect_registry_heartbeat_details();
         let telemetry = self.compose_heartbeat_telemetry(registry.as_ref());
@@ -626,6 +637,7 @@ impl SyncAgent {
 
         match self.heartbeat_sender.send(&request).await {
             Ok(Some(response)) => {
+                self.heartbeat_circuit.record_success();
                 if response.config_changed {
                     let puller = match self.config_puller.lock() {
                         Ok(guard) => guard.clone(),
@@ -645,8 +657,13 @@ impl SyncAgent {
                 }
                 Ok(true)
             }
-            Ok(None) => Ok(false),
+            Ok(None) => {
+                // Server responded but rejected the heartbeat (non-2xx).
+                self.heartbeat_circuit.record_failure();
+                Ok(false)
+            }
             Err(error) => {
+                self.heartbeat_circuit.record_failure();
                 self.set_sync_error(&format!("heartbeat_error: {error}"))?;
                 Err(error)
             }

@@ -17,6 +17,7 @@ pub mod agent;
 pub mod api_types;
 pub mod body_uploader;
 pub mod cache;
+pub mod circuit_breaker;
 pub mod config;
 pub mod config_puller;
 pub mod db;

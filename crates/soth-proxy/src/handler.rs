@@ -424,6 +424,7 @@ impl ProxyHandler {
             truncated_body_sizes,
             &detect_result,
         );
+        crate::heartbeat_telemetry::record_detect_latency_us(detect_result.detect_latency_us);
         crate::trace::dev_verify_request(
             connection_id,
             req.method.as_str(),

@@ -3369,6 +3369,7 @@ dependencies = [
  "hmac",
  "http",
  "libc",
+ "once_cell",
  "rand 0.8.5",
  "rusqlite",
  "rustls",

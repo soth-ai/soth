@@ -4,9 +4,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use soth_core::{derive_proxy_signing_seed, ClassificationFlag, TelemetryPolicyKind};
 use soth_telemetry::{SignedBatch, TransmittedBatch};
 use std::collections::HashMap;
+use std::sync::Arc;
 use zeroize::Zeroizing;
 
 use crate::api_types::{TelemetryBatchRequest, TelemetryEvent};
+use crate::circuit_breaker::CircuitBreaker;
 use crate::http_client::SothHttpClient;
 
 #[derive(Debug, Clone)]
@@ -16,12 +18,19 @@ pub enum TelemetrySendOutcome {
     NonRetryable { reason: String },
 }
 
+/// Defaults used when no explicit circuit-breaker config is provided.
+const DEFAULT_CB_FAILURE_THRESHOLD: u32 = 5;
+const DEFAULT_CB_OPEN_DURATION_MS: u64 = 30_000; // 30 s
+const DEFAULT_CB_SUCCESS_THRESHOLD: u32 = 3;
+
 #[derive(Clone)]
 pub struct TelemetrySender {
     cloud: SothHttpClient,
     endpoint_path: String,
     device_id_hash: String,
     signing_key: SigningKey,
+    /// Shared across clones so all copies of a sender observe the same breaker state.
+    circuit: Arc<CircuitBreaker>,
 }
 
 impl TelemetrySender {
@@ -45,13 +54,30 @@ impl TelemetrySender {
             endpoint_path,
             device_id_hash,
             signing_key,
+            circuit: Arc::new(CircuitBreaker::new(
+                DEFAULT_CB_FAILURE_THRESHOLD,
+                DEFAULT_CB_OPEN_DURATION_MS,
+                DEFAULT_CB_SUCCESS_THRESHOLD,
+            )),
         })
     }
 
     pub async fn send_batch(&self, batch: &TransmittedBatch) -> TelemetrySendOutcome {
+        if !self.circuit.allow_request() {
+            tracing::debug!(
+                state = self.circuit.state_label(),
+                "telemetry circuit breaker open, skipping batch send"
+            );
+            return TelemetrySendOutcome::Retryable {
+                reason: "telemetry circuit breaker open".to_string(),
+            };
+        }
+
         let request = match self.batch_to_request(batch) {
             Ok(request) => request,
             Err(error) => {
+                // Serialization / key errors are non-retryable and should not
+                // count as network failures against the circuit breaker.
                 return TelemetrySendOutcome::NonRetryable {
                     reason: error.to_string(),
                 };
@@ -70,12 +96,17 @@ impl TelemetrySender {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
+                    self.circuit.record_success();
                     TelemetrySendOutcome::Sent
                 } else if is_retryable_status(status) {
+                    self.circuit.record_failure();
                     TelemetrySendOutcome::Retryable {
                         reason: format!("telemetry batch rejected with status {}", status.as_u16()),
                     }
                 } else {
+                    // Non-retryable HTTP errors (4xx auth/validation) should not
+                    // penalise the circuit breaker — they indicate a protocol or
+                    // configuration problem rather than an infra outage.
                     TelemetrySendOutcome::NonRetryable {
                         reason: format!("telemetry batch rejected with status {}", status.as_u16()),
                     }
@@ -84,6 +115,7 @@ impl TelemetrySender {
             Err(error) => {
                 if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
                 {
+                    self.circuit.record_failure();
                     TelemetrySendOutcome::Retryable {
                         reason: error.to_string(),
                     }
