@@ -35,6 +35,9 @@ struct SessionEntry {
     request_timestamps_ms: Vec<i64>,
     credential_timestamps_ms: Vec<i64>,
     last_active: Instant,
+    /// Running centroid of per-request embeddings, updated as a weighted average.
+    /// Used by stage5_anomaly to detect topic drift across requests in a session.
+    embedding_centroid: Option<Vec<f32>>,
 }
 
 /// Result of session creation/lookup, carrying both the deterministic
@@ -133,6 +136,7 @@ impl SessionManager {
                 request_timestamps_ms: Vec::new(),
                 credential_timestamps_ms: Vec::new(),
                 last_active: Instant::now(),
+                embedding_centroid: None,
             }
         });
 
@@ -270,6 +274,24 @@ impl SessionManager {
         s.anomaly_baseline.avg_tokens_per_request = s.stats.total_tokens as f32 / count;
         s.anomaly_baseline.avg_requests_per_hour = requests_per_hour;
         s.last_activity = current_ts;
+
+        // Update running embedding centroid for topic-drift detection.
+        // Uses an incremental weighted average: c_n = (c_{n-1} * (n-1) + e) / n
+        // where n is the request count after increment.
+        if let Some(ref embedding) = result.embedding {
+            match &mut entry.embedding_centroid {
+                Some(centroid) if centroid.len() == embedding.len() => {
+                    let n = count; // already request_count.max(1) as f32
+                    for (c, e) in centroid.iter_mut().zip(embedding.iter()) {
+                        *c = (*c * (n - 1.0) + e) / n;
+                    }
+                }
+                _ => {
+                    // First embedding for this session, or dimension mismatch — seed the centroid.
+                    entry.embedding_centroid = Some(embedding.clone());
+                }
+            }
+        }
     }
 
     /// Apply response usage (output tokens + cost) via connection_id.
@@ -362,7 +384,7 @@ impl SessionManager {
             total_tokens: session.stats.total_tokens,
             total_cost_usd: session.stats.total_cost_usd,
             credential_alerts: session.stats.credential_alerts,
-            embedding_centroid: None,
+            embedding_centroid: entry.embedding_centroid.clone(),
             prior_semantic_hashes: Vec::new(),
             last_model: None,
             current_request_timestamp: session.last_activity,

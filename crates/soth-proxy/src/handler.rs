@@ -444,9 +444,12 @@ impl ProxyHandler {
             // Prefer parsed content (system prompt + user message) over raw body.
             // Raw body includes JSON structure, API params, temperature, etc. that
             // would pollute the embedding vector.
+            // Both paths are capped at MAX_EMBEDDING_INPUT_BYTES so the tokenizer
+            // never scans more than ~1 000 tokens before truncating to 128.
             _ => detect_result
                 .user_prompt
                 .clone()
+                .map(truncate_for_embedding)
                 .or_else(|| extract_content_for_embedding(&req.body)),
         };
 
@@ -795,12 +798,26 @@ impl ProxyHandler {
                     Arc::clone(&pending.detect_result)
                 };
 
+                // The WebSocket upgrade request has an empty body (HTTP GET),
+                // so deferred.content_for_embedding is None. Use the first
+                // frame's payload as embedding content instead — it typically
+                // contains `response.create` JSON with the model and system
+                // instructions, which is exactly what we want to embed.
+                let first_frame_text = if !chunk.payload.is_empty() {
+                    std::str::from_utf8(&chunk.payload)
+                        .ok()
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+                let content_for_embedding = first_frame_text.or(deferred.content_for_embedding);
+
                 let policy_block_enforced = Arc::new(AtomicBool::new(false));
                 let _block_rx =
                     classify_task::spawn_classify_task(classify_task::ClassifyTaskInput {
                         connection_id: pending.connection_id,
                         detect_result: refreshed_detect,
-                        content_for_embedding: deferred.content_for_embedding,
+                        content_for_embedding,
                         proxy_ctx: Arc::clone(&pending.proxy_ctx),
                         capture_mode: pending.outcome.capture_mode,
                         matched_provider: pending.outcome.matched_provider.clone(),
@@ -1120,10 +1137,29 @@ fn extract_host(header_host: Option<&str>, path: &str) -> String {
     "unknown".to_string()
 }
 
+/// Maximum byte length of text fed into the embedding pipeline.
+/// 4096 bytes is ~1 000 tokens at average English density, comfortably
+/// above the 128-token tokenizer window while preventing the tokenizer
+/// from scanning multi-megabyte bodies before truncating.  Kept at 1 MB
+/// so agentic coding prompts (full repo context, multi-file pastes) are
+/// not truncated — the tokenizer handles its own efficient truncation.
+const MAX_EMBEDDING_INPUT_BYTES: usize = 1024 * 1024;
+
 fn extract_content_for_embedding(body: &Bytes) -> Option<String> {
-    std::str::from_utf8(body.as_ref())
-        .ok()
-        .map(std::string::ToString::to_string)
+    let text = std::str::from_utf8(body.as_ref()).ok()?;
+    if text.len() > MAX_EMBEDDING_INPUT_BYTES {
+        Some(text[..MAX_EMBEDDING_INPUT_BYTES].to_string())
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn truncate_for_embedding(text: String) -> String {
+    if text.len() > MAX_EMBEDDING_INPUT_BYTES {
+        text[..MAX_EMBEDDING_INPUT_BYTES].to_string()
+    } else {
+        text
+    }
 }
 
 fn sha256_hex(input: &[u8]) -> String {
