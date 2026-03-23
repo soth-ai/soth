@@ -1,4 +1,5 @@
 #![allow(clippy::all)]
+#![cfg(feature = "policy")]
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};

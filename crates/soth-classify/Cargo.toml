@@ -7,9 +7,13 @@ license = "Apache-2.0"
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+policy = ["dep:soth-policy"]
+
 [dependencies]
 soth-core = { workspace = true }
-soth-policy = { workspace = true }
+soth-policy = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

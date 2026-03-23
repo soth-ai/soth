@@ -3379,23 +3379,15 @@ dependencies = [
  "soth-mitm",
  "soth-parse",
  "soth-policy",
- "soth-sqlite-vec",
  "soth-sync",
  "soth-telemetry",
+ "sqlite-vec",
  "thiserror 1.0.69",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "soth-sqlite-vec"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "sqlite-vec",
 ]
 
 [[package]]

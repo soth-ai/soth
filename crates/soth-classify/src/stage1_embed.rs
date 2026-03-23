@@ -267,24 +267,10 @@ mod tests {
 
     fn test_bundle() -> ClassifyBundle {
         use crate::fallback::{KeywordClassifier, StaticAnomalyScorer};
-        use soth_policy::sync_policy::{
-            BudgetLimits, CompiledRuleSet, OrgPatterns, PolicyBundle, PolicyBundleMetadata,
-        };
         ClassifyBundle {
             classifier: Arc::new(KeywordClassifier),
             anomaly_scorer: Arc::new(StaticAnomalyScorer),
-            policy_bundle: Arc::new(PolicyBundle {
-                metadata: PolicyBundleMetadata {
-                    bundle_version: "test".to_string(),
-                    schema_version: "1".to_string(),
-                    org_id: "test".to_string(),
-                    signed_at: 0,
-                },
-                system_rules: Arc::new(CompiledRuleSet::default()),
-                org_rules: Arc::new(CompiledRuleSet::default()),
-                org_patterns: Arc::new(OrgPatterns::default()),
-                budget_limits: BudgetLimits::default(),
-            }),
+            policy_bundle: Arc::new(crate::bundle::build_fallback_policy_bundle_ref()),
             embedding_onnx: Some(Arc::new(b"model-v1".to_vec())),
             tokenizer_json: Some(Arc::new(b"{\"type\":\"bpe\"}".to_vec())),
             use_case_mlp: None,

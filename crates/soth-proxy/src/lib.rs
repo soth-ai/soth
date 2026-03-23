@@ -1,4 +1,7 @@
-#![forbid(unsafe_code)]
+// unsafe_code is denied crate-wide; the single exception is sqlite_vec, which
+// must call sqlite3_auto_extension via FFI. deny (not forbid) is used so that
+// the per-module allow override on sqlite_vec is permitted.
+#![deny(unsafe_code)]
 
 pub mod classify_task;
 pub mod config;
@@ -12,6 +15,8 @@ pub mod pending_emit;
 pub mod response;
 pub mod search;
 pub mod session;
+#[allow(unsafe_code)]
+pub mod sqlite_vec;
 pub mod streaming;
 mod trace;
 

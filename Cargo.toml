@@ -5,7 +5,6 @@ members = [
     "crates/soth-core",
     "crates/soth-bundle",
     "crates/soth-classify",
-    "crates/soth-sqlite-vec",
     "crates/soth-proxy",
     "crates/soth-telemetry",
     "crates/soth-policy",
@@ -41,7 +40,6 @@ authors = ["Labterminal"]
 soth-core = { path = "crates/soth-core" }
 soth-bundle = { path = "crates/soth-bundle" }
 soth-classify = { path = "crates/soth-classify" }
-soth-sqlite-vec = { path = "crates/soth-sqlite-vec" }
 soth-proxy = { path = "crates/soth-proxy" }
 soth-telemetry = { path = "crates/soth-telemetry" }
 soth-policy = { path = "crates/soth-policy" }

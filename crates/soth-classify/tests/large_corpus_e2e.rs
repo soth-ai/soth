@@ -1,3 +1,4 @@
+#![cfg(feature = "policy")]
 mod common;
 
 use std::sync::Arc;

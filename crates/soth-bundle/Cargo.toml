@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 soth-core = { workspace = true }
-soth-classify = { workspace = true }
+soth-classify = { workspace = true, features = ["policy"] }
 soth-policy = { workspace = true }
 
 serde = { workspace = true }

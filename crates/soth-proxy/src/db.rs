@@ -105,7 +105,7 @@ const REQUIRED_INTERCEPT_COLUMNS: &[(&str, &str)] = &[
 ];
 
 pub fn open(db_path: &Path) -> Result<rusqlite::Connection> {
-    soth_sqlite_vec::register_auto_extension();
+    crate::sqlite_vec::register_auto_extension();
 
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
