@@ -42,7 +42,7 @@ pub fn parse_rest(
     }
 
     let system_prompt = extract_system_prompt(&json, desc);
-    let user_content = first_user_content(&messages).unwrap_or_default();
+    let user_content = last_user_content(&messages).unwrap_or_default();
 
     let conversation = messages
         .iter()
@@ -371,12 +371,22 @@ fn extract_messages(json: &Value, desc: &RestFormatDescriptor) -> Vec<(String, S
     out
 }
 
-fn first_user_content(messages: &[(String, String)]) -> Option<String> {
+/// Return the content of the last user-role message in a conversation.
+///
+/// For multi-turn agentic conversations (e.g. Claude Code requests that carry
+/// hundreds of tokens of prior history) the last user message is the actual
+/// current task instruction.  The first user message is often context setup or
+/// a short greeting and would produce a misleading embedding.
+///
+/// Falls back to the last message of any role when no explicit "user" turn is
+/// found (single-message formats with no role tag).
+fn last_user_content(messages: &[(String, String)]) -> Option<String> {
     messages
         .iter()
+        .rev()
         .find(|(role, _)| role.eq_ignore_ascii_case("user"))
         .map(|(_, content)| content.clone())
-        .or_else(|| messages.first().map(|(_, content)| content.clone()))
+        .or_else(|| messages.last().map(|(_, content)| content.clone()))
 }
 
 fn extract_messages_fallback(json: &Value) -> Vec<(String, String)> {

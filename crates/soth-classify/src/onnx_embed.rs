@@ -3,14 +3,19 @@ use std::sync::Mutex;
 use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::tokenizer::TruncationDirection;
-use tokenizers::Tokenizer;
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
 
-/// Maximum token sequence length for the ONNX embedding model. Inputs
-/// longer than this are truncated from the right. Must match the
-/// `max_length` declared in the tokenizer config (currently 128); the
-/// tokenizer pads to this value regardless of what the constant says,
-/// so keeping them in sync avoids wasted processing on phantom tokens.
-const TOKENIZER_MAX_LENGTH: usize = 128;
+/// Maximum token sequence length for the ONNX embedding model.
+///
+/// MiniLM-L6-v2 was trained with a 256-token context window.  The tokenizer
+/// JSON bundled from HuggingFace ships with `max_length: 128` as a
+/// conservative default; we override both truncation and padding in code so
+/// that the full 256-token window is used regardless of what the JSON config
+/// says.  Longer inputs are truncated from the LEFT (keeping the LAST 256
+/// tokens) because for agentic coding prompts the user's actual instruction
+/// is at the end, while pasted context/code is at the beginning.  Shorter
+/// inputs are right-padded to exactly 256 tokens for fixed-size tensors.
+const TOKENIZER_MAX_LENGTH: usize = 256;
 
 pub(crate) struct OnnxEmbeddingRuntime {
     session: Mutex<Session>,
@@ -19,8 +24,26 @@ pub(crate) struct OnnxEmbeddingRuntime {
 
 impl OnnxEmbeddingRuntime {
     pub(crate) fn new(model_bytes: &[u8], tokenizer_json: &[u8]) -> Result<Self, String> {
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_bytes(tokenizer_json).map_err(|error| format!("tokenizer: {error}"))?;
+
+        // Override any max_length baked into tokenizer.json.  The bundled file
+        // ships with max_length=128; we want the full 256-token MiniLM window.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: TOKENIZER_MAX_LENGTH,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+                direction: TruncationDirection::Left,
+            }))
+            .map_err(|error| format!("tokenizer truncation: {error}"))?;
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::Fixed(TOKENIZER_MAX_LENGTH),
+            pad_id: 0,
+            pad_token: "[PAD]".to_string(),
+            ..Default::default()
+        }));
+
         let session = Session::builder()
             .map_err(|error| format!("ort builder: {error}"))?
             .with_intra_threads(1)
@@ -40,7 +63,9 @@ impl OnnxEmbeddingRuntime {
             .tokenizer
             .encode(text, true)
             .map_err(|error| format!("tokenize: {error}"))?;
-        encoding.truncate(TOKENIZER_MAX_LENGTH, 0, TruncationDirection::Right);
+        // Defensive guard — tokenizer-level truncation (Left, set in new()) already
+        // caps to TOKENIZER_MAX_LENGTH, but re-apply here as a safety net.
+        encoding.truncate(TOKENIZER_MAX_LENGTH, 0, TruncationDirection::Left);
 
         let input_ids = encoding
             .get_ids()
