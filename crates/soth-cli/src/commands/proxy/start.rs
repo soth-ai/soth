@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 const LISTENER_STARTUP_TIMEOUT_SECS: u64 = 20;
 const LISTENER_HEALTH_CHECK_INTERVAL_MS: u64 = 1_000;
-const LISTENER_HEALTH_FAILURE_WINDOW_MS: u64 = 30_000;
+/// How long the listener can be unresponsive before the supervisor kills and
+/// restarts the proxy.  Kept short (5s) so laptop sleep/wake recovery is fast.
+const LISTENER_HEALTH_FAILURE_WINDOW_MS: u64 = 5_000;
 const MAX_RESTART_ATTEMPTS: u32 = 10;
 const RESTART_BACKOFF_BASE_MS: u64 = 1_000;
 const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
@@ -368,7 +370,7 @@ async fn monitor_listener_health(port: u16) -> Result<()> {
         let started_at = unhealthy_since.get_or_insert(now);
         let elapsed = now.duration_since(*started_at);
 
-        if !warned && elapsed >= Duration::from_secs(5) {
+        if !warned && elapsed >= Duration::from_secs(2) {
             warn!(
                 port,
                 elapsed_ms = elapsed.as_millis() as u64,
