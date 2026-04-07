@@ -263,7 +263,7 @@ impl Default for MitmRuntimeConfig {
             h2_header_stage_timeout_ms: 120_000,
             h2_body_idle_timeout_ms: 60_000,
             h2_response_overflow_mode: H2ResponseOverflowModeConfig::TruncateContinue,
-            upstream_connect_timeout_ms: 10_000,
+            upstream_connect_timeout_ms: 5_000,
             upstream_retry_on_failure: false,
             upstream_retry_delay_ms: 200,
             verify_upstream_tls: true,

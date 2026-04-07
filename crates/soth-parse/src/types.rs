@@ -36,7 +36,7 @@ pub fn empty_heuristic_request(method: &str, path: &str) -> NormalizedRequest {
         parser_id: "heuristic-v1".to_string(),
         schema_version: "1".to_string(),
         parse_warnings: Vec::new(),
-        is_ai_call: true,
+        is_ai_call: false,
         provider: "unknown".to_string(),
         model: None,
         endpoint_type: EndpointType::Unknown,

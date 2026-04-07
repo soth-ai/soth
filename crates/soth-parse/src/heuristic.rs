@@ -44,6 +44,12 @@ pub fn parse(req: &RawRequest, pre_parsed: Option<&Value>) -> NormalizedRequest 
                 ],
             );
 
+            // Only flag as AI call when there is real evidence: a recognised
+            // model field OR a known prompt/message content path matched.
+            if nr.model.is_some() || content.is_some() {
+                nr.is_ai_call = true;
+            }
+
             let content = match content {
                 Some(value) if !value.is_empty() => value,
                 _ => {
