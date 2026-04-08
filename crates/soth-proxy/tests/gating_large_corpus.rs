@@ -659,6 +659,8 @@ fn sample_mitm_request(connection_id: Uuid, case: &HttpCase) -> soth_mitm::RawRe
                 parent_process_name: None,
             }),
             tls_info: None,
+            h2_connection_id: None,
+            h2_stream_id: None,
         }),
     }
 }
@@ -676,6 +678,8 @@ fn sample_mitm_response(connection_id: Uuid) -> soth_mitm::RawResponse {
             },
             process_info: None,
             tls_info: None,
+            h2_connection_id: None,
+            h2_stream_id: None,
         }),
     }
 }

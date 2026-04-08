@@ -51,7 +51,7 @@ soth-sync = { workspace = true }
 
 soth-extensions = { workspace = true, optional = true }
 soth-historian = { workspace = true, optional = true }
-soth-mitm = "0.2.2"
+soth-mitm = "0.3.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

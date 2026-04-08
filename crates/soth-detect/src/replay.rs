@@ -115,5 +115,7 @@ fn build_replay_connection_meta(event_uuid: &str) -> ConnectionMeta {
         capture_mode: None,
         matched_provider: None,
         matched_application: None,
+        h2_connection_id: None,
+        h2_stream_id: None,
     }
 }

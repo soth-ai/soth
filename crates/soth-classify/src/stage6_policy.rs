@@ -221,6 +221,11 @@ mod tests {
             product_id: None,
             surface_type: soth_core::SurfaceType::Unknown,
             is_shadow_it: false,
+            ja4_hash: None,
+            tls_version: None,
+            alpn_protocol: None,
+            h2_connection_id: None,
+            h2_stream_id: None,
         }
     }
 

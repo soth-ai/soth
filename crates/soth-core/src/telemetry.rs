@@ -269,6 +269,18 @@ pub struct TelemetryEvent {
     #[serde(default)]
     pub ws_turn_number: Option<u64>,
 
+    // Connection intelligence (JA4 fingerprint, TLS metadata, H2 multiplexing)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_stream_id: Option<u32>,
+
     // Product/Surface taxonomy (populated by catalog lookup)
     #[serde(default)]
     pub session_id: Option<Uuid>,
@@ -348,6 +360,11 @@ impl Default for TelemetryEvent {
             session_credential_alerts: None,
             conversation_turn: None,
             ws_turn_number: None,
+            ja4_hash: None,
+            tls_version: None,
+            alpn_protocol: None,
+            h2_connection_id: None,
+            h2_stream_id: None,
             session_id: None,
             product_id: None,
             surface_type: SurfaceType::Unknown,

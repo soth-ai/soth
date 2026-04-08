@@ -139,6 +139,11 @@ fn proxy_context_and_policy_context_semantic_extension_contract() {
         product_id: None,
         surface_type: SurfaceType::Unknown,
         is_shadow_it: false,
+        ja4_hash: None,
+        tls_version: None,
+        alpn_protocol: None,
+        h2_connection_id: None,
+        h2_stream_id: None,
     };
     assert_eq!(proxy_ctx.org_id, "org-test");
     assert_eq!(proxy_ctx.capture_mode, CaptureMode::SensitiveArtifacts);
@@ -238,6 +243,11 @@ fn telemetry_event_surface_excludes_raw_content_fields() {
         product_id: None,
         surface_type: SurfaceType::Unknown,
         is_shadow_it: false,
+        ja4_hash: None,
+        tls_version: None,
+        alpn_protocol: None,
+        h2_connection_id: None,
+        h2_stream_id: None,
     };
 
     let value = serde_json::to_value(event).expect("serialize telemetry event");
@@ -607,6 +617,11 @@ fn telemetry_event_new_fields_serde_roundtrip() {
         product_id: None,
         surface_type: SurfaceType::Unknown,
         is_shadow_it: false,
+        ja4_hash: None,
+        tls_version: None,
+        alpn_protocol: None,
+        h2_connection_id: None,
+        h2_stream_id: None,
     };
 
     let json = serde_json::to_string(&event).expect("serialize");

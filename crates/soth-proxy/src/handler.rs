@@ -482,6 +482,11 @@ impl ProxyHandler {
             deployment_context: None,
             precomputed_commitment_nonce: None,
             precomputed_commitment_hash: None,
+            ja4_hash: req.connection_meta.tls_info.as_ref().and_then(|t| t.ja4_hash.clone()),
+            tls_version: req.connection_meta.tls_info.as_ref().and_then(|t| t.tls_version.clone()),
+            alpn_protocol: req.connection_meta.tls_info.as_ref().and_then(|t| t.alpn.clone()),
+            h2_connection_id: req.connection_meta.h2_connection_id.as_ref().map(|u| u.to_string()),
+            h2_stream_id: req.connection_meta.h2_stream_id,
             connection_id: Some(connection_id),
             bundle_trust_level: Some(soth_core::BundleTrustLevel::SignatureDisabled),
             session_id: Some(session_result.session_id),
@@ -1417,11 +1422,15 @@ fn mitm_connection_meta_to_core(meta: &soth_mitm::ConnectionMeta) -> soth_core::
             sni: info.sni.clone(),
             alpn: info.negotiated_proto.clone(),
             protocol: None,
+            ja4_hash: info.ja4_hash.clone(),
+            tls_version: info.tls_version.as_ref().map(|v| v.as_str().to_string()),
         }),
         app_identity: None,
         capture_mode: None,
         matched_provider: None,
         matched_application: None,
+        h2_connection_id: meta.h2_connection_id.clone(),
+        h2_stream_id: meta.h2_stream_id,
     }
 }
 

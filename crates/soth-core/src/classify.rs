@@ -30,6 +30,18 @@ pub struct ProxyContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_trust_level: Option<crate::telemetry::BundleTrustLevel>,
 
+    // ── Connection intelligence ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_stream_id: Option<u32>,
+
     // ── Product taxonomy & session (v7+) ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Uuid>,

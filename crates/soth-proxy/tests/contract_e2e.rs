@@ -103,6 +103,11 @@ fn sample_proxy_context(capture_mode: CaptureMode, timestamp_epoch_ms: i64) -> P
         product_id: None,
         surface_type: SurfaceType::Unknown,
         is_shadow_it: false,
+        ja4_hash: None,
+        tls_version: None,
+        alpn_protocol: None,
+        h2_connection_id: None,
+        h2_stream_id: None,
     }
 }
 

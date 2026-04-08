@@ -266,6 +266,8 @@ fn sample_connection_meta(connection_id: Uuid) -> Arc<soth_mitm::ConnectionMeta>
         },
         process_info: None,
         tls_info: None,
+        h2_connection_id: None,
+        h2_stream_id: None,
     })
 }
 

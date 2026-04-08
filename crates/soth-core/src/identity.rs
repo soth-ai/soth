@@ -14,6 +14,10 @@ pub struct ConnectionMeta {
     pub capture_mode: Option<CaptureMode>,
     pub matched_provider: Option<String>,
     pub matched_application: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_stream_id: Option<u32>,
 }
 
 impl ConnectionMeta {
@@ -32,6 +36,8 @@ impl ConnectionMeta {
             capture_mode: None,
             matched_provider: None,
             matched_application: None,
+            h2_connection_id: None,
+            h2_stream_id: None,
         }
     }
 
@@ -125,4 +131,8 @@ pub struct TlsInfo {
     pub sni: Option<String>,
     pub alpn: Option<String>,
     pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_version: Option<String>,
 }

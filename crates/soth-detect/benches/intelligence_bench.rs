@@ -24,8 +24,9 @@ fn bench_process_with_intelligence(c: &mut Criterion) {
     c.bench_function("detect_process_with_intelligence", |b| {
         b.iter(|| {
             let request = build_request(black_box("hello benchmark"));
+            let snapshot = soth_core::SessionSnapshot::default();
             let _ =
-                process_with_registry_and_intelligence(&registry, &request, &bundle_slice, &store);
+                process_with_registry_and_intelligence(&registry, &request, &bundle_slice, &snapshot, &store);
         })
     });
 }
@@ -41,7 +42,8 @@ fn bench_intelligence_signals_query(c: &mut Criterion) {
 
     for _ in 0..200 {
         let request = build_request("seed event");
-        let _ = process_with_registry_and_intelligence(&registry, &request, &bundle_slice, &store);
+        let snapshot = soth_core::SessionSnapshot::default();
+        let _ = process_with_registry_and_intelligence(&registry, &request, &bundle_slice, &snapshot, &store);
     }
 
     c.bench_function("detect_intelligence_signals", |b| {
@@ -102,6 +104,11 @@ fn build_request(content: &str) -> RawRequest {
             process_info: None,
             tls_info: None,
             app_identity: None,
+            capture_mode: None,
+            matched_provider: None,
+            matched_application: None,
+            h2_connection_id: None,
+            h2_stream_id: None,
         },
     }
 }

@@ -3285,9 +3285,9 @@ dependencies = [
 
 [[package]]
 name = "soth-mitm"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d0579000b0e4e7491d8cb0d18ed8ff64569b026ca977e19fc35ec518969dffc"
+checksum = "39d94c8d8cf943da1fa6caf394bcce36721e749b8c19b427e8f31a7fca9c0395"
 dependencies = [
  "base64 0.22.1",
  "brotli",
@@ -3308,6 +3308,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "socket2 0.5.10",
  "soketto",
  "sysinfo",

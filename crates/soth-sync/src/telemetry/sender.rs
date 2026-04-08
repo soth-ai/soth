@@ -247,6 +247,31 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         }
     }
 
+    // Connection intelligence tags (JA4 fingerprint, TLS metadata, H2 multiplexing)
+    if let Some(ref ja4) = event.ja4_hash {
+        if !ja4.is_empty() {
+            tags.insert("ja4_hash".to_string(), ja4.clone());
+        }
+    }
+    if let Some(ref tv) = event.tls_version {
+        if !tv.is_empty() {
+            tags.insert("tls_version".to_string(), tv.clone());
+        }
+    }
+    if let Some(ref alpn) = event.alpn_protocol {
+        if !alpn.is_empty() {
+            tags.insert("alpn_protocol".to_string(), alpn.clone());
+        }
+    }
+    if let Some(ref h2cid) = event.h2_connection_id {
+        if !h2cid.is_empty() {
+            tags.insert("h2_connection_id".to_string(), h2cid.clone());
+        }
+    }
+    if let Some(h2sid) = event.h2_stream_id {
+        tags.insert("h2_stream_id".to_string(), h2sid.to_string());
+    }
+
     TelemetryEvent {
         event_id: event.event_id.to_string(),
         timestamp: event.timestamp_epoch_ms / 1_000,

@@ -134,6 +134,12 @@ pub(crate) fn run(
             .map(|s| s.credential_alerts),
         conversation_turn: detect_result.normalized.conversation_turn,
         ws_turn_number: None,
+        // Connection intelligence — populated by proxy handler from TLS handshake
+        ja4_hash: proxy_ctx.ja4_hash.clone(),
+        tls_version: proxy_ctx.tls_version.clone(),
+        alpn_protocol: proxy_ctx.alpn_protocol.clone(),
+        h2_connection_id: proxy_ctx.h2_connection_id.clone(),
+        h2_stream_id: proxy_ctx.h2_stream_id,
         // Product/Session taxonomy — populated by proxy handler, not classify
         session_id: proxy_ctx.session_id,
         product_id: proxy_ctx.product_id.clone(),
@@ -418,6 +424,11 @@ mod tests {
             product_id: None,
             surface_type: soth_core::SurfaceType::Unknown,
             is_shadow_it: false,
+            ja4_hash: None,
+            tls_version: None,
+            alpn_protocol: None,
+            h2_connection_id: None,
+            h2_stream_id: None,
         }
     }
 

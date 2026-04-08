@@ -729,6 +729,8 @@ mod tests {
             capture_mode: None,
             matched_provider: None,
             matched_application: None,
+            h2_connection_id: None,
+            h2_stream_id: None,
         }
     }
 

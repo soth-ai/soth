@@ -301,6 +301,8 @@ fn sample_connection_meta(
             parent_process_name: None,
         }),
         tls_info: None,
+        h2_connection_id: None,
+        h2_stream_id: None,
     })
 }
 
