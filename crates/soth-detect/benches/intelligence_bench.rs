@@ -25,8 +25,13 @@ fn bench_process_with_intelligence(c: &mut Criterion) {
         b.iter(|| {
             let request = build_request(black_box("hello benchmark"));
             let snapshot = soth_core::SessionSnapshot::default();
-            let _ =
-                process_with_registry_and_intelligence(&registry, &request, &bundle_slice, &snapshot, &store);
+            let _ = process_with_registry_and_intelligence(
+                &registry,
+                &request,
+                &bundle_slice,
+                &snapshot,
+                &store,
+            );
         })
     });
 }
@@ -43,7 +48,13 @@ fn bench_intelligence_signals_query(c: &mut Criterion) {
     for _ in 0..200 {
         let request = build_request("seed event");
         let snapshot = soth_core::SessionSnapshot::default();
-        let _ = process_with_registry_and_intelligence(&registry, &request, &bundle_slice, &snapshot, &store);
+        let _ = process_with_registry_and_intelligence(
+            &registry,
+            &request,
+            &bundle_slice,
+            &snapshot,
+            &store,
+        );
     }
 
     c.bench_function("detect_intelligence_signals", |b| {

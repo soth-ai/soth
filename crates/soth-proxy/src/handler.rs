@@ -482,10 +482,26 @@ impl ProxyHandler {
             deployment_context: None,
             precomputed_commitment_nonce: None,
             precomputed_commitment_hash: None,
-            ja4_hash: req.connection_meta.tls_info.as_ref().and_then(|t| t.ja4_hash.clone()),
-            tls_version: req.connection_meta.tls_info.as_ref().and_then(|t| t.tls_version.clone()),
-            alpn_protocol: req.connection_meta.tls_info.as_ref().and_then(|t| t.alpn.clone()),
-            h2_connection_id: req.connection_meta.h2_connection_id.as_ref().map(|u| u.to_string()),
+            ja4_hash: req
+                .connection_meta
+                .tls_info
+                .as_ref()
+                .and_then(|t| t.ja4_hash.clone()),
+            tls_version: req
+                .connection_meta
+                .tls_info
+                .as_ref()
+                .and_then(|t| t.tls_version.clone()),
+            alpn_protocol: req
+                .connection_meta
+                .tls_info
+                .as_ref()
+                .and_then(|t| t.alpn.clone()),
+            h2_connection_id: req
+                .connection_meta
+                .h2_connection_id
+                .as_ref()
+                .map(|u| u.to_string()),
             h2_stream_id: req.connection_meta.h2_stream_id,
             connection_id: Some(connection_id),
             bundle_trust_level: Some(soth_core::BundleTrustLevel::SignatureDisabled),
