@@ -702,10 +702,31 @@ impl ProxyHandler {
 
         let response_body_bytes = response.body.len();
 
+        // For streaming responses (SSE, NDJSON) delivered via H2, on_response
+        // fires with only headers (empty body).  Start the streaming store so
+        // on_stream_chunk can accumulate payload, then let handle_stream_end /
+        // finalize_completed_stream deposit the actual usage.
+        let content_type = response.headers.get("content-type").map(String::as_str);
+        let is_streaming_content = content_type
+            .map(|ct| {
+                ct.contains("text/event-stream")
+                    || ct.contains("application/x-ndjson")
+                    || ct.contains("application/grpc")
+            })
+            .unwrap_or(false);
+        if is_streaming_content && response_body_bytes == 0 {
+            self.streaming.start_stream(pending);
+            tracing::debug!(
+                connection_id = %connection_id,
+                content_type = content_type.unwrap_or("-"),
+                "streaming response detected; deferring usage to stream end",
+            );
+            return;
+        }
+
         // Guard: skip expensive body parsing for heavy content types (video, audio,
         // images, archives, binaries) or oversized bodies.  These can reach the
         // handler when non-AI hosts are intercepted via discovery mode.
-        let content_type = response.headers.get("content-type").map(String::as_str);
         let skip_body_parse = is_heavy_content_type(content_type)
             || response_body_bytes > MAX_RESPONSE_BODY_PARSE_BYTES;
 
