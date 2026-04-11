@@ -61,8 +61,14 @@ pub fn process_chunk_with_bundle(
             if let Some(usage) = sse.usage {
                 session.last_usage = Some(usage);
             }
+            let got_finish = sse.finish_reason.is_some();
             if let Some(fr) = sse.finish_reason {
                 session.last_finish_reason = Some(fr);
+            }
+            if session.stream_prompt.is_none() {
+                if let Some(prompt) = sse.prompt {
+                    session.stream_prompt = Some(prompt);
+                }
             }
             // Prefer the SSE-extracted delta; fall back to GraphQL/Gemini parsers.
             if let Some(delta) = sse
@@ -71,6 +77,25 @@ pub fn process_chunk_with_bundle(
                 .or_else(|| extract_gemini_length_prefixed(&chunk.payload))
             {
                 session.accumulate(delta);
+            }
+
+            // For long-lived SSE connections (e.g. Copilot), the `done` event
+            // signals the end of a response turn but the connection stays open.
+            // Emit a TurnCompleted so the proxy writes a per-turn record
+            // immediately instead of waiting for connection close (which may
+            // never happen).
+            if got_finish && descriptor.is_some_and(|d| {
+                d.features.iter().any(|f| f.protocol == "websocket")
+            }) {
+                let usage = session.last_usage.take().unwrap_or_default();
+                let model = session.model.clone();
+                session.turns_emitted += 1;
+                return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
+                    connection_id: session.connection_id,
+                    model,
+                    usage,
+                    turn_number: session.turns_emitted,
+                }));
             }
         }
         FrameKind::WebSocketText => {
@@ -129,7 +154,7 @@ pub fn process_chunk_with_bundle(
                 let is_server_frame = chunk.direction == Some(FrameDirection::ServerToClient);
 
                 if is_client_frame {
-                    // CLIENT → SERVER: extract model from request frames.
+                    // CLIENT → SERVER: extract model and prompt from request frames.
                     if let Some(turn) = process_websocket_turn(&chunk.payload, session) {
                         return Some(ChunkEvent::TurnCompleted(turn));
                     }
@@ -140,6 +165,11 @@ pub fn process_chunk_with_bundle(
                     );
                     if let Some(model) = sse.model {
                         session.model = Some(model);
+                    }
+                    if session.stream_prompt.is_none() {
+                        if let Some(prompt) = sse.prompt {
+                            session.stream_prompt = Some(prompt);
+                        }
                     }
                 } else {
                     // SERVER → CLIENT (or direction unknown): extract response data.
@@ -154,8 +184,32 @@ pub fn process_chunk_with_bundle(
                     if let Some(usage) = sse.usage {
                         session.last_usage = Some(usage);
                     }
+                    let got_finish = sse.finish_reason.is_some();
                     if let Some(fr) = sse.finish_reason {
                         session.last_finish_reason = Some(fr);
+                    }
+                    if session.stream_prompt.is_none() {
+                        if let Some(prompt) = sse.prompt {
+                            session.stream_prompt = Some(prompt);
+                        }
+                    }
+
+                    // For long-lived WebSocket connections (e.g. Copilot), the
+                    // `done` event signals the end of a response turn. Emit
+                    // TurnCompleted so the proxy writes a per-turn record
+                    // immediately.
+                    if got_finish && descriptor.is_some_and(|d| {
+                        d.features.iter().any(|f| f.protocol == "websocket")
+                    }) {
+                        let usage = session.last_usage.take().unwrap_or_default();
+                        let model = session.model.clone();
+                        session.turns_emitted += 1;
+                        return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
+                            connection_id: session.connection_id,
+                            model,
+                            usage,
+                            turn_number: session.turns_emitted,
+                        }));
                     }
 
                     if session.is_websocket {
@@ -193,7 +247,76 @@ pub fn process_chunk_with_bundle(
             }
         }
         FrameKind::WebSocketBinary => {
-            if looks_like_protobuf_payload(&chunk.payload) {
+            // For formats with stream rules (e.g. Meta AI), extract JSON
+            // strings from the protobuf-wrapped binary frames and run the
+            // rules engine against them. This handles the PROTO_INSIDE_JSON
+            // pattern where protobuf frames contain embedded JSON payloads.
+            if descriptor.is_some_and(|d| !d.features.is_empty()) {
+                // Extract JSON objects embedded in binary frames. Apps like
+                // Meta AI wrap JSON inside a custom binary envelope (not
+                // standard protobuf). Scan for '{' and try to parse JSON.
+                let json_objects = extract_json_from_binary(&chunk.payload);
+                for trimmed in &json_objects {
+                    if !trimmed.is_empty() {
+                        let json_bytes = trimmed.as_bytes();
+                        let sse = extract_all_from_sse_lines(
+                            json_bytes,
+                            session.model.is_none(),
+                            descriptor,
+                        );
+                        if let Some(model) = sse.model {
+                            session.model = Some(model);
+                        }
+                        if let Some(usage) = sse.usage {
+                            session.last_usage = Some(usage);
+                        }
+                        let got_finish = sse.finish_reason.is_some();
+                        if let Some(fr) = sse.finish_reason {
+                            session.last_finish_reason = Some(fr);
+                        }
+                        if session.stream_prompt.is_none() {
+                            if let Some(prompt) = sse.prompt {
+                                session.stream_prompt = Some(prompt);
+                            }
+                        }
+                        if let Some(delta) = sse.delta {
+                            session.accumulate(delta);
+                        }
+                        // Emit TurnCompleted on finish for long-lived connections
+                        if got_finish && descriptor.is_some_and(|d| {
+                            d.features.iter().any(|f| f.protocol == "websocket")
+                        }) {
+                            let usage = session.last_usage.take().unwrap_or_default();
+                            let model = session.model.clone();
+                            session.turns_emitted += 1;
+                            return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
+                                connection_id: session.connection_id,
+                                model,
+                                usage,
+                                turn_number: session.turns_emitted,
+                            }));
+                        }
+                    }
+                }
+                // Also try raw text for non-binary frames
+                if json_objects.is_empty() {
+                    if let Ok(text) = std::str::from_utf8(&chunk.payload) {
+                        if !text.trim().is_empty() && text.trim().starts_with('{') {
+                            let sse = extract_all_from_sse_lines(
+                                text.as_bytes(),
+                                session.model.is_none(),
+                                descriptor,
+                            );
+                            if let Some(model) = sse.model {
+                                session.model = Some(model);
+                            }
+                            if let Some(delta) = sse.delta {
+                                session.accumulate(delta);
+                            }
+                        }
+                    }
+                }
+            } else if looks_like_protobuf_payload(&chunk.payload) {
                 if let Some(delta) = parse_grpc_chunk_payload(
                     &chunk.payload,
                     bundle,
@@ -313,6 +436,7 @@ struct SseExtracted {
     usage: Option<crate::types::StreamUsage>,
     finish_reason: Option<String>,
     delta: Option<String>,
+    prompt: Option<String>,
 }
 
 /// Parse JSON lines once and extract model, usage, finish_reason, and delta
@@ -350,6 +474,7 @@ fn extract_all_from_sse_lines(
                     usage: usage_result,
                     finish_reason: extracted.finish_reason,
                     delta: extracted.content,
+                    prompt: extracted.prompt,
                 };
             }
         }
@@ -360,6 +485,7 @@ fn extract_all_from_sse_lines(
         usage: None,
         finish_reason: None,
         delta: None,
+        prompt: None,
     };
 
     let Ok(text) = std::str::from_utf8(payload) else {
@@ -412,6 +538,70 @@ fn extract_all_from_sse_lines(
         Some(delta_buf)
     };
     result
+}
+
+/// Extract JSON objects from a binary frame by scanning for `{` and
+/// attempting to parse balanced brace-delimited substrings as JSON.
+/// Used for protocols that wrap JSON inside binary envelopes (e.g. Meta AI's
+/// PROTO_INSIDE_JSON format).
+fn extract_json_from_binary(payload: &[u8]) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut i = 0;
+    while i < payload.len() {
+        if payload[i] == b'{' {
+            // Try to find matching closing brace
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escape = false;
+            let mut end = i;
+            for j in i..payload.len() {
+                let b = payload[j];
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if b == b'\\' && in_string {
+                    escape = true;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = !in_string;
+                    continue;
+                }
+                if !in_string {
+                    if b == b'{' {
+                        depth += 1;
+                    } else if b == b'}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = j + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if depth == 0 && end > i {
+                if let Ok(text) = std::str::from_utf8(&payload[i..end]) {
+                    // Validate it's actual JSON by checking for common keys
+                    if text.contains("\"seq\"")
+                        || text.contains("\"type\"")
+                        || text.contains("\"event\"")
+                        || text.contains("\"code\"")
+                        || text.contains("\"response\"")
+                        || text.contains("\"operations\"")
+                    {
+                        results.push(text.to_string());
+                    }
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    results
 }
 
 fn looks_like_protobuf_payload(payload: &[u8]) -> bool {

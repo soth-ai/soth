@@ -232,6 +232,9 @@ pub struct StreamSession {
     /// Finish reason extracted independently of usage (providers often send
     /// finish_reason in a different chunk than the usage summary).
     pub last_finish_reason: Option<String>,
+    /// User prompt extracted from the response stream (for apps that echo
+    /// the prompt back, e.g. Copilot's `send` event).
+    pub stream_prompt: Option<String>,
 }
 
 /// Usage data extracted from a streaming frame.
@@ -276,6 +279,7 @@ impl StreamSession {
             current_turn_model: None,
             last_usage: None,
             last_finish_reason: None,
+            stream_prompt: None,
         }
     }
 

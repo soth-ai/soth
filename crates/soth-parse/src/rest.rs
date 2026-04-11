@@ -16,6 +16,53 @@ pub fn parse_rest(
     let desc =
         descriptor.ok_or_else(|| ParseError::MissingRequiredField("rest_format".to_string()))?;
 
+    // WebSocket features use GET with no body — the chat data flows over
+    // WebSocket frames after the HTTP upgrade, so there is nothing to parse
+    // from the request. Return a minimal NormalizedRequest and let the
+    // streaming session handle content extraction via the feature's stream
+    // rules.
+    if is_websocket_feature(desc) && req.body.is_empty() {
+        let parser_id = parser_id_for_format(&format, Some(desc));
+        let api_version = extract_api_version(&req.headers, &req.path, &format);
+        let mut normalized = NormalizedRequest {
+            parse_confidence: ParseConfidence::Partial,
+            parser_id,
+            schema_version: "1".to_string(),
+            parse_warnings: vec![],
+            is_ai_call: true,
+            provider: provider_id.to_string(),
+            model: None,
+            endpoint_type: EndpointType::ChatCompletion,
+            system_prompt_hash: None,
+            system_prompt_token_estimate: None,
+            user_content_hash: hash_content("[WEBSOCKET_UPGRADE]"),
+            user_content_token_estimate: 0,
+            conversation_hash: hash_content("[WEBSOCKET_UPGRADE]"),
+            conversation_turn: None,
+            has_tool_definitions: false,
+            tool_definition_hash: None,
+            temperature: None,
+            max_tokens: None,
+            stream: true,
+            top_p: None,
+            stop_sequences: Vec::new(),
+            estimated_input_tokens: 0,
+            estimated_cost_usd: 0.0,
+            parse_source: crate::types::ParseSource::Heuristic,
+            has_structured_output: false,
+            has_tool_results: false,
+            estimated_output_tokens: None,
+            canonical_cache_key: String::new(),
+            format_metadata: FormatMeta::Rest {
+                content_type: req.path.clone(),
+            },
+            api_version,
+            user_prompt: None,
+        };
+        normalized.canonical_cache_key = canonical_hash(&normalized);
+        return Ok((normalized, Value::Null));
+    }
+
     let json: Value = decode_request_body(req, desc, pre_parsed)?;
 
     let mut warnings = Vec::new();
@@ -39,6 +86,15 @@ pub fn parse_rest(
     }
     if messages.is_empty() {
         messages = extract_messages_fallback(&json);
+    }
+
+    // Feature-based field extraction: when flat request paths yield nothing,
+    // match the request path against feature URL patterns and use the
+    // feature's request.fields to extract the prompt.
+    if messages.is_empty() {
+        if let Some(prompt) = extract_prompt_from_feature(desc, &req.path, &req.method, &json) {
+            messages.push(("user".to_string(), normalize_unicodeish(&prompt)));
+        }
     }
 
     let system_prompt = extract_system_prompt(&json, desc);
@@ -170,7 +226,7 @@ pub fn parse_rest(
     let estimated_input_tokens = estimate_tokens(&input_parts.join("\n")) + tool_token_estimate;
 
     let api_version = extract_api_version(&req.headers, &req.path, &format);
-    let parser_id = parser_id_for_format(&format);
+    let parser_id = parser_id_for_format(&format, Some(desc));
 
     let mut normalized = NormalizedRequest {
         parse_confidence: if warnings.is_empty() {
@@ -579,14 +635,64 @@ fn extract_path_version(path: &str) -> Option<String> {
     None
 }
 
-fn parser_id_for_format(format: &DetectedFormat) -> String {
+/// Try to extract the user prompt by matching the request path against
+/// feature URL patterns and using the matching feature's `request.fields.prompt`.
+fn extract_prompt_from_feature(
+    desc: &RestFormatDescriptor,
+    path: &str,
+    method: &str,
+    json: &Value,
+) -> Option<String> {
+    let path_only = path.split('?').next().unwrap_or(path);
+    for feature in &desc.features {
+        if feature.feature_type != "chat" {
+            continue;
+        }
+        let pattern_matches = feature.patterns.iter().any(|p| {
+            let method_ok = p
+                .method
+                .as_deref()
+                .map_or(true, |m| m.eq_ignore_ascii_case(method));
+            method_ok && crate::glob_match(&p.url, path_only)
+        });
+        if !pattern_matches {
+            continue;
+        }
+        if let Some(prompt_path) = feature.request.fields.get("prompt") {
+            if let Some(value) = json_path(json, prompt_path) {
+                if let Some(text) = extract_string(value) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns `true` when the descriptor's primary chat feature uses the
+/// WebSocket protocol, meaning the initial HTTP request is a GET upgrade
+/// with no body.
+fn is_websocket_feature(desc: &RestFormatDescriptor) -> bool {
+    desc.features
+        .iter()
+        .any(|f| f.feature_type == "chat" && f.protocol == "websocket")
+}
+
+fn parser_id_for_format(format: &DetectedFormat, descriptor: Option<&RestFormatDescriptor>) -> String {
     match format {
         DetectedFormat::OpenAIRest => "openai-v1".to_string(),
         DetectedFormat::AnthropicRest => "anthropic-v1".to_string(),
         DetectedFormat::CohereRest => "cohere-v1".to_string(),
         DetectedFormat::GeminiRest => "gemini-v1".to_string(),
         DetectedFormat::BedrockRest => "bedrock-v1".to_string(),
-        DetectedFormat::CustomRest(name) => format!("{name}-v1"),
+        DetectedFormat::CustomRest(_) => {
+            // Use the bundle's provider_hint as parser_id — the cloud import
+            // pipeline sets provider_hint = parser_id (e.g. "bing-copilot").
+            descriptor
+                .and_then(|d| d.provider_hint.as_deref())
+                .map(str::to_string)
+                .unwrap_or_else(|| "custom-rest-v1".to_string())
+        }
         _ => "rest-v1".to_string(),
     }
 }
