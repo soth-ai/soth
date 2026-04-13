@@ -346,6 +346,7 @@ pub struct RulesExtracted {
     pub model: Option<String>,
     pub content: Option<String>,
     pub finish_reason: Option<String>,
+    pub prompt: Option<String>,
 }
 
 /// Process a streaming payload using the rules engine.
@@ -374,6 +375,7 @@ pub fn extract_with_stream_rules(
         return RulesExtracted {
             model: accumulator.get("model").map(str::to_string),
             content: accumulator.get("content").map(str::to_string),
+            prompt: accumulator.get("prompt").map(str::to_string),
             finish_reason: accumulator
                 .get("finish_reason")
                 .or_else(|| accumulator.get("stop_reason"))
@@ -386,6 +388,7 @@ pub fn extract_with_stream_rules(
             model: None,
             content: None,
             finish_reason: None,
+            prompt: None,
         };
     };
 
@@ -422,6 +425,7 @@ pub fn extract_with_stream_rules(
             .get("finish_reason")
             .or_else(|| accumulator.get("stop_reason"))
             .map(str::to_string),
+        prompt: accumulator.get("prompt").map(str::to_string),
     }
 }
 
