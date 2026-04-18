@@ -55,6 +55,8 @@ async fn main() -> Result<()> {
     let db_conn = db::open(config.db_path.as_path())?;
     let db = Arc::new(Mutex::new(db_conn));
 
+    ensure_classify_models(&config).await;
+
     let vendor_pubkey = config
         .bundle_vendor_pubkey()
         .context("parse bundle vendor pubkey")?;
@@ -363,6 +365,104 @@ fn inherited_listener() -> Result<Option<tokio::net::TcpListener>> {
 #[cfg(not(unix))]
 fn inherited_listener() -> Result<Option<tokio::net::TcpListener>> {
     Ok(None)
+}
+
+/// When the classify model directory is missing, fetch the classify bundle
+/// from the cloud and extract it. This is non-fatal — the proxy will start
+/// with a fallback classifier if this fails.
+async fn ensure_classify_models(config: &soth_proxy::config::ProxyConfig) {
+    let classify_dir = config.bundle.bundle_dir.join("classify");
+    if classify_dir.join("manifest.json").exists() {
+        return;
+    }
+
+    if !config.sync.enabled {
+        tracing::warn!(
+            classify_dir = %classify_dir.display(),
+            "classify models missing and sync disabled — using fallback classifier"
+        );
+        return;
+    }
+
+    tracing::info!(
+        classify_dir = %classify_dir.display(),
+        "classify models missing — downloading from cloud"
+    );
+
+    let sync_cfg = config.sync_config();
+    let endpoint = sync_cfg.endpoint.trim_end_matches('/');
+    let url = format!("{endpoint}/v1/edge/classify/current");
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to build HTTP client for classify download");
+            return;
+        }
+    };
+
+    let response = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", sync_cfg.api_key))
+        .header("x-soth-agent-instance-id", &sync_cfg.agent_instance_id)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, url = %url, "classify bundle download failed");
+            return;
+        }
+    };
+
+    if !response.status().is_success() {
+        tracing::warn!(
+            status = %response.status(),
+            "classify bundle not available from cloud — using fallback classifier"
+        );
+        return;
+    }
+
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed reading classify bundle response body");
+            return;
+        }
+    };
+
+    if let Err(e) = extract_classify_tar_gz(&classify_dir, &bytes) {
+        tracing::warn!(error = %e, "failed extracting classify bundle — using fallback classifier");
+        return;
+    }
+
+    tracing::info!(
+        classify_dir = %classify_dir.display(),
+        size_bytes = bytes.len(),
+        "classify models downloaded and extracted"
+    );
+}
+
+fn extract_classify_tar_gz(
+    target_dir: &std::path::Path,
+    gz_bytes: &[u8],
+) -> anyhow::Result<()> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    std::fs::create_dir_all(target_dir)
+        .with_context(|| format!("create classify dir {}", target_dir.display()))?;
+
+    let decoder = GzDecoder::new(gz_bytes);
+    let mut archive = Archive::new(decoder);
+    archive
+        .unpack(target_dir)
+        .context("unpack classify tar.gz")?;
+
+    Ok(())
 }
 
 fn init_tracing(extension_targets: &[&str]) {
