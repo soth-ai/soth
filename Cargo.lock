@@ -3399,7 +3399,9 @@ dependencies = [
 
 [[package]]
 name = "soth-mitm"
-version = "0.3.2"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6928d42ad8b1f7ec6894b89fdd0c014154b5ca214dc6a5fa36234b06c7061c6"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
