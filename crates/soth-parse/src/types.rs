@@ -235,6 +235,11 @@ pub struct StreamSession {
     /// User prompt extracted from the response stream (for apps that echo
     /// the prompt back, e.g. Copilot's `send` event).
     pub stream_prompt: Option<String>,
+    /// Pending `StreamTurnRequest` to be returned by `process_chunk_with_bundle`
+    /// at the end of the current chunk.  Set when a client frame extracts a
+    /// prompt; drained at the end of the function so `credential_scan` can
+    /// still run.  Not serialized.
+    pub pending_request_event: Option<StreamTurnRequest>,
 }
 
 /// Usage data extracted from a streaming frame.
@@ -250,12 +255,44 @@ pub struct StreamUsage {
 /// Emitted by `process_chunk_with_bundle()` when a `response.completed`
 /// event is detected.  Model comes from the client's `response.create`
 /// request frame; usage comes from the server's `response.completed`.
-#[derive(Clone, Debug)]
+///
+/// `prompt` and `content` are drained out of the session at construction
+/// time so each turn carries its own assembled text and the next turn on
+/// the same long-lived WS session starts with empty buffers.
+#[derive(Clone, Debug, Default)]
 pub struct StreamTurn {
     pub connection_id: Uuid,
     pub model: Option<String>,
     pub usage: StreamUsage,
     pub turn_number: u64,
+    /// User prompt extracted from the client→server frame that initiated
+    /// this turn.  `None` if no prompt was extracted or capture is
+    /// `MetadataOnly`/`Disabled`.  Bounded to `MAX_TURN_PAYLOAD_BYTES`.
+    pub prompt: Option<String>,
+    /// Assembled response content from server→client frames, joined in
+    /// arrival order.  `None` if no content accumulated.  Bounded to
+    /// `MAX_TURN_PAYLOAD_BYTES`.
+    pub content: Option<String>,
+}
+
+/// A request event emitted when the user's prompt is extracted from a
+/// client→server WebSocket frame, BEFORE the server has finished
+/// streaming the assistant's response.  This exists so dev verify can
+/// show the prompt immediately when it lands instead of waiting for the
+/// (potentially long) turn to complete.
+///
+/// One `StreamTurnRequest` fires per client prompt frame.  The paired
+/// `StreamTurn` (with the response content) fires later when the
+/// server's `done`/`response.completed` frame arrives.
+#[derive(Clone, Debug, Default)]
+pub struct StreamTurnRequest {
+    pub connection_id: Uuid,
+    pub model: Option<String>,
+    /// Sequence number of the upcoming turn (1-indexed).  Equal to
+    /// `session.turns_emitted + 1` at the time the prompt was extracted.
+    pub turn_number: u64,
+    /// Extracted user prompt, bounded to `MAX_TURN_PAYLOAD_BYTES`.
+    pub prompt: String,
 }
 
 impl StreamSession {
@@ -280,6 +317,7 @@ impl StreamSession {
             last_usage: None,
             last_finish_reason: None,
             stream_prompt: None,
+            pending_request_event: None,
         }
     }
 

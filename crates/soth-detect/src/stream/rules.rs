@@ -335,6 +335,65 @@ fn apply_single_preprocess(value: &Value, op: &PreprocessOp) -> Value {
                 value.clone()
             }
         }
+        // Navigate to a sub-path and replace the current value with whatever
+        // is there. Used to "focus" on a nested string field before running a
+        // subsequent `json_parse` op to unwrap escaped JSON payloads (e.g.
+        // HubSpot Ably messages carry a deeply-nested `chirpMessageJson`).
+        "pluck" => {
+            if let Some(path) = op.value.as_ref().and_then(|v| v.as_str()) {
+                json_path(value, path).cloned().unwrap_or(Value::Null)
+            } else {
+                value.clone()
+            }
+        }
+        // Guard the pipeline: keep the current value only if a specific
+        // sub-path exists, is non-null, and — if it resolves to a string —
+        // is also non-empty.  If the path is missing or empty, the value
+        // is replaced with `Null`, causing all subsequent extract paths
+        // on this rule to return `None`.  Used to drop frames that should
+        // not contribute content (e.g. Poe placeholder messageAdded events
+        // where `text` is "" or missing).
+        "require" => {
+            if let Some(path) = op.value.as_ref().and_then(|v| v.as_str()) {
+                match json_path(value, path) {
+                    Some(v) if !v.is_null() => {
+                        // Reject empty strings — they're present but carry no content.
+                        if let Some(s) = v.as_str() {
+                            if s.is_empty() {
+                                Value::Null
+                            } else {
+                                value.clone()
+                            }
+                        } else {
+                            value.clone()
+                        }
+                    }
+                    _ => Value::Null,
+                }
+            } else {
+                value.clone()
+            }
+        }
+        // Like `require`, but also checks that the sub-path equals a given
+        // string value.  Config shape: `{"op":"require_eq","value":{"path":"state","value":"complete"}}`.
+        // Used to gate extraction on a specific terminal marker (e.g.
+        // Poe messageAdded `state == "complete"`).
+        "require_eq" => {
+            if let Some(cfg) = op.value.as_ref() {
+                let path = cfg.get("path").and_then(|v| v.as_str());
+                let expected = cfg.get("value").and_then(|v| v.as_str());
+                if let (Some(p), Some(e)) = (path, expected) {
+                    match json_path(value, p).and_then(|v| v.as_str()) {
+                        Some(actual) if actual == e => value.clone(),
+                        _ => Value::Null,
+                    }
+                } else {
+                    value.clone()
+                }
+            } else {
+                value.clone()
+            }
+        }
         _ => value.clone(),
     }
 }
@@ -369,17 +428,51 @@ pub fn extract_with_stream_rules(
         .is_some_and(|e| e.eq_ignore_ascii_case("protobuf"));
 
     if is_protobuf {
-        if let Some(content) = best_grpc_content(&scan_proto_strings(payload), 6) {
-            accumulator.push("content", &content);
+        // PROTO_INSIDE_JSON pattern (e.g. Meta AI): the binary frame wraps a
+        // complete JSON object as a protobuf length-delimited field.  Scan
+        // for embedded `{...}` JSON blocks first and apply the configured
+        // rules to each — this lets data-driven extraction (content, model,
+        // finish_reason) work even though the outer frame is protobuf.
+        let embedded = super::extract_json_from_binary(payload);
+        let mut any_rule_matched = false;
+        for json_str in &embedded {
+            let Ok(value) = serde_json::from_str::<Value>(json_str) else {
+                continue;
+            };
+            for rule in &rules_spec.rules {
+                if !evaluate_condition(&rule.when, &value) {
+                    continue;
+                }
+                any_rule_matched = true;
+                let processed = if rule.preprocess.is_empty() {
+                    value.clone()
+                } else {
+                    apply_preprocess(&value, &rule.preprocess)
+                };
+                for (field, path) in &rule.extract {
+                    if let Some(extracted) =
+                        json_path(&processed, path).and_then(extract_string)
+                    {
+                        accumulator.push(field, &extracted);
+                    }
+                }
+            }
         }
+        // Only fall back to raw protobuf string scanning when no JSON rules
+        // matched — preserves behavior for pure-protobuf formats like
+        // ConnectRPC/Cursor where no embedded JSON exists.
+        if !any_rule_matched {
+            if let Some(content) = best_grpc_content(&scan_proto_strings(payload), 6) {
+                accumulator.push("content", &content);
+            }
+        }
+        let fr = accumulator.get("finish_reason").or_else(|| accumulator.get("stop_reason")).map(str::to_string);
+        eprintln!("[DBG-META] rules protobuf branch done, rule_matched={}, accumulator.fr={:?}, accumulator.content={:?}, accumulator.stop_reason={:?}", any_rule_matched, accumulator.get("finish_reason"), accumulator.get("content").map(|s| s.len()), accumulator.get("stop_reason"));
         return RulesExtracted {
             model: accumulator.get("model").map(str::to_string),
             content: accumulator.get("content").map(str::to_string),
             prompt: accumulator.get("prompt").map(str::to_string),
-            finish_reason: accumulator
-                .get("finish_reason")
-                .or_else(|| accumulator.get("stop_reason"))
-                .map(str::to_string),
+            finish_reason: fr,
         };
     }
 

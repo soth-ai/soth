@@ -35,6 +35,97 @@ pub enum ChunkEvent {
     Artifact(ChunkArtifact),
     /// A WebSocket turn completed (response.completed detected).
     TurnCompleted(crate::types::StreamTurn),
+    /// A client→server WebSocket frame delivered a new user prompt.
+    /// Fires BEFORE the server streams the response so dev verify can
+    /// show the prompt immediately.
+    TurnRequest(crate::types::StreamTurnRequest),
+}
+
+/// Maximum bytes of assembled prompt or response content carried on a
+/// single `StreamTurn`. Anything past this is truncated to keep
+/// `intercept_records.telemetry_json` rows bounded.  This is independent
+/// of `MAX_ACCUMULATED_BYTES` (16 KB on `StreamSession`) which limits
+/// in-flight memory; this constant limits *persisted* per-turn payload.
+pub(crate) const MAX_TURN_PAYLOAD_BYTES: usize = 8 * 1024;
+
+/// Set `session.stream_prompt` and simultaneously stage a
+/// `StreamTurnRequest` event to be emitted at the end of the current
+/// `process_chunk_with_bundle` call.  The pending event is drained AFTER
+/// credential_scan so both can be reported for one chunk.
+fn set_stream_prompt_and_signal(
+    session: &mut crate::types::StreamSession,
+    mut prompt: String,
+) {
+    if prompt.len() > MAX_TURN_PAYLOAD_BYTES {
+        let mut cut = MAX_TURN_PAYLOAD_BYTES;
+        while cut > 0 && !prompt.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        prompt.truncate(cut);
+    }
+    let request_event = crate::types::StreamTurnRequest {
+        connection_id: session.connection_id,
+        model: session.model.clone(),
+        turn_number: session.turns_emitted + 1,
+        prompt: prompt.clone(),
+    };
+    session.stream_prompt = Some(prompt);
+    session.pending_request_event = Some(request_event);
+}
+
+/// Drain the session's accumulated text into a (prompt, content) pair for
+/// emission on a finished `StreamTurn`.  Truncates each side to
+/// `max_bytes` so per-turn rows stay bounded on long conversations.
+///
+/// Capture-mode aware: in `MetadataOnly` / `Disabled` modes the buffers
+/// are still drained (memory hygiene) but the returned values are `None`
+/// so no content is ever persisted.
+pub(crate) fn take_session_turn_payload(
+    session: &mut crate::types::StreamSession,
+    max_bytes: usize,
+) -> (Option<String>, Option<String>) {
+    let capture_mode = session.capture_mode;
+
+    // Always drain the buffers so the next turn on a long-lived WS
+    // connection starts clean and we don't accumulate memory.
+    let drained_buffer: Vec<String> = std::mem::take(&mut session.delta_buffer);
+    let drained_prompt: Option<String> = session.stream_prompt.take();
+    session.accumulated_bytes = 0;
+
+    // Privacy modes: drained but not surfaced.  Only Full / FullContent
+    // capture modes opt-in to persisting prompt/response text.
+    if !matches!(capture_mode, CaptureMode::Full | CaptureMode::FullContent) {
+        return (None, None);
+    }
+
+    let mut assembled = drained_buffer.join("");
+    if assembled.len() > max_bytes {
+        // Truncate at a UTF-8 char boundary to avoid producing invalid UTF-8.
+        let mut cut = max_bytes;
+        while cut > 0 && !assembled.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        assembled.truncate(cut);
+    }
+
+    let prompt = drained_prompt.map(|mut p| {
+        if p.len() > max_bytes {
+            let mut cut = max_bytes;
+            while cut > 0 && !p.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            p.truncate(cut);
+        }
+        p
+    });
+
+    let content = if assembled.is_empty() {
+        None
+    } else {
+        Some(assembled)
+    };
+
+    (prompt, content)
 }
 
 pub fn process_chunk_with_bundle(
@@ -67,7 +158,7 @@ pub fn process_chunk_with_bundle(
             }
             if session.stream_prompt.is_none() {
                 if let Some(prompt) = sse.prompt {
-                    session.stream_prompt = Some(prompt);
+                    set_stream_prompt_and_signal(session, prompt);
                 }
             }
             // Prefer the SSE-extracted delta; fall back to GraphQL/Gemini parsers.
@@ -87,14 +178,21 @@ pub fn process_chunk_with_bundle(
             if got_finish && descriptor.is_some_and(|d| {
                 d.features.iter().any(|f| f.protocol == "websocket")
             }) {
+                eprintln!("[DBG-META] emit@SSE path, fmt={:?}, turn_will_be={}", session.format_name, session.turns_emitted + 1);
                 let usage = session.last_usage.take().unwrap_or_default();
                 let model = session.model.clone();
                 session.turns_emitted += 1;
+                let turn_number = session.turns_emitted;
+                let connection_id = session.connection_id;
+                let (prompt, content) =
+                    take_session_turn_payload(session, MAX_TURN_PAYLOAD_BYTES);
                 return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
-                    connection_id: session.connection_id,
+                    connection_id,
                     model,
                     usage,
-                    turn_number: session.turns_emitted,
+                    turn_number,
+                    prompt,
+                    content,
                 }));
             }
         }
@@ -105,9 +203,17 @@ pub fn process_chunk_with_bundle(
                 !chunk.payload.is_empty() && std::str::from_utf8(&chunk.payload).is_err();
 
             if is_binary_encoded {
-                // Binary-encoded WebSocket frame (e.g. Codex protobuf).
-                // Try protobuf string extraction.
-                if looks_like_protobuf_payload(&chunk.payload) {
+                // Binary-encoded WebSocket frame (e.g. Codex protobuf, Meta
+                // AI protobuf-wrapped JSON).  If the format has stream
+                // rules, run them against embedded JSON extracted from the
+                // binary envelope — this is the PROTO_INSIDE_JSON path.
+                if let Some(event) =
+                    process_binary_ws_payload(&chunk.payload, session, descriptor, chunk.direction)
+                {
+                    return Some(event);
+                }
+                // Fallback for pure protobuf formats without stream rules.
+                if descriptor.is_none() && looks_like_protobuf_payload(&chunk.payload) {
                     if let Some(delta) = parse_grpc_chunk_payload(
                         &chunk.payload,
                         bundle,
@@ -122,6 +228,7 @@ pub fn process_chunk_with_bundle(
                 // packet prefix (e.g. `42["event", ...]`), unwrap it first
                 // and process only the inner JSON data.
                 if socketio::looks_like_socketio(&chunk.payload) {
+                    let direction_is_client = chunk.direction == Some(FrameDirection::ClientToServer);
                     if let Some(socketio::SocketIoFrame::Event { data_json, .. }) =
                         socketio::decode_socketio_frame(&chunk.payload)
                     {
@@ -137,11 +244,47 @@ pub fn process_chunk_with_bundle(
                         if let Some(usage) = sse.usage {
                             session.last_usage = Some(usage);
                         }
+                        let got_finish = sse.finish_reason.is_some();
                         if let Some(fr) = sse.finish_reason {
                             session.last_finish_reason = Some(fr);
                         }
-                        if let Some(delta) = sse.delta {
-                            session.accumulate(delta);
+                        if direction_is_client {
+                            if session.stream_prompt.is_none() {
+                                if let Some(prompt) = sse.prompt {
+                                    set_stream_prompt_and_signal(session, prompt);
+                                }
+                            }
+                            // Drain the pending TurnRequest so dev-verify shows
+                            // the STREAM TURN REQUEST block when the user sends
+                            // a message.  Without this, the signal is staged but
+                            // never surfaces because the socketio branch exits
+                            // before the bottom-of-function fallthrough.
+                            if let Some(req) = session.pending_request_event.take() {
+                                return Some(ChunkEvent::TurnRequest(req));
+                            }
+                        } else {
+                            if let Some(delta) = sse.delta {
+                                session.accumulate(delta);
+                            }
+                            if got_finish && descriptor.is_some_and(|d| {
+                                d.features.iter().any(|f| f.protocol == "websocket")
+                            }) {
+                                let usage = session.last_usage.take().unwrap_or_default();
+                                let model = session.model.clone();
+                                session.turns_emitted += 1;
+                                let turn_number = session.turns_emitted;
+                                let connection_id = session.connection_id;
+                                let (prompt, content) =
+                                    take_session_turn_payload(session, MAX_TURN_PAYLOAD_BYTES);
+                                return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
+                                    connection_id,
+                                    model,
+                                    usage,
+                                    turn_number,
+                                    prompt,
+                                    content,
+                                }));
+                            }
                         }
                     }
                     // Non-EVENT Socket.IO frames (PING, PONG, ACK) are ignored.
@@ -156,6 +299,7 @@ pub fn process_chunk_with_bundle(
                 if is_client_frame {
                     // CLIENT → SERVER: extract model and prompt from request frames.
                     if let Some(turn) = process_websocket_turn(&chunk.payload, session) {
+                        eprintln!("[DBG-META] emit@WSText-client process_websocket_turn, fmt={:?}", session.format_name);
                         return Some(ChunkEvent::TurnCompleted(turn));
                     }
                     let sse = extract_all_from_sse_lines(
@@ -168,7 +312,7 @@ pub fn process_chunk_with_bundle(
                     }
                     if session.stream_prompt.is_none() {
                         if let Some(prompt) = sse.prompt {
-                            session.stream_prompt = Some(prompt);
+                            set_stream_prompt_and_signal(session, prompt);
                         }
                     }
                 } else {
@@ -190,7 +334,7 @@ pub fn process_chunk_with_bundle(
                     }
                     if session.stream_prompt.is_none() {
                         if let Some(prompt) = sse.prompt {
-                            session.stream_prompt = Some(prompt);
+                            set_stream_prompt_and_signal(session, prompt);
                         }
                     }
 
@@ -201,19 +345,27 @@ pub fn process_chunk_with_bundle(
                     if got_finish && descriptor.is_some_and(|d| {
                         d.features.iter().any(|f| f.protocol == "websocket")
                     }) {
+                        eprintln!("[DBG-META] emit@WSText-server got_finish path, fmt={:?}, turn_will_be={}", session.format_name, session.turns_emitted + 1);
                         let usage = session.last_usage.take().unwrap_or_default();
                         let model = session.model.clone();
                         session.turns_emitted += 1;
+                        let turn_number = session.turns_emitted;
+                        let connection_id = session.connection_id;
+                        let (prompt, content) =
+                            take_session_turn_payload(session, MAX_TURN_PAYLOAD_BYTES);
                         return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
-                            connection_id: session.connection_id,
+                            connection_id,
                             model,
                             usage,
-                            turn_number: session.turns_emitted,
+                            turn_number,
+                            prompt,
+                            content,
                         }));
                     }
 
                     if session.is_websocket {
                         if let Some(turn) = process_websocket_turn(&chunk.payload, session) {
+                            eprintln!("[DBG-META] emit@WSText-server process_websocket_turn, fmt={:?}", session.format_name);
                             return Some(ChunkEvent::TurnCompleted(turn));
                         }
                     }
@@ -227,9 +379,17 @@ pub fn process_chunk_with_bundle(
                             .or_else(|| parse_multipart_payload_text(&chunk.payload))
                         {
                             session.accumulate(delta);
-                        } else if let Ok(text) = std::str::from_utf8(&chunk.payload) {
-                            if !text.trim().is_empty() {
-                                session.accumulate(text.to_string());
+                        } else if descriptor.is_none() {
+                            // Raw-text fallback: only used when there is NO
+                            // parser descriptor. Providers with rules (Poe,
+                            // Manus, HubSpot, Meta AI) deliberately return
+                            // no delta on non-terminal frames so the rules
+                            // engine can filter them out — don't pollute the
+                            // session with raw JSON frames in that case.
+                            if let Ok(text) = std::str::from_utf8(&chunk.payload) {
+                                if !text.trim().is_empty() {
+                                    session.accumulate(text.to_string());
+                                }
                             }
                         }
                     }
@@ -247,74 +407,14 @@ pub fn process_chunk_with_bundle(
             }
         }
         FrameKind::WebSocketBinary => {
-            // For formats with stream rules (e.g. Meta AI), extract JSON
-            // strings from the protobuf-wrapped binary frames and run the
-            // rules engine against them. This handles the PROTO_INSIDE_JSON
-            // pattern where protobuf frames contain embedded JSON payloads.
+            // For formats with stream rules (e.g. Meta AI), run the unified
+            // binary-ws helper which handles PROTO_INSIDE_JSON and pure
+            // protobuf via the rules engine.
             if descriptor.is_some_and(|d| !d.features.is_empty()) {
-                // Extract JSON objects embedded in binary frames. Apps like
-                // Meta AI wrap JSON inside a custom binary envelope (not
-                // standard protobuf). Scan for '{' and try to parse JSON.
-                let json_objects = extract_json_from_binary(&chunk.payload);
-                for trimmed in &json_objects {
-                    if !trimmed.is_empty() {
-                        let json_bytes = trimmed.as_bytes();
-                        let sse = extract_all_from_sse_lines(
-                            json_bytes,
-                            session.model.is_none(),
-                            descriptor,
-                        );
-                        if let Some(model) = sse.model {
-                            session.model = Some(model);
-                        }
-                        if let Some(usage) = sse.usage {
-                            session.last_usage = Some(usage);
-                        }
-                        let got_finish = sse.finish_reason.is_some();
-                        if let Some(fr) = sse.finish_reason {
-                            session.last_finish_reason = Some(fr);
-                        }
-                        if session.stream_prompt.is_none() {
-                            if let Some(prompt) = sse.prompt {
-                                session.stream_prompt = Some(prompt);
-                            }
-                        }
-                        if let Some(delta) = sse.delta {
-                            session.accumulate(delta);
-                        }
-                        // Emit TurnCompleted on finish for long-lived connections
-                        if got_finish && descriptor.is_some_and(|d| {
-                            d.features.iter().any(|f| f.protocol == "websocket")
-                        }) {
-                            let usage = session.last_usage.take().unwrap_or_default();
-                            let model = session.model.clone();
-                            session.turns_emitted += 1;
-                            return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
-                                connection_id: session.connection_id,
-                                model,
-                                usage,
-                                turn_number: session.turns_emitted,
-                            }));
-                        }
-                    }
-                }
-                // Also try raw text for non-binary frames
-                if json_objects.is_empty() {
-                    if let Ok(text) = std::str::from_utf8(&chunk.payload) {
-                        if !text.trim().is_empty() && text.trim().starts_with('{') {
-                            let sse = extract_all_from_sse_lines(
-                                text.as_bytes(),
-                                session.model.is_none(),
-                                descriptor,
-                            );
-                            if let Some(model) = sse.model {
-                                session.model = Some(model);
-                            }
-                            if let Some(delta) = sse.delta {
-                                session.accumulate(delta);
-                            }
-                        }
-                    }
+                if let Some(event) =
+                    process_binary_ws_payload(&chunk.payload, session, descriptor, chunk.direction)
+                {
+                    return Some(event);
                 }
             } else if looks_like_protobuf_payload(&chunk.payload) {
                 if let Some(delta) = parse_grpc_chunk_payload(
@@ -354,11 +454,19 @@ pub fn process_chunk_with_bundle(
             },
         );
         if !artifacts.is_empty() {
+            // Credential wins over request event — safety trumps dev verify.
+            session.pending_request_event.take();
             return Some(ChunkEvent::Artifact(ChunkArtifact {
                 sequence: chunk.sequence,
                 artifacts,
             }));
         }
+    }
+
+    // Drain any pending request event staged by a client-frame prompt
+    // extraction earlier in this chunk.
+    if let Some(req) = session.pending_request_event.take() {
+        return Some(ChunkEvent::TurnRequest(req));
     }
 
     None
@@ -540,11 +648,257 @@ fn extract_all_from_sse_lines(
     result
 }
 
+/// Run stream rules against a binary-encoded WebSocket frame.  Handles two
+/// shapes: (a) pure protobuf — the rules engine calls `scan_proto_strings`
+/// via its `is_protobuf` branch; (b) PROTO_INSIDE_JSON (Meta AI) — the
+/// rules engine extracts embedded JSON and applies the configured rules.
+///
+/// Called from both `FrameKind::WebSocketBinary` and from
+/// `FrameKind::WebSocketText` when the payload fails UTF-8 (some servers
+/// send binary data on text opcodes).  Returns a `ChunkEvent::TurnCompleted`
+/// when a `finish_reason` rule fires on a websocket feature.
+fn process_binary_ws_payload(
+    payload: &[u8],
+    session: &mut crate::types::StreamSession,
+    descriptor: Option<&RestFormatDescriptor>,
+    direction: Option<FrameDirection>,
+) -> Option<ChunkEvent> {
+    // ── CLIENT → SERVER ─────────────────────────────────────────────────
+    // Client frames carry the user prompt.  Apps like Meta AI don't
+    // declare request-side rules in the bundle, so run the rules engine
+    // *and* a field-name heuristic to find a prompt string and stage a
+    // STREAM TURN REQUEST event.  Always re-stage on each client frame so
+    // multi-turn conversations update the prompt per turn.
+    if direction == Some(FrameDirection::ClientToServer) {
+        let sse = extract_all_from_sse_lines(payload, session.model.is_none(), descriptor);
+        let prompt = sse
+            .prompt
+            .or_else(|| heuristic_client_prompt_from_binary(payload));
+        if let Some(p) = prompt {
+            set_stream_prompt_and_signal(session, p);
+        }
+        return None;
+    }
+
+    // ── SERVER → CLIENT (or unknown direction) ──────────────────────────
+    let sse = extract_all_from_sse_lines(payload, session.model.is_none(), descriptor);
+    eprintln!("[DBG-META] binary_ws server frame, fmt={:?}, sse.finish_reason={:?}, sse.delta_len={:?}, payload_len={}", session.format_name, sse.finish_reason, sse.delta.as_ref().map(|s| s.len()), payload.len());
+    if let Some(model) = sse.model {
+        session.model = Some(model);
+    }
+    if let Some(usage) = sse.usage {
+        session.last_usage = Some(usage);
+    }
+    let got_finish = sse.finish_reason.is_some();
+    if let Some(fr) = sse.finish_reason {
+        session.last_finish_reason = Some(fr);
+    }
+    if session.stream_prompt.is_none() {
+        if let Some(prompt) = sse.prompt {
+            set_stream_prompt_and_signal(session, prompt);
+        }
+    }
+    if let Some(delta) = sse.delta {
+        session.accumulate(delta);
+    }
+    if got_finish
+        && descriptor.is_some_and(|d| d.features.iter().any(|f| f.protocol == "websocket"))
+    {
+        eprintln!("[DBG-META] emit@binary_ws got_finish path, fmt={:?}, turn_will_be={}", session.format_name, session.turns_emitted + 1);
+        let usage = session.last_usage.take().unwrap_or_default();
+        let model = session.model.clone();
+        session.turns_emitted += 1;
+        let turn_number = session.turns_emitted;
+        let connection_id = session.connection_id;
+        let (prompt, content) = take_session_turn_payload(session, MAX_TURN_PAYLOAD_BYTES);
+        return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
+            connection_id,
+            model,
+            usage,
+            turn_number,
+            prompt,
+            content,
+        }));
+    }
+    None
+}
+
+/// Heuristic: find a user prompt inside the embedded JSON of a binary
+/// client frame.  Used as a fallback when the format has no request-side
+/// prompt rule (e.g. Meta AI's Clippy WS).  Walks each embedded JSON object
+/// and returns the first non-empty string at a field name commonly used
+/// for user input.
+fn heuristic_client_prompt_from_binary(payload: &[u8]) -> Option<String> {
+    const PROMPT_FIELDS: &[&str] = &[
+        "message", "prompt", "text", "query", "input", "content", "user_input", "user_message",
+        "question",
+    ];
+
+    // Pass 1: look inside embedded JSON for a likely prompt field by name.
+    // Also handle the Meta AI envelope `{"req-id":..., "payload":"<b64>"}`
+    // where the real prompt lives inside a base64-encoded protobuf blob.
+    for json_str in extract_json_from_binary(payload) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+            continue;
+        };
+        if let Some(found) = find_prompt_in_value(&value, PROMPT_FIELDS) {
+            return Some(found);
+        }
+        // Meta AI envelope: base64-decode `payload` and filter proto strings.
+        if let Some(serde_json::Value::String(b64_payload)) = value.get("payload") {
+            if let Some(found) = prompt_from_meta_ai_payload(b64_payload) {
+                return Some(found);
+            }
+        }
+    }
+    // Pass 2: pure-protobuf fallback — scan length-delimited string fields
+    // and pick the longest readable one, filtering out noise.
+    let strings = soth_parse::proto::scan_proto_strings(payload);
+    pick_user_prompt_from_proto_strings(&strings)
+}
+
+/// Meta AI Clippy wraps the client-side request as
+/// `{"req-id": "...", "payload": "<base64 protobuf>"}`.  Base64-decode the
+/// payload and pull the user's typed message out of the inner protobuf by
+/// scanning length-delimited string fields and filtering noise.
+fn prompt_from_meta_ai_payload(b64: &str) -> Option<String> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let strings = soth_parse::proto::scan_proto_strings(&decoded);
+    pick_user_prompt_from_proto_strings(&strings)
+}
+
+/// Noise filter for proto-scanned strings.  Strips UUIDs, pure numerics,
+/// user agents, locale / timezone strings, file hashes, and known Meta AI
+/// system enum values so the remaining short strings surface the actual
+/// user prompt.
+fn pick_user_prompt_from_proto_strings(strings: &[(u32, String)]) -> Option<String> {
+    fn looks_like_uuid(s: &str) -> bool {
+        let s = s.trim_start_matches('$');
+        let bytes = s.as_bytes();
+        bytes.len() >= 32
+            && bytes.iter().filter(|b| **b == b'-').count() >= 4
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_hexdigit() || *b == b'-')
+    }
+    fn looks_like_hash(s: &str) -> bool {
+        s.len() >= 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+    }
+    fn looks_like_numeric_id(s: &str) -> bool {
+        s.len() >= 6 && s.chars().all(|c| c.is_ascii_digit())
+    }
+    fn is_all_caps_enum(s: &str) -> bool {
+        // Matches strings like KADABRA__CHAT__UNIFIED_INPUT_BAR, HUMAN_AGENT, ECTO1.
+        s.len() >= 3
+            && s.chars().all(|c| {
+                c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'
+            })
+    }
+    const BLACKLIST_SUBSTRINGS: &[&str] = &[
+        "Mozilla",
+        "AppleWebKit",
+        "Mac OS",
+        "Windows NT",
+        "Linux",
+        "Chrome/",
+        "Safari/",
+        "Firefox/",
+        "user_input",
+        "desktop_web",
+        "mobile_web",
+        "Asia/",
+        "America/",
+        "Europe/",
+        "Africa/",
+        "en-GB",
+        "en-US",
+        "meta_knowledge",
+        "meta_catalog",
+        "media_gallery",
+        "Abra Web",
+        "stocks",
+        "weather",
+    ];
+
+    // Collect candidates that survive the filters.  Meta AI places the
+    // actual prompt near the end of the protobuf, so walk in reverse and
+    // return the first survivor — that's almost always the user text.
+    for (_field, s) in strings.iter().rev() {
+        let trimmed = s.trim().trim_matches('"').trim_matches('$');
+        if trimmed.len() < 2 {
+            continue;
+        }
+        if looks_like_uuid(trimmed) || looks_like_hash(trimmed) || looks_like_numeric_id(trimmed) {
+            continue;
+        }
+        if is_all_caps_enum(trimmed) {
+            continue;
+        }
+        if BLACKLIST_SUBSTRINGS
+            .iter()
+            .any(|needle| trimmed.contains(needle))
+        {
+            continue;
+        }
+        // Skip strings that look like base64/nonces (mixed alnum, no spaces,
+        // long, no punctuation).  User prompts typically have spaces or are
+        // short and printable; fingerprint hashes are 20+ chars of mixed
+        // alnum with no spaces.
+        if trimmed.len() >= 20 && !trimmed.contains(' ') && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Recursive DFS looking for `PROMPT_FIELDS` keys with a non-empty string
+/// value.  Bounded by depth to avoid pathological payloads.
+fn find_prompt_in_value(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    fn recurse(
+        v: &serde_json::Value,
+        fields: &[&str],
+        depth: u32,
+    ) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        match v {
+            serde_json::Value::Object(map) => {
+                for key in fields {
+                    if let Some(serde_json::Value::String(s)) = map.get(*key) {
+                        if !s.trim().is_empty() {
+                            return Some(s.clone());
+                        }
+                    }
+                }
+                for (_, child) in map {
+                    if let Some(found) = recurse(child, fields, depth + 1) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let Some(found) = recurse(item, fields, depth + 1) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    recurse(value, fields, 0)
+}
+
 /// Extract JSON objects from a binary frame by scanning for `{` and
 /// attempting to parse balanced brace-delimited substrings as JSON.
 /// Used for protocols that wrap JSON inside binary envelopes (e.g. Meta AI's
 /// PROTO_INSIDE_JSON format).
-fn extract_json_from_binary(payload: &[u8]) -> Vec<String> {
+pub(crate) fn extract_json_from_binary(payload: &[u8]) -> Vec<String> {
     let mut results = Vec::new();
     let mut i = 0;
     while i < payload.len() {
