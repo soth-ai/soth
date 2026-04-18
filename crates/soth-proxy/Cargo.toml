@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["extensions"]
 dev-pipeline-trace = []
 extensions = ["dep:soth-extensions", "dep:soth-historian"]
 

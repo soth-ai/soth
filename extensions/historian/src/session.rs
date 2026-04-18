@@ -94,6 +94,24 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         metadata.insert("original_timestamp".to_string(), ts.to_string());
     }
 
+    // Tool identity — read in soth-core's from_governable() to synthesize a
+    // ProcessResolution, which the sync sender then converts into the
+    // tool_identity_key / source_class / tool_name / tool_kind / tool_category /
+    // provider_id tags that cloud analytics groups by.
+    let identity = session.tool.identity();
+    metadata.insert(
+        "tool_identity_key".to_string(),
+        identity.identity_key.to_string(),
+    );
+    metadata.insert("tool_name".to_string(), identity.tool_name.to_string());
+    metadata.insert("tool_kind".to_string(), identity.tool_kind.to_string());
+    metadata.insert(
+        "tool_category".to_string(),
+        identity.tool_category.to_string(),
+    );
+    metadata.insert("provider_id".to_string(), identity.provider_id.to_string());
+    metadata.insert("source_class".to_string(), "agent_app".to_string());
+
     let normalized = soth_core::normalized::NormalizedRequest {
         parse_confidence: soth_core::artifacts::ParseConfidence::Heuristic,
         parser_id: "historian".to_string(),
@@ -333,6 +351,52 @@ mod tests {
         assert_eq!(meta.get("is_historical").unwrap(), "true");
         assert_eq!(meta.get("data_source").unwrap(), "historian_claude_code");
         assert_eq!(meta.get("original_timestamp").unwrap(), "1700000000000");
+    }
+
+    #[test]
+    fn reconstruct_sets_tool_identity_metadata_for_claude_code() {
+        let event = reconstruct_event(&sample_session());
+        let meta = &event.context.metadata;
+        assert_eq!(meta.get("tool_identity_key").unwrap(), "claude-code");
+        assert_eq!(meta.get("tool_name").unwrap(), "Claude Code");
+        assert_eq!(meta.get("tool_kind").unwrap(), "cli");
+        assert_eq!(meta.get("tool_category").unwrap(), "CLI Tool");
+        assert_eq!(meta.get("provider_id").unwrap(), "anthropic");
+        assert_eq!(meta.get("source_class").unwrap(), "agent_app");
+    }
+
+    #[test]
+    fn reconstruct_sets_tool_identity_metadata_for_cursor() {
+        let mut session = sample_session();
+        session.tool = AiTool::Cursor;
+        let event = reconstruct_event(&session);
+        let meta = &event.context.metadata;
+        assert_eq!(meta.get("tool_identity_key").unwrap(), "cursor");
+        assert_eq!(meta.get("tool_name").unwrap(), "Cursor");
+        assert_eq!(meta.get("tool_kind").unwrap(), "ide");
+        assert_eq!(meta.get("provider_id").unwrap(), "anthropic");
+    }
+
+    #[test]
+    fn from_governable_synthesizes_process_resolution_from_metadata() {
+        // End-to-end: metadata written here must be readable by soth-core's
+        // TelemetryEvent::from_governable so the sender emits the identity
+        // tags. Guards against silent regressions of Fix 3.
+        use soth_core::classify::AppType;
+        use soth_core::TelemetryEvent;
+
+        let gov = reconstruct_event(&sample_session());
+        let telem = TelemetryEvent::from_governable(&gov, None);
+
+        let pr = telem
+            .process_resolution
+            .expect("historian event must carry ProcessResolution so sender can tag it");
+        assert_eq!(pr.matched_app_id.as_deref(), Some("claude-code"));
+        assert_eq!(pr.tool_name.as_deref(), Some("Claude Code"));
+        assert_eq!(pr.tool_kind.as_deref(), Some("cli"));
+        assert_eq!(pr.tool_category.as_deref(), Some("CLI Tool"));
+        assert_eq!(pr.provider_id.as_deref(), Some("anthropic"));
+        assert_eq!(pr.app_type, AppType::NonHost); // → "agent_app" source_class
     }
 
     #[test]

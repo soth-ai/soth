@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::artifacts::{CaptureMode, ParseConfidence, ParseSource};
-use crate::classify::{AnomalyFlag, ProcessResolution, SurfaceType, TrafficClassification};
+use crate::classify::{
+    AnomalyFlag, AppType, ProcessMatchKind, ProcessResolution, SurfaceType, TrafficClassification,
+};
 use crate::normalized::EndpointType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +132,9 @@ pub struct SensitiveCodeFlags {
     pub org_pattern_matches: Vec<String>,
     pub private_key_detected: bool,
     pub hardcoded_secret_detected: bool,
+    /// Specific secret types detected (e.g. "aws_access_key", "github_pat", "stripe_secret_key").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_secret_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +152,11 @@ pub enum DataSource {
     HistorianClaudeCode,
     HistorianGemini,
     HistorianCodex,
+    HistorianCursor,
+    HistorianGithubCopilot,
+    HistorianContinue,
+    HistorianOpenClaw,
+    HistorianUnknown,
 }
 
 impl Default for DataSource {
@@ -474,6 +484,23 @@ impl TelemetryEvent {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
+        // Synthesize a ProcessResolution from identity metadata so the sync
+        // sender emits tool_identity_key/source_class/tool_name/tool_kind/
+        // tool_category/provider_id tags for historian events — matching the
+        // tagging live-proxy events receive from process detection.
+        let process_resolution = meta.get("tool_identity_key").map(|key| ProcessResolution {
+            match_kind: ProcessMatchKind::Exact,
+            app_type: AppType::NonHost,
+            capture_mode: Some(gov.capture_mode),
+            process_name: None,
+            bundle_id: None,
+            matched_app_id: Some(key.clone()),
+            tool_name: meta.get("tool_name").cloned(),
+            tool_kind: meta.get("tool_kind").cloned(),
+            tool_category: meta.get("tool_category").cloned(),
+            provider_id: meta.get("provider_id").cloned(),
+        });
+
         Self {
             event_id: gov.event_id,
             timestamp_epoch_ms: gov.timestamp_epoch_ms,
@@ -516,6 +543,7 @@ impl TelemetryEvent {
             anomaly_score,
             complexity_score,
             topic_cluster_id,
+            process_resolution,
             ..Self::default()
         }
     }
