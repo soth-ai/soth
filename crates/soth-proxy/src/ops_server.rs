@@ -9,7 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
 
 /// State shared across all ops handler functions.
 pub struct OpsState {
@@ -27,6 +33,7 @@ pub fn build_router(state: Arc<OpsState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route("/reload", post(reload))
         .with_state(state)
 }
 
@@ -99,6 +106,19 @@ async fn metrics(State(state): State<Arc<OpsState>>) -> impl IntoResponse {
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         out,
     )
+}
+
+/// Triggers a live reload of the global DNS resolver.
+///
+/// Re-reads the system nameserver configuration and replaces the running
+/// resolver atomically. In-flight DNS queries on the old resolver complete
+/// safely via Arc refcounting; new queries use the replacement immediately.
+///
+/// Returns `200 reloaded\n` on success. The endpoint is idempotent and safe
+/// to call at any time without disrupting proxy traffic.
+async fn reload() -> impl IntoResponse {
+    soth_mitm::reload_dns_resolver(None);
+    (StatusCode::OK, "reloaded\n")
 }
 
 /// Write a single Prometheus histogram in text exposition format.

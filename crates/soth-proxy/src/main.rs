@@ -275,12 +275,37 @@ async fn main() -> Result<()> {
     let proxy = soth_mitm::MitmProxyBuilder::new(mitm_config, handler)
         .build()
         .context("build mitm proxy")?;
-    let proxy_handle = proxy.start().await.context("start mitm proxy")?;
+    let proxy_handle = match inherited_listener()? {
+        Some(listener) => {
+            info!("using inherited listener from supervisor");
+            proxy
+                .start_with_listener(listener)
+                .await
+                .context("start mitm proxy with inherited listener")?
+        }
+        None => proxy.start().await.context("start mitm proxy")?,
+    };
 
     info!("soth-proxy started; press Ctrl+C to stop");
-    tokio::signal::ctrl_c().await.context("wait for Ctrl+C")?;
 
-    info!("shutdown requested");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut usr1 = signal(SignalKind::user_defined1()).expect("listen for SIGUSR1");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("shutdown requested (Ctrl+C)");
+            }
+            _ = usr1.recv() => {
+                info!("graceful drain requested (SIGUSR1)");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("wait for Ctrl+C")?;
+        info!("shutdown requested");
+    }
     proxy_handle
         .shutdown(Duration::from_secs(30))
         .await
@@ -312,6 +337,32 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn inherited_listener() -> Result<Option<tokio::net::TcpListener>> {
+    let fd_str = match std::env::var("SOTH_LISTENER_FD") {
+        Ok(val) => val,
+        Err(_) => return Ok(None),
+    };
+    let fd: i32 = fd_str
+        .trim()
+        .parse()
+        .context("SOTH_LISTENER_FD is not a valid fd number")?;
+
+    use std::os::unix::io::FromRawFd;
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    std_listener
+        .set_nonblocking(true)
+        .context("set inherited listener to non-blocking")?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)
+        .context("convert inherited listener to tokio")?;
+    Ok(Some(listener))
+}
+
+#[cfg(not(unix))]
+fn inherited_listener() -> Result<Option<tokio::net::TcpListener>> {
+    Ok(None)
 }
 
 fn init_tracing(extension_targets: &[&str]) {

@@ -200,17 +200,35 @@ fn build_sensitive_code_flags(
                 flags.private_key_detected = true;
                 flags.hardcoded_secret_detected = true;
                 flags.credential_pattern_detected = true;
+                flags.detected_secret_types.push("private_key".to_string());
             }
             ArtifactKind::CodeBlock { .. } => {
                 flags.auth_logic_detected = true;
             }
-            ArtifactKind::ApiKey { .. }
-            | ArtifactKind::Jwt
-            | ArtifactKind::HexKey
-            | ArtifactKind::ConnectionString
-            | ArtifactKind::UnknownCredential => {
+            ArtifactKind::ApiKey { .. } => {
                 flags.credential_pattern_detected = true;
                 flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("api_key".to_string());
+            }
+            ArtifactKind::Jwt => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("jwt".to_string());
+            }
+            ArtifactKind::HexKey => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("hex_key".to_string());
+            }
+            ArtifactKind::ConnectionString => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("connection_string".to_string());
+            }
+            ArtifactKind::UnknownCredential => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("unknown_credential".to_string());
             }
             ArtifactKind::OrgPattern { pattern_id } => {
                 flags.org_pattern_matches.push(pattern_id.to_string());
@@ -221,16 +239,37 @@ fn build_sensitive_code_flags(
             ArtifactKind::CryptoOperation => {
                 flags.crypto_operations_detected = true;
             }
-            ArtifactKind::AwsAccessKey
-            | ArtifactKind::GitHubPat
-            | ArtifactKind::GitLabToken
-            | ArtifactKind::SlackToken
-            | ArtifactKind::StripeSecretKey => {
+            ArtifactKind::AwsAccessKey => {
                 flags.credential_pattern_detected = true;
                 flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("aws_access_key".to_string());
+            }
+            ArtifactKind::GitHubPat => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("github_pat".to_string());
+            }
+            ArtifactKind::GitLabToken => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("gitlab_token".to_string());
+            }
+            ArtifactKind::SlackToken => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("slack_token".to_string());
+            }
+            ArtifactKind::StripeSecretKey => {
+                flags.credential_pattern_detected = true;
+                flags.hardcoded_secret_detected = true;
+                flags.detected_secret_types.push("stripe_secret_key".to_string());
             }
         }
     }
+
+    // Deduplicate secret types (e.g. multiple API keys in one event)
+    flags.detected_secret_types.sort();
+    flags.detected_secret_types.dedup();
 
     // Gap 10: import category based flags
     for category in import_categories {

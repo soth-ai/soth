@@ -852,27 +852,98 @@ async fn check_macos_proxy_status() -> Result<bool> {
 
 #[cfg(target_os = "linux")]
 async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<bool> {
-    // Try GNOME gsettings first
+    // Try GNOME gsettings first — covers GNOME, Cinnamon, Unity, Pop_OS.
     if which::which("gsettings").is_ok() {
         configure_gnome_proxy(enable, port, print_user_output)?;
         return Ok(true);
     }
 
-    // Fall back to environment variable instructions
+    // KDE / Plasma: no generic auto-configure (kwriteconfig5/6 writes kioslaverc
+    // but KDE apps only honor it when ReversedException=false and the proxy type
+    // is set via the GUI — scripting it reliably is brittle). Print tailored
+    // manual commands and fall back to env-var configuration which KDE terminal
+    // apps inherit.
+    let kde_tool = detect_kde_config_tool();
+    if let Some(tool) = kde_tool {
+        if print_user_output {
+            print_kde_manual_instructions(enable, port, &tool);
+        }
+    }
+
+    // Env-var fallback: works for curl, wget, pip, npm, and anything that honors
+    // the standard proxy environment variables. Users on headless / server /
+    // unsupported DE hosts should rely on this.
     if print_user_output {
         if enable {
-            println!("   {} Add to your shell profile:", style::INFO);
+            println!(
+                "   {} Desktop environment auto-configure is not supported. \
+                 Add the following to your shell profile (~/.bashrc, ~/.zshrc, \
+                 /etc/environment, systemd Environment=...):",
+                style::INFO
+            );
             println!("      export https_proxy=\"http://127.0.0.1:{}\"", port);
             println!("      export HTTPS_PROXY=\"http://127.0.0.1:{}\"", port);
+            println!("      export http_proxy=\"http://127.0.0.1:{}\"", port);
+            println!("      export HTTP_PROXY=\"http://127.0.0.1:{}\"", port);
             println!("      export no_proxy=\"localhost,127.0.0.1,::1,*.local\"");
             println!("      export NO_PROXY=\"localhost,127.0.0.1,::1,*.local\"");
         } else {
             println!("   {} Remove from your shell profile:", style::INFO);
-            println!("      unset https_proxy HTTPS_PROXY no_proxy NO_PROXY");
+            println!(
+                "      unset https_proxy HTTPS_PROXY http_proxy HTTP_PROXY no_proxy NO_PROXY"
+            );
         }
     }
 
     Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn detect_kde_config_tool() -> Option<String> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .or_else(|_| std::env::var("XDG_SESSION_DESKTOP"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_kde = desktop.contains("kde") || desktop.contains("plasma");
+    if !is_kde {
+        return None;
+    }
+    // Plasma 6 renames the tool to `kwriteconfig6`; Plasma 5 uses `kwriteconfig5`.
+    for tool in ["kwriteconfig6", "kwriteconfig5"] {
+        if which::which(tool).is_ok() {
+            return Some(tool.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn print_kde_manual_instructions(enable: bool, port: u16, tool: &str) {
+    println!(
+        "   {} Detected KDE Plasma. Run the following to toggle system proxy:",
+        style::INFO
+    );
+    if enable {
+        println!("      {tool} --file kioslaverc --group \"Proxy Settings\" --key ProxyType 1");
+        println!(
+            "      {tool} --file kioslaverc --group \"Proxy Settings\" --key httpsProxy \
+             \"http://127.0.0.1:{port}\""
+        );
+        println!(
+            "      {tool} --file kioslaverc --group \"Proxy Settings\" --key httpProxy \
+             \"http://127.0.0.1:{port}\""
+        );
+        println!(
+            "      {tool} --file kioslaverc --group \"Proxy Settings\" --key NoProxyFor \
+             \"localhost,127.0.0.1,::1,*.local\""
+        );
+    } else {
+        println!("      {tool} --file kioslaverc --group \"Proxy Settings\" --key ProxyType 0");
+    }
+    println!(
+        "   {} After running, restart KDE apps to pick up the change (or log out/in).",
+        style::INFO
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -307,6 +307,11 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
                     .classification_flags
                     .contains(&ClassificationFlag::CredentialDetected),
         ),
+        detected_secret_types: if event.sensitive_code_flags.detected_secret_types.is_empty() {
+            None
+        } else {
+            Some(event.sensitive_code_flags.detected_secret_types.clone())
+        },
         endpoint_hash: if event.endpoint_hash.is_empty() {
             None
         } else {

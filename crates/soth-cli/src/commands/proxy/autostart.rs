@@ -521,14 +521,49 @@ fn ensure_windows_run_key(exe: &Path, args: &[String]) -> Result<String> {
 
 #[cfg(target_os = "windows")]
 fn windows_quote_arg(value: &str) -> String {
+    // Follows the CommandLineToArgvW rules documented at
+    // https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-commandlinetoargvw
+    //
+    // Key rules:
+    //   * 2n backslashes + `"` → n backslashes + begin/end quote
+    //   * 2n+1 backslashes + `"` → n backslashes + literal `"`
+    //   * Trailing backslashes before the closing `"` must also be doubled.
     if value.is_empty() {
         return "\"\"".to_string();
     }
-    if !value.contains([' ', '\t', '"']) {
+    if !value.contains([' ', '\t', '\n', '\x0B', '"']) {
         return value.to_string();
     }
-    let escaped = value.replace('"', "\\\"");
-    format!("\"{escaped}\"")
+
+    let mut result = String::with_capacity(value.len() + 2);
+    result.push('"');
+    let mut backslashes = 0usize;
+    for c in value.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Escape any backslashes preceding the quote (double them) and the quote itself.
+                for _ in 0..(2 * backslashes + 1) {
+                    result.push('\\');
+                }
+                result.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    result.push('\\');
+                }
+                backslashes = 0;
+                result.push(c);
+            }
+        }
+    }
+    // Double any trailing backslashes before the closing quote.
+    for _ in 0..(2 * backslashes) {
+        result.push('\\');
+    }
+    result.push('"');
+    result
 }
 
 #[cfg(test)]
@@ -549,5 +584,39 @@ mod tests {
         let escaped = systemd_escape_arg("/tmp/soth path/bin");
         assert!(escaped.starts_with('"'));
         assert!(escaped.ends_with('"'));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_quote_handles_simple_path() {
+        assert_eq!(windows_quote_arg("C:\\soth\\bin.exe"), "C:\\soth\\bin.exe");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_quote_handles_spaces() {
+        assert_eq!(
+            windows_quote_arg("C:\\Program Files\\soth\\bin.exe"),
+            "\"C:\\Program Files\\soth\\bin.exe\""
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_quote_doubles_trailing_backslashes() {
+        // "C:\\path with space\\" → "\"C:\\path with space\\\\\""
+        assert_eq!(
+            windows_quote_arg("C:\\path with space\\"),
+            "\"C:\\path with space\\\\\""
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_quote_escapes_embedded_quote() {
+        // a"b → "a\"b"
+        assert_eq!(windows_quote_arg("a\"b"), "\"a\\\"b\"");
+        // a\"b → "a\\\"b"   (the `\` before `"` is doubled + quote escaped)
+        assert_eq!(windows_quote_arg("a\\\"b"), "\"a\\\\\\\"b\"");
     }
 }

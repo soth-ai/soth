@@ -11,6 +11,24 @@ mod start;
 mod status;
 mod system;
 
+/// Apply `CREATE_NO_WINDOW` to a `std::process::Command` on Windows so that
+/// spawned helper processes (tasklist, reg, certutil, openssl, etc.) don't
+/// briefly flash a console window during proxy lifecycle operations.
+/// No-op on non-Windows platforms.
+#[inline]
+pub(crate) fn hide_console_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};

@@ -72,11 +72,35 @@ pub async fn run(
             );
         }
     }
+    #[cfg(windows)]
+    {
+        // Idempotently re-apply the restrictive ACL on the CA private key at startup.
+        // This repairs drift if something loosened it post-install and is a no-op when
+        // the ACL is already correct.
+        if let Err(error) = reapply_windows_key_acl(&key_path) {
+            tracing::warn!(
+                path = %key_path.display(),
+                error = %error,
+                "failed to re-apply restrictive ACL on CA private key; key may be readable by other local users"
+            );
+        }
+    }
     ensure_ca_runtime_health(&ca_paths, quiet)?;
 
     let generated_path = write_proxy_config(&config, port)?;
     let expected_port = port.unwrap_or(config.forward_proxy.port);
-    let mut child = spawn_proxy_process(generated_path.as_path())
+
+    #[cfg(unix)]
+    let _supervisor_listener = bind_supervisor_listener(&config.forward_proxy.address, expected_port)?;
+    #[cfg(unix)]
+    let listener_fd = Some({
+        use std::os::unix::io::AsRawFd;
+        _supervisor_listener.as_raw_fd()
+    });
+    #[cfg(not(unix))]
+    let listener_fd: Option<i32> = None;
+
+    let mut child = spawn_proxy_process(generated_path.as_path(), listener_fd)
         .await
         .context("spawn soth-proxy process")?;
     wait_for_listener_start(&mut child, expected_port).await?;
@@ -91,6 +115,7 @@ pub async fn run(
         generated_path.as_path(),
         expected_port,
         foreground,
+        listener_fd,
     )
     .await
 }
@@ -163,10 +188,13 @@ fn ensure_ca_runtime_health(paths: &super::ca_health::ResolvedCaPaths, quiet: bo
     Ok(())
 }
 
-async fn spawn_proxy_process(config_path: &Path) -> Result<Child> {
+async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Result<Child> {
     let proxy_bin = resolve_proxy_binary()?;
     let mut cmd = Command::new(proxy_bin);
     cmd.env("SOTH_PROXY_CONFIG", config_path);
+    if let Some(fd) = listener_fd {
+        cmd.env("SOTH_LISTENER_FD", fd.to_string());
+    }
     // Propagate RUST_LOG so user overrides reach the proxy subprocess.
     if let Ok(rust_log) = std::env::var("RUST_LOG") {
         cmd.env("RUST_LOG", rust_log);
@@ -190,6 +218,7 @@ async fn supervise_proxy(
     config_path: &Path,
     expected_port: u16,
     foreground: bool,
+    listener_fd: Option<i32>,
 ) -> Result<()> {
     let mut consecutive_failures: u32 = 0;
     let mut last_healthy = Instant::now();
@@ -206,6 +235,24 @@ async fn supervise_proxy(
             }
             ProxyExit::ChildExited(status) => {
                 warn!("soth-proxy exited with status {status}");
+            }
+            ProxyExit::Reload => {
+                info!("SIGHUP received — performing graceful child rotation");
+                let mut new_child = spawn_proxy_process(config_path, listener_fd)
+                    .await
+                    .context("spawn new soth-proxy for graceful rotation")?;
+                if let Err(error) = wait_for_listener_start(&mut new_child, expected_port).await {
+                    warn!(error = %error, "new proxy child failed to start; keeping old child");
+                    let _ = terminate_child(&mut new_child).await;
+                    continue;
+                }
+                info!("new proxy child healthy — draining old child");
+                graceful_stop_child(child).await?;
+                *child = new_child;
+                last_healthy = Instant::now();
+                consecutive_failures = 0;
+                info!("graceful child rotation complete");
+                continue;
             }
             ProxyExit::Unhealthy => {
                 warn!(
@@ -241,7 +288,7 @@ async fn supervise_proxy(
         );
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
 
-        *child = spawn_proxy_process(config_path)
+        *child = spawn_proxy_process(config_path, listener_fd)
             .await
             .context("respawn soth-proxy process")?;
         if let Err(error) = wait_for_listener_start(child, expected_port).await {
@@ -261,6 +308,7 @@ enum ProxyExit {
     Signal,
     ChildExited(std::process::ExitStatus),
     Unhealthy,
+    Reload,
 }
 
 async fn wait_until_exit_or_unhealthy(
@@ -287,6 +335,7 @@ async fn wait_until_exit_or_unhealthy(
             use tokio::signal::unix::{signal, SignalKind};
             let mut term = signal(SignalKind::terminate()).expect("listen for SIGTERM");
             let mut interrupt = signal(SignalKind::interrupt()).expect("listen for SIGINT");
+            let mut hangup = signal(SignalKind::hangup()).expect("listen for SIGHUP");
             tokio::select! {
                 status = child.wait() => {
                     ProxyExit::ChildExited(status.unwrap_or_else(|_| {
@@ -295,6 +344,7 @@ async fn wait_until_exit_or_unhealthy(
                 }
                 _ = term.recv() => ProxyExit::Signal,
                 _ = interrupt.recv() => ProxyExit::Signal,
+                _ = hangup.recv() => ProxyExit::Reload,
                 _ = &mut health_monitor => ProxyExit::Unhealthy,
             }
         }
@@ -316,6 +366,35 @@ async fn terminate_child(child: &mut Child) -> Result<()> {
     let _ = child.start_kill();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
     Ok(())
+}
+
+/// Sends SIGUSR1 to the child to trigger graceful shutdown (stop accepting,
+/// drain in-flight connections), then waits up to 30 seconds for exit.
+/// Falls back to SIGKILL if the child doesn't exit in time.
+#[cfg(unix)]
+async fn graceful_stop_child(child: &mut Child) -> Result<()> {
+    if let Some(pid) = child.id() {
+        // SIGUSR1 tells soth-proxy to stop accepting and drain in-flight connections.
+        unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
+    }
+    match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(status)) => {
+            info!(status = %status, "old proxy child exited after drain");
+        }
+        Ok(Err(error)) => {
+            warn!(error = %error, "error waiting for old proxy child");
+        }
+        Err(_) => {
+            warn!("old proxy child did not exit within 30s drain window; killing");
+            let _ = terminate_child(child).await;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn graceful_stop_child(child: &mut Child) -> Result<()> {
+    terminate_child(child).await
 }
 
 async fn wait_for_listener_start(child: &mut Child, port: u16) -> Result<()> {
@@ -653,6 +732,24 @@ fn resolve_proxy_binary() -> Result<PathBuf> {
     which::which("soth-proxy").context("could not locate `soth-proxy` executable")
 }
 
+#[cfg(unix)]
+fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpListener> {
+    let addr = format!("{address}:{port}");
+    let listener = std::net::TcpListener::bind(&addr)
+        .with_context(|| format!("supervisor: failed to bind listener on {addr}"))?;
+    // Clear FD_CLOEXEC so the child process inherits this socket.
+    use std::os::unix::io::AsRawFd;
+    let fd = listener.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        }
+    }
+    info!(bind = %addr, fd, "supervisor bound listener");
+    Ok(listener)
+}
+
 fn parse_env_u64(key: &str) -> Option<u64> {
     env::var(key).ok()?.trim().parse::<u64>().ok()
 }
@@ -723,6 +820,34 @@ fn ensure_fd_budget() {
 
 #[cfg(not(unix))]
 fn ensure_fd_budget() {}
+
+#[cfg(windows)]
+fn reapply_windows_key_acl(path: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let username = std::env::var("USERNAME").context("USERNAME env var not set")?;
+    if username.is_empty() {
+        anyhow::bail!("USERNAME env var is empty");
+    }
+    let grant = format!("{username}:F");
+
+    let output = Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", grant.as_str()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed to spawn icacls")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "icacls failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize)]
 struct GeneratedProxyConfig {
