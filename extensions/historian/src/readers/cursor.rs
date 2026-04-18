@@ -17,8 +17,23 @@ use crate::types::{AiTool, Cursor, HistoricalMessage, HistoricalSession};
 /// Cursor stores all composer conversations in:
 /// `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
 ///
-/// The `cursorDiskKV` table holds JSON blobs keyed `composerData:<uuid>`.
-/// Each blob encodes a full conversation with typed bubbles (1=user, 2=assistant).
+/// ## Storage format (v14+)
+///
+/// The `cursorDiskKV` table uses a split-row layout:
+///
+/// - `composerData:<composerId>` — session metadata with an ordered
+///   `fullConversationHeadersOnly` array of `{bubbleId, type}` entries
+///   and a `createdAt` epoch-ms timestamp.
+///
+/// - `bubbleId:<composerId>:<bubbleId>` — individual messages, each with
+///   `type` (1=user, 2=assistant), `text`, `createdAt` (ISO 8601), and
+///   optional `tokenCount`.
+///
+/// ## Legacy format (pre-v14)
+///
+/// Older Cursor versions stored an inline `conversation` array inside the
+/// `composerData:` row.  The reader tries the v14+ layout first and falls
+/// back to the legacy inline format for backward compatibility.
 ///
 /// Opens the database read-only. If the WAL is locked by the running Cursor
 /// process we skip and retry on the next cycle rather than blocking.
@@ -77,27 +92,6 @@ impl CursorReader {
         None
     }
 
-    /// Canonical macOS path, resolved from the real home directory.
-    ///
-    /// Useful for callers that want to check the live Cursor installation
-    /// without going through the `detect` / root-resolution path.
-    #[allow(dead_code)]
-    fn default_db_path() -> Option<PathBuf> {
-        let home = dirs::home_dir()?;
-        let path = home
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
-            .join("User")
-            .join("globalStorage")
-            .join("state.vscdb");
-        if path.exists() {
-            Some(path)
-        } else {
-            None
-        }
-    }
-
     fn open_readonly(db_path: &Path) -> Result<Connection, ReaderError> {
         let conn = Connection::open_with_flags(
             db_path,
@@ -121,18 +115,59 @@ impl CursorReader {
 // Wire types for JSON deserialization
 // ---------------------------------------------------------------------------
 
+/// Session metadata stored at `composerData:<id>`.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ComposerData {
     composer_id: String,
     #[serde(default)]
     created_at: Option<i64>,
+    /// v14+: ordered list of bubble headers (no text).
     #[serde(default)]
-    conversation: Vec<ComposerBubble>,
+    full_conversation_headers_only: Vec<BubbleHeader>,
+    /// Legacy (pre-v14): inline conversation with text.
+    #[serde(default)]
+    conversation: Vec<LegacyBubble>,
+}
+
+/// Bubble header in `fullConversationHeadersOnly`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BubbleHeader {
+    bubble_id: String,
+    /// 1 = user, 2 = assistant.
+    #[serde(rename = "type")]
+    bubble_type: u8,
+}
+
+/// Individual bubble stored at `bubbleId:<composerId>:<bubbleId>`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BubbleData {
+    /// 1 = user, 2 = assistant.
+    #[serde(rename = "type")]
+    bubble_type: u8,
+    #[serde(default)]
+    text: Option<String>,
+    /// ISO 8601 timestamp (e.g. "2026-04-16T08:52:53.967Z").
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    token_count: Option<TokenCount>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ComposerBubble {
+#[serde(rename_all = "camelCase")]
+struct TokenCount {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+/// Legacy inline bubble (pre-v14).
+#[derive(Debug, serde::Deserialize)]
+struct LegacyBubble {
     /// 1 = user, 2 = assistant.
     #[serde(rename = "type")]
     bubble_type: u8,
@@ -140,18 +175,23 @@ struct ComposerBubble {
     text: Option<String>,
 }
 
-impl ComposerBubble {
-    fn role(&self) -> &'static str {
-        match self.bubble_type {
-            1 => "user",
-            2 => "assistant",
-            _ => "unknown",
-        }
+fn role_from_type(bubble_type: u8) -> &'static str {
+    match bubble_type {
+        1 => "user",
+        2 => "assistant",
+        _ => "unknown",
     }
 }
 
+/// Parse an ISO 8601 timestamp string to epoch milliseconds.
+fn parse_iso_to_epoch_ms(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 // ---------------------------------------------------------------------------
-// Core query logic (pure fn, no self borrow — easier to test)
+// Core query logic
 // ---------------------------------------------------------------------------
 
 fn read_cursor_sessions(
@@ -160,7 +200,7 @@ fn read_cursor_sessions(
 ) -> Result<(Vec<HistoricalSession>, Option<i64>), ReaderError> {
     let conn = CursorReader::open_readonly(db_path)?;
 
-    // Verify the expected table exists; surface a clear error if it does not.
+    // Verify the expected table exists.
     let table_exists: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cursorDiskKV'",
@@ -177,6 +217,7 @@ fn read_cursor_sessions(
         });
     }
 
+    // Read all composerData rows.
     let where_clause = if let Some(rowid) = since_rowid {
         format!("WHERE key LIKE 'composerData:%' AND rowid > {rowid}")
     } else {
@@ -220,28 +261,25 @@ fn read_cursor_sessions(
             }
         };
 
-        let mut messages: Vec<HistoricalMessage> = Vec::new();
-        for bubble in &data.conversation {
-            let text = match bubble.text.as_deref() {
-                Some(t) if !t.is_empty() => t.to_string(),
-                _ => continue, // skip null / empty bubbles
-            };
-
-            let token_estimate = estimate_tokens(&text);
-            messages.push(HistoricalMessage {
-                role: bubble.role().to_string(),
-                content: text,
-                timestamp: data.created_at,
-                token_estimate,
-            });
-        }
+        let messages = if !data.full_conversation_headers_only.is_empty() {
+            // v14+ format: fetch individual bubble rows.
+            read_bubbles_v14(&conn, &data)?
+        } else if !data.conversation.is_empty() {
+            // Legacy format: inline conversation array.
+            read_bubbles_legacy(&data)
+        } else {
+            Vec::new()
+        };
 
         if messages.is_empty() {
             continue;
         }
 
-        let started_at = data.created_at;
-        let ended_at = data.created_at;
+        // Derive session timestamps from messages if available.
+        let first_ts = messages.first().and_then(|m| m.timestamp);
+        let last_ts = messages.last().and_then(|m| m.timestamp);
+        let started_at = first_ts.or(data.created_at);
+        let ended_at = last_ts.or(data.created_at);
 
         sessions.push(HistoricalSession {
             tool: AiTool::Cursor,
@@ -258,6 +296,87 @@ fn read_cursor_sessions(
     Ok((sessions, max_rowid))
 }
 
+/// v14+ format: read individual bubble rows keyed as
+/// `bubbleId:<composerId>:<bubbleId>`.  The order comes from
+/// `fullConversationHeadersOnly` in the composerData row.
+fn read_bubbles_v14(
+    conn: &Connection,
+    data: &ComposerData,
+) -> Result<Vec<HistoricalMessage>, ReaderError> {
+    let mut messages = Vec::new();
+
+    for header in &data.full_conversation_headers_only {
+        let key = format!("bubbleId:{}:{}", data.composer_id, header.bubble_id);
+
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let Some(json_str) = value else {
+            continue;
+        };
+
+        let bubble: BubbleData = match serde_json::from_str(&json_str) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(err = %e, key = %key, "cursor: skipping unparseable bubble");
+                continue;
+            }
+        };
+
+        let text = match bubble.text.as_deref() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => continue,
+        };
+
+        let timestamp = bubble
+            .created_at
+            .as_deref()
+            .and_then(parse_iso_to_epoch_ms)
+            .or(data.created_at);
+
+        let token_estimate = bubble
+            .token_count
+            .as_ref()
+            .map(|tc| tc.input_tokens + tc.output_tokens)
+            .filter(|&t| t > 0)
+            .unwrap_or_else(|| estimate_tokens(&text) as u32);
+
+        messages.push(HistoricalMessage {
+            role: role_from_type(bubble.bubble_type).to_string(),
+            content: text,
+            timestamp,
+            token_estimate,
+        });
+    }
+
+    Ok(messages)
+}
+
+/// Legacy (pre-v14) format: inline `conversation` array in composerData.
+fn read_bubbles_legacy(data: &ComposerData) -> Vec<HistoricalMessage> {
+    let mut messages = Vec::new();
+    for bubble in &data.conversation {
+        let text = match bubble.text.as_deref() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => continue,
+        };
+
+        let token_estimate = estimate_tokens(&text) as u32;
+        messages.push(HistoricalMessage {
+            role: role_from_type(bubble.bubble_type).to_string(),
+            content: text,
+            timestamp: data.created_at,
+            token_estimate,
+        });
+    }
+    messages
+}
+
 // ---------------------------------------------------------------------------
 // FormatReader impl
 // ---------------------------------------------------------------------------
@@ -268,12 +387,6 @@ impl FormatReader for CursorReader {
         AiTool::Cursor
     }
 
-    /// Returns `true` when a `state.vscdb` file is reachable from `root`.
-    ///
-    /// During normal operation `root` is the user's home directory and this
-    /// resolves to `~/Library/Application Support/Cursor/…/state.vscdb`.
-    /// In tests, `root` can point directly at a temp directory that contains
-    /// the file, or at the file itself.
     fn detect(&self, root: &Path) -> bool {
         CursorReader::resolve_db_path(root).is_some()
     }
@@ -285,7 +398,6 @@ impl FormatReader for CursorReader {
     ) -> Pin<Box<dyn Stream<Item = Result<HistoricalSession, ReaderError>> + Send + '_>> {
         let root = root.to_path_buf();
 
-        // Snapshot the last rowid before we move into the async block.
         let since_rowid = self.cursor.lock().unwrap().as_ref().and_then(|c| match c {
             Cursor::SqliteRowId { last_rowid, .. } => Some(*last_rowid),
             _ => None,
@@ -345,7 +457,7 @@ mod tests {
     use tokio_stream::StreamExt;
 
     /// Create a `state.vscdb` with the `cursorDiskKV` schema and the supplied
-    /// composer rows. Returns the path to the database file.
+    /// rows. Returns the path to the database file.
     fn create_cursor_db(dir: &Path, rows: &[(&str, &str)]) -> PathBuf {
         let db_path = dir.join("state.vscdb");
         let conn = Connection::open(&db_path).unwrap();
@@ -361,7 +473,42 @@ mod tests {
         db_path
     }
 
-    fn composer_json(id: &str, created_at: i64, bubbles: &[(u8, &str)]) -> String {
+    /// Build v14+ composerData JSON with fullConversationHeadersOnly.
+    fn composer_v14_json(id: &str, created_at: i64, headers: &[(u8, &str)]) -> String {
+        let fch: Vec<serde_json::Value> = headers
+            .iter()
+            .map(|(t, bid)| {
+                serde_json::json!({
+                    "bubbleId": bid,
+                    "type": t,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "_v": 14,
+            "composerId": id,
+            "createdAt": created_at,
+            "fullConversationHeadersOnly": fch,
+            "conversationMap": {},
+        })
+        .to_string()
+    }
+
+    /// Build a bubble row JSON.
+    fn bubble_json(bubble_type: u8, text: &str, created_at: &str) -> String {
+        serde_json::json!({
+            "_v": 3,
+            "type": bubble_type,
+            "bubbleId": "test-bubble",
+            "text": text,
+            "createdAt": created_at,
+            "tokenCount": { "inputTokens": 0, "outputTokens": 0 },
+        })
+        .to_string()
+    }
+
+    /// Build legacy composerData JSON with inline conversation.
+    fn composer_legacy_json(id: &str, created_at: i64, bubbles: &[(u8, &str)]) -> String {
         let conversation: Vec<serde_json::Value> = bubbles
             .iter()
             .map(|(t, text)| {
@@ -408,18 +555,137 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // read_sessions
+    // v14+ format: split bubble rows
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn reads_sessions_from_sqlite() {
+    async fn reads_v14_sessions_from_split_rows() {
+        let tmp = TempDir::new().unwrap();
+        let session_id = "session-v14";
+        let b1_id = "bubble-user-1";
+        let b2_id = "bubble-assistant-1";
+
+        create_cursor_db(
+            tmp.path(),
+            &[
+                (
+                    &format!("composerData:{session_id}"),
+                    &composer_v14_json(
+                        session_id,
+                        1732629531988,
+                        &[(1, b1_id), (2, b2_id)],
+                    ),
+                ),
+                (
+                    &format!("bubbleId:{session_id}:{b1_id}"),
+                    &bubble_json(1, "hello cursor", "2026-04-16T08:52:53.967Z"),
+                ),
+                (
+                    &format!("bubbleId:{session_id}:{b2_id}"),
+                    &bubble_json(2, "hello user!", "2026-04-16T08:52:55.123Z"),
+                ),
+            ],
+        );
+
+        let reader = CursorReader::new();
+        let mut stream = reader.read_sessions(tmp.path(), None);
+
+        let mut sessions = Vec::new();
+        while let Some(result) = stream.next().await {
+            sessions.push(result.unwrap());
+        }
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, session_id);
+        assert_eq!(sessions[0].messages.len(), 2);
+        assert_eq!(sessions[0].messages[0].role, "user");
+        assert_eq!(sessions[0].messages[0].content, "hello cursor");
+        assert_eq!(sessions[0].messages[1].role, "assistant");
+        assert_eq!(sessions[0].messages[1].content, "hello user!");
+    }
+
+    #[tokio::test]
+    async fn v14_skips_bubbles_with_empty_text() {
+        let tmp = TempDir::new().unwrap();
+        let session_id = "session-empty";
+        let b1_id = "bubble-empty";
+        let b2_id = "bubble-real";
+
+        create_cursor_db(
+            tmp.path(),
+            &[
+                (
+                    &format!("composerData:{session_id}"),
+                    &composer_v14_json(
+                        session_id,
+                        1732629531988,
+                        &[(1, b1_id), (1, b2_id)],
+                    ),
+                ),
+                (
+                    &format!("bubbleId:{session_id}:{b1_id}"),
+                    &bubble_json(1, "", "2026-04-16T08:52:53.967Z"),
+                ),
+                (
+                    &format!("bubbleId:{session_id}:{b2_id}"),
+                    &bubble_json(1, "real message", "2026-04-16T08:52:55.123Z"),
+                ),
+            ],
+        );
+
+        let reader = CursorReader::new();
+        let mut stream = reader.read_sessions(tmp.path(), None);
+        let session = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "real message");
+    }
+
+    #[tokio::test]
+    async fn v14_skips_missing_bubble_rows() {
+        let tmp = TempDir::new().unwrap();
+        let session_id = "session-missing";
+
+        // Header references a bubble that doesn't exist in DB.
+        create_cursor_db(
+            tmp.path(),
+            &[
+                (
+                    &format!("composerData:{session_id}"),
+                    &composer_v14_json(
+                        session_id,
+                        1732629531988,
+                        &[(1, "missing-bubble"), (1, "real-bubble")],
+                    ),
+                ),
+                (
+                    &format!("bubbleId:{session_id}:real-bubble"),
+                    &bubble_json(1, "I exist", "2026-04-16T08:52:53.967Z"),
+                ),
+            ],
+        );
+
+        let reader = CursorReader::new();
+        let mut stream = reader.read_sessions(tmp.path(), None);
+        let session = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "I exist");
+    }
+
+    // ------------------------------------------------------------------
+    // Legacy format: inline conversation
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reads_legacy_sessions() {
         let tmp = TempDir::new().unwrap();
         create_cursor_db(
             tmp.path(),
             &[
                 (
                     "composerData:session-1",
-                    &composer_json(
+                    &composer_legacy_json(
                         "session-1",
                         1732629531988,
                         &[(1, "hello cursor"), (2, "hello user")],
@@ -427,7 +693,7 @@ mod tests {
                 ),
                 (
                     "composerData:session-2",
-                    &composer_json("session-2", 1732629600000, &[(1, "second session")]),
+                    &composer_legacy_json("session-2", 1732629600000, &[(1, "second session")]),
                 ),
             ],
         );
@@ -441,8 +707,6 @@ mod tests {
         }
 
         assert_eq!(sessions.len(), 2);
-
-        // Sorted chronologically — session-1 has the earlier createdAt.
         assert_eq!(sessions[0].session_id, "session-1");
         assert_eq!(sessions[0].messages.len(), 2);
         assert_eq!(sessions[0].messages[0].role, "user");
@@ -452,7 +716,6 @@ mod tests {
 
         assert_eq!(sessions[1].session_id, "session-2");
         assert_eq!(sessions[1].messages.len(), 1);
-        assert_eq!(sessions[1].messages[0].role, "user");
     }
 
     #[tokio::test]
@@ -461,7 +724,6 @@ mod tests {
         create_cursor_db(
             tmp.path(),
             &[
-                // All bubbles have empty text — should be skipped entirely.
                 (
                     "composerData:empty-session",
                     &serde_json::json!({
@@ -474,10 +736,9 @@ mod tests {
                     })
                     .to_string(),
                 ),
-                // One valid session alongside the empty one.
                 (
                     "composerData:good-session",
-                    &composer_json("good-session", 1732629532000, &[(1, "real message")]),
+                    &composer_legacy_json("good-session", 1732629532000, &[(1, "real message")]),
                 ),
             ],
         );
@@ -494,35 +755,6 @@ mod tests {
         assert_eq!(sessions[0].session_id, "good-session");
     }
 
-    #[tokio::test]
-    async fn skips_null_text_bubbles() {
-        let tmp = TempDir::new().unwrap();
-        create_cursor_db(
-            tmp.path(),
-            &[(
-                "composerData:mixed",
-                &serde_json::json!({
-                    "composerId": "mixed",
-                    "createdAt": 1732629531988_i64,
-                    "conversation": [
-                        { "type": 1, "bubbleId": "b1", "text": null },
-                        { "type": 1, "bubbleId": "b2", "text": "actual message" },
-                        { "type": 2, "bubbleId": "b3", "text": "" }
-                    ]
-                })
-                .to_string(),
-            )],
-        );
-
-        let reader = CursorReader::new();
-        let mut stream = reader.read_sessions(tmp.path(), None);
-        let session = stream.next().await.unwrap().unwrap();
-
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].content, "actual message");
-        assert!(stream.next().await.is_none());
-    }
-
     // ------------------------------------------------------------------
     // cursor / incremental reads
     // ------------------------------------------------------------------
@@ -534,7 +766,7 @@ mod tests {
             tmp.path(),
             &[(
                 "composerData:s1",
-                &composer_json("s1", 1732629531988, &[(1, "hi"), (2, "hello")]),
+                &composer_legacy_json("s1", 1732629531988, &[(1, "hi"), (2, "hello")]),
             )],
         );
 
@@ -565,11 +797,11 @@ mod tests {
             &[
                 (
                     "composerData:s1",
-                    &composer_json("s1", 1732629531988, &[(1, "first")]),
+                    &composer_legacy_json("s1", 1732629531988, &[(1, "first")]),
                 ),
                 (
                     "composerData:s2",
-                    &composer_json("s2", 1732629540000, &[(1, "second")]),
+                    &composer_legacy_json("s2", 1732629540000, &[(1, "second")]),
                 ),
             ],
         );
@@ -590,7 +822,7 @@ mod tests {
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
                 rusqlite::params![
                     "composerData:s3",
-                    composer_json("s3", 1732629600000, &[(1, "third")])
+                    composer_legacy_json("s3", 1732629600000, &[(1, "third")])
                 ],
             )
             .unwrap();
@@ -608,7 +840,6 @@ mod tests {
     #[tokio::test]
     async fn returns_error_when_table_missing() {
         let tmp = TempDir::new().unwrap();
-        // Create a valid SQLite file but without cursorDiskKV.
         let db_path = tmp.path().join("state.vscdb");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY)")
@@ -632,23 +863,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timestamps_propagated_from_created_at() {
+    async fn v14_timestamps_from_bubble_created_at() {
         let tmp = TempDir::new().unwrap();
-        let ts: i64 = 1732629531988;
+        let session_id = "ts-test";
+        let b1_id = "b1";
+
         create_cursor_db(
             tmp.path(),
-            &[(
-                "composerData:ts-test",
-                &composer_json("ts-test", ts, &[(1, "msg")]),
-            )],
+            &[
+                (
+                    &format!("composerData:{session_id}"),
+                    &composer_v14_json(session_id, 1732629531988, &[(1, b1_id)]),
+                ),
+                (
+                    &format!("bubbleId:{session_id}:{b1_id}"),
+                    &bubble_json(1, "msg", "2026-04-16T08:52:53.967Z"),
+                ),
+            ],
         );
 
         let reader = CursorReader::new();
         let mut stream = reader.read_sessions(tmp.path(), None);
         let session = stream.next().await.unwrap().unwrap();
 
-        assert_eq!(session.started_at, Some(ts));
-        assert_eq!(session.ended_at, Some(ts));
-        assert_eq!(session.messages[0].timestamp, Some(ts));
+        // Bubble has its own ISO timestamp — should be used instead of composerData.createdAt.
+        assert!(session.messages[0].timestamp.is_some());
+        let ts = session.messages[0].timestamp.unwrap();
+        // 2026-04-16T08:52:53.967Z → epoch ms
+        assert!(ts > 1700000000000, "timestamp should be a reasonable epoch ms");
     }
 }

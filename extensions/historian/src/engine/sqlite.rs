@@ -8,6 +8,7 @@ use tracing::warn;
 
 use crate::error::ReaderError;
 use crate::playbook::{Playbook, PlaybookSource, RecordIterMethod, SessionIdConfig};
+use crate::session::estimate_tokens;
 use crate::types::{AiTool, Cursor, HistoricalMessage, HistoricalSession};
 
 use super::{
@@ -211,8 +212,8 @@ fn read_kv_sessions(
         // Get records array.
         let records = match &extraction.records.iterate {
             RecordIterMethod::Field { path } => match resolve_path(&doc, path) {
-                Some(serde_json::Value::Array(arr)) => arr.clone(),
-                _ => continue,
+                Some(serde_json::Value::Array(arr)) if !arr.is_empty() => arr.clone(),
+                _ => Vec::new(),
             },
             RecordIterMethod::Lines => vec![doc.clone()],
         };
@@ -226,48 +227,128 @@ fn read_kv_sessions(
             &extraction.timestamp.format,
         );
 
-        for record in &records {
-            if !passes_filters(record, &extraction.records.filters) {
-                continue;
+        if records.is_empty() {
+            // Cursor v14+ fallback: the inline records array (e.g. `conversation`)
+            // is empty. Check for `fullConversationHeadersOnly` and fetch individual
+            // bubble rows from the same table keyed as `bubbleId:<sessionId>:<bubbleId>`.
+            eprintln!("[HISTORIAN-DBG] session={session_id}: records empty, checking fullConversationHeadersOnly");
+            let fch_value = resolve_path(&doc, "fullConversationHeadersOnly");
+            eprintln!("[HISTORIAN-DBG] session={session_id}: fch_value is_some={}, is_array={}", fch_value.is_some(), matches!(fch_value, Some(serde_json::Value::Array(_))));
+            if let Some(serde_json::Value::Array(headers)) = fch_value {
+                eprintln!("[HISTORIAN-DBG] session={session_id}: headers count={}", headers.len());
+                for header in headers {
+                    let bubble_id = match header.get("bubbleId").and_then(|v| v.as_str()) {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    let bubble_key = format!("bubbleId:{session_id}:{bubble_id}");
+                    let bubble_json: Option<String> = conn
+                        .query_row(
+                            &format!("SELECT {value_column} FROM {table} WHERE key = ?1"),
+                            rusqlite::params![bubble_key],
+                            |row| row.get(0),
+                        )
+                        .ok();
+
+                    let Some(json_str) = bubble_json else {
+                        continue;
+                    };
+
+                    let Ok(bubble_doc) = serde_json::from_str::<serde_json::Value>(&json_str)
+                    else {
+                        continue;
+                    };
+
+                    let role = match extract_role(&bubble_doc, &extraction.role) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+
+                    let text = match extract_content(&bubble_doc, &extraction.content) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+
+                    // Bubble-level timestamp: try ISO 8601 `createdAt` first,
+                    // then fall back to playbook-configured field/format,
+                    // then session-level timestamp.
+                    let ts = bubble_doc
+                        .get("createdAt")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|dt| dt.timestamp_millis())
+                        })
+                        .or_else(|| {
+                            parse_timestamp(
+                                &bubble_doc,
+                                &extraction.timestamp.field,
+                                &extraction.timestamp.format,
+                            )
+                        })
+                        .or(session_ts);
+
+                    let token_estimate = extract_tokens(&bubble_doc, &extraction.tokens, &text);
+
+                    messages.push(HistoricalMessage {
+                        role,
+                        content: text,
+                        timestamp: ts,
+                        token_estimate,
+                    });
+                }
             }
+        } else {
+            for record in &records {
+                if !passes_filters(record, &extraction.records.filters) {
+                    continue;
+                }
 
-            let role = match extract_role(record, &extraction.role) {
-                Some(r) => r,
-                None => continue,
-            };
+                let role = match extract_role(record, &extraction.role) {
+                    Some(r) => r,
+                    None => continue,
+                };
 
-            let text = match extract_content(record, &extraction.content) {
-                Some(t) => t,
-                None => continue,
-            };
+                let text = match extract_content(record, &extraction.content) {
+                    Some(t) => t,
+                    None => continue,
+                };
 
-            let ts = parse_timestamp(
-                record,
-                &extraction.timestamp.field,
-                &extraction.timestamp.format,
-            )
-            .or(session_ts);
+                let ts = parse_timestamp(
+                    record,
+                    &extraction.timestamp.field,
+                    &extraction.timestamp.format,
+                )
+                .or(session_ts);
 
-            let token_estimate = extract_tokens(record, &extraction.tokens, &text);
+                let token_estimate = extract_tokens(record, &extraction.tokens, &text);
 
-            messages.push(HistoricalMessage {
-                role,
-                content: text,
-                timestamp: ts,
-                token_estimate,
-            });
+                messages.push(HistoricalMessage {
+                    role,
+                    content: text,
+                    timestamp: ts,
+                    token_estimate,
+                });
+            }
         }
 
         if messages.is_empty() {
+            eprintln!("[HISTORIAN-DBG] session={session_id}: 0 messages, skipping");
             continue;
         }
+        eprintln!("[HISTORIAN-DBG] session={session_id}: {msgs} messages extracted", msgs = messages.len());
+
+        let first_msg_ts = messages.first().and_then(|m| m.timestamp);
+        let last_msg_ts = messages.last().and_then(|m| m.timestamp);
 
         sessions.push(HistoricalSession {
             tool: tool.clone(),
             session_id,
             messages,
-            started_at: session_ts,
-            ended_at: session_ts,
+            started_at: first_msg_ts.or(session_ts),
+            ended_at: last_msg_ts.or(session_ts),
         });
     }
 

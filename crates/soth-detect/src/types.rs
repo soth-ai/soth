@@ -4,7 +4,7 @@ pub use soth_parse::types::{
     DetectWarning, DetectedFormat, DetectedImportCategory, EndpointType, FormatMeta, GqlOpType,
     HeaderMap, NormalizedRequest, ParseDetectResult, ParseError, ParseResult, ParseSource,
     ParseWarning, SensitiveArtifact, Severity, StreamSession, StreamSummary, StreamTurn,
-    StreamUsage,
+    StreamTurnRequest, StreamUsage,
 };
 
 // Transport types from soth-core — appear in soth-detect's public API signatures.

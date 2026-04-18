@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use soth_core::DetectBundleSlice;
 use soth_core::StreamChunk;
-use soth_detect::{ChunkEvent, StreamTurn};
+use soth_detect::ChunkEvent;
 use uuid::Uuid;
 
 use crate::pending::PendingCapture;
@@ -92,12 +92,14 @@ impl StreamingStore {
     }
 
     /// Process a stream chunk through soth-detect's parser layer.
-    /// Returns `Some(StreamTurn)` when a WebSocket turn completes.
+    /// Returns `Some(ChunkEvent)` for turn-completed or turn-request
+    /// events that the handler should trace/dispatch; artifact events
+    /// are merged into the session's stream_artifacts vector internally.
     pub fn on_chunk(
         &self,
         chunk: &StreamChunk,
         bundle: &DetectBundleSlice<'_>,
-    ) -> Option<StreamTurn> {
+    ) -> Option<ChunkEvent> {
         if let Some(mut state) = self.inner.get_mut(&chunk.connection_id) {
             if state.first_chunk_at.is_none() {
                 state.first_chunk_at = Some(Instant::now());
@@ -130,7 +132,9 @@ impl StreamingStore {
                 soth_detect::process_chunk_with_bundle(chunk, &mut state.detect_session, bundle)
             {
                 match event {
-                    ChunkEvent::TurnCompleted(turn) => return Some(turn),
+                    ChunkEvent::TurnCompleted(_) | ChunkEvent::TurnRequest(_) => {
+                        return Some(event);
+                    }
                     ChunkEvent::Artifact(chunk_artifact) => {
                         state.stream_artifacts.extend(chunk_artifact.artifacts);
                     }

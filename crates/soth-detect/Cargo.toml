@@ -23,6 +23,7 @@ intelligence = ["dep:rusqlite"]
 [dependencies]
 soth-core = { workspace = true }
 soth-parse = { workspace = true }
+base64 = { workspace = true }
 bytes = "1"
 lru = "0.12"
 graphql-parser = "0.4"

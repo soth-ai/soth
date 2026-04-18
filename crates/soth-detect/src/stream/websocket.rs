@@ -87,10 +87,17 @@ fn emit_turn_from_response(
     session.last_usage = None;
     session.last_finish_reason = None;
 
+    let turn_number = session.turns_emitted;
+    let connection_id = session.connection_id;
+    let (prompt, content) =
+        crate::stream::take_session_turn_payload(session, crate::stream::MAX_TURN_PAYLOAD_BYTES);
+
     Some(StreamTurn {
-        connection_id: session.connection_id,
+        connection_id,
         model,
         usage,
-        turn_number: session.turns_emitted,
+        turn_number,
+        prompt,
+        content,
     })
 }

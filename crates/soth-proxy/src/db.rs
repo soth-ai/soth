@@ -564,6 +564,12 @@ pub fn update_stream_usage(
 /// Write a lightweight per-turn record for a completed turn within a WebSocket
 /// stream.  Each `response.completed` event gets its own row so we capture
 /// model and usage even if the WebSocket connection stays open for hours.
+///
+/// Builds a real `telemetry_json` payload (TelemetryEvent-shaped) so the
+/// sync loop has something meaningful to ship to the cloud.  Includes the
+/// drained `turn.prompt` and `turn.content` from the StreamTurn so the
+/// cloud receives prompt/response previews per turn (capped via the
+/// session-side `MAX_TURN_PAYLOAD_BYTES` truncation).
 pub fn write_stream_turn(
     db: &Arc<Mutex<rusqlite::Connection>>,
     connection_id: Uuid,
@@ -578,8 +584,46 @@ pub fn write_stream_turn(
     let event_id = Uuid::new_v4().to_string();
     let model = turn.model.as_deref().unwrap_or("unknown");
     let provider = pending.detect_result.normalized.provider.as_str();
-    let capture_mode = format!("{:?}", pending.outcome.capture_mode);
+    let capture_mode_dbg = format!("{:?}", pending.outcome.capture_mode);
     let now_ms = Utc::now().timestamp_millis();
+
+    // Build a TelemetryEvent-shaped JSON payload so the sync loop can
+    // package this row into the next batch.  Schema mirrors the keys
+    // emitted by `write_intercept_record_with_conn` for HTTP requests so
+    // cloud ingestion + ClickHouse views see identical fields.
+    //
+    // The two "preview" fields (`user_prompt_preview`, `response_content_preview`)
+    // are additive — older cloud versions ignore unknown keys, newer
+    // versions can surface them in the dashboard event-detail view.
+    let telemetry_payload = serde_json::json!({
+        "event_id": event_id,
+        "timestamp_epoch_ms": now_ms,
+        "connection_id": connection_id.to_string(),
+        "provider": provider,
+        "model": turn.model,
+        "endpoint_type": "chat_completion",
+        "parse_confidence": "stream",
+        "parse_source": { "kind": "agent_app" },
+        "capture_mode": capture_mode_dbg.to_lowercase(),
+        "request_method": "ws",
+        "request_method_lower": "ws",
+        "estimated_input_tokens": turn.usage.input_tokens,
+        "estimated_output_tokens": turn.usage.output_tokens,
+        "matched_application": pending.outcome.matched_application.as_deref(),
+        "matched_provider": pending.outcome.matched_provider.as_deref(),
+        "endpoint_hash": pending.proxy_ctx.endpoint_hash.clone(),
+        "ws_turn_number": turn.turn_number,
+        "finish_reason": turn.usage.finish_reason,
+        "is_ai_call": true,
+        "data_source": "live_proxy",
+        "parser_id": "websocket-turn",
+        "policy_decision": "allow",
+        // ── per-turn content (the whole point of this fix) ────────
+        "user_prompt_preview": turn.prompt,
+        "response_content_preview": turn.content,
+    });
+    let telemetry_json =
+        serde_json::to_string(&telemetry_payload).unwrap_or_else(|_| "{}".to_string());
 
     let result = conn.execute(
         "
@@ -617,7 +661,7 @@ pub fn write_stream_turn(
             :capture_mode,
             :matched_provider,
             :matched_application,
-            '{}',
+            :telemetry_json,
             :created_at_epoch_ms
         )
         ",
@@ -630,21 +674,25 @@ pub fn write_stream_turn(
             ":endpoint_hash": pending.proxy_ctx.endpoint_hash.clone(),
             ":input_tokens": turn.usage.input_tokens as i64,
             ":output_tokens": turn.usage.output_tokens as i64,
-            ":capture_mode": capture_mode,
+            ":capture_mode": capture_mode_dbg,
             ":matched_provider": pending.outcome.matched_provider.as_deref(),
             ":matched_application": pending.outcome.matched_application.as_deref(),
+            ":telemetry_json": telemetry_json,
             ":created_at_epoch_ms": now_ms,
         },
     );
 
     match result {
         Ok(_) => {
-            tracing::debug!(
+            tracing::info!(
+                target: "soth_proxy::ws_content",
                 connection_id = %connection_id,
                 turn = turn.turn_number,
                 model = model,
                 input_tokens = turn.usage.input_tokens,
                 output_tokens = turn.usage.output_tokens,
+                prompt_bytes = turn.prompt.as_ref().map(|p| p.len()).unwrap_or(0),
+                content_bytes = turn.content.as_ref().map(|c| c.len()).unwrap_or(0),
                 "wrote websocket turn record"
             );
         }
