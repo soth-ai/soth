@@ -85,10 +85,6 @@ pub struct GateEvaluator {
     discovery_counters: Arc<Mutex<DiscoveryCounters>>,
     tls_intercept_matcher: HostMatcher,
     tls_passthrough_matcher: HostMatcher,
-    /// Dev-only: domains listed in `SOTH_DEV_FORCE_INTERCEPT` (comma-separated)
-    /// are intercepted even when they appear on the passthrough list.
-    /// Evaluated once at construction time so there is no per-request env lookup.
-    dev_force_intercept: Option<HostMatcher>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -103,29 +99,11 @@ impl GateEvaluator {
             HostMatcher::from_patterns(&bundle.gates.stage0_tls.tls_intercept_hosts);
         let tls_passthrough_matcher =
             HostMatcher::from_patterns(&bundle.gates.stage0_tls.passthrough_domains);
-
-        // SOTH_DEV_FORCE_INTERCEPT=cursor.sh,api2.cursor.sh,...
-        // Overrides the passthrough list for listed domains so devs can
-        // capture traffic from apps that the remote bundle passthroughs.
-        let dev_force_intercept = std::env::var("SOTH_DEV_FORCE_INTERCEPT")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .map(|v| {
-                let patterns: std::collections::HashSet<String> =
-                    v.split(',').map(|s| s.trim().to_string()).collect();
-                tracing::info!(
-                    patterns = ?patterns,
-                    "SOTH_DEV_FORCE_INTERCEPT active — these domains will bypass passthrough"
-                );
-                HostMatcher::from_patterns(&patterns)
-            });
-
         Self {
             bundle,
             discovery_counters: Arc::new(Mutex::new(DiscoveryCounters::default())),
             tls_intercept_matcher,
             tls_passthrough_matcher,
-            dev_force_intercept,
         }
     }
 

@@ -466,8 +466,10 @@ pub fn extract_with_stream_rules(
                 accumulator.push("content", &content);
             }
         }
-        let fr = accumulator.get("finish_reason").or_else(|| accumulator.get("stop_reason")).map(str::to_string);
-        eprintln!("[DBG-META] rules protobuf branch done, rule_matched={}, accumulator.fr={:?}, accumulator.content={:?}, accumulator.stop_reason={:?}", any_rule_matched, accumulator.get("finish_reason"), accumulator.get("content").map(|s| s.len()), accumulator.get("stop_reason"));
+        let fr = accumulator
+            .get("finish_reason")
+            .or_else(|| accumulator.get("stop_reason"))
+            .map(str::to_string);
         return RulesExtracted {
             model: accumulator.get("model").map(str::to_string),
             content: accumulator.get("content").map(str::to_string),

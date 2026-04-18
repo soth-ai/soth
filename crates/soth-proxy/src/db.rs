@@ -584,7 +584,14 @@ pub fn write_stream_turn(
     let event_id = Uuid::new_v4().to_string();
     let model = turn.model.as_deref().unwrap_or("unknown");
     let provider = pending.detect_result.normalized.provider.as_str();
-    let capture_mode_dbg = format!("{:?}", pending.outcome.capture_mode);
+    // Serde-serialize so capture_mode matches the snake_case spelling
+    // ("metadata_only", "full_content") emitted by the HTTP intercept path —
+    // a Debug+lowercase shortcut produces "metadataonly", which would split
+    // the same enum into two spellings in ClickHouse.
+    let capture_mode = serde_json::to_value(pending.outcome.capture_mode)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "unknown".to_string());
     let now_ms = Utc::now().timestamp_millis();
 
     // Build a TelemetryEvent-shaped JSON payload so the sync loop can
@@ -604,7 +611,7 @@ pub fn write_stream_turn(
         "endpoint_type": "chat_completion",
         "parse_confidence": "stream",
         "parse_source": { "kind": "agent_app" },
-        "capture_mode": capture_mode_dbg.to_lowercase(),
+        "capture_mode": capture_mode,
         "request_method": "ws",
         "request_method_lower": "ws",
         "estimated_input_tokens": turn.usage.input_tokens,
@@ -674,7 +681,7 @@ pub fn write_stream_turn(
             ":endpoint_hash": pending.proxy_ctx.endpoint_hash.clone(),
             ":input_tokens": turn.usage.input_tokens as i64,
             ":output_tokens": turn.usage.output_tokens as i64,
-            ":capture_mode": capture_mode_dbg,
+            ":capture_mode": capture_mode,
             ":matched_provider": pending.outcome.matched_provider.as_deref(),
             ":matched_application": pending.outcome.matched_application.as_deref(),
             ":telemetry_json": telemetry_json,
@@ -684,7 +691,7 @@ pub fn write_stream_turn(
 
     match result {
         Ok(_) => {
-            tracing::info!(
+            tracing::debug!(
                 target: "soth_proxy::ws_content",
                 connection_id = %connection_id,
                 turn = turn.turn_number,

@@ -8,7 +8,6 @@ use tracing::warn;
 
 use crate::error::ReaderError;
 use crate::playbook::{Playbook, PlaybookSource, RecordIterMethod, SessionIdConfig};
-use crate::session::estimate_tokens;
 use crate::types::{AiTool, Cursor, HistoricalMessage, HistoricalSession};
 
 use super::{
@@ -231,11 +230,8 @@ fn read_kv_sessions(
             // Cursor v14+ fallback: the inline records array (e.g. `conversation`)
             // is empty. Check for `fullConversationHeadersOnly` and fetch individual
             // bubble rows from the same table keyed as `bubbleId:<sessionId>:<bubbleId>`.
-            eprintln!("[HISTORIAN-DBG] session={session_id}: records empty, checking fullConversationHeadersOnly");
             let fch_value = resolve_path(&doc, "fullConversationHeadersOnly");
-            eprintln!("[HISTORIAN-DBG] session={session_id}: fch_value is_some={}, is_array={}", fch_value.is_some(), matches!(fch_value, Some(serde_json::Value::Array(_))));
             if let Some(serde_json::Value::Array(headers)) = fch_value {
-                eprintln!("[HISTORIAN-DBG] session={session_id}: headers count={}", headers.len());
                 for header in headers {
                     let bubble_id = match header.get("bubbleId").and_then(|v| v.as_str()) {
                         Some(id) => id,
@@ -335,10 +331,8 @@ fn read_kv_sessions(
         }
 
         if messages.is_empty() {
-            eprintln!("[HISTORIAN-DBG] session={session_id}: 0 messages, skipping");
             continue;
         }
-        eprintln!("[HISTORIAN-DBG] session={session_id}: {msgs} messages extracted", msgs = messages.len());
 
         let first_msg_ts = messages.first().and_then(|m| m.timestamp);
         let last_msg_ts = messages.last().and_then(|m| m.timestamp);

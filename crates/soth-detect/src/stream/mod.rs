@@ -178,7 +178,6 @@ pub fn process_chunk_with_bundle(
             if got_finish && descriptor.is_some_and(|d| {
                 d.features.iter().any(|f| f.protocol == "websocket")
             }) {
-                eprintln!("[DBG-META] emit@SSE path, fmt={:?}, turn_will_be={}", session.format_name, session.turns_emitted + 1);
                 let usage = session.last_usage.take().unwrap_or_default();
                 let model = session.model.clone();
                 session.turns_emitted += 1;
@@ -299,7 +298,6 @@ pub fn process_chunk_with_bundle(
                 if is_client_frame {
                     // CLIENT → SERVER: extract model and prompt from request frames.
                     if let Some(turn) = process_websocket_turn(&chunk.payload, session) {
-                        eprintln!("[DBG-META] emit@WSText-client process_websocket_turn, fmt={:?}", session.format_name);
                         return Some(ChunkEvent::TurnCompleted(turn));
                     }
                     let sse = extract_all_from_sse_lines(
@@ -345,7 +343,6 @@ pub fn process_chunk_with_bundle(
                     if got_finish && descriptor.is_some_and(|d| {
                         d.features.iter().any(|f| f.protocol == "websocket")
                     }) {
-                        eprintln!("[DBG-META] emit@WSText-server got_finish path, fmt={:?}, turn_will_be={}", session.format_name, session.turns_emitted + 1);
                         let usage = session.last_usage.take().unwrap_or_default();
                         let model = session.model.clone();
                         session.turns_emitted += 1;
@@ -365,7 +362,6 @@ pub fn process_chunk_with_bundle(
 
                     if session.is_websocket {
                         if let Some(turn) = process_websocket_turn(&chunk.payload, session) {
-                            eprintln!("[DBG-META] emit@WSText-server process_websocket_turn, fmt={:?}", session.format_name);
                             return Some(ChunkEvent::TurnCompleted(turn));
                         }
                     }
@@ -682,7 +678,6 @@ fn process_binary_ws_payload(
 
     // ── SERVER → CLIENT (or unknown direction) ──────────────────────────
     let sse = extract_all_from_sse_lines(payload, session.model.is_none(), descriptor);
-    eprintln!("[DBG-META] binary_ws server frame, fmt={:?}, sse.finish_reason={:?}, sse.delta_len={:?}, payload_len={}", session.format_name, sse.finish_reason, sse.delta.as_ref().map(|s| s.len()), payload.len());
     if let Some(model) = sse.model {
         session.model = Some(model);
     }
@@ -704,7 +699,6 @@ fn process_binary_ws_payload(
     if got_finish
         && descriptor.is_some_and(|d| d.features.iter().any(|f| f.protocol == "websocket"))
     {
-        eprintln!("[DBG-META] emit@binary_ws got_finish path, fmt={:?}, turn_will_be={}", session.format_name, session.turns_emitted + 1);
         let usage = session.last_usage.take().unwrap_or_default();
         let model = session.model.clone();
         session.turns_emitted += 1;
@@ -1016,6 +1010,7 @@ mod tests {
                     .any(|a| matches!(a.kind, ArtifactKind::ApiKey { .. })));
             }
             ChunkEvent::TurnCompleted(_) => panic!("expected Artifact, got TurnCompleted"),
+            ChunkEvent::TurnRequest(_) => panic!("expected Artifact, got TurnRequest"),
         }
     }
 
