@@ -699,7 +699,9 @@ async fn ensure_classify_models(config: &crate::config::ProxyConfig) {
 
     let sync_cfg = config.sync_config();
     let endpoint = sync_cfg.endpoint.trim_end_matches('/');
-    let url = format!("{endpoint}/v1/edge/classify/current");
+    // /api/v1/registry/* is the prefix staging nginx forwards to soth-ingestion;
+    // same handler as /v1/edge/classify/current, same edge-bearer auth.
+    let url = format!("{endpoint}/api/v1/registry/classify/current");
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
