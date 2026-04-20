@@ -64,6 +64,9 @@ pub enum Commands {
     /// Exchange enrollment token and persist credentials
     Enroll(commands::enroll::EnrollArgs),
 
+    /// Persist a long-lived cloud API key to the local config
+    Login(commands::login::LoginArgs),
+
     /// Generate and trust CA certificate
     SetupCa(SetupCaArgs),
 
@@ -344,6 +347,9 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
         }
         Commands::Enroll(args) => {
             commands::enroll::run(args, global_config).await?;
+        }
+        Commands::Login(args) => {
+            commands::login::run(args, global_config).await?;
         }
         Commands::SetupCa(args) => {
             commands::proxy::run_setup_ca(args.no_trust, args.output, global_config).await?;
