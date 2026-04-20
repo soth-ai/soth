@@ -1,4 +1,4 @@
-use soth_core::{AnomalyFlag, UseCaseLabel};
+use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel};
 
 use crate::traits::{AnomalyScorer, AnomalySignals, ClassificationProvider, ClassificationResult};
 
@@ -10,6 +10,7 @@ impl ClassificationProvider for KeywordClassifier {
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
             secondary_label: None,
+            interaction_mode: InteractionMode::Unknown,
         }
     }
 

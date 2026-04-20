@@ -140,6 +140,26 @@ pub enum BundleTrustLevel {
     SignatureDisabled,
 }
 
+/// Auxiliary classification head — interaction mode (how the user is engaging with AI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionMode {
+    /// AI is augmenting the user's work (code completion, suggestions).
+    Augmentative,
+    /// User is directing AI to execute a task ("write X", "fix Y").
+    Directive,
+    /// User is exploring/creating freely (brainstorming, creative writing).
+    Expressive,
+    /// Not classified.
+    Unknown,
+}
+
+impl Default for InteractionMode {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataSource {
@@ -226,6 +246,8 @@ pub struct TelemetryEvent {
     pub secondary_label: Option<UseCaseLabel>,
     #[serde(default)]
     pub complexity_score: u8,
+    #[serde(default)]
+    pub interaction_mode: InteractionMode,
     #[serde(default)]
     pub embedding_norm: f32,
     #[serde(default)]
@@ -369,6 +391,7 @@ impl Default for TelemetryEvent {
             product_id: None,
             surface_type: SurfaceType::Unknown,
             is_shadow_it: false,
+            interaction_mode: InteractionMode::Unknown,
         }
     }
 }
@@ -516,6 +539,10 @@ impl TelemetryEvent {
             anomaly_score,
             complexity_score,
             topic_cluster_id,
+            interaction_mode: meta
+                .get("interaction_mode")
+                .and_then(|s| serde_json::from_value(serde_json::Value::String(s.clone())).ok())
+                .unwrap_or(InteractionMode::Unknown),
             ..Self::default()
         }
     }

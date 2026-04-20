@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use soth_core::UseCaseLabel;
+use soth_core::{InteractionMode, UseCaseLabel};
 
 use crate::config::ClassifyConfig;
 use crate::traits::ClassificationProvider;
@@ -11,6 +11,7 @@ pub(crate) struct UsecaseOutput {
     pub confidence: f32,
     pub secondary_label: Option<UseCaseLabel>,
     pub complexity_score: u8,
+    pub interaction_mode: InteractionMode,
 }
 
 impl UsecaseOutput {
@@ -20,6 +21,7 @@ impl UsecaseOutput {
             confidence: 0.0,
             secondary_label: None,
             complexity_score: 1,
+            interaction_mode: InteractionMode::Unknown,
         }
     }
 }
@@ -59,6 +61,7 @@ pub(crate) fn run(
             confidence,
             secondary_label,
             complexity_score,
+            interaction_mode: classified.interaction_mode,
         },
         started.elapsed().as_micros() as u64,
     )
