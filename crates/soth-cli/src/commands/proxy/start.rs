@@ -37,6 +37,13 @@ pub async fn run(
     no_autostart: bool,
     allow_daemon_child_fallback: bool,
 ) -> Result<()> {
+    // Worker mode: re-execed by the supervisor to run the in-process MITM
+    // runtime. Bypasses supervisor/CA bootstrap logic — those are the
+    // supervisor's job; this process only runs the proxy loop.
+    if std::env::var(PROXY_WORKER_ENV).is_ok() {
+        return run_proxy_worker().await;
+    }
+
     if !foreground && !daemon_child {
         return daemon::run_start_daemon(
             port,
@@ -190,13 +197,18 @@ fn ensure_ca_runtime_health(paths: &super::ca_health::ResolvedCaPaths, quiet: bo
 }
 
 async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Result<Child> {
-    let proxy_bin = resolve_proxy_binary()?;
-    let mut cmd = Command::new(proxy_bin);
+    let current_exe =
+        std::env::current_exe().context("resolve current executable for proxy worker")?;
+    let mut cmd = Command::new(current_exe);
+    // `start --daemon-child` + SOTH_PROXY_WORKER=1 selects the in-process MITM
+    // runtime path in `run()` below, replacing the historical `soth-proxy`
+    // sibling binary.
+    cmd.arg("start").arg("--daemon-child");
+    cmd.env(PROXY_WORKER_ENV, "1");
     cmd.env("SOTH_PROXY_CONFIG", config_path);
     if let Some(fd) = listener_fd {
         cmd.env("SOTH_LISTENER_FD", fd.to_string());
     }
-    // Propagate RUST_LOG so user overrides reach the proxy subprocess.
     if let Ok(rust_log) = std::env::var("RUST_LOG") {
         cmd.env("RUST_LOG", rust_log);
     }
@@ -204,8 +216,12 @@ async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Re
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
     cmd.spawn()
-        .map_err(|error| anyhow::anyhow!("failed launching soth-proxy: {error}"))
+        .map_err(|error| anyhow::anyhow!("failed launching proxy worker: {error}"))
 }
+
+/// Env var toggle that re-executed child processes use to enter in-process
+/// MITM runtime mode. Set by [`spawn_proxy_process`].
+pub(crate) const PROXY_WORKER_ENV: &str = "SOTH_PROXY_WORKER";
 
 /// Supervise the proxy child process with auto-restart on failure.
 ///
@@ -715,24 +731,6 @@ fn normalize_agent_instance_id(raw: &str) -> Option<String> {
     }
 }
 
-fn resolve_proxy_binary() -> Result<PathBuf> {
-    if let Ok(value) = std::env::var("SOTH_PROXY_BIN") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-
-    if let Ok(current) = std::env::current_exe() {
-        let sibling = current.with_file_name("soth-proxy");
-        if sibling.exists() {
-            return Ok(sibling);
-        }
-    }
-
-    which::which("soth-proxy").context("could not locate `soth-proxy` executable")
-}
-
 #[cfg(unix)]
 fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpListener> {
     let addr = format!("{address}:{port}");
@@ -943,6 +941,23 @@ struct GeneratedPipelineConfig {
 #[derive(Debug, Serialize)]
 struct GeneratedTelemetryConfig {
     enabled: bool,
+}
+
+/// In-process MITM runtime, invoked by re-execed supervisor children (see
+/// [`spawn_proxy_process`]). Registers the historian extension and delegates
+/// to `soth_proxy::runtime::run`.
+async fn run_proxy_worker() -> Result<()> {
+    use std::sync::Arc;
+
+    soth_proxy::runtime::init_rustls_provider();
+
+    let mut registry = soth_extensions::ExtensionRegistry::empty();
+    registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
+
+    let tracing_targets = registry.tracing_targets();
+    soth_proxy::runtime::init_tracing(&tracing_targets);
+
+    soth_proxy::runtime::run(registry).await
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = ["extensions"]
 dev-pipeline-trace = []
-extensions = ["dep:soth-extensions", "dep:soth-historian"]
+extensions = ["dep:soth-extensions"]
 
 [dependencies]
 anyhow.workspace = true
@@ -54,7 +54,6 @@ soth-policy = { workspace = true }
 soth-sync = { workspace = true }
 
 soth-extensions = { workspace = true, optional = true }
-soth-historian = { workspace = true, optional = true }
 soth-mitm = "0.3.3"
 
 [dev-dependencies]
