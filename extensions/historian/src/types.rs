@@ -47,20 +47,94 @@ impl AiTool {
         }
     }
 
+    /// Identity metadata used by the cloud to group events by tool.
+    /// Values align with bundle detection conventions (kebab-case identity keys,
+    /// unified registry tool_kind/tool_category).
+    pub fn identity(&self) -> ToolIdentity {
+        match self {
+            Self::ClaudeCode => ToolIdentity {
+                identity_key: "claude-code",
+                tool_name: "Claude Code",
+                tool_kind: "cli",
+                tool_category: "CLI Tool",
+                provider_id: "anthropic",
+            },
+            Self::GeminiCli => ToolIdentity {
+                identity_key: "gemini-cli",
+                tool_name: "Gemini CLI",
+                tool_kind: "cli",
+                tool_category: "CLI Tool",
+                provider_id: "google",
+            },
+            Self::OpenAiCodex => ToolIdentity {
+                identity_key: "openai-codex",
+                tool_name: "OpenAI Codex",
+                tool_kind: "cli",
+                tool_category: "CLI Tool",
+                provider_id: "openai",
+            },
+            Self::Cursor => ToolIdentity {
+                identity_key: "cursor",
+                tool_name: "Cursor",
+                tool_kind: "ide",
+                tool_category: "Code Editor",
+                provider_id: "anthropic",
+            },
+            Self::GithubCopilot => ToolIdentity {
+                identity_key: "github-copilot",
+                tool_name: "GitHub Copilot",
+                tool_kind: "ide_plugin",
+                tool_category: "IDE Plugin",
+                provider_id: "github",
+            },
+            Self::Continue => ToolIdentity {
+                identity_key: "continue",
+                tool_name: "Continue",
+                tool_kind: "ide_plugin",
+                tool_category: "IDE Plugin",
+                provider_id: "unknown",
+            },
+            Self::OpenClaw => ToolIdentity {
+                identity_key: "openclaw",
+                tool_name: "OpenClaw",
+                tool_kind: "cli",
+                tool_category: "CLI Tool",
+                provider_id: "unknown",
+            },
+            Self::Unknown(_) => ToolIdentity {
+                identity_key: "unknown",
+                tool_name: "Unknown",
+                tool_kind: "unknown",
+                tool_category: "Unknown",
+                provider_id: "unknown",
+            },
+        }
+    }
+
     /// Map to the corresponding `DataSource` variant for telemetry.
     pub fn data_source(&self) -> DataSource {
         match self {
             Self::ClaudeCode => DataSource::HistorianClaudeCode,
             Self::GeminiCli => DataSource::HistorianGemini,
             Self::OpenAiCodex => DataSource::HistorianCodex,
-            // All others map to the closest variant; extend DataSource as needed.
-            Self::Cursor
-            | Self::GithubCopilot
-            | Self::Continue
-            | Self::OpenClaw
-            | Self::Unknown(_) => DataSource::HistorianClaudeCode,
+            Self::Cursor => DataSource::HistorianCursor,
+            Self::GithubCopilot => DataSource::HistorianGithubCopilot,
+            Self::Continue => DataSource::HistorianContinue,
+            Self::OpenClaw => DataSource::HistorianOpenClaw,
+            Self::Unknown(_) => DataSource::HistorianUnknown,
         }
     }
+}
+
+/// Resolved tool identity fields written to event metadata so cloud
+/// analytics can group historian events by tool without a catalog lookup.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolIdentity {
+    pub identity_key: &'static str,
+    pub tool_name: &'static str,
+    pub tool_kind: &'static str,
+    pub tool_category: &'static str,
+    pub provider_id: &'static str,
 }
 
 impl std::fmt::Display for AiTool {

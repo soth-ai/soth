@@ -6,12 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["extensions"]
 dev-pipeline-trace = []
 extensions = ["dep:soth-extensions", "dep:soth-historian"]
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 once_cell.workspace = true
 arc-swap = "1"
 async-trait.workspace = true
@@ -25,6 +26,9 @@ ed25519-dalek.workspace = true
 hex = "0.4"
 hmac = "0.12"
 rand.workspace = true
+reqwest.workspace = true
+flate2 = { workspace = true }
+tar = { workspace = true }
 zeroize = { workspace = true }
 http = "1"
 rusqlite.workspace = true
@@ -51,7 +55,7 @@ soth-sync = { workspace = true }
 
 soth-extensions = { workspace = true, optional = true }
 soth-historian = { workspace = true, optional = true }
-soth-mitm = "0.3.2"
+soth-mitm = "0.3.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

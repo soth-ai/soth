@@ -611,12 +611,44 @@ pub(crate) fn stream_completed(
 }
 
 #[cfg(feature = "dev-pipeline-trace")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_turn_completed(
     connection_id: Uuid,
     turn_number: u64,
     model: Option<&str>,
     usage: &soth_detect::StreamUsage,
+    prompt: Option<&str>,
+    content: Option<&str>,
 ) {
+    let prompt_preview = prompt.map(|p| truncate_body(p.as_bytes(), 500));
+    let content_preview = content.map(|c| truncate_body(c.as_bytes(), 4096));
+
+    if dev_verify_enabled() {
+        let summary = format!(
+            "\n\
+             ┌─── DEV VERIFY: STREAM TURN COMPLETED ─────────────────────\n\
+             │ connection:    {connection_id}\n\
+             │ turn:          {turn_number}\n\
+             │ model:         {model}\n\
+             │ input_tokens:  {input_tokens}\n\
+             │ output_tokens: {output_tokens}\n\
+             │ finish_reason: {finish_reason}\n\
+             ├─── PROMPT ─────────────────────────────────────────────────\n\
+             {prompt_block}\
+             ├─── RESPONSE ───────────────────────────────────────────────\n\
+             {content_block}\
+             └────────────────────────────────────────────────────────────",
+            model = model.unwrap_or("-"),
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            finish_reason = usage.finish_reason.as_deref().unwrap_or("-"),
+            prompt_block = format_trace_block(prompt_preview.as_deref().unwrap_or("(none)"), 500),
+            content_block =
+                format_trace_block(content_preview.as_deref().unwrap_or("(none)"), 4096),
+        );
+        eprintln!("{summary}");
+    }
+
     emit(
         "stream_turn_completed",
         json!({
@@ -625,17 +657,100 @@ pub(crate) fn stream_turn_completed(
             "model": model.unwrap_or("unknown"),
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
+            "finish_reason": usage.finish_reason,
+            "user_prompt": prompt_preview,
+            "content_preview": content_preview,
         }),
     );
 }
 
 #[cfg(not(feature = "dev-pipeline-trace"))]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_turn_completed(
     _connection_id: Uuid,
     _turn_number: u64,
     _model: Option<&str>,
     _usage: &soth_detect::StreamUsage,
+    _prompt: Option<&str>,
+    _content: Option<&str>,
+) {
+}
+
+#[cfg(feature = "dev-pipeline-trace")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_turn_request(
+    connection_id: Uuid,
+    turn_number: u64,
+    host: &str,
+    path: &str,
+    method: &str,
+    provider: &str,
+    model: Option<&str>,
+    matched_application: Option<&str>,
+    matched_provider: Option<&str>,
+    capture_mode: soth_core::CaptureMode,
+    prompt: &str,
+) {
+    let prompt_preview = truncate_body(prompt.as_bytes(), 500);
+
+    if dev_verify_enabled() {
+        let summary = format!(
+            "\n\
+             ┌─── DEV VERIFY: STREAM TURN REQUEST ───────────────────────\n\
+             │ connection:    {connection_id}\n\
+             │ {method} {host}{path}\n\
+             │ capture:       {capture_mode:?}\n\
+             │ turn:          {turn_number}\n\
+             ├─── DETECTION ──────────────────────────────────────────────\n\
+             │ provider:      {provider}\n\
+             │ model:         {model}\n\
+             │ matched_app:   {matched_application}\n\
+             │ matched_prov:  {matched_provider}\n\
+             ├─── PROMPT ─────────────────────────────────────────────────\n\
+             {prompt_block}\
+             └────────────────────────────────────────────────────────────",
+            model = model.unwrap_or("-"),
+            matched_application = matched_application.unwrap_or("-"),
+            matched_provider = matched_provider.unwrap_or("-"),
+            prompt_block = format_trace_block(&prompt_preview, 500),
+        );
+        eprintln!("{summary}");
+    }
+
+    emit(
+        "stream_turn_request",
+        json!({
+            "connection_id": connection_id.to_string(),
+            "turn": turn_number,
+            "host": host,
+            "path": path,
+            "method": method,
+            "provider": provider,
+            "model": model.unwrap_or("unknown"),
+            "matched_application": matched_application,
+            "matched_provider": matched_provider,
+            "capture_mode": serialize_json(capture_mode),
+            "user_prompt": prompt_preview,
+        }),
+    );
+}
+
+#[cfg(not(feature = "dev-pipeline-trace"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_turn_request(
+    _connection_id: Uuid,
+    _turn_number: u64,
+    _host: &str,
+    _path: &str,
+    _method: &str,
+    _provider: &str,
+    _model: Option<&str>,
+    _matched_application: Option<&str>,
+    _matched_provider: Option<&str>,
+    _capture_mode: soth_core::CaptureMode,
+    _prompt: &str,
 ) {
 }
 

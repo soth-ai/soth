@@ -236,9 +236,15 @@ fn openai_codex() -> Playbook {
 
 /// Cursor IDE: SQLite at `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
 fn cursor() -> Playbook {
+    // v2 playbook: reads both legacy inline-conversation rows and v14+ split-
+    // record rows. For v14, each `composerData:<id>` row carries only a
+    // `fullConversationHeadersOnly` header list; the actual bubbles live in
+    // separate `bubbleId:<session>:<bubble>` rows in the same table. The
+    // engine consults `split_record_source` when the inline array is empty,
+    // so one playbook covers both formats without branching in code.
     Playbook {
         tool: "cursor".into(),
-        version: 1,
+        version: 2,
         provider: "openai".into(),
         discovery: PlaybookDiscovery {
             roots: vec!["${HOME}/Library/Application Support/Cursor/User/globalStorage".into()],
@@ -253,6 +259,11 @@ fn cursor() -> Playbook {
             table: "cursorDiskKV".into(),
             key_prefix: "composerData:".into(),
             value_column: "value".into(),
+            split_record_source: Some(SplitRecordSource {
+                headers_field: "fullConversationHeadersOnly".into(),
+                header_id_field: "bubbleId".into(),
+                record_key_template: "bubbleId:{session_id}:{record_id}".into(),
+            }),
         },
         extraction: PlaybookExtraction {
             session_id: SessionIdConfig::Field {
@@ -275,6 +286,9 @@ fn cursor() -> Playbook {
             content: ContentConfig::Plain {
                 field: "text".into(),
             },
+            // Legacy composer rows use epoch-ms `createdAt`; v14 bubble rows
+            // use ISO-8601 `createdAt`. The engine falls back to ISO-8601
+            // parsing on the bubble path when this format fails to parse.
             timestamp: TimestampConfig {
                 field: "createdAt".into(),
                 format: TimestampFormat::EpochMs,

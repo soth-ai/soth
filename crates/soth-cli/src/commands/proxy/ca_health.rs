@@ -103,10 +103,12 @@ fn cert_fingerprint(path: &Path, algo: &str) -> Result<String> {
         anyhow::bail!("certificate not found at {}", path.display());
     }
     let flag = format!("-{}", algo.trim());
-    let output = Command::new("openssl")
-        .args(["x509", "-in"])
+    let mut cmd = Command::new("openssl");
+    cmd.args(["x509", "-in"])
         .arg(path)
-        .args(["-noout", "-fingerprint", flag.as_str()])
+        .args(["-noout", "-fingerprint", flag.as_str()]);
+    super::hide_console_window(&mut cmd);
+    let output = cmd
         .output()
         .context("failed running openssl for certificate fingerprint")?;
     if !output.status.success() {
@@ -121,10 +123,12 @@ fn cert_fingerprint(path: &Path, algo: &str) -> Result<String> {
 }
 
 fn cert_public_key_pem(path: &Path) -> Result<String> {
-    let output = Command::new("openssl")
-        .args(["x509", "-in"])
+    let mut cmd = Command::new("openssl");
+    cmd.args(["x509", "-in"])
         .arg(path)
-        .args(["-pubkey", "-noout"])
+        .args(["-pubkey", "-noout"]);
+    super::hide_console_window(&mut cmd);
+    let output = cmd
         .output()
         .context("failed running openssl x509 -pubkey")?;
     if !output.status.success() {
@@ -134,10 +138,10 @@ fn cert_public_key_pem(path: &Path) -> Result<String> {
 }
 
 fn key_public_key_pem(path: &Path) -> Result<String> {
-    let output = Command::new("openssl")
-        .args(["pkey", "-in"])
-        .arg(path)
-        .args(["-pubout"])
+    let mut cmd = Command::new("openssl");
+    cmd.args(["pkey", "-in"]).arg(path).args(["-pubout"]);
+    super::hide_console_window(&mut cmd);
+    let output = cmd
         .output()
         .context("failed running openssl pkey -pubout")?;
     if !output.status.success() {

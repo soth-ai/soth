@@ -623,10 +623,10 @@ fn process_running(pid: u32) -> bool {
 
 #[cfg(target_os = "windows")]
 fn process_running(pid: u32) -> bool {
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}")])
-        .output();
-    output
+    let mut cmd = std::process::Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}")]);
+    super::hide_console_window(&mut cmd);
+    cmd.output()
         .map(|value| String::from_utf8_lossy(&value.stdout).contains(&pid.to_string()))
         .unwrap_or(false)
 }
@@ -648,14 +648,14 @@ fn parse_cert_not_after(path: &Path) -> Result<String> {
     if !path.exists() {
         anyhow::bail!("cert not found");
     }
-    let output = std::process::Command::new("openssl")
-        .arg("x509")
+    let mut cmd = std::process::Command::new("openssl");
+    cmd.arg("x509")
         .arg("-in")
         .arg(path)
         .arg("-noout")
-        .arg("-enddate")
-        .output()
-        .with_context(|| "failed running openssl")?;
+        .arg("-enddate");
+    super::hide_console_window(&mut cmd);
+    let output = cmd.output().with_context(|| "failed running openssl")?;
     if !output.status.success() {
         anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr));
     }

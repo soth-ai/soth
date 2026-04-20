@@ -178,34 +178,31 @@ fn install_trust(cert_path: &Path) -> Result<()> {
             style::success("CA trusted in Windows Root store.");
             return Ok(());
         }
-        anyhow::bail!(
-            "certutil -addstore failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{stderr}{stdout}");
+        let lower = combined.to_ascii_lowercase();
+        // certutil surfaces admin failure as "access is denied" / 0x80070005 /
+        // "The system cannot find the file specified" when HKLM\...\Root is blocked.
+        if lower.contains("access is denied")
+            || lower.contains("0x80070005")
+            || lower.contains("denied")
+            || output.status.code() == Some(5)
+        {
+            anyhow::bail!(
+                "certutil -addstore failed: access denied. \
+                 Trusting a CA in the Windows Root store requires Administrator privileges. \
+                 Re-run `soth proxy setup-ca` from an elevated PowerShell or Command Prompt \
+                 (right-click → Run as administrator).\n\nraw error: {}",
+                combined.trim()
+            );
+        }
+        anyhow::bail!("certutil -addstore failed: {}", combined.trim());
     }
 
     #[cfg(target_os = "linux")]
     {
-        style::warning("Automatic Linux trust installation is best-effort.");
-        if which::which("update-ca-certificates").is_ok() {
-            style::info(&format!(
-                "Run with elevated privileges: sudo cp {} /usr/local/share/ca-certificates/soth-proxy-ca.crt && sudo update-ca-certificates",
-                cert_path.display()
-            ));
-            return Ok(());
-        }
-        if which::which("trust").is_ok() {
-            style::info(&format!(
-                "Run with elevated privileges: sudo trust anchor {}",
-                cert_path.display()
-            ));
-            return Ok(());
-        }
-        style::warning("Could not detect a Linux trust tool (update-ca-certificates/trust).");
-        style::info(&format!(
-            "Manually import {} into your system trust store.",
-            cert_path.display()
-        ));
+        install_trust_linux(cert_path)?;
         return Ok(());
     }
 
@@ -300,4 +297,154 @@ fn macos_verify_ssl_trust(cert_path: &Path) -> bool {
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxDistroFamily {
+    DebianUbuntu,
+    RhelFedora,
+    Arch,
+    Alpine,
+    Suse,
+    Unknown,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxDistroFamily {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DebianUbuntu => "Debian/Ubuntu",
+            Self::RhelFedora => "RHEL/Fedora/CentOS",
+            Self::Arch => "Arch",
+            Self::Alpine => "Alpine",
+            Self::Suse => "openSUSE/SLE",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Absolute path where the CA cert file should be installed.
+    fn anchor_path(self) -> &'static str {
+        match self {
+            Self::DebianUbuntu => "/usr/local/share/ca-certificates/soth-proxy-ca.crt",
+            Self::RhelFedora => "/etc/pki/ca-trust/source/anchors/soth-proxy-ca.crt",
+            Self::Arch => "/etc/ca-certificates/trust-source/anchors/soth-proxy-ca.crt",
+            Self::Alpine => "/usr/local/share/ca-certificates/soth-proxy-ca.crt",
+            Self::Suse => "/etc/pki/trust/anchors/soth-proxy-ca.crt",
+            Self::Unknown => "/usr/local/share/ca-certificates/soth-proxy-ca.crt",
+        }
+    }
+
+    /// Command to rebuild the system trust store after placing the anchor.
+    fn update_command(self) -> &'static str {
+        match self {
+            Self::DebianUbuntu | Self::Alpine | Self::Suse => "update-ca-certificates",
+            Self::RhelFedora => "update-ca-trust",
+            Self::Arch => "update-ca-trust",
+            Self::Unknown => "update-ca-certificates",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_distro() -> LinuxDistroFamily {
+    let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let lower = os_release.to_ascii_lowercase();
+    // ID_LIKE often lists the parent family for derivatives (e.g. Linux Mint → "ubuntu debian").
+    let id_like_line = lower
+        .lines()
+        .find(|line| line.starts_with("id_like="))
+        .unwrap_or("");
+    let id_line = lower
+        .lines()
+        .find(|line| line.starts_with("id="))
+        .unwrap_or("");
+    let combined = format!("{id_line} {id_like_line}");
+
+    if combined.contains("alpine") {
+        return LinuxDistroFamily::Alpine;
+    }
+    if combined.contains("arch") || combined.contains("manjaro") {
+        return LinuxDistroFamily::Arch;
+    }
+    if combined.contains("suse") || combined.contains("sles") {
+        return LinuxDistroFamily::Suse;
+    }
+    if combined.contains("rhel")
+        || combined.contains("fedora")
+        || combined.contains("centos")
+        || combined.contains("rocky")
+        || combined.contains("alma")
+        || combined.contains("amzn")
+    {
+        return LinuxDistroFamily::RhelFedora;
+    }
+    if combined.contains("debian") || combined.contains("ubuntu") {
+        return LinuxDistroFamily::DebianUbuntu;
+    }
+    LinuxDistroFamily::Unknown
+}
+
+#[cfg(target_os = "linux")]
+fn running_as_root() -> bool {
+    // SAFETY: getuid() is always safe; it takes no arguments and returns a uid_t.
+    unsafe { libc::getuid() == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn install_trust_linux(cert_path: &Path) -> Result<()> {
+    let family = detect_linux_distro();
+    let anchor = family.anchor_path();
+    let update_tool = family.update_command();
+
+    if family == LinuxDistroFamily::Unknown {
+        style::warning(
+            "Could not detect Linux distro family from /etc/os-release; \
+             falling back to Debian-style paths.",
+        );
+    } else {
+        style::info(&format!("Detected distro family: {}", family.label()));
+    }
+
+    if which::which(update_tool).is_err() {
+        style::warning(&format!(
+            "`{update_tool}` not found in PATH. Install it first (e.g. `ca-certificates` package) \
+             or set up trust manually."
+        ));
+        print_linux_manual_instructions(cert_path, anchor, update_tool);
+        return Ok(());
+    }
+
+    if running_as_root() {
+        // Automatic install path: already elevated.
+        if let Some(parent) = Path::new(anchor).parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create anchor dir {}", parent.display()))?;
+        }
+        std::fs::copy(cert_path, anchor).with_context(|| format!("copy CA to {anchor}"))?;
+        let status = Command::new(update_tool)
+            .status()
+            .with_context(|| format!("run {update_tool}"))?;
+        if !status.success() {
+            anyhow::bail!("{update_tool} exited with status {status}");
+        }
+        style::success(&format!(
+            "CA installed to {anchor} and trust store refreshed via {update_tool}."
+        ));
+        return Ok(());
+    }
+
+    // Not root — print ready-to-copy commands. pkexec is intentionally not used
+    // because it requires a polkit rule to run `cp`/`update-ca-certificates`
+    // non-interactively without bypassing auth.
+    style::warning("Trusting a CA on Linux requires root privileges.");
+    print_linux_manual_instructions(cert_path, anchor, update_tool);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn print_linux_manual_instructions(cert_path: &Path, anchor: &str, update_tool: &str) {
+    style::info("Run with sudo:");
+    println!("  sudo cp {} {anchor}", cert_path.display());
+    println!("  sudo {update_tool}");
 }

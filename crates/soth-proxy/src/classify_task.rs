@@ -542,6 +542,92 @@ pub fn merge_and_emit(
     }
 }
 
+/// Build a per-turn `TelemetryEvent` from a completed WebSocket `StreamTurn`
+/// and the surrounding `PendingCapture` state, then push it to the telemetry
+/// pipeline so the cloud sync loop picks it up.  Unlike the HTTP path (which
+/// runs the full classify pipeline), this helper produces a "lean" event:
+/// fields that don't apply to per-turn records (anomaly scores, cluster
+/// labels, sensitive-code flags) stay at `TelemetryEvent::default()` values.
+///
+/// The bundle-driven classify pipeline already ran once for the upgrade GET
+/// that opened this WebSocket; its event is pushed separately.  This
+/// function adds an additional per-turn event so the dashboard can show
+/// one row per assistant response rather than one row per connection.
+pub fn emit_stream_turn(
+    connection_id: Uuid,
+    turn: &soth_detect::StreamTurn,
+    pending: &crate::pending::PendingCapture,
+    telemetry: Option<&Arc<soth_telemetry::TelemetryPipeline>>,
+) {
+    let Some(pipeline) = telemetry else {
+        return;
+    };
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let proxy_ctx = pending.proxy_ctx.as_ref();
+    let normalized = &pending.detect_result.normalized;
+
+    let mut event = soth_core::TelemetryEvent::default();
+
+    event.event_id = Uuid::new_v4();
+    event.timestamp_epoch_ms = now_ms;
+    event.connection_id = Some(connection_id);
+    event.provider = normalized.provider.clone();
+    event.model = turn.model.clone().or_else(|| normalized.model.clone());
+    event.endpoint_type = normalized.endpoint_type;
+    event.parse_confidence = soth_core::ParseConfidence::Full;
+    event.parse_source = soth_core::ParseSource::AgentApp;
+    event.capture_mode = pending.outcome.capture_mode;
+    event.request_method = proxy_ctx
+        .request_method
+        .unwrap_or(soth_core::RequestMethod::Get);
+
+    event.estimated_input_tokens = Some(turn.usage.input_tokens as u32);
+    event.estimated_output_tokens = Some(turn.usage.output_tokens as u32);
+    event.actual_output_tokens = Some(turn.usage.output_tokens);
+
+    event.process_resolution = Some(proxy_ctx.process_resolution.clone());
+    event.traffic_classification = Some(proxy_ctx.traffic_classification);
+    event.bundle_trust_level = proxy_ctx.bundle_trust_level;
+
+    event.ws_turn_number = Some(turn.turn_number);
+    event.finish_reason = turn.usage.finish_reason.clone();
+
+    event.endpoint_hash = proxy_ctx.endpoint_hash.clone();
+
+    // Connection intelligence / product taxonomy — clone from proxy ctx.
+    event.ja4_hash = proxy_ctx.ja4_hash.clone();
+    event.tls_version = proxy_ctx.tls_version.clone();
+    event.alpn_protocol = proxy_ctx.alpn_protocol.clone();
+    event.h2_connection_id = proxy_ctx.h2_connection_id.clone();
+    event.h2_stream_id = proxy_ctx.h2_stream_id;
+    event.session_id = proxy_ctx.session_id;
+    event.product_id = proxy_ctx.product_id.clone();
+    event.surface_type = proxy_ctx.surface_type;
+    event.is_shadow_it = proxy_ctx.is_shadow_it;
+
+    if let Some(ref snap) = proxy_ctx.session_snapshot {
+        event.session_key_hash = snap.session_key_hash.clone();
+        event.session_request_count = Some(snap.request_count);
+        event.session_total_tokens = Some(snap.total_tokens);
+        event.session_credential_alerts = Some(snap.credential_alerts);
+    }
+
+    debug!(
+        connection_id = %connection_id,
+        turn = turn.turn_number,
+        provider = %event.provider,
+        model = ?event.model,
+        input_tokens = turn.usage.input_tokens,
+        output_tokens = turn.usage.output_tokens,
+        prompt_bytes = turn.prompt.as_ref().map(|p| p.len()).unwrap_or(0),
+        content_bytes = turn.content.as_ref().map(|c| c.len()).unwrap_or(0),
+        "pushing ws turn event to telemetry pipeline"
+    );
+
+    pipeline.push(event);
+}
+
 /// Decide whether a telemetry event should be pushed to the cloud pipeline.
 ///
 /// Heuristic-parsed events where both provider and model are unknown are

@@ -443,6 +443,8 @@ pub struct TelemetryEvent {
     pub policy_rule_id: Option<String>,
     pub redaction_event: Option<bool>,
     pub credential_pattern_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_secret_types: Option<Vec<String>>,
     pub endpoint_hash: Option<String>,
     pub code_fraction: Option<f64>,
     #[serde(default)]

@@ -678,7 +678,10 @@ fn is_websocket_feature(desc: &RestFormatDescriptor) -> bool {
         .any(|f| f.feature_type == "chat" && f.protocol == "websocket")
 }
 
-fn parser_id_for_format(format: &DetectedFormat, descriptor: Option<&RestFormatDescriptor>) -> String {
+fn parser_id_for_format(
+    format: &DetectedFormat,
+    descriptor: Option<&RestFormatDescriptor>,
+) -> String {
     match format {
         DetectedFormat::OpenAIRest => "openai-v1".to_string(),
         DetectedFormat::AnthropicRest => "anthropic-v1".to_string(),

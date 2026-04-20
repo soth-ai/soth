@@ -714,14 +714,14 @@ fn parse_cert_not_after(path: &Path) -> Result<String> {
     if !path.exists() {
         anyhow::bail!("cert not found");
     }
-    let output = Command::new("openssl")
-        .arg("x509")
+    let mut cmd = Command::new("openssl");
+    cmd.arg("x509")
         .arg("-in")
         .arg(path)
         .arg("-noout")
-        .arg("-enddate")
-        .output()
-        .with_context(|| "failed running openssl")?;
+        .arg("-enddate");
+    super::hide_console_window(&mut cmd);
+    let output = cmd.output().with_context(|| "failed running openssl")?;
     if !output.status.success() {
         anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }

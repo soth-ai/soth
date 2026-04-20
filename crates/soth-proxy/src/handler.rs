@@ -885,22 +885,84 @@ impl ProxyHandler {
 
         let bundle = self.bundle_handle.current();
         let detect_bundle = bundle.detect_slice();
-        if let Some(turn) = self.streaming.on_chunk(&chunk, &detect_bundle) {
-            // A WebSocket turn completed (response.completed).
-            // Write a per-turn record immediately — don't wait for
-            // connection close which could be hours away.
-            if let Some(state) = self.streaming.peek_pending(&chunk.connection_id) {
-                crate::trace::stream_turn_completed(
-                    chunk.connection_id,
-                    turn.turn_number,
-                    turn.model.as_deref(),
-                    &turn.usage,
-                );
-                crate::db::write_stream_turn(&self.db, chunk.connection_id, &turn, &state);
-                // Per-turn usage is written to the DB via write_stream_turn above.
-                // Session token totals are NOT updated here — they are applied
-                // once at stream finalization (finalize_completed_stream) to avoid
-                // double-counting across turns + final summary.
+        if let Some(event) = self.streaming.on_chunk(&chunk, &detect_bundle) {
+            match event {
+                // A client→server frame delivered a new prompt.  Fire a
+                // dev verify REQUEST block immediately so the user sees
+                // the prompt without waiting for the response to finish.
+                soth_detect::ChunkEvent::TurnRequest(req) => {
+                    if let Some(state) = self.streaming.peek_pending(&chunk.connection_id) {
+                        let provider = state.detect_result.normalized.provider.as_str().to_string();
+                        crate::trace::stream_turn_request(
+                            chunk.connection_id,
+                            req.turn_number,
+                            state.request_host.as_str(),
+                            state.request_path.as_str(),
+                            state.request_method.as_str(),
+                            provider.as_str(),
+                            req.model.as_deref(),
+                            state.outcome.matched_application.as_deref(),
+                            state.outcome.matched_provider.as_deref(),
+                            state.outcome.capture_mode,
+                            &req.prompt,
+                        );
+                    } else {
+                        // Fallback: no pending capture state available.
+                        crate::trace::stream_turn_request(
+                            chunk.connection_id,
+                            req.turn_number,
+                            "",
+                            "",
+                            "ws",
+                            "unknown",
+                            req.model.as_deref(),
+                            None,
+                            None,
+                            soth_core::CaptureMode::MetadataOnly,
+                            &req.prompt,
+                        );
+                    }
+                }
+                // A WebSocket turn completed (response.completed).
+                // Write a per-turn record immediately — don't wait for
+                // connection close which could be hours away.
+                soth_detect::ChunkEvent::TurnCompleted(turn) => {
+                    if let Some(state) = self.streaming.peek_pending(&chunk.connection_id) {
+                        crate::trace::stream_turn_completed(
+                            chunk.connection_id,
+                            turn.turn_number,
+                            turn.model.as_deref(),
+                            &turn.usage,
+                            turn.prompt.as_deref(),
+                            turn.content.as_deref(),
+                        );
+                        crate::db::write_stream_turn(&self.db, chunk.connection_id, &turn, &state);
+                        // Push a per-turn TelemetryEvent into the cloud
+                        // pipeline so long-lived WebSocket sessions (e.g.
+                        // Microsoft Copilot) can show one row per assistant
+                        // response rather than one row per WS connection.
+                        //
+                        // Gate: skip turn #1 because it was already emitted
+                        // by the existing path — either by
+                        // `classify_task::spawn_classify_task` at request
+                        // time (for HTTP POST + SSE like Codex) or by the
+                        // deferred-classify flow that fires on the first WS
+                        // frame (for real WebSocket upgrades).  Emitting
+                        // again here would double-count turn #1.  Only
+                        // turns 2, 3, ...N need this extra push.
+                        if turn.turn_number > 1 {
+                            crate::classify_task::emit_stream_turn(
+                                chunk.connection_id,
+                                &turn,
+                                &state,
+                                self.telemetry.as_ref(),
+                            );
+                        }
+                    }
+                }
+                // Artifact events are already merged into the session's
+                // stream_artifacts by `self.streaming.on_chunk`.
+                soth_detect::ChunkEvent::Artifact(_) => {}
             }
         }
     }

@@ -7,7 +7,9 @@ use tokio_stream::Stream;
 use tracing::warn;
 
 use crate::error::ReaderError;
-use crate::playbook::{Playbook, PlaybookSource, RecordIterMethod, SessionIdConfig};
+use crate::playbook::{
+    Playbook, PlaybookSource, RecordIterMethod, SessionIdConfig, SplitRecordSource,
+};
 use crate::types::{AiTool, Cursor, HistoricalMessage, HistoricalSession};
 
 use super::{
@@ -16,25 +18,32 @@ use super::{
 };
 
 /// Stream sessions from a SQLite key-value store using a playbook configuration.
+///
+/// `since` (epoch ms) drops sessions whose start timestamp is before the
+/// cutoff. Applied in-process after row decode since the timestamp lives
+/// inside a JSON value column. Used by watch mode to process only
+/// recently-created composers and by backfill for time-bounded rescans.
 pub fn read_sessions_sqlite<'a>(
     playbook: &'a Playbook,
     root: &Path,
-    _since: Option<i64>,
+    since: Option<i64>,
     cursor: &'a Mutex<Option<Cursor>>,
 ) -> Pin<Box<dyn Stream<Item = Result<HistoricalSession, ReaderError>> + Send + 'a>> {
     let root = root.to_path_buf();
 
-    let (db_file, table, key_prefix, value_column) = match &playbook.source {
+    let (db_file, table, key_prefix, value_column, split_source) = match &playbook.source {
         PlaybookSource::SqliteKv {
             db_file,
             table,
             key_prefix,
             value_column,
+            split_record_source,
         } => (
             db_file.clone(),
             table.clone(),
             key_prefix.clone(),
             value_column.clone(),
+            split_record_source.clone(),
         ),
         _ => return Box::pin(tokio_stream::empty()),
     };
@@ -59,7 +68,7 @@ pub fn read_sessions_sqlite<'a>(
             message: format!("{} not found at or beneath {}", db_file, root.display()),
         })?;
 
-        match read_kv_sessions(&db_path, &table, &key_prefix, &value_column, since_rowid, playbook) {
+        match read_kv_sessions(&db_path, &table, &key_prefix, &value_column, since_rowid, since, split_source.as_ref(), playbook) {
             Ok((sessions, max_rowid)) => {
                 for session in sessions {
                     yield session;
@@ -126,6 +135,8 @@ fn read_kv_sessions(
     key_prefix: &str,
     value_column: &str,
     since_rowid: Option<i64>,
+    since_ms: Option<i64>,
+    split_source: Option<&SplitRecordSource>,
     playbook: &Playbook,
 ) -> Result<(Vec<HistoricalSession>, Option<i64>), ReaderError> {
     let conn = open_readonly(db_path, &playbook.tool)?;
@@ -211,8 +222,8 @@ fn read_kv_sessions(
         // Get records array.
         let records = match &extraction.records.iterate {
             RecordIterMethod::Field { path } => match resolve_path(&doc, path) {
-                Some(serde_json::Value::Array(arr)) => arr.clone(),
-                _ => continue,
+                Some(serde_json::Value::Array(arr)) if !arr.is_empty() => arr.clone(),
+                _ => Vec::new(),
             },
             RecordIterMethod::Lines => vec![doc.clone()],
         };
@@ -226,48 +237,140 @@ fn read_kv_sessions(
             &extraction.timestamp.format,
         );
 
-        for record in &records {
-            if !passes_filters(record, &extraction.records.filters) {
+        // Skip sessions older than the since cutoff when both are known.
+        if let (Some(cutoff), Some(ts)) = (since_ms, session_ts) {
+            if ts < cutoff {
                 continue;
             }
+        }
 
-            let role = match extract_role(record, &extraction.role) {
-                Some(r) => r,
-                None => continue,
-            };
+        if records.is_empty() {
+            // Declarative split-record fallback: the inline records array is
+            // empty, so look up each record in a separate DB row using the
+            // playbook-configured header list + key template. Used for
+            // Cursor v14+ (`fullConversationHeadersOnly` → `bubbleId:*` rows).
+            if let Some(split) = split_source {
+                if let Some(serde_json::Value::Array(headers)) =
+                    resolve_path(&doc, &split.headers_field)
+                {
+                    for header in headers {
+                        let record_id =
+                            match header.get(&split.header_id_field).and_then(|v| v.as_str()) {
+                                Some(id) => id,
+                                None => continue,
+                            };
 
-            let text = match extract_content(record, &extraction.content) {
-                Some(t) => t,
-                None => continue,
-            };
+                        let record_key = split
+                            .record_key_template
+                            .replace("{session_id}", &session_id)
+                            .replace("{record_id}", record_id);
+                        let record_json: Option<String> = conn
+                            .query_row(
+                                &format!("SELECT {value_column} FROM {table} WHERE key = ?1"),
+                                rusqlite::params![record_key],
+                                |row| row.get(0),
+                            )
+                            .ok();
 
-            let ts = parse_timestamp(
-                record,
-                &extraction.timestamp.field,
-                &extraction.timestamp.format,
-            )
-            .or(session_ts);
+                        let Some(json_str) = record_json else {
+                            continue;
+                        };
 
-            let token_estimate = extract_tokens(record, &extraction.tokens, &text);
+                        let Ok(record_doc) = serde_json::from_str::<serde_json::Value>(&json_str)
+                        else {
+                            continue;
+                        };
 
-            messages.push(HistoricalMessage {
-                role,
-                content: text,
-                timestamp: ts,
-                token_estimate,
-            });
+                        let role = match extract_role(&record_doc, &extraction.role) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+
+                        let text = match extract_content(&record_doc, &extraction.content) {
+                            Some(t) => t,
+                            None => continue,
+                        };
+
+                        // Split-row timestamp: try the configured field/format
+                        // first, then fall back to ISO-8601 parsing for record
+                        // rows that use a different format than the session
+                        // row (e.g. Cursor v14: composer=epoch_ms, bubble=iso8601),
+                        // then to the session-level timestamp.
+                        let ts = parse_timestamp(
+                            &record_doc,
+                            &extraction.timestamp.field,
+                            &extraction.timestamp.format,
+                        )
+                        .or_else(|| {
+                            record_doc
+                                .get(&extraction.timestamp.field)
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| {
+                                    chrono::DateTime::parse_from_rfc3339(s)
+                                        .ok()
+                                        .map(|dt| dt.timestamp_millis())
+                                })
+                        })
+                        .or(session_ts);
+
+                        let token_estimate = extract_tokens(&record_doc, &extraction.tokens, &text);
+
+                        messages.push(HistoricalMessage {
+                            role,
+                            content: text,
+                            timestamp: ts,
+                            token_estimate,
+                        });
+                    }
+                }
+            }
+        } else {
+            for record in &records {
+                if !passes_filters(record, &extraction.records.filters) {
+                    continue;
+                }
+
+                let role = match extract_role(record, &extraction.role) {
+                    Some(r) => r,
+                    None => continue,
+                };
+
+                let text = match extract_content(record, &extraction.content) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                let ts = parse_timestamp(
+                    record,
+                    &extraction.timestamp.field,
+                    &extraction.timestamp.format,
+                )
+                .or(session_ts);
+
+                let token_estimate = extract_tokens(record, &extraction.tokens, &text);
+
+                messages.push(HistoricalMessage {
+                    role,
+                    content: text,
+                    timestamp: ts,
+                    token_estimate,
+                });
+            }
         }
 
         if messages.is_empty() {
             continue;
         }
 
+        let first_msg_ts = messages.first().and_then(|m| m.timestamp);
+        let last_msg_ts = messages.last().and_then(|m| m.timestamp);
+
         sessions.push(HistoricalSession {
             tool: tool.clone(),
             session_id,
             messages,
-            started_at: session_ts,
-            ended_at: session_ts,
+            started_at: first_msg_ts.or(session_ts),
+            ended_at: last_msg_ts.or(session_ts),
         });
     }
 
@@ -302,6 +405,7 @@ mod tests {
                 table: "cursorDiskKV".into(),
                 key_prefix: "composerData:".into(),
                 value_column: "value".into(),
+                split_record_source: None,
             },
             extraction: PlaybookExtraction {
                 session_id: SessionIdConfig::Field {
@@ -512,6 +616,148 @@ mod tests {
             new_count += 1;
         }
         assert_eq!(new_count, 1);
+    }
+
+    fn cursor_v14_playbook() -> Playbook {
+        let mut pb = cursor_playbook();
+        pb.version = 2;
+        if let PlaybookSource::SqliteKv {
+            ref mut split_record_source,
+            ..
+        } = pb.source
+        {
+            *split_record_source = Some(SplitRecordSource {
+                headers_field: "fullConversationHeadersOnly".into(),
+                header_id_field: "bubbleId".into(),
+                record_key_template: "bubbleId:{session_id}:{record_id}".into(),
+            });
+        }
+        pb
+    }
+
+    #[tokio::test]
+    async fn cursor_v14_reads_split_bubble_rows() {
+        // Simulates Cursor v14+: the composerData row has an empty inline
+        // `conversation` and a `fullConversationHeadersOnly` pointer list.
+        // Each bubble lives in its own `bubbleId:<session>:<bubble>` row.
+        let tmp = TempDir::new().unwrap();
+        let composer = serde_json::json!({
+            "composerId": "sess1",
+            "createdAt": 1732629531988_i64,
+            "conversation": [],
+            "fullConversationHeadersOnly": [
+                {"bubbleId": "b1"},
+                {"bubbleId": "b2"},
+            ],
+        })
+        .to_string();
+        let bubble1 = serde_json::json!({
+            "type": 1,
+            "text": "hello from v14",
+            "createdAt": "2024-11-26T11:18:51.988Z",
+        })
+        .to_string();
+        let bubble2 = serde_json::json!({
+            "type": 2,
+            "text": "hi — i'm the assistant",
+            "createdAt": "2024-11-26T11:18:53.000Z",
+        })
+        .to_string();
+        create_cursor_db(
+            tmp.path(),
+            &[
+                ("composerData:sess1", &composer),
+                ("bubbleId:sess1:b1", &bubble1),
+                ("bubbleId:sess1:b2", &bubble2),
+            ],
+        );
+
+        let pb = cursor_v14_playbook();
+        let cursor = Mutex::new(None);
+        let mut stream = read_sessions_sqlite(&pb, tmp.path(), None, &cursor);
+        let mut sessions = Vec::new();
+        while let Some(r) = stream.next().await {
+            sessions.push(r.unwrap());
+        }
+
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.session_id, "sess1");
+        assert_eq!(s.messages.len(), 2, "both bubbles should resolve");
+        assert_eq!(s.messages[0].role, "user");
+        assert_eq!(s.messages[0].content, "hello from v14");
+        assert_eq!(s.messages[1].role, "assistant");
+        assert_eq!(s.messages[1].content, "hi — i'm the assistant");
+        // ISO-8601 timestamp on the bubble resolved, not session's epoch-ms.
+        assert_eq!(s.messages[0].timestamp, Some(1732619931988));
+    }
+
+    #[tokio::test]
+    async fn cursor_v14_playbook_still_reads_legacy_inline_sessions() {
+        // A playbook with split_record_source should still handle legacy rows
+        // whose inline `conversation` array is populated.
+        let tmp = TempDir::new().unwrap();
+        create_cursor_db(
+            tmp.path(),
+            &[(
+                "composerData:legacy",
+                &composer_json("legacy", 1732629531988, &[(1, "inline hello")]),
+            )],
+        );
+
+        let pb = cursor_v14_playbook();
+        let cursor = Mutex::new(None);
+        let mut stream = read_sessions_sqlite(&pb, tmp.path(), None, &cursor);
+        let mut sessions = Vec::new();
+        while let Some(r) = stream.next().await {
+            sessions.push(r.unwrap());
+        }
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages.len(), 1);
+        assert_eq!(sessions[0].messages[0].content, "inline hello");
+    }
+
+    #[tokio::test]
+    async fn cursor_v14_skips_bubbles_with_missing_rows() {
+        // If a header points to a non-existent bubble row, it should be
+        // skipped rather than failing the whole session.
+        let tmp = TempDir::new().unwrap();
+        let composer = serde_json::json!({
+            "composerId": "sess1",
+            "createdAt": 1732629531988_i64,
+            "conversation": [],
+            "fullConversationHeadersOnly": [
+                {"bubbleId": "present"},
+                {"bubbleId": "missing"},
+            ],
+        })
+        .to_string();
+        let bubble = serde_json::json!({
+            "type": 1,
+            "text": "only one survives",
+            "createdAt": "2024-11-26T11:18:51.988Z",
+        })
+        .to_string();
+        create_cursor_db(
+            tmp.path(),
+            &[
+                ("composerData:sess1", &composer),
+                ("bubbleId:sess1:present", &bubble),
+            ],
+        );
+
+        let pb = cursor_v14_playbook();
+        let cursor = Mutex::new(None);
+        let mut stream = read_sessions_sqlite(&pb, tmp.path(), None, &cursor);
+        let mut sessions = Vec::new();
+        while let Some(r) = stream.next().await {
+            sessions.push(r.unwrap());
+        }
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages.len(), 1);
+        assert_eq!(sessions[0].messages[0].content, "only one survives");
     }
 
     #[tokio::test]

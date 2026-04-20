@@ -87,7 +87,32 @@ pub enum PlaybookSource {
         key_prefix: String,
         /// Column containing the JSON value.
         value_column: String,
+        /// Optional split-record source — used when a session's messages
+        /// live in separate DB rows pointed-to by a header array on the
+        /// session row. Enabled for Cursor v14+ where `composerData:<id>`
+        /// rows carry only `fullConversationHeadersOnly` pointers and the
+        /// actual message rows are stored under `bubbleId:<session>:<bubble>`.
+        /// The engine applies this only when the inline records array
+        /// (from `extraction.records.iterate`) is empty, so a single
+        /// playbook can read both legacy and v14 data transparently.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        split_record_source: Option<SplitRecordSource>,
     },
+}
+
+/// Resolves a session's message records from a separate per-record DB row
+/// when the inline conversation array on the session row is empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitRecordSource {
+    /// Dot-path on the session row that contains the header array
+    /// (e.g. `"fullConversationHeadersOnly"`).
+    pub headers_field: String,
+    /// Field inside each header entry that holds the record's ID
+    /// (e.g. `"bubbleId"`).
+    pub header_id_field: String,
+    /// Template for the per-record DB key. Supports `{session_id}` and
+    /// `{record_id}` substitution (e.g. `"bubbleId:{session_id}:{record_id}"`).
+    pub record_key_template: String,
 }
 
 fn default_true() -> bool {

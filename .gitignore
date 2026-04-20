@@ -55,6 +55,7 @@ yarn-error.log*
 *.profraw
 coverage/
 lcov.info
+.playwright-mcp/
 
 # Certificates (generated)
 *.pem
