@@ -643,7 +643,8 @@ pub(crate) fn stream_turn_completed(
             output_tokens = usage.output_tokens,
             finish_reason = usage.finish_reason.as_deref().unwrap_or("-"),
             prompt_block = format_trace_block(prompt_preview.as_deref().unwrap_or("(none)"), 500),
-            content_block = format_trace_block(content_preview.as_deref().unwrap_or("(none)"), 4096),
+            content_block =
+                format_trace_block(content_preview.as_deref().unwrap_or("(none)"), 4096),
         );
         eprintln!("{summary}");
     }

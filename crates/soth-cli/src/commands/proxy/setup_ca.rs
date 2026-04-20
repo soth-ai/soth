@@ -421,8 +421,7 @@ fn install_trust_linux(cert_path: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create anchor dir {}", parent.display()))?;
         }
-        std::fs::copy(cert_path, anchor)
-            .with_context(|| format!("copy CA to {anchor}"))?;
+        std::fs::copy(cert_path, anchor).with_context(|| format!("copy CA to {anchor}"))?;
         let status = Command::new(update_tool)
             .status()
             .with_context(|| format!("run {update_tool}"))?;

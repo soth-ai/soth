@@ -450,9 +450,7 @@ pub fn extract_with_stream_rules(
                     apply_preprocess(&value, &rule.preprocess)
                 };
                 for (field, path) in &rule.extract {
-                    if let Some(extracted) =
-                        json_path(&processed, path).and_then(extract_string)
-                    {
+                    if let Some(extracted) = json_path(&processed, path).and_then(extract_string) {
                         accumulator.push(field, &extracted);
                     }
                 }

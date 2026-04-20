@@ -52,10 +52,7 @@ pub(crate) const MAX_TURN_PAYLOAD_BYTES: usize = 8 * 1024;
 /// `StreamTurnRequest` event to be emitted at the end of the current
 /// `process_chunk_with_bundle` call.  The pending event is drained AFTER
 /// credential_scan so both can be reported for one chunk.
-fn set_stream_prompt_and_signal(
-    session: &mut crate::types::StreamSession,
-    mut prompt: String,
-) {
+fn set_stream_prompt_and_signal(session: &mut crate::types::StreamSession, mut prompt: String) {
     if prompt.len() > MAX_TURN_PAYLOAD_BYTES {
         let mut cut = MAX_TURN_PAYLOAD_BYTES;
         while cut > 0 && !prompt.is_char_boundary(cut) {
@@ -175,16 +172,15 @@ pub fn process_chunk_with_bundle(
             // Emit a TurnCompleted so the proxy writes a per-turn record
             // immediately instead of waiting for connection close (which may
             // never happen).
-            if got_finish && descriptor.is_some_and(|d| {
-                d.features.iter().any(|f| f.protocol == "websocket")
-            }) {
+            if got_finish
+                && descriptor.is_some_and(|d| d.features.iter().any(|f| f.protocol == "websocket"))
+            {
                 let usage = session.last_usage.take().unwrap_or_default();
                 let model = session.model.clone();
                 session.turns_emitted += 1;
                 let turn_number = session.turns_emitted;
                 let connection_id = session.connection_id;
-                let (prompt, content) =
-                    take_session_turn_payload(session, MAX_TURN_PAYLOAD_BYTES);
+                let (prompt, content) = take_session_turn_payload(session, MAX_TURN_PAYLOAD_BYTES);
                 return Some(ChunkEvent::TurnCompleted(crate::types::StreamTurn {
                     connection_id,
                     model,
@@ -227,7 +223,8 @@ pub fn process_chunk_with_bundle(
                 // packet prefix (e.g. `42["event", ...]`), unwrap it first
                 // and process only the inner JSON data.
                 if socketio::looks_like_socketio(&chunk.payload) {
-                    let direction_is_client = chunk.direction == Some(FrameDirection::ClientToServer);
+                    let direction_is_client =
+                        chunk.direction == Some(FrameDirection::ClientToServer);
                     if let Some(socketio::SocketIoFrame::Event { data_json, .. }) =
                         socketio::decode_socketio_frame(&chunk.payload)
                     {
@@ -265,9 +262,11 @@ pub fn process_chunk_with_bundle(
                             if let Some(delta) = sse.delta {
                                 session.accumulate(delta);
                             }
-                            if got_finish && descriptor.is_some_and(|d| {
-                                d.features.iter().any(|f| f.protocol == "websocket")
-                            }) {
+                            if got_finish
+                                && descriptor.is_some_and(|d| {
+                                    d.features.iter().any(|f| f.protocol == "websocket")
+                                })
+                            {
                                 let usage = session.last_usage.take().unwrap_or_default();
                                 let model = session.model.clone();
                                 session.turns_emitted += 1;
@@ -340,9 +339,10 @@ pub fn process_chunk_with_bundle(
                     // `done` event signals the end of a response turn. Emit
                     // TurnCompleted so the proxy writes a per-turn record
                     // immediately.
-                    if got_finish && descriptor.is_some_and(|d| {
-                        d.features.iter().any(|f| f.protocol == "websocket")
-                    }) {
+                    if got_finish
+                        && descriptor
+                            .is_some_and(|d| d.features.iter().any(|f| f.protocol == "websocket"))
+                    {
                         let usage = session.last_usage.take().unwrap_or_default();
                         let model = session.model.clone();
                         session.turns_emitted += 1;
@@ -724,7 +724,14 @@ fn process_binary_ws_payload(
 /// for user input.
 fn heuristic_client_prompt_from_binary(payload: &[u8]) -> Option<String> {
     const PROMPT_FIELDS: &[&str] = &[
-        "message", "prompt", "text", "query", "input", "content", "user_input", "user_message",
+        "message",
+        "prompt",
+        "text",
+        "query",
+        "input",
+        "content",
+        "user_input",
+        "user_message",
         "question",
     ];
 
@@ -772,9 +779,7 @@ fn pick_user_prompt_from_proto_strings(strings: &[(u32, String)]) -> Option<Stri
         let bytes = s.as_bytes();
         bytes.len() >= 32
             && bytes.iter().filter(|b| **b == b'-').count() >= 4
-            && bytes
-                .iter()
-                .all(|b| b.is_ascii_hexdigit() || *b == b'-')
+            && bytes.iter().all(|b| b.is_ascii_hexdigit() || *b == b'-')
     }
     fn looks_like_hash(s: &str) -> bool {
         s.len() >= 32 && s.chars().all(|c| c.is_ascii_hexdigit())
@@ -785,9 +790,8 @@ fn pick_user_prompt_from_proto_strings(strings: &[(u32, String)]) -> Option<Stri
     fn is_all_caps_enum(s: &str) -> bool {
         // Matches strings like KADABRA__CHAT__UNIFIED_INPUT_BAR, HUMAN_AGENT, ECTO1.
         s.len() >= 3
-            && s.chars().all(|c| {
-                c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'
-            })
+            && s.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     }
     const BLACKLIST_SUBSTRINGS: &[&str] = &[
         "Mozilla",
@@ -839,7 +843,12 @@ fn pick_user_prompt_from_proto_strings(strings: &[(u32, String)]) -> Option<Stri
         // long, no punctuation).  User prompts typically have spaces or are
         // short and printable; fingerprint hashes are 20+ chars of mixed
         // alnum with no spaces.
-        if trimmed.len() >= 20 && !trimmed.contains(' ') && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+        if trimmed.len() >= 20
+            && !trimmed.contains(' ')
+            && trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.')
+        {
             continue;
         }
         return Some(trimmed.to_string());
@@ -850,11 +859,7 @@ fn pick_user_prompt_from_proto_strings(strings: &[(u32, String)]) -> Option<Stri
 /// Recursive DFS looking for `PROMPT_FIELDS` keys with a non-empty string
 /// value.  Bounded by depth to avoid pathological payloads.
 fn find_prompt_in_value(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
-    fn recurse(
-        v: &serde_json::Value,
-        fields: &[&str],
-        depth: u32,
-    ) -> Option<String> {
+    fn recurse(v: &serde_json::Value, fields: &[&str], depth: u32) -> Option<String> {
         if depth > 8 {
             return None;
         }

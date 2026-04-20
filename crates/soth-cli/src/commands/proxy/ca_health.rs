@@ -139,9 +139,7 @@ fn cert_public_key_pem(path: &Path) -> Result<String> {
 
 fn key_public_key_pem(path: &Path) -> Result<String> {
     let mut cmd = Command::new("openssl");
-    cmd.args(["pkey", "-in"])
-        .arg(path)
-        .args(["-pubout"]);
+    cmd.args(["pkey", "-in"]).arg(path).args(["-pubout"]);
     super::hide_console_window(&mut cmd);
     let output = cmd
         .output()

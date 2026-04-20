@@ -446,10 +446,7 @@ async fn ensure_classify_models(config: &soth_proxy::config::ProxyConfig) {
     );
 }
 
-fn extract_classify_tar_gz(
-    target_dir: &std::path::Path,
-    gz_bytes: &[u8],
-) -> anyhow::Result<()> {
+fn extract_classify_tar_gz(target_dir: &std::path::Path, gz_bytes: &[u8]) -> anyhow::Result<()> {
     use flate2::read::GzDecoder;
     use tar::Archive;
 

@@ -892,12 +892,7 @@ impl ProxyHandler {
                 // the prompt without waiting for the response to finish.
                 soth_detect::ChunkEvent::TurnRequest(req) => {
                     if let Some(state) = self.streaming.peek_pending(&chunk.connection_id) {
-                        let provider = state
-                            .detect_result
-                            .normalized
-                            .provider
-                            .as_str()
-                            .to_string();
+                        let provider = state.detect_result.normalized.provider.as_str().to_string();
                         crate::trace::stream_turn_request(
                             chunk.connection_id,
                             req.turn_number,
@@ -941,12 +936,7 @@ impl ProxyHandler {
                             turn.prompt.as_deref(),
                             turn.content.as_deref(),
                         );
-                        crate::db::write_stream_turn(
-                            &self.db,
-                            chunk.connection_id,
-                            &turn,
-                            &state,
-                        );
+                        crate::db::write_stream_turn(&self.db, chunk.connection_id, &turn, &state);
                         // Push a per-turn TelemetryEvent into the cloud
                         // pipeline so long-lived WebSocket sessions (e.g.
                         // Microsoft Copilot) can show one row per assistant

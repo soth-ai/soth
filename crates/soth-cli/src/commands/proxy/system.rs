@@ -889,9 +889,7 @@ async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool)
             println!("      export NO_PROXY=\"localhost,127.0.0.1,::1,*.local\"");
         } else {
             println!("   {} Remove from your shell profile:", style::INFO);
-            println!(
-                "      unset https_proxy HTTPS_PROXY http_proxy HTTP_PROXY no_proxy NO_PROXY"
-            );
+            println!("      unset https_proxy HTTPS_PROXY http_proxy HTTP_PROXY no_proxy NO_PROXY");
         }
     }
 

@@ -223,12 +223,16 @@ fn build_sensitive_code_flags(
             ArtifactKind::ConnectionString => {
                 flags.credential_pattern_detected = true;
                 flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("connection_string".to_string());
+                flags
+                    .detected_secret_types
+                    .push("connection_string".to_string());
             }
             ArtifactKind::UnknownCredential => {
                 flags.credential_pattern_detected = true;
                 flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("unknown_credential".to_string());
+                flags
+                    .detected_secret_types
+                    .push("unknown_credential".to_string());
             }
             ArtifactKind::OrgPattern { pattern_id } => {
                 flags.org_pattern_matches.push(pattern_id.to_string());
@@ -242,7 +246,9 @@ fn build_sensitive_code_flags(
             ArtifactKind::AwsAccessKey => {
                 flags.credential_pattern_detected = true;
                 flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("aws_access_key".to_string());
+                flags
+                    .detected_secret_types
+                    .push("aws_access_key".to_string());
             }
             ArtifactKind::GitHubPat => {
                 flags.credential_pattern_detected = true;
@@ -262,7 +268,9 @@ fn build_sensitive_code_flags(
             ArtifactKind::StripeSecretKey => {
                 flags.credential_pattern_detected = true;
                 flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("stripe_secret_key".to_string());
+                flags
+                    .detected_secret_types
+                    .push("stripe_secret_key".to_string());
             }
         }
     }

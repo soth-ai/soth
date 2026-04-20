@@ -254,13 +254,11 @@ fn read_kv_sessions(
                     resolve_path(&doc, &split.headers_field)
                 {
                     for header in headers {
-                        let record_id = match header
-                            .get(&split.header_id_field)
-                            .and_then(|v| v.as_str())
-                        {
-                            Some(id) => id,
-                            None => continue,
-                        };
+                        let record_id =
+                            match header.get(&split.header_id_field).and_then(|v| v.as_str()) {
+                                Some(id) => id,
+                                None => continue,
+                            };
 
                         let record_key = split
                             .record_key_template
