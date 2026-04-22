@@ -215,6 +215,17 @@ async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Re
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
+    // On Windows a console-subsystem binary creates its own console window
+    // unless CREATE_NO_WINDOW is set. Without this the worker pops a blank
+    // "soth.exe" window and closing it kills the daemon via CTRL_CLOSE_EVENT.
+    // CREATE_NEW_PROCESS_GROUP so supervisor SIGBREAK/termination of the
+    // shell that launched `soth up` does not cascade to the worker.
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
     cmd.spawn()
         .map_err(|error| anyhow::anyhow!("failed launching proxy worker: {error}"))
 }

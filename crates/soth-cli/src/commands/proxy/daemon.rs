@@ -123,7 +123,11 @@ fn windows_unlock_file(file: &File) {
 #[cfg(target_os = "windows")]
 fn apply_windows_hidden_process_flags(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    // Detach from the invoking shell's console + process group so the daemon
+    // survives shell exit and doesn't pop a blank console window.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1052,6 +1056,9 @@ pub async fn run_start_daemon(
             });
         }
     }
+
+    #[cfg(target_os = "windows")]
+    apply_windows_hidden_process_flags(&mut cmd);
 
     let mut child = cmd.spawn().context("failed spawning proxy daemon")?;
     let startup_timeout = daemon_startup_timeout();
