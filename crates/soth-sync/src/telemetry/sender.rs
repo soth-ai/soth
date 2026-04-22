@@ -377,6 +377,7 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         product_id: event.product_id.clone(),
         surface_type: enum_name(&event.surface_type),
         is_shadow_it: if event.is_shadow_it { Some(true) } else { None },
+        interaction_mode: enum_name(&event.interaction_mode),
     }
 }
 

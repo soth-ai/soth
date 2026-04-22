@@ -1058,7 +1058,12 @@ pub async fn run_start_daemon(
     }
 
     #[cfg(target_os = "windows")]
-    apply_windows_hidden_process_flags(&mut cmd);
+    {
+        apply_windows_hidden_process_flags(&mut cmd);
+        // This Command already applies DETACHED_PROCESS + CREATE_NO_WINDOW so
+        // the child doesn't need the self-detach re-exec in start::run.
+        cmd.env(super::start::DAEMON_DETACHED_ENV, "1");
+    }
 
     let mut child = cmd.spawn().context("failed spawning proxy daemon")?;
     let startup_timeout = daemon_startup_timeout();

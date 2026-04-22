@@ -44,6 +44,18 @@ pub async fn run(
         return run_proxy_worker().await;
     }
 
+    // Windows autostart self-detach: when `soth start --daemon-child` is
+    // invoked from HKCU\...\Run at user login, explorer.exe spawns it with
+    // default creation flags — the binary gets a visible console and is
+    // tied to explorer. Closing that console kills the supervisor, and with
+    // it the proxy. Spawners that already applied detached flags set
+    // DAEMON_DETACHED_ENV to skip this re-exec; anyone else (Run key, user
+    // shell) triggers the self-detach below.
+    #[cfg(target_os = "windows")]
+    if daemon_child && std::env::var(DAEMON_DETACHED_ENV).is_err() {
+        return self_detach_daemon(port, config_path.as_ref(), quiet);
+    }
+
     if !foreground && !daemon_child {
         return daemon::run_start_daemon(
             port,
@@ -233,6 +245,69 @@ async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Re
 /// Env var toggle that re-executed child processes use to enter in-process
 /// MITM runtime mode. Set by [`spawn_proxy_process`].
 pub(crate) const PROXY_WORKER_ENV: &str = "SOTH_PROXY_WORKER";
+
+/// Windows-only marker env var. Set by spawners that have already applied
+/// `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` flags so
+/// the child doesn't re-detach in a loop. When a daemon-child process starts
+/// without this var set (e.g. triggered from HKCU\Run at login), it re-execs
+/// itself detached via [`self_detach_daemon`] and exits.
+#[cfg(target_os = "windows")]
+pub(crate) const DAEMON_DETACHED_ENV: &str = "SOTH_DAEMON_DETACHED";
+
+/// Re-spawn ourselves as a fully detached daemon child and return `Ok(())` so
+/// the caller (Run key / shell) exits cleanly. stdout/stderr go to
+/// `~/.soth/logs/proxy.log` so the detached child has persistent logging.
+#[cfg(target_os = "windows")]
+fn self_detach_daemon(port: Option<u16>, config_path: Option<&PathBuf>, quiet: bool) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    let exe = std::env::current_exe().context("resolve current executable for self-detach")?;
+    let log_path = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("home directory not found for self-detach log"))?
+        .join(".soth")
+        .join("logs")
+        .join("proxy.log");
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating proxy log directory {}", parent.display()))?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed opening proxy log {}", log_path.display()))?;
+    let log_clone = log
+        .try_clone()
+        .context("failed cloning proxy log file handle for self-detach stderr")?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("start").arg("--daemon-child");
+    if quiet {
+        cmd.arg("--quiet");
+    }
+    if let Some(p) = port {
+        cmd.arg("--port").arg(p.to_string());
+    }
+    if let Some(cfg) = config_path {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.env(DAEMON_DETACHED_ENV, "1");
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_clone))
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    cmd.spawn()
+        .context("failed spawning detached SOTH proxy daemon on Windows")?;
+
+    Ok(())
+}
 
 /// Supervise the proxy child process with auto-restart on failure.
 ///
