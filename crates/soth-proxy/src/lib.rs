@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 #![allow(clippy::too_many_arguments)]
 
+pub mod bundle_runtime;
 pub mod classify_task;
 pub mod config;
 pub mod db;
@@ -15,6 +16,7 @@ pub mod ops_server;
 pub mod pending;
 pub mod pending_emit;
 pub mod response;
+pub mod runtime;
 pub mod search;
 pub mod session;
 #[allow(unsafe_code)]

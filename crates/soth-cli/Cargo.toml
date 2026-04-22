@@ -19,6 +19,8 @@ dev-pipeline-trace = ["soth-proxy/dev-pipeline-trace"]
 soth-core = { workspace = true }
 soth-bundle = { workspace = true }
 soth-proxy = { workspace = true }
+soth-extensions = { workspace = true }
+soth-historian = { workspace = true }
 soth-sync = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "signal", "time", "process"] }
