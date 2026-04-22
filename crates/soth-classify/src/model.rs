@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use soth_core::{AnomalyFlag, UseCaseLabel};
+use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel};
 
 use crate::traits::{AnomalyScorer, AnomalySignals, ClassificationProvider, ClassificationResult};
 
@@ -74,6 +74,9 @@ struct SothBinaryClassifier {
     usecase_weights: Vec<Vec<f32>>,
     usecase_biases: Vec<f32>,
     usecase_labels: Vec<UseCaseLabel>,
+    auxiliary_weights: Vec<Vec<f32>>,
+    auxiliary_biases: Vec<f32>,
+    auxiliary_labels: Vec<String>,
 }
 
 impl BundleModelClassifier {
@@ -121,6 +124,7 @@ fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> Classificatio
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
             secondary_label: None,
+            interaction_mode: InteractionMode::Unknown,
         };
     }
 
@@ -130,6 +134,7 @@ fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> Classificatio
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
             secondary_label: None,
+            interaction_mode: InteractionMode::Unknown,
         };
     }
 
@@ -145,6 +150,7 @@ fn classify_soth_binary(model: &SothBinaryClassifier, embedding: &[f32]) -> Clas
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
             secondary_label: None,
+            interaction_mode: InteractionMode::Unknown,
         };
     }
 
@@ -170,13 +176,40 @@ fn classify_soth_binary(model: &SothBinaryClassifier, embedding: &[f32]) -> Clas
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
             secondary_label: None,
+            interaction_mode: InteractionMode::Unknown,
         };
     }
 
     let probs = softmax(logits.as_slice());
     let aggregated =
         aggregate_probs_to_public_labels(model.usecase_labels.as_slice(), probs.as_slice());
-    classify_from_probs(LABEL_SPACE.as_slice(), aggregated.as_slice())
+    let mut result = classify_from_probs(LABEL_SPACE.as_slice(), aggregated.as_slice());
+
+    // Auxiliary head: interaction mode (AUGMENTATIVE / DIRECTIVE / EXPRESSIVE)
+    if !model.auxiliary_weights.is_empty() && !model.auxiliary_labels.is_empty() {
+        let aux_logits = affine_logits(
+            hidden2.as_slice(),
+            &model.auxiliary_weights,
+            &model.auxiliary_biases,
+        );
+        if !aux_logits.is_empty() && aux_logits.len() == model.auxiliary_labels.len() {
+            let aux_probs = softmax(aux_logits.as_slice());
+            let (top_idx, _) = top1(aux_probs.as_slice());
+            result.interaction_mode =
+                map_auxiliary_label(model.auxiliary_labels.get(top_idx).map(String::as_str));
+        }
+    }
+
+    result
+}
+
+fn map_auxiliary_label(label: Option<&str>) -> InteractionMode {
+    match label {
+        Some("AUGMENTATIVE") => InteractionMode::Augmentative,
+        Some("DIRECTIVE") => InteractionMode::Directive,
+        Some("EXPRESSIVE") => InteractionMode::Expressive,
+        _ => InteractionMode::Unknown,
+    }
 }
 
 fn classify_from_probs(labels: &[UseCaseLabel], probs: &[f32]) -> ClassificationResult {
@@ -185,6 +218,7 @@ fn classify_from_probs(labels: &[UseCaseLabel], probs: &[f32]) -> Classification
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
             secondary_label: None,
+            interaction_mode: InteractionMode::Unknown,
         };
     }
 
@@ -208,6 +242,7 @@ fn classify_from_probs(labels: &[UseCaseLabel], probs: &[f32]) -> Classification
         label: labels[top_idx],
         confidence: top_prob.clamp(0.0, 1.0),
         secondary_label: secondary,
+        interaction_mode: InteractionMode::Unknown, // set by caller for soth_binary
     }
 }
 
@@ -456,15 +491,15 @@ fn parse_classifier_soth_binary(
     if auxiliary_rows != auxiliary_count || auxiliary_cols != hidden2_dim {
         return None;
     }
-    let _auxiliary_weights = cursor.read_matrix(auxiliary_rows, auxiliary_cols)?;
-    let _auxiliary_biases = cursor.read_len_prefixed_vector(auxiliary_rows)?;
+    let auxiliary_weights = cursor.read_matrix(auxiliary_rows, auxiliary_cols)?;
+    let auxiliary_biases = cursor.read_len_prefixed_vector(auxiliary_rows)?;
 
     let usecase_labels = cursor
         .read_label_block(usecase_count)?
         .into_iter()
         .map(|label| map_bundle_label(label.as_str()))
         .collect::<Vec<_>>();
-    let _auxiliary_labels = cursor.read_label_block(auxiliary_count)?;
+    let auxiliary_labels = cursor.read_label_block(auxiliary_count)?;
 
     if usecase_labels.is_empty() {
         return None;
@@ -482,6 +517,9 @@ fn parse_classifier_soth_binary(
             usecase_weights,
             usecase_biases,
             usecase_labels,
+            auxiliary_weights,
+            auxiliary_biases,
+            auxiliary_labels,
         }),
     })
 }

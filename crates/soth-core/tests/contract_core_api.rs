@@ -248,6 +248,7 @@ fn telemetry_event_surface_excludes_raw_content_fields() {
         alpn_protocol: None,
         h2_connection_id: None,
         h2_stream_id: None,
+        interaction_mode: soth_core::InteractionMode::Unknown,
     };
 
     let value = serde_json::to_value(event).expect("serialize telemetry event");
@@ -622,6 +623,7 @@ fn telemetry_event_new_fields_serde_roundtrip() {
         alpn_protocol: None,
         h2_connection_id: None,
         h2_stream_id: None,
+        interaction_mode: soth_core::InteractionMode::Unknown,
     };
 
     let json = serde_json::to_string(&event).expect("serialize");

@@ -1,10 +1,11 @@
-use soth_core::{AnomalyFlag, UseCaseLabel};
+use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel};
 
 #[derive(Debug, Clone)]
 pub struct ClassificationResult {
     pub label: UseCaseLabel,
     pub confidence: f32,
     pub secondary_label: Option<UseCaseLabel>,
+    pub interaction_mode: InteractionMode,
 }
 
 #[derive(Debug, Clone, Default)]

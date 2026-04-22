@@ -82,7 +82,7 @@ pub use session::{
 
 // ── telemetry ─────────────────────────────────────────────────────────────────
 pub use telemetry::{
-    BundleTrustLevel, CacheLevel, ClassificationFlag, DataSource, ImportCategory,
+    BundleTrustLevel, CacheLevel, ClassificationFlag, DataSource, ImportCategory, InteractionMode,
     ProgrammingLanguage, RequestMethod, RoutingReason, SensitiveCodeFlags, TelemetryEvent,
     TelemetryPolicyKind, UseCaseLabel, VolatilityClass,
 };

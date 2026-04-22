@@ -113,6 +113,7 @@ pub(crate) fn run(
         use_case_confidence: usecase.confidence.clamp(0.0, 1.0),
         secondary_label: usecase.secondary_label,
         complexity_score: usecase.complexity_score,
+        interaction_mode: usecase.interaction_mode,
         embedding_norm,
         system_prompt_hash: detect_result.normalized.system_prompt_hash.clone(),
         system_prompt_token_length: detect_result.normalized.system_prompt_token_estimate,
@@ -485,6 +486,7 @@ mod tests {
             confidence: 0.8,
             secondary_label: Some(soth_core::UseCaseLabel::CodeReview),
             complexity_score: 4,
+            interaction_mode: soth_core::InteractionMode::Directive,
         }
     }
 

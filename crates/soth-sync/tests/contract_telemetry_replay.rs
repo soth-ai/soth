@@ -128,6 +128,7 @@ fn sample_event(event_id: Uuid) -> TelemetryEvent {
         alpn_protocol: None,
         h2_connection_id: None,
         h2_stream_id: None,
+        interaction_mode: soth_core::InteractionMode::Unknown,
     }
 }
 

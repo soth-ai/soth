@@ -511,6 +511,8 @@ pub struct TelemetryEvent {
     pub surface_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_shadow_it: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
