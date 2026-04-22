@@ -563,6 +563,10 @@ fn ensure_windows_run_key(exe: &Path, args: &[String]) -> Result<String> {
 
     Command::new(exe)
         .args(args)
+        // Marker tells the child to skip the Windows self-detach re-exec —
+        // this Command already applies DETACHED_PROCESS + CREATE_NO_WINDOW +
+        // CREATE_NEW_PROCESS_GROUP, so the child is already properly detached.
+        .env(crate::commands::proxy::start::DAEMON_DETACHED_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_clone))
