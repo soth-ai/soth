@@ -485,6 +485,12 @@ fn shell_escape(value: &str) -> String {
 #[cfg(target_os = "windows")]
 fn ensure_windows_run_key(exe: &Path, args: &[String]) -> Result<String> {
     use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    // Windows process creation flags (see winbase.h).
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
     let mut commandline = windows_quote_arg(&exe.display().to_string());
     for arg in args {
@@ -504,7 +510,7 @@ fn ensure_windows_run_key(exe: &Path, args: &[String]) -> Result<String> {
             &commandline,
             "/f",
         ])
-        .creation_flags(0x08000000)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .context("failed configuring Windows startup Run key")?;
     if !output.status.success() {
@@ -513,8 +519,39 @@ fn ensure_windows_run_key(exe: &Path, args: &[String]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+
+    // The Run key only fires at next user login. Also spawn the daemon now so
+    // `soth start` / `soth up` unblocks immediately. Detached from this
+    // process group so it survives when the shell that invoked `soth up` exits.
+    let log_path = dirs::home_dir()
+        .ok_or_else(|| anyhow!("home directory not found"))?
+        .join(".soth")
+        .join("logs")
+        .join("proxy.log");
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating proxy log directory {}", parent.display()))?;
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed opening proxy log file {}", log_path.display()))?;
+    let log_clone = log_file
+        .try_clone()
+        .context("failed cloning proxy log file handle for stderr")?;
+
+    Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_clone))
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .context("failed spawning SOTH proxy daemon on Windows")?;
+
     Ok(format!(
-        "windows Run key enabled (HKCU\\...\\Run\\{})",
+        "windows Run key enabled (HKCU\\...\\Run\\{}) and daemon spawned",
         WINDOWS_RUN_KEY_VALUE
     ))
 }
