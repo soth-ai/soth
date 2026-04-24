@@ -88,7 +88,10 @@ fn claude_code() -> Playbook {
             detect: PlaybookDetect::GlobExists {
                 pattern: "**/*.jsonl".into(),
             },
-            exclude_dirs: vec!["memory".into(), "subagents".into()],
+            // `subagents/agent-*.jsonl` are distinct conversations spawned by
+            // the Task tool — include them. Only `memory/` (MEMORY.md etc.)
+            // stays excluded as it holds notes, not transcripts.
+            exclude_dirs: vec!["memory".into()],
             exclude_file_patterns: vec![],
         },
         source: PlaybookSource::JsonlFiles {

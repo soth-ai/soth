@@ -348,7 +348,7 @@ mod tests {
                 detect: PlaybookDetect::GlobExists {
                     pattern: "**/*.jsonl".into(),
                 },
-                exclude_dirs: vec!["memory".into(), "subagents".into()],
+                exclude_dirs: vec!["memory".into()],
                 exclude_file_patterns: vec![],
             },
             source: PlaybookSource::JsonlFiles {
@@ -621,9 +621,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn excludes_subagents_dir() {
-        // Subagent files are AI-to-AI conversations that duplicate content
-        // already captured in the parent session — they should be excluded.
+    async fn includes_subagents_dir() {
+        // Subagent files are distinct conversations spawned by the Task tool —
+        // the parent session only records the tool_use call, not the full
+        // sub-conversation, so these must be ingested to capture the work.
         let tmp = TempDir::new().unwrap();
         write_file(
             tmp.path(),
@@ -640,10 +641,15 @@ mod tests {
         let cursor = Mutex::new(None);
         let mut stream = read_sessions_jsonl(&pb, tmp.path(), None, &cursor);
 
-        let session = stream.next().await.unwrap().unwrap();
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].content, "real user msg");
-        assert!(stream.next().await.is_none());
+        let mut contents: Vec<String> = Vec::new();
+        while let Some(res) = stream.next().await {
+            let session = res.unwrap();
+            for m in session.messages {
+                contents.push(m.content);
+            }
+        }
+        contents.sort();
+        assert_eq!(contents, vec!["delegated task".to_string(), "real user msg".to_string()]);
     }
 
     #[tokio::test]
