@@ -1,7 +1,9 @@
 use crate::cli_config::{self, SothConfig};
 use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -69,14 +71,15 @@ pub(crate) fn cert_fingerprint_sha256(path: &Path) -> Result<String> {
     cert_fingerprint(path, "sha256")
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn cert_fingerprint_sha1(path: &Path) -> Result<String> {
     cert_fingerprint(path, "sha1")
 }
 
 pub(crate) fn cert_matches_key(cert_path: &Path, key_path: &Path) -> Result<bool> {
-    let cert_pubkey = cert_public_key_pem(cert_path)?;
-    let key_pubkey = key_public_key_pem(key_path)?;
-    Ok(normalize_pem_block(cert_pubkey.as_str()) == normalize_pem_block(key_pubkey.as_str()))
+    let cert_spki = cert_spki_der(cert_path)?;
+    let key_spki = key_spki_der(key_path)?;
+    Ok(cert_spki == key_spki)
 }
 
 pub(crate) fn check_os_trust(cert_path: &Path) -> Result<OsTrustCheck> {
@@ -102,63 +105,56 @@ fn cert_fingerprint(path: &Path, algo: &str) -> Result<String> {
     if !path.exists() {
         anyhow::bail!("certificate not found at {}", path.display());
     }
-    let flag = format!("-{}", algo.trim());
-    let mut cmd = Command::new("openssl");
-    cmd.args(["x509", "-in"])
-        .arg(path)
-        .args(["-noout", "-fingerprint", flag.as_str()]);
-    super::hide_console_window(&mut cmd);
-    let output = cmd
-        .output()
-        .context("failed running openssl for certificate fingerprint")?;
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    let der = read_first_pem_block_der(path)
+        .with_context(|| format!("failed reading certificate at {}", path.display()))?;
+    let digest: Vec<u8> = match algo.trim().to_ascii_lowercase().as_str() {
+        "sha256" => {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&der).to_vec()
+        }
+        "sha1" => {
+            use sha1::{Digest as _, Sha1};
+            Sha1::digest(&der).to_vec()
+        }
+        other => anyhow::bail!("unsupported fingerprint algorithm: {other}"),
+    };
+    Ok(hex_upper(&digest))
+}
+
+fn cert_spki_der(path: &Path) -> Result<Vec<u8>> {
+    let der = read_first_pem_block_der(path)
+        .with_context(|| format!("failed reading certificate at {}", path.display()))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|e| anyhow::anyhow!("failed parsing X.509 certificate: {e}"))?;
+    Ok(cert.tbs_certificate.subject_pki.raw.to_vec())
+}
+
+fn key_spki_der(path: &Path) -> Result<Vec<u8>> {
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("failed reading private key at {}", path.display()))?;
+    let key_pair = rcgen::KeyPair::from_pem(pem.as_str())
+        .map_err(|e| anyhow::anyhow!("failed parsing private key: {e}"))?;
+    Ok(key_pair.public_key_der())
+}
+
+fn read_first_pem_block_der(path: &Path) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&bytes)
+        .map_err(|e| anyhow::anyhow!("failed decoding PEM: {e}"))?;
+    Ok(pem.contents)
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.trim();
-    let (_, value) = line
-        .split_once('=')
-        .ok_or_else(|| anyhow::anyhow!("unexpected openssl fingerprint output: {line}"))?;
-    normalize_hash(value).ok_or_else(|| anyhow::anyhow!("invalid fingerprint format: {line}"))
+    out
 }
 
-fn cert_public_key_pem(path: &Path) -> Result<String> {
-    let mut cmd = Command::new("openssl");
-    cmd.args(["x509", "-in"])
-        .arg(path)
-        .args(["-pubkey", "-noout"]);
-    super::hide_console_window(&mut cmd);
-    let output = cmd
-        .output()
-        .context("failed running openssl x509 -pubkey")?;
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn key_public_key_pem(path: &Path) -> Result<String> {
-    let mut cmd = Command::new("openssl");
-    cmd.args(["pkey", "-in"]).arg(path).args(["-pubout"]);
-    super::hide_console_window(&mut cmd);
-    let output = cmd
-        .output()
-        .context("failed running openssl pkey -pubout")?;
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn normalize_pem_block(value: &str) -> String {
-    value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
+#[cfg(target_os = "macos")]
 fn normalize_hash(raw: &str) -> Option<String> {
     let normalized: String = raw.chars().filter(|ch| ch.is_ascii_hexdigit()).collect();
     if normalized.len() == 40 || normalized.len() == 64 {

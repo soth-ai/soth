@@ -3294,6 +3294,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha1",
+ "sha2",
  "soth-bundle",
  "soth-core",
  "soth-extensions",
@@ -3307,6 +3309,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "which",
+ "x509-parser",
 ]
 
 [[package]]

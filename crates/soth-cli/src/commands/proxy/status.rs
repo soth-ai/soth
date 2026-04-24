@@ -648,23 +648,13 @@ fn parse_cert_not_after(path: &Path) -> Result<String> {
     if !path.exists() {
         anyhow::bail!("cert not found");
     }
-    let mut cmd = std::process::Command::new("openssl");
-    cmd.arg("x509")
-        .arg("-in")
-        .arg(path)
-        .arg("-noout")
-        .arg("-enddate");
-    super::hide_console_window(&mut cmd);
-    let output = cmd.output().with_context(|| "failed running openssl")?;
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.trim();
-    if let Some(value) = line.strip_prefix("notAfter=") {
-        return Ok(value.trim().to_string());
-    }
-    anyhow::bail!("unexpected openssl output: {line}")
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed reading cert at {}", path.display()))?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&bytes)
+        .map_err(|e| anyhow::anyhow!("failed decoding PEM: {e}"))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
+        .map_err(|e| anyhow::anyhow!("failed parsing X.509 certificate: {e}"))?;
+    Ok(cert.tbs_certificate.validity.not_after.to_string())
 }
 
 fn format_ago(seconds: i64) -> String {
