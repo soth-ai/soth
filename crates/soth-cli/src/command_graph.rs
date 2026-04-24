@@ -636,19 +636,20 @@ async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow:
     }
 
     if let Some(error) = enrollment_error {
-        let config = cli_config::load_effective_config(effective_config.as_ref(), None)?;
-        let bundle_dir = cli_config::expand_tilde(Path::new(config.bundle.bundle_dir.as_str()));
-        if !bundle_dir.join("manifest.json").exists() {
-            return Err(anyhow::anyhow!(
-                "Enrollment failed and no local bundle exists at {}. Cannot continue startup.\nEnrollment error: {:#}",
-                bundle_dir.display(),
-                error
-            ));
-        }
+        // Enrollment failed. Don't bail here — fall through to
+        // `ensure_bundle_for_bootstrap`, which knows how to either reuse a
+        // local manifest or pull one from the cloud using any API key
+        // already on disk from a prior `soth enroll` / `soth login`. Hard
+        // failure only happens if neither path produces a bundle.
         tracing::warn!(
             error = %format!("{error:#}"),
-            "Enrollment failed during `up`; continuing fail-open with local runtime bundle"
+            "Enrollment failed during `up`; attempting bundle bootstrap with existing credentials"
         );
+        if !args.quiet {
+            style::warning(&format!(
+                "Enrollment failed: {error:#}\nContinuing with any local bundle or existing cloud credentials."
+            ));
+        }
     }
 
     #[cfg(test)]
@@ -854,7 +855,8 @@ async fn ensure_bundle_for_bootstrap(
         Some(value) => value,
         None => {
             anyhow::bail!(
-                "Bundle directory {} is missing. Cloud credentials are not configured, so bootstrap cannot fetch bundle. Run `soth enroll <token>` first.",
+                "Bundle directory {} is missing and cloud credentials are not configured; bootstrap cannot fetch bundle.\n\
+                 Run one of:\n  soth enroll <token>       (exchange an invite token for an API key)\n  soth login --api-key <key> (persist a pre-issued API key directly)",
                 bundle_dir.display()
             );
         }
