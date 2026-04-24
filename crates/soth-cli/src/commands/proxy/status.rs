@@ -362,7 +362,9 @@ fn collect_sync_status(
         last_heartbeat_secs: last_sync,
         queued,
         failed,
-        endpoint: config.cloud.endpoint.clone(),
+        // Sync/heartbeat targets the ingest endpoint; report the actual URL
+        // the runtime is using so `soth status` reflects the live wire.
+        endpoint: config.cloud.resolved_ingest_endpoint(),
     })
 }
 

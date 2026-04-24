@@ -24,9 +24,18 @@ pub struct LoginArgs {
     #[arg(long)]
     pub from_stdin: bool,
 
-    /// Cloud management endpoint (e.g. https://api.soth.ai).
+    /// Cloud management endpoint (e.g. https://api.soth.ai). Serves
+    /// dashboard/management routes (/v1/keys, /v1/dashboard/*, /v1/org/*).
     #[arg(long)]
     pub endpoint: Option<String>,
+
+    /// Cloud edge/ingest endpoint (e.g. https://ingest.soth.ai). Serves the
+    /// edge plane (/v1/edge/enroll/exchange, /v1/edge/heartbeat, etc.).
+    /// Optional: when omitted, derived from --endpoint by rewriting
+    /// api.<domain> to ingest.<domain>. Set this explicitly only for
+    /// single-host dev or custom deployments.
+    #[arg(long)]
+    pub ingest_endpoint: Option<String>,
 
     /// Config file path to update (defaults to ~/.soth/soth.yaml).
     #[arg(long)]
@@ -57,13 +66,25 @@ pub async fn run(args: LoginArgs, global_config: Option<PathBuf>) -> Result<()> 
     if let Some(endpoint) = args.endpoint.clone() {
         config.cloud.endpoint = endpoint;
     }
+    if let Some(ingest) = args.ingest_endpoint.clone() {
+        let trimmed = ingest.trim();
+        config.cloud.ingest_endpoint = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
     config.exchange.enabled = true;
 
     cli_config::write_config(&config_path, &config)?;
 
     println!("Login saved.");
     println!("Config: {}", config_path.display());
-    println!("Cloud endpoint: {}", config.cloud.endpoint);
+    println!("Cloud endpoint (management): {}", config.cloud.endpoint);
+    println!(
+        "Cloud endpoint (edge/ingest): {}",
+        config.cloud.resolved_ingest_endpoint()
+    );
 
     Ok(())
 }

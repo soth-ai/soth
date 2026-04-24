@@ -215,7 +215,16 @@ impl Default for CaConfig {
 pub struct CloudConfig {
     pub enabled: bool,
     pub api_key: Option<String>,
+    /// Management / dashboard endpoint. Serves `/v1/keys`, `/v1/teams`,
+    /// `/v1/dashboard/*`, `/v1/org/*` on `soth-api`.
     pub endpoint: String,
+    /// Edge-plane endpoint. Serves `/v1/edge/*` (enroll, heartbeat, bundle,
+    /// telemetry, registry) on `soth-ingestion`. When unset, the CLI derives
+    /// it by rewriting `api.<domain>` → `ingest.<domain>` in `endpoint`.
+    /// Only set this explicitly for custom deployments where derivation
+    /// does not apply (single-host dev, on-prem, alternative naming).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest_endpoint: Option<String>,
     pub sync_interval_secs: u64,
     pub tags: BTreeMap<String, String>,
 }
@@ -226,9 +235,133 @@ impl Default for CloudConfig {
             enabled: false,
             api_key: None,
             endpoint: "https://api.soth.ai".to_string(),
+            ingest_endpoint: None,
             sync_interval_secs: 30,
             tags: BTreeMap::new(),
         }
+    }
+}
+
+impl CloudConfig {
+    /// Return the edge-plane endpoint for enroll / bundle / heartbeat /
+    /// telemetry. Honors `ingest_endpoint` when present; otherwise derives
+    /// from `endpoint` by rewriting an `api.` hostname prefix to `ingest.`.
+    ///
+    /// Leaves hosts without an `api.` prefix unchanged, so single-host dev
+    /// and custom deployments keep working without extra config.
+    pub fn resolved_ingest_endpoint(&self) -> String {
+        if let Some(explicit) = self.ingest_endpoint.as_deref() {
+            let trimmed = explicit.trim();
+            if !trimmed.is_empty() {
+                return trimmed.trim_end_matches('/').to_string();
+            }
+        }
+        derive_ingest_endpoint(self.endpoint.as_str())
+    }
+}
+
+/// Rewrites `https://api.<rest>` → `https://ingest.<rest>` while preserving
+/// scheme, port, and any path. Returns the input unchanged when the host
+/// does not start with `api.`, when the URL is malformed, or when empty.
+pub fn derive_ingest_endpoint(management: &str) -> String {
+    let trimmed = management.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return trimmed.to_string();
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (hostname, port) = authority
+        .split_once(':')
+        .map_or((authority, ""), |(h, p)| (h, p));
+    let Some(tail) = hostname.strip_prefix("api.") else {
+        return trimmed.trim_end_matches('/').to_string();
+    };
+    let mut rewritten = format!("{scheme}://ingest.{tail}");
+    if !port.is_empty() {
+        rewritten.push(':');
+        rewritten.push_str(port);
+    }
+    if !path.is_empty() {
+        rewritten.push('/');
+        rewritten.push_str(path);
+    }
+    rewritten.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod cloud_endpoint_tests {
+    use super::{derive_ingest_endpoint, CloudConfig};
+
+    #[test]
+    fn derives_ingest_from_prod_api_host() {
+        assert_eq!(
+            derive_ingest_endpoint("https://api.soth.ai"),
+            "https://ingest.soth.ai"
+        );
+    }
+
+    #[test]
+    fn derives_ingest_from_staging_api_host() {
+        assert_eq!(
+            derive_ingest_endpoint("https://api.staging.soth.xyz"),
+            "https://ingest.staging.soth.xyz"
+        );
+    }
+
+    #[test]
+    fn preserves_port_and_path() {
+        assert_eq!(
+            derive_ingest_endpoint("https://api.soth.ai:8443/v1"),
+            "https://ingest.soth.ai:8443/v1"
+        );
+    }
+
+    #[test]
+    fn strips_trailing_slash() {
+        assert_eq!(
+            derive_ingest_endpoint("https://api.soth.ai/"),
+            "https://ingest.soth.ai"
+        );
+    }
+
+    #[test]
+    fn leaves_non_api_host_unchanged() {
+        assert_eq!(
+            derive_ingest_endpoint("https://cloud.example.com"),
+            "https://cloud.example.com"
+        );
+        assert_eq!(
+            derive_ingest_endpoint("http://localhost:4201"),
+            "http://localhost:4201"
+        );
+    }
+
+    #[test]
+    fn leaves_empty_unchanged() {
+        assert_eq!(derive_ingest_endpoint(""), "");
+        assert_eq!(derive_ingest_endpoint("   "), "");
+    }
+
+    #[test]
+    fn explicit_ingest_endpoint_wins_over_derivation() {
+        let cfg = CloudConfig {
+            endpoint: "https://api.soth.ai".to_string(),
+            ingest_endpoint: Some("https://alt-ingest.internal/".to_string()),
+            ..CloudConfig::default()
+        };
+        assert_eq!(cfg.resolved_ingest_endpoint(), "https://alt-ingest.internal");
+    }
+
+    #[test]
+    fn empty_explicit_ingest_endpoint_falls_back_to_derivation() {
+        let cfg = CloudConfig {
+            endpoint: "https://api.soth.ai".to_string(),
+            ingest_endpoint: Some("   ".to_string()),
+            ..CloudConfig::default()
+        };
+        assert_eq!(cfg.resolved_ingest_endpoint(), "https://ingest.soth.ai");
     }
 }
 

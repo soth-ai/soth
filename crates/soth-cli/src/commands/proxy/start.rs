@@ -723,7 +723,9 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
         },
         sync: GeneratedSyncConfig {
             enabled: sync_enabled,
-            endpoint: config.cloud.endpoint.clone(),
+            // Runtime sync (heartbeat, telemetry, registry puller) is
+            // edge plane — must target soth-ingestion, not the management API.
+            endpoint: config.cloud.resolved_ingest_endpoint(),
             api_key: config.cloud.api_key.clone().unwrap_or_default(),
             agent_instance_id: sync_agent_instance_id,
             sync_interval_secs: config.cloud.sync_interval_secs.max(5),

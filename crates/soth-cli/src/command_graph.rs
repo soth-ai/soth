@@ -842,7 +842,9 @@ async fn ensure_bundle_for_bootstrap(
         return Ok(());
     }
 
-    let endpoint = config.cloud.endpoint.trim().to_string();
+    // Bundle bootstrap hits `/v1/edge/registry/*` (edge plane) on
+    // soth-ingestion. Use the ingest endpoint, not the management one.
+    let endpoint = config.cloud.resolved_ingest_endpoint();
     let api_key = config
         .cloud
         .api_key
@@ -864,7 +866,7 @@ async fn ensure_bundle_for_bootstrap(
 
     if endpoint.is_empty() {
         anyhow::bail!(
-            "Bundle directory {} is missing and cloud.endpoint is empty; bootstrap cannot fetch bundle.",
+            "Bundle directory {} is missing and no cloud endpoint is configured; bootstrap cannot fetch bundle.",
             bundle_dir.display()
         );
     }

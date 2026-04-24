@@ -54,9 +54,15 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
 
     let enroll_token = resolve_enroll_token(&args)?;
     let endpoint_override = args.endpoint.clone();
-    let endpoint = endpoint_override
+    // Management endpoint (for display + persistence in cloud.endpoint).
+    let management_endpoint = endpoint_override
         .clone()
         .unwrap_or_else(|| config.cloud.endpoint.clone());
+    // Enrollment itself is an edge-plane call (/v1/edge/enroll/exchange) and
+    // must go to soth-ingestion. Derive from the effective management URL
+    // so `--endpoint https://api.<domain>` auto-rewrites to `ingest.<domain>`
+    // without the user needing to know the split.
+    let ingest_endpoint = cli_config::derive_ingest_endpoint(management_endpoint.as_str());
     let machine_name = args
         .machine_name
         .clone()
@@ -65,7 +71,7 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     let enrollment_proxy_public_key = proxy_public_key_base64(enrollment_device_id.as_str());
 
     let response_json = exchange_enroll_token(
-        &endpoint,
+        &ingest_endpoint,
         &enroll_token,
         &machine_name,
         enrollment_device_id.as_str(),
@@ -78,11 +84,11 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     config.cloud.enabled = true;
     config.cloud.api_key = Some(exchanged.api_key);
     // If user passed --endpoint, keep it authoritative for this enrollment.
-    // Otherwise accept server-provided endpoint override when available.
+    // Otherwise accept server-provided management endpoint when available.
     config.cloud.endpoint = if let Some(explicit) = endpoint_override {
         explicit
     } else {
-        exchanged.endpoint.unwrap_or(endpoint)
+        exchanged.endpoint.unwrap_or(management_endpoint)
     };
     // Cloud sync uses the unified Exchange pipeline (schema_version=1).
     config.exchange.enabled = true;
@@ -116,7 +122,11 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     println!("Enrollment completed.");
     println!("Saved cloud credentials to {}", config_path.display());
     println!("Cloud sync enabled: {}", config.cloud.enabled);
-    println!("Cloud endpoint: {}", config.cloud.endpoint);
+    println!("Cloud endpoint (management): {}", config.cloud.endpoint);
+    println!(
+        "Cloud endpoint (edge/ingest): {}",
+        config.cloud.resolved_ingest_endpoint()
+    );
     println!("Exchange enabled: {}", config.exchange.enabled);
     println!("Client device ID: {device_id}");
     if let Some(workspace_id) = config.cloud.tags.get("workspace_id") {
