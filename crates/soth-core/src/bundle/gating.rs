@@ -125,7 +125,7 @@ impl Default for GateDefaults {
         Self {
             sensor_enabled: true,
             fail_open_on_config_error: true,
-            unknown_app_action: UnknownAppAction::Skip,
+            unknown_app_action: UnknownAppAction::Intercept,
             non_cataloged_host_action: NonCatalogedAction::Skip,
             discovery: DiscoveryConfig::default(),
             source_unknown_app_action: None,
@@ -154,8 +154,8 @@ impl Default for DiscoveryConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UnknownAppAction {
-    #[default]
     Skip,
+    #[default]
     Intercept,
     Block,
 }

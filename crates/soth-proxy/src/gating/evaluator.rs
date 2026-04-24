@@ -314,6 +314,29 @@ impl GateEvaluator {
                     );
                 }
                 UnknownAppAction::Intercept => {
+                    let app_key = process_info.as_ref().and_then(|info| {
+                        info.bundle_id
+                            .as_ref()
+                            .or(info.process_name.as_ref())
+                            .map(|v| v.trim().to_ascii_lowercase())
+                    });
+                    if let Some(key) = app_key {
+                        let limit = defaults.discovery.unknown_app_daily_limit.max(1);
+                        if !self.allow_app_discovery(key.as_str(), limit) {
+                            crate::trace::gate_stage(
+                                connection_id,
+                                GateStage::Stage1AppOrigin,
+                                "skip",
+                                Some(DecisionReason::UnknownAppPolicy),
+                                "unknown app daily intercept cap reached",
+                            );
+                            return outcome_skip(
+                                DecisionReason::UnknownAppPolicy,
+                                GateStage::Stage1AppOrigin,
+                                false,
+                            );
+                        }
+                    }
                     crate::trace::gate_stage(
                         connection_id,
                         GateStage::Stage1AppOrigin,
@@ -321,17 +344,6 @@ impl GateEvaluator {
                         None,
                         "unknown app policy intercept",
                     );
-                    if let Some(info) = process_info.as_ref() {
-                        let key = info
-                            .bundle_id
-                            .as_ref()
-                            .or(info.process_name.as_ref())
-                            .map(|v| v.trim().to_ascii_lowercase());
-                        if let Some(key) = key {
-                            let limit = defaults.discovery.unknown_app_daily_limit.max(1);
-                            let _ = self.allow_app_discovery(key.as_str(), limit);
-                        }
-                    }
                 }
             }
         } else {
@@ -932,6 +944,53 @@ mod tests {
         assert!(matches!(outcome.decision, GateDecision::Skip));
         assert_eq!(outcome.reason, DecisionReason::BlacklistedKeyword);
         assert!(after > before);
+    }
+
+    #[test]
+    fn unknown_app_intercept_caps_to_once_per_app_per_day() {
+        let mut bundle = (*bundle_with_defaults(false)).clone();
+        bundle.gates.defaults.unknown_app_action = UnknownAppAction::Intercept;
+        // Use realistic default of 1/day per app.
+        bundle.gates.defaults.discovery.unknown_app_daily_limit = 1;
+        let evaluator = GateEvaluator::new(Arc::new(bundle));
+        let ei = test_entity_index();
+        let env = EnvIndex::default();
+
+        let app_a = Some(ProcessInfo {
+            pid: Some(1),
+            process_name: Some("app-a".to_string()),
+            bundle_id: Some("com.example.app-a".to_string()),
+            parent_pid: None,
+            parent_process_name: None,
+            parent_bundle_id: None,
+        });
+        let app_b = Some(ProcessInfo {
+            pid: Some(2),
+            process_name: Some("app-b".to_string()),
+            bundle_id: Some("com.example.app-b".to_string()),
+            parent_pid: None,
+            parent_process_name: None,
+            parent_bundle_id: None,
+        });
+        let req = request_for("api.openai.com");
+
+        // App A, first hit: intercept.
+        let a1 = evaluator.evaluate_http(&req, &app_a, GateOverrides::default(), None, &ei, &env);
+        assert!(matches!(a1.decision, GateDecision::Intercept));
+
+        // App A, second hit in same day: skip (cap reached).
+        let a2 = evaluator.evaluate_http(&req, &app_a, GateOverrides::default(), None, &ei, &env);
+        assert!(matches!(a2.decision, GateDecision::Skip));
+        assert_eq!(a2.reason, DecisionReason::UnknownAppPolicy);
+        assert_eq!(a2.terminal_stage, GateStage::Stage1AppOrigin);
+
+        // Different app, first hit: still gets its own intercept (unlimited distinct apps).
+        let b1 = evaluator.evaluate_http(&req, &app_b, GateOverrides::default(), None, &ei, &env);
+        assert!(matches!(b1.decision, GateDecision::Intercept));
+
+        // App B, second hit: also skips.
+        let b2 = evaluator.evaluate_http(&req, &app_b, GateOverrides::default(), None, &ei, &env);
+        assert!(matches!(b2.decision, GateDecision::Skip));
     }
 
     #[test]

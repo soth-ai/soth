@@ -133,7 +133,7 @@ pub fn gating_from_native(bundle: &NativeBundle) -> GatingBundle {
             defaults: GateDefaults {
                 sensor_enabled: true,
                 fail_open_on_config_error: true,
-                unknown_app_action: UnknownAppAction::Skip,
+                unknown_app_action: UnknownAppAction::Intercept,
                 non_cataloged_host_action: NonCatalogedAction::Skip,
                 discovery: soth_core::DiscoveryConfig::default(),
                 source_unknown_app_action: None,
@@ -487,7 +487,7 @@ mod tests {
         assert!(gating.gates.defaults.fail_open_on_config_error);
         assert_eq!(
             gating.gates.defaults.unknown_app_action,
-            soth_core::UnknownAppAction::Skip
+            soth_core::UnknownAppAction::Intercept
         );
         assert!(gating.gates.stage1_app_origin.skip_if_unresolved_process);
         assert!(
