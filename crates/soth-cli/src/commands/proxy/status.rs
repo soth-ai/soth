@@ -153,7 +153,10 @@ fn render_human(status: &StatusJson) {
             .proxy
             .uptime_secs
             .map(format_duration)
-            .unwrap_or_else(|| "unknown".to_string())
+            // Reached when the meta sidecar (proxy.pid.meta.json) is missing
+            // or unreadable — most often "proxy not running yet". Surfacing
+            // that directly is more honest than "unknown".
+            .unwrap_or_else(|| "not started".to_string())
     );
     println!("Autostart:     {}", status.proxy.autostart);
     println!(
@@ -178,7 +181,15 @@ fn render_human(status: &StatusJson) {
                     .map(|d| format!(". {d}"))
                     .unwrap_or_default()
             ),
-            _ => "unknown".to_string(),
+            _ => format!(
+                "unverified (run `soth doctor`){}",
+                status
+                    .proxy
+                    .ca_trust_detail
+                    .as_deref()
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default()
+            ),
         }
     );
     if let Some(source) = status.proxy.bundle_runtime_source.as_deref() {
@@ -200,14 +211,14 @@ fn render_human(status: &StatusJson) {
             .bundle
             .installed_at_epoch_s
             .map(format_epoch_secs)
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "not installed".to_string())
     );
     println!(
         "Vendor sig:    {}",
         if status.bundle.sig_valid {
             "verified"
         } else {
-            "unknown"
+            "unverified"
         }
     );
     println!();
@@ -219,7 +230,7 @@ fn render_human(status: &StatusJson) {
             .sync
             .last_heartbeat_secs
             .map(format_ago)
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "never".to_string())
     );
     println!(
         "Queue:          {} queued  {} failed",
@@ -281,7 +292,8 @@ fn collect_proxy_status(
                 .max(0) as u64
         });
     let system_proxy_on = system_proxy_state_path().exists();
-    let autostart = super::autostart::managed_status().unwrap_or_else(|_| "unknown".to_string());
+    let autostart =
+        super::autostart::managed_status().unwrap_or_else(|_| "unavailable".to_string());
     let ca_paths = super::ca_health::resolve_ca_paths(config);
     let cert_path = ca_paths.trust_cert_path.clone();
     let ca_valid_until = parse_cert_not_after(ca_paths.runtime_cert_path.as_path()).ok();
@@ -569,7 +581,10 @@ fn runtime_source_label(source: &str) -> &str {
         "primary" => "primary",
         "fallback_last_known_good" => "fallback (last-known-good)",
         "startup_failed" => "startup failed",
-        _ => "unknown",
+        // Unreachable in practice — `normalize_runtime_source` only emits
+        // one of the three variants above. Keep a neutral placeholder
+        // rather than the misleading "unknown".
+        _ => "-",
     }
 }
 
