@@ -56,7 +56,19 @@ pub async fn run(args: LoginArgs, global_config: Option<PathBuf>) -> Result<()> 
         cli_config::SothConfig::default()
     };
 
-    let api_key = resolve_api_key(&args)?;
+    // Allow the existing config's api key to satisfy the requirement when no
+    // flag is supplied — useful for `soth login --endpoint <url>` /
+    // `--ingest-endpoint <url>` / `--config <path>` invocations that just
+    // want to update other fields without re-pasting the key. The user only
+    // hits the "key required" error on a truly fresh install.
+    let existing_key = config
+        .cloud
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let api_key = resolve_api_key(&args, existing_key.as_deref())?;
     if api_key.is_empty() {
         anyhow::bail!("api key is empty");
     }
@@ -89,7 +101,7 @@ pub async fn run(args: LoginArgs, global_config: Option<PathBuf>) -> Result<()> 
     Ok(())
 }
 
-fn resolve_api_key(args: &LoginArgs) -> Result<String> {
+fn resolve_api_key(args: &LoginArgs, existing: Option<&str>) -> Result<String> {
     if args.from_stdin {
         let mut buf = String::new();
         io::stdin()
@@ -100,5 +112,11 @@ fn resolve_api_key(args: &LoginArgs) -> Result<String> {
     if let Some(key) = args.api_key.as_ref() {
         return Ok(key.trim().to_string());
     }
-    anyhow::bail!("api key required: pass --api-key or --from-stdin")
+    if let Some(key) = existing {
+        // Reuse the key already on disk for endpoint-only / config-only updates.
+        return Ok(key.to_string());
+    }
+    anyhow::bail!(
+        "api key required: pass --api-key, --from-stdin, or run on a config that already has one"
+    )
 }
