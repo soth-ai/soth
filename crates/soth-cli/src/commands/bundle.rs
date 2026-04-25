@@ -3,6 +3,7 @@
 use crate::cli_config;
 use crate::style;
 use anyhow::{Context, Result};
+use chrono::{TimeZone, Utc};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -130,41 +131,42 @@ async fn run_status(args: BundleStatusArgs, global_config: Option<PathBuf>) -> R
     );
     println!(
         "Version:              {}",
-        status.version.as_deref().unwrap_or("unknown")
+        status.version.as_deref().unwrap_or("not loaded")
     );
     println!(
         "Bundle ID:            {}",
-        status.bundle_id.as_deref().unwrap_or("unknown")
+        status.bundle_id.as_deref().unwrap_or("not loaded")
     );
     println!(
         "Model version:        {}",
-        status.model_version.as_deref().unwrap_or("unknown")
+        status.model_version.as_deref().unwrap_or("not loaded")
     );
     println!(
         "Policy version:       {}",
-        status.policy_version.as_deref().unwrap_or("unknown")
+        status.policy_version.as_deref().unwrap_or("not loaded")
     );
+    // Bundles only carry the org's UUID — the human-readable org name lives
+    // in the cloud and would require an authenticated round-trip to resolve.
+    // Label this as an ID so users don't read it as a missing name.
     println!(
-        "Org:                  {}",
-        status.org_id.as_deref().unwrap_or("unknown")
+        "Org ID:               {}",
+        status.org_id.as_deref().unwrap_or("not loaded")
     );
+    let now_secs = Utc::now().timestamp();
     println!(
         "Issued at:            {}",
         status
             .issued_at
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .map(format_epoch_secs)
+            .unwrap_or_else(|| "not loaded".to_string())
     );
     println!(
         "Expires at:           {}",
-        status
-            .expires_at
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string())
+        format_expiry(status.expires_at, now_secs)
     );
     println!(
         "Trust level:          {}",
-        status.trust_level.as_deref().unwrap_or("unknown")
+        status.trust_level.as_deref().unwrap_or("not loaded")
     );
     println!(
         "Verify vendor sig:    {}",
@@ -190,11 +192,69 @@ async fn run_status(args: BundleStatusArgs, global_config: Option<PathBuf>) -> R
     if let Some(error) = status.load_error.as_deref() {
         println!("Error:                {error}");
         style::warning("bundle load failed");
+    } else if let Some(message) = expiry_warning(status.expires_at, now_secs) {
+        style::warning(&message);
     } else {
         style::success("bundle load ok");
     }
 
     Ok(())
+}
+
+fn format_epoch_secs(epoch_secs: u64) -> String {
+    Utc.timestamp_opt(epoch_secs as i64, 0)
+        .single()
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("{epoch_secs} (unparseable)"))
+}
+
+fn format_expiry(expires_at: Option<u64>, now_secs: i64) -> String {
+    let Some(expires) = expires_at else {
+        return "none (bundle has no expiry set)".to_string();
+    };
+    let formatted = format_epoch_secs(expires);
+    let delta_secs = expires as i64 - now_secs;
+    if delta_secs < 0 {
+        format!(
+            "{formatted} (EXPIRED {} ago)",
+            format_relative_secs(-delta_secs)
+        )
+    } else {
+        format!("{formatted} (in {})", format_relative_secs(delta_secs))
+    }
+}
+
+fn format_relative_secs(seconds: i64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    if seconds < 3600 {
+        return format!("{}m", seconds / 60);
+    }
+    if seconds < 86400 {
+        return format!("{}h", seconds / 3600);
+    }
+    format!("{}d", seconds / 86400)
+}
+
+/// Returns a user-facing warning if the bundle is expired or expiring within 7 days.
+fn expiry_warning(expires_at: Option<u64>, now_secs: i64) -> Option<String> {
+    let expires = expires_at? as i64;
+    let delta = expires - now_secs;
+    const WARN_WINDOW_SECS: i64 = 7 * 24 * 3600;
+    if delta < 0 {
+        Some(format!(
+            "bundle EXPIRED {} ago — refresh via `soth bundle pull` (or restart proxy)",
+            format_relative_secs(-delta)
+        ))
+    } else if delta < WARN_WINDOW_SECS {
+        Some(format!(
+            "bundle expires in {} — refresh soon",
+            format_relative_secs(delta)
+        ))
+    } else {
+        None
+    }
 }
 
 async fn run_verify(args: BundleVerifyArgs, global_config: Option<PathBuf>) -> Result<()> {
