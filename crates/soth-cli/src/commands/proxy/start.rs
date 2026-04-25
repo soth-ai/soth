@@ -125,6 +125,30 @@ pub async fn run(
         .context("spawn soth-proxy process")?;
     wait_for_listener_start(&mut child, expected_port).await?;
 
+    // Engage the OS-level system proxy so traffic actually flows through us.
+    // Reached by both foreground (`soth up --foreground`) and daemon-child
+    // paths; the standalone-daemon path (line ~67) re-execs back into this
+    // function with daemon_child=true, so it lands here too.
+    //
+    // Failure here is non-fatal — the proxy is healthy, we just didn't
+    // capture system traffic. Surface it as a warning and let the user
+    // recover with `soth on` after fixing whatever blocked the toggle
+    // (e.g. missing pf admin grant on macOS, registry ACL on Windows).
+    if let Err(error) = super::system::enable(Some(expected_port)).await {
+        tracing::warn!(
+            error = %error,
+            port = expected_port,
+            "system proxy engage failed at startup; proxy is running but traffic is not captured. \
+             Re-run `soth on` once the underlying cause is fixed."
+        );
+        if !quiet {
+            style::warning(&format!(
+                "Proxy is running on port {expected_port} but the system proxy did not engage: {error}. \
+                 Run `soth on` to retry, or `soth doctor` to diagnose."
+            ));
+        }
+    }
+
     if !quiet && foreground {
         style::success("Proxy started in foreground mode.");
         style::info("Press Ctrl+C to stop.");
