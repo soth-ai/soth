@@ -214,6 +214,69 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Returns the wall-clock unix timestamp at which `pid` was started, if the OS
+/// can answer the question. Used by the adopt path so `soth status` can show
+/// real uptime for daemons we discover after the fact (e.g. launchd-managed
+/// proxies whose meta file was lost across reboot).
+#[cfg(target_os = "macos")]
+fn process_start_unix_secs(pid: u32) -> Option<u64> {
+    // `ps -o lstart=` prints the process start time in `Mon DD HH:MM:SS YYYY`
+    // format, which `chrono` can parse via `%a %b %e %H:%M:%S %Y`. The trailing
+    // `=` suppresses the column header so we get one clean line.
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    use chrono::TimeZone;
+    let parsed = chrono::NaiveDateTime::parse_from_str(&raw, "%a %b %e %H:%M:%S %Y").ok()?;
+    let local = chrono::Local.from_local_datetime(&parsed).single()?;
+    Some(local.timestamp().max(0) as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_unix_secs(pid: u32) -> Option<u64> {
+    // `/proc/<pid>/stat` field 22 is the process start time in jiffies since
+    // boot. Combine with `/proc/uptime` and the current wall clock to recover
+    // the absolute start time.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field (field 2) is wrapped in parens and can contain spaces; use
+    // the closing paren to skip past it before splitting the rest by whitespace.
+    let close = stat.rfind(')')?;
+    let rest = stat.get(close + 1..)?.trim();
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After `)`, the remaining fields start at field 3 (state). Field 22
+    // (start_time in jiffies since boot) is therefore index 19 of `fields`.
+    let start_jiffies: u64 = fields.get(19)?.parse().ok()?;
+
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    if clk_tck == 0 {
+        return None;
+    }
+    let start_secs_since_boot = start_jiffies / clk_tck;
+
+    let uptime_raw = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs: f64 = uptime_raw.split_whitespace().next()?.parse().ok()?;
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let boot_time = now.saturating_sub(uptime_secs as u64);
+    Some(boot_time.saturating_add(start_secs_since_boot))
+}
+
+// Windows can be added later via `GetProcessTimes`; for now Windows callers
+// fall through to `now_unix_secs()` which matches the previous behavior — no
+// regression for Windows users.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_unix_secs(_pid: u32) -> Option<u64> {
+    None
+}
+
 fn acquire_lifecycle_lock() -> anyhow::Result<DaemonLifecycleLock> {
     let path = lock_path();
     if let Some(parent) = path.parent() {
@@ -388,6 +451,18 @@ pub(crate) fn active_daemon_port_hint() -> Option<u16> {
 }
 
 fn write_pid_metadata(pid: u32, port: u16, owner_token: &str) -> anyhow::Result<()> {
+    write_pid_metadata_with_start(pid, port, owner_token, now_unix_secs())
+}
+
+/// Variant of [`write_pid_metadata`] that takes an explicit start time. Used by
+/// the adopt path (where the daemon was already running before we discovered
+/// it, so `now` would understate uptime) — see [`process_start_unix_secs`].
+fn write_pid_metadata_with_start(
+    pid: u32,
+    port: u16,
+    owner_token: &str,
+    started_at_unix_secs: u64,
+) -> anyhow::Result<()> {
     let path = pid_meta_path();
     let executable = std::env::current_exe()
         .ok()
@@ -399,7 +474,7 @@ fn write_pid_metadata(pid: u32, port: u16, owner_token: &str) -> anyhow::Result<
         port,
         executable,
         owner_token: owner_token.to_string(),
-        started_at_unix_secs: now_unix_secs(),
+        started_at_unix_secs,
     };
     let body = serde_json::to_vec_pretty(&metadata)?;
     std::fs::write(&path, body)
@@ -866,7 +941,12 @@ fn adopt_running_daemon_state(expected_port: u16, quiet: bool) -> anyhow::Result
     let owner_token = uuid::Uuid::new_v4().to_string();
     write_pid(pid)?;
     write_pid_owner_token(&owner_token)?;
-    let _ = write_pid_metadata(pid, expected_port, &owner_token);
+    // Try to recover the actual process start time so `soth status` reports
+    // real uptime for adopted daemons (e.g. launchd-managed proxies whose
+    // pid metadata was wiped across reboot). Falls back to "now" when the
+    // OS query fails — better than showing a stale or zero value.
+    let started_at = process_start_unix_secs(pid).unwrap_or_else(now_unix_secs);
+    let _ = write_pid_metadata_with_start(pid, expected_port, &owner_token, started_at);
     if !quiet {
         style::warning(&format!(
             "Recovered missing daemon pid state from running listener (pid {pid}, port {expected_port})."
@@ -1382,6 +1462,30 @@ mod tests {
 
             assert_eq!(trusted_pid_from_metadata(), Some(5050));
         });
+    }
+
+    #[test]
+    fn process_start_unix_secs_returns_recent_value_for_self() {
+        // The test process started moments ago; the resolved start time must
+        // be in the past and not absurdly far back. This catches parsing
+        // regressions on the macOS `ps -o lstart=` format (and is harmless on
+        // Linux where /proc/self exists; the Windows variant is excluded
+        // because the test runner doesn't always run with the right rights).
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let pid = std::process::id();
+            let start = process_start_unix_secs(pid);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("now")
+                .as_secs();
+            let start = start.expect("OS query should succeed for own pid");
+            assert!(start <= now, "start ({start}) must be <= now ({now})");
+            assert!(
+                now.saturating_sub(start) < 24 * 3600,
+                "start ({start}) is more than a day before now ({now}) — parse regression?"
+            );
+        }
     }
 
     #[test]
