@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use tokio_stream::Stream;
 use tracing::warn;
 
@@ -108,9 +108,11 @@ impl CursorReader {
             message: format!("open {}: {e}", db_path.display()),
         })?;
 
-        // Short busy timeout — WAL contention with a live Cursor process is
-        // expected; we prefer a fast skip over a long stall.
-        conn.busy_timeout(std::time::Duration::from_millis(500))
+        // WAL contention with a live Cursor process is expected. 2s gives the
+        // writer room to checkpoint while still preferring a skip over a long
+        // stall. Individual per-bubble lookups that exceed this are caught and
+        // skipped by the caller rather than aborting the whole scan.
+        conn.busy_timeout(std::time::Duration::from_millis(2_000))
             .ok();
 
         Ok(conn)
@@ -129,24 +131,41 @@ struct ComposerData {
     created_at: Option<i64>,
     #[serde(default)]
     conversation: Vec<ComposerBubble>,
+    /// Cursor v14+: inline `conversation` is empty; bubbles are stored in
+    /// separate `bubbleId:<composerId>:<bubbleId>` rows and this field holds
+    /// the ordered header list.
+    #[serde(default)]
+    full_conversation_headers_only: Vec<ComposerHeader>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct ComposerBubble {
     /// 1 = user, 2 = assistant.
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     bubble_type: u8,
     #[serde(default)]
     text: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ComposerHeader {
+    #[serde(rename = "bubbleId")]
+    bubble_id: String,
+    #[serde(rename = "type", default)]
+    bubble_type: u8,
+}
+
+fn bubble_role(bubble_type: u8) -> &'static str {
+    match bubble_type {
+        1 => "user",
+        2 => "assistant",
+        _ => "unknown",
+    }
+}
+
 impl ComposerBubble {
     fn role(&self) -> &'static str {
-        match self.bubble_type {
-            1 => "user",
-            2 => "assistant",
-            _ => "unknown",
-        }
+        bubble_role(self.bubble_type)
     }
 }
 
@@ -193,7 +212,7 @@ fn read_cursor_sessions(
     let mut sessions: Vec<HistoricalSession> = Vec::new();
     let mut max_rowid: Option<i64> = None;
 
-    let rows = stmt
+    let composer_rows: Vec<(String, i64)> = stmt
         .query_map([], |row| {
             let value: String = row.get(0)?;
             let rowid: i64 = row.get(1)?;
@@ -202,14 +221,22 @@ fn read_cursor_sessions(
         .map_err(|e| ReaderError::Reader {
             tool: "cursor".into(),
             message: format!("query: {e}"),
-        })?;
-
-    for row in rows {
-        let (value, rowid) = row.map_err(|e| ReaderError::Reader {
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(|e| ReaderError::Reader {
             tool: "cursor".into(),
             message: format!("row: {e}"),
         })?;
 
+    // Prepared once, reused for every split-bubble lookup below.
+    let mut bubble_stmt = conn
+        .prepare("SELECT value FROM cursorDiskKV WHERE key = ?1")
+        .map_err(|e| ReaderError::Reader {
+            tool: "cursor".into(),
+            message: format!("prepare bubble query: {e}"),
+        })?;
+
+    for (value, rowid) in composer_rows {
         max_rowid = Some(max_rowid.map_or(rowid, |prev: i64| prev.max(rowid)));
 
         let data: ComposerData = match serde_json::from_str(&value) {
@@ -221,10 +248,12 @@ fn read_cursor_sessions(
         };
 
         let mut messages: Vec<HistoricalMessage> = Vec::new();
+
+        // Pre-v14 format: conversation bubbles are inline.
         for bubble in &data.conversation {
             let text = match bubble.text.as_deref() {
                 Some(t) if !t.is_empty() => t.to_string(),
-                _ => continue, // skip null / empty bubbles
+                _ => continue,
             };
 
             let token_estimate = estimate_tokens(&text);
@@ -234,6 +263,51 @@ fn read_cursor_sessions(
                 timestamp: data.created_at,
                 token_estimate,
             });
+        }
+
+        // v14+ format: inline conversation is empty, bubbles live in separate
+        // `bubbleId:<composerId>:<bubbleId>` rows. Stitch them back together in
+        // header order. Per-bubble lookup failures are logged and skipped so a
+        // single transient WAL lock doesn't sink the entire session.
+        if messages.is_empty() && !data.full_conversation_headers_only.is_empty() {
+            for header in &data.full_conversation_headers_only {
+                let key = format!("bubbleId:{}:{}", data.composer_id, header.bubble_id);
+                let raw: Option<String> = match bubble_stmt
+                    .query_row([&key], |r| r.get::<_, String>(0))
+                    .optional()
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(err = %e, key = %key, "cursor: bubble lookup failed, skipping");
+                        continue;
+                    }
+                };
+                let Some(raw) = raw else {
+                    continue;
+                };
+
+                let bubble: ComposerBubble = match serde_json::from_str(&raw) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(err = %e, key = %key, "cursor: skipping unparseable bubble row");
+                        continue;
+                    }
+                };
+
+                let text = match bubble.text.as_deref() {
+                    Some(t) if !t.is_empty() => t.to_string(),
+                    _ => continue,
+                };
+
+                // Role comes from the header: some bubble payloads omit `type`.
+                let token_estimate = estimate_tokens(&text);
+                messages.push(HistoricalMessage {
+                    role: bubble_role(header.bubble_type).to_string(),
+                    content: text,
+                    timestamp: data.created_at,
+                    token_estimate,
+                });
+            }
         }
 
         if messages.is_empty() {
@@ -629,6 +703,52 @@ mod tests {
     async fn tool_type_is_cursor() {
         let reader = CursorReader::new();
         assert_eq!(reader.tool_type(), AiTool::Cursor);
+    }
+
+    #[tokio::test]
+    async fn reads_v14_split_bubble_sessions() {
+        // Cursor v14+: composerData row carries `fullConversationHeadersOnly`
+        // and inline `conversation` is empty. Actual text lives in separate
+        // `bubbleId:<composerId>:<bubbleId>` rows.
+        let tmp = TempDir::new().unwrap();
+        let composer_id = "abc123";
+        let composer_payload = serde_json::json!({
+            "_v": 15,
+            "composerId": composer_id,
+            "createdAt": 1732629531988_i64,
+            "text": "",
+            "conversation": [],
+            "fullConversationHeadersOnly": [
+                { "bubbleId": "b1", "type": 1 },
+                { "bubbleId": "b2", "type": 2 },
+                { "bubbleId": "b-missing", "type": 1 }
+            ]
+        })
+        .to_string();
+
+        let bubble_1 = serde_json::json!({ "text": "hello from user", "type": 1 }).to_string();
+        let bubble_2 = serde_json::json!({ "text": "hi back", "type": 2 }).to_string();
+
+        create_cursor_db(
+            tmp.path(),
+            &[
+                (&format!("composerData:{composer_id}"), &composer_payload),
+                (&format!("bubbleId:{composer_id}:b1"), &bubble_1),
+                (&format!("bubbleId:{composer_id}:b2"), &bubble_2),
+                // b-missing intentionally absent — must be skipped gracefully.
+            ],
+        );
+
+        let reader = CursorReader::new();
+        let mut stream = reader.read_sessions(tmp.path(), None);
+        let session = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(session.session_id, composer_id);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, "user");
+        assert_eq!(session.messages[0].content, "hello from user");
+        assert_eq!(session.messages[1].role, "assistant");
+        assert_eq!(session.messages[1].content, "hi back");
     }
 
     #[tokio::test]
