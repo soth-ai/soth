@@ -219,7 +219,7 @@ fn now_unix_secs() -> u64 {
 /// real uptime for daemons we discover after the fact (e.g. launchd-managed
 /// proxies whose meta file was lost across reboot).
 #[cfg(target_os = "macos")]
-fn process_start_unix_secs(pid: u32) -> Option<u64> {
+pub(super) fn process_start_unix_secs(pid: u32) -> Option<u64> {
     // `ps -o lstart=` prints the process start time in `Mon DD HH:MM:SS YYYY`
     // format, which `chrono` can parse via `%a %b %e %H:%M:%S %Y`. The trailing
     // `=` suppresses the column header so we get one clean line.
@@ -241,7 +241,7 @@ fn process_start_unix_secs(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_unix_secs(pid: u32) -> Option<u64> {
+pub(super) fn process_start_unix_secs(pid: u32) -> Option<u64> {
     // `/proc/<pid>/stat` field 22 is the process start time in jiffies since
     // boot. Combine with `/proc/uptime` and the current wall clock to recover
     // the absolute start time.
@@ -273,7 +273,7 @@ fn process_start_unix_secs(pid: u32) -> Option<u64> {
 // fall through to `now_unix_secs()` which matches the previous behavior — no
 // regression for Windows users.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_start_unix_secs(_pid: u32) -> Option<u64> {
+pub(super) fn process_start_unix_secs(_pid: u32) -> Option<u64> {
     None
 }
 
@@ -684,7 +684,7 @@ fn is_expected_daemon_process(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn listener_owner_pids(port: u16) -> Option<Vec<u32>> {
+pub(super) fn listener_owner_pids(port: u16) -> Option<Vec<u32>> {
     let output = Command::new("lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
         .output()
@@ -714,7 +714,7 @@ fn parse_endpoint_port(endpoint: &str) -> Option<u16> {
 }
 
 #[cfg(target_os = "windows")]
-fn listener_owner_pids(port: u16) -> Option<Vec<u32>> {
+pub(super) fn listener_owner_pids(port: u16) -> Option<Vec<u32>> {
     let mut cmd = Command::new("netstat");
     cmd.args(["-ano", "-p", "tcp"]);
     apply_windows_hidden_process_flags(&mut cmd);
@@ -753,7 +753,7 @@ fn listener_owner_pids(port: u16) -> Option<Vec<u32>> {
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
-fn listener_owner_pids(_port: u16) -> Option<Vec<u32>> {
+pub(super) fn listener_owner_pids(_port: u16) -> Option<Vec<u32>> {
     None
 }
 
