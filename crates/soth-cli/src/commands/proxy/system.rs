@@ -13,8 +13,25 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-/// Network services to configure on macOS
-const MACOS_NETWORK_SERVICES: &[&str] = &["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN"];
+// macOS network services we explicitly skip when enabling the proxy. Anything
+// else returned by `networksetup -listallnetworkservices` (and not marked
+// disabled with a leading `*`) is configured. macOS proxy settings are
+// per-service, so we have to set them on every service the user might switch
+// to (Wi-Fi, iPhone USB tethering, Bluetooth PAN, Thunderbolt Bridge, …) —
+// otherwise switching the active interface bypasses the proxy entirely even
+// though `soth status` still reports it as on.
+//
+// We skip VPN-style services that own their own DNS/routing semantics. They
+// either tunnel everything (so a system proxy entry is moot) or break in
+// confusing ways when one is added. Add to this list rather than the old
+// whitelist if a new VPN client shows up.
+const MACOS_PROXY_SKIP_PREFIXES: &[&str] = &[
+    "Tailscale",
+    "NordVPN",
+    "ExpressVPN",
+    "Mullvad",
+    "Cloudflare WARP",
+];
 
 /// Default proxy port
 const DEFAULT_PROXY_PORT: u16 = 8080;
@@ -659,7 +676,8 @@ fn get_macos_network_services() -> Result<Vec<String>> {
 
     for line in stdout.lines() {
         let line = line.trim();
-        // Skip the header line and disabled services (marked with *)
+        // Skip the header line, disabled services (marked with `*`), and any
+        // diagnostic noise that ends up in stdout.
         if line.is_empty()
             || line.starts_with('*')
             || line.contains("denotes")
@@ -669,26 +687,18 @@ fn get_macos_network_services() -> Result<Vec<String>> {
         {
             continue;
         }
-        // Check if this is a known/common service we should configure
-        if MACOS_NETWORK_SERVICES.iter().any(|s| line.contains(s)) || line.contains("Ethernet") {
-            services.push(line.to_string());
+        // Skip VPN-style services where injecting an HTTP/HTTPS proxy entry
+        // doesn't help (the VPN already owns routing) and can confuse the
+        // tunnel. Everything else — Wi-Fi, Ethernet, iPhone USB tethering,
+        // Bluetooth PAN, Thunderbolt Bridge, etc. — gets configured.
+        if MACOS_PROXY_SKIP_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        {
+            debug!("Skipping VPN-style network service: {}", line);
+            continue;
         }
-    }
-
-    // If no known services found, try all active ones
-    if services.is_empty() {
-        for line in stdout.lines() {
-            let line = line.trim();
-            if !line.is_empty()
-                && !line.starts_with('*')
-                && !line.contains("denotes")
-                && !line.contains("AuthorizationCreate() failed")
-                && !line.contains("requires admin privileges")
-                && !line.starts_with("** Error")
-            {
-                services.push(line.to_string());
-            }
-        }
+        services.push(line.to_string());
     }
 
     debug!("Found network services: {:?}", services);
