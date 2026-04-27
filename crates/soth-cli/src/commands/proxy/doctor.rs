@@ -147,7 +147,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .daemon
             .pid
             .map(|v| v.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a (proxy not running)".to_string())
     );
     println!(
         "Running:        {}",
@@ -155,7 +155,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .daemon
             .process_running
             .map(|v| if v { "yes" } else { "no" }.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a (no PID file)".to_string())
     );
     println!(
         "Meta pid/port:  {} / {}",
@@ -163,12 +163,12 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .daemon
             .meta_pid
             .map(|v| v.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
+            .unwrap_or_else(|| "n/a".to_string()),
         report
             .daemon
             .meta_port
             .map(|v| v.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a".to_string())
     );
     println!(
         "Owner match:    {}",
@@ -176,7 +176,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .daemon
             .owner_token_matches_meta
             .map(|v| if v { "yes" } else { "no" }.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a (no owner token)".to_string())
     );
 
     println!();
@@ -206,7 +206,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .system_proxy
             .state_platform
             .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a (system proxy off)".to_string())
     );
     println!(
         "State owner:    {}",
@@ -214,7 +214,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .system_proxy
             .state_owner_id
             .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a".to_string())
     );
     println!(
         "Local owner:    {}",
@@ -222,7 +222,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .system_proxy
             .owner_id
             .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a".to_string())
     );
     println!(
         "Owner match:    {}",
@@ -230,7 +230,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .system_proxy
             .owner_matches_state
             .map(|v| if v { "yes" } else { "no" }.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a".to_string())
     );
 
     println!();
@@ -270,7 +270,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .ca
             .cert_not_after
             .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "missing/invalid (see Parse error below)".to_string())
     );
     println!(
         "Fingerprint:    {}",
@@ -278,7 +278,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .ca
             .cert_fingerprint_sha256
             .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "missing (cert not readable)".to_string())
     );
     println!(
         "Trust fp:       {}",
@@ -286,7 +286,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .ca
             .trust_fingerprint_sha256
             .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "missing (trust cert not readable)".to_string())
     );
     println!(
         "FP match:       {}",
@@ -294,7 +294,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .ca
             .fingerprint_match
             .map(|v| if v { "yes" } else { "no" }.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a (one or both fingerprints missing)".to_string())
     );
     println!(
         "Cert/key pair:  {}",
@@ -302,7 +302,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .ca
             .key_matches_cert
             .map(|v| if v { "match" } else { "mismatch" }.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a (cert or key missing)".to_string())
     );
     println!(
         "OS trust:       {}",
@@ -310,7 +310,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .ca
             .os_trust_status
             .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "n/a (cert missing)".to_string())
     );
     if let Some(detail) = &report.ca.os_trust_detail {
         println!("Trust detail:   {detail}");
@@ -356,7 +356,7 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
 fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
     let config = cli_config::load_effective_config(config_path.as_ref(), None).unwrap_or_default();
     let managed_runtime =
-        super::autostart::managed_status().unwrap_or_else(|err| format!("unknown ({err})"));
+        super::autostart::managed_status().unwrap_or_else(|err| format!("unavailable ({err})"));
 
     let run_dir = soth_home_dir().join("run");
     let pid_file = super::daemon::pid_path();
