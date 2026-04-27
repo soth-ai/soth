@@ -649,7 +649,10 @@ mod tests {
             }
         }
         contents.sort();
-        assert_eq!(contents, vec!["delegated task".to_string(), "real user msg".to_string()]);
+        assert_eq!(
+            contents,
+            vec!["delegated task".to_string(), "real user msg".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -309,8 +309,9 @@ fn read_kv_sessions(
                         let record_json: Option<String> = match split_stmt_opt
                             .as_mut()
                             .expect("split_stmt present when split_source is some")
-                            .query_row(rusqlite::params![&record_key], |row| row.get::<_, String>(0))
-                        {
+                            .query_row(rusqlite::params![&record_key], |row| {
+                                row.get::<_, String>(0)
+                            }) {
                             Ok(v) => Some(v),
                             Err(rusqlite::Error::QueryReturnedNoRows) => None,
                             Err(e) => {
