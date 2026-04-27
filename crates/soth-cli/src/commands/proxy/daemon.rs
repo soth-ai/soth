@@ -672,15 +672,52 @@ fn is_expected_daemon_process(pid: u32) -> bool {
     let Some(command) = process_commandline(pid) else {
         return false;
     };
+    is_soth_daemon_command_line(&command)
+}
+
+/// Token-aware check used by `is_expected_daemon_process`. Extracted so we can
+/// unit-test it across both Unix-style command lines (`soth start --daemon-child …`)
+/// and Windows-style command lines from `Get-CimInstance Win32_Process` /
+/// `wmic`, which return each arg individually quoted
+/// (e.g. `"C:\…\soth.exe" "start" "--daemon-child" "--port" "8080"`).
+///
+/// The previous implementation matched on `" start "` (literal space-padded)
+/// to avoid `restart` false-positives. That fails on Windows because the
+/// quoted form has no space-padded `start` substring — the daemon-child was
+/// then never recognized as ours, and second `soth up` invocations fell
+/// through to spawning a duplicate proxy.
+fn is_soth_daemon_command_line(command: &str) -> bool {
     let normalized = command.to_ascii_lowercase();
-    let looks_like_soth_binary = normalized.contains("soth.exe")
-        || normalized.contains("/soth")
-        || normalized.contains("\\soth")
-        || normalized.starts_with("soth ")
-        || normalized == "soth";
-    normalized.contains(" start ")
-        && normalized.contains("--daemon-child")
-        && looks_like_soth_binary
+
+    // Tokenize on whitespace AND on the double-quote characters that wrap
+    // each arg in the Windows-quoted form. After this split, both
+    // `soth start --daemon-child` and `"soth.exe" "start" "--daemon-child"`
+    // produce the tokens `["soth(.exe)", "start", "--daemon-child", …]`.
+    let tokens: Vec<&str> = normalized
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let has_start = tokens.iter().any(|t| *t == "start");
+    let has_daemon_child = tokens.iter().any(|t| *t == "--daemon-child");
+
+    // The first token is the executable. Be lenient about path/extension
+    // shapes (`/usr/local/bin/soth`, `C:\…\soth.exe`, plain `soth`).
+    let looks_like_soth_binary = tokens
+        .first()
+        .map(|t| {
+            // Require a path separator OR an exact match. `ends_with("soth")`
+            // alone would also match `notsoth`, `mysoth`, etc.
+            *t == "soth"
+                || t.ends_with("/soth")
+                || t.ends_with("\\soth")
+                || t.ends_with("/soth.exe")
+                || t.ends_with("\\soth.exe")
+                || *t == "soth.exe"
+        })
+        .unwrap_or(false);
+
+    has_start && has_daemon_child && looks_like_soth_binary
 }
 
 #[cfg(unix)]
@@ -969,6 +1006,26 @@ pub async fn run_start_daemon(
     let autostart_enabled = resolve_autostart_enabled(no_autostart, config_path.as_ref());
     if read_pid()?.is_none() && trusted_pid_from_metadata().is_none() {
         let _ = adopt_running_daemon_state(expected_port, quiet);
+    }
+
+    // Defensive fallback for the Windows duplicate-spawn race: if the
+    // listener is already open and owned by an `soth start --daemon-child`
+    // process, treat that as success and don't proceed into the autostart
+    // spawn. This catches the case where the running daemon hasn't been
+    // adopted into our pid files yet — e.g. it was started by the HKCU\Run
+    // key at user login and `adopt_running_daemon_state` failed to write
+    // the pid sidecar (or `is_expected_daemon_process` rejected the pid).
+    if read_pid()?.is_none() && is_local_listener_ready(expected_port) {
+        if let Some(owners) = listener_owner_pids(expected_port) {
+            if owners.iter().any(|pid| is_expected_daemon_process(*pid)) {
+                if !quiet {
+                    style::success(&format!(
+                        "Proxy daemon already listening on 127.0.0.1:{expected_port}; nothing to do."
+                    ));
+                }
+                return Ok(());
+            }
+        }
     }
 
     if let Some(pid) = read_pid()? {
@@ -1412,6 +1469,50 @@ mod tests {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+
+    #[test]
+    fn daemon_command_line_matches_unix_form() {
+        // `ps -o command= -p <pid>` on Linux/macOS returns the cmdline with
+        // single spaces between args and no quoting.
+        assert!(is_soth_daemon_command_line(
+            "/usr/local/bin/soth start --daemon-child --quiet --port 8080"
+        ));
+        assert!(is_soth_daemon_command_line(
+            "soth start --daemon-child --port=8080"
+        ));
+    }
+
+    #[test]
+    fn daemon_command_line_matches_windows_quoted_form() {
+        // `Get-CimInstance Win32_Process` on Windows quotes each arg
+        // individually, which broke the previous `.contains(" start ")` check
+        // and caused `soth up` to spawn a duplicate daemon-child on every
+        // re-invocation.
+        assert!(is_soth_daemon_command_line(
+            r#""C:\Users\foo\.local\bin\soth.exe" "start" "--daemon-child" "--quiet" "--port" "8080""#
+        ));
+        // wmic's `CommandLine=…` form sometimes drops the quotes around args
+        // that don't need them — still a valid match.
+        assert!(is_soth_daemon_command_line(
+            r#""C:\Users\foo\.local\bin\soth.exe" start --daemon-child --port 8080"#
+        ));
+    }
+
+    #[test]
+    fn daemon_command_line_rejects_unrelated_processes() {
+        // `restart` must not match the `start` token check.
+        assert!(!is_soth_daemon_command_line(
+            "/usr/bin/systemctl restart soth.service"
+        ));
+        // No --daemon-child marker — could be a foreground `soth start`.
+        assert!(!is_soth_daemon_command_line(
+            "soth start --foreground --port 8080"
+        ));
+        // Different binary that happens to have "soth" in the path.
+        assert!(!is_soth_daemon_command_line(
+            "/usr/local/bin/notsoth start --daemon-child"
+        ));
     }
 
     #[test]
