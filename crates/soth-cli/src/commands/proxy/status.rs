@@ -276,13 +276,36 @@ fn collect_proxy_status(
     config: &cli_config::SothConfig,
     now: DateTime<Utc>,
 ) -> Result<ProxyStatusJson> {
-    let pid = read_pid_file().filter(|value| process_running(*value));
+    let pid_from_file = read_pid_file().filter(|value| process_running(*value));
     let pid_meta = read_pid_meta();
     let active_port = pid_meta
         .as_ref()
         .and_then(|meta| meta.port)
         .unwrap_or(config.forward_proxy.port);
-    let running = pid.is_some() || is_port_open(active_port);
+    let listener_open = is_port_open(active_port);
+
+    // launchd/systemd-managed proxies don't go through our daemon spawn path,
+    // so neither `proxy.pid` nor `proxy.pid.meta.json` gets written. When the
+    // listener is open but our pid file is empty, ask the OS who owns the
+    // listener so `soth status` can still display a real pid + uptime instead
+    // of "not started" — which read like "the proxy is broken" to pilot
+    // testers even though it was running fine under launchctl.
+    let discovered_pid = if pid_from_file.is_none() && listener_open {
+        // launchd-spawned daemons typically show up as multiple lsof owners
+        // (supervisor + daemon-child both hold the inherited listener fd) —
+        // pick the lowest pid, which is the parent supervisor and is what
+        // launchd actually tracks. We verify it's still alive before using it.
+        super::daemon::listener_owner_pids(active_port)
+            .and_then(|mut owners| {
+                owners.sort_unstable();
+                owners.into_iter().find(|pid| process_running(*pid))
+            })
+    } else {
+        None
+    };
+    let pid = pid_from_file.or(discovered_pid);
+    let running = pid.is_some() || listener_open;
+
     let uptime_secs = pid_meta
         .as_ref()
         .filter(|meta| meta.started_at_unix_secs > 0)
@@ -290,6 +313,13 @@ fn collect_proxy_status(
             now.timestamp()
                 .saturating_sub(meta.started_at_unix_secs as i64)
                 .max(0) as u64
+        })
+        .or_else(|| {
+            // No meta sidecar — fall back to the OS-reported start time of the
+            // discovered listener owner. Same query as the adopt path uses.
+            let pid = discovered_pid?;
+            let start = super::daemon::process_start_unix_secs(pid)?;
+            Some(now.timestamp().saturating_sub(start as i64).max(0) as u64)
         });
     let system_proxy_on = system_proxy_state_path().exists();
     let autostart =

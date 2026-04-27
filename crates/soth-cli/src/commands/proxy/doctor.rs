@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PID_META_FILE: &str = "proxy.pid.meta.json";
 const PID_OWNER_TOKEN_FILE: &str = "proxy.pid.token";
@@ -33,6 +33,14 @@ struct DaemonDiagnostics {
     meta_pid: Option<u32>,
     meta_port: Option<u16>,
     owner_token_matches_meta: Option<bool>,
+    /// Pid we discovered by asking the OS who owns the listener — set when
+    /// the proxy is running but we didn't write the pid files (typical for
+    /// launchd/systemd-managed daemons).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovered_pid: Option<u32>,
+    /// OS-reported wall-clock start time of `discovered_pid`, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovered_started_at_unix_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +155,10 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .daemon
             .pid
             .map(|v| v.to_string())
+            .or_else(|| report
+                .daemon
+                .discovered_pid
+                .map(|v| format!("{v} (managed externally; no pid file)")))
             .unwrap_or_else(|| "n/a (proxy not running)".to_string())
     );
     println!(
@@ -155,8 +167,25 @@ pub async fn run(config_path: Option<PathBuf>, json: bool) -> Result<()> {
             .daemon
             .process_running
             .map(|v| if v { "yes" } else { "no" }.to_string())
+            .or_else(|| report
+                .daemon
+                .discovered_pid
+                .map(|_| "yes (listener owned by external supervisor)".to_string()))
             .unwrap_or_else(|| "n/a (no PID file)".to_string())
     );
+    if let Some(start) = report.daemon.discovered_started_at_unix_secs {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let uptime = now.saturating_sub(start);
+        println!(
+            "Discovered up:  {} (since unix {})",
+            format_short_duration(uptime),
+            start
+        );
+    }
     println!(
         "Meta pid/port:  {} / {}",
         report
@@ -366,7 +395,7 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
     let state_owner_file = run_dir.join(SYSTEM_PROXY_OWNER_FILE);
 
     let pid = read_u32(pid_file.as_path());
-    let process_running = pid.map(process_running);
+    let process_running_state = pid.map(process_running);
     let pid_meta = read_pid_meta(pid_meta_file.as_path());
     let owner_token = read_trimmed_string(owner_token_file.as_path());
 
@@ -376,6 +405,28 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
         }
         _ => None,
     };
+
+    // Same fallback as `soth status`: if our pid file is empty but the
+    // listener is open, the daemon was started by launchd/systemd. Ask the
+    // OS who owns the port so we can show the real pid + start time.
+    let probe_port = pid_meta
+        .as_ref()
+        .map(|m| m.port)
+        .unwrap_or(config.forward_proxy.port);
+    let discovered_pid = if pid.is_none() && is_loopback_listener_open(probe_port) {
+        // Same heuristic as `soth status`: launchd-spawned daemons appear as
+        // multiple lsof owners (supervisor + child both hold the inherited
+        // listener fd). Pick the lowest pid that's still alive — that's the
+        // parent supervisor which launchd actually tracks.
+        super::daemon::listener_owner_pids(probe_port).and_then(|mut owners| {
+            owners.sort_unstable();
+            owners.into_iter().find(|pid| process_running(*pid))
+        })
+    } else {
+        None
+    };
+    let discovered_started_at_unix_secs =
+        discovered_pid.and_then(super::daemon::process_start_unix_secs);
 
     let daemon = DaemonDiagnostics {
         pid_file: PathDetails {
@@ -391,10 +442,12 @@ fn build_report(config_path: Option<PathBuf>) -> DoctorReport {
             exists: owner_token_file.exists(),
         },
         pid,
-        process_running,
+        process_running: process_running_state,
         meta_pid: pid_meta.as_ref().map(|m| m.pid),
         meta_port: pid_meta.as_ref().map(|m| m.port),
         owner_token_matches_meta,
+        discovered_pid,
+        discovered_started_at_unix_secs,
     };
 
     let state = read_proxy_state(state_file.as_path());
@@ -679,6 +732,21 @@ fn read_trimmed_string(path: &Path) -> Option<String> {
 
 fn read_u32(path: &Path) -> Option<u32> {
     read_trimmed_string(path)?.parse::<u32>().ok()
+}
+
+/// Compact uptime renderer used only for the doctor's discovered-pid line.
+/// Mirrors the convention `soth status` uses (`12s`, `4m`, `7h`, `3d`).
+fn format_short_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    if seconds < 3600 {
+        return format!("{}m", seconds / 60);
+    }
+    if seconds < 86400 {
+        return format!("{}h", seconds / 3600);
+    }
+    format!("{}d", seconds / 86400)
 }
 
 fn read_pid_meta(path: &Path) -> Option<PidMetadata> {
@@ -1007,6 +1075,8 @@ mod tests {
                 meta_pid: None,
                 meta_port: None,
                 owner_token_matches_meta: None,
+                discovered_pid: None,
+                discovered_started_at_unix_secs: None,
             },
             system_proxy: SystemProxyDiagnostics {
                 state_file: PathDetails {
