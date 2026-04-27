@@ -611,6 +611,20 @@ async fn run_start_command(args: StartArgs, global_config: Option<PathBuf>) -> a
 }
 
 async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow::Result<()> {
+    // `--endpoint` on `up` is the enrollment-exchange URL — only consumed
+    // inside the `if args.token.is_some()` branch below. Without a token
+    // it would have been silently ignored, which broke at least one pilot
+    // tester who expected `--endpoint` to switch the persisted cloud
+    // endpoint. Surface a clear error pointing at the command that
+    // actually does that, instead of failing later in confusing ways.
+    if args.endpoint.is_some() && args.token.is_none() {
+        anyhow::bail!(
+            "--endpoint on `soth up` is only honoured together with --token (it's the enrollment endpoint). \
+             To switch the persisted cloud endpoint without re-enrolling, run \
+             `soth login --endpoint <url>` first, then `soth up`."
+        );
+    }
+
     let effective_config = ensure_config_for_up(args.config, global_config, args.quiet).await?;
     let mut enrollment_error: Option<anyhow::Error> = None;
 
