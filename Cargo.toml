@@ -113,7 +113,7 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
 opentelemetry-semantic-conventions = "0.27"
 tracing-opentelemetry = "0.28"
-sentry = { version = "0.34", default-features = false, features = ["panic", "tracing", "reqwest", "rustls", "backtrace", "contexts"] }
+sentry = { version = "0.34", default-features = false, features = ["panic", "tracing", "transport", "reqwest", "rustls", "backtrace", "contexts"] }
 once_cell = "1"
 dashmap = "5"
 dirs = "5"

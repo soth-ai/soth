@@ -14,7 +14,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use sentry::protocol::{Event, Value};
+use ::sentry::protocol::{Event, Value};
 
 use super::redaction::{redact, REDACTED};
 
@@ -23,18 +23,18 @@ use super::redaction::{redact, REDACTED};
 /// Returns `None` if the env var is unset or empty — Sentry is opt-in and
 /// the proxy must run cleanly without it (tests, offline dev, distros that
 /// haven't been configured yet).
-pub fn init() -> Option<sentry::ClientInitGuard> {
+pub fn init() -> Option<::sentry::ClientInitGuard> {
     let dsn = std::env::var("SENTRY_DSN").ok()?;
     if dsn.trim().is_empty() {
         return None;
     }
 
-    let release = sentry::release_name!();
+    let release = ::sentry::release_name!();
     let environment = std::env::var("SOTH_ENVIRONMENT")
         .or_else(|_| std::env::var("ENVIRONMENT"))
         .unwrap_or_else(|_| "unknown".into());
 
-    let options = sentry::ClientOptions {
+    let options = ::sentry::ClientOptions {
         dsn: dsn.parse().ok(),
         release,
         environment: Some(environment.into()),
@@ -48,7 +48,7 @@ pub fn init() -> Option<sentry::ClientInitGuard> {
         ..Default::default()
     };
 
-    Some(sentry::init(options))
+    Some(::sentry::init(options))
 }
 
 /// Apply the redaction policy to a Sentry event before transmission.
