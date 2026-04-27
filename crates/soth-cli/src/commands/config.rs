@@ -100,15 +100,36 @@ pub fn validate(config_path: &Path) -> Result<()> {
         }
     }
 
-    // 5. Check for insecure all-zeros vendor pubkey
+    // 5. Check for insecure all-zeros vendor pubkey.
+    //
+    // Pilot/dev configs commonly set `require_verified_bundle: false` and run
+    // with the placeholder pubkey because they're loading an unsigned local
+    // bundle on purpose. In that mode the pubkey is never consulted, so the
+    // warning is pure noise — suppress it. Anything else (verification on, or
+    // the field omitted entirely so it falls back to default) still warns.
     if let Some(bundle) = config.get("bundle") {
         if let Some(pk) = bundle.get("vendor_pubkey_hex").and_then(|v| v.as_str()) {
             if !pk.is_empty() && pk.chars().all(|c| c == '0') {
-                println!(
-                    "  [WARN] vendor_pubkey_hex is all-zeros \
-                     (signature verification will not work)"
-                );
-                warnings += 1;
+                let require_verified = bundle
+                    .get("require_verified_bundle")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let verify_signature = bundle
+                    .get("verify_vendor_signature")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if require_verified || verify_signature {
+                    println!(
+                        "  [WARN] vendor_pubkey_hex is all-zeros \
+                         (signature verification will not work)"
+                    );
+                    warnings += 1;
+                } else {
+                    println!(
+                        "  [ok] vendor_pubkey_hex is placeholder \
+                         (verification disabled — pilot/dev mode)"
+                    );
+                }
             }
         }
     }
@@ -170,5 +191,18 @@ mod tests {
     fn missing_file_returns_error() {
         let result = validate(Path::new("/tmp/soth_nonexistent_config_xyz.yaml"));
         assert!(result.is_err(), "expected an error for missing file");
+    }
+
+    #[test]
+    fn placeholder_pubkey_with_verification_disabled_does_not_error() {
+        // In pilot/dev mode (verification off) the all-zeros placeholder is
+        // expected. validate() must not exit non-zero.
+        let yaml = "bundle:\n  vendor_pubkey_hex: \"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n  require_verified_bundle: false\n  verify_vendor_signature: false\n";
+        let f = write_temp_yaml(yaml);
+        let result = std::panic::catch_unwind(|| validate(f.path()));
+        assert!(
+            result.is_ok(),
+            "validate should not panic/exit on pilot config"
+        );
     }
 }
