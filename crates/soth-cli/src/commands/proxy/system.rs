@@ -1275,11 +1275,59 @@ async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: boo
                 );
             }
             remove_system_proxy_state();
+            if print_user_output {
+                println!("   {} Restored Windows proxy settings", style::CHECK);
+            }
         } else {
-            anyhow::bail!("system proxy state missing; refusing blind Windows proxy disable");
-        }
-        if print_user_output {
-            println!("   {} Restored Windows proxy settings", style::CHECK);
+            // Sentinel missing. Match the macOS behaviour: only touch the
+            // proxy if we can prove it currently points at our loopback —
+            // anyone running with `127.0.0.1:<our-port>` set is using soth's
+            // forwarder regardless of whether the sentinel survived. If
+            // it's pointing somewhere else (genuine pre-existing user
+            // proxy, or already turned off), do nothing and report
+            // success so `soth down` doesn't deadlock the user.
+            let registered = read_windows_string_value("ProxyServer").unwrap_or(None);
+            let registered_str = registered.as_deref().unwrap_or("").trim();
+            let proxy_enabled = read_windows_proxy_enabled().unwrap_or(false);
+            let points_at_loopback = registered_str.starts_with(&proxy_server);
+            if proxy_enabled && points_at_loopback {
+                warn!(
+                    "system proxy state file missing but registered proxy is {proxy_server}; treating as soth-owned and disabling"
+                );
+                // ProxyEnable → 0; clear ProxyServer + ProxyOverride so a
+                // subsequent `soth on` builds them fresh from defaults.
+                let _ = run_reg_add(
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    "ProxyEnable",
+                    "REG_DWORD",
+                    "0",
+                );
+                let _ = run_reg_delete(
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    "ProxyServer",
+                );
+                let _ = run_reg_delete(
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    "ProxyOverride",
+                );
+                if print_user_output {
+                    println!(
+                        "   {} Disabled Windows proxy (state sentinel was missing; recovered via registry inspection)",
+                        style::CHECK
+                    );
+                }
+            } else {
+                // Not pointing at us → respect whatever's there. This is
+                // the same fail-open posture the macOS path takes when
+                // its state file is missing: never blind-disable a proxy
+                // we can't prove we set.
+                if print_user_output {
+                    println!(
+                        "   {} System proxy state missing and current setting is not soth-owned (no-op).",
+                        style::INFO
+                    );
+                }
+            }
         }
     }
 
