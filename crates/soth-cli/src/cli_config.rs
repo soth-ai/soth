@@ -351,7 +351,10 @@ mod cloud_endpoint_tests {
             ingest_endpoint: Some("https://alt-ingest.internal/".to_string()),
             ..CloudConfig::default()
         };
-        assert_eq!(cfg.resolved_ingest_endpoint(), "https://alt-ingest.internal");
+        assert_eq!(
+            cfg.resolved_ingest_endpoint(),
+            "https://alt-ingest.internal"
+        );
     }
 
     #[test]

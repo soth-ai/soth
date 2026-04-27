@@ -59,8 +59,15 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
     let system_prompt_hash = system_prompt.as_deref().map(sha256_hex);
     let semantic_hash = compute_semantic_hash(&user_content);
 
+    // Use the session's most recent activity (last message) as the event
+    // timestamp, falling back to session start, then to "now". This keeps
+    // long-lived sessions visible in the dashboard's default recent-time
+    // window — otherwise a Cursor chat originally created a week ago but
+    // still being appended to today would render as 7 days old and be hidden
+    // by typical "last 24h / 3d" filters.
     let timestamp = session
-        .started_at
+        .ended_at
+        .or(session.started_at)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let mut metadata = HashMap::new();

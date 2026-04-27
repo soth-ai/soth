@@ -124,7 +124,10 @@ fn open_readonly(db_path: &Path, tool: &str) -> Result<Connection, ReaderError> 
         message: format!("open {}: {e}", db_path.display()),
     })?;
 
-    conn.busy_timeout(std::time::Duration::from_millis(500))
+    // WAL contention with a live writer (e.g. an open Cursor IDE) is common.
+    // 2s gives the writer room to checkpoint while still preferring a skip
+    // over a long stall.
+    conn.busy_timeout(std::time::Duration::from_millis(2_000))
         .ok();
     Ok(conn)
 }
@@ -184,7 +187,11 @@ fn read_kv_sessions(
     let mut sessions = Vec::new();
     let mut max_rowid: Option<i64> = None;
 
-    let rows = stmt
+    // Collect outer rows first so `stmt` is no longer iterating when we run
+    // per-bubble sub-queries on the same connection. Interleaving query_row on
+    // a connection with a live Statement iterator triggers silent misuse on
+    // some rusqlite versions — we saw 1/132 bubbles captured for Cursor v15.
+    let composer_rows: Vec<(String, i64)> = stmt
         .query_map([], |row| {
             let value: String = row.get(0)?;
             let rowid: i64 = row.get(1)?;
@@ -193,14 +200,36 @@ fn read_kv_sessions(
         .map_err(|e| ReaderError::Reader {
             tool: playbook.tool.clone(),
             message: format!("query: {e}"),
-        })?;
+        })?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!(err = %e, tool = %playbook.tool, "skipping row with read error");
+                None
+            }
+        })
+        .collect();
+    drop(stmt);
 
-    for row in rows {
-        let (value, rowid) = row.map_err(|e| ReaderError::Reader {
-            tool: playbook.tool.clone(),
-            message: format!("row: {e}"),
-        })?;
+    // Pre-prepare the bubble/split-record lookup statement once; reused for
+    // every header in every session below. Avoids per-bubble re-prepare cost
+    // and — more importantly — lets us surface real errors via `.optional()`
+    // instead of swallowing them with `.ok()`.
+    let mut split_stmt_opt = if split_source.is_some() {
+        Some(
+            conn.prepare(&format!(
+                "SELECT {value_column} FROM {table} WHERE key = ?1"
+            ))
+            .map_err(|e| ReaderError::Reader {
+                tool: playbook.tool.clone(),
+                message: format!("prepare split lookup: {e}"),
+            })?,
+        )
+    } else {
+        None
+    };
 
+    for (value, rowid) in composer_rows {
         max_rowid = Some(max_rowid.map_or(rowid, |prev: i64| prev.max(rowid)));
 
         let doc: serde_json::Value = match serde_json::from_str(&value) {
@@ -244,6 +273,14 @@ fn read_kv_sessions(
             }
         }
 
+        // Split-record diagnostics, declared at session scope so they're
+        // visible in the `emitting session` log below regardless of whether
+        // we took the inline or split path.
+        let mut split_headers_seen: usize = 0;
+        let mut split_lookups_resolved: usize = 0;
+        let mut split_role_missing: usize = 0;
+        let mut split_text_missing: usize = 0;
+
         if records.is_empty() {
             // Declarative split-record fallback: the inline records array is
             // empty, so look up each record in a separate DB row using the
@@ -253,6 +290,7 @@ fn read_kv_sessions(
                 if let Some(serde_json::Value::Array(headers)) =
                     resolve_path(&doc, &split.headers_field)
                 {
+                    split_headers_seen = headers.len();
                     for header in headers {
                         let record_id =
                             match header.get(&split.header_id_field).and_then(|v| v.as_str()) {
@@ -264,17 +302,32 @@ fn read_kv_sessions(
                             .record_key_template
                             .replace("{session_id}", &session_id)
                             .replace("{record_id}", record_id);
-                        let record_json: Option<String> = conn
-                            .query_row(
-                                &format!("SELECT {value_column} FROM {table} WHERE key = ?1"),
-                                rusqlite::params![record_key],
-                                |row| row.get(0),
-                            )
-                            .ok();
+
+                        // Use the pre-prepared statement and distinguish
+                        // "no such row" (None) from real errors (log + skip)
+                        // so WAL contention doesn't silently drop bubbles.
+                        let record_json: Option<String> = match split_stmt_opt
+                            .as_mut()
+                            .expect("split_stmt present when split_source is some")
+                            .query_row(rusqlite::params![&record_key], |row| {
+                                row.get::<_, String>(0)
+                            }) {
+                            Ok(v) => Some(v),
+                            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                            Err(e) => {
+                                warn!(
+                                    err = %e,
+                                    key = %record_key,
+                                    "split-record lookup failed, skipping bubble"
+                                );
+                                None
+                            }
+                        };
 
                         let Some(json_str) = record_json else {
                             continue;
                         };
+                        split_lookups_resolved += 1;
 
                         let Ok(record_doc) = serde_json::from_str::<serde_json::Value>(&json_str)
                         else {
@@ -283,12 +336,18 @@ fn read_kv_sessions(
 
                         let role = match extract_role(&record_doc, &extraction.role) {
                             Some(r) => r,
-                            None => continue,
+                            None => {
+                                split_role_missing += 1;
+                                continue;
+                            }
                         };
 
                         let text = match extract_content(&record_doc, &extraction.content) {
                             Some(t) => t,
-                            None => continue,
+                            None => {
+                                split_text_missing += 1;
+                                continue;
+                            }
                         };
 
                         // Split-row timestamp: try the configured field/format
@@ -359,8 +418,31 @@ fn read_kv_sessions(
         }
 
         if messages.is_empty() {
+            tracing::info!(
+                tool = %playbook.tool,
+                session_id = %session_id,
+                rowid,
+                inline_records = records.len(),
+                had_split_source = split_source.is_some(),
+                "historian: skipping empty session"
+            );
             continue;
         }
+
+        // INFO-level so it's visible at default log level; this has been the
+        // single hardest field to diagnose — surfaces exactly how many bubbles
+        // arrived and where the split-record fallback lost them (if any).
+        tracing::info!(
+            tool = %playbook.tool,
+            session_id = %session_id,
+            rowid,
+            messages = messages.len(),
+            split_headers_seen,
+            split_lookups_resolved,
+            split_role_missing,
+            split_text_missing,
+            "historian: emitting session"
+        );
 
         let first_msg_ts = messages.first().and_then(|m| m.timestamp);
         let last_msg_ts = messages.last().and_then(|m| m.timestamp);
