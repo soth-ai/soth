@@ -1,10 +1,12 @@
 /// Realworld E2E corpus tests.
 ///
-/// Loads the NativeBundle from `~/.soth/bundle/detect/bundle.json`,
-/// converts it through the same `detect_from_native` + `gating_from_native`
-/// pipeline the proxy uses, generates test requests for every LLM provider
-/// using the provider's own `api_format`, sets `matched_provider` from the
-/// gating domain resolution, and verifies model extraction + AI call detection.
+/// Loads the NativeBundle from `~/.soth/bundle/native/bundle.json` (or the
+/// legacy `detect/bundle.json` location for older installs — same priority
+/// order as `soth-bundle/src/loader.rs::NATIVE_BUNDLE_PATHS`), converts it
+/// through the same `detect_from_native` + `gating_from_native` pipeline the
+/// proxy uses, generates test requests for every LLM provider using the
+/// provider's own `api_format`, sets `matched_provider` from the gating
+/// domain resolution, and verifies model extraction + AI call detection.
 ///
 /// No synthetic heuristics — the bundle's own data is the ground truth.
 use bytes::Bytes;
@@ -21,24 +23,16 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn load_native_bundle() -> Option<soth_bundle::NativeBundle> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let path = PathBuf::from(home).join(".soth/bundle/detect/bundle.json");
-    if !path.exists() {
-        eprintln!("Skipping: NativeBundle not found at {}", path.display());
-        return None;
-    }
-    let bytes = std::fs::read(&path).expect("read detect/bundle.json");
-    let native: soth_bundle::NativeBundle =
-        serde_json::from_slice(&bytes).expect("parse NativeBundle");
-    eprintln!(
-        "Loaded NativeBundle v{}: {} providers, {} products, {} formats, {} domains",
-        native.schema_version,
-        native.llm_providers.len(),
-        native.products.len(),
-        native.formats.len(),
-        native.domain_index.len(),
-    );
-    Some(native)
+    let home = std::env::var("HOME").ok()?;
+    // Mirror the runtime loader's priority order
+    // (`soth-bundle/src/loader.rs::NATIVE_BUNDLE_PATHS`): canonical first,
+    // legacy fallback second, skip if neither exists.
+    let path = ["native/bundle.json", "detect/bundle.json"]
+        .iter()
+        .map(|rel| PathBuf::from(&home).join(".soth/bundle").join(rel))
+        .find(|p| p.exists())?;
+    let bytes = std::fs::read(&path).expect("read native bundle");
+    Some(serde_json::from_slice(&bytes).expect("parse NativeBundle"))
 }
 
 // ---------------------------------------------------------------------------
@@ -273,14 +267,8 @@ fn realworld_provider_corpus_model_extraction() {
         );
     }
 
-    eprintln!(
-        "\n[Provider corpus] tested={tested} model={model_ok}/{tested} ai_call={ai_call_ok}/{tested} skipped={skipped_no_format}",
-    );
     if !failures.is_empty() {
-        eprintln!("Failures ({}):", failures.len());
-        for f in &failures[..failures.len().min(15)] {
-            eprintln!("  {f}");
-        }
+        for f in &failures[..failures.len().min(15)] {}
     }
 
     assert!(
@@ -339,12 +327,6 @@ fn realworld_domain_index_coverage() {
     }
 
     let total = covered + uncovered.len();
-    eprintln!(
-        "\n[Domain coverage] {}/{} domains resolvable via gating ({} uncovered)",
-        covered,
-        total,
-        uncovered.len()
-    );
 
     // At least 50% of domains should resolve (wildcards may not match materialized hosts)
     assert!(
@@ -369,12 +351,6 @@ fn realworld_rest_format_coverage() {
             "rest_formats missing required format: {fmt}"
         );
     }
-
-    eprintln!(
-        "\n[Format coverage] {} rest_formats loaded (required: {})",
-        detect.rest_formats.len(),
-        required_formats.len()
-    );
 }
 
 #[test]
@@ -407,7 +383,6 @@ fn classify_codex_format_from_bundle() {
         "/backend-api/codex/responses",
         &detect.as_slice(),
     );
-    eprintln!("classify_request_format result: {result:?}");
     assert_eq!(
         result.as_deref(),
         Some("codex"),
@@ -426,24 +401,17 @@ fn codex_format_features_survive_deserialization() {
         .rest_formats
         .get("codex")
         .expect("codex in rest_formats");
-    eprintln!("codex features count: {}", desc.features.len());
     assert!(
         !desc.features.is_empty(),
         "codex should have features after deserialization"
     );
 
     let chat = &desc.features[0];
-    eprintln!("feature id: {}, type: {}", chat.id, chat.feature_type);
     assert_eq!(chat.feature_type, "chat");
 
     // Check if FeatureResponseSpec::Stream variant was parsed
     match &chat.response {
         soth_core::bundle::detect::FeatureResponseSpec::Stream { stream } => {
-            eprintln!(
-                "stream format: {:?}, rules: {}",
-                stream.format,
-                stream.rules.len()
-            );
             assert!(!stream.rules.is_empty(), "stream rules should be non-empty");
         }
         soth_core::bundle::detect::FeatureResponseSpec::Direct(map) => {

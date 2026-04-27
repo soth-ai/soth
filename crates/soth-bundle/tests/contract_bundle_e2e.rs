@@ -1,46 +1,28 @@
+/// Find the live native bundle on disk, mirroring the runtime loader's
+/// priority order (`soth-bundle/src/loader.rs::NATIVE_BUNDLE_PATHS`):
+/// `native/bundle.json` is the canonical location; `detect/bundle.json` is a
+/// legacy fallback kept around so older installs keep working.
+fn find_real_native_bundle() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    for rel in ["native/bundle.json", "detect/bundle.json"] {
+        let path = std::path::PathBuf::from(&home)
+            .join(".soth/bundle")
+            .join(rel);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 #[test]
 fn real_bundle_entity_index_resolves_web_apps() {
-    let home = std::env::var("HOME").unwrap();
-    let bundle_path = std::path::PathBuf::from(home).join(".soth/bundle/detect/bundle.json");
-    if !bundle_path.exists() {
-        eprintln!("SKIP: no real bundle at {bundle_path:?}");
-        return;
-    }
+    let Some(bundle_path) = find_real_native_bundle() else {
+        return; // No real bundle on this machine — skip silently.
+    };
     let bytes = std::fs::read(&bundle_path).unwrap();
     let bundle: soth_core::native_bundle::NativeBundle = serde_json::from_slice(&bytes).unwrap();
-    eprintln!(
-        "entities: {}, llm_providers: {}, products: {}",
-        bundle.entities.len(),
-        bundle.llm_providers.len(),
-        bundle.products.len()
-    );
-
     let index = soth_bundle::entity_index::entity_index_from_native(&bundle);
-    eprintln!("index.len() = {}", index.len());
-
-    for host in &[
-        "chatgpt.com",
-        "claude.ai",
-        "gemini.google.com",
-        "api.openai.com",
-        "api.anthropic.com",
-    ] {
-        let simple = index.resolve_host(host);
-        let rules = index.resolve_host_with_rules(host);
-        eprintln!(
-            "{}: resolve_host={:?}, provider={:?}, app={:?}",
-            host,
-            simple.map(|e| &e.id),
-            rules
-                .provider
-                .as_ref()
-                .map(|m| &index.entity_for_host_match(m).id),
-            rules
-                .application
-                .as_ref()
-                .map(|m| &index.entity_for_host_match(m).id),
-        );
-    }
 
     assert!(
         index.resolve_host("chatgpt.com").is_some()
@@ -70,12 +52,9 @@ fn real_bundle_entity_index_resolves_web_apps() {
 
 #[test]
 fn real_bundle_gemini_web_format_has_features_after_projection() {
-    let home = std::env::var("HOME").unwrap();
-    let bundle_path = std::path::PathBuf::from(home).join(".soth/bundle/detect/bundle.json");
-    if !bundle_path.exists() {
-        eprintln!("SKIP: no real bundle");
-        return;
-    }
+    let Some(bundle_path) = find_real_native_bundle() else {
+        return; // No real bundle on this machine — skip silently.
+    };
     let bytes = std::fs::read(&bundle_path).unwrap();
     let bundle: soth_core::native_bundle::NativeBundle = serde_json::from_slice(&bytes).unwrap();
     let detect = soth_bundle::detect_from_native(&bundle);
@@ -85,7 +64,6 @@ fn real_bundle_gemini_web_format_has_features_after_projection() {
         .rest_formats
         .get("gemini_web")
         .expect("gemini_web format should exist");
-    eprintln!("gemini_web features: {}", gemini_web.features.len());
     assert!(
         !gemini_web.features.is_empty(),
         "gemini_web should have features merged from gemini format"
@@ -98,9 +76,4 @@ fn real_bundle_gemini_web_format_has_features_after_projection() {
         .find(|f| f.id == "chat")
         .expect("gemini_web should have a chat feature");
     assert_eq!(chat.protocol, "rest");
-    eprintln!(
-        "chat feature: protocol={}, patterns={}",
-        chat.protocol,
-        chat.patterns.len()
-    );
 }
