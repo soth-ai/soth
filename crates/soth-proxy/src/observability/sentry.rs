@@ -18,16 +18,39 @@ use ::sentry::protocol::{Event, Value};
 
 use super::redaction::{redact, REDACTED};
 
-/// Initialise the Sentry SDK from `SENTRY_DSN`.
+// Build-time embedded DSN. Sentry DSNs are write-only ingest tokens
+// (project-scoped, can't read events / admin the project), which is why
+// embedding in shipped client SDKs is the standard pattern. Set via
+// `SOTH_SENTRY_DSN=... cargo build --release` in the release pipeline.
+const BUILT_IN_DSN: Option<&str> = option_env!("SOTH_SENTRY_DSN");
+
+/// Initialise the Sentry SDK from `SENTRY_DSN` (runtime) or the
+/// `SOTH_SENTRY_DSN` build-time embed.
 ///
-/// Returns `None` if the env var is unset or empty — Sentry is opt-in and
-/// the proxy must run cleanly without it (tests, offline dev, distros that
-/// haven't been configured yet).
+/// Returns `None` if neither source has a value — Sentry is opt-in and the
+/// proxy must run cleanly without it (tests, offline dev, distros that
+/// haven't been configured yet). A malformed DSN value also returns `None`
+/// (we never let a bad config crash the proxy at startup).
 pub fn init() -> Option<::sentry::ClientInitGuard> {
-    let dsn = std::env::var("SENTRY_DSN").ok()?;
-    if dsn.trim().is_empty() {
-        return None;
-    }
+    let dsn = std::env::var("SENTRY_DSN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| BUILT_IN_DSN.map(|s| s.to_string()))
+        .filter(|value| !value.trim().is_empty())?;
+
+    let parsed_dsn = match dsn.parse::<::sentry::types::Dsn>() {
+        Ok(dsn) => dsn,
+        Err(error) => {
+            // A malformed DSN must not crash the proxy at startup; just log
+            // once and continue without Sentry rather than initialising a
+            // half-broken client that does nothing useful.
+            tracing::warn!(
+                error = %error,
+                "SENTRY_DSN value could not be parsed; Sentry capture disabled"
+            );
+            return None;
+        }
+    };
 
     let release = ::sentry::release_name!();
     let environment = std::env::var("SOTH_ENVIRONMENT")
@@ -35,7 +58,7 @@ pub fn init() -> Option<::sentry::ClientInitGuard> {
         .unwrap_or_else(|_| "unknown".into());
 
     let options = ::sentry::ClientOptions {
-        dsn: dsn.parse().ok(),
+        dsn: Some(parsed_dsn),
         release,
         environment: Some(environment.into()),
         // We don't want Sentry's own performance tracing — Honeycomb owns that.

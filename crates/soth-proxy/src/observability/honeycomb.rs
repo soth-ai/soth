@@ -28,6 +28,18 @@ const DEFAULT_ENDPOINT: &str = "https://api.honeycomb.io/v1/traces";
 const DEFAULT_DATASET: &str = "soth-edge-proxy";
 const DEFAULT_SERVICE_NAME: &str = "soth-edge-proxy";
 
+// Build-time embedded credentials. When the release pipeline sets these
+// `cargo build` env vars, the resulting binary ships pre-configured for
+// `soth-edge-proxy` so end-user devices report telemetry out of the box.
+// Runtime env still wins (so dev/staging override freely), and absence of
+// both runtime and build-time values disables the exporter cleanly.
+//
+// IMPORTANT: only an *ingest-scoped, send-events-only* Honeycomb API key
+// belongs here. Never bake a configuration / admin key into a shipped
+// binary — anyone running `strings` on the binary can extract it.
+const BUILT_IN_API_KEY: Option<&str> = option_env!("SOTH_HONEYCOMB_API_KEY");
+const BUILT_IN_DATASET: Option<&str> = option_env!("SOTH_HONEYCOMB_DATASET");
+
 /// Build and install the Honeycomb-backed OTel tracer provider.
 ///
 /// Returns:
@@ -39,13 +51,19 @@ const DEFAULT_SERVICE_NAME: &str = "soth-edge-proxy";
 ///   opt-in so the proxy stays usable in tests, offline dev, and on hosts
 ///   that haven't been configured yet.
 pub fn init() -> Option<(SdkTracerProvider, opentelemetry_sdk::trace::Tracer)> {
-    let api_key = std::env::var("HONEYCOMB_API_KEY").ok()?;
-    if api_key.trim().is_empty() {
-        return None;
-    }
+    // Runtime env takes precedence over build-time embed so dev/staging
+    // overrides always work; the embedded key is the user-device fallback.
+    let api_key = std::env::var("HONEYCOMB_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| BUILT_IN_API_KEY.map(|s| s.to_string()))
+        .filter(|value| !value.trim().is_empty())?;
 
-    let dataset =
-        std::env::var("HONEYCOMB_DATASET").unwrap_or_else(|_| DEFAULT_DATASET.to_string());
+    let dataset = std::env::var("HONEYCOMB_DATASET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| BUILT_IN_DATASET.map(|s| s.to_string()))
+        .unwrap_or_else(|| DEFAULT_DATASET.to_string());
     let endpoint =
         std::env::var("HONEYCOMB_OTLP_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
     let service_name =
