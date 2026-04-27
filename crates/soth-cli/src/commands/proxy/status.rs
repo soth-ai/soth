@@ -295,11 +295,10 @@ fn collect_proxy_status(
         // (supervisor + daemon-child both hold the inherited listener fd) —
         // pick the lowest pid, which is the parent supervisor and is what
         // launchd actually tracks. We verify it's still alive before using it.
-        super::daemon::listener_owner_pids(active_port)
-            .and_then(|mut owners| {
-                owners.sort_unstable();
-                owners.into_iter().find(|pid| process_running(*pid))
-            })
+        super::daemon::listener_owner_pids(active_port).and_then(|mut owners| {
+            owners.sort_unstable();
+            owners.into_iter().find(|pid| process_running(*pid))
+        })
     } else {
         None
     };
