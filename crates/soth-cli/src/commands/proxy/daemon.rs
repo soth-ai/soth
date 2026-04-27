@@ -665,10 +665,104 @@ fn process_commandline(_pid: u32) -> Option<String> {
     None
 }
 
+/// Win32 API lookup of a process's executable path.
+///
+/// Used by [`is_expected_daemon_process`] on Windows as the *primary* dedup
+/// signal. The pre-existing PowerShell + `wmic` path
+/// ([`process_commandline_via_powershell`], [`process_commandline_via_wmic`])
+/// is unreliable on modern Windows: PowerShell can be locked down by GPO,
+/// and Microsoft removed `wmic` from default Windows 11 23H2+ installs. When
+/// both fail, `is_expected_daemon_process` returns false, the daemon-adopt
+/// path aborts, and `soth up` spawns a duplicate proxy on every invocation
+/// — which is exactly the regression PR #46 (the prior dedup fix) tried to
+/// solve but couldn't fully address while it depended on `process_commandline`.
+///
+/// `QueryFullProcessImageNameW` only requires
+/// `PROCESS_QUERY_LIMITED_INFORMATION`, which the OS grants for any process
+/// owned by the current user without elevation. It's available on every
+/// supported Windows version (Vista+) and ships with the OS, so it's the
+/// most portable path we have.
+#[cfg(target_os = "windows")]
+fn process_executable_path(pid: u32) -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        fn QueryFullProcessImageNameW(
+            handle: *mut std::ffi::c_void,
+            flags: u32,
+            buf: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        // `\\?\C:\…` paths can exceed MAX_PATH (260) on Windows 10+, so size
+        // generously and let the API report the actual length back.
+        let mut buf = vec![0u16; 32_768];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+        let _ = CloseHandle(handle);
+        if ok == 0 || size == 0 {
+            return None;
+        }
+        let path = OsString::from_wide(&buf[..size as usize]);
+        Some(path.to_string_lossy().into_owned())
+    }
+}
+
+/// Returns `true` when an executable path looks like our `soth` binary.
+/// Pure function so we can unit-test the path-shape matcher without an
+/// actual Windows process to query. Called by [`is_expected_daemon_process`]
+/// on Windows after [`process_executable_path`] resolves the running pid.
+fn is_soth_executable_path(path: &str) -> bool {
+    let normalized = path.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    // Require a path separator immediately before `soth(.exe)` or an exact
+    // match — same rule as `is_soth_daemon_command_line` so `notsoth.exe`
+    // doesn't false-positive.
+    normalized.ends_with("\\soth.exe")
+        || normalized.ends_with("/soth.exe")
+        || normalized.ends_with("\\soth")
+        || normalized.ends_with("/soth")
+        || normalized == "soth.exe"
+        || normalized == "soth"
+}
+
 fn is_expected_daemon_process(pid: u32) -> bool {
     if !is_process_running(pid) {
         return false;
     }
+
+    // Windows: trust the Win32 image-name query first. PowerShell/`wmic`
+    // are deprecated/locked down on enough installs that the cmdline-based
+    // check from PR #46 still fails for some users. The image-name query
+    // works regardless of shell or WMI configuration.
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(image_path) = process_executable_path(pid) {
+            return is_soth_executable_path(&image_path);
+        }
+        // If the API call itself failed (handle denied, race with exit),
+        // fall through to the cmdline path so we degrade gracefully rather
+        // than always returning false on Windows.
+    }
+
     let Some(command) = process_commandline(pid) else {
         return false;
     };
@@ -1513,6 +1607,40 @@ mod tests {
         assert!(!is_soth_daemon_command_line(
             "/usr/local/bin/notsoth start --daemon-child"
         ));
+    }
+
+    #[test]
+    fn executable_path_matches_canonical_windows_layouts() {
+        // Typical user install location.
+        assert!(is_soth_executable_path(
+            "C:\\Users\\foo\\.local\\bin\\soth.exe"
+        ));
+        // Mixed-case drive letter / path separators (PowerShell sometimes
+        // emits forward slashes via .NET interop).
+        assert!(is_soth_executable_path("C:/Users/foo/.local/bin/SOTH.EXE"));
+        // Long-path prefixed (\\?\) form returned by QueryFullProcessImageNameW
+        // when paths exceed MAX_PATH.
+        assert!(is_soth_executable_path(
+            "\\\\?\\C:\\Users\\foo\\.local\\bin\\soth.exe"
+        ));
+    }
+
+    #[test]
+    fn executable_path_matches_canonical_unix_layouts() {
+        assert!(is_soth_executable_path("/usr/local/bin/soth"));
+        assert!(is_soth_executable_path("/Users/gilfoyle/.local/bin/soth"));
+        assert!(is_soth_executable_path("soth"));
+    }
+
+    #[test]
+    fn executable_path_rejects_lookalike_binaries() {
+        // No path separator before `soth` → could be `notsoth`, `mysoth`, etc.
+        assert!(!is_soth_executable_path("/usr/local/bin/notsoth"));
+        assert!(!is_soth_executable_path("/usr/local/bin/notsoth.exe"));
+        assert!(!is_soth_executable_path("C:\\bin\\sothy.exe"));
+        // Empty / whitespace-only.
+        assert!(!is_soth_executable_path(""));
+        assert!(!is_soth_executable_path("   "));
     }
 
     #[test]
