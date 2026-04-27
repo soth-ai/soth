@@ -126,16 +126,51 @@ async fn contract_sync_endpoints_and_cursors() {
     assert_eq!(summary.exchange_retry_deferred, 0);
     assert_eq!(summary.exchange_dropped, 0);
 
+    // Snapshot last_sync_timestamp BEFORE the heartbeat. The earlier
+    // `agent.tick()` call queued + flushed an exchange event so the
+    // exchange-flush path already wrote a timestamp. We assert the heartbeat
+    // *moves it forward* — that catches the regression where
+    // heartbeat-only success didn't update the sync_state at all (the bug
+    // that left `Last heartbeat: never` showing forever for low-traffic
+    // devices even though cloud-side heartbeat tracking worked fine).
+    let conn = Connection::open(&db_path).unwrap();
+    let last_sync_before: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'last_sync_timestamp'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    // Sleep just enough that the second timestamp must differ at the
+    // millisecond resolution `mark_sync_success` uses (`Utc::now().to_rfc3339()`).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
     let heartbeat_ok = agent.send_heartbeat().await.unwrap();
     assert!(heartbeat_ok);
 
-    let conn = Connection::open(&db_path).unwrap();
     let queue_depth: i64 = conn
         .query_row("SELECT COUNT(*) FROM exchange_upload_queue", [], |row| {
             row.get(0)
         })
         .unwrap();
     assert_eq!(queue_depth, 0);
+
+    let last_sync_after: String = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'last_sync_timestamp'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("heartbeat success must persist `last_sync_timestamp` for `soth status`");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&last_sync_after).is_ok(),
+        "last_sync_timestamp should be RFC3339, got: {last_sync_after}"
+    );
+    assert_ne!(
+        last_sync_before.as_deref(),
+        Some(last_sync_after.as_str()),
+        "heartbeat success must advance last_sync_timestamp, but it stayed at {last_sync_after}"
+    );
 
     let captured = state.lock().unwrap().clone();
     assert_eq!(captured.metadata_requests.len(), 1);

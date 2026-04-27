@@ -638,6 +638,22 @@ impl SyncAgent {
         match self.heartbeat_sender.send(&request).await {
             Ok(Some(response)) => {
                 self.heartbeat_circuit.record_success();
+                // Persist the heartbeat timestamp into local sync_state so
+                // `soth status` can render `Last heartbeat: <N> ago`. Without
+                // this, the only writer of `last_sync_timestamp` is the
+                // exchange flush path (gated on `stats.exchange_sent > 0`), so
+                // any device that's heartbeating but not actively shipping
+                // exchange events showed `Last heartbeat: never` forever — even
+                // when the cloud dashboard correctly reported it as live.
+                // Best-effort: a sqlite write failure here must not abort the
+                // heartbeat (we still want to record_success on the breaker
+                // and honour any config_changed hint from the server).
+                if let Err(error) = self.mark_sync_success() {
+                    warn!(
+                        error = %error,
+                        "failed to persist heartbeat success timestamp to local sync_state"
+                    );
+                }
                 if response.config_changed {
                     let puller = match self.config_puller.lock() {
                         Ok(guard) => guard.clone(),
