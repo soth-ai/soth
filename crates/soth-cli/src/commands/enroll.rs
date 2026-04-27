@@ -18,9 +18,18 @@ pub struct EnrollArgs {
     /// Enrollment token (invite token). If omitted, prompt or read from stdin.
     pub token: Option<String>,
 
-    /// Enrollment endpoint override (defaults to cloud.endpoint from config)
+    /// Cloud management endpoint (e.g. https://api.soth.ai). Persisted as
+    /// `cloud.endpoint`. Defaults to the value already in config.
     #[arg(long)]
     pub endpoint: Option<String>,
+
+    /// Cloud edge/ingest endpoint (e.g. https://ingest.soth.ai). Used for the
+    /// `/v1/edge/enroll/exchange` POST and persisted as `cloud.ingest_endpoint`.
+    /// When omitted, derived from `--endpoint` by rewriting `api.<domain>` to
+    /// `ingest.<domain>` — set explicitly for single-host dev or local Docker
+    /// where management and ingest live on different ports of the same host.
+    #[arg(long)]
+    pub ingest_endpoint: Option<String>,
 
     /// Config file path to update (defaults to ~/.soth/soth.yaml)
     #[arg(long)]
@@ -54,15 +63,23 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
 
     let enroll_token = resolve_enroll_token(&args)?;
     let endpoint_override = args.endpoint.clone();
+    let ingest_endpoint_override = args
+        .ingest_endpoint
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     // Management endpoint (for display + persistence in cloud.endpoint).
     let management_endpoint = endpoint_override
         .clone()
         .unwrap_or_else(|| config.cloud.endpoint.clone());
     // Enrollment itself is an edge-plane call (/v1/edge/enroll/exchange) and
-    // must go to soth-ingestion. Derive from the effective management URL
-    // so `--endpoint https://api.<domain>` auto-rewrites to `ingest.<domain>`
-    // without the user needing to know the split.
-    let ingest_endpoint = cli_config::derive_ingest_endpoint(management_endpoint.as_str());
+    // must go to soth-ingestion. When the caller passes `--ingest-endpoint`
+    // explicitly (single-host dev, local Docker, custom deployments), use it
+    // verbatim. Otherwise derive from the management URL so
+    // `--endpoint https://api.<domain>` auto-rewrites to `ingest.<domain>`.
+    let ingest_endpoint = ingest_endpoint_override
+        .clone()
+        .unwrap_or_else(|| cli_config::derive_ingest_endpoint(management_endpoint.as_str()));
     let machine_name = args
         .machine_name
         .clone()
@@ -90,6 +107,12 @@ pub async fn run(args: EnrollArgs, global_config: Option<PathBuf>) -> Result<()>
     } else {
         exchanged.endpoint.unwrap_or(management_endpoint)
     };
+    // Persist an explicit ingest override so subsequent heartbeats /
+    // bundle pulls don't re-derive the wrong host (e.g. when management
+    // and ingest live on different ports of the same dev host).
+    if let Some(explicit_ingest) = ingest_endpoint_override {
+        config.cloud.ingest_endpoint = Some(explicit_ingest);
+    }
     // Cloud sync uses the unified Exchange pipeline (schema_version=1).
     config.exchange.enabled = true;
 

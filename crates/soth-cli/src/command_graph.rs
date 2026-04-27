@@ -150,9 +150,16 @@ pub struct UpArgs {
     #[arg(long)]
     pub token: Option<String>,
 
-    /// Enrollment endpoint override
+    /// Cloud management endpoint override (persisted as `cloud.endpoint`)
     #[arg(long)]
     pub endpoint: Option<String>,
+
+    /// Cloud edge/ingest endpoint override (used for the enrollment exchange
+    /// and persisted as `cloud.ingest_endpoint`). Only needed when management
+    /// and ingest can't be derived from each other by hostname rewrite — e.g.
+    /// local Docker where they're different ports on the same host.
+    #[arg(long)]
+    pub ingest_endpoint: Option<String>,
 
     /// Optional machine name override sent during enrollment
     #[arg(long)]
@@ -636,6 +643,7 @@ async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow:
             commands::enroll::EnrollArgs {
                 token: args.token,
                 endpoint: args.endpoint,
+                ingest_endpoint: args.ingest_endpoint,
                 config: effective_config.clone(),
                 from_stdin: false,
                 non_interactive: true,
@@ -1231,6 +1239,7 @@ mod tests {
                         config: Some(config_path.clone()),
                         token: None,
                         endpoint: None,
+                        ingest_endpoint: None,
                         machine_name: None,
                         quiet: true,
                         foreground: false,
@@ -1272,6 +1281,7 @@ mod tests {
                         config: Some(config_path),
                         token: None,
                         endpoint: None,
+                        ingest_endpoint: None,
                         machine_name: None,
                         quiet: true,
                         foreground: false,
@@ -1311,6 +1321,7 @@ mod tests {
                     config: Some(config_path),
                     token: None,
                     endpoint: None,
+                    ingest_endpoint: None,
                     machine_name: None,
                     quiet: true,
                     foreground: false,
