@@ -1067,7 +1067,11 @@ async fn run_proxy_worker() -> Result<()> {
     registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
 
     let tracing_targets = registry.tracing_targets();
-    soth_proxy::runtime::init_tracing(&tracing_targets);
+    // Hold the observability guard until proxy.run() returns so that the
+    // OTel batch exporter + Sentry transport flush in-flight events on
+    // graceful shutdown. If the worker is killed (signal, panic), Sentry's
+    // own panic handler still ships the event before the process exits.
+    let _observability_guard = soth_proxy::runtime::init_tracing(&tracing_targets);
 
     soth_proxy::runtime::run(registry).await
 }

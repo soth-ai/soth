@@ -41,6 +41,14 @@ tokio.workspace = true
 toml = "0.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Observability stack (see docs/common/observability.md)
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+tracing-opentelemetry.workspace = true
+sentry.workspace = true
 uuid.workspace = true
 
 soth-core = { workspace = true }
