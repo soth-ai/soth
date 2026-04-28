@@ -21,6 +21,19 @@ const LISTENER_HEALTH_FAILURE_WINDOW_MS: u64 = 5_000;
 const MAX_RESTART_ATTEMPTS: u32 = 10;
 const RESTART_BACKOFF_BASE_MS: u64 = 1_000;
 const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
+
+/// If the supervisor loop sees a wall-clock gap larger than this between two
+/// iterations, we assume the OS was suspended (sleep / hibernate / Modern
+/// Standby) for that duration. Sleep > 60s is the threshold because tokio's
+/// `interval` ticks at 1s and any sub-minute gap is plausibly just a slow
+/// upstream call or GC pause; everything beyond that is overwhelmingly
+/// likely to be a real suspend.
+const WAKE_DETECTION_GAP_SECS: u64 = 60;
+/// How long to wait for the listener to come up on the first restart after a
+/// detected wake event. Windows in particular can take many seconds to bring
+/// the network stack back up, during which the worker fails to bind. The
+/// regular 20s timeout is too aggressive here.
+const WAKE_LISTENER_STARTUP_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_NOFILE_MIN_SOFT_LIMIT: u64 = 8_192;
 const DEFAULT_NOFILE_WARN_SOFT_LIMIT: u64 = 2_048;
 const AGENT_INSTANCE_ID_TAG: &str = "agent_instance_id";
@@ -349,9 +362,37 @@ async fn supervise_proxy(
 ) -> Result<()> {
     let mut consecutive_failures: u32 = 0;
     let mut last_healthy = Instant::now();
+    let mut last_iteration = Instant::now();
+    // First restart after a detected wake gets a longer startup grace
+    // window — see WAKE_LISTENER_STARTUP_TIMEOUT_SECS for the rationale.
+    let mut next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
 
     loop {
         let exit_reason = wait_until_exit_or_unhealthy(child, expected_port, foreground).await;
+
+        // Detect wake-from-sleep before applying restart-budget logic. A long
+        // wall-clock gap between supervisor iterations almost always means
+        // the OS was suspended (sleep / hibernate / Modern Standby). Tokio's
+        // monotonic timers don't distinguish "we awaited a 1s tick" from
+        // "the OS suspended us for 8 hours mid-tick" — only Instant deltas
+        // do. On detection, treat the upcoming restart as a fresh start
+        // rather than letting transient post-wake bind failures drain the
+        // failure budget and kill the supervisor entirely (which would
+        // leave the user with no proxy until next login or `soth up`).
+        let now = Instant::now();
+        let iteration_gap = now.duration_since(last_iteration);
+        last_iteration = now;
+        if iteration_gap > Duration::from_secs(WAKE_DETECTION_GAP_SECS) {
+            warn!(
+                gap_secs = iteration_gap.as_secs(),
+                "supervisor saw a {}s wall-clock gap between iterations — assuming system resume from sleep/hibernate; resetting failure counter and granting longer listener-start grace",
+                iteration_gap.as_secs()
+            );
+            consecutive_failures = 0;
+            last_healthy = now;
+            next_startup_timeout = Duration::from_secs(WAKE_LISTENER_STARTUP_TIMEOUT_SECS);
+        }
+
         match exit_reason {
             ProxyExit::Signal => {
                 terminate_child(child).await?;
@@ -418,8 +459,13 @@ async fn supervise_proxy(
         *child = spawn_proxy_process(config_path, listener_fd)
             .await
             .context("respawn soth-proxy process")?;
-        if let Err(error) = wait_for_listener_start(child, expected_port).await {
-            warn!("proxy failed to start after respawn: {error}");
+        if let Err(error) =
+            wait_for_listener_start_with_timeout(child, expected_port, next_startup_timeout).await
+        {
+            warn!(
+                timeout_secs = next_startup_timeout.as_secs(),
+                "proxy failed to start after respawn: {error}"
+            );
             continue;
         }
         info!(
@@ -428,6 +474,9 @@ async fn supervise_proxy(
             "soth-proxy restarted successfully"
         );
         last_healthy = Instant::now();
+        // After a successful restart, drop back to the normal startup
+        // budget — the wake-up grace window is one-shot.
+        next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
     }
 }
 
@@ -525,7 +574,19 @@ async fn graceful_stop_child(child: &mut Child) -> Result<()> {
 }
 
 async fn wait_for_listener_start(child: &mut Child, port: u16) -> Result<()> {
-    let timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
+    wait_for_listener_start_with_timeout(
+        child,
+        port,
+        Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn wait_for_listener_start_with_timeout(
+    child: &mut Child,
+    port: u16,
+    timeout: Duration,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         if is_local_listener_ready(port) {
