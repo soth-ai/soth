@@ -123,8 +123,9 @@ pub async fn run(
     let expected_port = port.unwrap_or(config.forward_proxy.port);
 
     #[cfg(unix)]
-    let _supervisor_listener = bind_supervisor_listener(&config.forward_proxy.address, expected_port)
-        .map_err(|error| friendly_bind_error(error, expected_port))?;
+    let _supervisor_listener =
+        bind_supervisor_listener(&config.forward_proxy.address, expected_port)
+            .map_err(|error| friendly_bind_error(error, expected_port))?;
     #[cfg(unix)]
     let listener_fd = Some({
         use std::os::unix::io::AsRawFd;
@@ -904,7 +905,6 @@ fn normalize_agent_instance_id(raw: &str) -> Option<String> {
     }
 }
 
-#[cfg(unix)]
 /// Translate `bind_supervisor_listener` failures into something a user can act
 /// on. The raw OS error is "Address already in use (os error 48)" which gives
 /// no hint about which process is holding the port. We probe the listener's
@@ -951,6 +951,7 @@ fn friendly_bind_error(error: anyhow::Error, port: u16) -> anyhow::Error {
     error
 }
 
+#[cfg(unix)]
 fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpListener> {
     let addr = format!("{address}:{port}");
     let listener = std::net::TcpListener::bind(&addr)
