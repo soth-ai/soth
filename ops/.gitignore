@@ -1,0 +1,5 @@
+# Per-env override files cache secrets from your real secret store.
+# Never commit them.
+.env.local
+.env.staging
+.env.prod
