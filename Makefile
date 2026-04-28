@@ -50,6 +50,19 @@ release-classify:
 verify-classify:
 	$(OPS) verify-classify '$(ENV)'
 
+.PHONY: import-catalog compile-catalog publish-catalog release-catalog
+import-catalog:
+	$(OPS) import-catalog '$(ENV)'
+
+compile-catalog:
+	$(OPS) compile-catalog '$(ENV)'
+
+publish-catalog:
+	$(OPS) publish-catalog '$(ENV)'
+
+release-catalog:
+	$(OPS) release-catalog '$(ENV)'
+
 .PHONY: clean-dist
 clean-dist:
 	$(OPS) clean-dist

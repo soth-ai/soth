@@ -126,6 +126,13 @@ cmd_help() {
 	  release-classify       build-classify + publish-classify
 	  verify-classify        ENV=local: re-shasum the tarball
 
+	Tool catalog (Phase 3):
+	  import-catalog         Refresh server raw_bundle.json + POST /admin/registry/import/current
+	                         (staging: ssh+scp+ssh-cp; prod: prints soth-cloud-commit guidance)
+	  compile-catalog        POST /admin/registry/compile, capture compilation_id
+	  publish-catalog        POST /admin/registry/compilations/{id}/publish
+	  release-catalog        compile-catalog + publish-catalog (import is separate)
+
 	Maintenance:
 	  clean-dist             rm -rf ${DIST_DIR}
 
@@ -134,11 +141,11 @@ cmd_help() {
 	  SOTH_SENTRY_DSN         build-cli
 	  MINIO_ACCESS_KEY        publish-cli ENV=staging
 	  MINIO_SECRET_KEY        publish-cli ENV=staging
-	  PLATFORM_ADMIN_TOKEN    publish-classify (and Phase 3 catalog)
-	  ADMIN_API               publish-classify (auto-defaults per ENV)
+	  PLATFORM_ADMIN_TOKEN    publish-classify, *-catalog
+	  ADMIN_API               publish-classify, *-catalog (auto-defaults per ENV)
 	  (prod CLI publish uses \`wrangler login\` — no extra creds.)
 
-	Phase 3 (tool catalog) coming next; see ops/README.md.
+	Phase 4 (status/diff cross-env) and Phase 5 (GHA wrappers) follow.
 	EOF
 }
 
@@ -480,6 +487,187 @@ cmd_release_classify() {
   cmd_publish_classify
 }
 
+# --- tool catalog: import + compile + publish ------------------------------
+#
+# Three sub-verbs, one per stage. They're separate because each has very
+# different behavior across envs and the natural composite (compile +
+# publish) doesn't include import.
+#
+#   import-catalog    refresh server's raw_bundle.json source-of-truth.
+#                     - staging: scp + ssh sudo cp + POST /import/current
+#                     - prod:    requires soth-cloud commit + CI deploy
+#                                (Railway has no writable fs from outside)
+#   compile-catalog   POST /v1/admin/registry/compile, capture compilation_id
+#   publish-catalog   POST /v1/admin/registry/compilations/{id}/publish
+#   release-catalog   compile-catalog + publish-catalog
+#
+# Parsers (`SOTH_Complete_Governance_Dataset.json`) are out of scope for
+# this phase — the file's top-level shape is `{metadata, tools}` but
+# the admin endpoint expects `{parsers: {...}}`. Untangling the mapping
+# is its own ticket.
+
+require_catalog_admin_creds() {
+  require_var PLATFORM_ADMIN_TOKEN
+  if [ -z "$ADMIN_API" ]; then
+    err "ADMIN_API is empty (no default for ENV=$ENV; set in ops/.env.$ENV or shell)"
+  fi
+}
+
+# Hetzner staging deploy — ssh target + on-disk path.
+STAGING_SSH_HOST="ubuntu@65.108.45.248"
+STAGING_RAW_BUNDLE_PATH="/opt/soth/soth-cloud/data/runtime/local-bundle/registry/raw_bundle.json"
+
+cmd_import_catalog() {
+  case "$ENV" in
+    staging) cmd_import_catalog_staging ;;
+    prod)    cmd_import_catalog_prod ;;
+    local)   err "import-catalog ENV=local not supported (use compile-catalog directly against your dev API)" ;;
+    *)       err "ENV must be staging|prod (got '$ENV')" ;;
+  esac
+}
+
+cmd_import_catalog_staging() {
+  require_catalog_admin_creds
+
+  local src="${DATA_DIR}/raw_bundle.json"
+  [ -f "$src" ] || err "missing $src"
+
+  local local_sha
+  local_sha=$(shasum -a 256 "$src" | awk '{print $1}')
+
+  echo "==> sync raw_bundle.json → staging server"
+  echo "    src: $src (sha256=${local_sha:0:12}…)"
+  echo "    dst: ${STAGING_SSH_HOST}:${STAGING_RAW_BUNDLE_PATH}"
+
+  # Two-step: scp to /tmp (ubuntu user owns it), then sudo cp into the
+  # soth-owned deploy tree. Avoids needing ubuntu to write the deploy
+  # tree directly.
+  scp -q "$src" "${STAGING_SSH_HOST}:/tmp/raw_bundle.json.new"
+  ssh "$STAGING_SSH_HOST" "sudo -u soth cp /tmp/raw_bundle.json.new ${STAGING_RAW_BUNDLE_PATH} && rm -f /tmp/raw_bundle.json.new"
+
+  local remote_sha
+  remote_sha=$(ssh "$STAGING_SSH_HOST" "sha256sum ${STAGING_RAW_BUNDLE_PATH}" 2>/dev/null | awk '{print $1}')
+  [ "$local_sha" = "$remote_sha" ] || err "post-scp sha mismatch: local=$local_sha staging=$remote_sha"
+  echo "  -> server sha matches local"
+
+  echo
+  echo "==> POST ${ADMIN_API}/v1/admin/registry/import/current"
+  local response_file status body
+  response_file=$(mktemp)
+  status=$(curl -sS \
+    -o "$response_file" \
+    -w "%{http_code}" \
+    -X POST \
+    -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{}' \
+    "${ADMIN_API}/v1/admin/registry/import/current")
+  body=$(cat "$response_file")
+  rm -f "$response_file"
+  echo "  -> http=${status}"
+  if [ "$status" != "200" ]; then
+    echo "    body: $body"
+    err "import failed (http $status)"
+  fi
+  echo "    body: $body"
+  echo "  OK  raw_bundle imported into ${ENV} admin DB"
+}
+
+cmd_import_catalog_prod() {
+  cat >&2 <<-EOF
+	==> ENV=prod uses the soth-cloud deploy path:
+	    1. cp ${DATA_DIR}/raw_bundle.json \\
+	         <soth-cloud>/data/runtime/local-bundle/registry/raw_bundle.json
+	    2. (cd soth-cloud && git add data/runtime/local-bundle/registry/raw_bundle.json \\
+	         && git commit -m "data: refresh raw_bundle" && git push)
+	    3. Wait for Railway CI to deploy.
+	    4. make compile-catalog ENV=prod && make publish-catalog ENV=prod
+
+	    Direct file injection is not available because Railway containers
+	    don't expose a writable filesystem from outside.
+	EOF
+  err "import-catalog ENV=prod requires the soth-cloud commit flow above"
+}
+
+cmd_compile_catalog() {
+  require_catalog_admin_creds
+
+  echo "==> POST ${ADMIN_API}/v1/admin/registry/compile  (version=${VERSION})"
+
+  local response_file status body
+  response_file=$(mktemp)
+  status=$(curl -sS \
+    -o "$response_file" \
+    -w "%{http_code}" \
+    -X POST \
+    -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"version\": \"${VERSION}\", \"notes\": \"compiled via ops/release.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+    "${ADMIN_API}/v1/admin/registry/compile")
+  body=$(cat "$response_file")
+  rm -f "$response_file"
+  echo "  -> http=${status}"
+  if [ "$status" != "200" ]; then
+    echo "    body: $body"
+    err "compile failed (http $status)"
+  fi
+
+  # Extract compilation.id with python's stdlib json (already a dep elsewhere).
+  local compilation_id compiled_sha
+  compilation_id=$(printf "%s" "$body" | python3 -c "import sys,json; print(json.load(sys.stdin)['compilation']['id'])" 2>/dev/null || true)
+  compiled_sha=$(printf "%s" "$body" | python3 -c "import sys,json; print(json.load(sys.stdin)['compilation']['compiled_sha256'])" 2>/dev/null || true)
+
+  if [ -z "$compilation_id" ]; then
+    err "could not parse compilation.id from response: $body"
+  fi
+
+  mkdir -p "$DIST_DIR"
+  echo "$compilation_id" > "${DIST_DIR}/catalog-compilation-id.${ENV}.txt"
+
+  echo "  OK  compilation_id=${compilation_id}"
+  echo "       compiled_sha256=${compiled_sha}"
+  echo "       saved to ${DIST_DIR}/catalog-compilation-id.${ENV}.txt"
+}
+
+cmd_publish_catalog() {
+  require_catalog_admin_creds
+
+  local id_file="${DIST_DIR}/catalog-compilation-id.${ENV}.txt"
+  if [ ! -f "$id_file" ]; then
+    err "missing ${id_file} (run \`make compile-catalog ENV=${ENV}\` first)"
+  fi
+
+  local compilation_id
+  compilation_id=$(cat "$id_file")
+  [ -n "$compilation_id" ] || err "${id_file} is empty"
+
+  echo "==> POST ${ADMIN_API}/v1/admin/registry/compilations/${compilation_id}/publish"
+  local response_file status body
+  response_file=$(mktemp)
+  status=$(curl -sS \
+    -o "$response_file" \
+    -w "%{http_code}" \
+    -X POST \
+    -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{"bundle_type": "cloud"}' \
+    "${ADMIN_API}/v1/admin/registry/compilations/${compilation_id}/publish")
+  body=$(cat "$response_file")
+  rm -f "$response_file"
+  echo "  -> http=${status}"
+  if [ "$status" != "200" ]; then
+    echo "    body: $body"
+    err "publish failed (http $status)"
+  fi
+  echo "    body: $body"
+  echo "  OK  catalog compilation ${compilation_id} published on ${ENV}"
+}
+
+cmd_release_catalog() {
+  cmd_compile_catalog
+  cmd_publish_catalog
+}
+
 # --- clean-dist -------------------------------------------------------------
 
 cmd_clean_dist() {
@@ -498,6 +686,10 @@ case "$VERB" in
   publish-classify)  cmd_publish_classify ;;
   release-classify)  cmd_release_classify ;;
   verify-classify)   cmd_verify_classify ;;
+  import-catalog)    cmd_import_catalog ;;
+  compile-catalog)   cmd_compile_catalog ;;
+  publish-catalog)   cmd_publish_catalog ;;
+  release-catalog)   cmd_release_catalog ;;
   diff)              cmd_diff ;;
   clean-dist)        cmd_clean_dist ;;
   *)                 err "unknown verb: $VERB (try \`make help\`)" ;;
