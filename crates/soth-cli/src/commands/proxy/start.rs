@@ -123,8 +123,8 @@ pub async fn run(
     let expected_port = port.unwrap_or(config.forward_proxy.port);
 
     #[cfg(unix)]
-    let _supervisor_listener =
-        bind_supervisor_listener(&config.forward_proxy.address, expected_port)?;
+    let _supervisor_listener = bind_supervisor_listener(&config.forward_proxy.address, expected_port)
+        .map_err(|error| friendly_bind_error(error, expected_port))?;
     #[cfg(unix)]
     let listener_fd = Some({
         use std::os::unix::io::AsRawFd;
@@ -905,6 +905,52 @@ fn normalize_agent_instance_id(raw: &str) -> Option<String> {
 }
 
 #[cfg(unix)]
+/// Translate `bind_supervisor_listener` failures into something a user can act
+/// on. The raw OS error is "Address already in use (os error 48)" which gives
+/// no hint about which process is holding the port. We probe the listener's
+/// owners via `lsof`/`netstat` and, if any of them look like a soth daemon,
+/// say so explicitly.
+#[cfg(unix)]
+fn friendly_bind_error(error: anyhow::Error, port: u16) -> anyhow::Error {
+    let root = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    let is_addr_in_use = root
+        .map(|err| err.kind() == std::io::ErrorKind::AddrInUse)
+        .unwrap_or(false);
+    if !is_addr_in_use {
+        return error;
+    }
+
+    let owners = daemon::listener_owner_pids(port).unwrap_or_default();
+    let soth_owner = owners
+        .iter()
+        .copied()
+        .find(|pid| daemon::is_expected_daemon_process(*pid));
+
+    if let Some(pid) = soth_owner {
+        return anyhow::anyhow!(
+            "another soth proxy is already running on :{port} (pid {pid}). \
+             Run `soth down` to stop it before starting a new instance, \
+             or pass `--port <PORT>` to use a different port."
+        );
+    }
+
+    if !owners.is_empty() {
+        let pid_list = owners
+            .iter()
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return anyhow::anyhow!(
+            "port {port} is already bound by pid(s) {pid_list} (not a soth process). \
+             Stop that process or pass `--port <PORT>` to use a different port."
+        );
+    }
+
+    error
+}
+
 fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpListener> {
     let addr = format!("{address}:{port}");
     let listener = std::net::TcpListener::bind(&addr)
