@@ -284,7 +284,24 @@ pub fn run() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.global.verbose);
+    // Skip the early CLI fmt-only subscriber when we're about to re-enter
+    // the binary as the proxy MITM worker. The worker installs its own
+    // *layered* tracing subscriber (fmt + tracing-opentelemetry +
+    // sentry-tracing) via `soth_proxy::runtime::init_tracing`, and a
+    // tracing subscriber can only be installed once per process — if we
+    // call `.init()` here first, the worker's call falls through to a
+    // no-op and Honeycomb / Sentry never get attached.
+    //
+    // `SOTH_PROXY_WORKER=1` is set by the supervisor when it spawns its
+    // child process (see `commands::proxy::start::PROXY_WORKER_ENV`), so
+    // the env var is the authoritative signal for "we're going to run
+    // the MITM runtime in this process".
+    let in_worker_mode = std::env::var("SOTH_PROXY_WORKER")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if !in_worker_mode {
+        init_logging(cli.global.verbose);
+    }
     run_command(cli.command, cli.global.config).await
 }
 

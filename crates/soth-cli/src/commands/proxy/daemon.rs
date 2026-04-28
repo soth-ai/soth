@@ -744,7 +744,7 @@ fn is_soth_executable_path(path: &str) -> bool {
         || normalized == "soth"
 }
 
-fn is_expected_daemon_process(pid: u32) -> bool {
+pub(super) fn is_expected_daemon_process(pid: u32) -> bool {
     if !is_process_running(pid) {
         return false;
     }

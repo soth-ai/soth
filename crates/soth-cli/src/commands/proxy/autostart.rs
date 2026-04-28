@@ -19,6 +19,22 @@ const XDG_AUTOSTART_FILE: &str = "soth-proxy.desktop";
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_KEY_VALUE: &str = "SothProxy";
 
+/// Task Scheduler entry name registered alongside the HKCU Run key. The Run
+/// key fires only at user login; this task fires on Power-Troubleshooter
+/// Event ID 1 (system resume from sleep / hibernate / Modern Standby) so the
+/// proxy comes back on wake without the user having to type `soth up`.
+#[cfg(target_os = "windows")]
+const WINDOWS_WAKE_TASK_NAME: &str = "SothProxyWakeRecovery";
+
+/// Event-channel XPath query targeting Power-Troubleshooter Event ID 1.
+/// Microsoft logs this event on every successful resume from any low-power
+/// state (S3, S4, Modern Standby), and it's the same event the OS uses for
+/// "Last Wake Source" reporting in `powercfg /lastwake`. Most reliable
+/// resume signal available without admin / service context.
+#[cfg(target_os = "windows")]
+const WINDOWS_WAKE_TASK_XPATH: &str =
+    "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]";
+
 fn resolve_abs_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -574,10 +590,113 @@ fn ensure_windows_run_key(exe: &Path, args: &[String]) -> Result<String> {
         .spawn()
         .context("failed spawning SOTH proxy daemon on Windows")?;
 
+    // Best-effort: register a Task Scheduler entry that fires on system
+    // resume so the daemon recovers on wake even if the supervisor itself
+    // exited during the suspend transient. Failures here are non-fatal —
+    // the user just loses the wake-recovery safety net.
+    let wake_status = match ensure_windows_wake_task(exe, args) {
+        Ok(message) => message,
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed registering Windows wake-recovery task; daemon will still start at login but won't auto-recover on wake from sleep"
+            );
+            "wake task registration failed (see warning above)".to_string()
+        }
+    };
+
     Ok(format!(
-        "windows Run key enabled (HKCU\\...\\Run\\{}) and daemon spawned",
-        WINDOWS_RUN_KEY_VALUE
+        "windows Run key enabled (HKCU\\...\\Run\\{}) and daemon spawned; {}",
+        WINDOWS_RUN_KEY_VALUE, wake_status
     ))
+}
+
+/// Register a Task Scheduler entry that fires on system resume (from sleep,
+/// hibernate, or Modern Standby) so the proxy recovers without the user
+/// having to type `soth up`. The task runs the same daemon-child command
+/// as the HKCU Run key — the daemon's own port-collision check makes the
+/// invocation a no-op when the daemon is already alive.
+///
+/// Uses `schtasks /SC ONEVENT` rather than XML import for simplicity. No
+/// admin required: with no `/RU` flag, the task runs as the current user,
+/// only when that user is logged on (which matches what the proxy needs
+/// anyway — there's no point keeping the proxy alive when no one's logged
+/// in).
+#[cfg(target_os = "windows")]
+fn ensure_windows_wake_task(exe: &Path, args: &[String]) -> Result<String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut commandline = windows_quote_arg(&exe.display().to_string());
+    for arg in args {
+        commandline.push(' ');
+        commandline.push_str(&windows_quote_arg(arg));
+    }
+
+    let output = Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            WINDOWS_WAKE_TASK_NAME,
+            "/SC",
+            "ONEVENT",
+            "/EC",
+            "System",
+            "/MO",
+            WINDOWS_WAKE_TASK_XPATH,
+            "/TR",
+            &commandline,
+            // Force overwrite so re-running `soth up` after a soth upgrade
+            // refreshes the exe path baked into the task action.
+            "/F",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed running schtasks /Create for wake-recovery task")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "schtasks /Create failed for {}: {}",
+            WINDOWS_WAKE_TASK_NAME,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(format!(
+        "wake-recovery task registered (Task Scheduler\\{})",
+        WINDOWS_WAKE_TASK_NAME
+    ))
+}
+
+/// Remove the wake-recovery Task Scheduler entry. Best-effort — silently
+/// no-ops when the task doesn't exist. Used by `soth uninstall`.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub(crate) fn disable_windows_wake_task() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let output = Command::new("schtasks")
+        .args(["/Delete", "/TN", WINDOWS_WAKE_TASK_NAME, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed running schtasks /Delete for wake-recovery task")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        // "ERROR: The system cannot find the file specified." is the message
+        // schtasks emits when the task isn't registered — that's fine for
+        // uninstall, no error to surface.
+        if stderr.contains("cannot find the file") || stderr.contains("does not exist") {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "schtasks /Delete failed for {}: {}",
+            WINDOWS_WAKE_TASK_NAME,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

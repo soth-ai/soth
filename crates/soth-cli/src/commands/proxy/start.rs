@@ -21,6 +21,19 @@ const LISTENER_HEALTH_FAILURE_WINDOW_MS: u64 = 5_000;
 const MAX_RESTART_ATTEMPTS: u32 = 10;
 const RESTART_BACKOFF_BASE_MS: u64 = 1_000;
 const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
+
+/// If the supervisor loop sees a wall-clock gap larger than this between two
+/// iterations, we assume the OS was suspended (sleep / hibernate / Modern
+/// Standby) for that duration. Sleep > 60s is the threshold because tokio's
+/// `interval` ticks at 1s and any sub-minute gap is plausibly just a slow
+/// upstream call or GC pause; everything beyond that is overwhelmingly
+/// likely to be a real suspend.
+const WAKE_DETECTION_GAP_SECS: u64 = 60;
+/// How long to wait for the listener to come up on the first restart after a
+/// detected wake event. Windows in particular can take many seconds to bring
+/// the network stack back up, during which the worker fails to bind. The
+/// regular 20s timeout is too aggressive here.
+const WAKE_LISTENER_STARTUP_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_NOFILE_MIN_SOFT_LIMIT: u64 = 8_192;
 const DEFAULT_NOFILE_WARN_SOFT_LIMIT: u64 = 2_048;
 const AGENT_INSTANCE_ID_TAG: &str = "agent_instance_id";
@@ -110,8 +123,8 @@ pub async fn run(
     let expected_port = port.unwrap_or(config.forward_proxy.port);
 
     #[cfg(unix)]
-    let _supervisor_listener =
-        bind_supervisor_listener(&config.forward_proxy.address, expected_port)?;
+    let _supervisor_listener = bind_supervisor_listener(&config.forward_proxy.address, expected_port)
+        .map_err(|error| friendly_bind_error(error, expected_port))?;
     #[cfg(unix)]
     let listener_fd = Some({
         use std::os::unix::io::AsRawFd;
@@ -349,9 +362,37 @@ async fn supervise_proxy(
 ) -> Result<()> {
     let mut consecutive_failures: u32 = 0;
     let mut last_healthy = Instant::now();
+    let mut last_iteration = Instant::now();
+    // First restart after a detected wake gets a longer startup grace
+    // window — see WAKE_LISTENER_STARTUP_TIMEOUT_SECS for the rationale.
+    let mut next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
 
     loop {
         let exit_reason = wait_until_exit_or_unhealthy(child, expected_port, foreground).await;
+
+        // Detect wake-from-sleep before applying restart-budget logic. A long
+        // wall-clock gap between supervisor iterations almost always means
+        // the OS was suspended (sleep / hibernate / Modern Standby). Tokio's
+        // monotonic timers don't distinguish "we awaited a 1s tick" from
+        // "the OS suspended us for 8 hours mid-tick" — only Instant deltas
+        // do. On detection, treat the upcoming restart as a fresh start
+        // rather than letting transient post-wake bind failures drain the
+        // failure budget and kill the supervisor entirely (which would
+        // leave the user with no proxy until next login or `soth up`).
+        let now = Instant::now();
+        let iteration_gap = now.duration_since(last_iteration);
+        last_iteration = now;
+        if iteration_gap > Duration::from_secs(WAKE_DETECTION_GAP_SECS) {
+            warn!(
+                gap_secs = iteration_gap.as_secs(),
+                "supervisor saw a {}s wall-clock gap between iterations — assuming system resume from sleep/hibernate; resetting failure counter and granting longer listener-start grace",
+                iteration_gap.as_secs()
+            );
+            consecutive_failures = 0;
+            last_healthy = now;
+            next_startup_timeout = Duration::from_secs(WAKE_LISTENER_STARTUP_TIMEOUT_SECS);
+        }
+
         match exit_reason {
             ProxyExit::Signal => {
                 terminate_child(child).await?;
@@ -418,8 +459,13 @@ async fn supervise_proxy(
         *child = spawn_proxy_process(config_path, listener_fd)
             .await
             .context("respawn soth-proxy process")?;
-        if let Err(error) = wait_for_listener_start(child, expected_port).await {
-            warn!("proxy failed to start after respawn: {error}");
+        if let Err(error) =
+            wait_for_listener_start_with_timeout(child, expected_port, next_startup_timeout).await
+        {
+            warn!(
+                timeout_secs = next_startup_timeout.as_secs(),
+                "proxy failed to start after respawn: {error}"
+            );
             continue;
         }
         info!(
@@ -428,6 +474,9 @@ async fn supervise_proxy(
             "soth-proxy restarted successfully"
         );
         last_healthy = Instant::now();
+        // After a successful restart, drop back to the normal startup
+        // budget — the wake-up grace window is one-shot.
+        next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
     }
 }
 
@@ -525,7 +574,19 @@ async fn graceful_stop_child(child: &mut Child) -> Result<()> {
 }
 
 async fn wait_for_listener_start(child: &mut Child, port: u16) -> Result<()> {
-    let timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
+    wait_for_listener_start_with_timeout(
+        child,
+        port,
+        Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn wait_for_listener_start_with_timeout(
+    child: &mut Child,
+    port: u16,
+    timeout: Duration,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         if is_local_listener_ready(port) {
@@ -844,6 +905,52 @@ fn normalize_agent_instance_id(raw: &str) -> Option<String> {
 }
 
 #[cfg(unix)]
+/// Translate `bind_supervisor_listener` failures into something a user can act
+/// on. The raw OS error is "Address already in use (os error 48)" which gives
+/// no hint about which process is holding the port. We probe the listener's
+/// owners via `lsof`/`netstat` and, if any of them look like a soth daemon,
+/// say so explicitly.
+#[cfg(unix)]
+fn friendly_bind_error(error: anyhow::Error, port: u16) -> anyhow::Error {
+    let root = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    let is_addr_in_use = root
+        .map(|err| err.kind() == std::io::ErrorKind::AddrInUse)
+        .unwrap_or(false);
+    if !is_addr_in_use {
+        return error;
+    }
+
+    let owners = daemon::listener_owner_pids(port).unwrap_or_default();
+    let soth_owner = owners
+        .iter()
+        .copied()
+        .find(|pid| daemon::is_expected_daemon_process(*pid));
+
+    if let Some(pid) = soth_owner {
+        return anyhow::anyhow!(
+            "another soth proxy is already running on :{port} (pid {pid}). \
+             Run `soth down` to stop it before starting a new instance, \
+             or pass `--port <PORT>` to use a different port."
+        );
+    }
+
+    if !owners.is_empty() {
+        let pid_list = owners
+            .iter()
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return anyhow::anyhow!(
+            "port {port} is already bound by pid(s) {pid_list} (not a soth process). \
+             Stop that process or pass `--port <PORT>` to use a different port."
+        );
+    }
+
+    error
+}
+
 fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpListener> {
     let addr = format!("{address}:{port}");
     let listener = std::net::TcpListener::bind(&addr)
