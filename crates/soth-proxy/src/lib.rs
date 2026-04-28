@@ -12,6 +12,7 @@ pub mod error;
 pub mod gating;
 pub mod handler;
 pub mod heartbeat_telemetry;
+pub mod observability;
 pub mod ops_server;
 pub mod pending;
 pub mod pending_emit;
