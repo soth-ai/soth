@@ -904,7 +904,6 @@ fn normalize_agent_instance_id(raw: &str) -> Option<String> {
     }
 }
 
-#[cfg(unix)]
 /// Translate `bind_supervisor_listener` failures into something a user can act
 /// on. The raw OS error is "Address already in use (os error 48)" which gives
 /// no hint about which process is holding the port. We probe the listener's
@@ -951,6 +950,7 @@ fn friendly_bind_error(error: anyhow::Error, port: u16) -> anyhow::Error {
     error
 }
 
+#[cfg(unix)]
 fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpListener> {
     let addr = format!("{address}:{port}");
     let listener = std::net::TcpListener::bind(&addr)
