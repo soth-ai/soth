@@ -35,12 +35,27 @@ collapses all that into `make release-cli ENV=…` with the same shape per env.
 can ignore the file and pass everything as env directly. See
 `ops/.env.example` for the contract.
 
-## Next phases (not in this PR)
+## Phase 2 — classify bundle
 
-- **Phase 2 — classify bundle.** `make release-classify ENV=…`. Builds
-  `dist/classify-v<auto>.tar.gz` from `~/labterminal/soth/data/classify/`,
-  POSTs to `$(ADMIN_API)/v1/admin/classify/upload?version=…`. Replaces today's
-  Railway-shell-and-curl flow.
+```bash
+make release-classify ENV=staging                          # auto VERSION
+make release-classify ENV=prod VERSION=v1-2026-04-29-hotfix
+```
+
+Source: `~/labterminal/soth/data/classify/` (manifest.json + 5 model
+files). The build step packs the directory into a gzip-compressed tar
+at `dist/classify-$VERSION.tar.gz` — exactly the format the admin upload
+handler expects (`crates/soth-api/src/handlers/bundles.rs:72`). Publish
+POSTs the tarball to `$ADMIN_API/v1/admin/classify/upload?version=…`
+with `Authorization: Bearer $PLATFORM_ADMIN_TOKEN`. Verification matches
+the sha256 in the upload response against the local sha — server stores
+bytes as-is, so a match proves what we sent landed intact.
+
+`VERSION` defaults to `v1-$(date +%Y-%m-%d)`. Override on the command
+line for hotfixes or to force a re-publish under a new label.
+
+## Next phases
+
 - **Phase 3 — tool catalog.** `make release-catalog ENV=…`. Imports
   `raw_bundle.json` + parsers from `~/labterminal/soth/data/`, calls
   `compile`, then `publish` against the admin API.

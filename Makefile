@@ -37,6 +37,19 @@ verify-cli:
 diff:
 	$(OPS) diff '$(ENV)'
 
+.PHONY: build-classify publish-classify release-classify verify-classify
+build-classify:
+	$(OPS) build-classify '$(ENV)'
+
+publish-classify:
+	$(OPS) publish-classify '$(ENV)'
+
+release-classify:
+	$(OPS) release-classify '$(ENV)'
+
+verify-classify:
+	$(OPS) verify-classify '$(ENV)'
+
 .PHONY: clean-dist
 clean-dist:
 	$(OPS) clean-dist

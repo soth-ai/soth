@@ -80,6 +80,11 @@ if [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"
 fi
 
+# Apply admin-API default after env-file load, so per-env overrides win.
+if [ -z "$ADMIN_API" ]; then
+  ADMIN_API="$(default_admin_api_for_env)"
+fi
+
 # --- Helpers ----------------------------------------------------------------
 
 err() {
@@ -102,17 +107,24 @@ require_cmd() {
 # --- help -------------------------------------------------------------------
 cmd_help() {
   cat <<-EOF
-	SOTH ops Makefile (Phase 1: CLI binaries)
+	SOTH ops Makefile
 
-	Usage: make <target> [ENV=local|staging|prod]
+	Usage: make <target> [ENV=local|staging|prod] [VERSION=…]
 	  ENV defaults to staging; auto-loads ops/.env.\$ENV if present.
+	  VERSION defaults to v1-\$(date +%Y-%m-%d) for classify + catalog.
 
-	CLI binaries:
+	CLI binaries (Phase 1):
 	  build-cli              Build all 5 platform binaries (embedded creds) → ${DIST_DIR}/
 	  publish-cli            Push ${DIST_DIR}/ binaries to ENV destination + verify
 	  release-cli            build-cli + publish-cli
 	  verify-cli             Re-verify remote sha matches ${DIST_DIR}/ (no build/publish)
 	  diff                   Local sha vs ENV's currently-served sha
+
+	Classify bundle (Phase 2):
+	  build-classify         tar -czf ${DIST_DIR}/classify-\$VERSION.tar.gz from \$DATA_DIR/classify/
+	  publish-classify       POST tarball to \$ADMIN_API/v1/admin/classify/upload?version=…
+	  release-classify       build-classify + publish-classify
+	  verify-classify        ENV=local: re-shasum the tarball
 
 	Maintenance:
 	  clean-dist             rm -rf ${DIST_DIR}
@@ -122,9 +134,11 @@ cmd_help() {
 	  SOTH_SENTRY_DSN         build-cli
 	  MINIO_ACCESS_KEY        publish-cli ENV=staging
 	  MINIO_SECRET_KEY        publish-cli ENV=staging
-	  (prod uses \`wrangler login\` — no extra creds.)
+	  PLATFORM_ADMIN_TOKEN    publish-classify (and Phase 3 catalog)
+	  ADMIN_API               publish-classify (auto-defaults per ENV)
+	  (prod CLI publish uses \`wrangler login\` — no extra creds.)
 
-	Phase 2 (classify) + Phase 3 (tool catalog) coming next; see ops/README.md.
+	Phase 3 (tool catalog) coming next; see ops/README.md.
 	EOF
 }
 
@@ -315,6 +329,157 @@ cmd_release_cli() {
   cmd_publish_cli
 }
 
+# --- classify bundle: build + publish + verify ------------------------------
+#
+# Source layout in $DATA_DIR/classify/:
+#   manifest.json         (declares version + per-asset sha256)
+#   embedding.onnx
+#   centroids.bin
+#   lsh_projection.bin
+#   use_case_mlp.bin
+#   tokenizer.json
+#
+# `build-classify` packs the whole dir into one gzip-compressed tar
+# (the format the admin upload handler expects:
+# crates/soth-api/src/handlers/bundles.rs:72), pinned to the resolved
+# VERSION (default `v1-YYYY-MM-DD`, overridable via env).
+#
+# `publish-classify` POSTs the tarball to /v1/admin/classify/upload?version=…
+# with the bearer token. Verification compares the sha returned in the
+# upload response body against the local sha — the server stores bytes
+# as-is, so a match proves what we sent landed intact.
+
+require_classify_admin_creds() {
+  require_var PLATFORM_ADMIN_TOKEN
+  if [ -z "$ADMIN_API" ]; then
+    err "ADMIN_API is empty (no default for ENV=$ENV; set ADMIN_API explicitly)"
+  fi
+}
+
+# Resolve the version label and the on-disk tarball path, in one place,
+# so build / publish / verify all agree.
+classify_bundle_path() {
+  echo "${DIST_DIR}/classify-${VERSION}.tar.gz"
+}
+
+cmd_build_classify() {
+  local src="${DATA_DIR}/classify"
+  local out
+  out="$(classify_bundle_path)"
+
+  [ -d "$src" ] || err "classify source dir missing: $src"
+  [ -f "$src/manifest.json" ] || err "classify manifest missing: $src/manifest.json"
+
+  mkdir -p "$DIST_DIR"
+
+  echo "==> packaging classify bundle ${VERSION}"
+  echo "    source: $src"
+  echo "    target: $out"
+  # `-C $src .` keeps paths relative to the classify dir so the tar
+  # extracts back to `manifest.json`, `embedding.onnx`, etc. — no
+  # leading directory.
+  tar -czf "$out" -C "$src" .
+
+  local sha size
+  sha=$(shasum -a 256 "$out" | awk '{print $1}')
+  if [ "$(uname -s)" = "Darwin" ]; then
+    size=$(stat -f%z "$out")
+  else
+    size=$(stat -c%s "$out")
+  fi
+  printf "  size=%s sha256=%s\n" "$size" "$sha"
+
+  # Sidecar so re-running publish-classify without re-build still picks
+  # up the right version.
+  echo "$VERSION" > "${DIST_DIR}/classify-version.txt"
+}
+
+cmd_publish_classify() {
+  case "$ENV" in
+    local) cmd_publish_classify_local ;;
+    staging|prod) cmd_publish_classify_remote ;;
+    *) err "ENV must be local|staging|prod (got '$ENV')" ;;
+  esac
+}
+
+cmd_publish_classify_local() {
+  local out
+  out="$(classify_bundle_path)"
+  [ -f "$out" ] || err "missing $out (run \`make build-classify\` first)"
+  echo "==> ENV=local: classify bundle stays in ${out}, no remote publish."
+  ls -la "$out"
+}
+
+cmd_publish_classify_remote() {
+  require_classify_admin_creds
+  local out
+  out="$(classify_bundle_path)"
+  [ -f "$out" ] || err "missing $out (run \`make build-classify\` first)"
+
+  local local_sha
+  local_sha=$(shasum -a 256 "$out" | awk '{print $1}')
+
+  echo "==> POST ${ADMIN_API}/v1/admin/classify/upload?version=${VERSION}"
+  echo "    body: ${out}  (local sha256=${local_sha})"
+
+  # Capture body + status separately. Inline cleanup (no EXIT trap) so
+  # `set -u` doesn't choke on the local going out of scope before the
+  # trap fires.
+  local response_file status body remote_sha
+  response_file=$(mktemp)
+  status=$(curl -sS \
+    -o "$response_file" \
+    -w "%{http_code}" \
+    -X POST \
+    -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@${out}" \
+    "${ADMIN_API}/v1/admin/classify/upload?version=${VERSION}")
+
+  echo "  -> http=${status}"
+  if [ "$status" != "200" ]; then
+    echo "    body: $(cat "$response_file")"
+    rm -f "$response_file"
+    err "upload failed (http $status)"
+  fi
+
+  # Server response format (handlers/bundles.rs):
+  #   classify bundle <version> uploaded (sha256=<hex>)
+  body=$(cat "$response_file")
+  rm -f "$response_file"
+  echo "    body: ${body}"
+  remote_sha=$(printf "%s" "$body" | sed -n 's/.*sha256=\([0-9a-f]\{64\}\).*/\1/p')
+
+  if [ -z "$remote_sha" ]; then
+    err "could not parse sha from upload response: ${body}"
+  fi
+
+  if [ "$local_sha" != "$remote_sha" ]; then
+    err "sha mismatch after upload: local=${local_sha} remote=${remote_sha}"
+  fi
+  printf "  OK  classify ${VERSION} stored on ${ENV} (sha256=%s)\n" "$remote_sha"
+}
+
+cmd_verify_classify() {
+  case "$ENV" in
+    local)
+      local out
+      out="$(classify_bundle_path)"
+      [ -f "$out" ] || err "missing $out"
+      shasum -a 256 "$out"
+      ;;
+    staging|prod)
+      err "verify-classify on remote envs requires re-uploading; use \`make publish-classify\` which verifies inline, or implement an authenticated /v1/admin/classify/current probe (TODO)"
+      ;;
+    *) err "ENV must be local|staging|prod" ;;
+  esac
+}
+
+cmd_release_classify() {
+  cmd_build_classify
+  cmd_publish_classify
+}
+
 # --- clean-dist -------------------------------------------------------------
 
 cmd_clean_dist() {
@@ -324,12 +489,16 @@ cmd_clean_dist() {
 # --- Dispatch ---------------------------------------------------------------
 
 case "$VERB" in
-  help)         cmd_help ;;
-  build-cli)    cmd_build_cli ;;
-  publish-cli)  cmd_publish_cli ;;
-  release-cli)  cmd_release_cli ;;
-  verify-cli)   cmd_verify_cli ;;
-  diff)         cmd_diff ;;
-  clean-dist)   cmd_clean_dist ;;
-  *)            err "unknown verb: $VERB (try \`make help\`)" ;;
+  help)              cmd_help ;;
+  build-cli)         cmd_build_cli ;;
+  publish-cli)       cmd_publish_cli ;;
+  release-cli)       cmd_release_cli ;;
+  verify-cli)        cmd_verify_cli ;;
+  build-classify)    cmd_build_classify ;;
+  publish-classify)  cmd_publish_classify ;;
+  release-classify)  cmd_release_classify ;;
+  verify-classify)   cmd_verify_classify ;;
+  diff)              cmd_diff ;;
+  clean-dist)        cmd_clean_dist ;;
+  *)                 err "unknown verb: $VERB (try \`make help\`)" ;;
 esac
