@@ -728,6 +728,7 @@ fn process_executable_path(pid: u32) -> Option<String> {
 /// Pure function so we can unit-test the path-shape matcher without an
 /// actual Windows process to query. Called by [`is_expected_daemon_process`]
 /// on Windows after [`process_executable_path`] resolves the running pid.
+#[cfg(any(test, target_os = "windows"))]
 fn is_soth_executable_path(path: &str) -> bool {
     let normalized = path.trim().to_ascii_lowercase();
     if normalized.is_empty() {

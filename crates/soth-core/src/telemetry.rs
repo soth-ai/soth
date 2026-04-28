@@ -132,7 +132,8 @@ pub struct SensitiveCodeFlags {
     pub org_pattern_matches: Vec<String>,
     pub private_key_detected: bool,
     pub hardcoded_secret_detected: bool,
-    /// Specific secret types detected (e.g. "aws_access_key", "github_pat", "stripe_secret_key").
+    /// Exact credential types detected, such as `openai_api_key`,
+    /// `rsa_private_key`, `github_pat`, or `postgres_connection_string`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detected_secret_types: Vec<String>,
 }
@@ -665,8 +666,7 @@ fn build_sensitive_code_flags_from_artifacts(
         match &artifact.kind {
             ArtifactKind::PrivateKey => {
                 flags.private_key_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.credential_pattern_detected = true;
+                mark_credential_artifact(&mut flags, artifact);
             }
             ArtifactKind::CodeBlock { .. } => {
                 flags.auth_logic_detected = true;
@@ -676,8 +676,7 @@ fn build_sensitive_code_flags_from_artifacts(
             | ArtifactKind::HexKey
             | ArtifactKind::ConnectionString
             | ArtifactKind::UnknownCredential => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
+                mark_credential_artifact(&mut flags, artifact);
             }
             ArtifactKind::OrgPattern { pattern_id } => {
                 flags.org_pattern_matches.push(pattern_id.to_string());
@@ -693,11 +692,13 @@ fn build_sensitive_code_flags_from_artifacts(
             | ArtifactKind::GitLabToken
             | ArtifactKind::SlackToken
             | ArtifactKind::StripeSecretKey => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
+                mark_credential_artifact(&mut flags, artifact);
             }
         }
     }
+
+    flags.detected_secret_types.sort();
+    flags.detected_secret_types.dedup();
 
     for category in import_categories {
         match category {
@@ -710,6 +711,14 @@ fn build_sensitive_code_flags_from_artifacts(
     }
 
     flags
+}
+
+fn mark_credential_artifact(flags: &mut SensitiveCodeFlags, artifact: &crate::SensitiveArtifact) {
+    flags.credential_pattern_detected = true;
+    flags.hardcoded_secret_detected = true;
+    if let Some(credential_kind) = artifact.credential_kind_label() {
+        flags.detected_secret_types.push(credential_kind);
+    }
 }
 
 fn compute_code_fraction_from_artifacts(

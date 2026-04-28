@@ -42,6 +42,7 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         ArtifactKind::ApiKey {
             provider: Some(DetectedProvider::Anthropic),
         },
+        Some("anthropic_api_key"),
         ArtifactSeverity::Critical,
         location.clone(),
     );
@@ -52,6 +53,7 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         ArtifactKind::ApiKey {
             provider: Some(DetectedProvider::OpenAi),
         },
+        Some("openai_api_key"),
         ArtifactSeverity::Critical,
         location.clone(),
     );
@@ -60,6 +62,7 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         text,
         &AWS_KEY_RE,
         ArtifactKind::AwsAccessKey,
+        Some("aws_access_key_id"),
         ArtifactSeverity::High,
         location.clone(),
     );
@@ -68,6 +71,7 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         text,
         &GITHUB_PAT_RE,
         ArtifactKind::GitHubPat,
+        Some("github_pat"),
         ArtifactSeverity::High,
         location.clone(),
     );
@@ -76,6 +80,7 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         text,
         &GITLAB_PAT_RE,
         ArtifactKind::GitLabToken,
+        Some("gitlab_token"),
         ArtifactSeverity::High,
         location.clone(),
     );
@@ -84,6 +89,7 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         text,
         &SLACK_TOKEN_RE,
         ArtifactKind::SlackToken,
+        Some("slack_token"),
         ArtifactSeverity::High,
         location.clone(),
     );
@@ -92,6 +98,7 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         text,
         &STRIPE_SECRET_RE,
         ArtifactKind::StripeSecretKey,
+        Some("stripe_live_secret_key"),
         ArtifactSeverity::Critical,
         location.clone(),
     );
@@ -100,6 +107,7 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         text,
         &STRIPE_TEST_RE,
         ArtifactKind::StripeSecretKey,
+        Some("stripe_test_secret_key"),
         ArtifactSeverity::Medium,
         location.clone(),
     );
@@ -108,25 +116,12 @@ pub fn credential_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
         text,
         &JWT_RE,
         ArtifactKind::Jwt,
+        Some("jwt"),
         ArtifactSeverity::Medium,
         location.clone(),
     );
-    scan_pattern(
-        &mut out,
-        text,
-        &PRIVATE_KEY_RE,
-        ArtifactKind::PrivateKey,
-        ArtifactSeverity::Critical,
-        location.clone(),
-    );
-    scan_pattern(
-        &mut out,
-        text,
-        &CONNECTION_STRING_RE,
-        ArtifactKind::ConnectionString,
-        ArtifactSeverity::High,
-        location.clone(),
-    );
+    scan_private_keys(&mut out, text, location.clone());
+    scan_connection_strings(&mut out, text, location.clone());
 
     scan_hex_keys(&mut out, text, location);
 
@@ -178,6 +173,7 @@ pub fn structural_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
     if has_auth_logic(&text_lc) {
         out.push(SensitiveArtifact {
             kind: ArtifactKind::AuthLogic,
+            credential_kind: None,
             commitment: Some(sha256_hex(format!("auth_logic:present:{location:?}"))),
             severity: ArtifactSeverity::Low,
             location: location.clone(),
@@ -188,6 +184,7 @@ pub fn structural_scan_str(text: &str, location: ArtifactLocation) -> Vec<Sensit
     if has_crypto_operations(&text_lc) {
         out.push(SensitiveArtifact {
             kind: ArtifactKind::CryptoOperation,
+            credential_kind: None,
             commitment: Some(sha256_hex(format!("crypto_op:present:{location:?}"))),
             severity: ArtifactSeverity::Low,
             location,
@@ -286,6 +283,7 @@ pub fn org_pattern_scan(
             let pattern_id = idx as u32;
             out.push(SensitiveArtifact {
                 kind: ArtifactKind::OrgPattern { pattern_id },
+                credential_kind: None,
                 commitment: Some(sha256_hex(format!("org_pattern:{pattern_id}:detect-v1"))),
                 severity: ArtifactSeverity::Medium,
                 location: location.clone(),
@@ -351,6 +349,7 @@ pub fn org_pattern_scan_compiled_str(
                 kind: ArtifactKind::OrgPattern {
                     pattern_id: *pattern_id,
                 },
+                credential_kind: None,
                 commitment: Some(sha256_hex(format!("org_pattern:{pattern_id}:detect-v1"))),
                 severity: ArtifactSeverity::Medium,
                 location: location.clone(),
@@ -447,6 +446,7 @@ fn scan_pattern(
     haystack: &str,
     regex: &Option<Regex>,
     kind: ArtifactKind,
+    credential_kind: Option<&'static str>,
     severity: ArtifactSeverity,
     location: ArtifactLocation,
 ) {
@@ -464,11 +464,83 @@ fn scan_pattern(
         ));
         out.push(SensitiveArtifact {
             kind: kind.clone(),
+            credential_kind: credential_kind.map(str::to_string),
             commitment: Some(commitment),
             severity,
             location: location.clone(),
             redacted_hint: redacted_hint(raw),
         });
+    }
+}
+
+fn scan_private_keys(out: &mut Vec<SensitiveArtifact>, haystack: &str, location: ArtifactLocation) {
+    let Some(regex) = &*PRIVATE_KEY_RE else {
+        return;
+    };
+
+    for m in regex.find_iter(haystack) {
+        let raw = m.as_str();
+        let credential_kind = private_key_credential_kind(raw);
+        let commitment = sha256_hex(format!("private_key:{raw}:detect-v1"));
+        out.push(SensitiveArtifact {
+            kind: ArtifactKind::PrivateKey,
+            credential_kind: Some(credential_kind.to_string()),
+            commitment: Some(commitment),
+            severity: ArtifactSeverity::Critical,
+            location: location.clone(),
+            redacted_hint: redacted_hint(raw),
+        });
+    }
+}
+
+fn private_key_credential_kind(raw: &str) -> &'static str {
+    if raw.contains("RSA ") {
+        "rsa_private_key"
+    } else if raw.contains("EC ") {
+        "ec_private_key"
+    } else if raw.contains("OPENSSH ") {
+        "openssh_private_key"
+    } else {
+        "generic_private_key"
+    }
+}
+
+fn scan_connection_strings(
+    out: &mut Vec<SensitiveArtifact>,
+    haystack: &str,
+    location: ArtifactLocation,
+) {
+    let Some(regex) = &*CONNECTION_STRING_RE else {
+        return;
+    };
+
+    for m in regex.find_iter(haystack) {
+        let raw = m.as_str();
+        let credential_kind = connection_string_credential_kind(raw);
+        let commitment = sha256_hex(format!("connection_string:{raw}:detect-v1"));
+        out.push(SensitiveArtifact {
+            kind: ArtifactKind::ConnectionString,
+            credential_kind: Some(credential_kind.to_string()),
+            commitment: Some(commitment),
+            severity: ArtifactSeverity::High,
+            location: location.clone(),
+            redacted_hint: redacted_hint(raw),
+        });
+    }
+}
+
+fn connection_string_credential_kind(raw: &str) -> &'static str {
+    match raw
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("postgres") => "postgres_connection_string",
+        Some("mysql") => "mysql_connection_string",
+        Some("mongodb") => "mongodb_connection_string",
+        Some("redis") => "redis_connection_string",
+        Some("amqp") => "amqp_connection_string",
+        _ => "connection_string",
     }
 }
 
@@ -495,7 +567,8 @@ fn scan_hex_keys(out: &mut Vec<SensitiveArtifact>, haystack: &str, location: Art
         if mixed_case || raw.len() >= 48 {
             let commitment = sha256_hex(format!("hex_key:{raw}:detect-v1"));
             out.push(SensitiveArtifact {
-                kind: ArtifactKind::UnknownCredential,
+                kind: ArtifactKind::HexKey,
+                credential_kind: Some("hex_secret".to_string()),
                 commitment: Some(commitment),
                 severity: ArtifactSeverity::Medium,
                 location: location.clone(),
@@ -597,6 +670,19 @@ db=postgres://user:pass@db.local:5432/app
         assert!(artifacts
             .iter()
             .any(|a| matches!(a.kind, ArtifactKind::PrivateKey)));
+
+        let credential_kinds: Vec<&str> = artifacts
+            .iter()
+            .filter_map(|artifact| artifact.credential_kind.as_deref())
+            .collect();
+        assert!(credential_kinds.contains(&"openai_api_key"));
+        assert!(credential_kinds.contains(&"anthropic_api_key"));
+        assert!(credential_kinds.contains(&"aws_access_key_id"));
+        assert!(credential_kinds.contains(&"github_pat"));
+        assert!(credential_kinds.contains(&"gitlab_token"));
+        assert!(credential_kinds.contains(&"jwt"));
+        assert!(credential_kinds.contains(&"postgres_connection_string"));
+        assert!(credential_kinds.contains(&"generic_private_key"));
     }
 
     #[test]
@@ -615,6 +701,12 @@ db=postgres://user:pass@db.local:5432/app
         assert!(artifacts
             .iter()
             .any(|a| matches!(a.kind, ArtifactKind::StripeSecretKey)));
+        let credential_kinds: Vec<&str> = artifacts
+            .iter()
+            .filter_map(|artifact| artifact.credential_kind.as_deref())
+            .collect();
+        assert!(credential_kinds.contains(&"stripe_live_secret_key"));
+        assert!(credential_kinds.contains(&"stripe_test_secret_key"));
     }
 
     #[test]

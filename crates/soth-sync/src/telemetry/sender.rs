@@ -182,6 +182,7 @@ struct TelemetrySigningPayload<'a> {
 
 fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
     let mut tags = HashMap::new();
+    let detected_credential_types = event.sensitive_code_flags.detected_secret_types.clone();
     if let Some(endpoint_type) = enum_name(&event.endpoint_type) {
         tags.insert("endpoint_type".to_string(), endpoint_type);
     }
@@ -307,11 +308,26 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
                     .classification_flags
                     .contains(&ClassificationFlag::CredentialDetected),
         ),
-        detected_secret_types: if event.sensitive_code_flags.detected_secret_types.is_empty() {
+        detected_secret_types: if detected_credential_types.is_empty() {
             None
         } else {
-            Some(event.sensitive_code_flags.detected_secret_types.clone())
+            Some(detected_credential_types.clone())
         },
+        detected_credential_types,
+        languages: enum_names(&event.languages),
+        import_categories: enum_names(&event.import_categories),
+        auth_logic_detected: true_option(event.sensitive_code_flags.auth_logic_detected),
+        crypto_operations_detected: true_option(
+            event.sensitive_code_flags.crypto_operations_detected,
+        ),
+        network_calls_detected: true_option(event.sensitive_code_flags.network_calls_detected),
+        file_io_detected: true_option(event.sensitive_code_flags.file_io_detected),
+        private_key_detected: true_option(event.sensitive_code_flags.private_key_detected),
+        hardcoded_secret_detected: true_option(
+            event.sensitive_code_flags.hardcoded_secret_detected,
+        ),
+        org_pattern_matches: event.sensitive_code_flags.org_pattern_matches.clone(),
+        anomaly_flags: enum_names(&event.anomaly_flags),
         endpoint_hash: if event.endpoint_hash.is_empty() {
             None
         } else {
@@ -385,6 +401,18 @@ fn enum_name<T: serde::Serialize>(value: &T) -> Option<String> {
     match serde_json::to_value(value).ok()? {
         serde_json::Value::String(value) => Some(value),
         _ => None,
+    }
+}
+
+fn enum_names<T: serde::Serialize>(values: &[T]) -> Vec<String> {
+    values.iter().filter_map(enum_name).collect()
+}
+
+fn true_option(value: bool) -> Option<bool> {
+    if value {
+        Some(true)
+    } else {
+        None
     }
 }
 
@@ -479,6 +507,80 @@ mod tests {
         assert_eq!(
             normalize_device_id_hash(" device-1 ".to_string()),
             "device-1"
+        );
+    }
+
+    #[test]
+    fn map_event_exports_rich_detection_fields() {
+        let mut event = soth_core::TelemetryEvent::default();
+        event.provider = "openai".to_string();
+        event.languages = vec![
+            soth_core::ProgrammingLanguage::Rust,
+            soth_core::ProgrammingLanguage::Python,
+        ];
+        event.import_categories = vec![
+            soth_core::ImportCategory::Network,
+            soth_core::ImportCategory::Filesystem,
+            soth_core::ImportCategory::Auth,
+        ];
+        event.anomaly_flags = vec![
+            soth_core::AnomalyFlag::CredentialBurst,
+            soth_core::AnomalyFlag::TopicDrift,
+        ];
+        event.sensitive_code_flags.credential_pattern_detected = true;
+        event.sensitive_code_flags.auth_logic_detected = true;
+        event.sensitive_code_flags.crypto_operations_detected = true;
+        event.sensitive_code_flags.network_calls_detected = true;
+        event.sensitive_code_flags.file_io_detected = true;
+        event.sensitive_code_flags.private_key_detected = true;
+        event.sensitive_code_flags.hardcoded_secret_detected = true;
+        event.sensitive_code_flags.org_pattern_matches = vec!["0".to_string(), "4".to_string()];
+        event.sensitive_code_flags.detected_secret_types = vec![
+            "github_pat".to_string(),
+            "postgres_connection_string".to_string(),
+        ];
+
+        let mapped = map_event(&event);
+
+        assert_eq!(
+            mapped.detected_credential_types,
+            vec![
+                "github_pat".to_string(),
+                "postgres_connection_string".to_string()
+            ]
+        );
+        assert_eq!(
+            mapped.detected_secret_types,
+            Some(vec![
+                "github_pat".to_string(),
+                "postgres_connection_string".to_string()
+            ])
+        );
+        assert_eq!(
+            mapped.languages,
+            vec!["rust".to_string(), "python".to_string()]
+        );
+        assert_eq!(
+            mapped.import_categories,
+            vec![
+                "network".to_string(),
+                "filesystem".to_string(),
+                "auth".to_string()
+            ]
+        );
+        assert_eq!(mapped.auth_logic_detected, Some(true));
+        assert_eq!(mapped.crypto_operations_detected, Some(true));
+        assert_eq!(mapped.network_calls_detected, Some(true));
+        assert_eq!(mapped.file_io_detected, Some(true));
+        assert_eq!(mapped.private_key_detected, Some(true));
+        assert_eq!(mapped.hardcoded_secret_detected, Some(true));
+        assert_eq!(
+            mapped.org_pattern_matches,
+            vec!["0".to_string(), "4".to_string()]
+        );
+        assert_eq!(
+            mapped.anomaly_flags,
+            vec!["credential_burst".to_string(), "topic_drift".to_string()]
         );
     }
 }
