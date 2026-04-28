@@ -44,8 +44,26 @@ ENV="${2:-staging}"
 : "${DIST_DIR:=./dist}"
 : "${DATA_DIR:=$HOME/labterminal/soth/data}"
 
+# Phase 2 / 3 (admin API)
+: "${PLATFORM_ADMIN_TOKEN:=}"
+: "${ADMIN_API:=}"
+# VERSION default for classify + catalog. Today's prod is `v1-2026-04-28`,
+# matched here so the auto-default lines up with the existing convention.
+: "${VERSION:=v1-$(date +%Y-%m-%d)}"
+
 PROD_BASE_URL="https://storage.soth.ai/release"
 STAGING_BASE_URL="https://storage.staging.soth.xyz/release"
+
+# Default admin API per env, applied if ADMIN_API isn't already set above
+# (env file or shell). Local assumes a docker-compose'd soth-api on :8081.
+default_admin_api_for_env() {
+  case "$ENV" in
+    staging) echo "https://api.staging.soth.xyz" ;;
+    prod)    echo "https://api.soth.ai" ;;
+    local)   echo "http://localhost:8081" ;;
+    *)       echo "" ;;
+  esac
+}
 
 CLI_BINARIES=(
   soth-darwin-arm64
