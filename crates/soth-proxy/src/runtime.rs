@@ -33,35 +33,17 @@ pub fn init_rustls_provider() {
 
 /// Initialise tracing for the proxy with sensible defaults. Honours `RUST_LOG`
 /// when set. Extra extension targets are appended at `info` level.
-pub fn init_tracing(extension_targets: &[&str]) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let mut base = String::from(
-            "warn,\
-             soth_proxy=info,\
-             soth_detect=info,\
-             soth_bundle=info,\
-             soth_sync=info,\
-             soth_classify=info,\
-             soth_telemetry=info,\
-             soth_core=info,\
-             soth_mitm=info,\
-             soth_extensions=info,\
-             mitm_sidecar=info,\
-             soth_mitm::proxy::internal=off,\
-             hyper_util=warn,\
-             hyper=warn,\
-             rustls=warn,\
-             reqwest=warn",
-        );
-        for target in extension_targets {
-            base.push(',');
-            base.push_str(target);
-            base.push_str("=info");
-        }
-        tracing_subscriber::EnvFilter::new(base)
-    });
-
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+///
+/// The returned [`crate::observability::ObservabilityGuard`] keeps the OTel
+/// tracer provider + Sentry init alive for the proxy's lifetime; dropping it
+/// flushes any in-flight Honeycomb / Sentry traffic. Callers that don't care
+/// about graceful shutdown (e.g. test rigs) may discard or `Box::leak` it.
+///
+/// When neither `HONEYCOMB_API_KEY` nor `SENTRY_DSN` are set (the typical
+/// dev/CI default), the guard is a no-op and only the existing fmt subscriber
+/// is installed — preserving today's behaviour for offline runs.
+pub fn init_tracing(extension_targets: &[&str]) -> crate::observability::ObservabilityGuard {
+    crate::observability::init(extension_targets)
 }
 
 /// Run the proxy until shutdown is signalled.
@@ -71,11 +53,13 @@ pub fn init_tracing(extension_targets: &[&str]) {
 /// tracing targets can be appended to the env filter before subscriber
 /// installation.
 #[cfg(feature = "extensions")]
+#[tracing::instrument(name = "soth.proxy.run", skip_all)]
 pub async fn run(ext_registry: ExtensionRegistry) -> Result<()> {
     run_inner(Some(ext_registry)).await
 }
 
 #[cfg(not(feature = "extensions"))]
+#[tracing::instrument(name = "soth.proxy.run", skip_all)]
 pub async fn run() -> Result<()> {
     run_inner().await
 }
