@@ -3930,6 +3930,7 @@ name = "soth-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "getrandom 0.2.17",
  "hex",
  "http",
  "serde",

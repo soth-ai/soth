@@ -8,7 +8,13 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = []
+# Default ON for the proxy and native (PyO3 / napi-rs) SDK bindings: full local
+# embedding via ONNX Runtime. Disable (`--no-default-features`) for WASM /
+# size-constrained targets — see Phase 2 of the SDK plan for the cloud-classify
+# fallback contract. When `onnx-models` is OFF, the bundle's `onnx_runtime` is
+# always `None` and stage1 falls back to the deterministic hash embedding.
+default = ["onnx-models"]
+onnx-models = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 policy = ["dep:soth-policy"]
 
 [dependencies]
@@ -23,9 +29,9 @@ uuid = { workspace = true }
 sha2 = { workspace = true }
 hex = "0.4"
 toml = "0.8"
-ndarray = "0.16"
-ort = { version = "2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+ndarray = { version = "0.16", optional = true }
+ort = { version = "2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"], optional = true }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

@@ -3,8 +3,10 @@ mod engine;
 #[cfg(feature = "intelligence")]
 mod intelligence;
 #[cfg(feature = "intelligence")]
+mod intelligence_backends;
+#[cfg(feature = "intelligence-sqlite")]
 mod intelligence_store;
-#[cfg(feature = "intelligence")]
+#[cfg(feature = "intelligence-sqlite")]
 mod replay;
 pub mod sensitive;
 mod stream;
@@ -31,8 +33,10 @@ pub use engine::{process, process_with_registry, to_core_detect_result, ParserRe
 #[cfg(feature = "intelligence")]
 pub use intelligence::*;
 #[cfg(feature = "intelligence")]
+pub use intelligence_backends::{InMemoryBackend, NoopBackend};
+#[cfg(feature = "intelligence-sqlite")]
 pub use intelligence_store::IntelligenceStore;
-#[cfg(feature = "intelligence")]
+#[cfg(feature = "intelligence-sqlite")]
 pub use replay::replay_heuristic_events;
 pub use soth_parse::fingerprint::{
     classify_request, classify_request_pair, fingerprint, ClassifyPairResult, ClassifyResult,
@@ -43,6 +47,14 @@ pub use types::*;
 
 #[cfg(feature = "intelligence")]
 pub use engine::{process_with_intelligence, process_with_registry_and_intelligence};
+
+/// Trait alias for the SDK-facing intelligence backend abstraction.
+///
+/// The proxy uses the SQLite-backed [`IntelligenceStore`] (gated behind
+/// `intelligence-sqlite`); the SDK and tests use [`NoopBackend`] or
+/// [`InMemoryBackend`]. Anything implementing [`IntelligenceSink`] works.
+#[cfg(feature = "intelligence")]
+pub use intelligence::IntelligenceSink as IntelligenceBackend;
 
 // Re-export soth_core::SessionSnapshot so callers can reference it without
 // directly depending on soth_core for this type.
@@ -589,6 +601,7 @@ mod tests {
         assert_eq!(session.delta_buffer[0], "chunk response from grpc");
     }
 
+    #[cfg(feature = "intelligence-sqlite")]
     #[test]
     fn intelligence_logging_records_parse_events() {
         let bundle = bundle_fixture();
@@ -631,6 +644,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "intelligence-sqlite")]
     #[test]
     fn unknown_graphql_operation_is_aggregated_and_replay_upgrades_after_registry_update() {
         let mut bundle = bundle_fixture();

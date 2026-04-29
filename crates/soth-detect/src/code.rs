@@ -1,11 +1,27 @@
+// Code artifact detection.
+//
+// Capability tiers (informs SDK / WASM consumers):
+//   - WITH `tree-sitter-code` feature (proxy default):
+//       heuristic language ID + tree-sitter AST analysis.
+//       `TreeSitterResult::confirmed_language` populated when AST parse succeeds.
+//   - WITHOUT `tree-sitter-code` feature (SDK / WASM):
+//       heuristic language ID + regex-only fallback (`fallback_analysis`).
+//       `TreeSitterResult::confirmed_language` is always `None`; import
+//       categories and function counts come from regex extraction.
+//
+// In both cases the public `detect_code_artifacts` API returns a
+// `CodeDetectResult` of identical shape; only the fidelity of the inner
+// `tree_sitter` field differs. Callers MUST NOT branch on feature flags —
+// branch on the populated fields instead.
+
 use crate::hash::sha256_hex;
 use crate::types::{ArtifactLocation, DetectWarning, DetectedImportCategory, SensitiveArtifact};
 use soth_core::{ArtifactKind, ArtifactSeverity};
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 use std::panic::catch_unwind;
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 use std::time::Instant;
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Debug)]
@@ -125,15 +141,15 @@ pub fn detect_code_artifacts(content: &str, location: ArtifactLocation) -> CodeD
     }
 
     let detected_language = language.clone();
-    #[cfg_attr(not(feature = "tree-sitter"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "tree-sitter-code"), allow(unused_mut))]
     let mut warnings = Vec::new();
     let mut ts_result: Option<TreeSitterResult> = None;
-    #[cfg_attr(not(feature = "tree-sitter"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "tree-sitter-code"), allow(unused_mut))]
     let mut confirmed_lang = language.clone();
 
     if content.len() > 200 {
         if let Some(lang) = &language {
-            #[cfg(feature = "tree-sitter")]
+            #[cfg(feature = "tree-sitter-code")]
             {
                 let started = Instant::now();
                 let parse = catch_unwind(|| analyze_with_tree_sitter(content, lang));
@@ -161,7 +177,7 @@ pub fn detect_code_artifacts(content: &str, location: ArtifactLocation) -> CodeD
                     });
                 }
             }
-            #[cfg(not(feature = "tree-sitter"))]
+            #[cfg(not(feature = "tree-sitter-code"))]
             {
                 ts_result = fallback_analysis(content, lang);
             }
@@ -531,7 +547,7 @@ fn replace_numeric_literals(input: &str) -> String {
     out
 }
 
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 fn analyze_with_tree_sitter(content: &str, language: &str) -> Option<TreeSitterResult> {
     macro_rules! try_lang {
         ($lang_const:expr) => {{
@@ -647,7 +663,7 @@ fn fallback_analysis(content: &str, language: &str) -> Option<TreeSitterResult> 
     })
 }
 
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 fn extract_import_strings(root: Node<'_>, source: &str) -> Vec<String> {
     let mut imports = Vec::new();
     let mut cursor = root.walk();
@@ -655,7 +671,7 @@ fn extract_import_strings(root: Node<'_>, source: &str) -> Vec<String> {
     imports
 }
 
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 #[allow(clippy::only_used_in_recursion)]
 fn collect_import_nodes(
     node: Node<'_>,
@@ -833,14 +849,14 @@ fn classify_imports(imports: &[String]) -> Vec<DetectedImportCategory> {
     categories
 }
 
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 fn count_functions(root: Node<'_>) -> u32 {
     let mut count = 0u32;
     count_functions_recursive(root, &mut count);
     count
 }
 
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 fn count_functions_recursive(node: Node<'_>, count: &mut u32) {
     let kind = node.kind();
     if matches!(
@@ -935,7 +951,7 @@ fn is_likely_json(content: &str) -> bool {
         && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
 }
 
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "tree-sitter-code")]
 fn count_error_nodes(root: Node<'_>) -> u32 {
     let mut count: u32 = if root.is_error() { 1 } else { 0 };
     let mut cursor = root.walk();
