@@ -1,0 +1,36 @@
+{
+  "name": "openai_chat_basic",
+  "description": "OpenAI chat completion, single user message, no tools, non-streaming.",
+  "axes": {
+    "provider": "openai",
+    "streaming": false,
+    "tools": false,
+    "content_class": "clean",
+    "format": "rest_chat_completions",
+    "capture_mode": "metadata_only",
+    "policy_decision": "Allow"
+  },
+  "typed_call": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "messages": [
+      { "role": "user", "content": "What is the capital of France?" }
+    ],
+    "stream": false
+  },
+  "raw_request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "host": "api.openai.com",
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "gpt-4o-mini",
+      "messages": [
+        { "role": "user", "content": "What is the capital of France?" }
+      ]
+    },
+    "matched_provider": "openai"
+  }
+}

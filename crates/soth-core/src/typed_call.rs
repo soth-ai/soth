@@ -94,38 +94,41 @@ impl TypedLlmCall {
         }
     }
 
-    /// Concatenated user content across all `user`-role messages, separated
-    /// by newlines. Used as the embedding/classify input by `process_normalized`.
+    /// The user's *current* prompt: the content of the **last** message with
+    /// role `"user"`. Mirrors the proxy REST parser's `last_user_content`
+    /// semantics — for multi-turn agentic conversations, the last user
+    /// message is the actual current task instruction; earlier user turns
+    /// are context. If no `user` message exists, falls back to the last
+    /// message of any role; if `messages` is empty, returns `""`.
+    ///
+    /// Content is `trim()`-ed to match the proxy's `normalize_unicodeish`.
     pub fn user_content(&self) -> String {
-        let mut out = String::new();
-        for msg in &self.messages {
-            if msg.role == "user" {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(&msg.content);
-            }
-        }
-        out
+        let chosen = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role.eq_ignore_ascii_case("user"))
+            .or_else(|| self.messages.last());
+        chosen.map(|m| m.content.trim().to_string()).unwrap_or_default()
     }
 
-    /// Stable, canonical-ish serialization of the conversation for the
-    /// `conversation_hash`. Roles are joined with `\u{1f}` (unit separator)
-    /// to avoid collision with content text.
+    /// Conversation serialization for the `conversation_hash`. Format
+    /// matches the proxy REST parser: `role:content` per message, joined
+    /// by `\n`, no trailing newline. System prompt — when carried in the
+    /// dedicated `system` field rather than as a "system" message — is
+    /// **not** included here, mirroring providers like Anthropic where
+    /// the proxy reads `$.system` separately.
+    ///
+    /// SDK callers whose typed call surface includes the system prompt in
+    /// the messages array (OpenAI convention) should prepend it as a
+    /// `{role:"system",content:...}` entry rather than using the dedicated
+    /// `system` field, so the hash matches the proxy lane.
     pub fn conversation_text(&self) -> String {
-        let mut out = String::new();
-        if let Some(sys) = &self.system {
-            out.push_str("system\u{1f}");
-            out.push_str(sys);
-            out.push('\n');
-        }
-        for msg in &self.messages {
-            out.push_str(&msg.role);
-            out.push('\u{1f}');
-            out.push_str(&msg.content);
-            out.push('\n');
-        }
-        out
+        self.messages
+            .iter()
+            .map(|m| format!("{}:{}", m.role, m.content.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Stable serialization of tool definitions for `tool_definition_hash`.

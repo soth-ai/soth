@@ -3926,6 +3926,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "soth-conformance-tests"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "serde_json",
+ "soth-classify",
+ "soth-core",
+ "soth-detect",
+ "soth-policy",
+ "uuid",
+]
+
+[[package]]
 name = "soth-core"
 version = "0.1.0"
 dependencies = [

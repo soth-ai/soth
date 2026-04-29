@@ -258,8 +258,11 @@ fn build_normalized_from_typed_call(
     let conversation = call.conversation_text();
     let tool_definitions = call.tool_definitions_text();
 
+    // Mirror the REST parser: empty content hashes the sentinel placeholder
+    // so the cloud sees a stable hash for content-not-extracted cases. This
+    // matches `parse_rest::user_content_hash` for parity.
     let user_content_hash = if user_content.is_empty() {
-        String::new()
+        hash_content("[CONTENT_NOT_EXTRACTED]")
     } else {
         hash_content(&user_content)
     };
