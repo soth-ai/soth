@@ -3,34 +3,106 @@ use crate::telemetry::RequestMethod;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// `ProxyContext` is the per-call envelope passed into `soth-classify`.
+///
+/// As of PR 2 it is a thin composition of three concern-shaped sub-contexts.
+/// Wire format is preserved via `#[serde(flatten)]` — cloud-side consumers
+/// see the same flat JSON shape as before the split.
+///
+/// Audience map:
+/// - [`IdentityContext`]: domain identity. Both proxy and SDK populate.
+/// - [`TransportContext`]: HTTP/TLS/H2 plumbing. **Proxy-only.** SDK leaves
+///   every field at `Default::default()` (all `None`). Stages 6/7 read these
+///   through `Option` and gracefully omit when absent.
+/// - [`AttributionContext`]: proxy-derived gating outcomes (process info,
+///   shadow-IT classification, surface taxonomy). **Proxy-only.** SDK leaves
+///   at `Default::default()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyContext {
+    #[serde(flatten)]
+    pub identity: IdentityContext,
+    #[serde(flatten)]
+    pub transport: TransportContext,
+    #[serde(flatten)]
+    pub attribution: AttributionContext,
+}
+
+impl ProxyContext {
+    /// Construct a `ProxyContext` for SDK callers that only have identity
+    /// information. `transport` and `attribution` are filled with all-`None`
+    /// defaults; stage 6/7 reads degrade gracefully.
+    pub fn sdk_only(identity: IdentityContext) -> Self {
+        Self {
+            identity,
+            transport: TransportContext::default(),
+            attribution: AttributionContext::default(),
+        }
+    }
+
+    /// Construct from explicit parts (proxy/sidecar use). All three contexts
+    /// are required; pass `Default::default()` for any that aren't applicable.
+    pub fn from_parts(
+        identity: IdentityContext,
+        transport: TransportContext,
+        attribution: AttributionContext,
+    ) -> Self {
+        Self {
+            identity,
+            transport,
+            attribution,
+        }
+    }
+}
+
+/// Domain identity carried by every classify call. Both the proxy and SDK
+/// populate this fully — every field here is something an SDK caller can
+/// supply from app context (org_id from config, user_id_hmac from app
+/// session, etc.).
+///
+/// Field renames preserved on the wire:
+/// - `declared_provider` ⇄ `"matched_provider"` JSON key
+/// - `declared_application` ⇄ `"matched_application"` JSON key
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityContext {
     pub org_id: String,
     pub user_id_hmac: String,
     pub team_id: String,
     pub device_id_hash: String,
     pub endpoint_hash: String,
-    pub process_resolution: ProcessResolution,
     pub capture_mode: CaptureMode,
-    pub matched_provider: Option<String>,
-    pub matched_application: Option<String>,
     pub traffic_classification: TrafficClassification,
     pub classification_source: ClassificationSource,
     pub session_snapshot: Option<SessionSnapshot>,
+    /// Provider entity slug for the call. In the proxy this is filled by
+    /// the gating pipeline (`matched_provider` historically); in the SDK
+    /// it's declared directly by the caller (e.g. `Some("openai".into())`).
+    #[serde(default, rename = "matched_provider", skip_serializing_if = "Option::is_none")]
+    pub declared_provider: Option<String>,
+    /// Application entity slug for the call. Same dual-source semantics as
+    /// `declared_provider`.
+    #[serde(default, rename = "matched_application", skip_serializing_if = "Option::is_none")]
+    pub declared_application: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_method: Option<RequestMethod>,
+    pub session_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_context: Option<DeploymentContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_trust_level: Option<crate::telemetry::BundleTrustLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precomputed_commitment_nonce: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precomputed_commitment_hash: Option<String>,
+}
+
+/// HTTP/TLS/H2 plumbing visible only to the proxy. SDK callers leave this
+/// at `Default::default()` (all fields `None`); stages 6/7 read them through
+/// `Option` and gracefully omit from telemetry/policy when absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransportContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bundle_trust_level: Option<crate::telemetry::BundleTrustLevel>,
-
-    // ── Connection intelligence ──
+    pub request_method: Option<RequestMethod>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ja4_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,10 +113,16 @@ pub struct ProxyContext {
     pub h2_connection_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h2_stream_id: Option<u32>,
+}
 
-    // ── Product taxonomy & session (v7+) ──
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<Uuid>,
+/// Proxy-derived attribution: process resolution, surface taxonomy,
+/// shadow-IT classification. SDK callers leave this at `Default::default()`
+/// — they integrated the SDK on purpose, so concepts like `is_shadow_it`
+/// don't apply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttributionContext {
+    #[serde(default)]
+    pub process_resolution: ProcessResolution,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_id: Option<String>,
     #[serde(default)]
@@ -69,11 +147,12 @@ pub enum ClassificationSource {
     Sdk,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrafficClassification {
     ToolUsage,
     ApplicationUsage,
+    #[default]
     UnknownAgent,
     Other,
 }

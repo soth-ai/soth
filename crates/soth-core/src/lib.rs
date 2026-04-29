@@ -51,8 +51,9 @@ pub use detect::DetectResult;
 
 // ── classify ──────────────────────────────────────────────────────────────────
 pub use classify::{
-    AnomalyFlag, AppType, ClassificationSource, DeploymentContext, ProcessMatchKind,
-    ProcessResolution, ProxyContext, SessionSnapshot, SurfaceType, TrafficClassification,
+    AnomalyFlag, AppType, AttributionContext, ClassificationSource, DeploymentContext,
+    IdentityContext, ProcessMatchKind, ProcessResolution, ProxyContext, SessionSnapshot,
+    SurfaceType, TrafficClassification, TransportContext,
 };
 
 // ── extensions ────────────────────────────────────────────────────────────────
