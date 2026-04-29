@@ -5,6 +5,26 @@
 // type at the bottom of this file keeps `Option<Arc<OnnxEmbeddingRuntime>>`
 // in `ClassifyBundle` compilable; `bundle::build_onnx_runtime` always returns
 // `None` and stage1 takes the hash-embedding fallback path.
+//
+// ── Concurrency rationale ──────────────────────────────────────────────────
+// `ort::session::Session::run` takes `&mut self` in ort 2.0.0-rc.x (verified
+// against `~/.cargo/registry/.../ort-2.0.0-rc.11/src/session/mod.rs:206`).
+// Concurrent calls from multiple host threads — Python via PyO3, Node via
+// napi-rs worker pool, the proxy classify task pool — therefore require
+// exclusive access for the duration of each inference call.
+//
+// We wrap the session in a `std::sync::Mutex`. `RwLock` would not help: every
+// inference call is a writer under the `&mut self` signature. ort 2.x is
+// `Send + Sync` for the `Session` type itself (the underlying ONNX runtime is
+// thread-safe), but the Rust binding's signature is the binding constraint.
+//
+// Performance: ONNX Runtime parallelizes inference internally via its own
+// threadpool (`with_intra_threads` / `with_inter_threads`). The Mutex
+// serializes *Rust-level callers*, but each held call still uses the
+// configured ORT threadpool. Bench `classify_bench` measures the steady-state
+// cost; if Mutex contention becomes the bottleneck under high QPS, the next
+// step is a session pool (multiple `OnnxEmbeddingRuntime` instances behind
+// `crossbeam-queue::ArrayQueue`), not lock-free single-session access.
 
 #[cfg(feature = "onnx-models")]
 use std::sync::Mutex;
@@ -36,6 +56,16 @@ pub(crate) struct OnnxEmbeddingRuntime {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
 }
+
+// Compile-time assertion: `OnnxEmbeddingRuntime` MUST stay `Send + Sync` so
+// it can sit inside `Arc<...>` in `ClassifyBundle` and be shared across
+// host language thread pools (PyO3 / napi-rs). If a future change adds a
+// non-`Send`/non-`Sync` field this fails to compile.
+#[cfg(feature = "onnx-models")]
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<OnnxEmbeddingRuntime>();
+};
 
 #[cfg(feature = "onnx-models")]
 impl OnnxEmbeddingRuntime {

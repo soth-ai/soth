@@ -30,6 +30,15 @@ pub struct ParserRegistry {
     compiled_org: CompiledOrgPatterns,
 }
 
+// Compile-time check: SDK bindings stash an `Arc<ParserRegistry>` for the
+// lifetime of the host process and call `process_normalized` /
+// `process_with_registry` from arbitrary worker threads. Both ends require
+// `Send + Sync`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ParserRegistry>();
+};
+
 impl Default for ParserRegistry {
     fn default() -> Self {
         Self::with_org_patterns(512, &[])

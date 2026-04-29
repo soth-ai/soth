@@ -56,6 +56,17 @@ pub struct ClassifyBundle {
     pub has_real_models: bool,
 }
 
+// Compile-time assertion: `ClassifyBundle` and the trait objects it holds
+// must remain `Send + Sync` so SDK bindings (PyO3 / napi-rs) can stash a
+// shared `Arc<ClassifyBundle>` and call `classify` from arbitrary host
+// threads. If anyone adds a non-`Send`/non-`Sync` field, compilation fails.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ClassifyBundle>();
+    assert_send_sync::<Arc<dyn ClassificationProvider>>();
+    assert_send_sync::<Arc<dyn AnomalyScorer>>();
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelAssetStatus {
     pub has_embedding_onnx: bool,
