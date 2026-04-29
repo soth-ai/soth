@@ -123,8 +123,9 @@ pub async fn run(
     let expected_port = port.unwrap_or(config.forward_proxy.port);
 
     #[cfg(unix)]
-    let _supervisor_listener = bind_supervisor_listener(&config.forward_proxy.address, expected_port)
-        .map_err(|error| friendly_bind_error(error, expected_port))?;
+    let _supervisor_listener =
+        bind_supervisor_listener(&config.forward_proxy.address, expected_port)
+            .map_err(|error| friendly_bind_error(error, expected_port))?;
     #[cfg(unix)]
     let listener_fd = Some({
         use std::os::unix::io::AsRawFd;
