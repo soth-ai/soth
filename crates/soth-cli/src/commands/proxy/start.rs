@@ -951,6 +951,7 @@ fn friendly_bind_error(error: anyhow::Error, port: u16) -> anyhow::Error {
     error
 }
 
+#[cfg(unix)]
 fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpListener> {
     let addr = format!("{address}:{port}");
     let listener = std::net::TcpListener::bind(&addr)
