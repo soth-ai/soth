@@ -17,6 +17,7 @@ pub mod providers;
 pub mod request;
 pub mod session;
 pub mod telemetry;
+pub mod typed_call;
 
 // ── error (already explicit) ──────────────────────────────────────────────────
 pub use error::{Result, SothError};
@@ -48,6 +49,9 @@ pub use identity::{AppIdentity, AppKind, ConnectionMeta, ProcessInfo, SocketFami
 
 // ── detect ────────────────────────────────────────────────────────────────────
 pub use detect::DetectResult;
+
+// ── typed call (SDK input shape) ──────────────────────────────────────────────
+pub use typed_call::{TypedLlmCall, TypedMessage, TypedTool};
 
 // ── classify ──────────────────────────────────────────────────────────────────
 pub use classify::{

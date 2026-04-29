@@ -116,6 +116,10 @@ pub enum ParseSource {
     AgentApp,
     Heuristic,
     Filtered,
+    /// Pre-parsed input supplied by an SDK consumer via `process_normalized`.
+    /// The proxy's HTTP fingerprint/parse phase is skipped — the caller has
+    /// already decoded a typed LLM call (provider, model, messages, tools).
+    Sdk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
