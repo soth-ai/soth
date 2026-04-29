@@ -63,6 +63,13 @@ publish-catalog:
 release-catalog:
 	$(OPS) release-catalog '$(ENV)'
 
+.PHONY: status status-all
+status:
+	$(OPS) status '$(ENV)'
+
+status-all:
+	$(OPS) status-all
+
 .PHONY: clean-dist
 clean-dist:
 	$(OPS) clean-dist

@@ -100,10 +100,34 @@ phase: the file's top-level shape is `{metadata, tools}` but the
 admin endpoint expects `{parsers: {...}}`. The mapping needs its own
 exploration.
 
+## Phase 4 — inventory (status / diff)
+
+```bash
+make status ENV=staging          # one-env detail view
+make status ENV=prod
+make status-all                  # walk staging + prod side by side
+make diff ENV=staging            # local dist/ vs ENV: CLI + classify
+```
+
+`status` shows three blocks per env:
+
+- **CLI binaries** — sha256 of each binary at the live URL. No auth.
+- **Classify bundle** — version + sha + published_at, read from the
+  sidecar `dist/classify-published.<env>.json` (written automatically
+  by `publish-classify`). Reflects "last published from this machine"
+  — querying the edge endpoint directly requires api_key auth, which
+  ops tooling shouldn't carry.
+- **Tool catalog** — version + compilation_id + sha + counts, queried
+  live from `GET /v1/admin/registry/current` with the platform admin
+  token. Source of truth.
+
+`diff` reports the same artifacts as a local-vs-remote table. Catalog
+isn't included in `diff` — its source is server-side DB state, so
+there's no local-side artifact to compare. Use `status` for catalog
+state.
+
 ## Next phases
 
-- **Phase 4 — `make status` / `make diff` cross-env.** Drift detection
-  across envs.
 - **Phase 5 — GHA wrappers.** One workflow per artifact-env combo,
   calling the same `make` targets so CI and the laptop use the same
   code path.

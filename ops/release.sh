@@ -133,6 +133,11 @@ cmd_help() {
 	  publish-catalog        POST /admin/registry/compilations/{id}/publish
 	  release-catalog        compile-catalog + publish-catalog (import is separate)
 
+	Inventory (Phase 4):
+	  status                 Single-env: live CLI shas + last-published classify + live catalog
+	  status-all             Walk staging + prod side by side
+	  diff                   Local ${DIST_DIR}/ vs ENV: CLI shas + classify (vs last-published sidecar)
+
 	Maintenance:
 	  clean-dist             rm -rf ${DIST_DIR}
 
@@ -307,6 +312,10 @@ cmd_verify_against() {
 
 # --- diff -------------------------------------------------------------------
 
+# Walk all artifacts that have a local-vs-remote distinction and print
+# OK / DIFF / missing / unreachable per artifact. Catalog has no
+# local pre-publish artifact (its source is server-side DB state), so
+# `cmd_status` reports it instead of `cmd_diff`.
 cmd_diff() {
   local base
   case "$ENV" in
@@ -315,17 +324,137 @@ cmd_diff() {
     *) err "diff requires ENV=staging|prod" ;;
   esac
   echo "=== local ${DIST_DIR}/ vs ${ENV} (${base}) ==="
+  echo
+  echo "CLI binaries:"
   for f in "${CLI_BINARIES[@]}"; do
     local local_sha remote_sha status
     local_sha=$(shasum -a 256 "${DIST_DIR}/${f}" 2>/dev/null | awk '{print $1}' || echo "missing")
     remote_sha=$(curl -sL "${base}/${f}?cb=$(date +%s)" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
-    if [ "$local_sha" = "$remote_sha" ]; then
-      status="OK"
-    else
-      status="DIFF"
-    fi
+    if [ "$local_sha" = "$remote_sha" ]; then status="OK"; else status="DIFF"; fi
     printf "  %-30s local=%-12s remote=%-12s %s\n" \
       "$f" "${local_sha:0:12}" "${remote_sha:0:12}" "$status"
+  done
+
+  # Classify: compare local tarball sha to whatever this dist last
+  # published to ENV (the cached sidecar). True remote state requires
+  # an authenticated probe of the edge endpoint, but the sidecar is a
+  # solid proxy when this machine is the publisher.
+  echo
+  echo "Classify bundle:"
+  local classify_local classify_local_sha classify_remote_sidecar
+  classify_local="${DIST_DIR}/classify-${VERSION}.tar.gz"
+  classify_local_sha=$(shasum -a 256 "$classify_local" 2>/dev/null | awk '{print $1}' || echo "missing")
+  classify_remote_sidecar="${DIST_DIR}/classify-published.${ENV}.json"
+  if [ -f "$classify_remote_sidecar" ]; then
+    local remote_sha remote_version remote_status
+    remote_sha=$(python3 -c "import sys,json; print(json.load(open('$classify_remote_sidecar'))['sha256'])" 2>/dev/null || echo "")
+    remote_version=$(python3 -c "import sys,json; print(json.load(open('$classify_remote_sidecar'))['version'])" 2>/dev/null || echo "")
+    if [ "$classify_local_sha" = "$remote_sha" ]; then remote_status="OK"; else remote_status="DIFF"; fi
+    printf "  classify-%-21s local=%-12s remote=%-12s %s\n" \
+      "${VERSION}.tar.gz" \
+      "${classify_local_sha:0:12}" "${remote_sha:0:12}" "$remote_status"
+    printf "  (last published from this machine: version=%s)\n" "$remote_version"
+  else
+    printf "  classify-%-21s local=%-12s remote=%-12s %s\n" \
+      "${VERSION}.tar.gz" \
+      "${classify_local_sha:0:12}" "no-record" "?"
+    echo "  (no sidecar yet — publish from this machine to populate)"
+  fi
+}
+
+# --- status -----------------------------------------------------------------
+
+# Single-env detailed view: what's actually live in $ENV right now,
+# across CLI / classify / catalog.
+cmd_status() {
+  case "$ENV" in
+    local)   cmd_status_local ;;
+    staging|prod) cmd_status_remote ;;
+    *) err "ENV must be local|staging|prod" ;;
+  esac
+}
+
+cmd_status_local() {
+  echo "=== local (${DIST_DIR}/) ==="
+  echo
+  if [ -d "$DIST_DIR" ]; then
+    ls -la "$DIST_DIR" 2>/dev/null | tail -n +2
+  else
+    echo "  ${DIST_DIR} does not exist"
+  fi
+}
+
+cmd_status_remote() {
+  local base
+  case "$ENV" in
+    staging) base="$STAGING_BASE_URL" ;;
+    prod)    base="$PROD_BASE_URL" ;;
+  esac
+  echo "=== ${ENV} status ==="
+
+  echo
+  echo "CLI binaries (${base}):"
+  for f in "${CLI_BINARIES[@]}"; do
+    local sha
+    sha=$(curl -sL "${base}/${f}?cb=$(date +%s)" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
+    printf "  %-30s %s\n" "$f" "${sha:0:12}"
+  done
+
+  echo
+  echo "Classify bundle (last published from this machine):"
+  local sidecar="${DIST_DIR}/classify-published.${ENV}.json"
+  if [ -f "$sidecar" ]; then
+    python3 -c "
+import json
+d = json.load(open('$sidecar'))
+print(f\"  version:        {d.get('version','?')}\")
+print(f\"  sha256:         {d.get('sha256','?')[:32]}…\")
+print(f\"  published_at:   {d.get('published_at','?')}\")
+"
+  else
+    echo "  (no sidecar — never published from this dist/. Edge probe requires api_key auth.)"
+  fi
+
+  echo
+  echo "Tool catalog (live from admin API):"
+  if [ -z "$ADMIN_API" ] || [ -z "$PLATFORM_ADMIN_TOKEN" ]; then
+    echo "  (need PLATFORM_ADMIN_TOKEN + ADMIN_API in ops/.env.${ENV})"
+    return
+  fi
+  local resp_file resp_status
+  resp_file=$(mktemp)
+  resp_status=$(curl -sS -o "$resp_file" -w "%{http_code}" \
+    -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
+    "${ADMIN_API}/v1/admin/registry/current")
+  if [ "$resp_status" = "200" ]; then
+    python3 -c "
+import json
+b = json.load(open('$resp_file'))
+c = b.get('compilation', b)
+print(f\"  version:           {c.get('version','?')}\")
+print(f\"  compilation_id:    {c.get('id','?')}\")
+print(f\"  compiled_sha256:   {c.get('compiled_sha256','?')[:32]}…\")
+print(f\"  vendors:           {c.get('vendor_count','?')}\")
+print(f\"  llm providers:     {c.get('llm_provider_count','?')}\")
+"
+  else
+    echo "  (admin API returned $resp_status: $(cat "$resp_file"))"
+  fi
+  rm -f "$resp_file"
+}
+
+# Cross-env summary. Walks staging + prod and prints each env's status
+# block. Re-execs the script per env so each invocation freshly loads
+# ops/.env.<env> — same env-file contract as a direct `status ENV=…`
+# call. Useful for "what's where?" before a release.
+cmd_status_all() {
+  echo "=== cross-env release status ==="
+  for one_env in staging prod; do
+    echo
+    echo "--- ${one_env} ---"
+    # Don't break the outer loop on a per-env failure (e.g. token
+    # missing for one env but not the other).
+    "$0" status "$one_env" || true
   done
 }
 
@@ -465,6 +594,15 @@ cmd_publish_classify_remote() {
     err "sha mismatch after upload: local=${local_sha} remote=${remote_sha}"
   fi
   printf "  OK  classify ${VERSION} stored on ${ENV} (sha256=%s)\n" "$remote_sha"
+
+  # Sidecar so `make status ENV=$ENV` can report what was last
+  # published from this dist/ without needing api_key auth on the
+  # edge endpoint. Reflects "last published from this machine" — if
+  # someone else published from another machine, we won't see that
+  # here. Good enough for the common case.
+  cat > "${DIST_DIR}/classify-published.${ENV}.json" <<JSON
+{"version":"${VERSION}","sha256":"${remote_sha}","published_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+JSON
 }
 
 cmd_verify_classify() {
@@ -661,6 +799,16 @@ cmd_publish_catalog() {
   fi
   echo "    body: $body"
   echo "  OK  catalog compilation ${compilation_id} published on ${ENV}"
+
+  # Sidecar with version + published_at so `make status` can report
+  # the last publish without re-hitting the admin API. Source of
+  # truth is still GET /admin/registry/current — this is a cache.
+  local published_version published_at
+  published_version=$(printf "%s" "$body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version',''))" 2>/dev/null || echo "")
+  published_at=$(printf "%s" "$body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('published_at',''))" 2>/dev/null || echo "")
+  cat > "${DIST_DIR}/catalog-published.${ENV}.json" <<JSON
+{"version":"${published_version}","compilation_id":"${compilation_id}","published_at":"${published_at}"}
+JSON
 }
 
 cmd_release_catalog() {
@@ -690,6 +838,8 @@ case "$VERB" in
   compile-catalog)   cmd_compile_catalog ;;
   publish-catalog)   cmd_publish_catalog ;;
   release-catalog)   cmd_release_catalog ;;
+  status)            cmd_status ;;
+  status-all)        cmd_status_all ;;
   diff)              cmd_diff ;;
   clean-dist)        cmd_clean_dist ;;
   *)                 err "unknown verb: $VERB (try \`make help\`)" ;;
