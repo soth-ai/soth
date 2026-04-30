@@ -10,8 +10,10 @@ publish = false
 soth-core = { workspace = true }
 soth-detect = { workspace = true, features = ["intelligence", "tree-sitter-code"] }
 soth-classify = { workspace = true, features = ["policy", "onnx-models"] }
+soth-sdk-core = { path = "../soth-sdk-core" }
 soth-policy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = "1"
 uuid = { workspace = true }
+zeroize = { workspace = true }

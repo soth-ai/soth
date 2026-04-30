@@ -3936,7 +3936,9 @@ dependencies = [
  "soth-core",
  "soth-detect",
  "soth-policy",
+ "soth-sdk-core",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

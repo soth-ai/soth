@@ -131,6 +131,29 @@ impl SothSdk {
         })
     }
 
+    /// Test-only constructor that bypasses [`init`]'s bundle-source dispatch.
+    /// The conformance harness uses this to isolate facade-vs-direct-crate
+    /// parity from bundle-source differences. Not stable; not part of the
+    /// customer-facing API. Phase-1 `init` will gain an in-memory
+    /// `BundleSource` variant that subsumes this constructor.
+    #[doc(hidden)]
+    pub fn for_test(
+        config: SdkConfig,
+        detect_bundle: OwnedDetectBundle,
+        classify_bundle: Arc<soth_classify::ClassifyBundle>,
+    ) -> Result<Self, SdkError> {
+        let _hmac = config.hmac_key.resolve()?;
+        Ok(Self {
+            config,
+            detect_registry: Arc::new(soth_detect::ParserRegistry::default()),
+            detect_bundle: ArcSwap::from_pointee(detect_bundle),
+            classify_bundle: ArcSwap::from_pointee((*classify_bundle).clone()),
+            classify_config: soth_classify::ClassifyConfig::default(),
+            slab: Arc::new(DecisionSlab::new()),
+            telemetry: Arc::new(TelemetryQueue::new()),
+        })
+    }
+
     /// Synchronous decision path. Returns within 5 ms p99 (binding-side
     /// histograms gate this in CI).
     ///

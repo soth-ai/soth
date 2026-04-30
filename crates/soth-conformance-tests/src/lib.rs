@@ -447,6 +447,85 @@ pub fn run_sdk_lane(
 }
 
 // ---------------------------------------------------------------------------
+// Facade lane — runs the same fixture through `SothSdk::pre_call` /
+// `post_call`. Asserts the public-API facade does not introduce drift
+// vs. calling `process_normalized` + `classify` directly (run_sdk_lane).
+// ---------------------------------------------------------------------------
+
+pub struct FacadeOutput {
+    pub decision: soth_sdk_core::Decision,
+    /// Telemetry event emitted by `post_call`. Always present — even
+    /// `Decision::Block` paths still call `post_call` to consume the
+    /// token, and the SDK emits an event regardless.
+    pub telemetry: Option<soth_core::TelemetryEvent>,
+}
+
+pub fn run_facade_lane(
+    fixture: &Fixture,
+    detect_bundle: &OwnedDetectBundle,
+    classify_bundle: &std::sync::Arc<soth_classify::ClassifyBundle>,
+) -> FacadeOutput {
+    use zeroize::Zeroizing;
+
+    let config = soth_sdk_core::SdkConfigBuilder::new()
+        .api_key("conformance-test")
+        .org_id("org-conformance")
+        .hmac_key(soth_sdk_core::HmacKey::Static(Zeroizing::new(vec![0u8; 32])))
+        .build()
+        .expect("build sdk config");
+
+    let sdk = soth_sdk_core::SothSdk::for_test(
+        config,
+        detect_bundle.clone(),
+        std::sync::Arc::clone(classify_bundle),
+    )
+    .expect("init sdk for_test");
+
+    // Build the typed call from the fixture (same conversion the SDK
+    // direct lane uses).
+    let call = TypedCallSpec {
+        provider: fixture.typed_call.provider.clone(),
+        model: fixture.typed_call.model.clone(),
+        messages: fixture
+            .typed_call
+            .messages
+            .iter()
+            .map(|m| TypedMessageSpec {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect(),
+        system: fixture.typed_call.system.clone(),
+        tools: fixture
+            .typed_call
+            .tools
+            .iter()
+            .map(|t| TypedToolSpec {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters_json: t.parameters_json.clone(),
+            })
+            .collect(),
+        stream: fixture.typed_call.stream,
+        temperature: fixture.typed_call.temperature,
+        top_p: fixture.typed_call.top_p,
+        max_tokens: fixture.typed_call.max_tokens,
+        stop_sequences: fixture.typed_call.stop_sequences.clone(),
+    }
+    .into_call();
+
+    let decision = sdk.pre_call(&call);
+    let token = decision.token();
+
+    let response = soth_sdk_core::LlmResponse::new(EndpointType::ChatCompletion);
+    sdk.post_call(token, &response);
+
+    let telemetry = sdk.drain_telemetry_for_test().into_iter().next();
+
+    FacadeOutput { decision, telemetry }
+}
+
+// ---------------------------------------------------------------------------
 // Diff: compare proxy and SDK outputs on the SDK-to-cloud contract surface.
 //
 // The fields below comprise the *contract*. Anything not in this list is
@@ -620,6 +699,100 @@ pub fn compare_advisory(proxy: &LaneOutput, sdk: &LaneOutput) -> Vec<Diff> {
             sdk: format!("{sdk_anomaly:?}"),
         });
     }
+    diffs
+}
+
+/// Compare the SDK direct lane to the facade lane. The facade should
+/// emit a `TelemetryEvent` byte-identical to the SDK lane's
+/// `classified.telemetry_event` (excluding per-call ephemeral fields:
+/// `event_id`, `timestamp_epoch_ms`, `commitment_nonce`,
+/// `commitment_hash`). Any divergence is a facade bug.
+pub fn compare_sdk_vs_facade(sdk: &LaneOutput, facade: &FacadeOutput) -> Vec<Diff> {
+    let mut diffs = Vec::new();
+
+    let Some(facade_event) = facade.telemetry.as_ref() else {
+        diffs.push(Diff {
+            field: "facade.telemetry".to_string(),
+            proxy: format!("{:?}", sdk.classified.telemetry_event.provider),
+            sdk: "<no event emitted>".to_string(),
+        });
+        return diffs;
+    };
+
+    let sdk_event = &sdk.classified.telemetry_event;
+
+    // Cloud ingestion contract — these fields are what the cloud reads.
+    push_eq(
+        &mut diffs,
+        "telemetry.provider",
+        &sdk_event.provider,
+        &facade_event.provider,
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.model",
+        &format!("{:?}", sdk_event.model),
+        &format!("{:?}", facade_event.model),
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.endpoint_type",
+        &format!("{:?}", sdk_event.endpoint_type),
+        &format!("{:?}", facade_event.endpoint_type),
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.capture_mode",
+        &format!("{:?}", sdk_event.capture_mode),
+        &format!("{:?}", facade_event.capture_mode),
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.parse_source",
+        &format!("{:?}", sdk_event.parse_source),
+        &format!("{:?}", facade_event.parse_source),
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.parse_confidence",
+        &format!("{:?}", sdk_event.parse_confidence),
+        &format!("{:?}", facade_event.parse_confidence),
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.use_case",
+        &format!("{:?}", sdk_event.use_case),
+        &format!("{:?}", facade_event.use_case),
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.volatility_class",
+        &format!("{:?}", sdk_event.volatility_class),
+        &format!("{:?}", facade_event.volatility_class),
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.policy_kind",
+        &format!("{:?}", sdk_event.policy_kind),
+        &format!("{:?}", facade_event.policy_kind),
+    );
+    push_eq(
+        &mut diffs,
+        "telemetry.estimated_input_tokens",
+        &format!("{:?}", sdk_event.estimated_input_tokens),
+        &format!("{:?}", facade_event.estimated_input_tokens),
+    );
+
+    let sdk_anomaly = anomaly_flag_set(&sdk_event.anomaly_flags);
+    let facade_anomaly = anomaly_flag_set(&facade_event.anomaly_flags);
+    if sdk_anomaly != facade_anomaly {
+        diffs.push(Diff {
+            field: "telemetry.anomaly_flags".to_string(),
+            proxy: format!("{sdk_anomaly:?}"),
+            sdk: format!("{facade_anomaly:?}"),
+        });
+    }
+
     diffs
 }
 
