@@ -37,10 +37,18 @@ jobs:
         with:
           key: ffi-py
           workspaces: bindings/soth-py
-      - name: Install pytest + maturin
+      - name: Create venv + install pytest + maturin
+        # `maturin develop` requires an active virtualenv. Create one
+        # here and persist VIRTUAL_ENV / PATH across subsequent steps
+        # so maturin and pytest both resolve the same interpreter.
+        working-directory: bindings/soth-py
         run: |
+          python -m venv .venv
+          source .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install pytest pytest-asyncio maturin
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
       - name: Build + install soth-py into venv
         working-directory: bindings/soth-py
         run: maturin develop

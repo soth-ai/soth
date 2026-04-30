@@ -113,8 +113,10 @@ if (fixtures.length === 0) {
           `${name}: model drift`,
         );
       }
-      assert.ok('endpoint_type' in event);
-      assert.ok('capture_mode' in event);
+      // napi-rs renders Rust struct fields as camelCase by default,
+      // matching JS convention; the Python lane keeps snake_case.
+      assert.ok('endpointType' in event);
+      assert.ok('captureMode' in event);
       assert.equal(sdk.inFlightDecisions(), 0);
     });
   }
