@@ -306,7 +306,10 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
             Some(event.semantic_hash.clone())
         },
         is_semantic_collision: event.is_semantic_collision,
-        collision_response_stability: None,
+        // Was hardcoded `None` here; now flows through from the in-process
+        // TelemetryEvent so any future upstream computation reaches the
+        // wire payload without another mapping change.
+        collision_response_stability: event.collision_response_stability.map(f64::from),
         anomaly_score: event.anomaly_score.map(f64::from),
         volatility_class: enum_name(&event.volatility_class),
         input_tokens: event.estimated_input_tokens.map(u64::from),

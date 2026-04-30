@@ -129,6 +129,11 @@ pub(crate) fn run(
         dynamic_fraction: volatility.dynamic_fraction.clamp(0.0, 1.0),
         prefix_repeat_signature: volatility.prefix_repeat_signature.clone(),
         tool_definition_hash: detect_result.normalized.tool_definition_hash.clone(),
+        // Stays `None` until a session-level "prior responses for matched
+        // semantic_hash" history is wired in (no SessionSnapshot field
+        // tracks it today). Pipeline.rs and sender.rs now mirror this
+        // field through, so computing it here is a one-line drop-in when
+        // the data arrives — no further wiring needed.
         collision_response_stability: None,
         commitment_hash,
         code_fraction,
