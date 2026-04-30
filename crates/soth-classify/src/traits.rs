@@ -1,4 +1,4 @@
-use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel};
+use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel, UseCaseLabelReason};
 
 #[derive(Debug, Clone)]
 pub struct ClassificationResult {
@@ -6,6 +6,10 @@ pub struct ClassificationResult {
     pub confidence: f32,
     pub secondary_label: Option<UseCaseLabel>,
     pub interaction_mode: InteractionMode,
+    /// Why this label was chosen. Defaults to `Confident` for successful
+    /// model classifications; defensive paths set `ModelShapeError` /
+    /// `UnmappedBundleLabel`; the keyword fallback sets `FallbackBundle`.
+    pub label_reason: UseCaseLabelReason,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel};
+use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel, UseCaseLabelReason};
 
 use crate::traits::{AnomalyScorer, AnomalySignals, ClassificationProvider, ClassificationResult};
 
@@ -120,22 +120,22 @@ impl ClassificationProvider for BundleModelClassifier {
 
 fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> ClassificationResult {
     if embedding.len() != EMBEDDING_DIM {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            actual = embedding.len(),
+            expected = EMBEDDING_DIM,
+            "classify_linear: embedding dim mismatch; emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     let logits = affine_logits(embedding, &model.weights, &model.biases);
     if logits.is_empty() || logits.len() != model.labels.len() {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            logits_len = logits.len(),
+            labels_len = model.labels.len(),
+            "classify_linear: logits/labels length mismatch; emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     classify_from_probs(
@@ -146,12 +146,12 @@ fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> Classificatio
 
 fn classify_soth_binary(model: &SothBinaryClassifier, embedding: &[f32]) -> ClassificationResult {
     if embedding.len() != EMBEDDING_DIM {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            actual = embedding.len(),
+            expected = EMBEDDING_DIM,
+            "classify_soth_binary: embedding dim mismatch; emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     let mut hidden1 = affine_logits(embedding, &model.hidden1_weights, &model.hidden1_biases);
@@ -172,12 +172,13 @@ fn classify_soth_binary(model: &SothBinaryClassifier, embedding: &[f32]) -> Clas
         &model.usecase_biases,
     );
     if logits.is_empty() || logits.len() != model.usecase_labels.len() {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            logits_len = logits.len(),
+            labels_len = model.usecase_labels.len(),
+            "classify_soth_binary: usecase logits/labels length mismatch; \
+             emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     let probs = softmax(logits.as_slice());
@@ -214,12 +215,13 @@ fn map_auxiliary_label(label: Option<&str>) -> InteractionMode {
 
 fn classify_from_probs(labels: &[UseCaseLabel], probs: &[f32]) -> ClassificationResult {
     if labels.is_empty() || labels.len() != probs.len() {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            labels_len = labels.len(),
+            probs_len = probs.len(),
+            "classify_from_probs: labels/probs length mismatch; \
+             emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     let (top_idx, top_prob) = top1(probs);
@@ -238,11 +240,39 @@ fn classify_from_probs(labels: &[UseCaseLabel], probs: &[f32]) -> Classification
         None
     };
 
+    let confidence = top_prob.clamp(0.0, 1.0);
+    let top_label = labels[top_idx];
+    // Reason: Confident when top-1 ≥ 0.40 (also the threshold used to suppress
+    // the secondary label); LowConfidence below that. Unknown lands in the
+    // `Unknown` bucket only when the model was trained with `Unknown` as a
+    // class — preserve `Confident` in that case so the dashboard can tell
+    // "model confident this is unclassifiable" from "no signal at all".
+    let label_reason = if confidence < 0.40 {
+        UseCaseLabelReason::LowConfidence
+    } else {
+        UseCaseLabelReason::Confident
+    };
+
     ClassificationResult {
-        label: labels[top_idx],
-        confidence: top_prob.clamp(0.0, 1.0),
+        label: top_label,
+        confidence,
         secondary_label: secondary,
         interaction_mode: InteractionMode::Unknown, // set by caller for soth_binary
+        label_reason,
+    }
+}
+
+/// Shared defensive-error result used by `classify_linear`, `classify_soth_binary`,
+/// and `classify_from_probs` when input shapes don't match expectations.
+/// Carries `ModelShapeError` so the cloud can distinguish a corrupt model
+/// from a legitimate "no signal available" Unknown.
+fn shape_error_result() -> ClassificationResult {
+    ClassificationResult {
+        label: UseCaseLabel::Unknown,
+        confidence: 0.0,
+        secondary_label: None,
+        interaction_mode: InteractionMode::Unknown,
+        label_reason: UseCaseLabelReason::ModelShapeError,
     }
 }
 
@@ -494,8 +524,23 @@ fn parse_classifier_soth_binary(
     let auxiliary_weights = cursor.read_matrix(auxiliary_rows, auxiliary_cols)?;
     let auxiliary_biases = cursor.read_len_prefixed_vector(auxiliary_rows)?;
 
-    let usecase_labels = cursor
-        .read_label_block(usecase_count)?
+    let raw_labels = cursor.read_label_block(usecase_count)?;
+    // Log any vendor labels that don't match our canonical taxonomy — they
+    // get bucketed into UseCaseLabel::Unknown at parse time. Without this
+    // log, "vendor introduced a new label we should add to our enum" was
+    // indistinguishable from a legitimate model Unknown at runtime.
+    for raw in &raw_labels {
+        if matches!(map_bundle_label(raw.as_str()), UseCaseLabel::Unknown)
+            && !raw.trim().eq_ignore_ascii_case("UNKNOWN")
+        {
+            tracing::warn!(
+                bundle_label = %raw,
+                "bundle declared use-case label not in canonical UseCaseLabel enum; \
+                 bucketed as Unknown (UnmappedBundleLabel)"
+            );
+        }
+    }
+    let usecase_labels = raw_labels
         .into_iter()
         .map(|label| map_bundle_label(label.as_str()))
         .collect::<Vec<_>>();

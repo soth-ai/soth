@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
+use soth_core::UseCaseLabelReason;
 
 use crate::bundle::{ClassifyBundle, EMBEDDING_DIM};
 use crate::config::ClassifyConfig;
@@ -11,6 +12,26 @@ pub(crate) enum EmbedSkipReason {
     NotAiCall,
     HeuristicNoModel,
     CodeContextRepeat,
+    /// `content_for_embedding` was `None` (e.g. response-only event).
+    NoContent,
+    /// ONNX/legacy embedder panicked or produced a degenerate vector.
+    EmbeddingFailed,
+}
+
+impl EmbedSkipReason {
+    /// Map an embed-stage skip reason to the cross-cut `UseCaseLabelReason`
+    /// used by `ClassifiedResult` and `TelemetryEvent`. Used by stage3 when
+    /// the embedding is `None` and a label can't be produced.
+    pub(crate) fn to_label_reason(self) -> UseCaseLabelReason {
+        match self {
+            EmbedSkipReason::Disabled => UseCaseLabelReason::EmbeddingDisabled,
+            EmbedSkipReason::NotAiCall => UseCaseLabelReason::NotAiCall,
+            EmbedSkipReason::HeuristicNoModel => UseCaseLabelReason::HeuristicNoModel,
+            EmbedSkipReason::CodeContextRepeat => UseCaseLabelReason::CodeContextRepeat,
+            EmbedSkipReason::NoContent => UseCaseLabelReason::NoContent,
+            EmbedSkipReason::EmbeddingFailed => UseCaseLabelReason::EmbeddingFailed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,7 +101,7 @@ pub(crate) fn run(
             vector: None,
             norm: 0.0,
             latency_us: started.elapsed().as_micros() as u64,
-            skipped_reason: None,
+            skipped_reason: Some(EmbedSkipReason::NoContent),
         };
     };
 
@@ -114,15 +135,26 @@ pub(crate) fn run(
     .unwrap_or_default();
     let (vector, norm) = embedded.unwrap_or((Vec::new(), 0.0));
 
+    let vector_is_empty = vector.is_empty();
+    if vector_is_empty {
+        // Embedder panicked or returned a degenerate vector. Previously this
+        // was indistinguishable from "no skip reason"; surface it as
+        // `EmbeddingFailed` and log so fleet health can track the rate.
+        tracing::warn!(
+            text_len = text.len(),
+            "stage1 embedding failed (panic or norm<=1e-9); \
+             use_case_label will be Unknown with reason=EmbeddingFailed"
+        );
+    }
     EmbedOutput {
-        vector: if vector.is_empty() {
-            None
-        } else {
-            Some(vector)
-        },
+        vector: if vector_is_empty { None } else { Some(vector) },
         norm,
         latency_us: started.elapsed().as_micros() as u64,
-        skipped_reason: None,
+        skipped_reason: if vector_is_empty {
+            Some(EmbedSkipReason::EmbeddingFailed)
+        } else {
+            None
+        },
     }
 }
 

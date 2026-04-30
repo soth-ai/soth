@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
-use soth_core::{derive_proxy_signing_seed, ClassificationFlag, TelemetryPolicyKind};
+use soth_core::{
+    derive_proxy_signing_seed, ClassificationFlag, TelemetryPolicyKind, UseCaseLabelReason,
+};
 use soth_telemetry::{SignedBatch, TransmittedBatch};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -273,12 +275,26 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         tags.insert("h2_stream_id".to_string(), h2sid.to_string());
     }
 
+    // Promote a one-time WARN when historian events bypass enrichment so we
+    // can spot misconfig at the egress edge (soth-core can't log here).
+    if matches!(
+        event.use_case_label_reason,
+        UseCaseLabelReason::HistorianNotEnriched
+    ) {
+        tracing::warn!(
+            event_id = %event.event_id,
+            "shipping historian event with use_case_label_reason=historian_not_enriched; \
+             ClassifyEnricher likely failed or was skipped at ingest time"
+        );
+    }
+
     TelemetryEvent {
         event_id: event.event_id.to_string(),
         timestamp: event.timestamp_epoch_ms / 1_000,
         provider: Some(event.provider.clone()),
         model: event.model.clone(),
         use_case_label: enum_name(&event.use_case),
+        use_case_label_reason: enum_name(&event.use_case_label_reason),
         topic_cluster_id: if event.topic_cluster_id > 0 {
             Some(event.topic_cluster_id.to_string())
         } else {

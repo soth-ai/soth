@@ -429,6 +429,11 @@ pub struct TelemetryEvent {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub use_case_label: Option<String>,
+    /// Why `use_case_label` has its current value. See
+    /// `soth_core::UseCaseLabelReason`. Serialized as snake_case string.
+    /// Skipped when omitted to keep older receivers backwards-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_case_label_reason: Option<String>,
     pub topic_cluster_id: Option<String>,
     pub semantic_hash: Option<String>,
     #[serde(default)]

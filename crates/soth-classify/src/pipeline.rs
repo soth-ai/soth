@@ -57,6 +57,7 @@ pub(crate) fn run(
 
     let (usecase, stage3_us) = stage3_usecase::run(
         embed.vector.as_deref(),
+        embed.skipped_reason,
         bundle.classifier.as_ref(),
         &detect_result.normalized,
         config,
@@ -148,6 +149,7 @@ fn assemble_result(
         use_case_label: usecase.label,
         use_case_confidence: usecase.confidence,
         secondary_label: usecase.secondary_label,
+        use_case_label_reason: usecase.label_reason,
         topic_cluster_id: cluster.topic_cluster_id,
         semantic_hash: cluster.semantic_hash,
         embedding,
