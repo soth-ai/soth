@@ -295,6 +295,15 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         model: event.model.clone(),
         use_case_label: enum_name(&event.use_case),
         use_case_label_reason: enum_name(&event.use_case_label_reason),
+        // Tier A: previously dropped at egress. Only emit when classify
+        // produced a confidence (>0) — keeps payload size small for the
+        // many heuristic-parsed events that won't have a model output.
+        use_case_confidence: if event.use_case_confidence > 0.0 {
+            Some(event.use_case_confidence)
+        } else {
+            None
+        },
+        secondary_label: event.secondary_label.as_ref().and_then(enum_name),
         topic_cluster_id: if event.topic_cluster_id > 0 {
             Some(event.topic_cluster_id.to_string())
         } else {
