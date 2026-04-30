@@ -1,0 +1,31 @@
+[package]
+name = "soth-py"
+description = "Python binding for the SOTH SDK (PyO3 + maturin)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+# `_soth_native` is the compiled extension Python imports; the user-
+# facing `soth` package wraps it.
+name = "_soth_native"
+crate-type = ["cdylib"]
+
+[features]
+# `extension-module` tells PyO3 to leave Python symbols unresolved at
+# link time (Python provides them at runtime when the extension is
+# loaded). maturin / cibuildwheel pass this when building the actual
+# wheel; bare `cargo build -p soth-py` does NOT, so workspace builds
+# stay link-clean. `cargo build -p soth-py --features extension-module`
+# replicates the wheel build step.
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+soth-sdk-core = { path = "../../crates/soth-sdk-core" }
+soth-core = { workspace = true }
+zeroize = { workspace = true }
+pyo3 = { version = "0.22", features = ["abi3-py310"] }

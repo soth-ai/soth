@@ -15,6 +15,8 @@ members = [
     "crates/soth-detect",
     "crates/soth-extensions",
     "extensions/historian",
+    "bindings/soth-py",
+    "bindings/soth-node",
 ]
 default-members = [
     "crates/soth-cli",
@@ -27,6 +29,11 @@ default-members = [
     "crates/soth-sync",
     "crates/soth-extensions",
 ]
+# Bindings (soth-py, soth-node) are explicitly NOT in default-members:
+# they require Python / Node toolchains and produce cdylibs that the
+# rest of the workspace doesn't link against. Build them via
+# `cargo build -p soth-py` / `cargo build -p soth-node` or via the
+# language-level tooling (maturin / @napi-rs/cli).
 exclude = []
 
 [workspace.package]

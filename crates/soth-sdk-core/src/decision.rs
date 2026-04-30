@@ -154,6 +154,24 @@ impl DecisionToken {
     /// at the boundary and a fail-open `Decision::Allow` was emitted.
     pub const SENTINEL_FAIL_OPEN: DecisionToken = DecisionToken { inner: u64::MAX - 1 };
 
+    /// Opaque round-trip handle for FFI bindings. Bindings serialize
+    /// the token across the language boundary as the returned u64;
+    /// they MUST NOT interpret the bits or attempt to construct a
+    /// `DecisionToken` from arbitrary values.
+    pub fn raw(self) -> u64 {
+        self.inner
+    }
+
+    /// Reconstruct a `DecisionToken` from a value previously obtained
+    /// via [`raw`]. Bindings use this to round-trip the token across
+    /// the FFI boundary; passing values not previously emitted by the
+    /// SDK is undefined behavior at the slab level (the slab will
+    /// reject the token as stale and emit a `decision_orphaned`
+    /// telemetry event).
+    pub fn from_raw(raw: u64) -> Self {
+        Self { inner: raw }
+    }
+
     pub(crate) fn is_sentinel(self) -> bool {
         self == Self::SLAB_FULL || self == Self::SENTINEL_FAIL_OPEN
     }
