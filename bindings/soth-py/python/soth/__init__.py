@@ -48,6 +48,11 @@ from .exceptions import (
     SothFlagged,
     block_reason_from_dict,
 )
+from .instrumentation import (
+    instrument,
+    is_instrumented,
+    uninstrument,
+)
 
 __version__ = _soth_native.__version__
 
@@ -56,7 +61,11 @@ __all__ = [
     "shutdown",
     "guard",
     "guard_stream",
+    "guard_stream_sync",
     "context",
+    "instrument",
+    "uninstrument",
+    "is_instrumented",
     "SothBlocked",
     "SothFlagged",
     "BlockReason",
@@ -175,13 +184,21 @@ def guard(
 
     Translates `Decision::Block` into a raised `SothBlocked` and
     `Decision::Flag` into a logged `SothFlagged` warning. `Allow` and
-    `Redact` proceed to invoke `call_fn` (Redact handling is a Phase-1
-    deliverable; v0 treats Redact as Allow with the redactions logged).
+    `Redact` proceed to invoke `call_fn`.
+
+    Works with both **sync and async** providers:
+    - sync: `call_fn` returns the response object directly; guard
+      finalizes inline and returns the value.
+    - async: `call_fn` returns a coroutine; guard returns a coroutine
+      that, when awaited, finalizes the lifecycle after the inner
+      coroutine resolves. Customers `await soth.guard(...)`.
 
     `call_fn` is the customer's existing call (e.g.
     `client.chat.completions.create(...)`); the wrapper is intentionally
     narrow so it can be applied per-call with minimal disruption.
     """
+    import inspect
+
     sdk = get_sdk()
     ctx = _current_context.get() or None
     decision = sdk.pre_call(call, ctx)
@@ -196,18 +213,6 @@ def guard(
             reason=block_reason_from_dict(decision.get("reason", {})),
         )
 
-    # Allow / Flag / Redact (Redact is Phase-1; treat as Allow + log)
-    try:
-        result = call_fn()
-    finally:
-        # Always consume the token, even on host-level failure.
-        response_dict = (
-            response_extractor(result)  # type: ignore[name-defined]
-            if response_extractor and "result" in dir()
-            else None
-        )
-        sdk.post_call(token, response_dict)
-
     if kind == _soth_native.DECISION_KIND_FLAG:
         # Surface the flag through a logger; customers can install
         # handlers to act on it. Does NOT raise.
@@ -217,6 +222,39 @@ def guard(
             "soth flagged call: severity=%s", decision.get("severity")
         )
 
+    # Invoke the wrapped call. If it returns a coroutine, post_call
+    # MUST run after the await — return a coroutine that the customer
+    # awaits.
+    try:
+        result = call_fn()
+    except BaseException:
+        sdk.post_call(token, None)
+        raise
+
+    if inspect.iscoroutine(result) or inspect.isawaitable(result):
+        return _finalize_async(sdk, token, result, response_extractor)  # type: ignore[return-value]
+
+    # Sync path — finalize inline.
+    response_dict = response_extractor(result) if response_extractor else None
+    sdk.post_call(token, response_dict)
+    return result
+
+
+async def _finalize_async(
+    sdk: _soth_native.SothSdk,
+    token: int,
+    coro: Any,
+    response_extractor: Optional[Callable[[Any], dict[str, Any]]],
+) -> Any:
+    """Async finalizer: await the inner coroutine, then post_call.
+    Errors propagate after the slab has been balanced."""
+    try:
+        result = await coro
+    except BaseException:
+        sdk.post_call(token, None)
+        raise
+    response_dict = response_extractor(result) if response_extractor else None
+    sdk.post_call(token, response_dict)
     return result
 
 
@@ -226,10 +264,10 @@ async def guard_stream(
     call: dict[str, Any],
     chunk_extractor: Callable[[Any], tuple[Optional[str], Optional[str]]] | None = None,
 ):
-    """Wrap a streaming LLM call with SOTH's pre/post lifecycle.
+    """Wrap an **async** streaming LLM call with SOTH's pre/post lifecycle.
 
     `iter_factory` returns an async iterator (typically the awaited
-    result of e.g. ``client.chat.completions.create(stream=True, ...)``).
+    result of e.g. ``await aclient.chat.completions.create(stream=True, ...)``).
     `chunk_extractor(chunk) -> (delta_content, finish_reason)` pulls the
     fields the SDK records from each provider chunk; defaults to OpenAI's
     `chunk.choices[0].delta.content` shape.
@@ -256,8 +294,8 @@ async def guard_stream(
     sequence = 0
     try:
         provider_iter = iter_factory()
-        # Provider may return a sync iterator (e.g. anthropic non-async)
-        # OR a coroutine that resolves to an async iterator. Handle both.
+        # Provider may return an async iterator directly OR a coroutine
+        # that resolves to an async iterator. Handle both.
         if hasattr(provider_iter, "__await__"):
             provider_iter = await provider_iter
         async for chunk in provider_iter:
@@ -267,6 +305,52 @@ async def guard_stream(
             yield chunk
     finally:
         observation.end()
+
+
+def guard_stream_sync(
+    iter_factory: Callable[[], Any],
+    *,
+    call: dict[str, Any],
+    chunk_extractor: Callable[[Any], tuple[Optional[str], Optional[str]]] | None = None,
+):
+    """Wrap a **sync** streaming LLM call (e.g. OpenAI's sync `OpenAI`
+    client returning a `Stream[ChatCompletionChunk]`).
+
+    Returns a generator that yields each provider chunk back to the
+    caller. Raises `SothBlocked` if the decision is `Block`. Always
+    finalizes the stream observation on completion or exception.
+
+    Auto-instrumentation routes sync streaming calls here; customers
+    can call this directly when wrapping a sync stream by hand.
+    """
+    sdk = get_sdk()
+    ctx = _current_context.get() or None
+    decision, observation = sdk.stream_begin(call, ctx)
+    kind = decision["kind"]
+
+    if kind == _soth_native.DECISION_KIND_BLOCK:
+        observation.end()
+        raise SothBlocked(
+            decision_id=str(decision["token"]),
+            reason=block_reason_from_dict(decision.get("reason", {})),
+        )
+
+    if chunk_extractor is None:
+        chunk_extractor = _default_openai_chunk_extractor
+
+    def _generator():
+        sequence = 0
+        try:
+            provider_iter = iter_factory()
+            for chunk in provider_iter:
+                delta_content, finish_reason = chunk_extractor(chunk)
+                observation.chunk(sequence, delta_content, finish_reason)
+                sequence += 1
+                yield chunk
+        finally:
+            observation.end()
+
+    return _generator()
 
 
 def _default_openai_chunk_extractor(chunk: Any) -> tuple[Optional[str], Optional[str]]:

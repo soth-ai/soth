@@ -89,4 +89,19 @@ export function withContext<T>(
   overrides: CallContextOverrides,
   fn: () => Promise<T>,
 ): Promise<T>;
+
+export interface InstrumentOptions {
+  /**
+   * Limit instrumentation to a subset of providers. Omitting this
+   * field instruments every registered provider that is importable.
+   */
+  providers?: string[];
+}
+
+export type InstrumentResult = Record<string, string>;
+
+export function instrument(options?: InstrumentOptions): InstrumentResult;
+export function uninstrument(options?: InstrumentOptions): InstrumentResult;
+export function isInstrumented(provider: string): boolean;
+
 export function getSdk(): unknown;

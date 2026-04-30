@@ -192,12 +192,40 @@ async function* guardStream(iterFactory, { call, chunkExtractor } = {}) {
   }
 }
 
+// Auto-instrumentation is loaded lazily so `require('@soth/sdk')`
+// doesn't pull provider SDKs into the import graph until
+// `instrument()` is actually called.
+let _instrumentation = null;
+function _getInstrumentation() {
+  if (_instrumentation === null) {
+    /* eslint-disable global-require */
+    _instrumentation = require('./instrumentation/index.js');
+    /* eslint-enable global-require */
+  }
+  return _instrumentation;
+}
+
+function instrument(opts) {
+  return _getInstrumentation().instrument(opts);
+}
+
+function uninstrument(opts) {
+  return _getInstrumentation().uninstrument(opts);
+}
+
+function isInstrumented(provider) {
+  return _getInstrumentation().isInstrumented(provider);
+}
+
 module.exports = {
   init,
   shutdown,
   guard,
   guardStream,
   withContext,
+  instrument,
+  uninstrument,
+  isInstrumented,
   getSdk,
   SothBlocked,
   SothFlagged,
