@@ -279,6 +279,7 @@ mod tests {
             kind: soth_core::ArtifactKind::ApiKey {
                 provider: Some(soth_core::DetectedProvider::OpenAi),
             },
+            credential_kind: None,
             severity: soth_core::ArtifactSeverity::High,
             location: soth_core::ArtifactLocation::UserContent {
                 turn: 0,

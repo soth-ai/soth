@@ -1460,6 +1460,7 @@ fn parse_source_label(value: soth_core::ParseSource) -> &'static str {
         soth_core::ParseSource::AgentApp => "agent_app",
         soth_core::ParseSource::Heuristic => "heuristic",
         soth_core::ParseSource::Filtered => "filtered",
+        soth_core::ParseSource::Sdk => "sdk",
     }
 }
 
@@ -1705,6 +1706,7 @@ mod tests {
     fn artifact(kind: ArtifactKind, severity: ArtifactSeverity) -> SensitiveArtifact {
         SensitiveArtifact {
             kind,
+            credential_kind: None,
             severity,
             location: ArtifactLocation::Unknown,
             commitment: None,
@@ -2314,6 +2316,7 @@ mod tests {
             for _ in 0..artifact_count {
                 artifacts.push(SensitiveArtifact {
                     kind: artifact_pool[rng.gen_range(0..artifact_pool.len())].clone(),
+                    credential_kind: None,
                     severity: severity_pool[rng.gen_range(0..severity_pool.len())],
                     location: ArtifactLocation::Unknown,
                     commitment: None,

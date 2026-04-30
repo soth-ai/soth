@@ -46,9 +46,9 @@ pub(crate) fn run(
     );
 
     let context = PolicyContext {
-        process_resolution: proxy_ctx.process_resolution.clone(),
-        capture_mode: proxy_ctx.capture_mode,
-        traffic_classification: proxy_ctx.traffic_classification,
+        process_resolution: proxy_ctx.attribution.process_resolution.clone(),
+        capture_mode: proxy_ctx.identity.capture_mode,
+        traffic_classification: proxy_ctx.identity.traffic_classification,
         deployment: build_deployment_model(proxy_ctx),
         skip_org_rules,
         semantic: Some(SemanticPolicyContext {
@@ -60,7 +60,11 @@ pub(crate) fn run(
             volatility_class: volatility.class,
             topic_cluster_id: cluster.topic_cluster_id,
         }),
-        session: proxy_ctx.session_snapshot.clone().unwrap_or_default(),
+        session: proxy_ctx
+            .identity
+            .session_snapshot
+            .clone()
+            .unwrap_or_default(),
     };
 
     let decision = soth_policy::evaluate(
@@ -79,10 +83,10 @@ pub(crate) fn run(
 #[cfg(feature = "policy")]
 fn build_deployment_model(proxy_ctx: &soth_core::ProxyContext) -> soth_core::DeploymentModel {
     use soth_core::ClassificationSource;
-    match proxy_ctx.classification_source {
+    match proxy_ctx.identity.classification_source {
         ClassificationSource::Proxy => soth_core::DeploymentModel::Proxy,
         ClassificationSource::Sidecar => {
-            if let Some(ctx) = &proxy_ctx.deployment_context {
+            if let Some(ctx) = &proxy_ctx.identity.deployment_context {
                 soth_core::DeploymentModel::Sidecar {
                     service_name: ctx.service_name.clone(),
                     environment: ctx.environment.clone(),
@@ -95,7 +99,7 @@ fn build_deployment_model(proxy_ctx: &soth_core::ProxyContext) -> soth_core::Dep
             }
         }
         ClassificationSource::Sdk => {
-            if let Some(ctx) = &proxy_ctx.deployment_context {
+            if let Some(ctx) = &proxy_ctx.identity.deployment_context {
                 soth_core::DeploymentModel::Sdk {
                     service_name: ctx.service_name.clone(),
                     environment: ctx.environment.clone(),
@@ -191,41 +195,39 @@ mod tests {
 
     fn proxy_ctx() -> soth_core::ProxyContext {
         soth_core::ProxyContext {
-            org_id: "org-test".to_string(),
-            user_id_hmac: "user-hmac".to_string(),
-            team_id: "team-test".to_string(),
-            device_id_hash: "device-hash".to_string(),
-            endpoint_hash: "endpoint-hash".to_string(),
-            process_resolution: soth_core::ProcessResolution {
-                match_kind: soth_core::ProcessMatchKind::Unknown,
-                app_type: soth_core::AppType::Unknown,
-                capture_mode: Some(soth_core::CaptureMode::MetadataOnly),
-                process_name: None,
-                bundle_id: None,
-                matched_app_id: None,
-                ..Default::default()
+            identity: soth_core::IdentityContext {
+                org_id: "org-test".to_string(),
+                user_id_hmac: "user-hmac".to_string(),
+                team_id: "team-test".to_string(),
+                device_id_hash: "device-hash".to_string(),
+                endpoint_hash: "endpoint-hash".to_string(),
+                capture_mode: soth_core::CaptureMode::MetadataOnly,
+                traffic_classification: soth_core::TrafficClassification::Other,
+                classification_source: soth_core::ClassificationSource::Proxy,
+                session_snapshot: None,
+                declared_provider: Some("openai".to_string()),
+                declared_application: None,
+                session_id: None,
+                deployment_context: None,
+                bundle_trust_level: None,
+                precomputed_commitment_nonce: None,
+                precomputed_commitment_hash: None,
             },
-            capture_mode: soth_core::CaptureMode::MetadataOnly,
-            matched_provider: Some("openai".to_string()),
-            matched_application: None,
-            traffic_classification: soth_core::TrafficClassification::Other,
-            classification_source: soth_core::ClassificationSource::Proxy,
-            session_snapshot: None,
-            request_method: None,
-            deployment_context: None,
-            precomputed_commitment_nonce: None,
-            precomputed_commitment_hash: None,
-            connection_id: None,
-            bundle_trust_level: None,
-            session_id: None,
-            product_id: None,
-            surface_type: soth_core::SurfaceType::Unknown,
-            is_shadow_it: false,
-            ja4_hash: None,
-            tls_version: None,
-            alpn_protocol: None,
-            h2_connection_id: None,
-            h2_stream_id: None,
+            transport: soth_core::TransportContext::default(),
+            attribution: soth_core::AttributionContext {
+                process_resolution: soth_core::ProcessResolution {
+                    match_kind: soth_core::ProcessMatchKind::Unknown,
+                    app_type: soth_core::AppType::Unknown,
+                    capture_mode: Some(soth_core::CaptureMode::MetadataOnly),
+                    process_name: None,
+                    bundle_id: None,
+                    matched_app_id: None,
+                    ..Default::default()
+                },
+                product_id: None,
+                surface_type: soth_core::SurfaceType::Unknown,
+                is_shadow_it: false,
+            },
         }
     }
 
@@ -294,6 +296,7 @@ mod tests {
     fn private_key_artifact() -> soth_core::SensitiveArtifact {
         soth_core::SensitiveArtifact {
             kind: soth_core::ArtifactKind::PrivateKey,
+            credential_kind: None,
             severity: soth_core::ArtifactSeverity::Critical,
             location: soth_core::ArtifactLocation::SystemPrompt { char_offset: 0 },
             commitment: None,

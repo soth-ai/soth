@@ -33,14 +33,18 @@ pub(crate) fn run(
     let started = Instant::now();
 
     // Use precomputed nonce from proxy if available, otherwise generate
-    let nonce = proxy_ctx.precomputed_commitment_nonce.unwrap_or_else(|| {
-        let mut n = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut n);
-        n
-    });
+    let nonce = proxy_ctx
+        .identity
+        .precomputed_commitment_nonce
+        .unwrap_or_else(|| {
+            let mut n = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut n);
+            n
+        });
 
     // Commitment hash: use precomputed from proxy, or empty until proxy ships it
     let commitment_hash = proxy_ctx
+        .identity
         .precomputed_commitment_hash
         .clone()
         .unwrap_or_default();
@@ -57,7 +61,7 @@ pub(crate) fn run(
     let event = TelemetryEvent {
         event_id: Uuid::new_v4(),
         timestamp_epoch_ms: now_ms,
-        connection_id: proxy_ctx.connection_id,
+        connection_id: proxy_ctx.transport.connection_id,
         provider: detect_result.normalized.provider.clone(),
         model: detect_result.normalized.model.clone(),
         endpoint_type: detect_result.normalized.endpoint_type,
@@ -68,12 +72,15 @@ pub(crate) fn run(
         volatility_class: volatility.class,
         cache_level: None,
         routing_reason: derive_routing_reason(&policy.decision.kind),
-        request_method: proxy_ctx.request_method.unwrap_or(RequestMethod::Post),
+        request_method: proxy_ctx
+            .transport
+            .request_method
+            .unwrap_or(RequestMethod::Post),
         estimated_input_tokens: Some(detect_result.normalized.estimated_input_tokens),
         estimated_output_tokens: detect_result.normalized.estimated_output_tokens,
         estimated_cost_usd: Some(detect_result.normalized.estimated_cost_usd as f32),
-        process_resolution: Some(proxy_ctx.process_resolution.clone()),
-        traffic_classification: Some(proxy_ctx.traffic_classification),
+        process_resolution: Some(proxy_ctx.attribution.process_resolution.clone()),
+        traffic_classification: Some(proxy_ctx.identity.traffic_classification),
         languages,
         import_categories: detect_result.import_categories.clone(),
         classification_flags: classifications,
@@ -85,12 +92,13 @@ pub(crate) fn run(
             .matched_rule
             .as_ref()
             .map(|r| r.rule_id.clone()),
-        bundle_trust_level: proxy_ctx.bundle_trust_level,
+        bundle_trust_level: proxy_ctx.identity.bundle_trust_level,
         sensitive_code_flags: build_sensitive_code_flags(
             &detect_result.artifacts,
             &detect_result.import_categories,
         ),
         session_key_hash: proxy_ctx
+            .identity
             .session_snapshot
             .as_ref()
             .map(|s| s.session_key_hash.clone())
@@ -109,7 +117,7 @@ pub(crate) fn run(
         topic_cluster_id: cluster.topic_cluster_id,
         semantic_hash: cluster.semantic_hash.clone(),
         is_semantic_collision: cluster.is_semantic_collision,
-        endpoint_hash: proxy_ctx.endpoint_hash.clone(),
+        endpoint_hash: proxy_ctx.identity.endpoint_hash.clone(),
         use_case_confidence: usecase.confidence.clamp(0.0, 1.0),
         secondary_label: usecase.secondary_label,
         complexity_score: usecase.complexity_score,
@@ -127,25 +135,36 @@ pub(crate) fn run(
         finish_reason: None,
         response_latency_ms: None,
         ttfb_ms: None,
-        session_request_count: proxy_ctx.session_snapshot.as_ref().map(|s| s.request_count),
-        session_total_tokens: proxy_ctx.session_snapshot.as_ref().map(|s| s.total_tokens),
+        session_request_count: proxy_ctx
+            .identity
+            .session_snapshot
+            .as_ref()
+            .map(|s| s.request_count),
+        session_total_tokens: proxy_ctx
+            .identity
+            .session_snapshot
+            .as_ref()
+            .map(|s| s.total_tokens),
         session_credential_alerts: proxy_ctx
+            .identity
             .session_snapshot
             .as_ref()
             .map(|s| s.credential_alerts),
         conversation_turn: detect_result.normalized.conversation_turn,
         ws_turn_number: None,
-        // Connection intelligence — populated by proxy handler from TLS handshake
-        ja4_hash: proxy_ctx.ja4_hash.clone(),
-        tls_version: proxy_ctx.tls_version.clone(),
-        alpn_protocol: proxy_ctx.alpn_protocol.clone(),
-        h2_connection_id: proxy_ctx.h2_connection_id.clone(),
-        h2_stream_id: proxy_ctx.h2_stream_id,
-        // Product/Session taxonomy — populated by proxy handler, not classify
-        session_id: proxy_ctx.session_id,
-        product_id: proxy_ctx.product_id.clone(),
-        surface_type: proxy_ctx.surface_type,
-        is_shadow_it: proxy_ctx.is_shadow_it,
+        // Connection intelligence — populated by proxy handler from TLS handshake;
+        // SDK callers leave the entire transport context at default (all `None`).
+        ja4_hash: proxy_ctx.transport.ja4_hash.clone(),
+        tls_version: proxy_ctx.transport.tls_version.clone(),
+        alpn_protocol: proxy_ctx.transport.alpn_protocol.clone(),
+        h2_connection_id: proxy_ctx.transport.h2_connection_id.clone(),
+        h2_stream_id: proxy_ctx.transport.h2_stream_id,
+        // Product/Session taxonomy — populated by proxy handler, not classify;
+        // SDK leaves attribution at default.
+        session_id: proxy_ctx.identity.session_id,
+        product_id: proxy_ctx.attribution.product_id.clone(),
+        surface_type: proxy_ctx.attribution.surface_type,
+        is_shadow_it: proxy_ctx.attribution.is_shadow_it,
     };
 
     TelemetryOutput {
@@ -199,42 +218,16 @@ fn build_sensitive_code_flags(
         match &artifact.kind {
             ArtifactKind::PrivateKey => {
                 flags.private_key_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.credential_pattern_detected = true;
-                flags.detected_secret_types.push("private_key".to_string());
+                mark_credential_artifact(&mut flags, artifact);
             }
             ArtifactKind::CodeBlock { .. } => {
                 flags.auth_logic_detected = true;
             }
-            ArtifactKind::ApiKey { .. } => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("api_key".to_string());
-            }
-            ArtifactKind::Jwt => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("jwt".to_string());
-            }
-            ArtifactKind::HexKey => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("hex_key".to_string());
-            }
-            ArtifactKind::ConnectionString => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags
-                    .detected_secret_types
-                    .push("connection_string".to_string());
-            }
-            ArtifactKind::UnknownCredential => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags
-                    .detected_secret_types
-                    .push("unknown_credential".to_string());
-            }
+            ArtifactKind::ApiKey { .. }
+            | ArtifactKind::Jwt
+            | ArtifactKind::HexKey
+            | ArtifactKind::ConnectionString
+            | ArtifactKind::UnknownCredential => mark_credential_artifact(&mut flags, artifact),
             ArtifactKind::OrgPattern { pattern_id } => {
                 flags.org_pattern_matches.push(pattern_id.to_string());
             }
@@ -244,35 +237,11 @@ fn build_sensitive_code_flags(
             ArtifactKind::CryptoOperation => {
                 flags.crypto_operations_detected = true;
             }
-            ArtifactKind::AwsAccessKey => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags
-                    .detected_secret_types
-                    .push("aws_access_key".to_string());
-            }
-            ArtifactKind::GitHubPat => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("github_pat".to_string());
-            }
-            ArtifactKind::GitLabToken => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("gitlab_token".to_string());
-            }
-            ArtifactKind::SlackToken => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("slack_token".to_string());
-            }
-            ArtifactKind::StripeSecretKey => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags
-                    .detected_secret_types
-                    .push("stripe_secret_key".to_string());
-            }
+            ArtifactKind::AwsAccessKey
+            | ArtifactKind::GitHubPat
+            | ArtifactKind::GitLabToken
+            | ArtifactKind::SlackToken
+            | ArtifactKind::StripeSecretKey => mark_credential_artifact(&mut flags, artifact),
         }
     }
 
@@ -292,6 +261,17 @@ fn build_sensitive_code_flags(
     }
 
     flags
+}
+
+fn mark_credential_artifact(
+    flags: &mut SensitiveCodeFlags,
+    artifact: &soth_core::SensitiveArtifact,
+) {
+    flags.credential_pattern_detected = true;
+    flags.hardcoded_secret_detected = true;
+    if let Some(credential_kind) = artifact.credential_kind_label() {
+        flags.detected_secret_types.push(credential_kind);
+    }
 }
 
 fn compute_code_fraction(detect_result: &soth_core::DetectResult) -> f32 {
@@ -442,41 +422,39 @@ mod tests {
         let mut session = soth_core::SessionSnapshot::default();
         session.current_request_timestamp = timestamp;
         soth_core::ProxyContext {
-            org_id: "org".to_string(),
-            user_id_hmac: "user".to_string(),
-            team_id: "team".to_string(),
-            device_id_hash: "device".to_string(),
-            endpoint_hash: "endpoint".to_string(),
-            process_resolution: soth_core::ProcessResolution {
-                match_kind: soth_core::ProcessMatchKind::Unknown,
-                app_type: soth_core::AppType::Unknown,
-                capture_mode: Some(soth_core::CaptureMode::MetadataOnly),
-                process_name: None,
-                bundle_id: None,
-                matched_app_id: None,
-                ..Default::default()
+            identity: soth_core::IdentityContext {
+                org_id: "org".to_string(),
+                user_id_hmac: "user".to_string(),
+                team_id: "team".to_string(),
+                device_id_hash: "device".to_string(),
+                endpoint_hash: "endpoint".to_string(),
+                capture_mode: soth_core::CaptureMode::MetadataOnly,
+                traffic_classification: soth_core::TrafficClassification::Other,
+                classification_source: soth_core::ClassificationSource::Proxy,
+                session_snapshot: Some(session),
+                declared_provider: Some("openai".to_string()),
+                declared_application: None,
+                session_id: None,
+                deployment_context: None,
+                bundle_trust_level: None,
+                precomputed_commitment_nonce: None,
+                precomputed_commitment_hash: None,
             },
-            capture_mode: soth_core::CaptureMode::MetadataOnly,
-            matched_provider: Some("openai".to_string()),
-            matched_application: None,
-            traffic_classification: soth_core::TrafficClassification::Other,
-            classification_source: soth_core::ClassificationSource::Proxy,
-            session_snapshot: Some(session),
-            request_method: None,
-            deployment_context: None,
-            precomputed_commitment_nonce: None,
-            precomputed_commitment_hash: None,
-            connection_id: None,
-            bundle_trust_level: None,
-            session_id: None,
-            product_id: None,
-            surface_type: soth_core::SurfaceType::Unknown,
-            is_shadow_it: false,
-            ja4_hash: None,
-            tls_version: None,
-            alpn_protocol: None,
-            h2_connection_id: None,
-            h2_stream_id: None,
+            transport: soth_core::TransportContext::default(),
+            attribution: soth_core::AttributionContext {
+                process_resolution: soth_core::ProcessResolution {
+                    match_kind: soth_core::ProcessMatchKind::Unknown,
+                    app_type: soth_core::AppType::Unknown,
+                    capture_mode: Some(soth_core::CaptureMode::MetadataOnly),
+                    process_name: None,
+                    bundle_id: None,
+                    matched_app_id: None,
+                    ..Default::default()
+                },
+                product_id: None,
+                surface_type: soth_core::SurfaceType::Unknown,
+                is_shadow_it: false,
+            },
         }
     }
 
@@ -568,6 +546,7 @@ mod tests {
                 kind: soth_core::ArtifactKind::CodeBlock {
                     language: "rust".to_string(),
                 },
+                credential_kind: None,
                 severity: soth_core::ArtifactSeverity::Low,
                 location: soth_core::ArtifactLocation::UserContent {
                     turn: 0,
@@ -580,6 +559,7 @@ mod tests {
                 kind: soth_core::ArtifactKind::ApiKey {
                     provider: Some(soth_core::DetectedProvider::OpenAi),
                 },
+                credential_kind: None,
                 severity: soth_core::ArtifactSeverity::High,
                 location: soth_core::ArtifactLocation::UserContent {
                     turn: 0,
@@ -647,6 +627,7 @@ mod tests {
                 kind: soth_core::ArtifactKind::CodeBlock {
                     language: "rust".to_string(),
                 },
+                credential_kind: None,
                 severity: soth_core::ArtifactSeverity::Low,
                 location: soth_core::ArtifactLocation::UserContent {
                     turn: 0,
@@ -659,6 +640,7 @@ mod tests {
                 kind: soth_core::ArtifactKind::CodeBlock {
                     language: "Rust".to_string(),
                 },
+                credential_kind: None,
                 severity: soth_core::ArtifactSeverity::Low,
                 location: soth_core::ArtifactLocation::UserContent {
                     turn: 1,
@@ -694,6 +676,7 @@ mod tests {
         let mut detect = detect_result();
         detect.artifacts = vec![soth_core::SensitiveArtifact {
             kind: soth_core::ArtifactKind::PrivateKey,
+            credential_kind: None,
             severity: soth_core::ArtifactSeverity::Critical,
             location: soth_core::ArtifactLocation::SystemPrompt { char_offset: 0 },
             commitment: None,
@@ -714,6 +697,43 @@ mod tests {
         assert!(out.event.sensitive_code_flags.private_key_detected);
         assert!(out.event.sensitive_code_flags.hardcoded_secret_detected);
         assert!(out.event.sensitive_code_flags.credential_pattern_detected);
+        assert!(out
+            .event
+            .sensitive_code_flags
+            .detected_secret_types
+            .contains(&"generic_private_key".to_string()));
+    }
+
+    #[test]
+    fn telemetry_uses_exact_credential_kind_from_artifact_metadata() {
+        let mut detect = detect_result();
+        detect.artifacts = vec![soth_core::SensitiveArtifact {
+            kind: soth_core::ArtifactKind::StripeSecretKey,
+            credential_kind: Some("stripe_live_secret_key".to_string()),
+            severity: soth_core::ArtifactSeverity::Critical,
+            location: soth_core::ArtifactLocation::UserContent {
+                turn: 0,
+                char_offset: 0,
+            },
+            commitment: None,
+            redacted_hint: None,
+        }];
+
+        let out = run(
+            &detect,
+            &proxy_ctx_with_time(3),
+            &ClusterOutput::default(),
+            &usecase_output(),
+            &VolatilityOutput::default(),
+            &AnomalyOutput::default(),
+            &policy_allow(),
+            0.0,
+        );
+
+        assert_eq!(
+            out.event.sensitive_code_flags.detected_secret_types,
+            vec!["stripe_live_secret_key".to_string()]
+        );
     }
 
     #[test]
@@ -740,7 +760,7 @@ mod tests {
     #[test]
     fn telemetry_commitment_hash_from_precomputed() {
         let mut proxy = proxy_ctx_with_time(5);
-        proxy.precomputed_commitment_hash = Some("abc123hash".to_string());
+        proxy.identity.precomputed_commitment_hash = Some("abc123hash".to_string());
 
         let out = run(
             &detect_result(),

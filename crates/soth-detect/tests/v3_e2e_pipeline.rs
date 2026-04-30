@@ -411,6 +411,7 @@ fn parse_source_label(source: &soth_core::ParseSource) -> String {
         soth_core::ParseSource::GraphQl => "graphql".to_string(),
         soth_core::ParseSource::Grpc => "grpc".to_string(),
         soth_core::ParseSource::JsonRpc => "jsonrpc".to_string(),
+        soth_core::ParseSource::Sdk => "sdk".to_string(),
     }
 }
 

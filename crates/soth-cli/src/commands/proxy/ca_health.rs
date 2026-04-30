@@ -1,6 +1,6 @@
 use crate::cli_config::{self, SothConfig};
 use anyhow::{Context, Result};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -159,7 +159,7 @@ fn hex_upper(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn normalize_hash(raw: &str) -> Option<String> {
     let normalized: String = raw.chars().filter(|ch| ch.is_ascii_hexdigit()).collect();
     if normalized.len() == 40 || normalized.len() == 64 {
@@ -374,13 +374,12 @@ fn windows_root_store_thumbprints(scope: WindowsStoreScope) -> Result<BTreeSet<S
 
 /// Parse the SHA-1 thumbprints out of `certutil -store Root` stdout.
 ///
-/// Extracted as a pure function (and unconditionally compiled on platforms
-/// where this module's hash helpers are present) so it can be unit-tested
-/// on every host — running real `certutil` only happens on Windows. Scans
+/// Extracted as a pure function so it can be unit-tested on every host —
+/// running real `certutil` only happens on Windows. Scans
 /// for `Cert Hash(sha1):` (modern) and `Cert SHA1 Hash:` (older
 /// locales/SKUs) lines and runs each value through [`normalize_hash`] to
 /// drop `certutil`'s space-separated byte formatting.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(test, target_os = "windows"))]
 fn parse_certutil_root_thumbprints(stdout: &str) -> BTreeSet<String> {
     let mut hashes = BTreeSet::new();
     for line in stdout.lines() {
@@ -399,7 +398,6 @@ fn parse_certutil_root_thumbprints(stdout: &str) -> BTreeSet<String> {
 }
 
 #[cfg(test)]
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod windows_certutil_parse_tests {
     use super::*;
 

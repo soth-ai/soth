@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::io;
+#[cfg(feature = "onnx-models")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "onnx-models")]
+use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -52,6 +55,17 @@ pub struct ClassifyBundle {
     pub bundle_version: String,
     pub has_real_models: bool,
 }
+
+// Compile-time assertion: `ClassifyBundle` and the trait objects it holds
+// must remain `Send + Sync` so SDK bindings (PyO3 / napi-rs) can stash a
+// shared `Arc<ClassifyBundle>` and call `classify` from arbitrary host
+// threads. If anyone adds a non-`Send`/non-`Sync` field, compilation fails.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ClassifyBundle>();
+    assert_send_sync::<Arc<dyn ClassificationProvider>>();
+    assert_send_sync::<Arc<dyn AnomalyScorer>>();
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelAssetStatus {
@@ -437,6 +451,7 @@ fn toml_array_to_strings(values: &[toml::Value]) -> Option<Vec<String>> {
     Some(out)
 }
 
+#[cfg(feature = "onnx-models")]
 fn build_onnx_runtime(
     embedding_onnx: Option<&Vec<u8>>,
     tokenizer_json: Option<&Vec<u8>>,
@@ -446,6 +461,19 @@ fn build_onnx_runtime(
     init_onnx_runtime_quiet(model.as_slice(), tokenizer.as_slice()).map(Arc::new)
 }
 
+/// When `onnx-models` is disabled, local embedding is unavailable. The bundle
+/// loader always returns `None` and stage1 takes the deterministic
+/// hash-embedding fallback path. SDK consumers in cloud-classify mode route
+/// the request to soth-cloud (Phase 2 of the SDK plan).
+#[cfg(not(feature = "onnx-models"))]
+fn build_onnx_runtime(
+    _embedding_onnx: Option<&Vec<u8>>,
+    _tokenizer_json: Option<&Vec<u8>>,
+) -> Option<Arc<OnnxEmbeddingRuntime>> {
+    None
+}
+
+#[cfg(feature = "onnx-models")]
 fn init_onnx_runtime_quiet(model: &[u8], tokenizer: &[u8]) -> Option<OnnxEmbeddingRuntime> {
     static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let hook_lock = PANIC_HOOK_LOCK.get_or_init(|| Mutex::new(())).lock().ok()?;

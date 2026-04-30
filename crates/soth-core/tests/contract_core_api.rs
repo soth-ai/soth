@@ -117,36 +117,37 @@ fn session_snapshot_defaults_include_required_fields() {
 #[test]
 fn proxy_context_and_policy_context_semantic_extension_contract() {
     let proxy_ctx = ProxyContext {
-        org_id: "org-test".to_string(),
-        user_id_hmac: "user-hmac".to_string(),
-        team_id: "team-test".to_string(),
-        device_id_hash: "device-hash".to_string(),
-        endpoint_hash: "endpoint-hash".to_string(),
-        process_resolution: sample_process_resolution(),
-        capture_mode: CaptureMode::SensitiveArtifacts,
-        matched_provider: Some("openai".to_string()),
-        matched_application: Some("cursor".to_string()),
-        traffic_classification: TrafficClassification::ApplicationUsage,
-        classification_source: ClassificationSource::Proxy,
-        session_snapshot: Some(SessionSnapshot::default()),
-        request_method: None,
-        deployment_context: None,
-        precomputed_commitment_nonce: None,
-        precomputed_commitment_hash: None,
-        connection_id: None,
-        bundle_trust_level: None,
-        session_id: None,
-        product_id: None,
-        surface_type: SurfaceType::Unknown,
-        is_shadow_it: false,
-        ja4_hash: None,
-        tls_version: None,
-        alpn_protocol: None,
-        h2_connection_id: None,
-        h2_stream_id: None,
+        identity: soth_core::IdentityContext {
+            org_id: "org-test".to_string(),
+            user_id_hmac: "user-hmac".to_string(),
+            team_id: "team-test".to_string(),
+            device_id_hash: "device-hash".to_string(),
+            endpoint_hash: "endpoint-hash".to_string(),
+            capture_mode: CaptureMode::SensitiveArtifacts,
+            traffic_classification: TrafficClassification::ApplicationUsage,
+            classification_source: ClassificationSource::Proxy,
+            session_snapshot: Some(SessionSnapshot::default()),
+            declared_provider: Some("openai".to_string()),
+            declared_application: Some("cursor".to_string()),
+            session_id: None,
+            deployment_context: None,
+            bundle_trust_level: None,
+            precomputed_commitment_nonce: None,
+            precomputed_commitment_hash: None,
+        },
+        transport: soth_core::TransportContext::default(),
+        attribution: soth_core::AttributionContext {
+            process_resolution: sample_process_resolution(),
+            product_id: None,
+            surface_type: SurfaceType::Unknown,
+            is_shadow_it: false,
+        },
     };
-    assert_eq!(proxy_ctx.org_id, "org-test");
-    assert_eq!(proxy_ctx.capture_mode, CaptureMode::SensitiveArtifacts);
+    assert_eq!(proxy_ctx.identity.org_id, "org-test");
+    assert_eq!(
+        proxy_ctx.identity.capture_mode,
+        CaptureMode::SensitiveArtifacts
+    );
 
     let policy_ctx = PolicyContext {
         process_resolution: sample_process_resolution(),
@@ -662,6 +663,7 @@ fn from_governable_enriches_languages_and_classification_flags() {
                 kind: ArtifactKind::CodeBlock {
                     language: "rust".to_string(),
                 },
+                credential_kind: None,
                 severity: ArtifactSeverity::Low,
                 location: ArtifactLocation::UserContent {
                     turn: 0,
@@ -674,6 +676,7 @@ fn from_governable_enriches_languages_and_classification_flags() {
                 kind: ArtifactKind::CodeBlock {
                     language: "python".to_string(),
                 },
+                credential_kind: None,
                 severity: ArtifactSeverity::Low,
                 location: ArtifactLocation::UserContent {
                     turn: 1,
@@ -684,6 +687,7 @@ fn from_governable_enriches_languages_and_classification_flags() {
             },
             SensitiveArtifact {
                 kind: ArtifactKind::ApiKey { provider: None },
+                credential_kind: None,
                 severity: ArtifactSeverity::High,
                 location: ArtifactLocation::UserContent {
                     turn: 0,
@@ -728,6 +732,10 @@ fn from_governable_enriches_languages_and_classification_flags() {
     // Sensitive code flags from artifacts
     assert!(telemetry.sensitive_code_flags.credential_pattern_detected);
     assert!(telemetry.sensitive_code_flags.hardcoded_secret_detected);
+    assert!(telemetry
+        .sensitive_code_flags
+        .detected_secret_types
+        .contains(&"api_key".to_string()));
 
     // Code fraction is non-zero (2 code blocks / 42 tokens)
     assert!(telemetry.code_fraction > 0.0);
@@ -758,6 +766,7 @@ fn from_governable_with_private_key_sets_sensitive_flags() {
         normalized: None,
         artifacts: vec![SensitiveArtifact {
             kind: ArtifactKind::PrivateKey,
+            credential_kind: None,
             severity: ArtifactSeverity::Critical,
             location: ArtifactLocation::SystemPrompt { char_offset: 0 },
             commitment: None,
@@ -773,6 +782,10 @@ fn from_governable_with_private_key_sets_sensitive_flags() {
     assert!(telemetry.sensitive_code_flags.private_key_detected);
     assert!(telemetry.sensitive_code_flags.hardcoded_secret_detected);
     assert!(telemetry.sensitive_code_flags.credential_pattern_detected);
+    assert_eq!(
+        telemetry.sensitive_code_flags.detected_secret_types,
+        vec!["generic_private_key".to_string()]
+    );
 
     // Block policy sets PolicyTriggered flag
     assert!(telemetry
