@@ -46,25 +46,24 @@ impl PySothSdk {
         hmac_key_static: Option<Vec<u8>>,
         telemetry_endpoint: Option<String>,
     ) -> PyResult<Self> {
+        // HMAC key is optional in v1. Customers may pre-compute
+        // user_id_hmac in their own code; the Phase-2.5 SDK adds a
+        // helper that uses this key for SDK-side hashing.
         let hmac_key = match (hmac_key_env, hmac_key_static) {
-            (Some(env), None) => HmacKey::FromEnv(env),
-            (None, Some(bytes)) => HmacKey::Static(Zeroizing::new(bytes)),
+            (Some(env), None) => Some(HmacKey::FromEnv(env)),
+            (None, Some(bytes)) => Some(HmacKey::Static(Zeroizing::new(bytes))),
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "specify either hmac_key_env OR hmac_key_static, not both",
                 ));
             }
-            (None, None) => {
-                return Err(PyValueError::new_err(
-                    "hmac_key_env or hmac_key_static is required",
-                ));
-            }
+            (None, None) => None,
         };
 
-        let mut builder = SdkConfigBuilder::new()
-            .api_key(api_key)
-            .org_id(org_id)
-            .hmac_key(hmac_key);
+        let mut builder = SdkConfigBuilder::new().api_key(api_key).org_id(org_id);
+        if let Some(key) = hmac_key {
+            builder = builder.hmac_key(key);
+        }
         if let Some(endpoint) = telemetry_endpoint {
             builder = builder.telemetry_endpoint(endpoint);
         }

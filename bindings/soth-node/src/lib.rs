@@ -124,27 +124,25 @@ impl SothSdk {
         hmac_key_static: Option<Buffer>,
         telemetry_endpoint: Option<String>,
     ) -> Result<Self> {
+        // HMAC key is optional in v1; same semantics as the Python
+        // binding. See bindings/soth-py/python/soth/__init__.py for
+        // the privacy tradeoff.
         let hmac_key = match (hmac_key_env, hmac_key_static) {
-            (Some(env), None) => HmacKey::FromEnv(env),
-            (None, Some(buf)) => HmacKey::Static(Zeroizing::new(buf.as_ref().to_vec())),
+            (Some(env), None) => Some(HmacKey::FromEnv(env)),
+            (None, Some(buf)) => Some(HmacKey::Static(Zeroizing::new(buf.as_ref().to_vec()))),
             (Some(_), Some(_)) => {
                 return Err(Error::new(
                     Status::InvalidArg,
                     "specify either hmac_key_env OR hmac_key_static, not both",
                 ));
             }
-            (None, None) => {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    "hmac_key_env or hmac_key_static is required",
-                ));
-            }
+            (None, None) => None,
         };
 
-        let mut builder = SdkConfigBuilder::new()
-            .api_key(api_key)
-            .org_id(org_id)
-            .hmac_key(hmac_key);
+        let mut builder = SdkConfigBuilder::new().api_key(api_key).org_id(org_id);
+        if let Some(key) = hmac_key {
+            builder = builder.hmac_key(key);
+        }
         if let Some(endpoint) = telemetry_endpoint {
             builder = builder.telemetry_endpoint(endpoint);
         }

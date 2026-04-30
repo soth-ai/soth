@@ -60,8 +60,9 @@ sdk.stream_end(obs);
 
 ## What v0 does (Phase 0)
 
-- ✅ `init` validates config, resolves HMAC key, builds an empty detect
-     bundle and the deterministic fallback classify bundle.
+- ✅ `init` validates config (HMAC key optional in v1; resolved when
+     present), builds an empty detect bundle and the deterministic
+     fallback classify bundle.
 - ✅ `pre_call` runs `process_normalized` for artifact detection +
      session dedup. Sync block path fires on credential / private-key
      artifacts. Returns a real `DecisionToken` allocated from a fixed

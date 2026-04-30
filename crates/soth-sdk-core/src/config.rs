@@ -164,7 +164,19 @@ impl Default for BundleSource {
 pub struct SdkConfig {
     pub api_key: String,
     pub org_id: String,
-    pub hmac_key: HmacKey,
+    /// Optional in v1. When set, the SDK validates the key resolves at
+    /// init time and reserves the field for the future
+    /// `soth.hash_user_id()` helper. When absent, customers either
+    /// pre-compute `user_id_hmac` themselves with their own HMAC
+    /// scheme and pass it via `CallContext`, or omit user attribution
+    /// entirely.
+    ///
+    /// **Privacy tradeoff:** without an HMAC key, anything passed
+    /// through `user_id_hmac` reaches soth-cloud as-is. Regulated
+    /// workloads (HIPAA / heavy-PII) SHOULD still configure a key.
+    /// See `SDK_WASM_TRUST_BOUNDARY_SPEC.md` §6.6 for the Phase-2
+    /// implementation that closes this loop end-to-end.
+    pub hmac_key: Option<HmacKey>,
     pub default_team_id: Option<String>,
     pub default_device_id_hash: Option<String>,
     pub capture_mode: CaptureMode,
@@ -280,9 +292,10 @@ impl SdkConfigBuilder {
         let org_id = self
             .org_id
             .ok_or_else(|| SdkError::InvalidConfig("org_id required".into()))?;
-        let hmac_key = self
-            .hmac_key
-            .ok_or_else(|| SdkError::InvalidConfig("hmac_key required".into()))?;
+        // hmac_key is optional in v1. Customers who skip it pass
+        // user_id_hmac through plaintext (or omit it). Phase-2.5 SDK
+        // ships a hashing helper that activates per-customer privacy.
+        let hmac_key = self.hmac_key;
         let local_classification = self.local_classification.unwrap_or_default();
 
         // CloudOptIn requires a configured endpoint. Validation here
@@ -331,6 +344,19 @@ mod tests {
             .expect("build");
         assert_eq!(cfg.org_id, "org-test");
         assert_eq!(cfg.local_classification, ClassificationMode::Full);
+        assert!(cfg.hmac_key.is_some());
+    }
+
+    #[test]
+    fn builder_succeeds_without_hmac_key() {
+        // HMAC is opt-in for v1 — see crate docs. Builder must accept
+        // the no-key configuration without error.
+        let cfg = SdkConfigBuilder::new()
+            .api_key("sk-test")
+            .org_id("org-test")
+            .build()
+            .expect("build");
+        assert!(cfg.hmac_key.is_none());
     }
 
     #[test]
@@ -338,7 +364,6 @@ mod tests {
         let err = SdkConfigBuilder::new()
             .api_key("k")
             .org_id("o")
-            .hmac_key(HmacKey::Static(Zeroizing::new(vec![0u8; 32])))
             .local_classification(ClassificationMode::CloudOptIn)
             .build()
             .unwrap_err();

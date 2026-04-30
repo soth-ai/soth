@@ -134,6 +134,19 @@ def init(
 ) -> None:
     """Initialize the SOTH SDK module-level singleton.
 
+    `hmac_key_env` / `hmac_key_static` are **optional in v1**. When set,
+    the SDK validates the key resolves at init time and reserves it for
+    the future `soth.hash_user_id()` helper. When absent, customers
+    either pre-compute `user_id_hmac` themselves and pass via
+    `with soth.context(user_id_hmac=...)`, or omit user attribution
+    entirely.
+
+    **Privacy tradeoff:** without an HMAC key, anything passed via
+    `user_id_hmac` reaches soth-cloud as-is. Regulated workloads
+    (HIPAA / heavy-PII) SHOULD configure a key. Phase-2.5 SDK adds
+    SDK-side hashing — see
+    `docs/common/SDK_WASM_TRUST_BOUNDARY_SPEC.md` §6.6.
+
     Specify exactly one of `hmac_key_env` (read from environment) or
     `hmac_key_static` (raw bytes). Production usage SHOULD prefer
     `hmac_key_env` so the key never sits in source-controlled config.

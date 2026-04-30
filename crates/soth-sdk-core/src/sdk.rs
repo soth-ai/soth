@@ -98,10 +98,14 @@ impl SothSdk {
     /// failure logs and returns an error; the binding's wrapper SHOULD
     /// fall back to no-op mode rather than crashing the host process.
     pub fn init(config: SdkConfig) -> Result<Self, SdkError> {
-        // Validate the HMAC key resolves before we accept the config.
-        // Resolved bytes are dropped immediately — Phase 1 keeps them
-        // for telemetry signing, v0 only validates.
-        let _hmac = config.hmac_key.resolve()?;
+        // HMAC key is optional in v1. When configured, validate it
+        // resolves so misconfigured envs / vault paths fail loudly at
+        // init rather than later. When absent, the SDK skips the
+        // resolve and proceeds in plaintext-user-id mode (the
+        // customer either omits user_id_hmac or pre-computes it).
+        if let Some(key) = config.hmac_key.as_ref() {
+            let _hmac = key.resolve()?;
+        }
 
         // ClassificationMode::Full + onnx-models feature-off would be a
         // mismatch; bindings on size-constrained targets must pick
@@ -165,7 +169,9 @@ impl SothSdk {
         detect_bundle: OwnedDetectBundle,
         classify_bundle: Arc<soth_classify::ClassifyBundle>,
     ) -> Result<Self, SdkError> {
-        let _hmac = config.hmac_key.resolve()?;
+        if let Some(key) = config.hmac_key.as_ref() {
+            let _hmac = key.resolve()?;
+        }
         Ok(Self {
             config,
             detect_registry: Arc::new(soth_detect::ParserRegistry::default()),

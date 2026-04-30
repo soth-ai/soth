@@ -16,6 +16,23 @@ What v0 ships:
 - `soth.SothBlocked` — class extending `Error` (NOT `OpenAI.APIError`)
 - `soth.SothFlagged` — surface for `Decision::Flag`
 
+## HMAC key handling
+
+`hmacKeyEnv` / `hmacKeyStatic` on `soth.init({...})` are **optional
+in v1**.
+
+- **With HMAC key:** customers pre-compute `userIdHmac` themselves
+  using their stored secret (`crypto.createHmac('sha256', secret)
+  .update(userId).digest('hex')`) and pass it via
+  `soth.withContext({ userIdHmac, ... }, async () => ...)`. The
+  Phase-2.5 SDK adds an SDK-side hashing helper.
+- **Without HMAC key:** anything passed via `userIdHmac` reaches
+  soth-cloud as-is. Regulated workloads (HIPAA / heavy-PII) SHOULD
+  configure a key. Non-regulated workloads can defer.
+
+See `docs/common/SDK_WASM_TRUST_BOUNDARY_SPEC.md` §6.6 for the full
+key-lifecycle contract.
+
 What's deferred to follow-up Phase 1 commits:
 - Auto-instrumentation for `openai`, `@anthropic-ai/sdk`, `cohere-ai`,
   `@google/generative-ai`, `mistralai`

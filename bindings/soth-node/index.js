@@ -78,6 +78,20 @@ class SothFlagged {
 
 let _singleton = null;
 
+/**
+ * Initialize the SOTH SDK module-level singleton.
+ *
+ * `hmacKeyEnv` / `hmacKeyStatic` are **optional in v1**. When neither
+ * is set, customers pre-compute `userIdHmac` themselves (e.g. via
+ * `crypto.createHmac('sha256', secret).update(userId).digest('hex')`)
+ * and pass it through `withContext`, or omit user attribution.
+ *
+ * **Privacy tradeoff:** without an HMAC key, anything passed via
+ * `userIdHmac` reaches soth-cloud as-is. Regulated workloads
+ * (HIPAA / heavy-PII) SHOULD configure a key. The Phase-2.5 SDK
+ * adds SDK-side hashing — see
+ * `docs/common/SDK_WASM_TRUST_BOUNDARY_SPEC.md` §6.6.
+ */
 function init({ apiKey, orgId, hmacKeyEnv, hmacKeyStatic, telemetryEndpoint }) {
   if (!apiKey) throw new Error('init: apiKey required');
   if (!orgId) throw new Error('init: orgId required');
