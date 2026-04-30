@@ -272,3 +272,118 @@ def test_anthropic_adapter_apply_returns_bool():
     assert result in (True, False)
     if result is True:
         _anthropic.revert()
+
+
+def test_cohere_adapter_apply_returns_bool():
+    from soth.instrumentation import _cohere
+
+    result = _cohere.apply()
+    assert result in (True, False)
+    if result is True:
+        _cohere.revert()
+
+
+def test_google_genai_adapter_apply_returns_bool():
+    from soth.instrumentation import _google_genai
+
+    result = _google_genai.apply()
+    assert result in (True, False)
+    if result is True:
+        _google_genai.revert()
+
+
+def test_mistral_adapter_apply_returns_bool():
+    from soth.instrumentation import _mistral
+
+    result = _mistral.apply()
+    assert result in (True, False)
+    if result is True:
+        _mistral.revert()
+
+
+# ── extractor unit tests (no provider SDK install required) ────────
+
+
+def test_cohere_v2_extractor_normalizes_messages():
+    from soth.instrumentation._cohere import _build_call_v2
+
+    call = _build_call_v2(
+        (),
+        {
+            "model": "command-r-plus",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": [{"text": "hi"}, {"text": "there"}],
+                },
+            ],
+            "stream": False,
+        },
+    )
+    assert call["provider"] == "cohere"
+    assert call["model"] == "command-r-plus"
+    assert call["messages"][0] == {"role": "user", "content": "hello"}
+    assert call["messages"][1]["content"] == "hi there"
+
+
+def test_cohere_v4_extractor_promotes_message_to_messages():
+    from soth.instrumentation._cohere import _build_call_v4
+
+    call = _build_call_v4(
+        (),
+        {
+            "model": "command-r-plus",
+            "message": "current question",
+            "chat_history": [
+                {"role": "USER", "message": "earlier"},
+                {"role": "CHATBOT", "message": "earlier reply"},
+            ],
+        },
+    )
+    assert call["messages"][-1] == {"role": "user", "content": "current question"}
+    assert call["messages"][1] == {"role": "assistant", "content": "earlier reply"}
+
+
+def test_google_genai_extractor_handles_string_contents():
+    from soth.instrumentation._google_genai import _build_call
+
+    call = _build_call(
+        (),
+        {"model": "gemini-2.0-flash", "contents": "explain rust"},
+    )
+    assert call["provider"] == "google_genai"
+    assert call["messages"] == [{"role": "user", "content": "explain rust"}]
+
+
+def test_google_genai_extractor_handles_list_of_content_dicts():
+    from soth.instrumentation._google_genai import _build_call
+
+    call = _build_call(
+        (),
+        {
+            "model": "gemini-2.0-flash",
+            "contents": [
+                {"role": "user", "parts": [{"text": "first"}]},
+                {"role": "model", "parts": [{"text": "answer"}]},
+                {"role": "user", "parts": [{"text": "follow-up"}]},
+            ],
+        },
+    )
+    assert len(call["messages"]) == 3
+    assert call["messages"][0]["content"] == "first"
+    assert call["messages"][1]["role"] == "model"
+
+
+def test_mistral_extractor_normalizes_messages():
+    from soth.instrumentation._mistral import _build_call
+
+    call = _build_call(
+        (),
+        {
+            "model": "mistral-large-latest",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert call["provider"] == "mistralai"
+    assert call["messages"][0] == {"role": "user", "content": "hi"}

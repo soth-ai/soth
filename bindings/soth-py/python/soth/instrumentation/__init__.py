@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
-from . import _anthropic, _openai
+from . import _anthropic, _cohere, _google_genai, _mistral, _openai
 
 logger = logging.getLogger("soth.instrumentation")
 
@@ -41,6 +41,9 @@ logger = logging.getLogger("soth.instrumentation")
 _REGISTRY = {
     "openai": _openai,
     "anthropic": _anthropic,
+    "cohere": _cohere,
+    "google_genai": _google_genai,
+    "mistralai": _mistral,
 }
 
 # State tracking for idempotency. Maps provider name → bool.

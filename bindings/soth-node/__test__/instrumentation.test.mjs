@@ -196,3 +196,42 @@ test('OpenAI buildCall extracts model + messages from create() options', async (
   assert.equal(call.tools.length, 1);
   assert.equal(call.tools[0].name, 'lookup_weather');
 });
+
+test('Anthropic adapter apply returns bool — no exceptions', async () => {
+  const adapter = await import('../instrumentation/anthropic.js');
+  const result = adapter.apply();
+  assert.ok(typeof result === 'boolean');
+  if (result === true) {
+    adapter.revert();
+  }
+});
+
+test('Anthropic buildCall handles separate system field + input_schema tools', async () => {
+  const adapter = await import('../instrumentation/anthropic.js');
+  const call = adapter._buildCall([
+    {
+      model: 'claude-3-5-sonnet-latest',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'You are concise.',
+      tools: [
+        {
+          name: 'lookup',
+          description: 'Look something up',
+          input_schema: { type: 'object', properties: {} },
+        },
+      ],
+    },
+  ]);
+  assert.equal(call.provider, 'anthropic');
+  assert.equal(call.system, 'You are concise.');
+  assert.equal(call.tools.length, 1);
+  assert.equal(call.tools[0].name, 'lookup');
+});
+
+test('Anthropic chunkExtractor handles content_block_delta + message_stop', async () => {
+  const { _chunkExtractor } = await import('../instrumentation/anthropic.js');
+  const delta = _chunkExtractor({ type: 'content_block_delta', delta: { text: 'hello' } });
+  assert.equal(delta.deltaContent, 'hello');
+  const stop = _chunkExtractor({ type: 'message_stop' });
+  assert.equal(stop.finishReason, 'stop');
+});

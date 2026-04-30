@@ -22,9 +22,11 @@
 //      because the JS guard()/guardStream() helpers already detect.
 
 const openai = require('./openai.js');
+const anthropic = require('./anthropic.js');
 
 const REGISTRY = Object.freeze({
   openai,
+  anthropic,
 });
 
 const _state = Object.fromEntries(Object.keys(REGISTRY).map((k) => [k, false]));
