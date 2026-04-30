@@ -109,7 +109,9 @@ impl TypedLlmCall {
             .rev()
             .find(|m| m.role.eq_ignore_ascii_case("user"))
             .or_else(|| self.messages.last());
-        chosen.map(|m| m.content.trim().to_string()).unwrap_or_default()
+        chosen
+            .map(|m| m.content.trim().to_string())
+            .unwrap_or_default()
     }
 
     /// Conversation serialization for the `conversation_hash`. Format

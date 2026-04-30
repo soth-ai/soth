@@ -363,7 +363,9 @@ fn expected_decision(detect: &DetectResult, proxy: &ProxyContext) -> ExpectedDec
     if cost > 0.25 {
         return ExpectedDecision::RerouteHighCost;
     }
-    if proxy.identity.traffic_classification == TrafficClassification::UnknownAgent && has_credential {
+    if proxy.identity.traffic_classification == TrafficClassification::UnknownAgent
+        && has_credential
+    {
         return ExpectedDecision::Block451;
     }
     if detect.normalized.endpoint_type == EndpointType::Embedding {

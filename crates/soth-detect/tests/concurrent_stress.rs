@@ -12,7 +12,9 @@
 use std::sync::Arc;
 use std::thread;
 
-use soth_core::{CaptureMode, EndpointType, OwnedDetectBundle, SessionSnapshot, TypedLlmCall, TypedMessage};
+use soth_core::{
+    CaptureMode, EndpointType, OwnedDetectBundle, SessionSnapshot, TypedLlmCall, TypedMessage,
+};
 use soth_detect::{process_normalized, ParserRegistry};
 
 const THREADS: usize = 16;

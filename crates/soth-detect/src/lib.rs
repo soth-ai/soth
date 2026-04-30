@@ -1067,7 +1067,10 @@ mod tests {
             CaptureMode::MetadataOnly,
         );
         assert!(second.is_prefix_repeat);
-        assert_eq!(second.repeated_token_count, first.normalized.estimated_input_tokens);
+        assert_eq!(
+            second.repeated_token_count,
+            first.normalized.estimated_input_tokens
+        );
     }
 
     #[test]

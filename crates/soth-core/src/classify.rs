@@ -76,11 +76,19 @@ pub struct IdentityContext {
     /// Provider entity slug for the call. In the proxy this is filled by
     /// the gating pipeline (`matched_provider` historically); in the SDK
     /// it's declared directly by the caller (e.g. `Some("openai".into())`).
-    #[serde(default, rename = "matched_provider", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "matched_provider",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub declared_provider: Option<String>,
     /// Application entity slug for the call. Same dual-source semantics as
     /// `declared_provider`.
-    #[serde(default, rename = "matched_application", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "matched_application",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub declared_application: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Uuid>,

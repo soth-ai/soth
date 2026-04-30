@@ -109,7 +109,9 @@ impl Default for ParseConfidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParseSource {
-    Rest { provider: DetectedProvider },
+    Rest {
+        provider: DetectedProvider,
+    },
     GraphQl,
     Grpc,
     JsonRpc,
