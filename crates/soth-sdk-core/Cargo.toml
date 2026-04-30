@@ -17,6 +17,9 @@ onnx-models = ["soth-classify/onnx-models"]
 # OpenTelemetry span emission. Off by default — bindings opt in when the
 # host already has an OTel pipeline.
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+# Background HTTPS telemetry shipper. Off by default to keep workspace
+# `cargo build` fast; bindings flip it on for production builds.
+http-telemetry = ["dep:reqwest"]
 
 [dependencies]
 soth-core = { workspace = true }
@@ -36,5 +39,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
 arc-swap = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }

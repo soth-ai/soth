@@ -73,6 +73,13 @@ pub struct SothSdk {
     classify_config: soth_classify::ClassifyConfig,
     slab: Arc<DecisionSlab>,
     telemetry: Arc<TelemetryQueue>,
+    /// Background HTTPS shipper (when `http-telemetry` feature is on
+    /// AND `telemetry_endpoint` is configured). Held in a Mutex so
+    /// `shutdown` can take ownership and stop the thread cleanly; the
+    /// field is read indirectly via that path.
+    #[cfg(feature = "http-telemetry")]
+    #[allow(dead_code)]
+    shipper: std::sync::Mutex<Option<crate::shipper::TelemetryShipper>>,
 }
 
 // `SothSdk` must be `Send + Sync` for bindings to share it across host
@@ -120,6 +127,19 @@ impl SothSdk {
 
         let classify_config = soth_classify::ClassifyConfig::default();
 
+        let telemetry = Arc::new(TelemetryQueue::new());
+        #[cfg(feature = "http-telemetry")]
+        let shipper = if let Some(endpoint) = config.telemetry_endpoint.clone() {
+            Some(crate::shipper::TelemetryShipper::spawn(
+                Arc::clone(&telemetry),
+                endpoint,
+                config.api_key.clone(),
+                config.org_id.clone(),
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             detect_registry,
@@ -127,7 +147,9 @@ impl SothSdk {
             classify_bundle: ArcSwap::from_pointee((*classify_bundle).clone()),
             classify_config,
             slab: Arc::new(DecisionSlab::new()),
-            telemetry: Arc::new(TelemetryQueue::new()),
+            telemetry,
+            #[cfg(feature = "http-telemetry")]
+            shipper: std::sync::Mutex::new(shipper),
         })
     }
 
@@ -151,6 +173,10 @@ impl SothSdk {
             classify_config: soth_classify::ClassifyConfig::default(),
             slab: Arc::new(DecisionSlab::new()),
             telemetry: Arc::new(TelemetryQueue::new()),
+            // Test ctor never spawns a shipper — fixtures don't have
+            // a real cloud endpoint and we want CI hermetic.
+            #[cfg(feature = "http-telemetry")]
+            shipper: std::sync::Mutex::new(None),
         })
     }
 
@@ -321,6 +347,22 @@ impl SothSdk {
             },
             transport: TransportContext::default(),
             attribution: AttributionContext::default(),
+        }
+    }
+
+    /// Stop the background telemetry shipper (if any) and flush
+    /// pending events. Bindings call this at process exit so events
+    /// buffered in the last batch window aren't lost. Idempotent.
+    pub fn shutdown(&self) {
+        #[cfg(feature = "http-telemetry")]
+        {
+            let mut guard = match self.shipper.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(mut shipper) = guard.take() {
+                shipper.shutdown();
+            }
         }
     }
 

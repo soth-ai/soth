@@ -108,7 +108,13 @@ impl SothSdk {
     /// minimum-required field set; richer config (capture_mode,
     /// classification_mode, etc.) lands in a follow-up commit.
     #[napi(factory)]
-    pub fn create(api_key: String, org_id: String, hmac_key_env: Option<String>, hmac_key_static: Option<Buffer>) -> Result<Self> {
+    pub fn create(
+        api_key: String,
+        org_id: String,
+        hmac_key_env: Option<String>,
+        hmac_key_static: Option<Buffer>,
+        telemetry_endpoint: Option<String>,
+    ) -> Result<Self> {
         let hmac_key = match (hmac_key_env, hmac_key_static) {
             (Some(env), None) => HmacKey::FromEnv(env),
             (None, Some(buf)) => HmacKey::Static(Zeroizing::new(buf.as_ref().to_vec())),
@@ -126,10 +132,14 @@ impl SothSdk {
             }
         };
 
-        let config = SdkConfigBuilder::new()
+        let mut builder = SdkConfigBuilder::new()
             .api_key(api_key)
             .org_id(org_id)
-            .hmac_key(hmac_key)
+            .hmac_key(hmac_key);
+        if let Some(endpoint) = telemetry_endpoint {
+            builder = builder.telemetry_endpoint(endpoint);
+        }
+        let config = builder
             .build()
             .map_err(|e| Error::new(Status::InvalidArg, format!("{e}")))?;
 
@@ -230,6 +240,14 @@ impl SothSdk {
             self.inner.stream_end(obs);
         }
         Ok(())
+    }
+
+    /// Stop the background HTTPS telemetry shipper (if configured) and
+    /// flush pending events. Customers SHOULD call this at process exit
+    /// so the last batch window's events aren't lost. Idempotent.
+    #[napi]
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
     }
 
     /// Test helper — number of in-flight decisions.

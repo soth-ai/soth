@@ -67,6 +67,18 @@ impl TelemetryQueue {
         };
         guard.drain(..).collect()
     }
+
+    /// Pull up to `max` events for batched shipping. Returns an empty
+    /// vec when the queue is empty. Used by the background shipper.
+    #[allow(dead_code)] // only used when `http-telemetry` feature is on
+    pub(crate) fn drain_batch(&self, max: usize) -> Vec<TelemetryEvent> {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let take = guard.len().min(max);
+        guard.drain(..take).collect()
+    }
 }
 
 #[cfg(test)]

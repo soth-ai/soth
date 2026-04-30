@@ -34,7 +34,7 @@ class SothFlagged {
 
 let _singleton = null;
 
-function init({ apiKey, orgId, hmacKeyEnv, hmacKeyStatic }) {
+function init({ apiKey, orgId, hmacKeyEnv, hmacKeyStatic, telemetryEndpoint }) {
   if (!apiKey) throw new Error('init: apiKey required');
   if (!orgId) throw new Error('init: orgId required');
   _singleton = native.SothSdk.create(
@@ -42,7 +42,19 @@ function init({ apiKey, orgId, hmacKeyEnv, hmacKeyStatic }) {
     orgId,
     hmacKeyEnv ?? null,
     hmacKeyStatic ?? null,
+    telemetryEndpoint ?? null,
   );
+}
+
+/**
+ * Stop the background telemetry shipper and flush pending events.
+ * Customers SHOULD call this at process exit (e.g. on SIGINT / SIGTERM)
+ * so the last batch window's events aren't lost. Idempotent.
+ */
+function shutdown() {
+  if (_singleton) {
+    _singleton.shutdown();
+  }
 }
 
 function getSdk() {
@@ -138,6 +150,7 @@ async function* guardStream(iterFactory, { call, chunkExtractor } = {}) {
 
 module.exports = {
   init,
+  shutdown,
   guard,
   guardStream,
   getSdk,

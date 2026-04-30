@@ -51,6 +51,7 @@ __version__ = _soth_native.__version__
 
 __all__ = [
     "init",
+    "shutdown",
     "guard",
     "guard_stream",
     "SothBlocked",
@@ -71,12 +72,18 @@ def init(
     org_id: str,
     hmac_key_env: Optional[str] = None,
     hmac_key_static: Optional[bytes] = None,
+    telemetry_endpoint: Optional[str] = None,
 ) -> None:
     """Initialize the SOTH SDK module-level singleton.
 
     Specify exactly one of `hmac_key_env` (read from environment) or
     `hmac_key_static` (raw bytes). Production usage SHOULD prefer
     `hmac_key_env` so the key never sits in source-controlled config.
+
+    `telemetry_endpoint` (e.g.
+    `"https://api.soth.cloud/v1/edge/telemetry/batch"`) enables the
+    background HTTPS shipper. When omitted, telemetry events accumulate
+    in an in-memory queue with no transport — useful for tests.
     """
     global _singleton
     _singleton = _soth_native.SothSdk(
@@ -84,7 +91,20 @@ def init(
         org_id=org_id,
         hmac_key_env=hmac_key_env,
         hmac_key_static=hmac_key_static,
+        telemetry_endpoint=telemetry_endpoint,
     )
+
+
+def shutdown() -> None:
+    """Stop the background telemetry shipper and flush pending events.
+
+    Customers SHOULD call this at process exit (e.g. in a `finally`
+    block at the top of `main`) so the last batch window's events
+    aren't lost. Idempotent.
+    """
+    global _singleton
+    if _singleton is not None:
+        _singleton.shutdown()
 
 
 def get_sdk() -> _soth_native.SothSdk:

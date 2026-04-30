@@ -12,7 +12,10 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-soth-sdk-core = { path = "../../crates/soth-sdk-core" }
+# `http-telemetry` enables the background shipper; native Node
+# bindings always ship with it on so customers' configured
+# `telemetry_endpoint` actually reaches soth-cloud.
+soth-sdk-core = { path = "../../crates/soth-sdk-core", features = ["http-telemetry"] }
 soth-core = { workspace = true }
 zeroize = { workspace = true }
 napi = { version = "2", default-features = false, features = ["napi8", "serde-json"] }

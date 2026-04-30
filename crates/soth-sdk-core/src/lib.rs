@@ -24,6 +24,9 @@ mod sdk;
 mod slab;
 mod telemetry_queue;
 
+#[cfg(feature = "http-telemetry")]
+mod shipper;
+
 pub use call::{LlmCall, LlmChunk, LlmResponse, Message, Tool};
 pub use config::{
     BundleSource, ClassificationMode, HmacKey, SdkConfig, SdkConfigBuilder, StorageMode,

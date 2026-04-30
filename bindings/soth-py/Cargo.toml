@@ -25,7 +25,10 @@ default = []
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-soth-sdk-core = { path = "../../crates/soth-sdk-core" }
+# `http-telemetry` enables the background shipper; native Python
+# bindings always ship with it on so customers' configured
+# `telemetry_endpoint` actually reaches soth-cloud.
+soth-sdk-core = { path = "../../crates/soth-sdk-core", features = ["http-telemetry"] }
 soth-core = { workspace = true }
 zeroize = { workspace = true }
 tracing = { workspace = true }

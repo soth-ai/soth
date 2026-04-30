@@ -38,12 +38,13 @@ impl PySothSdk {
     /// these and fall back to a no-op SDK rather than crashing the
     /// host process.
     #[new]
-    #[pyo3(signature = (api_key, org_id, hmac_key_env=None, hmac_key_static=None))]
+    #[pyo3(signature = (api_key, org_id, hmac_key_env=None, hmac_key_static=None, telemetry_endpoint=None))]
     fn new(
         api_key: String,
         org_id: String,
         hmac_key_env: Option<String>,
         hmac_key_static: Option<Vec<u8>>,
+        telemetry_endpoint: Option<String>,
     ) -> PyResult<Self> {
         let hmac_key = match (hmac_key_env, hmac_key_static) {
             (Some(env), None) => HmacKey::FromEnv(env),
@@ -60,10 +61,14 @@ impl PySothSdk {
             }
         };
 
-        let config = SdkConfigBuilder::new()
+        let mut builder = SdkConfigBuilder::new()
             .api_key(api_key)
             .org_id(org_id)
-            .hmac_key(hmac_key)
+            .hmac_key(hmac_key);
+        if let Some(endpoint) = telemetry_endpoint {
+            builder = builder.telemetry_endpoint(endpoint);
+        }
+        let config = builder
             .build()
             .map_err(|error| PyValueError::new_err(format!("{error}")))?;
 
@@ -123,6 +128,13 @@ impl PySothSdk {
             inner: Arc::new(Mutex::new(Some(observation))),
         };
         Ok((decision_dict, py_obs))
+    }
+
+    /// Stop the background HTTPS telemetry shipper (if configured) and
+    /// flush pending events. Customers SHOULD call this at process exit
+    /// so the last batch window's events aren't lost. Idempotent.
+    fn shutdown(&self) {
+        self.inner.shutdown();
     }
 
     /// Drain the in-memory telemetry queue. Test-only — production
