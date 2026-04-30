@@ -62,10 +62,15 @@ jobs:
             runs-on: ubuntu-latest
             # napi-rs renamed/removed `lts-debian-musl`; the canonical
             # native-musl image is `lts-alpine`. Build runs inside the
-            # Alpine container, no cross-compile needed.
+            # Alpine container, no cross-compile needed. The image
+            # ships Rust 1.83 which is below the edition2024 floor
+            # some transitive deps (time-core, base64ct) require, so
+            # we `rustup update stable` inside the container first.
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
             build: |
               set -e
+              rustup default stable
+              rustup update stable
               cd bindings/soth-node && npm run build -- --target x86_64-unknown-linux-musl
           - target: aarch64-unknown-linux-gnu
             runs-on: ubuntu-latest
@@ -77,10 +82,13 @@ jobs:
             # x86_64 host → aarch64 musl: cross-compile via zig in the
             # napi-rs Debian+zig image. `--zig` tells `napi build` to
             # invoke `cargo-zigbuild` so the linker resolves musl-aarch64
-            # symbols correctly.
+            # symbols correctly. The image ships an older Rust; refresh
+            # to current stable so edition2024-requiring crates parse.
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-zig
             build: |
               set -e
+              rustup default stable
+              rustup update stable
               rustup target add aarch64-unknown-linux-musl
               cd bindings/soth-node && npm run build -- --target aarch64-unknown-linux-musl --zig
           - target: x86_64-apple-darwin
