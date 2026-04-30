@@ -5,6 +5,7 @@ members = [
     "crates/soth-core",
     "crates/soth-bundle",
     "crates/soth-classify",
+    "crates/soth-conformance-tests",
     "crates/soth-proxy",
     "crates/soth-telemetry",
     "crates/soth-policy",

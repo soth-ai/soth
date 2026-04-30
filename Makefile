@@ -37,6 +37,39 @@ verify-cli:
 diff:
 	$(OPS) diff '$(ENV)'
 
+.PHONY: build-classify publish-classify release-classify verify-classify
+build-classify:
+	$(OPS) build-classify '$(ENV)'
+
+publish-classify:
+	$(OPS) publish-classify '$(ENV)'
+
+release-classify:
+	$(OPS) release-classify '$(ENV)'
+
+verify-classify:
+	$(OPS) verify-classify '$(ENV)'
+
+.PHONY: import-catalog compile-catalog publish-catalog release-catalog
+import-catalog:
+	$(OPS) import-catalog '$(ENV)'
+
+compile-catalog:
+	$(OPS) compile-catalog '$(ENV)'
+
+publish-catalog:
+	$(OPS) publish-catalog '$(ENV)'
+
+release-catalog:
+	$(OPS) release-catalog '$(ENV)'
+
+.PHONY: status status-all
+status:
+	$(OPS) status '$(ENV)'
+
+status-all:
+	$(OPS) status-all
+
 .PHONY: clean-dist
 clean-dist:
 	$(OPS) clean-dist

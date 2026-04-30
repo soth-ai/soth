@@ -1460,6 +1460,7 @@ fn parse_source_label(value: soth_core::ParseSource) -> &'static str {
         soth_core::ParseSource::AgentApp => "agent_app",
         soth_core::ParseSource::Heuristic => "heuristic",
         soth_core::ParseSource::Filtered => "filtered",
+        soth_core::ParseSource::Sdk => "sdk",
     }
 }
 

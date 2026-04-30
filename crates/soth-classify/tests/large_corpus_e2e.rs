@@ -338,6 +338,7 @@ fn expected_decision(detect: &DetectResult, proxy: &ProxyContext) -> ExpectedDec
         .iter()
         .any(SensitiveArtifact::is_credential);
     let request_count = proxy
+        .identity
         .session_snapshot
         .as_ref()
         .map(|session| session.request_count)
@@ -362,7 +363,9 @@ fn expected_decision(detect: &DetectResult, proxy: &ProxyContext) -> ExpectedDec
     if cost > 0.25 {
         return ExpectedDecision::RerouteHighCost;
     }
-    if proxy.traffic_classification == TrafficClassification::UnknownAgent && has_credential {
+    if proxy.identity.traffic_classification == TrafficClassification::UnknownAgent
+        && has_credential
+    {
         return ExpectedDecision::Block451;
     }
     if detect.normalized.endpoint_type == EndpointType::Embedding {
@@ -392,12 +395,12 @@ fn apply_case_inputs(idx: usize, detect: &mut DetectResult, proxy: &mut ProxyCon
         ParseConfidence::Full
     };
 
-    proxy.traffic_classification = if idx % 11 == 0 {
+    proxy.identity.traffic_classification = if idx % 11 == 0 {
         TrafficClassification::UnknownAgent
     } else {
         TrafficClassification::ToolUsage
     };
-    proxy.capture_mode = if idx % 8 == 0 {
+    proxy.identity.capture_mode = if idx % 8 == 0 {
         CaptureMode::SensitiveArtifacts
     } else {
         CaptureMode::MetadataOnly
@@ -434,7 +437,7 @@ fn apply_case_inputs(idx: usize, detect: &mut DetectResult, proxy: &mut ProxyCon
     // meaningful coverage for unknown-agent credential controls.
     if !detect.artifacts.is_empty() && !matches!(detect.artifacts[0].kind, ArtifactKind::PrivateKey)
     {
-        proxy.traffic_classification = TrafficClassification::UnknownAgent;
+        proxy.identity.traffic_classification = TrafficClassification::UnknownAgent;
         detect.normalized.provider = "anthropic".to_string();
         detect.normalized.estimated_cost_usd = 0.03;
         detect.confidence = ParseConfidence::Full;

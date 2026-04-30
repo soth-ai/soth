@@ -53,7 +53,7 @@ uuid.workspace = true
 
 soth-core = { workspace = true }
 soth-bundle = { workspace = true }
-soth-detect = { workspace = true, features = ["tree-sitter", "intelligence"] }
+soth-detect = { workspace = true, features = ["tree-sitter-code", "intelligence", "intelligence-sqlite"] }
 soth-parse = { workspace = true }
 soth-classify = { workspace = true, features = ["policy"] }
 sqlite-vec = "0.1"

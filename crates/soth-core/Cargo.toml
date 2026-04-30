@@ -16,3 +16,11 @@ hex = "0.4"
 http = "1"
 thiserror = "1"
 zeroize = { workspace = true }
+
+# `wasm32-unknown-unknown` has no syscalls and no host-provided RNG. Both
+# `uuid` and `getrandom` need the `js` feature on this target so v4 RNG can
+# source entropy from the JS host (`crypto.getRandomValues`). On
+# wasm32-wasip1 the WASI imports cover this, so no override is needed.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1", features = ["v4", "serde", "js"] }

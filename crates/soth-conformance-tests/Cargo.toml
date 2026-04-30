@@ -1,0 +1,17 @@
+[package]
+name = "soth-conformance-tests"
+description = "Cross-lane parity harness for soth-detect + soth-classify (proxy vs SDK)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+soth-core = { workspace = true }
+soth-detect = { workspace = true, features = ["intelligence", "tree-sitter-code"] }
+soth-classify = { workspace = true, features = ["policy", "onnx-models"] }
+soth-policy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = "1"
+uuid = { workspace = true }

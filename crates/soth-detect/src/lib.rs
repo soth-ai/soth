@@ -3,8 +3,10 @@ mod engine;
 #[cfg(feature = "intelligence")]
 mod intelligence;
 #[cfg(feature = "intelligence")]
+mod intelligence_backends;
+#[cfg(feature = "intelligence-sqlite")]
 mod intelligence_store;
-#[cfg(feature = "intelligence")]
+#[cfg(feature = "intelligence-sqlite")]
 mod replay;
 pub mod sensitive;
 mod stream;
@@ -27,12 +29,16 @@ pub(crate) use soth_parse::rest;
 
 use once_cell::sync::Lazy;
 
-pub use engine::{process, process_with_registry, to_core_detect_result, ParserRegistry};
+pub use engine::{
+    process, process_normalized, process_with_registry, to_core_detect_result, ParserRegistry,
+};
 #[cfg(feature = "intelligence")]
 pub use intelligence::*;
 #[cfg(feature = "intelligence")]
+pub use intelligence_backends::{InMemoryBackend, NoopBackend};
+#[cfg(feature = "intelligence-sqlite")]
 pub use intelligence_store::IntelligenceStore;
-#[cfg(feature = "intelligence")]
+#[cfg(feature = "intelligence-sqlite")]
 pub use replay::replay_heuristic_events;
 pub use soth_parse::fingerprint::{
     classify_request, classify_request_pair, fingerprint, ClassifyPairResult, ClassifyResult,
@@ -43,6 +49,14 @@ pub use types::*;
 
 #[cfg(feature = "intelligence")]
 pub use engine::{process_with_intelligence, process_with_registry_and_intelligence};
+
+/// Trait alias for the SDK-facing intelligence backend abstraction.
+///
+/// The proxy uses the SQLite-backed [`IntelligenceStore`] (gated behind
+/// `intelligence-sqlite`); the SDK and tests use [`NoopBackend`] or
+/// [`InMemoryBackend`]. Anything implementing [`IntelligenceSink`] works.
+#[cfg(feature = "intelligence")]
+pub use intelligence::IntelligenceSink as IntelligenceBackend;
 
 // Re-export soth_core::SessionSnapshot so callers can reference it without
 // directly depending on soth_core for this type.
@@ -589,6 +603,7 @@ mod tests {
         assert_eq!(session.delta_buffer[0], "chunk response from grpc");
     }
 
+    #[cfg(feature = "intelligence-sqlite")]
     #[test]
     fn intelligence_logging_records_parse_events() {
         let bundle = bundle_fixture();
@@ -631,6 +646,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "intelligence-sqlite")]
     #[test]
     fn unknown_graphql_operation_is_aggregated_and_replay_upgrades_after_registry_update() {
         let mut bundle = bundle_fixture();
@@ -893,6 +909,221 @@ mod tests {
         } else {
             panic!("expected jsonrpc format metadata");
         }
+    }
+
+    // ── process_normalized — SDK pre-parsed entry point ──────────────────
+
+    #[test]
+    fn process_normalized_basic_openai_chat_marks_sdk_source() {
+        let bundle = bundle_fixture();
+        let registry = ParserRegistry::default();
+        let call = soth_core::TypedLlmCall {
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![soth_core::TypedMessage {
+                role: "user".to_string(),
+                content: "explain rust ownership in two sentences".to_string(),
+            }],
+            system: None,
+            tools: Vec::new(),
+            stream: false,
+            temperature: Some(0.2),
+            top_p: None,
+            max_tokens: None,
+            stop_sequences: Vec::new(),
+            endpoint_type: soth_core::EndpointType::ChatCompletion,
+        };
+
+        let out = process_normalized(
+            &registry,
+            &call,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+            CaptureMode::MetadataOnly,
+        );
+
+        assert_eq!(out.parse_source, soth_core::ParseSource::Sdk);
+        assert_eq!(out.confidence, soth_core::ParseConfidence::Full);
+        assert_eq!(out.normalized.provider, "openai");
+        assert_eq!(out.normalized.model.as_deref(), Some("gpt-4o-mini"));
+        assert!(out.normalized.is_ai_call);
+        assert!(!out.normalized.user_content_hash.is_empty());
+        assert!(!out.normalized.canonical_cache_key.is_empty());
+        assert_eq!(
+            out.normalized.user_prompt.as_deref(),
+            Some("explain rust ownership in two sentences")
+        );
+    }
+
+    #[test]
+    fn process_normalized_extracts_credentials_from_user_message() {
+        let bundle = bundle_fixture();
+        let registry = ParserRegistry::default();
+        let call = soth_core::TypedLlmCall {
+            provider: "anthropic".to_string(),
+            model: "claude-3-5-sonnet".to_string(),
+            messages: vec![soth_core::TypedMessage {
+                role: "user".to_string(),
+                content: "here is my key sk-ant-1234567890ABCDEF1234567890ABCDEF12 please review"
+                    .to_string(),
+            }],
+            system: None,
+            tools: Vec::new(),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop_sequences: Vec::new(),
+            endpoint_type: soth_core::EndpointType::ChatCompletion,
+        };
+
+        let out = process_normalized(
+            &registry,
+            &call,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+            CaptureMode::MetadataOnly,
+        );
+
+        assert!(
+            !out.artifacts.is_empty(),
+            "expected at least one credential artifact"
+        );
+    }
+
+    #[test]
+    fn process_normalized_with_tools_and_system_populates_hashes() {
+        let bundle = bundle_fixture();
+        let registry = ParserRegistry::default();
+        let call = soth_core::TypedLlmCall {
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            messages: vec![soth_core::TypedMessage {
+                role: "user".to_string(),
+                content: "look up the weather in tokyo".to_string(),
+            }],
+            system: Some("you are a helpful assistant".to_string()),
+            tools: vec![soth_core::TypedTool {
+                name: "get_weather".to_string(),
+                description: Some("Look up the weather for a city".to_string()),
+                parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#
+                    .to_string(),
+            }],
+            stream: true,
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(512),
+            stop_sequences: Vec::new(),
+            endpoint_type: soth_core::EndpointType::ChatCompletion,
+        };
+
+        let out = process_normalized(
+            &registry,
+            &call,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+            CaptureMode::MetadataOnly,
+        );
+
+        assert!(out.normalized.has_tool_definitions);
+        assert!(out.normalized.tool_definition_hash.is_some());
+        assert!(out.normalized.system_prompt_hash.is_some());
+        assert!(out.normalized.stream);
+        assert_eq!(out.normalized.max_tokens, Some(512));
+    }
+
+    #[test]
+    fn process_normalized_repeated_call_signals_prefix_repeat() {
+        let bundle = bundle_fixture();
+        let registry = ParserRegistry::default();
+        let call = soth_core::TypedLlmCall::chat("openai", "gpt-4o-mini");
+        let mut call = call;
+        call.messages.push(soth_core::TypedMessage {
+            role: "user".to_string(),
+            content: "hello world".to_string(),
+        });
+
+        // First pass — populate session snapshot from result.
+        let first = process_normalized(
+            &registry,
+            &call,
+            &bundle.as_slice(),
+            &soth_core::SessionSnapshot::default(),
+            CaptureMode::MetadataOnly,
+        );
+        assert!(!first.is_prefix_repeat);
+
+        // Second pass — feed the conversation hash back as a prior prefix.
+        let mut snapshot = soth_core::SessionSnapshot::default();
+        snapshot
+            .seen_prefix_hashes
+            .push(first.normalized.conversation_hash.clone());
+
+        let second = process_normalized(
+            &registry,
+            &call,
+            &bundle.as_slice(),
+            &snapshot,
+            CaptureMode::MetadataOnly,
+        );
+        assert!(second.is_prefix_repeat);
+        assert_eq!(
+            second.repeated_token_count,
+            first.normalized.estimated_input_tokens
+        );
+    }
+
+    #[test]
+    fn process_normalized_each_provider_variant_compiles() {
+        // Smoke check that conventional provider slugs all produce a
+        // sensible NormalizedRequest without panic. The conformance harness
+        // (PR 5) is the place that asserts byte-level parity with the proxy
+        // path; this test just guards basic shape.
+        let bundle = bundle_fixture();
+        let registry = ParserRegistry::default();
+        for provider in [
+            "openai",
+            "anthropic",
+            "cohere",
+            "google_vertex",
+            "google_genai",
+            "mistralai",
+            "azure_openai",
+        ] {
+            let mut call = soth_core::TypedLlmCall::chat(provider, "test-model");
+            call.messages.push(soth_core::TypedMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            });
+            let out = process_normalized(
+                &registry,
+                &call,
+                &bundle.as_slice(),
+                &soth_core::SessionSnapshot::default(),
+                CaptureMode::MetadataOnly,
+            );
+            assert_eq!(out.normalized.provider, provider);
+            assert_eq!(out.parse_source, soth_core::ParseSource::Sdk);
+            assert_eq!(out.confidence, soth_core::ParseConfidence::Full);
+        }
+    }
+
+    // ── from_typed_call constructor ───────────────────────────────────────
+
+    #[test]
+    fn detect_result_from_typed_call_sets_sdk_source_and_full_confidence() {
+        let normalized = soth_core::NormalizedRequest {
+            provider: "openai".to_string(),
+            ..soth_core::NormalizedRequest::default()
+        };
+        let out = soth_core::DetectResult::from_typed_call(
+            normalized,
+            Vec::new(),
+            CaptureMode::MetadataOnly,
+        );
+        assert_eq!(out.parse_source, soth_core::ParseSource::Sdk);
+        assert_eq!(out.confidence, soth_core::ParseConfidence::Full);
+        assert!(!out.is_prefix_repeat);
     }
 
     #[test]

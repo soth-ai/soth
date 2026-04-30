@@ -48,7 +48,7 @@ pub(crate) fn run(
             embed.vector.as_deref(),
             bundle.centroids.as_slice(),
             bundle.lsh_projection.as_slice(),
-            proxy_ctx.session_snapshot.as_ref(),
+            proxy_ctx.identity.session_snapshot.as_ref(),
             config,
         )
     } else {
@@ -75,7 +75,7 @@ pub(crate) fn run(
             &cluster,
             &detect_result.normalized,
             &detect_result.artifacts,
-            proxy_ctx.session_snapshot.as_ref(),
+            proxy_ctx.identity.session_snapshot.as_ref(),
         )
     } else {
         (AnomalyOutput::default(), 0)

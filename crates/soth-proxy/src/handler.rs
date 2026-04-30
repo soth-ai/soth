@@ -463,52 +463,58 @@ impl ProxyHandler {
         let emit_session_credential_alerts = session_snapshot.credential_alerts;
 
         let proxy_ctx = soth_core::ProxyContext {
-            org_id: self.org_id.clone(),
-            user_id_hmac: build_user_id_hmac(
-                &req.connection_meta,
-                self.user_hmac_secret.as_bytes(),
-            ),
-            team_id: self.team_id.clone(),
-            device_id_hash: self.device_id_hash.clone(),
-            endpoint_hash: sha256_hex(format!("{}{}", host, req.path).as_bytes()),
-            process_resolution,
-            capture_mode: outcome.capture_mode,
-            matched_provider: outcome.matched_provider.clone(),
-            matched_application: outcome.matched_application.clone(),
-            traffic_classification: outcome.traffic_classification,
-            classification_source: soth_core::ClassificationSource::Proxy,
-            session_snapshot: Some(session_snapshot),
-            request_method: Some(map_request_method(req.method.as_str())),
-            deployment_context: None,
-            precomputed_commitment_nonce: None,
-            precomputed_commitment_hash: None,
-            ja4_hash: req
-                .connection_meta
-                .tls_info
-                .as_ref()
-                .and_then(|t| t.ja4_hash.clone()),
-            tls_version: req
-                .connection_meta
-                .tls_info
-                .as_ref()
-                .and_then(|t| t.tls_version.clone()),
-            alpn_protocol: req
-                .connection_meta
-                .tls_info
-                .as_ref()
-                .and_then(|t| t.alpn.clone()),
-            h2_connection_id: req
-                .connection_meta
-                .h2_connection_id
-                .as_ref()
-                .map(|u| u.to_string()),
-            h2_stream_id: req.connection_meta.h2_stream_id,
-            connection_id: Some(connection_id),
-            bundle_trust_level: Some(soth_core::BundleTrustLevel::SignatureDisabled),
-            session_id: Some(session_result.session_id),
-            product_id,
-            surface_type,
-            is_shadow_it,
+            identity: soth_core::IdentityContext {
+                org_id: self.org_id.clone(),
+                user_id_hmac: build_user_id_hmac(
+                    &req.connection_meta,
+                    self.user_hmac_secret.as_bytes(),
+                ),
+                team_id: self.team_id.clone(),
+                device_id_hash: self.device_id_hash.clone(),
+                endpoint_hash: sha256_hex(format!("{}{}", host, req.path).as_bytes()),
+                capture_mode: outcome.capture_mode,
+                traffic_classification: outcome.traffic_classification,
+                classification_source: soth_core::ClassificationSource::Proxy,
+                session_snapshot: Some(session_snapshot),
+                declared_provider: outcome.matched_provider.clone(),
+                declared_application: outcome.matched_application.clone(),
+                session_id: Some(session_result.session_id),
+                deployment_context: None,
+                bundle_trust_level: Some(soth_core::BundleTrustLevel::SignatureDisabled),
+                precomputed_commitment_nonce: None,
+                precomputed_commitment_hash: None,
+            },
+            transport: soth_core::TransportContext {
+                connection_id: Some(connection_id),
+                request_method: Some(map_request_method(req.method.as_str())),
+                ja4_hash: req
+                    .connection_meta
+                    .tls_info
+                    .as_ref()
+                    .and_then(|t| t.ja4_hash.clone()),
+                tls_version: req
+                    .connection_meta
+                    .tls_info
+                    .as_ref()
+                    .and_then(|t| t.tls_version.clone()),
+                alpn_protocol: req
+                    .connection_meta
+                    .tls_info
+                    .as_ref()
+                    .and_then(|t| t.alpn.clone()),
+                h2_connection_id: req
+                    .connection_meta
+                    .h2_connection_id
+                    .as_ref()
+                    .map(|u| u.to_string()),
+                h2_stream_id: req.connection_meta.h2_stream_id,
+            },
+            attribution: soth_core::AttributionContext {
+                process_resolution,
+                product_id,
+                surface_type,
+                is_shadow_it,
+            },
         };
 
         let raw_body_for_commitment = match outcome.capture_mode {
