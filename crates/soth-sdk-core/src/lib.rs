@@ -17,6 +17,7 @@
 
 pub mod call;
 pub mod config;
+pub mod context;
 pub mod decision;
 pub mod error;
 
@@ -31,6 +32,7 @@ pub use call::{LlmCall, LlmChunk, LlmResponse, Message, Tool};
 pub use config::{
     BundleSource, ClassificationMode, HmacKey, SdkConfig, SdkConfigBuilder, StorageMode,
 };
+pub use context::CallContext;
 pub use decision::{
     BlockReason, BudgetKind, Decision, DecisionToken, FlagSeverity, MessageRedaction,
     MessageRedactions, RedactReason,

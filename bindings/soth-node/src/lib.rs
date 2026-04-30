@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use soth_sdk_core::{
-    BlockReason as CoreBlockReason, Decision as CoreDecision, DecisionToken, FlagSeverity,
-    HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder, SothSdk as CoreSothSdk,
-    StreamObservation as CoreStreamObservation, Tool,
+    BlockReason as CoreBlockReason, CallContext, Decision as CoreDecision, DecisionToken,
+    FlagSeverity, HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder,
+    SothSdk as CoreSothSdk, StreamObservation as CoreStreamObservation, Tool,
 };
 use soth_core::EndpointType;
 use zeroize::Zeroizing;
@@ -78,6 +78,15 @@ pub struct JsLlmCall {
     pub system: Option<String>,
     pub tools: Option<Vec<JsTool>>,
     pub stream: Option<bool>,
+}
+
+#[napi(object)]
+pub struct JsCallContext {
+    pub user_id_hmac: Option<String>,
+    pub team_id: Option<String>,
+    pub device_id_hash: Option<String>,
+    pub session_id: Option<String>,
+    pub request_id: Option<String>,
 }
 
 #[napi(object)]
@@ -154,11 +163,13 @@ impl SothSdk {
 
     /// Synchronous decision path. Returns a typed `JsDecision` that the
     /// JS shim translates into either a token (Allow / Flag) or a
-    /// thrown `SothBlocked` (Block / Redact).
+    /// thrown `SothBlocked` (Block / Redact). `context` is optional;
+    /// the JS shim pulls the current AsyncLocalStorage value.
     #[napi]
-    pub fn pre_call(&self, call: JsLlmCall) -> Result<JsDecision> {
+    pub fn pre_call(&self, call: JsLlmCall, context: Option<JsCallContext>) -> Result<JsDecision> {
         let llm_call = build_llm_call(call);
-        let decision = self.inner.pre_call(&llm_call);
+        let ctx = build_call_context(context);
+        let decision = self.inner.pre_call_with_context(&llm_call, &ctx);
         Ok(decision_to_js(&decision))
     }
 
@@ -181,9 +192,14 @@ impl SothSdk {
     /// with `streamEnd(token)`. The observation lives inside the SDK
     /// keyed by token, so the FFI boundary stays scalar-only.
     #[napi]
-    pub fn stream_begin(&self, call: JsLlmCall) -> Result<JsDecision> {
+    pub fn stream_begin(
+        &self,
+        call: JsLlmCall,
+        context: Option<JsCallContext>,
+    ) -> Result<JsDecision> {
         let llm_call = build_llm_call(call);
-        let (decision, observation) = self.inner.stream_begin(&llm_call);
+        let ctx = build_call_context(context);
+        let (decision, observation) = self.inner.stream_begin_with_context(&llm_call, &ctx);
         let token_raw = decision.token().raw();
         // Sentinel tokens (SLAB_FULL / SENTINEL_FAIL_OPEN) skip slab
         // bookkeeping — there's no observation to stash because pre_call
@@ -278,6 +294,29 @@ impl SothSdk {
 
 fn is_sentinel_raw(raw: u64) -> bool {
     raw == DecisionToken::SLAB_FULL.raw() || raw == DecisionToken::SENTINEL_FAIL_OPEN.raw()
+}
+
+fn build_call_context(ctx: Option<JsCallContext>) -> CallContext {
+    let Some(ctx) = ctx else {
+        return CallContext::default();
+    };
+    let mut out = CallContext::new();
+    if let Some(v) = ctx.user_id_hmac {
+        out = out.with_user_id_hmac(v);
+    }
+    if let Some(v) = ctx.team_id {
+        out = out.with_team_id(v);
+    }
+    if let Some(v) = ctx.device_id_hash {
+        out = out.with_device_id_hash(v);
+    }
+    if let Some(v) = ctx.session_id {
+        out = out.with_session_id(v);
+    }
+    if let Some(v) = ctx.request_id {
+        out = out.with_request_id(v);
+    }
+    out
 }
 
 // ── conversions ──────────────────────────────────────────────────────

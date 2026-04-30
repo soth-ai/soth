@@ -37,7 +37,9 @@ Quick start:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, TypeVar
+import contextvars
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional, TypeVar
 
 from . import _soth_native  # type: ignore[attr-defined]
 from .exceptions import (
@@ -54,10 +56,57 @@ __all__ = [
     "shutdown",
     "guard",
     "guard_stream",
+    "context",
     "SothBlocked",
     "SothFlagged",
     "BlockReason",
 ]
+
+
+# Per-call context lives in a contextvars.ContextVar so it survives
+# `asyncio` task switches naturally — async code that awaits inside a
+# `with soth.context(...)` block sees the same context after the await.
+_current_context: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
+    "soth_current_context", default={}
+)
+
+
+@contextmanager
+def context(
+    *,
+    user_id_hmac: Optional[str] = None,
+    team_id: Optional[str] = None,
+    device_id_hash: Optional[str] = None,
+    session_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> Iterator[None]:
+    """Override identity fields for any `guard()` / `guard_stream()`
+    calls inside this block.
+
+    Uses `contextvars` so async tasks awaited inside the block see the
+    same context. Nested `with soth.context(...)` blocks merge — fields
+    not set in the inner block fall through to the outer block.
+
+    `user_id_hmac` MUST be the HMAC of the customer's user ID,
+    computed by the customer's code using their `SOTH_HMAC_KEY`.
+    The SDK never sees plaintext user IDs.
+    """
+    current = dict(_current_context.get())
+    if user_id_hmac is not None:
+        current["user_id_hmac"] = user_id_hmac
+    if team_id is not None:
+        current["team_id"] = team_id
+    if device_id_hash is not None:
+        current["device_id_hash"] = device_id_hash
+    if session_id is not None:
+        current["session_id"] = session_id
+    if request_id is not None:
+        current["request_id"] = request_id
+    token = _current_context.set(current)
+    try:
+        yield
+    finally:
+        _current_context.reset(token)
 
 # Module-level singleton. Bindings keep one SothSdk per process; per-call
 # context (org/user/team override) is layered on top via `with_context`.
@@ -134,7 +183,8 @@ def guard(
     narrow so it can be applied per-call with minimal disruption.
     """
     sdk = get_sdk()
-    decision = sdk.pre_call(call)
+    ctx = _current_context.get() or None
+    decision = sdk.pre_call(call, ctx)
     kind = decision["kind"]
     token = decision["token"]
 
@@ -189,7 +239,8 @@ async def guard_stream(
     completion or exception.
     """
     sdk = get_sdk()
-    decision, observation = sdk.stream_begin(call)
+    ctx = _current_context.get() or None
+    decision, observation = sdk.stream_begin(call, ctx)
     kind = decision["kind"]
 
     if kind == _soth_native.DECISION_KIND_BLOCK:

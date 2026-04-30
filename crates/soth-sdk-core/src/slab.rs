@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use soth_core::{ArtifactKind, DetectResult};
 
+use crate::context::CallContext;
 use crate::decision::DecisionToken;
 
 const SLAB_CAPACITY: usize = 4096;
@@ -39,6 +40,10 @@ pub(crate) struct DecisionContext {
     pub call_model: String,
     #[allow(dead_code)] // Phase-1: cloud-classify path serializes user_content
     pub user_content: Option<String>,
+    /// Resolved per-call context — `CallContext` overrides merged with
+    /// `SdkConfig` defaults at `pre_call` time. Carried so `post_call`
+    /// uses the same identity values it asserted at decision time.
+    pub resolved_context: CallContext,
 }
 
 /// Pre-summarized artifact view so `post_call` doesn't re-walk the
@@ -249,6 +254,7 @@ mod tests {
             call_provider: "openai".to_string(),
             call_model: "gpt-4o-mini".to_string(),
             user_content: None,
+            resolved_context: CallContext::default(),
         }
     }
 

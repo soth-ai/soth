@@ -10,6 +10,15 @@ export interface InitOptions {
    */
   hmacKeyEnv?: string;
   hmacKeyStatic?: Buffer;
+  telemetryEndpoint?: string;
+}
+
+export interface CallContextOverrides {
+  userIdHmac?: string;
+  teamId?: string;
+  deviceIdHash?: string;
+  sessionId?: string;
+  requestId?: string;
 }
 
 export interface Message {
@@ -70,9 +79,14 @@ export interface GuardStreamOptions<TChunk = unknown> {
 }
 
 export function init(options: InitOptions): void;
+export function shutdown(): void;
 export function guard<T>(callFn: () => Promise<T>, options: GuardOptions): Promise<T>;
 export function guardStream<TChunk = unknown>(
   iterFactory: () => AsyncIterable<TChunk> | Promise<AsyncIterable<TChunk>>,
   options: GuardStreamOptions<TChunk>,
 ): AsyncIterable<TChunk>;
+export function withContext<T>(
+  overrides: CallContextOverrides,
+  fn: () => Promise<T>,
+): Promise<T>;
 export function getSdk(): unknown;

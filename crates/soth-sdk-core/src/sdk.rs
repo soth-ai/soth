@@ -28,6 +28,7 @@ use soth_core::{
 
 use crate::call::{LlmCall, LlmChunk, LlmResponse};
 use crate::config::{BundleSource, ClassificationMode, SdkConfig};
+use crate::context::CallContext;
 use crate::decision::{
     BlockReason, BudgetKind, Decision, DecisionToken, FlagSeverity, MessageRedactions,
 };
@@ -181,13 +182,21 @@ impl SothSdk {
     }
 
     /// Synchronous decision path. Returns within 5 ms p99 (binding-side
-    /// histograms gate this in CI).
+    /// histograms gate this in CI). Convenience: equivalent to
+    /// `pre_call_with_context(call, &CallContext::default())`.
+    pub fn pre_call(&self, call: &LlmCall) -> Decision {
+        self.pre_call_with_context(call, &CallContext::default())
+    }
+
+    /// Synchronous decision path with per-call identity overrides.
+    /// Bindings expose this through language-native context primitives
+    /// (Python `contextvars`, Node `AsyncLocalStorage`).
     ///
     /// Allowed work (per spec §7.1):
     /// - artifact scan via `process_normalized`
     /// - artifact-conditioned system rules
     /// - artifact-conditioned org rules
-    pub fn pre_call(&self, call: &LlmCall) -> Decision {
+    pub fn pre_call_with_context(&self, call: &LlmCall, ctx: &CallContext) -> Decision {
         let detect_bundle = self.detect_bundle.load_full();
         let detect = soth_detect::process_normalized(
             self.detect_registry.as_ref(),
@@ -198,6 +207,7 @@ impl SothSdk {
         );
 
         let summary = ArtifactsSummary::from_artifacts(&detect.artifacts);
+        let resolved_ctx = self.resolve_context(ctx);
 
         // Sync block path — credential / private-key artifacts are an
         // unconditional block in v0. Phase-1 expands this with full
@@ -205,7 +215,7 @@ impl SothSdk {
         if let Some(reason) = detect.artifacts.iter().find_map(|a| {
             artifact_block_reason(&a.kind, a.severity)
         }) {
-            let ctx = DecisionContext {
+            let slab_ctx = DecisionContext {
                 created_at: std::time::Instant::now(),
                 generation: 0,
                 detect: detect.clone(),
@@ -213,13 +223,14 @@ impl SothSdk {
                 call_provider: call.provider.clone(),
                 call_model: call.model.clone(),
                 user_content: detect.normalized.user_prompt.clone(),
+                resolved_context: resolved_ctx,
             };
-            let token = self.slab.allocate(ctx);
+            let token = self.slab.allocate(slab_ctx);
             return Decision::Block { token, reason };
         }
 
         // Allow path — stash the partial state for post_call enrichment.
-        let ctx = DecisionContext {
+        let slab_ctx = DecisionContext {
             created_at: std::time::Instant::now(),
             generation: 0,
             detect,
@@ -227,9 +238,23 @@ impl SothSdk {
             call_provider: call.provider.clone(),
             call_model: call.model.clone(),
             user_content: None, // populated on consume; we cloned detect so re-derive there
+            resolved_context: resolved_ctx,
         };
-        let token = self.slab.allocate(ctx);
+        let token = self.slab.allocate(slab_ctx);
         Decision::Allow { token }
+    }
+
+    /// Merge per-call overrides with config defaults to produce the
+    /// fully-resolved CallContext used by `post_call` enrichment.
+    fn resolve_context(&self, ctx: &CallContext) -> CallContext {
+        let mut resolved = ctx.clone();
+        if resolved.team_id.is_none() {
+            resolved.team_id = self.config.default_team_id.clone();
+        }
+        if resolved.device_id_hash.is_none() {
+            resolved.device_id_hash = self.config.default_device_id_hash.clone();
+        }
+        resolved
     }
 
     /// Async-ish enrichment + telemetry emission. Bindings spawn this
@@ -261,7 +286,16 @@ impl SothSdk {
     /// Streaming counterpart to `pre_call`. Returns the decision and an
     /// observation handle for `stream_chunk` / `stream_end`.
     pub fn stream_begin(&self, call: &LlmCall) -> (Decision, StreamObservation) {
-        let decision = self.pre_call(call);
+        self.stream_begin_with_context(call, &CallContext::default())
+    }
+
+    /// Streaming counterpart to `pre_call_with_context`.
+    pub fn stream_begin_with_context(
+        &self,
+        call: &LlmCall,
+        ctx: &CallContext,
+    ) -> (Decision, StreamObservation) {
+        let decision = self.pre_call_with_context(call, ctx);
         let token = decision.token();
         (decision, StreamObservation::new(token))
     }
@@ -318,20 +352,23 @@ impl SothSdk {
     }
 
     fn build_proxy_context(&self, ctx: &DecisionContext) -> ProxyContext {
+        let resolved = &ctx.resolved_context;
+        let user_id_hmac = resolved
+            .user_id_hmac
+            .clone()
+            .unwrap_or_else(|| String::from("sdk-anonymous"));
+        let team_id = resolved.team_id.clone().unwrap_or_default();
+        let device_id_hash = resolved.device_id_hash.clone().unwrap_or_default();
+        let session_id = resolved
+            .session_id
+            .as_ref()
+            .and_then(|s| uuid::Uuid::parse_str(s).ok());
         ProxyContext {
             identity: IdentityContext {
                 org_id: self.config.org_id.clone(),
-                user_id_hmac: self
-                    .config
-                    .default_team_id
-                    .clone()
-                    .unwrap_or_else(|| String::from("sdk-anonymous")),
-                team_id: self.config.default_team_id.clone().unwrap_or_default(),
-                device_id_hash: self
-                    .config
-                    .default_device_id_hash
-                    .clone()
-                    .unwrap_or_default(),
+                user_id_hmac,
+                team_id,
+                device_id_hash,
                 endpoint_hash: String::new(),
                 capture_mode: self.config.capture_mode,
                 traffic_classification: TrafficClassification::ToolUsage,
@@ -339,7 +376,7 @@ impl SothSdk {
                 session_snapshot: Some(SessionSnapshot::default()),
                 declared_provider: Some(ctx.call_provider.clone()),
                 declared_application: None,
-                session_id: None,
+                session_id,
                 deployment_context: None,
                 bundle_trust_level: None,
                 precomputed_commitment_nonce: None,

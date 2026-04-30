@@ -15,9 +15,9 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use soth_sdk_core::{
-    BlockReason as CoreBlockReason, Decision as CoreDecision, DecisionToken, FlagSeverity,
-    HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder, SothSdk as CoreSothSdk,
-    StreamObservation as CoreStreamObservation, Tool,
+    BlockReason as CoreBlockReason, CallContext, Decision as CoreDecision, DecisionToken,
+    FlagSeverity, HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder,
+    SothSdk as CoreSothSdk, StreamObservation as CoreStreamObservation, Tool,
 };
 use soth_core::EndpointType;
 use zeroize::Zeroizing;
@@ -85,11 +85,18 @@ impl PySothSdk {
     /// Returns a `dict` describing the decision; the Python wrapper in
     /// `soth/__init__.py` translates this into either a token (`Allow` /
     /// `Flag`) or a raised `SothBlocked` exception (`Block` /
-    /// `Redact` paths).
-    #[pyo3(signature = (call_dict))]
-    fn pre_call<'py>(&self, py: Python<'py>, call_dict: &Bound<'py, PyDict>) -> PyResult<Bound<'py, PyDict>> {
+    /// `Redact` paths). `context_dict` is optional; the Python wrapper
+    /// pulls the current `contextvars` value before each call.
+    #[pyo3(signature = (call_dict, context_dict=None))]
+    fn pre_call<'py>(
+        &self,
+        py: Python<'py>,
+        call_dict: &Bound<'py, PyDict>,
+        context_dict: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let call = build_llm_call(call_dict)?;
-        let decision = self.inner.pre_call(&call);
+        let ctx = build_call_context(context_dict)?;
+        let decision = self.inner.pre_call_with_context(&call, &ctx);
         decision_to_pydict(py, &decision)
     }
 
@@ -114,14 +121,16 @@ impl PySothSdk {
     /// the provider's stream and feeds chunks via `observation.chunk(...)`,
     /// then calls `observation.end()` on terminal chunk to consume the
     /// token and emit telemetry.
-    #[pyo3(signature = (call_dict))]
+    #[pyo3(signature = (call_dict, context_dict=None))]
     fn stream_begin<'py>(
         &self,
         py: Python<'py>,
         call_dict: &Bound<'py, PyDict>,
+        context_dict: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<(Bound<'py, PyDict>, PyStreamObservation)> {
         let call = build_llm_call(call_dict)?;
-        let (decision, observation) = self.inner.stream_begin(&call);
+        let ctx = build_call_context(context_dict)?;
+        let (decision, observation) = self.inner.stream_begin_with_context(&call, &ctx);
         let decision_dict = decision_to_pydict(py, &decision)?;
         let py_obs = PyStreamObservation {
             sdk: Arc::clone(&self.inner),
@@ -406,6 +415,39 @@ fn build_llm_call(dict: &Bound<'_, PyDict>) -> PyResult<LlmCall> {
         stop_sequences: Vec::new(),
         endpoint_type: EndpointType::ChatCompletion,
     })
+}
+
+fn build_call_context(dict: Option<&Bound<'_, PyDict>>) -> PyResult<CallContext> {
+    let Some(dict) = dict else {
+        return Ok(CallContext::default());
+    };
+    let mut ctx = CallContext::default();
+    if let Some(v) = dict.get_item("user_id_hmac")? {
+        if !v.is_none() {
+            ctx.user_id_hmac = Some(v.extract()?);
+        }
+    }
+    if let Some(v) = dict.get_item("team_id")? {
+        if !v.is_none() {
+            ctx.team_id = Some(v.extract()?);
+        }
+    }
+    if let Some(v) = dict.get_item("device_id_hash")? {
+        if !v.is_none() {
+            ctx.device_id_hash = Some(v.extract()?);
+        }
+    }
+    if let Some(v) = dict.get_item("session_id")? {
+        if !v.is_none() {
+            ctx.session_id = Some(v.extract()?);
+        }
+    }
+    if let Some(v) = dict.get_item("request_id")? {
+        if !v.is_none() {
+            ctx.request_id = Some(v.extract()?);
+        }
+    }
+    Ok(ctx)
 }
 
 fn response_from_pydict(_dict: Option<&Bound<'_, PyDict>>) -> PyResult<LlmResponse> {

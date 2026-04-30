@@ -12,10 +12,54 @@
 // The exception inheritance MUST stay flat — `SothBlocked extends Error`.
 // If anyone changes that, `__test__/blocked-propagates.test.mjs` fails.
 
+const { AsyncLocalStorage } = require('node:async_hooks');
+
 const native = require('./soth-node.darwin-arm64.node'); /* eslint-disable-line global-require */
 // Real builds ship per-arch binaries via @napi-rs/cli; the line above
 // is a placeholder for local dev. Production loader logic lands in a
 // follow-up commit.
+
+// Per-call context lives in AsyncLocalStorage so async functions
+// awaited inside `withContext` see the same context after each await.
+const _contextStore = new AsyncLocalStorage();
+
+function _currentContext() {
+  return _contextStore.getStore() ?? null;
+}
+
+/**
+ * Run `fn` with per-call identity overrides applied to every
+ * `guard()` / `guardStream()` inside it. Async-aware via
+ * AsyncLocalStorage. Nested `withContext` calls merge — fields not
+ * set in the inner block fall through to the outer block.
+ *
+ * `userIdHmac` MUST be the HMAC of the customer's user ID, computed
+ * by the customer's code using their `SOTH_HMAC_KEY`. The SDK never
+ * sees plaintext user IDs.
+ */
+async function withContext(overrides, fn) {
+  const current = _contextStore.getStore() ?? {};
+  const merged = { ...current };
+  for (const k of ['userIdHmac', 'teamId', 'deviceIdHash', 'sessionId', 'requestId']) {
+    if (overrides[k] !== undefined) merged[k] = overrides[k];
+  }
+  return _contextStore.run(merged, fn);
+}
+
+function _currentNativeContext() {
+  const ctx = _currentContext();
+  if (!ctx) return null;
+  // napi-rs object key names match the Rust JsCallContext field
+  // names (snake_case). The JS-facing helper uses camelCase for
+  // ergonomics; we translate at the FFI boundary.
+  return {
+    userIdHmac: ctx.userIdHmac ?? null,
+    teamId: ctx.teamId ?? null,
+    deviceIdHash: ctx.deviceIdHash ?? null,
+    sessionId: ctx.sessionId ?? null,
+    requestId: ctx.requestId ?? null,
+  };
+}
 
 class SothBlocked extends Error {
   constructor(decisionId, reason) {
@@ -66,7 +110,7 @@ function getSdk() {
 
 async function guard(callFn, { call }) {
   const sdk = getSdk();
-  const decision = sdk.preCall(call);
+  const decision = sdk.preCall(call, _currentNativeContext());
   const { kind, token } = decision;
 
   if (kind === 'block') {
@@ -123,7 +167,7 @@ async function* guardStream(iterFactory, { call, chunkExtractor } = {}) {
   if (!call) throw new Error('guardStream: call required');
   const extractor = chunkExtractor ?? defaultOpenAIChunkExtractor;
   const sdk = getSdk();
-  const decision = sdk.streamBegin(call);
+  const decision = sdk.streamBegin(call, _currentNativeContext());
   const { kind, token } = decision;
 
   if (kind === 'block') {
@@ -153,6 +197,7 @@ module.exports = {
   shutdown,
   guard,
   guardStream,
+  withContext,
   getSdk,
   SothBlocked,
   SothFlagged,
