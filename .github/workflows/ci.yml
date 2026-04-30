@@ -35,3 +35,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --lib --bins
+
+  conformance:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The conformance harness runs every fixture through proxy lane,
+      # SDK direct lane, and SDK facade lane. Strict-parity failures
+      # name the diverging field. See crates/soth-conformance-tests/README.md.
+      - run: cargo test -p soth-conformance-tests --test parity
+
+  wasm:
+    # Locks the WASM target build matrix that Plan 1 PR 1 committed
+    # to. Both targets MUST stay green for soth-detect and soth-classify
+    # with --no-default-features. Failures here mean an SDK-blocking
+    # native-dep regression slipped in.
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip1, wasm32-unknown-unknown]
+        crate: [soth-detect, soth-classify]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.crate }}
+      - run: cargo build -p ${{ matrix.crate }} --no-default-features --target ${{ matrix.target }}
+
+  bindings-build-check:
+    # Compile-check both bindings on Linux. Full per-arch wheel/binary
+    # builds happen in python-wheels.yml + node-binaries.yml; this job
+    # just verifies the FFI surface still compiles.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p soth-py
+      - run: cargo build -p soth-node

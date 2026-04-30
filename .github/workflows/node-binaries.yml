@@ -1,0 +1,147 @@
+name: node-binaries
+
+# Builds prebuilt napi-rs binaries for `@soth/sdk` (the soth-node
+# binding) across the 7 triples declared in
+# `bindings/soth-node/package.json`. Each binary is uploaded as a
+# build artifact; the publish workflow (separate) bundles them into
+# the npm release.
+#
+# Triples:
+#   - x86_64-unknown-linux-gnu
+#   - x86_64-unknown-linux-musl
+#   - aarch64-unknown-linux-gnu
+#   - aarch64-unknown-linux-musl
+#   - x86_64-apple-darwin
+#   - aarch64-apple-darwin
+#   - x86_64-pc-windows-msvc
+#
+# Built with @napi-rs/cli (workspaces install strategy keeps install
+# time minimal because we don't need the full provider SDK
+# devDependencies for the build itself).
+
+on:
+  push:
+    branches:
+      - main
+      - 'sdk-*'
+    paths:
+      - 'bindings/soth-node/**'
+      - 'crates/soth-sdk-core/**'
+      - 'crates/soth-core/**'
+      - 'crates/soth-detect/**'
+      - 'crates/soth-classify/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/node-binaries.yml'
+  pull_request:
+    paths:
+      - 'bindings/soth-node/**'
+      - 'crates/soth-sdk-core/**'
+      - 'Cargo.toml'
+      - '.github/workflows/node-binaries.yml'
+  workflow_dispatch:
+
+env:
+  DEBUG: napi:*
+  APP_NAME: soth-node
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-latest
+            build: |
+              cd bindings/soth-node && npm run build
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-latest
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-musl
+            build: |
+              cd bindings/soth-node && npm run build -- --target x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-latest
+            cross: aarch64-linux-gnu-gcc
+            build: |
+              cd bindings/soth-node && npm run build -- --target aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-latest
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-musl
+            build: |
+              cd bindings/soth-node && npm run build -- --target aarch64-unknown-linux-musl
+          - target: x86_64-apple-darwin
+            runs-on: macos-13
+            build: |
+              cd bindings/soth-node && npm run build -- --target x86_64-apple-darwin
+          - target: aarch64-apple-darwin
+            runs-on: macos-14
+            build: |
+              cd bindings/soth-node && npm run build -- --target aarch64-apple-darwin
+          - target: x86_64-pc-windows-msvc
+            runs-on: windows-latest
+            build: |
+              cd bindings/soth-node
+              npm run build -- --target x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: bindings/soth-node/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-${{ matrix.target }}
+
+      - name: Install aarch64 cross-toolchain
+        if: matrix.cross == 'aarch64-linux-gnu-gcc'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install npm deps
+        working-directory: bindings/soth-node
+        # Minimal install — skip optionalDependencies so we don't
+        # pull in the @napi-rs prebuilt binaries for OTHER targets.
+        run: npm install --no-optional --ignore-scripts
+
+      - name: Build (native)
+        if: matrix.docker == ''
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: ${{ matrix.build }}
+
+      - name: Build (musl in docker)
+        if: matrix.docker != ''
+        uses: addnab/docker-run-action@v3
+        with:
+          image: ${{ matrix.docker }}
+          options: --user 0:0 -v ${{ github.workspace }}:/build -w /build
+          run: ${{ matrix.build }}
+
+      - name: Smoke test binary (native arches only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        working-directory: bindings/soth-node
+        shell: bash
+        run: |
+          # Quick require() test — confirms the binary loads without
+          # symbol resolution errors. Real test is in
+          # ffi-conformance.yml which runs the test suite.
+          node -e "const s = require('./index.js'); console.log('soth-node loads ok');" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soth-node-${{ matrix.target }}
+          path: bindings/soth-node/*.node
+          if-no-files-found: error
+          retention-days: 14

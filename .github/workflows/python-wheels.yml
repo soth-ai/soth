@@ -1,0 +1,143 @@
+name: python-wheels
+
+# Builds wheels for `soth` (the soth-py PyO3 binding) across the
+# supported platform/arch matrix. Triggered on:
+#   - push to main / sdk-* branches
+#   - pull requests touching the binding
+#   - manual workflow_dispatch (for ad-hoc verification)
+#
+# Wheels are abi3-py310 — one wheel per platform×arch covers
+# Python 3.10+, so the matrix is 5 jobs (not 5×N-Python-versions).
+#
+# This workflow does NOT publish to PyPI. Publication is a separate
+# release workflow that gates on artifacts uploaded here.
+
+on:
+  push:
+    branches:
+      - main
+      - 'sdk-*'
+    paths:
+      - 'bindings/soth-py/**'
+      - 'crates/soth-sdk-core/**'
+      - 'crates/soth-core/**'
+      - 'crates/soth-detect/**'
+      - 'crates/soth-classify/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/python-wheels.yml'
+  pull_request:
+    paths:
+      - 'bindings/soth-py/**'
+      - 'crates/soth-sdk-core/**'
+      - 'Cargo.toml'
+      - '.github/workflows/python-wheels.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.platform.os }} / ${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # Linux x86_64 — manylinux2014 via cibuildwheel
+          - { os: linux, runs-on: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: '2014' }
+          # Linux aarch64 — same manylinux base, cross via QEMU
+          - { os: linux, runs-on: ubuntu-latest, target: aarch64-unknown-linux-gnu, manylinux: '2014' }
+          # macOS Intel
+          - { os: macos, runs-on: macos-13, target: x86_64-apple-darwin, manylinux: '' }
+          # macOS Apple Silicon
+          - { os: macos, runs-on: macos-14, target: aarch64-apple-darwin, manylinux: '' }
+          # Windows
+          - { os: windows, runs-on: windows-latest, target: x86_64-pc-windows-msvc, manylinux: '' }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up QEMU (for aarch64 cross)
+        if: matrix.platform.target == 'aarch64-unknown-linux-gnu'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: py-${{ matrix.platform.target }}
+          # Restrict cache to the binding's manifest path so other
+          # workspace changes don't invalidate this job's cache too
+          # aggressively.
+          workspaces: |
+            bindings/soth-py
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          # When manylinux is set, maturin runs inside the manylinux
+          # docker image so wheels are universally compatible.
+          manylinux: ${{ matrix.platform.manylinux }}
+          working-directory: bindings/soth-py
+          # `extension-module` is required for the actual abi3 wheel
+          # (workspace `cargo build` builds without it; only the wheel
+          # path enables Python-runtime-supplied symbols).
+          rust-toolchain: stable
+          docker-options: ${{ matrix.platform.os == 'linux' && '-e PYO3_CROSS_LIB_DIR=/opt/python/cp310-cp310/lib' || '' }}
+          before-script-linux: |
+            yum install -y openssl-devel || apt-get update && apt-get install -y libssl-dev pkg-config
+
+      - name: Inspect wheel
+        if: matrix.platform.os != 'windows'
+        run: ls -la bindings/soth-py/dist/
+
+      - name: Inspect wheel (windows)
+        if: matrix.platform.os == 'windows'
+        run: dir bindings\soth-py\dist\
+
+      - name: Smoke test wheel (native arches only)
+        if: matrix.platform.target == 'x86_64-unknown-linux-gnu' || matrix.platform.target == 'aarch64-apple-darwin' || matrix.platform.target == 'x86_64-apple-darwin' || matrix.platform.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --find-links bindings/soth-py/dist soth
+          python -c "import soth; print('soth', soth.__version__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soth-py-${{ matrix.platform.target }}
+          path: bindings/soth-py/dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  sdist:
+    # Source distribution — built once on Linux. Required so customers
+    # on unsupported platforms can build from source as a fallback.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: bindings/soth-py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soth-py-sdist
+          path: bindings/soth-py/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
