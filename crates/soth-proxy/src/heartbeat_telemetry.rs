@@ -126,6 +126,7 @@ static RUNTIME_FD_HARD_LIMIT: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_EMFILE_FORWARD_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_POLICY_ENFORCED_FALSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_CLASSIFY_OVERLOAD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_CLASSIFY_PANIC_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_CLASSIFY_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_DB_WRITE_QUEUE_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_BUNDLE_TRUST_LEVEL: AtomicU64 = AtomicU64::new(0);
@@ -167,6 +168,15 @@ pub fn record_policy_enforced_false() {
 
 pub fn record_classify_overload_drop() {
     RUNTIME_CLASSIFY_OVERLOAD_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Counter for events dropped because the classify worker panicked or
+/// returned a JoinError. Distinct from `record_classify_overload_drop`
+/// (saturation): this surfaces actual classify-pipeline crashes which
+/// should be near zero in a healthy fleet. Each increment corresponds
+/// to a `tracing::warn!` from `spawn_classify_task`.
+pub fn record_classify_panic_drop() {
+    RUNTIME_CLASSIFY_PANIC_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn record_classify_in_flight_started() {
@@ -270,6 +280,10 @@ pub fn heartbeat_telemetry_snapshot() -> HeartbeatTelemetry {
     counters.insert(
         "edge.runtime.classify_overload_dropped_total".to_string(),
         RUNTIME_CLASSIFY_OVERLOAD_DROPPED_TOTAL.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "edge.runtime.classify_panic_dropped_total".to_string(),
+        RUNTIME_CLASSIFY_PANIC_DROPPED_TOTAL.load(Ordering::Relaxed),
     );
     counters.insert(
         "edge.runtime.classify_in_flight".to_string(),

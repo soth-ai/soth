@@ -419,10 +419,12 @@ pub fn spawn_classify_task(
                     result
                 }
                 Err(error) => {
+                    crate::heartbeat_telemetry::record_classify_panic_drop();
                     warn!(
                         connection_id = %connection_id,
                         error = %error,
-                        "classification worker failed before completion"
+                        "classification worker failed before completion; \
+                         event dropped (counted in classify_panic_dropped_total)"
                     );
                     if let Some(ref store) = pending_emit_store {
                         store.remove(&connection_id);
