@@ -367,9 +367,15 @@ async fn supervise_proxy(
     // First restart after a detected wake gets a longer startup grace
     // window — see WAKE_LISTENER_STARTUP_TIMEOUT_SECS for the rationale.
     let mut next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
+    // Watches for primary-network changes (wifi switch, captive-portal
+    // address reassignment) and triggers a graceful child rotation so the
+    // upstream connection pool isn't left bound to the old gateway.
+    let mut network_change_rx = super::network_watcher::spawn();
 
     loop {
-        let exit_reason = wait_until_exit_or_unhealthy(child, expected_port, foreground).await;
+        let exit_reason =
+            wait_until_exit_or_unhealthy(child, expected_port, foreground, &mut network_change_rx)
+                .await;
 
         // Detect wake-from-sleep before applying restart-budget logic. A long
         // wall-clock gap between supervisor iterations almost always means
@@ -406,7 +412,7 @@ async fn supervise_proxy(
                 warn!("soth-proxy exited with status {status}");
             }
             ProxyExit::Reload => {
-                info!("SIGHUP received — performing graceful child rotation");
+                info!("reload requested (SIGHUP or network change) — performing graceful child rotation");
                 let mut new_child = spawn_proxy_process(config_path, listener_fd)
                     .await
                     .context("spawn new soth-proxy for graceful rotation")?;
@@ -492,6 +498,7 @@ async fn wait_until_exit_or_unhealthy(
     child: &mut Child,
     expected_port: u16,
     foreground: bool,
+    network_change_rx: &mut tokio::sync::watch::Receiver<u64>,
 ) -> ProxyExit {
     let health_monitor = monitor_listener_health(expected_port);
     tokio::pin!(health_monitor);
@@ -505,6 +512,7 @@ async fn wait_until_exit_or_unhealthy(
             }
             _ = tokio::signal::ctrl_c() => ProxyExit::Signal,
             _ = &mut health_monitor => ProxyExit::Unhealthy,
+            _ = network_change_rx.changed() => ProxyExit::Reload,
         }
     } else {
         #[cfg(unix)]
@@ -523,6 +531,7 @@ async fn wait_until_exit_or_unhealthy(
                 _ = interrupt.recv() => ProxyExit::Signal,
                 _ = hangup.recv() => ProxyExit::Reload,
                 _ = &mut health_monitor => ProxyExit::Unhealthy,
+                _ = network_change_rx.changed() => ProxyExit::Reload,
             }
         }
         #[cfg(not(unix))]
@@ -534,6 +543,7 @@ async fn wait_until_exit_or_unhealthy(
                     }))
                 }
                 _ = &mut health_monitor => ProxyExit::Unhealthy,
+                _ = network_change_rx.changed() => ProxyExit::Reload,
             }
         }
     }

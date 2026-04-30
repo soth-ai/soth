@@ -5,6 +5,7 @@ pub(crate) mod ca_health;
 mod daemon;
 mod doctor;
 mod env;
+mod network_watcher;
 mod setup_ca;
 pub(crate) mod shell_env;
 mod start;
