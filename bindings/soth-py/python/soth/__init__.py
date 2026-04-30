@@ -52,6 +52,7 @@ __version__ = _soth_native.__version__
 __all__ = [
     "init",
     "guard",
+    "guard_stream",
     "SothBlocked",
     "SothFlagged",
     "BlockReason",
@@ -147,6 +148,72 @@ def guard(
         )
 
     return result
+
+
+async def guard_stream(
+    iter_factory: Callable[[], Any],
+    *,
+    call: dict[str, Any],
+    chunk_extractor: Callable[[Any], tuple[Optional[str], Optional[str]]] | None = None,
+):
+    """Wrap a streaming LLM call with SOTH's pre/post lifecycle.
+
+    `iter_factory` returns an async iterator (typically the awaited
+    result of e.g. ``client.chat.completions.create(stream=True, ...)``).
+    `chunk_extractor(chunk) -> (delta_content, finish_reason)` pulls the
+    fields the SDK records from each provider chunk; defaults to OpenAI's
+    `chunk.choices[0].delta.content` shape.
+
+    Yields each chunk back to the caller. Raises `SothBlocked` if the
+    decision is `Block`. Always finalizes the stream observation on
+    completion or exception.
+    """
+    sdk = get_sdk()
+    decision, observation = sdk.stream_begin(call)
+    kind = decision["kind"]
+
+    if kind == _soth_native.DECISION_KIND_BLOCK:
+        observation.end()  # Consume token even on block.
+        raise SothBlocked(
+            decision_id=str(decision["token"]),
+            reason=block_reason_from_dict(decision.get("reason", {})),
+        )
+
+    if chunk_extractor is None:
+        chunk_extractor = _default_openai_chunk_extractor
+
+    sequence = 0
+    try:
+        provider_iter = iter_factory()
+        # Provider may return a sync iterator (e.g. anthropic non-async)
+        # OR a coroutine that resolves to an async iterator. Handle both.
+        if hasattr(provider_iter, "__await__"):
+            provider_iter = await provider_iter
+        async for chunk in provider_iter:
+            delta_content, finish_reason = chunk_extractor(chunk)
+            observation.chunk(sequence, delta_content, finish_reason)
+            sequence += 1
+            yield chunk
+    finally:
+        observation.end()
+
+
+def _default_openai_chunk_extractor(chunk: Any) -> tuple[Optional[str], Optional[str]]:
+    """Default chunk extractor for OpenAI-shaped streams.
+
+    Looks for `chunk.choices[0].delta.content` and
+    `chunk.choices[0].finish_reason`. Falls back to `(None, None)` for
+    chunks that don't fit (the SDK still sees the chunk count, just no
+    content sample).
+    """
+    try:
+        choice = chunk.choices[0]
+        delta = getattr(choice, "delta", None)
+        delta_content = getattr(delta, "content", None) if delta else None
+        finish_reason = getattr(choice, "finish_reason", None)
+        return delta_content, finish_reason
+    except (AttributeError, IndexError, TypeError):
+        return None, None
 
 
 # Test-only re-exports (used by `tests/test_smoke.py` etc.)

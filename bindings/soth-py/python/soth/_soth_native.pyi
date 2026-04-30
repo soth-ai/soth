@@ -15,6 +15,16 @@ DECISION_KIND_REDACT: str
 DECISION_KIND_FLAG: str
 
 
+class StreamObservation:
+    def chunk(
+        self,
+        sequence: int,
+        delta_content: Optional[str] = None,
+        finish_reason: Optional[str] = None,
+    ) -> None: ...
+    def end(self) -> None: ...
+
+
 class SothSdk:
     def __init__(
         self,
@@ -27,5 +37,8 @@ class SothSdk:
 
     def pre_call(self, call: dict[str, Any]) -> dict[str, Any]: ...
     def post_call(self, token: int, response: Optional[dict[str, Any]] = None) -> None: ...
+    def stream_begin(
+        self, call: dict[str, Any]
+    ) -> tuple[dict[str, Any], StreamObservation]: ...
     def in_flight_decisions(self) -> int: ...
     def drain_telemetry_for_test(self) -> list[dict[str, Any]]: ...

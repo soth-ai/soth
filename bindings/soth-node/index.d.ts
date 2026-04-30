@@ -59,6 +59,20 @@ export interface GuardOptions {
   call: LlmCall;
 }
 
+export interface ChunkExtractorOutput {
+  deltaContent: string | null;
+  finishReason: string | null;
+}
+
+export interface GuardStreamOptions<TChunk = unknown> {
+  call: LlmCall;
+  chunkExtractor?: (chunk: TChunk) => ChunkExtractorOutput;
+}
+
 export function init(options: InitOptions): void;
 export function guard<T>(callFn: () => Promise<T>, options: GuardOptions): Promise<T>;
+export function guardStream<TChunk = unknown>(
+  iterFactory: () => AsyncIterable<TChunk> | Promise<AsyncIterable<TChunk>>,
+  options: GuardStreamOptions<TChunk>,
+): AsyncIterable<TChunk>;
 export function getSdk(): unknown;

@@ -78,9 +78,68 @@ async function guard(callFn, { call }) {
   return result;
 }
 
+// Default chunk extractor for OpenAI-shaped chat-completion streams.
+// Returns `{ deltaContent, finishReason }` extracted from the chunk's
+// `choices[0]` entry. Customers using non-OpenAI shapes pass their own
+// extractor to `guardStream`.
+function defaultOpenAIChunkExtractor(chunk) {
+  try {
+    const choice = chunk?.choices?.[0];
+    return {
+      deltaContent: choice?.delta?.content ?? null,
+      finishReason: choice?.finish_reason ?? null,
+    };
+  } catch (_) {
+    return { deltaContent: null, finishReason: null };
+  }
+}
+
+/**
+ * Wrap a streaming LLM call with SOTH's pre/post lifecycle.
+ *
+ * `iterFactory` returns the provider's async iterable (e.g. the result
+ * of `client.chat.completions.create({stream: true, ...})`). The
+ * `chunkExtractor` (defaults to OpenAI shape) pulls
+ * `{deltaContent, finishReason}` from each chunk; the SDK records
+ * those alongside chunk count.
+ *
+ * Yields each chunk back to the caller. Throws `SothBlocked` if the
+ * decision is `Block`. Always finalizes the stream observation on
+ * normal completion or thrown exception.
+ */
+async function* guardStream(iterFactory, { call, chunkExtractor } = {}) {
+  if (!call) throw new Error('guardStream: call required');
+  const extractor = chunkExtractor ?? defaultOpenAIChunkExtractor;
+  const sdk = getSdk();
+  const decision = sdk.streamBegin(call);
+  const { kind, token } = decision;
+
+  if (kind === 'block') {
+    sdk.streamEnd(token);
+    throw new SothBlocked(token, decision.reason);
+  }
+
+  let sequence = 0;
+  try {
+    let provIter = iterFactory();
+    if (provIter && typeof provIter.then === 'function') {
+      provIter = await provIter;
+    }
+    for await (const chunk of provIter) {
+      const { deltaContent, finishReason } = extractor(chunk);
+      sdk.streamChunk(token, sequence, deltaContent ?? null, finishReason ?? null);
+      sequence += 1;
+      yield chunk;
+    }
+  } finally {
+    sdk.streamEnd(token);
+  }
+}
+
 module.exports = {
   init,
   guard,
+  guardStream,
   getSdk,
   SothBlocked,
   SothFlagged,

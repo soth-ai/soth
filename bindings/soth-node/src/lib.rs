@@ -9,13 +9,15 @@
 
 #![deny(clippy::all)]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use soth_sdk_core::{
     BlockReason as CoreBlockReason, Decision as CoreDecision, DecisionToken, FlagSeverity,
-    HmacKey, LlmCall, LlmResponse, Message, SdkConfigBuilder, SothSdk as CoreSothSdk, Tool,
+    HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder, SothSdk as CoreSothSdk,
+    StreamObservation as CoreStreamObservation, Tool,
 };
 use soth_core::EndpointType;
 use zeroize::Zeroizing;
@@ -93,6 +95,11 @@ pub struct JsTelemetryEvent {
 #[napi]
 pub struct SothSdk {
     inner: Arc<CoreSothSdk>,
+    /// In-flight stream observations indexed by their `DecisionToken`'s
+    /// raw u64 (stringified across the FFI boundary). The JS shim's
+    /// `guardStream` looks observations up by token rather than holding
+    /// a napi class reference, which keeps the FFI boundary scalar-only.
+    streams: Arc<Mutex<HashMap<u64, CoreStreamObservation>>>,
 }
 
 #[napi]
@@ -131,6 +138,7 @@ impl SothSdk {
 
         Ok(Self {
             inner: Arc::new(sdk),
+            streams: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -158,6 +166,72 @@ impl SothSdk {
         Ok(())
     }
 
+    /// Streaming counterpart to `pre_call`. Returns the decision; the
+    /// JS shim feeds chunks via `streamChunk(token, ...)` and finalizes
+    /// with `streamEnd(token)`. The observation lives inside the SDK
+    /// keyed by token, so the FFI boundary stays scalar-only.
+    #[napi]
+    pub fn stream_begin(&self, call: JsLlmCall) -> Result<JsDecision> {
+        let llm_call = build_llm_call(call);
+        let (decision, observation) = self.inner.stream_begin(&llm_call);
+        let token_raw = decision.token().raw();
+        // Sentinel tokens (SLAB_FULL / SENTINEL_FAIL_OPEN) skip slab
+        // bookkeeping — there's no observation to stash because pre_call
+        // itself didn't allocate one. Phase-1 telemetry records this.
+        if !is_sentinel_raw(token_raw) {
+            let mut guard = self.streams.lock().map_err(|_| {
+                Error::new(Status::GenericFailure, "stream slot lock poisoned")
+            })?;
+            guard.insert(token_raw, observation);
+        }
+        Ok(decision_to_js(&decision))
+    }
+
+    /// Feed a delta chunk. Returns silently if the token is unknown
+    /// (treated as a binding bug — same semantic as the slab's
+    /// stale-token handling).
+    #[napi]
+    pub fn stream_chunk(
+        &self,
+        token: String,
+        sequence: u32,
+        delta_content: Option<String>,
+        finish_reason: Option<String>,
+    ) -> Result<()> {
+        let raw: u64 = token.parse().map_err(|_| {
+            Error::new(Status::InvalidArg, "stream token must be a numeric string")
+        })?;
+        let mut guard = self
+            .streams
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "stream slot lock poisoned"))?;
+        let Some(obs) = guard.get_mut(&raw) else {
+            return Ok(());
+        };
+        let mut chunk = LlmChunk::new(sequence);
+        chunk.delta_content = delta_content;
+        chunk.finish_reason = finish_reason;
+        self.inner.stream_chunk(obs, &chunk);
+        Ok(())
+    }
+
+    /// Finalize the stream. Idempotent — second call is a no-op.
+    #[napi]
+    pub fn stream_end(&self, token: String) -> Result<()> {
+        let raw: u64 = token.parse().map_err(|_| {
+            Error::new(Status::InvalidArg, "stream token must be a numeric string")
+        })?;
+        let mut guard = self
+            .streams
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "stream slot lock poisoned"))?;
+        if let Some(obs) = guard.remove(&raw) {
+            drop(guard);
+            self.inner.stream_end(obs);
+        }
+        Ok(())
+    }
+
     /// Test helper — number of in-flight decisions.
     #[napi]
     pub fn in_flight_decisions(&self) -> u32 {
@@ -180,6 +254,12 @@ impl SothSdk {
             })
             .collect()
     }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+fn is_sentinel_raw(raw: u64) -> bool {
+    raw == DecisionToken::SLAB_FULL.raw() || raw == DecisionToken::SENTINEL_FAIL_OPEN.raw()
 }
 
 // ── conversions ──────────────────────────────────────────────────────

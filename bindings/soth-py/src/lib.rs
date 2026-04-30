@@ -9,14 +9,15 @@
 //! partly here (the FFI boundary) and partly in `python/soth/exceptions.py`
 //! (the `SothBlocked` exception + propagation tests).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use soth_sdk_core::{
     BlockReason as CoreBlockReason, Decision as CoreDecision, DecisionToken, FlagSeverity,
-    HmacKey, LlmCall, LlmResponse, Message, SdkConfigBuilder, SothSdk as CoreSothSdk, Tool,
+    HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder, SothSdk as CoreSothSdk,
+    StreamObservation as CoreStreamObservation, Tool,
 };
 use soth_core::EndpointType;
 use zeroize::Zeroizing;
@@ -103,6 +104,27 @@ impl PySothSdk {
         self.inner.in_flight_decisions()
     }
 
+    /// Streaming counterpart to `pre_call`. Returns
+    /// `(decision_dict, stream_observation)`. The host wrapper iterates
+    /// the provider's stream and feeds chunks via `observation.chunk(...)`,
+    /// then calls `observation.end()` on terminal chunk to consume the
+    /// token and emit telemetry.
+    #[pyo3(signature = (call_dict))]
+    fn stream_begin<'py>(
+        &self,
+        py: Python<'py>,
+        call_dict: &Bound<'py, PyDict>,
+    ) -> PyResult<(Bound<'py, PyDict>, PyStreamObservation)> {
+        let call = build_llm_call(call_dict)?;
+        let (decision, observation) = self.inner.stream_begin(&call);
+        let decision_dict = decision_to_pydict(py, &decision)?;
+        let py_obs = PyStreamObservation {
+            sdk: Arc::clone(&self.inner),
+            inner: Arc::new(Mutex::new(Some(observation))),
+        };
+        Ok((decision_dict, py_obs))
+    }
+
     /// Drain the in-memory telemetry queue. Test-only — production
     /// shippers will pull batches via the Phase-1 transport API.
     fn drain_telemetry_for_test<'py>(
@@ -127,6 +149,60 @@ impl PySothSdk {
             result.append(event_dict)?;
         }
         Ok(result)
+    }
+}
+
+/// Wraps a `StreamObservation` so Python can call `chunk` / `end` from
+/// inside an `async for` loop. Bindings hold the observation in a
+/// Mutex-Option so `end()` can take ownership exactly once; double-end
+/// is silently a no-op (logged via tracing) — same semantic as the
+/// slab's stale-token handling.
+#[pyclass(name = "StreamObservation", module = "soth._soth_native")]
+struct PyStreamObservation {
+    sdk: Arc<CoreSothSdk>,
+    inner: Arc<Mutex<Option<CoreStreamObservation>>>,
+}
+
+#[pymethods]
+impl PyStreamObservation {
+    /// Feed a single delta chunk. Cheap; no allocation beyond
+    /// accumulating the content into the underlying observation.
+    #[pyo3(signature = (sequence, delta_content=None, finish_reason=None))]
+    fn chunk(
+        &self,
+        sequence: u32,
+        delta_content: Option<String>,
+        finish_reason: Option<String>,
+    ) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("stream observation lock poisoned"))?;
+        let Some(obs) = guard.as_mut() else {
+            // Double-chunk after end is benign — log via tracing then
+            // return Ok so Python iteration doesn't break.
+            tracing::warn!("stream_chunk called after stream_end (binding bug)");
+            return Ok(());
+        };
+        let mut llm_chunk = LlmChunk::new(sequence);
+        llm_chunk.delta_content = delta_content;
+        llm_chunk.finish_reason = finish_reason;
+        self.sdk.stream_chunk(obs, &llm_chunk);
+        Ok(())
+    }
+
+    /// Finalize the stream — consumes the DecisionToken, runs classify
+    /// enrichment, emits the telemetry event. Idempotent: subsequent
+    /// calls are no-ops with a logged warning.
+    fn end(&self) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("stream observation lock poisoned"))?;
+        if let Some(obs) = guard.take() {
+            self.sdk.stream_end(obs);
+        }
+        Ok(())
     }
 }
 
@@ -330,6 +406,7 @@ fn response_from_pydict(_dict: Option<&Bound<'_, PyDict>>) -> PyResult<LlmRespon
 #[pymodule]
 fn _soth_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySothSdk>()?;
+    m.add_class::<PyStreamObservation>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("DECISION_KIND_ALLOW", DECISION_KIND_ALLOW)?;
     m.add("DECISION_KIND_BLOCK", DECISION_KIND_BLOCK)?;
