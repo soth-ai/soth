@@ -1,0 +1,40 @@
+[package]
+name = "soth-sdk-core"
+description = "Public-API facade consumed by SOTH SDK bindings (PyO3 / napi-rs / WASM)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Default features keep the SDK build self-contained and WASM-compatible.
+# The `onnx-models` feature transitively turns on local ONNX classification
+# in soth-classify; bindings flip it on for native targets and off for
+# WASM/edge.
+[features]
+default = ["onnx-models"]
+onnx-models = ["soth-classify/onnx-models"]
+# OpenTelemetry span emission. Off by default — bindings opt in when the
+# host already has an OTel pipeline.
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+
+[dependencies]
+soth-core = { workspace = true }
+# soth-detect's workspace entry uses `default-features = false`; this crate
+# turns on `intelligence` so the in-memory backends are available, but
+# leaves `tree-sitter-code` and `intelligence-sqlite` off — neither is
+# needed in the SDK runtime, both block the WASM target.
+soth-detect = { workspace = true, features = ["intelligence"] }
+# soth-classify's workspace entry pulls default features (incl. onnx-models).
+# `policy` is needed for the post_call enrichment path. WASM builds disable
+# default features at the binding level (Phase 2).
+soth-classify = { workspace = true, features = ["policy"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+arc-swap = "1"
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }

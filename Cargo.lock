@@ -4158,6 +4158,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "soth-sdk-core"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "opentelemetry",
+ "serde",
+ "serde_json",
+ "soth-classify",
+ "soth-core",
+ "soth-detect",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-opentelemetry",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "soth-sync"
 version = "0.1.0"
 dependencies = [

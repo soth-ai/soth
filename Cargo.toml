@@ -7,6 +7,7 @@ members = [
     "crates/soth-classify",
     "crates/soth-conformance-tests",
     "crates/soth-proxy",
+    "crates/soth-sdk-core",
     "crates/soth-telemetry",
     "crates/soth-policy",
     "crates/soth-sync",
