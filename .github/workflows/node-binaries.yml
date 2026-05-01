@@ -92,8 +92,14 @@ jobs:
               rustup target add aarch64-unknown-linux-musl
               cd bindings/soth-node && npm run build -- --target aarch64-unknown-linux-musl --zig
           - target: x86_64-apple-darwin
-            runs-on: macos-13
+            # GitHub's macos-13 (Intel) runner pool is oversubscribed
+            # and routinely auto-cancels queued jobs after the queue
+            # timeout. Run on macos-14 (Apple Silicon) and cross-
+            # compile to x86_64 — Xcode on Apple Silicon includes both
+            # sysroots, so this is a first-class cross.
+            runs-on: macos-14
             build: |
+              rustup target add x86_64-apple-darwin
               cd bindings/soth-node && npm run build -- --target x86_64-apple-darwin
           - target: aarch64-apple-darwin
             runs-on: macos-14
@@ -154,7 +160,11 @@ jobs:
           run: ${{ matrix.build }}
 
       - name: Smoke test binary (native arches only)
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        # x86_64-apple-darwin is now built via cross from an arm64
+        # macos-14 host; the host can't `require()` an x86_64 binary,
+        # so it's excluded from the smoke list along with the other
+        # cross targets. Real coverage lives in ffi-conformance.yml.
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
         working-directory: bindings/soth-node
         shell: bash
         run: |
