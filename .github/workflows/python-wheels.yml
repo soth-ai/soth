@@ -91,6 +91,14 @@ jobs:
           # When manylinux is set, maturin runs inside the manylinux
           # docker image so wheels are universally compatible.
           manylinux: ${{ matrix.platform.manylinux }}
+          # For aarch64 we override maturin-action's default of the
+          # Debian-based `ghcr.io/rust-cross/manylinux2014-cross:aarch64`
+          # image. That image's cross-gcc fails to predefine __ARM_ARCH,
+          # which breaks ring 0.17.x's bundled ARM assembly. Pin the
+          # native manylinux2014_aarch64 image instead and let the QEMU
+          # binfmt setup (above) emulate it on the x86_64 host. Slower,
+          # but uses a native aarch64 toolchain so ring builds cleanly.
+          container: ${{ matrix.platform.target == 'aarch64-unknown-linux-gnu' && 'quay.io/pypa/manylinux2014_aarch64' || '' }}
           working-directory: bindings/soth-py
           # `extension-module` is required for the actual abi3 wheel
           # (workspace `cargo build` builds without it; only the wheel
@@ -98,11 +106,10 @@ jobs:
           rust-toolchain: stable
           docker-options: ${{ matrix.platform.os == 'linux' && '-e PYO3_CROSS_LIB_DIR=/opt/python/cp310-cp310/lib' || '' }}
           before-script-linux: |
-            # The native manylinux2014 image (x86_64) is CentOS-based and
-            # uses yum. The cross image used for non-native arches
-            # (`ghcr.io/rust-cross/manylinux2014-cross:<arch>`) is
-            # Debian-based and uses apt-get. Detect which package
-            # manager is on PATH instead of assuming.
+            # Both the native manylinux2014 image (x86_64) and the
+            # native manylinux2014_aarch64 image are CentOS-based and
+            # use yum. Keep an apt-get fallback in case maturin-action
+            # ever defaults to the Debian-based cross image again.
             set -e
             if command -v yum >/dev/null 2>&1; then
               yum install -y openssl-devel pkgconfig
