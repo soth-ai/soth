@@ -72,7 +72,7 @@ impl Default for ForwardProxyConfig {
             upstream_timeout: DurationSetting::millis(30_000),
             upstream_retry_on_failure: false,
             upstream_retry_delay: DurationSetting::millis(200),
-            capture_max_body_bytes: 10 * 1024 * 1024,
+            capture_max_body_bytes: 64 * 1024 * 1024,
             buffer_request_bodies: true,
             handler_request_timeout: DurationSetting::millis(5_000),
             handler_response_timeout: DurationSetting::millis(5_000),
