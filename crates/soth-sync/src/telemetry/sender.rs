@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
-use soth_core::{derive_proxy_signing_seed, ClassificationFlag, TelemetryPolicyKind};
+use soth_core::{
+    derive_proxy_signing_seed, ClassificationFlag, TelemetryPolicyKind, UseCaseLabelReason,
+};
 use soth_telemetry::{SignedBatch, TransmittedBatch};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -273,12 +275,35 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         tags.insert("h2_stream_id".to_string(), h2sid.to_string());
     }
 
+    // Promote a one-time WARN when historian events bypass enrichment so we
+    // can spot misconfig at the egress edge (soth-core can't log here).
+    if matches!(
+        event.use_case_label_reason,
+        UseCaseLabelReason::HistorianNotEnriched
+    ) {
+        tracing::warn!(
+            event_id = %event.event_id,
+            "shipping historian event with use_case_label_reason=historian_not_enriched; \
+             ClassifyEnricher likely failed or was skipped at ingest time"
+        );
+    }
+
     TelemetryEvent {
         event_id: event.event_id.to_string(),
         timestamp: event.timestamp_epoch_ms / 1_000,
         provider: Some(event.provider.clone()),
         model: event.model.clone(),
         use_case_label: enum_name(&event.use_case),
+        use_case_label_reason: enum_name(&event.use_case_label_reason),
+        // Tier A: previously dropped at egress. Only emit when classify
+        // produced a confidence (>0) — keeps payload size small for the
+        // many heuristic-parsed events that won't have a model output.
+        use_case_confidence: if event.use_case_confidence > 0.0 {
+            Some(event.use_case_confidence)
+        } else {
+            None
+        },
+        secondary_label: event.secondary_label.as_ref().and_then(enum_name),
         topic_cluster_id: if event.topic_cluster_id > 0 {
             Some(event.topic_cluster_id.to_string())
         } else {
@@ -290,7 +315,10 @@ fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
             Some(event.semantic_hash.clone())
         },
         is_semantic_collision: event.is_semantic_collision,
-        collision_response_stability: None,
+        // Was hardcoded `None` here; now flows through from the in-process
+        // TelemetryEvent so any future upstream computation reaches the
+        // wire payload without another mapping change.
+        collision_response_stability: event.collision_response_stability.map(f64::from),
         anomaly_score: event.anomaly_score.map(f64::from),
         volatility_class: enum_name(&event.volatility_class),
         input_tokens: event.estimated_input_tokens.map(u64::from),

@@ -24,6 +24,7 @@ use soth_extensions::ExtensionRuntimeContext;
 pub mod keys {
     pub const USE_CASE: &str = "classify.use_case";
     pub const USE_CASE_CONFIDENCE: &str = "classify.use_case_confidence";
+    pub const USE_CASE_LABEL_REASON: &str = "classify.use_case_label_reason";
     pub const VOLATILITY_CLASS: &str = "classify.volatility_class";
     pub const DYNAMIC_FRACTION: &str = "classify.dynamic_fraction";
     pub const ANOMALY_SCORE: &str = "classify.anomaly_score";
@@ -88,6 +89,10 @@ impl ClassifyEnricher {
         meta.insert(
             keys::USE_CASE_CONFIDENCE.to_string(),
             result.use_case_confidence.to_string(),
+        );
+        meta.insert(
+            keys::USE_CASE_LABEL_REASON.to_string(),
+            serde_json::to_string(&result.use_case_label_reason).unwrap_or_default(),
         );
         meta.insert(
             keys::VOLATILITY_CLASS.to_string(),

@@ -121,6 +121,7 @@ pub(crate) fn run(
         use_case_confidence: usecase.confidence.clamp(0.0, 1.0),
         secondary_label: usecase.secondary_label,
         complexity_score: usecase.complexity_score,
+        use_case_label_reason: usecase.label_reason,
         interaction_mode: usecase.interaction_mode,
         embedding_norm,
         system_prompt_hash: detect_result.normalized.system_prompt_hash.clone(),
@@ -128,6 +129,11 @@ pub(crate) fn run(
         dynamic_fraction: volatility.dynamic_fraction.clamp(0.0, 1.0),
         prefix_repeat_signature: volatility.prefix_repeat_signature.clone(),
         tool_definition_hash: detect_result.normalized.tool_definition_hash.clone(),
+        // Stays `None` until a session-level "prior responses for matched
+        // semantic_hash" history is wired in (no SessionSnapshot field
+        // tracks it today). Pipeline.rs and sender.rs now mirror this
+        // field through, so computing it here is a one-line drop-in when
+        // the data arrives — no further wiring needed.
         collision_response_stability: None,
         commitment_hash,
         code_fraction,
@@ -465,6 +471,7 @@ mod tests {
             secondary_label: Some(soth_core::UseCaseLabel::CodeReview),
             complexity_score: 4,
             interaction_mode: soth_core::InteractionMode::Directive,
+            label_reason: soth_core::UseCaseLabelReason::Confident,
         }
     }
 

@@ -29,6 +29,43 @@ pub enum UseCaseLabel {
     Unknown,
 }
 
+/// Discriminator that explains *why* a `UseCaseLabel` was chosen, especially
+/// when the chosen label is `Unknown`. Lets the cloud/dashboard distinguish a
+/// genuinely-unknown classification from a configuration skip, an upstream
+/// error, or an unenriched historian event — all of which previously emitted
+/// `Unknown` indistinguishably.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UseCaseLabelReason {
+    /// Model classified above the confidence threshold.
+    #[default]
+    Confident,
+    /// Model ran but top-1 confidence is below threshold; label still emitted.
+    LowConfidence,
+    /// `ClassifyConfig::embedding_enabled = false`.
+    EmbeddingDisabled,
+    /// Detect pipeline marked the call as not-AI; classifier short-circuited.
+    NotAiCall,
+    /// Heuristic parse with no resolved model — model context required to classify.
+    HeuristicNoModel,
+    /// CodeContextRepeat lane optimization — embedding intentionally skipped.
+    CodeContextRepeat,
+    /// No content available to embed (e.g. response-only event).
+    NoContent,
+    /// ONNX or legacy embedder panicked or returned a degenerate vector.
+    EmbeddingFailed,
+    /// Bundle has no real ONNX models — `KeywordClassifier` fallback in use.
+    FallbackBundle,
+    /// Bundle declared a label string not in the canonical `UseCaseLabel` enum.
+    UnmappedBundleLabel,
+    /// Model weights/biases/labels shape mismatch (defensive check).
+    ModelShapeError,
+    /// Historian event was queued without running `ClassifyEnricher`.
+    HistorianNotEnriched,
+    /// Struct default — never populated by a real classify run.
+    UninitializedDefault,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VolatilityClass {
@@ -257,6 +294,11 @@ pub struct TelemetryEvent {
     pub secondary_label: Option<UseCaseLabel>,
     #[serde(default)]
     pub complexity_score: u8,
+    /// Why `use_case` has its current value — see [`UseCaseLabelReason`].
+    /// Defaults to `UninitializedDefault` for backward compatibility with
+    /// existing wire payloads that omit the field.
+    #[serde(default)]
+    pub use_case_label_reason: UseCaseLabelReason,
     #[serde(default)]
     pub interaction_mode: InteractionMode,
     #[serde(default)]
@@ -375,6 +417,7 @@ impl Default for TelemetryEvent {
             use_case_confidence: 0.0,
             secondary_label: None,
             complexity_score: 0,
+            use_case_label_reason: UseCaseLabelReason::UninitializedDefault,
             embedding_norm: 0.0,
             system_prompt_hash: None,
             system_prompt_token_length: None,
@@ -479,10 +522,22 @@ impl TelemetryEvent {
 
         // Pre-computed classify enrichment (written by historian's ClassifyEnricher
         // before queue serialization, since embed_content is #[serde(skip)]).
-        let use_case = meta
+        // Detect "historian queued an event without running ClassifyEnricher"
+        // by checking for the presence of any classify.* metadata. Callers
+        // (sync sender, historian) emit a WARN log when they see the
+        // `HistorianNotEnriched` reason — soth-core stays log-free for the
+        // SDK/WASM build.
+        let raw_use_case = meta
             .get("classify.use_case")
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or(UseCaseLabel::Unknown);
+            .and_then(|s| serde_json::from_str::<UseCaseLabel>(s).ok());
+        let use_case_label_reason = if raw_use_case.is_none() {
+            UseCaseLabelReason::HistorianNotEnriched
+        } else {
+            meta.get("classify.use_case_label_reason")
+                .and_then(|s| serde_json::from_str::<UseCaseLabelReason>(s).ok())
+                .unwrap_or(UseCaseLabelReason::Confident)
+        };
+        let use_case = raw_use_case.unwrap_or(UseCaseLabel::Unknown);
         let use_case_confidence = meta
             .get("classify.use_case_confidence")
             .and_then(|s| s.parse::<f32>().ok())
@@ -562,6 +617,7 @@ impl TelemetryEvent {
             code_fraction,
             use_case,
             use_case_confidence,
+            use_case_label_reason,
             volatility_class,
             dynamic_fraction,
             anomaly_score,

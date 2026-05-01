@@ -57,6 +57,7 @@ pub(crate) fn run(
 
     let (usecase, stage3_us) = stage3_usecase::run(
         embed.vector.as_deref(),
+        embed.skipped_reason,
         bundle.classifier.as_ref(),
         &detect_result.normalized,
         config,
@@ -148,6 +149,7 @@ fn assemble_result(
         use_case_label: usecase.label,
         use_case_confidence: usecase.confidence,
         secondary_label: usecase.secondary_label,
+        use_case_label_reason: usecase.label_reason,
         topic_cluster_id: cluster.topic_cluster_id,
         semantic_hash: cluster.semantic_hash,
         embedding,
@@ -157,7 +159,11 @@ fn assemble_result(
         volatility_class: volatility.class,
         dynamic_fraction: volatility.dynamic_fraction,
         is_semantic_collision: cluster.is_semantic_collision,
-        collision_response_stability: None,
+        // Mirror from the upstream TelemetryEvent so any future stage7
+        // computation flows through to ClassifiedResult without an extra
+        // wiring change. Previously two independent `None` hardcodes meant
+        // a future computation in stage7 would silently fail to surface here.
+        collision_response_stability: telemetry.event.collision_response_stability,
         prefix_repeat_signature: volatility.prefix_repeat_signature,
         anomaly_score: anomaly.score,
         anomaly_flags: anomaly.flags,

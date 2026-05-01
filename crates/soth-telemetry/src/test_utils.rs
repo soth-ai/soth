@@ -66,6 +66,7 @@ pub(crate) fn sample_event(event_id: Uuid) -> TelemetryEvent {
         use_case_confidence: 0.0,
         secondary_label: None,
         complexity_score: 0,
+        use_case_label_reason: soth_core::UseCaseLabelReason::UninitializedDefault,
         embedding_norm: 0.0,
         system_prompt_hash: None,
         system_prompt_token_length: None,
