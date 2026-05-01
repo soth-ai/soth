@@ -94,7 +94,11 @@ jobs:
           rust-toolchain: stable
           docker-options: ${{ matrix.platform.os == 'linux' && '-e PYO3_CROSS_LIB_DIR=/opt/python/cp310-cp310/lib' || '' }}
           before-script-linux: |
-            yum install -y openssl-devel || apt-get update && apt-get install -y libssl-dev pkg-config
+            # manylinux2014 is CentOS-based, so always yum. The previous
+            # `yum ... || apt-get update && apt-get install ...` had a
+            # shell-precedence bug that ran apt-get unconditionally and
+            # failed with `apt-get: command not found`.
+            yum install -y openssl-devel pkgconfig
 
       - name: Inspect wheel
         if: matrix.platform.os != 'windows'
