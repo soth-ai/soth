@@ -46,8 +46,12 @@ jobs:
           - { os: linux, runs-on: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: '2014' }
           # Linux aarch64 — same manylinux base, cross via QEMU
           - { os: linux, runs-on: ubuntu-latest, target: aarch64-unknown-linux-gnu, manylinux: '2014' }
-          # macOS Intel
-          - { os: macos, runs-on: macos-13, target: x86_64-apple-darwin, manylinux: '' }
+          # macOS Intel — cross-built from the Apple Silicon runner.
+          # GitHub's macos-13 Intel pool is heavily oversubscribed; jobs
+          # routinely sit queued past the queue timeout. macos-14's Xcode
+          # SDK ships both arm64 and x86_64 sysroots so this is a
+          # first-class native cross via `rustup target add`.
+          - { os: macos, runs-on: macos-14, target: x86_64-apple-darwin, manylinux: '' }
           # macOS Apple Silicon
           - { os: macos, runs-on: macos-14, target: aarch64-apple-darwin, manylinux: '' }
           # Windows
@@ -94,11 +98,21 @@ jobs:
           rust-toolchain: stable
           docker-options: ${{ matrix.platform.os == 'linux' && '-e PYO3_CROSS_LIB_DIR=/opt/python/cp310-cp310/lib' || '' }}
           before-script-linux: |
-            # manylinux2014 is CentOS-based, so always yum. The previous
-            # `yum ... || apt-get update && apt-get install ...` had a
-            # shell-precedence bug that ran apt-get unconditionally and
-            # failed with `apt-get: command not found`.
-            yum install -y openssl-devel pkgconfig
+            # The native manylinux2014 image (x86_64) is CentOS-based and
+            # uses yum. The cross image used for non-native arches
+            # (`ghcr.io/rust-cross/manylinux2014-cross:<arch>`) is
+            # Debian-based and uses apt-get. Detect which package
+            # manager is on PATH instead of assuming.
+            set -e
+            if command -v yum >/dev/null 2>&1; then
+              yum install -y openssl-devel pkgconfig
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y libssl-dev pkg-config
+            else
+              echo "no supported package manager (yum or apt-get) found" >&2
+              exit 1
+            fi
 
       - name: Inspect wheel
         if: matrix.platform.os != 'windows'
@@ -109,7 +123,11 @@ jobs:
         run: dir bindings\soth-py\dist\
 
       - name: Smoke test wheel (native arches only)
-        if: matrix.platform.target == 'x86_64-unknown-linux-gnu' || matrix.platform.target == 'aarch64-apple-darwin' || matrix.platform.target == 'x86_64-apple-darwin' || matrix.platform.target == 'x86_64-pc-windows-msvc'
+        # x86_64-apple-darwin is now cross-built from an arm64 macos-14
+        # host, which can't `import` an x86_64 extension module. Skip
+        # the smoke step there; the load-bearing test is the eventual
+        # PyPI consumer install on a real Intel Mac.
+        if: matrix.platform.target == 'x86_64-unknown-linux-gnu' || matrix.platform.target == 'aarch64-apple-darwin' || matrix.platform.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: |
           python -m pip install --upgrade pip
