@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensitiveArtifact {
     pub kind: ArtifactKind,
+    /// Exact credential taxonomy detected by the scanner, such as
+    /// `openai_api_key`, `rsa_private_key`, or `postgres_connection_string`.
+    /// This must never contain the raw credential value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_kind: Option<String>,
     pub severity: ArtifactSeverity,
     pub location: ArtifactLocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +60,38 @@ pub enum ArtifactLocation {
 }
 
 impl SensitiveArtifact {
+    pub fn credential_kind_label(&self) -> Option<String> {
+        if let Some(kind) = self
+            .credential_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+        {
+            return Some(kind.to_string());
+        }
+
+        match &self.kind {
+            ArtifactKind::PrivateKey => Some("generic_private_key".to_string()),
+            ArtifactKind::ApiKey {
+                provider: Some(provider),
+            } => Some(format!("{}_api_key", provider.canonical_name())),
+            ArtifactKind::ApiKey { provider: None } => Some("api_key".to_string()),
+            ArtifactKind::Jwt => Some("jwt".to_string()),
+            ArtifactKind::HexKey => Some("hex_secret".to_string()),
+            ArtifactKind::ConnectionString => Some("connection_string".to_string()),
+            ArtifactKind::UnknownCredential => Some("unknown_credential".to_string()),
+            ArtifactKind::AwsAccessKey => Some("aws_access_key_id".to_string()),
+            ArtifactKind::GitHubPat => Some("github_pat".to_string()),
+            ArtifactKind::GitLabToken => Some("gitlab_token".to_string()),
+            ArtifactKind::SlackToken => Some("slack_token".to_string()),
+            ArtifactKind::StripeSecretKey => Some("stripe_secret_key".to_string()),
+            ArtifactKind::CodeBlock { .. }
+            | ArtifactKind::OrgPattern { .. }
+            | ArtifactKind::AuthLogic
+            | ArtifactKind::CryptoOperation => None,
+        }
+    }
+
     pub fn is_private_key(&self) -> bool {
         matches!(self.kind, ArtifactKind::PrivateKey)
     }
@@ -109,7 +146,9 @@ impl Default for ParseConfidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParseSource {
-    Rest { provider: DetectedProvider },
+    Rest {
+        provider: DetectedProvider,
+    },
     GraphQl,
     Grpc,
     JsonRpc,

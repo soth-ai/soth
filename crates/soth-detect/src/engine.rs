@@ -191,7 +191,11 @@ pub fn process_normalized(
     // detection sees per-turn locations.
     let scan_input = build_scan_input_from_typed_call(call);
     let synthetic_body = call.conversation_text();
-    let scan = scan_content(synthetic_body.as_bytes(), &scan_input, &registry.compiled_org);
+    let scan = scan_content(
+        synthetic_body.as_bytes(),
+        &scan_input,
+        &registry.compiled_org,
+    );
 
     // Phase 3: session prefix-repeat dedup (same primitive as proxy hot path).
     let (

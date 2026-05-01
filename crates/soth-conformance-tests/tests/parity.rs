@@ -38,10 +38,7 @@ fn proxy_and_sdk_lanes_agree_on_contract_surface() {
 
         let diffs = soth_conformance_tests::compare(&proxy, &sdk);
         if !diffs.is_empty() {
-            failures.push((
-                format!("{} ({})", fixture.name, path.display()),
-                diffs,
-            ));
+            failures.push((format!("{} ({})", fixture.name, path.display()), diffs));
         }
 
         let advisory_diffs = soth_conformance_tests::compare_advisory(&proxy, &sdk);

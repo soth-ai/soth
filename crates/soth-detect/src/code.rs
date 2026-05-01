@@ -966,6 +966,7 @@ fn code_artifact(content: &str, language: &str, location: ArtifactLocation) -> S
         kind: ArtifactKind::CodeBlock {
             language: language.to_string(),
         },
+        credential_kind: None,
         commitment: Some(sha256_hex(format!("code_block:{language}:{content}"))),
         severity: ArtifactSeverity::Low,
         location,

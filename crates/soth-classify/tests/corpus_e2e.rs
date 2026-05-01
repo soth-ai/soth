@@ -709,6 +709,7 @@ fn build_artifacts(input: &[ArtifactInput]) -> Vec<SensitiveArtifact> {
         for _ in 0..repeat {
             out.push(SensitiveArtifact {
                 kind: kind.clone(),
+                credential_kind: None,
                 severity,
                 location: ArtifactLocation::Unknown,
                 commitment: None,

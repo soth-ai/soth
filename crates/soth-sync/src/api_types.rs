@@ -445,6 +445,28 @@ pub struct TelemetryEvent {
     pub credential_pattern_detected: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_secret_types: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_credential_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_categories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_logic_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crypto_operations_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_calls_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_io_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardcoded_secret_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub org_pattern_matches: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anomaly_flags: Vec<String>,
     pub endpoint_hash: Option<String>,
     pub code_fraction: Option<f64>,
     #[serde(default)]

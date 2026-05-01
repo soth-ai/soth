@@ -923,9 +923,18 @@ impl ParityRunner {
     }
 
     pub fn run(&self, fixture: &Fixture) -> Vec<Diff> {
-        let proxy =
-            run_proxy_lane(fixture, &self.detect_bundle, &self.classify_bundle, &self.config);
-        let sdk = run_sdk_lane(fixture, &self.detect_bundle, &self.classify_bundle, &self.config);
+        let proxy = run_proxy_lane(
+            fixture,
+            &self.detect_bundle,
+            &self.classify_bundle,
+            &self.config,
+        );
+        let sdk = run_sdk_lane(
+            fixture,
+            &self.detect_bundle,
+            &self.classify_bundle,
+            &self.config,
+        );
         compare(&proxy, &sdk)
     }
 }

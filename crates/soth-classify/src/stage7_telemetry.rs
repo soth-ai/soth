@@ -218,42 +218,16 @@ fn build_sensitive_code_flags(
         match &artifact.kind {
             ArtifactKind::PrivateKey => {
                 flags.private_key_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.credential_pattern_detected = true;
-                flags.detected_secret_types.push("private_key".to_string());
+                mark_credential_artifact(&mut flags, artifact);
             }
             ArtifactKind::CodeBlock { .. } => {
                 flags.auth_logic_detected = true;
             }
-            ArtifactKind::ApiKey { .. } => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("api_key".to_string());
-            }
-            ArtifactKind::Jwt => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("jwt".to_string());
-            }
-            ArtifactKind::HexKey => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("hex_key".to_string());
-            }
-            ArtifactKind::ConnectionString => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags
-                    .detected_secret_types
-                    .push("connection_string".to_string());
-            }
-            ArtifactKind::UnknownCredential => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags
-                    .detected_secret_types
-                    .push("unknown_credential".to_string());
-            }
+            ArtifactKind::ApiKey { .. }
+            | ArtifactKind::Jwt
+            | ArtifactKind::HexKey
+            | ArtifactKind::ConnectionString
+            | ArtifactKind::UnknownCredential => mark_credential_artifact(&mut flags, artifact),
             ArtifactKind::OrgPattern { pattern_id } => {
                 flags.org_pattern_matches.push(pattern_id.to_string());
             }
@@ -263,35 +237,11 @@ fn build_sensitive_code_flags(
             ArtifactKind::CryptoOperation => {
                 flags.crypto_operations_detected = true;
             }
-            ArtifactKind::AwsAccessKey => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags
-                    .detected_secret_types
-                    .push("aws_access_key".to_string());
-            }
-            ArtifactKind::GitHubPat => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("github_pat".to_string());
-            }
-            ArtifactKind::GitLabToken => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("gitlab_token".to_string());
-            }
-            ArtifactKind::SlackToken => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags.detected_secret_types.push("slack_token".to_string());
-            }
-            ArtifactKind::StripeSecretKey => {
-                flags.credential_pattern_detected = true;
-                flags.hardcoded_secret_detected = true;
-                flags
-                    .detected_secret_types
-                    .push("stripe_secret_key".to_string());
-            }
+            ArtifactKind::AwsAccessKey
+            | ArtifactKind::GitHubPat
+            | ArtifactKind::GitLabToken
+            | ArtifactKind::SlackToken
+            | ArtifactKind::StripeSecretKey => mark_credential_artifact(&mut flags, artifact),
         }
     }
 
@@ -311,6 +261,17 @@ fn build_sensitive_code_flags(
     }
 
     flags
+}
+
+fn mark_credential_artifact(
+    flags: &mut SensitiveCodeFlags,
+    artifact: &soth_core::SensitiveArtifact,
+) {
+    flags.credential_pattern_detected = true;
+    flags.hardcoded_secret_detected = true;
+    if let Some(credential_kind) = artifact.credential_kind_label() {
+        flags.detected_secret_types.push(credential_kind);
+    }
 }
 
 fn compute_code_fraction(detect_result: &soth_core::DetectResult) -> f32 {
@@ -585,6 +546,7 @@ mod tests {
                 kind: soth_core::ArtifactKind::CodeBlock {
                     language: "rust".to_string(),
                 },
+                credential_kind: None,
                 severity: soth_core::ArtifactSeverity::Low,
                 location: soth_core::ArtifactLocation::UserContent {
                     turn: 0,
@@ -597,6 +559,7 @@ mod tests {
                 kind: soth_core::ArtifactKind::ApiKey {
                     provider: Some(soth_core::DetectedProvider::OpenAi),
                 },
+                credential_kind: None,
                 severity: soth_core::ArtifactSeverity::High,
                 location: soth_core::ArtifactLocation::UserContent {
                     turn: 0,
@@ -664,6 +627,7 @@ mod tests {
                 kind: soth_core::ArtifactKind::CodeBlock {
                     language: "rust".to_string(),
                 },
+                credential_kind: None,
                 severity: soth_core::ArtifactSeverity::Low,
                 location: soth_core::ArtifactLocation::UserContent {
                     turn: 0,
@@ -676,6 +640,7 @@ mod tests {
                 kind: soth_core::ArtifactKind::CodeBlock {
                     language: "Rust".to_string(),
                 },
+                credential_kind: None,
                 severity: soth_core::ArtifactSeverity::Low,
                 location: soth_core::ArtifactLocation::UserContent {
                     turn: 1,
@@ -711,6 +676,7 @@ mod tests {
         let mut detect = detect_result();
         detect.artifacts = vec![soth_core::SensitiveArtifact {
             kind: soth_core::ArtifactKind::PrivateKey,
+            credential_kind: None,
             severity: soth_core::ArtifactSeverity::Critical,
             location: soth_core::ArtifactLocation::SystemPrompt { char_offset: 0 },
             commitment: None,
@@ -731,6 +697,43 @@ mod tests {
         assert!(out.event.sensitive_code_flags.private_key_detected);
         assert!(out.event.sensitive_code_flags.hardcoded_secret_detected);
         assert!(out.event.sensitive_code_flags.credential_pattern_detected);
+        assert!(out
+            .event
+            .sensitive_code_flags
+            .detected_secret_types
+            .contains(&"generic_private_key".to_string()));
+    }
+
+    #[test]
+    fn telemetry_uses_exact_credential_kind_from_artifact_metadata() {
+        let mut detect = detect_result();
+        detect.artifacts = vec![soth_core::SensitiveArtifact {
+            kind: soth_core::ArtifactKind::StripeSecretKey,
+            credential_kind: Some("stripe_live_secret_key".to_string()),
+            severity: soth_core::ArtifactSeverity::Critical,
+            location: soth_core::ArtifactLocation::UserContent {
+                turn: 0,
+                char_offset: 0,
+            },
+            commitment: None,
+            redacted_hint: None,
+        }];
+
+        let out = run(
+            &detect,
+            &proxy_ctx_with_time(3),
+            &ClusterOutput::default(),
+            &usecase_output(),
+            &VolatilityOutput::default(),
+            &AnomalyOutput::default(),
+            &policy_allow(),
+            0.0,
+        );
+
+        assert_eq!(
+            out.event.sensitive_code_flags.detected_secret_types,
+            vec!["stripe_live_secret_key".to_string()]
+        );
     }
 
     #[test]

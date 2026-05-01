@@ -363,7 +363,9 @@ fn expected_decision(detect: &DetectResult, proxy: &ProxyContext) -> ExpectedDec
     if cost > 0.25 {
         return ExpectedDecision::RerouteHighCost;
     }
-    if proxy.identity.traffic_classification == TrafficClassification::UnknownAgent && has_credential {
+    if proxy.identity.traffic_classification == TrafficClassification::UnknownAgent
+        && has_credential
+    {
         return ExpectedDecision::Block451;
     }
     if detect.normalized.endpoint_type == EndpointType::Embedding {
@@ -407,6 +409,7 @@ fn apply_case_inputs(idx: usize, detect: &mut DetectResult, proxy: &mut ProxyCon
     detect.artifacts = if idx % 17 == 0 {
         vec![SensitiveArtifact {
             kind: ArtifactKind::PrivateKey,
+            credential_kind: None,
             severity: ArtifactSeverity::Critical,
             location: ArtifactLocation::SystemPrompt { char_offset: 0 },
             commitment: None,
@@ -417,6 +420,7 @@ fn apply_case_inputs(idx: usize, detect: &mut DetectResult, proxy: &mut ProxyCon
             kind: ArtifactKind::ApiKey {
                 provider: Some(DetectedProvider::OpenAi),
             },
+            credential_kind: None,
             severity: ArtifactSeverity::High,
             location: ArtifactLocation::UserContent {
                 turn: 0,

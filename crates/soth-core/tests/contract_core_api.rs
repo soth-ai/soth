@@ -663,6 +663,7 @@ fn from_governable_enriches_languages_and_classification_flags() {
                 kind: ArtifactKind::CodeBlock {
                     language: "rust".to_string(),
                 },
+                credential_kind: None,
                 severity: ArtifactSeverity::Low,
                 location: ArtifactLocation::UserContent {
                     turn: 0,
@@ -675,6 +676,7 @@ fn from_governable_enriches_languages_and_classification_flags() {
                 kind: ArtifactKind::CodeBlock {
                     language: "python".to_string(),
                 },
+                credential_kind: None,
                 severity: ArtifactSeverity::Low,
                 location: ArtifactLocation::UserContent {
                     turn: 1,
@@ -685,6 +687,7 @@ fn from_governable_enriches_languages_and_classification_flags() {
             },
             SensitiveArtifact {
                 kind: ArtifactKind::ApiKey { provider: None },
+                credential_kind: None,
                 severity: ArtifactSeverity::High,
                 location: ArtifactLocation::UserContent {
                     turn: 0,
@@ -729,6 +732,10 @@ fn from_governable_enriches_languages_and_classification_flags() {
     // Sensitive code flags from artifacts
     assert!(telemetry.sensitive_code_flags.credential_pattern_detected);
     assert!(telemetry.sensitive_code_flags.hardcoded_secret_detected);
+    assert!(telemetry
+        .sensitive_code_flags
+        .detected_secret_types
+        .contains(&"api_key".to_string()));
 
     // Code fraction is non-zero (2 code blocks / 42 tokens)
     assert!(telemetry.code_fraction > 0.0);
@@ -759,6 +766,7 @@ fn from_governable_with_private_key_sets_sensitive_flags() {
         normalized: None,
         artifacts: vec![SensitiveArtifact {
             kind: ArtifactKind::PrivateKey,
+            credential_kind: None,
             severity: ArtifactSeverity::Critical,
             location: ArtifactLocation::SystemPrompt { char_offset: 0 },
             commitment: None,
@@ -774,6 +782,10 @@ fn from_governable_with_private_key_sets_sensitive_flags() {
     assert!(telemetry.sensitive_code_flags.private_key_detected);
     assert!(telemetry.sensitive_code_flags.hardcoded_secret_detected);
     assert!(telemetry.sensitive_code_flags.credential_pattern_detected);
+    assert_eq!(
+        telemetry.sensitive_code_flags.detected_secret_types,
+        vec!["generic_private_key".to_string()]
+    );
 
     // Block policy sets PolicyTriggered flag
     assert!(telemetry
