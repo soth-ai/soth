@@ -470,7 +470,10 @@ pub fn run_facade_lane(
     let config = soth_sdk_core::SdkConfigBuilder::new()
         .api_key("conformance-test")
         .org_id("org-conformance")
-        .hmac_key(soth_sdk_core::HmacKey::Static(Zeroizing::new(vec![0u8; 32])))
+        .hmac_key(soth_sdk_core::HmacKey::Static(Zeroizing::new(vec![
+            0u8;
+            32
+        ])))
         .build()
         .expect("build sdk config");
 
@@ -522,7 +525,10 @@ pub fn run_facade_lane(
 
     let telemetry = sdk.drain_telemetry_for_test().into_iter().next();
 
-    FacadeOutput { decision, telemetry }
+    FacadeOutput {
+        decision,
+        telemetry,
+    }
 }
 
 // ---------------------------------------------------------------------------

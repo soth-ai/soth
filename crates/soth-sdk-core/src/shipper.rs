@@ -146,6 +146,10 @@ fn run_loop(
             "org_id": &org_id,
             "events": final_batch,
         });
-        let _ = client.post(&endpoint).bearer_auth(&api_key).json(&body).send();
+        let _ = client
+            .post(&endpoint)
+            .bearer_auth(&api_key)
+            .json(&body)
+            .send();
     }
 }

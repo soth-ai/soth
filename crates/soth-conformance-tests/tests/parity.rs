@@ -104,10 +104,7 @@ fn sdk_direct_and_facade_lanes_agree_byte_identical() {
 
         let diffs = soth_conformance_tests::compare_sdk_vs_facade(&sdk, &facade);
         if !diffs.is_empty() {
-            failures.push((
-                format!("{} ({})", fixture.name, path.display()),
-                diffs,
-            ));
+            failures.push((format!("{} ({})", fixture.name, path.display()), diffs));
         }
     }
 

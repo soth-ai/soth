@@ -11,11 +11,11 @@
 //! - Streaming round-trip: `stream_begin` / `stream_chunk` /
 //!   `stream_end` consumes the token exactly once.
 
+use soth_core::EndpointType;
 use soth_sdk_core::{
     BlockReason, Decision, HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder,
     SothSdk,
 };
-use soth_core::EndpointType;
 use zeroize::Zeroizing;
 
 fn minimal_sdk() -> SothSdk {
@@ -53,8 +53,7 @@ fn credential_call() -> LlmCall {
         model: "gpt-4o-mini".into(),
         messages: vec![Message {
             role: "user".into(),
-            content: "review this key sk-abcdefghijklmnopqrstuvwxyzABCD1234567890 for me"
-                .into(),
+            content: "review this key sk-abcdefghijklmnopqrstuvwxyzABCD1234567890 for me".into(),
         }],
         system: None,
         tools: Vec::new(),
@@ -152,5 +151,8 @@ fn many_pre_calls_without_post_call_do_not_leak_past_slab_capacity() {
         "slab pressure should yield SLAB_FULL token"
     );
     // post_call with SLAB_FULL is a documented no-op.
-    sdk.post_call(decision.token(), &LlmResponse::new(EndpointType::ChatCompletion));
+    sdk.post_call(
+        decision.token(),
+        &LlmResponse::new(EndpointType::ChatCompletion),
+    );
 }

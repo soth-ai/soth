@@ -14,12 +14,12 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use soth_core::EndpointType;
 use soth_sdk_core::{
     BlockReason as CoreBlockReason, CallContext, Decision as CoreDecision, DecisionToken,
     FlagSeverity, HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder,
     SothSdk as CoreSothSdk, StreamObservation as CoreStreamObservation, Tool,
 };
-use soth_core::EndpointType;
 use zeroize::Zeroizing;
 
 /// PyO3 wrapper around `SothSdk`. Stored as `Arc<SothSdk>` so it can be
@@ -147,10 +147,7 @@ impl PySothSdk {
 
     /// Drain the in-memory telemetry queue. Test-only — production
     /// shippers will pull batches via the Phase-1 transport API.
-    fn drain_telemetry_for_test<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyList>> {
+    fn drain_telemetry_for_test<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let events = self.inner.drain_telemetry_for_test();
         let result = PyList::empty_bound(py);
         for event in events {
@@ -162,10 +159,7 @@ impl PySothSdk {
             event_dict.set_item("endpoint_type", format!("{:?}", event.endpoint_type))?;
             event_dict.set_item("capture_mode", format!("{:?}", event.capture_mode))?;
             event_dict.set_item("use_case", format!("{:?}", event.use_case))?;
-            event_dict.set_item(
-                "volatility_class",
-                format!("{:?}", event.volatility_class),
-            )?;
+            event_dict.set_item("volatility_class", format!("{:?}", event.volatility_class))?;
             result.append(event_dict)?;
         }
         Ok(result)

@@ -14,12 +14,12 @@ use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use soth_core::EndpointType;
 use soth_sdk_core::{
     BlockReason as CoreBlockReason, CallContext, Decision as CoreDecision, DecisionToken,
     FlagSeverity, HmacKey, LlmCall, LlmChunk, LlmResponse, Message, SdkConfigBuilder,
     SothSdk as CoreSothSdk, StreamObservation as CoreStreamObservation, Tool,
 };
-use soth_core::EndpointType;
 use zeroize::Zeroizing;
 
 // ── napi-exposed types ────────────────────────────────────────────────
@@ -177,7 +177,10 @@ impl SothSdk {
     #[napi]
     pub fn post_call(&self, token: String, _response: Option<serde_json::Value>) -> Result<()> {
         let inner: u64 = token.parse().map_err(|_| {
-            Error::new(Status::InvalidArg, "decision token must be a numeric string")
+            Error::new(
+                Status::InvalidArg,
+                "decision token must be a numeric string",
+            )
         })?;
         let token = DecisionToken::from_raw(inner);
         let response = LlmResponse::new(EndpointType::ChatCompletion);
@@ -203,9 +206,10 @@ impl SothSdk {
         // bookkeeping — there's no observation to stash because pre_call
         // itself didn't allocate one. Phase-1 telemetry records this.
         if !is_sentinel_raw(token_raw) {
-            let mut guard = self.streams.lock().map_err(|_| {
-                Error::new(Status::GenericFailure, "stream slot lock poisoned")
-            })?;
+            let mut guard = self
+                .streams
+                .lock()
+                .map_err(|_| Error::new(Status::GenericFailure, "stream slot lock poisoned"))?;
             guard.insert(token_raw, observation);
         }
         Ok(decision_to_js(&decision))
@@ -222,9 +226,9 @@ impl SothSdk {
         delta_content: Option<String>,
         finish_reason: Option<String>,
     ) -> Result<()> {
-        let raw: u64 = token.parse().map_err(|_| {
-            Error::new(Status::InvalidArg, "stream token must be a numeric string")
-        })?;
+        let raw: u64 = token
+            .parse()
+            .map_err(|_| Error::new(Status::InvalidArg, "stream token must be a numeric string"))?;
         let mut guard = self
             .streams
             .lock()
@@ -242,9 +246,9 @@ impl SothSdk {
     /// Finalize the stream. Idempotent — second call is a no-op.
     #[napi]
     pub fn stream_end(&self, token: String) -> Result<()> {
-        let raw: u64 = token.parse().map_err(|_| {
-            Error::new(Status::InvalidArg, "stream token must be a numeric string")
-        })?;
+        let raw: u64 = token
+            .parse()
+            .map_err(|_| Error::new(Status::InvalidArg, "stream token must be a numeric string"))?;
         let mut guard = self
             .streams
             .lock()

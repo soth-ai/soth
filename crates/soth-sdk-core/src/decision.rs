@@ -152,7 +152,9 @@ impl DecisionToken {
 
     /// Test/binding-failure sentinel. Used when an FFI panic was caught
     /// at the boundary and a fail-open `Decision::Allow` was emitted.
-    pub const SENTINEL_FAIL_OPEN: DecisionToken = DecisionToken { inner: u64::MAX - 1 };
+    pub const SENTINEL_FAIL_OPEN: DecisionToken = DecisionToken {
+        inner: u64::MAX - 1,
+    };
 
     /// Opaque round-trip handle for FFI bindings. Bindings serialize
     /// the token across the language boundary as the returned u64;

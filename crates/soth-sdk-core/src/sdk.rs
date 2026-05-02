@@ -218,9 +218,11 @@ impl SothSdk {
         // Sync block path — credential / private-key artifacts are an
         // unconditional block in v0. Phase-1 expands this with full
         // org-rule evaluation on artifact-conditioned rules.
-        if let Some(reason) = detect.artifacts.iter().find_map(|a| {
-            artifact_block_reason(&a.kind, a.severity)
-        }) {
+        if let Some(reason) = detect
+            .artifacts
+            .iter()
+            .find_map(|a| artifact_block_reason(&a.kind, a.severity))
+        {
             let slab_ctx = DecisionContext {
                 created_at: std::time::Instant::now(),
                 generation: 0,
