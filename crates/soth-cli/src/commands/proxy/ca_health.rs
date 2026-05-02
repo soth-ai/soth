@@ -171,42 +171,106 @@ fn normalize_hash(raw: &str) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn check_macos_trust(cert_path: &Path) -> Result<OsTrustCheck> {
-    // Primary check: `security verify-cert` tests actual SSL trust policy,
-    // not just keychain presence. A cert can be in the keychain but have
-    // zero trust settings, which means browsers will reject it.
-    let verify = Command::new("security")
-        .args(["verify-cert", "-c"])
-        .arg(cert_path)
-        .args(["-p", "ssl"])
-        .output()
-        .context("failed running security verify-cert")?;
-
-    if verify.status.success() {
-        return Ok(OsTrustCheck {
-            status: OsTrustStatus::Trusted,
-            detail: "certificate passes SSL trust verification (security verify-cert)".to_string(),
-        });
+    // Why not `security verify-cert -p ssl`?
+    // For a self-signed CA root with `BasicConstraints: CA:TRUE` and no
+    // `serverAuth` EKU (our cert), the SSL policy treats the CA as a leaf
+    // SSL server cert and rejects it on basic-constraints/EKU grounds —
+    // even when trust IS installed. So that check returns "untrusted" for
+    // a properly trusted root, and we'd bail in `setup_ca` after the user
+    // already typed their admin password.
+    //
+    // Authoritative check: read the admin trust domain via
+    // `security trust-settings-export -d`. Trust list keys are uppercase
+    // SHA-1 fingerprints (no spaces). If our cert's SHA-1 is present, the
+    // CA is trusted by the OS; the trust setting itself was already vetted
+    // when `add-trusted-cert` accepted the explicit `-p ssl -p basic`
+    // policy flags during install.
+    match macos_cert_in_admin_trust(cert_path) {
+        Ok(true) => {
+            return Ok(OsTrustCheck {
+                status: OsTrustStatus::Trusted,
+                detail: "certificate present in admin trust domain (trust-settings-export)"
+                    .to_string(),
+            });
+        }
+        Ok(false) => {
+            // Fall through to diagnose presence vs trust.
+        }
+        Err(error) => {
+            return Ok(OsTrustCheck {
+                status: OsTrustStatus::Unknown,
+                detail: format!("could not read admin trust settings: {error}"),
+            });
+        }
     }
 
-    // verify-cert failed — cert is not trusted for SSL.
-    // Gather extra detail: check if it's at least present in a keychain.
-    let stderr = String::from_utf8_lossy(&verify.stderr);
     let keychain_detail = match macos_keychain_presence(cert_path) {
         Ok(Some(location)) => format!(
-            "certificate is in {location} keychain but lacks SSL trust policy. \
-             Run `soth setup-ca` to set trust."
+            "certificate is in {location} keychain but admin trust domain does \
+             not include it. Run `soth setup-ca` to set trust."
         ),
         Ok(None) => {
             "certificate not found in any keychain. Run `soth setup-ca` to install and trust."
                 .to_string()
         }
-        Err(_) => format!("verify-cert failed: {}", stderr.trim()),
+        Err(error) => format!("admin trust check fell through: {error}"),
     };
 
     Ok(OsTrustCheck {
         status: OsTrustStatus::Untrusted,
         detail: keychain_detail,
     })
+}
+
+/// Check whether the cert's SHA-1 fingerprint appears in the admin trust
+/// domain (`/Library/Security/Trust Settings/Admin.plist`, exported via
+/// `security trust-settings-export -d`). The export does NOT require root
+/// since Big Sur, so this works from a normal-user `soth status` / `soth up`.
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_cert_in_admin_trust(cert_path: &Path) -> Result<bool> {
+    let expected_sha1 = cert_fingerprint_sha1(cert_path)?;
+    let tmp = tempfile::Builder::new()
+        .prefix("soth-trust-settings-")
+        .suffix(".plist")
+        .tempfile()
+        .context("create temp file for trust-settings-export")?;
+    let tmp_path = tmp.path();
+
+    let export = Command::new("security")
+        .arg("trust-settings-export")
+        .arg("-d")
+        .arg(tmp_path)
+        .output()
+        .context("failed running security trust-settings-export -d")?;
+    if !export.status.success() {
+        let stderr = String::from_utf8_lossy(&export.stderr);
+        // Empty admin trust domain → exporter writes a stub plist and exits
+        // 0; a non-zero exit here means a real failure (e.g. SIP issue),
+        // worth surfacing to the caller.
+        anyhow::bail!(
+            "security trust-settings-export -d failed: {}",
+            stderr.trim()
+        );
+    }
+
+    // The exported plist is binary; convert to readable form via plutil.
+    // Both binary and XML serializations encode trustList keys as the
+    // uppercase SHA-1 hex string with no separators, so a substring grep
+    // on the textual form is robust without a plist parser.
+    let dump = Command::new("plutil")
+        .args(["-convert", "xml1", "-o", "-"])
+        .arg(tmp_path)
+        .output()
+        .context("failed running plutil -convert xml1")?;
+    if !dump.status.success() {
+        anyhow::bail!(
+            "plutil failed to read trust-settings export: {}",
+            String::from_utf8_lossy(&dump.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&dump.stdout);
+    Ok(stdout.contains(expected_sha1.as_str()))
 }
 
 /// Check which keychains contain the certificate (for diagnostics only).
