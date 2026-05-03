@@ -342,23 +342,32 @@ impl ProxyHandler {
             parent_process_name,
             env_index.as_ref(),
         );
-        let (product_id, surface_type, is_shadow_it) = match resolved_tool {
-            Some((entity, _)) => (
-                Some(entity.id.clone()),
-                entity.kind.to_surface_type(),
-                false,
-            ),
+        let (product_id, surface_type) = match resolved_tool {
+            Some((entity, _)) => (Some(entity.id.clone()), entity.kind.to_surface_type()),
             None => {
-                // Shadow IT — derive surface_type from the parent environment so
-                // the telemetry record carries meaningful context even without a
-                // known entity match.  This branch also handles the IdePlugin
-                // case where the parent is not an IDE (resolve_tool returned None).
+                // Process didn't match a catalog entity. Derive surface_type
+                // from the parent environment so the telemetry record carries
+                // meaningful context. Also handles the IdePlugin case where
+                // the parent is not an IDE (resolve_tool returns None).
                 let parent_env_class =
                     env_index.resolve_parent(parent_bundle_id, parent_process_name);
                 let surface = env_class_to_surface(parent_env_class);
-                (None, surface, true)
+                (None, surface)
             }
         };
+
+        // Look up the matched destination entity to determine whether the
+        // proxy has a parser for it. matched_application is the specific
+        // product (e.g. `chatgpt`); matched_provider is the underlying API
+        // surface (e.g. `openai`). Prefer application — that's the slug the
+        // catalog publishes parser coverage against.
+        let dest_slug = outcome
+            .matched_application
+            .as_deref()
+            .or(outcome.matched_provider.as_deref());
+        let matched_with_parser =
+            dest_slug.and_then(|slug| entity_index.get(slug).map(|e| e.api_format.is_some()));
+        let is_shadow_it = determine_shadow_it(matched_with_parser);
 
         // Derive session key and bind this connection
         let session_key = self
@@ -1608,4 +1617,69 @@ fn is_heavy_content_type(ct: Option<&str>) -> bool {
             | "application/x-executable"
             | "application/x-iso9660-image"
     )
+}
+
+/// Decide whether a request flags as shadow IT given the parser
+/// coverage of its matched destination entity.
+///
+/// **Definition.** Shadow IT here means "we recognise this AI tool
+/// but cannot decode what is happening inside the request" — i.e.
+/// the catalog has an entry for the destination but no parser /
+/// `api_format` is available in the bundle. Our visibility is
+/// limited to metadata (host, byte counts, latency).
+///
+/// Inputs: `matched_with_parser` is `Some(true)` when the destination
+/// matched a catalog entity AND that entity has an `api_format`,
+/// `Some(false)` when matched but no parser exists, and `None` when
+/// nothing in the catalog matched (i.e. non-AI traffic or unknown AI).
+///
+/// Outputs:
+/// - `Some(true)`  → not shadow. Catalog match with full parser
+///   visibility — this is the "fully observed" path, surfaces in
+///   regular AI inference dashboards rather than the shadow view.
+/// - `Some(false)` → **shadow**. Catalog match without a parser. We
+///   know which product is being used but can only see metadata.
+///   This is the bucket the cloud's `/detect/shadow-ai` view
+///   highlights so the org can prioritise parser coverage or
+///   approval/blocking decisions.
+/// - `None`        → not shadow. No catalog match at all — either
+///   non-AI traffic (skipped at gate) or an AI tool we don't yet
+///   know about. Org-approval and blocking are applied separately
+///   in soth-cloud, so the proxy stays stateless about policy.
+pub(crate) fn determine_shadow_it(matched_with_parser: Option<bool>) -> bool {
+    matches!(matched_with_parser, Some(false))
+}
+
+#[cfg(test)]
+mod shadow_it_tests {
+    use super::determine_shadow_it;
+
+    #[test]
+    fn catalog_match_without_parser_is_shadow() {
+        // ~64% of bundle entities (180/280 on dev box) have
+        // api_format=None: the catalog knows the product (Notion AI,
+        // HuggingChat, Manus, etc.) but no parser is shipped, so
+        // requests are visible only as metadata. That's the
+        // shadow bucket.
+        assert!(determine_shadow_it(Some(false)));
+    }
+
+    #[test]
+    fn catalog_match_with_parser_is_not_shadow() {
+        // ChatGPT, Claude, Gemini, Cursor, Claude Code all have
+        // dedicated parsers (api_format = "openai" / "anthropic" /
+        // "claude_web" / etc.), so the proxy fully decodes the
+        // request and the event flows through the regular AI
+        // inference dashboards rather than the shadow view.
+        assert!(!determine_shadow_it(Some(true)));
+    }
+
+    #[test]
+    fn no_catalog_match_is_not_shadow() {
+        // Non-AI traffic, or AI tools the catalog doesn't yet know
+        // about. The shadow signal is meaningful only for detected
+        // tools; emitting shadow=true here would drown the
+        // dashboard in noise from generic web traffic.
+        assert!(!determine_shadow_it(None));
+    }
 }
