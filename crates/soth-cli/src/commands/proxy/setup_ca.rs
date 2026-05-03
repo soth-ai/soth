@@ -292,9 +292,7 @@ fn install_trust_macos(cert_path: &Path) -> Result<()> {
                -k /Library/Keychains/System.keychain '{cert_escaped}'"
         );
         let escaped_inner = inner_command.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!(
-            "do shell script \"{escaped_inner}\" with administrator privileges"
-        );
+        let script = format!("do shell script \"{escaped_inner}\" with administrator privileges");
         let elevate = Command::new("osascript")
             .args(["-e", &script])
             .output()
@@ -388,9 +386,7 @@ fn install_trust_windows(cert_path: &Path) -> Result<()> {
     // the UAC consent dialog. `-Wait -PassThru` blocks until the elevated
     // certutil exits and surfaces its exit code so we know whether the
     // install actually succeeded after the user clicked "Yes".
-    style::info(
-        "Administrator privileges are required to add the CA to the Windows Root store.",
-    );
+    style::info("Administrator privileges are required to add the CA to the Windows Root store.");
 
     // PowerShell single-quoted strings escape an apostrophe by doubling
     // it. Cert paths from us never contain quotes but we sanitize anyway.

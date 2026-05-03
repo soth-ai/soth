@@ -596,12 +596,7 @@ async fn graceful_stop_child(child: &mut Child) -> Result<()> {
 }
 
 async fn wait_for_listener_start(child: &mut Child, port: u16) -> Result<()> {
-    wait_for_listener_start_with_timeout(
-        child,
-        port,
-        listener_startup_timeout(),
-    )
-    .await
+    wait_for_listener_start_with_timeout(child, port, listener_startup_timeout()).await
 }
 
 async fn wait_for_listener_start_with_timeout(
