@@ -118,6 +118,15 @@ impl RegistryPuller {
         SothHttpClient::new(endpoint.to_string(), self.api_key.clone())
     }
 
+    /// Client used for bundle body downloads. Uses per-read inactivity
+    /// timeout instead of a total request deadline so multi-MB payloads
+    /// over slow networks (poor Wi-Fi, mobile tethering, AV TLS-inspection
+    /// proxies) complete instead of failing at the 20s wall-clock that
+    /// `cloud_client_for_endpoint` enforces. See `build_bundle_client`.
+    fn bundle_client_for_endpoint(&self, endpoint: &str) -> SothHttpClient {
+        SothHttpClient::for_bundles(endpoint.to_string(), self.api_key.clone())
+    }
+
     pub async fn sync_from_hint(
         &self,
         expected_bundle_version: Option<&str>,
@@ -400,7 +409,10 @@ impl RegistryPuller {
         if_none_match: Option<&str>,
         fetch_query: &RegistryBundleFetchQuery,
     ) -> anyhow::Result<BundleFetchResultWithMetadata> {
-        let cloud = self.cloud_client_for_endpoint(endpoint);
+        // Use the bundle client (per-read inactivity timeout, no total
+        // deadline) — bundles can be multi-MB and the 20s total timeout in
+        // the regular cloud client kills slow downloads mid-body.
+        let cloud = self.bundle_client_for_endpoint(endpoint);
         let url = cloud.url("/v1/edge/bundle/current");
         let mut query_params = vec![("type", self.bundle_type.clone())];
         query_params.extend(build_bundle_query_pairs(fetch_query));
