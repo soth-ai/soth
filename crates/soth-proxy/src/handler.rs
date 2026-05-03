@@ -342,23 +342,25 @@ impl ProxyHandler {
             parent_process_name,
             env_index.as_ref(),
         );
-        let (product_id, surface_type, is_shadow_it) = match resolved_tool {
-            Some((entity, _)) => (
-                Some(entity.id.clone()),
-                entity.kind.to_surface_type(),
-                false,
-            ),
+        let (product_id, surface_type) = match resolved_tool {
+            Some((entity, _)) => (Some(entity.id.clone()), entity.kind.to_surface_type()),
             None => {
-                // Shadow IT — derive surface_type from the parent environment so
-                // the telemetry record carries meaningful context even without a
-                // known entity match.  This branch also handles the IdePlugin
-                // case where the parent is not an IDE (resolve_tool returned None).
+                // Process didn't match a catalog entity. Derive surface_type
+                // from the parent environment so the telemetry record carries
+                // meaningful context. Also handles the IdePlugin case where
+                // the parent is not an IDE (resolve_tool returns None).
                 let parent_env_class =
                     env_index.resolve_parent(parent_bundle_id, parent_process_name);
                 let surface = env_class_to_surface(parent_env_class);
-                (None, surface, true)
+                (None, surface)
             }
         };
+
+        let is_shadow_it = determine_shadow_it(
+            outcome.matched_application.as_deref(),
+            outcome.matched_provider.as_deref(),
+            &self.pipeline_config.approved_tool_slugs,
+        );
 
         // Derive session key and bind this connection
         let session_key = self
@@ -1608,4 +1610,99 @@ fn is_heavy_content_type(ct: Option<&str>) -> bool {
             | "application/x-executable"
             | "application/x-iso9660-image"
     )
+}
+
+/// Decide whether a request flags as shadow IT given its destination
+/// match and the org-approved tool allowlist.
+///
+/// SSPM/CASB discovery model: any catalog-known AI tool not on the
+/// org's allowlist is shadow IT. No catalog match → not shadow (the
+/// signal only applies to detected AI tools — non-AI traffic and
+/// completely unrecognized hosts shouldn't pollute the dashboard).
+///
+/// Slug match prefers `matched_application` (the specific product like
+/// `chatgpt`) over `matched_provider` (the underlying API surface like
+/// `openai`) because approval policy generally targets products, not
+/// raw APIs. Comparison is case-insensitive to tolerate inconsistent
+/// casing in YAML config and bundle entity slugs.
+pub(crate) fn determine_shadow_it(
+    matched_application: Option<&str>,
+    matched_provider: Option<&str>,
+    approved_tool_slugs: &[String],
+) -> bool {
+    let dest_slug = matched_application.or(matched_provider);
+    match dest_slug {
+        Some(slug) => !approved_tool_slugs
+            .iter()
+            .any(|approved| approved.eq_ignore_ascii_case(slug)),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod shadow_it_tests {
+    use super::determine_shadow_it;
+
+    #[test]
+    fn catalog_match_with_empty_allowlist_is_shadow() {
+        // Default deployment: no org has approved anything yet, so every
+        // detected catalog tool flags as shadow. This is the SSPM
+        // discovery default.
+        assert!(determine_shadow_it(Some("chatgpt"), Some("openai"), &[]));
+    }
+
+    #[test]
+    fn catalog_match_in_allowlist_is_not_shadow() {
+        let approved = vec!["chatgpt".to_string(), "claude".to_string()];
+        assert!(!determine_shadow_it(
+            Some("chatgpt"),
+            Some("openai"),
+            &approved
+        ));
+    }
+
+    #[test]
+    fn no_catalog_match_is_not_shadow() {
+        // Non-AI traffic (or AI we don't recognize) → not shadow. The
+        // signal is meaningful only for detected AI tools.
+        assert!(!determine_shadow_it(None, None, &[]));
+        assert!(!determine_shadow_it(
+            None,
+            None,
+            &["chatgpt".to_string()]
+        ));
+    }
+
+    #[test]
+    fn application_slug_takes_precedence_over_provider() {
+        // `matched_application` (the specific product) is the canonical
+        // approval target. Approving `openai` (the API surface) without
+        // approving `chatgpt` (the product) does NOT clear chatgpt.
+        let approved = vec!["openai".to_string()];
+        assert!(determine_shadow_it(
+            Some("chatgpt"),
+            Some("openai"),
+            &approved
+        ));
+    }
+
+    #[test]
+    fn provider_slug_used_when_application_is_none() {
+        // Some destinations resolve only to a provider (e.g. raw
+        // api.anthropic.com call without product attribution). Fall
+        // back to provider for the allowlist check.
+        let approved = vec!["anthropic".to_string()];
+        assert!(!determine_shadow_it(None, Some("anthropic"), &approved));
+        assert!(determine_shadow_it(None, Some("anthropic"), &[]));
+    }
+
+    #[test]
+    fn allowlist_match_is_case_insensitive() {
+        // YAML configs and bundle slugs can drift on casing — accept
+        // either form so a typo doesn't silently break approval.
+        let approved = vec!["ChatGPT".to_string()];
+        assert!(!determine_shadow_it(Some("chatgpt"), None, &approved));
+        let approved2 = vec!["chatgpt".to_string()];
+        assert!(!determine_shadow_it(Some("CHATGPT"), None, &approved2));
+    }
 }
