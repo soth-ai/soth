@@ -18,9 +18,16 @@ const PID_OWNER_TOKEN_FILE: &str = "proxy.pid.token";
 const LOCK_FILE: &str = "proxy.lifecycle.lock";
 const LOG_FILE: &str = "proxy.log";
 const DEFAULT_PROXY_PORT: u16 = 8080;
-const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 12;
+// Cold-install on Windows with Defender real-time scanning can spend
+// 15-20s in the bundle install pass (asset writes scanned per-file)
+// before `proxy.start()` reaches `TcpListener::bind`. The CLI parent
+// waits for `127.0.0.1:<port>` to open, so this ceiling has to comfortably
+// exceed the proxy-side `LISTENER_STARTUP_TIMEOUT_SECS` *plus* a small
+// margin for spawn/handshake. Healthy installs still complete in <5s;
+// the bump just lifts the ceiling for slow machines.
+const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 65;
 const MIN_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 3;
-const MAX_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 60;
+const MAX_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_PROXY_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const MIN_PROXY_LOG_MAX_BYTES: u64 = 1024 * 1024;
 const MAX_PROXY_LOG_MAX_BYTES: u64 = 512 * 1024 * 1024;
