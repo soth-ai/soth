@@ -356,11 +356,18 @@ impl ProxyHandler {
             }
         };
 
-        let is_shadow_it = determine_shadow_it(
-            outcome.matched_application.as_deref(),
-            outcome.matched_provider.as_deref(),
-            &self.pipeline_config.approved_tool_slugs,
-        );
+        // Look up the matched destination entity to determine whether the
+        // proxy has a parser for it. matched_application is the specific
+        // product (e.g. `chatgpt`); matched_provider is the underlying API
+        // surface (e.g. `openai`). Prefer application — that's the slug the
+        // catalog publishes parser coverage against.
+        let dest_slug = outcome
+            .matched_application
+            .as_deref()
+            .or(outcome.matched_provider.as_deref());
+        let matched_with_parser =
+            dest_slug.and_then(|slug| entity_index.get(slug).map(|e| e.api_format.is_some()));
+        let is_shadow_it = determine_shadow_it(matched_with_parser);
 
         // Derive session key and bind this connection
         let session_key = self
@@ -1612,31 +1619,35 @@ fn is_heavy_content_type(ct: Option<&str>) -> bool {
     )
 }
 
-/// Decide whether a request flags as shadow IT given its destination
-/// match and the org-approved tool allowlist.
+/// Decide whether a request flags as shadow IT given the parser
+/// coverage of its matched destination entity.
 ///
-/// SSPM/CASB discovery model: any catalog-known AI tool not on the
-/// org's allowlist is shadow IT. No catalog match → not shadow (the
-/// signal only applies to detected AI tools — non-AI traffic and
-/// completely unrecognized hosts shouldn't pollute the dashboard).
+/// **Definition.** Shadow IT here means "we recognise this AI tool
+/// but cannot decode what is happening inside the request" — i.e.
+/// the catalog has an entry for the destination but no parser /
+/// `api_format` is available in the bundle. Our visibility is
+/// limited to metadata (host, byte counts, latency).
 ///
-/// Slug match prefers `matched_application` (the specific product like
-/// `chatgpt`) over `matched_provider` (the underlying API surface like
-/// `openai`) because approval policy generally targets products, not
-/// raw APIs. Comparison is case-insensitive to tolerate inconsistent
-/// casing in YAML config and bundle entity slugs.
-pub(crate) fn determine_shadow_it(
-    matched_application: Option<&str>,
-    matched_provider: Option<&str>,
-    approved_tool_slugs: &[String],
-) -> bool {
-    let dest_slug = matched_application.or(matched_provider);
-    match dest_slug {
-        Some(slug) => !approved_tool_slugs
-            .iter()
-            .any(|approved| approved.eq_ignore_ascii_case(slug)),
-        None => false,
-    }
+/// Inputs: `matched_with_parser` is `Some(true)` when the destination
+/// matched a catalog entity AND that entity has an `api_format`,
+/// `Some(false)` when matched but no parser exists, and `None` when
+/// nothing in the catalog matched (i.e. non-AI traffic or unknown AI).
+///
+/// Outputs:
+/// - `Some(true)`  → not shadow. Catalog match with full parser
+///   visibility — this is the "fully observed" path, surfaces in
+///   regular AI inference dashboards rather than the shadow view.
+/// - `Some(false)` → **shadow**. Catalog match without a parser. We
+///   know which product is being used but can only see metadata.
+///   This is the bucket the cloud's `/detect/shadow-ai` view
+///   highlights so the org can prioritise parser coverage or
+///   approval/blocking decisions.
+/// - `None`        → not shadow. No catalog match at all — either
+///   non-AI traffic (skipped at gate) or an AI tool we don't yet
+///   know about. Org-approval and blocking are applied separately
+///   in soth-cloud, so the proxy stays stateless about policy.
+pub(crate) fn determine_shadow_it(matched_with_parser: Option<bool>) -> bool {
+    matches!(matched_with_parser, Some(false))
 }
 
 #[cfg(test)]
@@ -1644,65 +1655,31 @@ mod shadow_it_tests {
     use super::determine_shadow_it;
 
     #[test]
-    fn catalog_match_with_empty_allowlist_is_shadow() {
-        // Default deployment: no org has approved anything yet, so every
-        // detected catalog tool flags as shadow. This is the SSPM
-        // discovery default.
-        assert!(determine_shadow_it(Some("chatgpt"), Some("openai"), &[]));
+    fn catalog_match_without_parser_is_shadow() {
+        // ~64% of bundle entities (180/280 on dev box) have
+        // api_format=None: the catalog knows the product (Notion AI,
+        // HuggingChat, Manus, etc.) but no parser is shipped, so
+        // requests are visible only as metadata. That's the
+        // shadow bucket.
+        assert!(determine_shadow_it(Some(false)));
     }
 
     #[test]
-    fn catalog_match_in_allowlist_is_not_shadow() {
-        let approved = vec!["chatgpt".to_string(), "claude".to_string()];
-        assert!(!determine_shadow_it(
-            Some("chatgpt"),
-            Some("openai"),
-            &approved
-        ));
+    fn catalog_match_with_parser_is_not_shadow() {
+        // ChatGPT, Claude, Gemini, Cursor, Claude Code all have
+        // dedicated parsers (api_format = "openai" / "anthropic" /
+        // "claude_web" / etc.), so the proxy fully decodes the
+        // request and the event flows through the regular AI
+        // inference dashboards rather than the shadow view.
+        assert!(!determine_shadow_it(Some(true)));
     }
 
     #[test]
     fn no_catalog_match_is_not_shadow() {
-        // Non-AI traffic (or AI we don't recognize) → not shadow. The
-        // signal is meaningful only for detected AI tools.
-        assert!(!determine_shadow_it(None, None, &[]));
-        assert!(!determine_shadow_it(
-            None,
-            None,
-            &["chatgpt".to_string()]
-        ));
-    }
-
-    #[test]
-    fn application_slug_takes_precedence_over_provider() {
-        // `matched_application` (the specific product) is the canonical
-        // approval target. Approving `openai` (the API surface) without
-        // approving `chatgpt` (the product) does NOT clear chatgpt.
-        let approved = vec!["openai".to_string()];
-        assert!(determine_shadow_it(
-            Some("chatgpt"),
-            Some("openai"),
-            &approved
-        ));
-    }
-
-    #[test]
-    fn provider_slug_used_when_application_is_none() {
-        // Some destinations resolve only to a provider (e.g. raw
-        // api.anthropic.com call without product attribution). Fall
-        // back to provider for the allowlist check.
-        let approved = vec!["anthropic".to_string()];
-        assert!(!determine_shadow_it(None, Some("anthropic"), &approved));
-        assert!(determine_shadow_it(None, Some("anthropic"), &[]));
-    }
-
-    #[test]
-    fn allowlist_match_is_case_insensitive() {
-        // YAML configs and bundle slugs can drift on casing — accept
-        // either form so a typo doesn't silently break approval.
-        let approved = vec!["ChatGPT".to_string()];
-        assert!(!determine_shadow_it(Some("chatgpt"), None, &approved));
-        let approved2 = vec!["chatgpt".to_string()];
-        assert!(!determine_shadow_it(Some("CHATGPT"), None, &approved2));
+        // Non-AI traffic, or AI tools the catalog doesn't yet know
+        // about. The shadow signal is meaningful only for detected
+        // tools; emitting shadow=true here would drown the
+        // dashboard in noise from generic web traffic.
+        assert!(!determine_shadow_it(None));
     }
 }

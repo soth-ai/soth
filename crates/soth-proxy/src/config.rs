@@ -754,15 +754,6 @@ pub struct PipelineConfig {
     /// Bind address for the lightweight ops HTTP server (`/healthz`, `/readyz`, `/metrics`).
     /// Set to an empty string to disable.
     pub ops_bind: String,
-    /// Org-approved AI tool slugs. Any catalog-matched destination NOT in this
-    /// list is flagged as shadow IT (`is_shadow_it = true`) in telemetry.
-    /// Empty list means "every detected catalog tool is shadow until you
-    /// approve it" — the SSPM/CASB discovery default. Match is exact on the
-    /// matched_application slug (preferred) or matched_provider slug
-    /// fallback. Slugs come from the bundle's entity catalog (e.g.
-    /// `chatgpt`, `claude`, `cursor`, `notion-ai`).
-    #[serde(default)]
-    pub approved_tool_slugs: Vec<String>,
 }
 
 impl Default for PipelineConfig {
@@ -776,7 +767,6 @@ impl Default for PipelineConfig {
             session: SessionConfig::default(),
             retention_days: Self::default_retention_days(),
             ops_bind: "127.0.0.1:9090".to_string(),
-            approved_tool_slugs: Vec::new(),
         }
     }
 }
