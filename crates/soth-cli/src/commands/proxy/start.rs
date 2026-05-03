@@ -13,7 +13,18 @@ use tokio::process::{Child, Command};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-const LISTENER_STARTUP_TIMEOUT_SECS: u64 = 20;
+// Default budget for the supervisor to wait for the worker proxy to bind
+// 127.0.0.1:<port>. The bind happens late in `proxy.start()` — after
+// `verify_bundle_source_ready()` synchronously fetches AND installs the
+// cloud bundle, which on cold-install Windows boxes with Defender
+// real-time scanning can take 15-20s on its own. 60s gives that path
+// headroom without making real failures (port in use, panic at startup)
+// linger forever. Operators can override via
+// `SOTH_PROXY_LISTENER_STARTUP_TIMEOUT_SECS` if their environment is even
+// slower (corporate AV, encrypted volumes, etc.).
+const LISTENER_STARTUP_TIMEOUT_SECS: u64 = 60;
+const MIN_LISTENER_STARTUP_TIMEOUT_SECS: u64 = 5;
+const MAX_LISTENER_STARTUP_TIMEOUT_SECS: u64 = 300;
 const LISTENER_HEALTH_CHECK_INTERVAL_MS: u64 = 1_000;
 /// How long the listener can be unresponsive before the supervisor kills and
 /// restarts the proxy.  Kept short (5s) so laptop sleep/wake recovery is fast.
@@ -366,7 +377,7 @@ async fn supervise_proxy(
     let mut last_iteration = Instant::now();
     // First restart after a detected wake gets a longer startup grace
     // window — see WAKE_LISTENER_STARTUP_TIMEOUT_SECS for the rationale.
-    let mut next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
+    let mut next_startup_timeout = listener_startup_timeout();
     // Watches for primary-network changes (wifi switch, captive-portal
     // address reassignment) and triggers a graceful child rotation so the
     // upstream connection pool isn't left bound to the old gateway.
@@ -483,7 +494,7 @@ async fn supervise_proxy(
         last_healthy = Instant::now();
         // After a successful restart, drop back to the normal startup
         // budget — the wake-up grace window is one-shot.
-        next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
+        next_startup_timeout = listener_startup_timeout();
     }
 }
 
@@ -588,7 +599,7 @@ async fn wait_for_listener_start(child: &mut Child, port: u16) -> Result<()> {
     wait_for_listener_start_with_timeout(
         child,
         port,
-        Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS),
+        listener_startup_timeout(),
     )
     .await
 }
@@ -981,6 +992,22 @@ fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpLis
 
 fn parse_env_u64(key: &str) -> Option<u64> {
     env::var(key).ok()?.trim().parse::<u64>().ok()
+}
+
+/// Resolve the listener-bind startup deadline. Defaults to
+/// `LISTENER_STARTUP_TIMEOUT_SECS`; operators can override via
+/// `SOTH_PROXY_LISTENER_STARTUP_TIMEOUT_SECS`. Clamped to
+/// `[MIN_LISTENER_STARTUP_TIMEOUT_SECS, MAX_LISTENER_STARTUP_TIMEOUT_SECS]`
+/// so a misconfiguration can't make the supervisor wait forever or give
+/// up before the worker has a chance to bind.
+fn listener_startup_timeout() -> Duration {
+    let secs = parse_env_u64("SOTH_PROXY_LISTENER_STARTUP_TIMEOUT_SECS")
+        .unwrap_or(LISTENER_STARTUP_TIMEOUT_SECS)
+        .clamp(
+            MIN_LISTENER_STARTUP_TIMEOUT_SECS,
+            MAX_LISTENER_STARTUP_TIMEOUT_SECS,
+        );
+    Duration::from_secs(secs)
 }
 
 #[cfg(unix)]
