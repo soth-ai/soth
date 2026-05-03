@@ -45,11 +45,11 @@ hex = "0.4"
 dirs = "5.0"
 which = "6.0"
 libc = "0.2"
+tempfile = { workspace = true }
 
 # CLI styling
 owo-colors = "4.0"
 comfy-table = "7.0"
 
 [dev-dependencies]
-tempfile = { workspace = true }
 criterion = { version = "0.5", features = ["async_tokio"] }
