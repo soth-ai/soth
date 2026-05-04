@@ -84,12 +84,62 @@ fn local_v4_addrs() -> BTreeSet<Ipv4Addr> {
     set
 }
 
-#[cfg(not(unix))]
+/// Windows path: ask the kernel which local IPv4 it would route to a
+/// public destination via a UDP "connect" trick. Connecting a UDP
+/// socket sends no packets — it only updates the kernel's route
+/// resolution for that socket — but `local_addr()` then returns the
+/// IP that the default route would use. That IP is exactly what
+/// flips on a wifi switch / interface change, so polling it
+/// detects the change without any FFI into `GetAdaptersAddresses`.
+///
+/// Trade-off vs `getifaddrs` on Unix: this captures only the
+/// default-route IP, not the full set of bound IPv4s. On Windows
+/// that's enough for the watcher's purpose — the supervisor reload
+/// is triggered by *any* change, and the default-route IP changes
+/// on every realistic network event (wifi network switch, VPN
+/// up/down, dock/undock with USB-Ethernet, captive-portal IP
+/// reassignment). It does NOT catch "added a secondary adapter
+/// while the existing default route is still active" but neither
+/// did the previous empty stub, and the upstream connection pool
+/// only cares about routes that actually flip.
+#[cfg(windows)]
+fn local_v4_addrs() -> BTreeSet<Ipv4Addr> {
+    use std::net::{IpAddr, UdpSocket};
+
+    let mut set = BTreeSet::new();
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+        return set;
+    };
+    // 8.8.8.8 is a stable, well-known target. UDP connect doesn't
+    // emit packets — it only sets the destination so the kernel
+    // resolves a route. If the host is fully offline the connect
+    // can fail; fall through to an empty set, which matches the
+    // "no networks" baseline and won't spuriously trigger reloads.
+    if sock.connect("8.8.8.8:80").is_err() {
+        return set;
+    }
+    let Ok(addr) = sock.local_addr() else {
+        return set;
+    };
+    if let IpAddr::V4(v4) = addr.ip() {
+        if !v4.is_loopback() && !v4.is_unspecified() {
+            set.insert(v4);
+        }
+    }
+    set
+}
+
+/// Catch-all for non-Unix, non-Windows targets (BSDs we don't
+/// officially ship to, WASM, etc.). Empty set means the watcher
+/// polls but never fires — same effective behaviour as the
+/// pre-fix Windows path, just scoped to platforms we don't
+/// actively support.
+#[cfg(not(any(unix, windows)))]
 fn local_v4_addrs() -> BTreeSet<Ipv4Addr> {
     BTreeSet::new()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
 
