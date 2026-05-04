@@ -5,6 +5,11 @@
 //! shipper is gated behind the `http-telemetry` feature so default
 //! builds stay light; bindings flip it on for production.
 //!
+//! Wire format is the cloud-facing `soth_api_types::TelemetryBatchRequest`,
+//! the same envelope the proxy ships via `soth-sync`. The SDK and the
+//! proxy share a single source of truth for the cloud contract so
+//! they cannot silently drift.
+//!
 //! V0 deliberately ships a minimal shipper: bounded batches, fixed
 //! window, no retry/circuit-breaker. Phase 2 ports the full retry
 //! semantics from `soth-sync` (5 attempts with exp backoff, 72-hour
@@ -16,6 +21,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+use soth_api_types::api_types::{TelemetryBatchRequest, API_VERSION, API_VERSION_HEADER};
+use soth_api_types::convert::map_event;
+use soth_core::TelemetryEvent as CoreTelemetryEvent;
 
 use crate::telemetry_queue::TelemetryQueue;
 
@@ -52,7 +61,6 @@ impl TelemetryShipper {
     pub fn shutdown(&mut self) {
         if !self.shutdown.swap(true, Ordering::Release) {
             if let Some(handle) = self.handle.take() {
-                // Best-effort join; ignore poisoned panics.
                 let _ = handle.join();
             }
         }
@@ -101,55 +109,110 @@ fn run_loop(
             continue;
         }
 
-        // Wire envelope is intentionally minimal; cloud-side ingestion
-        // accepts the same shape soth-sync uses for the proxy.
-        let body = serde_json::json!({
-            "org_id": &org_id,
-            "events": batch,
-        });
-
-        match client
-            .post(&endpoint)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send()
-        {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(
-                    target: "soth_sdk_core::shipper",
-                    status = resp.status().as_u16(),
-                    "telemetry batch posted"
-                );
-            }
-            Ok(resp) => {
-                tracing::warn!(
-                    target: "soth_sdk_core::shipper",
-                    status = resp.status().as_u16(),
-                    "telemetry POST returned non-success; events dropped (Phase-2 retry not yet wired)"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "soth_sdk_core::shipper",
-                    error = %error,
-                    "telemetry POST error; events dropped"
-                );
-            }
-        }
+        post_batch(
+            &client, &endpoint, &api_key, &org_id, batch, /*final*/ false,
+        );
     }
 
     // Final drain on shutdown so events buffered during the last
     // BATCH_WINDOW aren't lost on graceful exit.
     let final_batch = queue.drain_batch(MAX_BATCH_SIZE);
     if !final_batch.is_empty() {
-        let body = serde_json::json!({
-            "org_id": &org_id,
-            "events": final_batch,
-        });
-        let _ = client
-            .post(&endpoint)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send();
+        post_batch(
+            &client,
+            &endpoint,
+            &api_key,
+            &org_id,
+            final_batch,
+            /*final*/ true,
+        );
+    }
+}
+
+fn post_batch(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    api_key: &str,
+    org_id: &str,
+    batch: Vec<CoreTelemetryEvent>,
+    is_final: bool,
+) {
+    let batch_size = batch.len();
+    let request = build_request(org_id, batch);
+    let label = if is_final { "FINAL POST" } else { "POST" };
+
+    match client
+        .post(endpoint)
+        .header(API_VERSION_HEADER, API_VERSION)
+        .bearer_auth(api_key)
+        .json(&request)
+        .send()
+    {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::debug!(
+                target: "soth_sdk_core::shipper",
+                status = resp.status().as_u16(),
+                "telemetry batch posted"
+            );
+            if std::env::var("SOTH_SHIPPER_VERBOSE").is_ok() {
+                eprintln!(
+                    "[soth-sdk-core::shipper] {} {} -> {} ({} events)",
+                    label,
+                    endpoint,
+                    resp.status().as_u16(),
+                    batch_size
+                );
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body_text = resp.text().unwrap_or_default();
+            tracing::warn!(
+                target: "soth_sdk_core::shipper",
+                status,
+                "telemetry POST returned non-success; events dropped (Phase-2 retry not yet wired)"
+            );
+            if std::env::var("SOTH_SHIPPER_VERBOSE").is_ok() {
+                eprintln!(
+                    "[soth-sdk-core::shipper] {} {} -> {} ({} events dropped): {}",
+                    label, endpoint, status, batch_size, body_text
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "soth_sdk_core::shipper",
+                error = %error,
+                "telemetry POST error; events dropped"
+            );
+            if std::env::var("SOTH_SHIPPER_VERBOSE").is_ok() {
+                eprintln!(
+                    "[soth-sdk-core::shipper] {} {} -> ERROR ({} events dropped): {}",
+                    label, endpoint, batch_size, error
+                );
+            }
+        }
+    }
+}
+
+fn build_request(org_id: &str, batch: Vec<CoreTelemetryEvent>) -> TelemetryBatchRequest {
+    let timestamp = batch.first().map(|e| e.timestamp_epoch_ms).unwrap_or(0);
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let events = batch.iter().map(map_event).collect();
+
+    TelemetryBatchRequest {
+        batch_id,
+        org_id: org_id.to_string(),
+        // SDK has no signed device-id-hash flow; cloud accepts the
+        // bearer token + org_id alone for SDK-class telemetry.
+        device_id_hash: format!("sdk:{}", org_id),
+        proxy_version: format!("soth-sdk-core/{}", env!("CARGO_PKG_VERSION")),
+        timestamp,
+        events,
+        // Cloud requires a non-empty signature field but accepts the
+        // sentinel below for SDK-class submissions; full ed25519
+        // signing is a Phase-2 deliverable.
+        proxy_signature: String::from("sdk-unsigned"),
+        observation_records: None,
     }
 }

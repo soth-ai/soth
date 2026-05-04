@@ -1,0 +1,18 @@
+[package]
+name = "soth-api-types"
+description = "SOTH cloud API wire contract — shared between proxy (soth-sync) and SDK (soth-sdk-core)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Pure types + a deterministic in-process → wire converter. No I/O, no
+# tokio, no reqwest. Both the proxy and the SDK depend on this so they
+# can never silently drift on the cloud contract.
+
+[dependencies]
+soth-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
