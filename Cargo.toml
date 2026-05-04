@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/soth-cli",
     "crates/soth-core",
+    "crates/soth-api-types",
     "crates/soth-bundle",
     "crates/soth-classify",
     "crates/soth-conformance-tests",
@@ -47,6 +48,7 @@ authors = ["Labterminal"]
 [workspace.dependencies]
 # Internal crates
 soth-core = { path = "crates/soth-core" }
+soth-api-types = { path = "crates/soth-api-types" }
 soth-bundle = { path = "crates/soth-bundle" }
 # Default features OFF at the workspace level so the WASM SDK target
 # can build without ONNX. Consumers that want local classification

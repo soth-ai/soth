@@ -19,10 +19,13 @@ onnx-models = ["soth-classify/onnx-models"]
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 # Background HTTPS telemetry shipper. Off by default to keep workspace
 # `cargo build` fast; bindings flip it on for production builds.
-http-telemetry = ["dep:reqwest"]
+http-telemetry = ["dep:reqwest", "dep:soth-api-types"]
 
 [dependencies]
 soth-core = { workspace = true }
+# Shared cloud wire contract. Optional + gated under `http-telemetry`
+# so default builds (e.g. WASM) stay free of it.
+soth-api-types = { workspace = true, optional = true }
 # soth-detect's workspace entry uses `default-features = false`; this crate
 # turns on `intelligence` so the in-memory backends are available, but
 # leaves `tree-sitter-code` and `intelligence-sqlite` off — neither is
