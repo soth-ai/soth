@@ -760,12 +760,7 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
             .or_else(|| config.cloud.tags.get("workspace_id"))
             .cloned()
             .unwrap_or_else(|| "local-team".to_string()),
-        device_id_hash: config
-            .cloud
-            .tags
-            .get("device_id")
-            .cloned()
-            .unwrap_or_else(|| "local-device".to_string()),
+        device_id_hash: sync_agent_instance_id.clone(),
         mitm: GeneratedMitmConfig {
             bind: format!(
                 "{}:{}",
