@@ -765,7 +765,7 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
             .tags
             .get("device_id")
             .cloned()
-            .unwrap_or_else(|| "local-device".to_string()),
+            .unwrap_or_else(|| sync_agent_instance_id.clone()),
         mitm: GeneratedMitmConfig {
             bind: format!(
                 "{}:{}",
@@ -875,6 +875,18 @@ fn resolve_sync_agent_instance_id(config: &SothConfig, soth_home: &Path) -> Resu
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("failed creating {}", runtime_dir.display()))?;
     let id_path = runtime_dir.join(AGENT_INSTANCE_ID_FILE);
+
+    // Prefer the yaml's `device_id` (written at enrollment) so heartbeat and
+    // telemetry agree on a single identifier — without this they diverge:
+    // heartbeat writes a fresh "edge-<uuid>" to postgres while telemetry
+    // sends "device-<uuid>" from the yaml, and the cloud's hostname-resolution
+    // join can never line them up.
+    if let Some(value) = config.cloud.tags.get("device_id") {
+        if let Some(normalized) = normalize_agent_instance_id(value) {
+            let _ = std::fs::write(&id_path, format!("{normalized}\n"));
+            return Ok(normalized);
+        }
+    }
 
     if let Ok(raw) = std::fs::read_to_string(&id_path) {
         if let Some(normalized) = normalize_agent_instance_id(raw.as_str()) {
@@ -1598,12 +1610,14 @@ mod tests {
                 Some("device_primary")
             );
 
+            // agent_instance_id now mirrors the yaml's device_id so heartbeat
+            // and telemetry write the same identifier.
             let agent_instance_id = value
                 .get("sync")
                 .and_then(|v| v.get("agent_instance_id"))
                 .and_then(toml::Value::as_str)
                 .expect("agent_instance_id should be set");
-            assert!(agent_instance_id.starts_with("edge-"));
+            assert_eq!(agent_instance_id, "device_primary");
 
             let persisted = std::fs::read_to_string(
                 home.join(".soth").join("runtime").join("agent_instance_id"),

@@ -237,7 +237,10 @@ fn tool_to_provider(tool: &AiTool) -> String {
         AiTool::GeminiCli => "gemini".to_string(),
         AiTool::OpenAiCodex => "openai".to_string(),
         AiTool::GithubCopilot => "openai".to_string(),
-        AiTool::Cursor => "openai".to_string(),
+        // Cursor is its own surface — was previously mislabeled as "openai"
+        // which made historian_cursor events indistinguishable from real
+        // OpenAI proxy traffic in ClickHouse and the dashboard.
+        AiTool::Cursor => "cursor".to_string(),
         AiTool::Continue | AiTool::OpenClaw => "unknown".to_string(),
         AiTool::Unknown(_) => "unknown".to_string(),
     }

@@ -117,6 +117,22 @@ impl WatchEngine {
         // Debounce: collect changed paths over the debounce window, then process.
         let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
 
+        // Periodic poll fallback. macOS fsevents on `~/Library/Application
+        // Support/...` is unreliable for SQLite-WAL-mode writers (Cursor in
+        // particular): the live writer holds the .vscdb open and writes
+        // through state.vscdb-wal without bumping the main file's mtime,
+        // so the OS may never fire a notification we can see. Every
+        // POLL_INTERVAL we mark every watched root as "ready to re-scan",
+        // regardless of fsevents. The dedup layer downstream keys on
+        // content-hash, so re-scanning unchanged sessions is cheap.
+        const POLL_INTERVAL: Duration = Duration::from_secs(15);
+        let mut poll = tokio::time::interval(POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick of `interval` fires immediately; consume it so the
+        // initial backfill we just finished doesn't get redone before the
+        // watcher even settles.
+        poll.tick().await;
+
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -128,6 +144,14 @@ impl WatchEngine {
                 Some(path) = fs_rx.recv() => {
                     self.stats.fs_events_received.fetch_add(1, Ordering::Relaxed);
                     pending.insert(path, Instant::now());
+                }
+                _ = poll.tick() => {
+                    // Force every watched root into the pending set so the
+                    // debounce arm picks them up. Cheap insurance against
+                    // fsevents misses on macOS for SQLite-WAL writers.
+                    for (root, _) in root_to_tool.iter() {
+                        pending.entry(root.clone()).or_insert_with(Instant::now);
+                    }
                 }
                 _ = sleep(self.debounce) => {
                     if pending.is_empty() {
@@ -178,8 +202,13 @@ impl WatchEngine {
 
             trace!(tool = %tool, root = %root.display(), "processing changes");
 
-            // Read only recent sessions (last 60 seconds window to catch new data)
-            let since = Some(chrono::Utc::now().timestamp_millis() - 60_000);
+            // No `since` cutoff: long-lived sessions (Cursor composers,
+            // Claude threads) keep growing for days. Filtering by their
+            // ORIGINAL createdAt timestamp would drop every conversation
+            // older than a minute, leaving the watch loop with nothing
+            // to emit. The content-hash dedup downstream prevents
+            // re-emitting unchanged sessions, so passing `None` is safe.
+            let since = None;
             let mut stream = reader.read_sessions(root, since);
 
             while let Some(result) = stream.next().await {
