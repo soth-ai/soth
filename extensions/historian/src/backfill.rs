@@ -247,12 +247,14 @@ async fn backfill_one_tool(
 
         let mut event = reconstruct_event(&session);
 
-        // Run classify enrichment before queue write (embed_content
-        // is #[serde(skip)] so it must happen here).
-        if let Some(enricher) = enricher {
-            enricher.enrich(&mut event);
-        }
-
+        // Dedup BEFORE enrichment. On rerun, the discovered set replays every
+        // session under each tool root — already-processed sessions hit dedup
+        // immediately and used to still pay for `ClassifyEnricher::enrich`
+        // (~10–50ms each) before being discarded. Skipping them is pure win.
+        //
+        // Safe: `conversation_hash` / `semantic_hash` are set by
+        // `reconstruct_event` (session.rs:81-82); the enricher only adds
+        // `classify.*` keys, which the dedup key never reads.
         let content_hash = event
             .context
             .metadata
@@ -271,6 +273,12 @@ async fn backfill_one_tool(
         ) {
             summary.duplicates_skipped += 1;
             continue;
+        }
+
+        // Survived dedup — pay the classify cost. embed_content is
+        // `#[serde(skip)]`, so enrichment must run before `writer.enqueue`.
+        if let Some(enricher) = enricher {
+            enricher.enrich(&mut event);
         }
 
         match writer.enqueue(&event, &allow_decision()) {

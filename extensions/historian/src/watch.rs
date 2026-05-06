@@ -141,7 +141,14 @@ impl WatchEngine {
         // POLL_INTERVAL we mark every watched root as "ready to re-scan",
         // regardless of fsevents. The dedup layer downstream keys on
         // content-hash, so re-scanning unchanged sessions is cheap.
-        const POLL_INTERVAL: Duration = Duration::from_secs(15);
+        //
+        // 60s is a deliberate trade-off: 15s caused noticeable system
+        // jitter on M-series Macs while users were active in Cursor (the
+        // big composers re-emit and pay classify CPU on every cycle).
+        // 60s still picks up new content "within a minute" for monitoring
+        // / dashboard purposes — historian is not a hot-path latency
+        // signal — while cutting the scan/classify rate 4×.
+        const POLL_INTERVAL: Duration = Duration::from_secs(60);
         let mut poll = tokio::time::interval(POLL_INTERVAL);
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick of `interval` fires immediately; consume it so the
@@ -238,13 +245,16 @@ impl WatchEngine {
 
                 let mut event = reconstruct_event(&session);
 
-                // Run classify enrichment before queue write — matches the
-                // backfill path. embed_content is `#[serde(skip)]`, so this
-                // must happen here and not at deserialization time.
-                if let Some(enricher) = self.enricher.as_deref() {
-                    enricher.enrich(&mut event);
-                }
-
+                // Dedup BEFORE enrichment. The 15s poll re-scans every cursor
+                // session each cycle; ~80%+ of those hit dedup as duplicates
+                // (unchanged content_hash). `ClassifyEnricher::enrich` runs the
+                // ML classify pipeline (~10–50ms each on M-series), which
+                // would be wasted on duplicates that are about to be discarded.
+                //
+                // Safe to dedup first: `conversation_hash` and `semantic_hash`
+                // are populated by `reconstruct_event` (see
+                // session.rs:81-82), not by the enricher. The enricher only
+                // adds `classify.*` keys, which the dedup key never reads.
                 let content_hash = event
                     .context
                     .metadata
@@ -265,6 +275,14 @@ impl WatchEngine {
                         .duplicates_skipped
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
+                }
+
+                // Survived dedup — pay the classify cost.
+                // embed_content is `#[serde(skip)]`, so enrichment must run
+                // before `writer.enqueue` (post-serialize would lose the
+                // classify metadata).
+                if let Some(enricher) = self.enricher.as_deref() {
+                    enricher.enrich(&mut event);
                 }
 
                 match self.writer.enqueue(&event, &allow_decision()) {
