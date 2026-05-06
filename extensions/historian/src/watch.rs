@@ -156,6 +156,24 @@ impl WatchEngine {
         // watcher even settles.
         poll.tick().await;
 
+        // Hard floor on how often `process_changes` may run, regardless of
+        // what triggered it. Without this, an active Cursor session fires
+        // fsevents per keystroke; the 2s debounce collapses bursts but not
+        // sustained typing, so we'd run a full per-session SQLite scan +
+        // event reconstruct ~every 2-5s. That hogs the tokio runtime and
+        // starves soth_mitm flow workers (we saw "reaping stale flow
+        // state without explicit stream_end" in proxy logs). With this
+        // floor, we get *at most* one scan per MIN_CYCLE no matter how
+        // many fsevents arrive — fsevents only act as "wake up earlier
+        // than the 60s poll if something changed", they can't make us
+        // run more often than the poll interval.
+        const MIN_CYCLE: Duration = POLL_INTERVAL;
+        // Initialize so the first cycle is allowed immediately (we just
+        // finished the initial backfill before entering this loop).
+        let mut last_processed = Instant::now()
+            .checked_sub(MIN_CYCLE)
+            .unwrap_or_else(Instant::now);
+
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -181,6 +199,14 @@ impl WatchEngine {
                         continue;
                     }
 
+                    // Throttle: enforce MIN_CYCLE between scans regardless
+                    // of how many fsevents/poll ticks queued up paths.
+                    // Pending entries stay in the map and will be picked up
+                    // on the next allowed cycle.
+                    if last_processed.elapsed() < MIN_CYCLE {
+                        continue;
+                    }
+
                     let cutoff = Instant::now() - self.debounce;
                     let ready: Vec<PathBuf> = pending
                         .iter()
@@ -195,6 +221,7 @@ impl WatchEngine {
                     if !ready.is_empty() {
                         self.stats.process_cycles.fetch_add(1, Ordering::Relaxed);
                         self.process_changes(&ready, &root_to_tool).await;
+                        last_processed = Instant::now();
                     }
                 }
             }
@@ -316,6 +343,23 @@ impl WatchEngine {
     }
 }
 
+/// Sidecar files SQLite WAL-mode writers touch on every transaction.
+///
+/// Cursor opens `state.vscdb` in WAL mode, which means every keystroke that
+/// commits a transaction writes to `state.vscdb-wal` and bumps
+/// `state.vscdb-shm`. We don't read those files directly — we only read the
+/// main `state.vscdb` (read-only, with `busy_timeout`) — so fsevents on the
+/// sidecars are pure noise. They were the dominant source of fsevent volume
+/// while the user was active in Cursor, and each one used to bypass the
+/// poll cadence and trigger a debounced re-scan. Drop them at the watcher
+/// boundary so they never reach `pending` in the first place.
+fn is_sqlite_sidecar(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+}
+
 fn setup_watcher(
     tools: &[DiscoveredTool],
     tx: mpsc::Sender<PathBuf>,
@@ -323,6 +367,9 @@ fn setup_watcher(
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             for path in event.paths {
+                if is_sqlite_sidecar(&path) {
+                    continue;
+                }
                 let _ = tx.try_send(path);
             }
         }
@@ -341,4 +388,46 @@ fn setup_watcher(
     }
 
     Ok(watcher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sqlite_sidecar;
+    use std::path::PathBuf;
+
+    #[test]
+    fn drops_sqlite_sidecar_paths() {
+        // Cursor's WAL-mode writer hits these on every keystroke commit;
+        // they must not wake the watch loop.
+        for f in [
+            "state.vscdb-wal",
+            "state.vscdb-shm",
+            "history.db-journal",
+            "/abs/path/to/state.vscdb-wal",
+        ] {
+            assert!(
+                is_sqlite_sidecar(&PathBuf::from(f)),
+                "expected {f} to be filtered as a sidecar"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_main_db_and_other_paths() {
+        // Anything that isn't a -wal/-shm/-journal must pass through —
+        // dropping the main DB or directory events would silently break
+        // the watch path.
+        for f in [
+            "state.vscdb",
+            "history.jsonl",
+            "/abs/path/to/state.vscdb",
+            "/abs/path/to/dir",
+            "session-2026-05-06.json",
+        ] {
+            assert!(
+                !is_sqlite_sidecar(&PathBuf::from(f)),
+                "expected {f} to pass through, got filtered"
+            );
+        }
+    }
 }
