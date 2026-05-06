@@ -1208,15 +1208,33 @@ struct GeneratedTelemetryConfig {
 }
 
 /// In-process MITM runtime, invoked by re-execed supervisor children (see
-/// [`spawn_proxy_process`]). Registers the historian extension and delegates
-/// to `soth_proxy::runtime::run`.
+/// [`spawn_proxy_process`]). Registers the historian extension (unless the
+/// user disabled it via `extensions.historian.enabled: false` in their
+/// soth.yaml) and delegates to `soth_proxy::runtime::run`.
 async fn run_proxy_worker() -> Result<()> {
     use std::sync::Arc;
 
     soth_proxy::runtime::init_rustls_provider();
 
+    // Re-load the config here rather than threading it through the
+    // re-exec boundary. The supervisor passes config-file path via
+    // SOTH_CONFIG_PATH (see spawn_proxy_process). Default falls back to
+    // the standard location, matching what the parent already validated.
+    let config_path = std::env::var_os("SOTH_CONFIG_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(cli_config::default_config_path);
+    let extensions_config = cli_config::load_effective_config(Some(&config_path), None)
+        .map(|cfg| cfg.extensions)
+        .unwrap_or_default();
+
     let mut registry = soth_extensions::ExtensionRegistry::empty();
-    registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
+    if extensions_config.historian.enabled {
+        registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
+    } else {
+        tracing::info!(
+            "extensions.historian.enabled = false; skipping HistorianExtension registration"
+        );
+    }
 
     let tracing_targets = registry.tracing_targets();
     // Hold the observability guard until proxy.run() returns so that the

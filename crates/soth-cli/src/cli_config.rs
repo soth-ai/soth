@@ -21,6 +21,12 @@ pub struct SothConfig {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub pipeline: PipelineOverrides,
+    /// Per-extension on/off and per-extension knobs. Today only governs
+    /// the historian extension (AI-tool-history backfill + watch). The
+    /// `extensions:` block is optional in soth.yaml — missing or empty
+    /// keeps the historical default of "everything enabled".
+    #[serde(default)]
+    pub extensions: ExtensionsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,6 +449,43 @@ impl Default for ProxyConfig {
 pub struct PipelineOverrides {
     pub unknown_app_action: Option<String>,
     pub non_cataloged_host_action: Option<String>,
+}
+
+/// Per-extension toggles. Each field is its own struct so individual
+/// extensions can grow knobs without affecting the others.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionsConfig {
+    pub historian: HistorianExtensionConfig,
+}
+
+impl Default for ExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            historian: HistorianExtensionConfig::default(),
+        }
+    }
+}
+
+/// Historian extension config. Backfills + watches local AI-tool history
+/// (Cursor, Claude Code, Gemini CLI, ...) and enriches it with classify.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistorianExtensionConfig {
+    /// Master switch. Off → the proxy worker never registers
+    /// `HistorianExtension`, so backfill, watch, and the periodic
+    /// SQLite scans of Cursor's `state.vscdb` don't run at all. Useful
+    /// when the watch loop's CPU spikes (Cursor 482-message composer
+    /// + ML classify) are competing with mitm flow handling on the
+    /// same tokio runtime, e.g. while debugging buffering on
+    /// long-lived video tunnels.
+    pub enabled: bool,
+}
+
+impl Default for HistorianExtensionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 pub fn default_config_path() -> PathBuf {
