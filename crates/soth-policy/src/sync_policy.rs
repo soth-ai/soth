@@ -1465,6 +1465,9 @@ fn parse_source_label(value: soth_core::ParseSource) -> &'static str {
 }
 
 fn use_case_label(value: UseCaseLabel) -> &'static str {
+    // Snake-case strings must match `#[serde(rename_all = "snake_case")]`
+    // on UseCaseLabel exactly — these are the values cloud sees on the
+    // wire and writes to ClickHouse.
     match value {
         UseCaseLabel::CodeGeneration => "code_generation",
         UseCaseLabel::CodeReview => "code_review",
@@ -1482,6 +1485,11 @@ fn use_case_label(value: UseCaseLabel) -> &'static str {
         UseCaseLabel::ImageAnalysis => "image_analysis",
         UseCaseLabel::AudioTranscription => "audio_transcription",
         UseCaseLabel::SystemPromptOnly => "system_prompt_only",
+        UseCaseLabel::InfraDevops => "infra_devops",
+        UseCaseLabel::LegalContract => "legal_contract",
+        UseCaseLabel::ResearchSynthesis => "research_synthesis",
+        UseCaseLabel::SecurityAnalysis => "security_analysis",
+        UseCaseLabel::ContentEditing => "content_editing",
         UseCaseLabel::Unknown => "unknown",
     }
 }
