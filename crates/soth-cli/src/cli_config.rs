@@ -69,13 +69,27 @@ impl Default for ForwardProxyConfig {
             process_attribution: ForwardProxyProcessAttributionConfig::default(),
             tls: ForwardProxyTlsConfig::default(),
             flow_runtime: ForwardProxyFlowRuntimeConfig::default(),
-            upstream_timeout: DurationSetting::millis(30_000),
+            // Total upstream operation deadline. 30s used to be the default
+            // but it bisected long Claude / GPT tool-calling streams that
+            // routinely run 30-90s end-to-end, so the user-visible symptom
+            // was "API Error: socket connection closed unexpectedly" mid-
+            // response. 120s gives streaming LLM responses the headroom
+            // they need without hiding genuinely-stuck upstreams.
+            upstream_timeout: DurationSetting::millis(120_000),
             upstream_retry_on_failure: false,
             upstream_retry_delay: DurationSetting::millis(200),
             capture_max_body_bytes: 64 * 1024 * 1024,
             buffer_request_bodies: true,
-            handler_request_timeout: DurationSetting::millis(5_000),
-            handler_response_timeout: DurationSetting::millis(5_000),
+            // Handler stage timeout (per request/response chunk). 5s was
+            // way too tight for HTTP/2 streaming: Claude's first byte on
+            // big inference jobs takes 5-10s, which would trip the
+            // handler timeout and cause soth-mitm to reap the flow with
+            // "reaping stale flow state without explicit stream_end".
+            // 15s matches the underlying soth-proxy default in
+            // crates/soth-proxy/src/config.rs and aligns with what
+            // upstream LLM APIs actually need.
+            handler_request_timeout: DurationSetting::millis(15_000),
+            handler_response_timeout: DurationSetting::millis(15_000),
             handler_recover_from_panics: true,
             max_http_head_bytes: 64 * 1024,
             accept_retry_backoff: DurationSetting::millis(100),
@@ -131,7 +145,13 @@ impl Default for ForwardProxyPoolConfig {
     fn default() -> Self {
         Self {
             max_connections_per_host: 64,
-            idle_timeout: DurationSetting::millis(60_000),
+            // Pool-side idle timeout: how long an idle upstream connection
+            // sits in the pool before being closed. 60s used to be the
+            // default but it caused the pool to drop conns right when an
+            // LLM client paused between turns, forcing a fresh handshake
+            // on the next request. 90s matches the underlying soth-proxy
+            // default and improves connection reuse.
+            idle_timeout: DurationSetting::millis(90_000),
             connect_timeout: DurationSetting::millis(10_000),
             max_idle_per_host: 16,
         }
