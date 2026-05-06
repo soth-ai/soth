@@ -1008,10 +1008,7 @@ mod tests {
         // their own first-class variants. See `UseCaseLabel` doc comments
         // for why each was split out (sensitivity, governance needs,
         // dashboard granularity).
-        assert_eq!(
-            map_bundle_label("INFRA_DEVOPS"),
-            UseCaseLabel::InfraDevops
-        );
+        assert_eq!(map_bundle_label("INFRA_DEVOPS"), UseCaseLabel::InfraDevops);
         assert_eq!(
             map_bundle_label("LEGAL_CONTRACT"),
             UseCaseLabel::LegalContract

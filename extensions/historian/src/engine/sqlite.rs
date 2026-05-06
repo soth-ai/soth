@@ -642,7 +642,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_reads_via_cursor() {
+    async fn second_read_returns_all_sessions_for_dedup_layer() {
+        // Pin the post-watermark behavior introduced when `read_kv_sessions`
+        // stopped filtering by `rowid > since_rowid`. The composer rowid is
+        // stable across IDE writes (Cursor mutates the composer in place while
+        // appending bubble rows separately), so a watermark over composer rowid
+        // hid bubble updates after the first poll. We now re-emit every
+        // composer on each pass and rely on `DedupChecker::is_duplicate`
+        // (content-hashed) to suppress unchanged sessions downstream.
         let tmp = TempDir::new().unwrap();
         let db_path = create_cursor_db(
             tmp.path(),
@@ -682,13 +689,15 @@ mod tests {
             .unwrap();
         }
 
-        // Second read: only new session.
+        // Second read: full re-scan returns all 3 sessions. Dedup happens at a
+        // higher layer (content-hashed `already_processed` rows), so duplicate
+        // emissions here are filtered before they reach the queue.
         let mut stream = read_sessions_sqlite(&pb, tmp.path(), None, &cursor);
         let mut new_count = 0;
         while let Some(Ok(_)) = stream.next().await {
             new_count += 1;
         }
-        assert_eq!(new_count, 1);
+        assert_eq!(new_count, 3);
     }
 
     fn cursor_v14_playbook() -> Playbook {

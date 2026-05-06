@@ -13,6 +13,7 @@ use tracing::{info, trace, warn};
 use soth_extensions::TelemetryQueueWriter;
 
 use crate::dedup::DedupChecker;
+use crate::enrich::ClassifyEnricher;
 use crate::reader::FormatReader;
 use crate::session::reconstruct_event;
 use crate::types::{AiTool, DiscoveredTool};
@@ -33,6 +34,13 @@ pub struct WatchEngine {
     tools: Vec<DiscoveredTool>,
     dedup: Arc<DedupChecker>,
     writer: TelemetryQueueWriter,
+    /// Optional classify enricher. When unset, events ship without
+    /// `classify.*` metadata and `TelemetryEvent::from_governable` defaults
+    /// `use_case_label_reason` to `historian_not_enriched`, which the sync
+    /// sender then logs a WARN per event for. Backfill always wires this;
+    /// watch did not until this field was added — see lib.rs and
+    /// bin/standalone.rs for the call sites that populate it.
+    enricher: Option<Arc<ClassifyEnricher>>,
     debounce: Duration,
     stats: WatchStats,
 }
@@ -70,9 +78,17 @@ impl WatchEngine {
             tools,
             dedup,
             writer,
+            enricher: None,
             debounce: Duration::from_secs(2),
             stats: WatchStats::default(),
         }
+    }
+
+    /// Attach a classify enricher. Mirrors `BackfillEngine::with_enricher`
+    /// so both ingest paths run the same enrichment stages.
+    pub fn with_enricher(mut self, enricher: ClassifyEnricher) -> Self {
+        self.enricher = Some(Arc::new(enricher));
+        self
     }
 
     /// Snapshot of current watch engine stats.
@@ -220,7 +236,15 @@ impl WatchEngine {
                     }
                 };
 
-                let event = reconstruct_event(&session);
+                let mut event = reconstruct_event(&session);
+
+                // Run classify enrichment before queue write — matches the
+                // backfill path. embed_content is `#[serde(skip)]`, so this
+                // must happen here and not at deserialization time.
+                if let Some(enricher) = self.enricher.as_deref() {
+                    enricher.enrich(&mut event);
+                }
+
                 let content_hash = event
                     .context
                     .metadata

@@ -163,7 +163,11 @@ impl HistorianWorker {
         let writer = TelemetryQueueWriter::for_extension(&ctx, "historian");
         let readers = Self::build_readers();
 
-        let watch = WatchEngine::new(readers, report.tools, dedup, writer);
+        let mut watch = WatchEngine::new(readers, report.tools, dedup, writer);
+        if let Some(enricher) = enrich::ClassifyEnricher::try_new(&ctx) {
+            info!("classify enrichment enabled for historian watch");
+            watch = watch.with_enricher(enricher);
+        }
         watch.run(shutdown_rx).await;
 
         {
@@ -302,7 +306,10 @@ impl HistorianExtension {
         let writer = TelemetryQueueWriter::for_extension(ctx, "historian");
         let readers = Self::build_readers();
 
-        let watch = WatchEngine::new(readers, report.tools, dedup, writer);
+        let mut watch = WatchEngine::new(readers, report.tools, dedup, writer);
+        if let Some(enricher) = enrich::ClassifyEnricher::try_new(ctx) {
+            watch = watch.with_enricher(enricher);
+        }
         watch.run(shutdown).await;
     }
 
