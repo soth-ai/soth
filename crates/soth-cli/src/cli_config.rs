@@ -472,19 +472,51 @@ impl Default for ExtensionsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HistorianExtensionConfig {
-    /// Master switch. Off → the proxy worker never registers
-    /// `HistorianExtension`, so backfill, watch, and the periodic
-    /// SQLite scans of Cursor's `state.vscdb` don't run at all. Useful
-    /// when the watch loop's CPU spikes (Cursor 482-message composer
-    /// + ML classify) are competing with mitm flow handling on the
-    /// same tokio runtime, e.g. while debugging buffering on
-    /// long-lived video tunnels.
+    /// Master switch. Off → no backfill, no watch, no periodic SQLite
+    /// scans of Cursor's `state.vscdb`. Set to false when debugging
+    /// network issues that may correlate with historian CPU bursts.
     pub enabled: bool,
+
+    /// How historian runs in relation to the proxy worker.
+    ///
+    /// `Subprocess` (default): historian runs in its own process at
+    /// nice +5 / BELOW_NORMAL_PRIORITY_CLASS. The proxy worker's
+    /// tokio runtime never sees historian's classify CPU bursts, so
+    /// long-lived TLS tunnels (video, websockets) don't get reaped
+    /// by upstream CDNs because of momentary mitm-runtime starvation.
+    ///
+    /// `InProcess`: historian registers as an ExtensionRegistry hook
+    /// inside the proxy worker. Lower memory floor (~30-50 MiB), but
+    /// classify bursts compete with mitm flow handling. Kept as an
+    /// opt-in for resource-constrained installs (containers,
+    /// CI runners) where the extra process is more expensive than
+    /// the occasional flow hiccup.
+    pub run_mode: HistorianRunMode,
 }
 
 impl Default for HistorianExtensionConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            run_mode: HistorianRunMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorianRunMode {
+    /// Historian runs as a sibling process supervised by `soth start`.
+    /// Default — isolates classify CPU from the mitm runtime.
+    Subprocess,
+    /// Historian runs as an ExtensionRegistry hook inside the proxy
+    /// worker. Backwards-compatible behavior; explicit opt-in.
+    InProcess,
+}
+
+impl Default for HistorianRunMode {
+    fn default() -> Self {
+        Self::Subprocess
     }
 }
 

@@ -127,6 +127,14 @@ pub struct StartArgs {
     #[arg(long, hide = true)]
     pub daemon_child: bool,
 
+    /// Internal historian sibling worker mode. Set by the supervisor when
+    /// re-execing this binary as the historian worker (see
+    /// `spawn_historian_process`). Hidden from `--help`; user code never
+    /// sets this. The `SOTH_HISTORIAN_WORKER=1` env paired with this
+    /// flag is what actually dispatches into `run_historian_worker`.
+    #[arg(long, hide = true)]
+    pub historian_child: bool,
+
     /// Do not register startup autostart
     #[arg(long)]
     pub no_autostart: bool,
@@ -1213,6 +1221,7 @@ mod tests {
                     quiet: true,
                     foreground: false,
                     daemon_child: false,
+                    historian_child: false,
                     no_autostart: true,
                     allow_daemon_child_fallback: true,
                 },
@@ -1393,6 +1402,7 @@ mod tests {
                         quiet: true,
                         foreground: false,
                         daemon_child: false,
+                        historian_child: false,
                         no_autostart: true,
                         allow_daemon_child_fallback: false,
                     },

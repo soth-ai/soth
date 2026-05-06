@@ -68,6 +68,16 @@ pub async fn run(
         return run_proxy_worker().await;
     }
 
+    // Historian-worker mode: re-execed by the supervisor to run the
+    // HistorianExtension lifecycle (backfill → watch) as an isolated
+    // sibling process. Same multi-call binary pattern as the proxy
+    // worker — keeps the install surface single-binary while letting
+    // OS-level scheduling guarantee the proxy worker can't be CPU-
+    // starved by historian's classify bursts.
+    if std::env::var(HISTORIAN_WORKER_ENV).is_ok() {
+        return run_historian_worker().await;
+    }
+
     // Windows autostart self-detach: when `soth start --daemon-child` is
     // invoked from HKCU\...\Run at user login, explorer.exe spawns it with
     // default creation flags — the binary gets a visible console and is
@@ -149,6 +159,25 @@ pub async fn run(
         .await
         .context("spawn soth-proxy process")?;
     wait_for_listener_start(&mut child, expected_port).await?;
+
+    // Historian sibling process. Spawned only when both `enabled` and
+    // run_mode == Subprocess. Watched in its own background task so its
+    // lifecycle (crash → backoff → respawn) is independent of the
+    // proxy worker — a wedged historian must never affect mitm flows.
+    let _historian_supervisor: Option<tokio::task::JoinHandle<()>> =
+        if config.extensions.historian.enabled
+            && matches!(
+                config.extensions.historian.run_mode,
+                cli_config::HistorianRunMode::Subprocess
+            )
+        {
+            let historian_config_path = generated_path.clone();
+            Some(tokio::spawn(async move {
+                supervise_historian(historian_config_path).await;
+            }))
+        } else {
+            None
+        };
 
     // Engage the OS-level system proxy so traffic actually flows through us.
     // Reached by both foreground (`soth up --foreground`) and daemon-child
@@ -257,6 +286,158 @@ fn ensure_ca_runtime_health(paths: &super::ca_health::ResolvedCaPaths, quiet: bo
     Ok(())
 }
 
+/// Lightweight supervisor for the historian sibling process. Spawns,
+/// waits for exit, applies exponential backoff, and respawns. Runs as a
+/// detached tokio task so historian's lifecycle is fully decoupled from
+/// the proxy worker's — a crashed historian must never affect mitm flows
+/// (and a crashed proxy already has its own supervisor that won't re-enter
+/// this function).
+///
+/// On graceful exit (status 0) the historian is treated as "done" — no
+/// respawn — because the discovery-empty path returns 0 and there's no
+/// useful work to retry. On crash, exponential backoff caps at 60s.
+///
+/// The supervisor task is dropped when `run()` exits (process shutdown),
+/// which drops the JoinHandle and aborts the await. We rely on the proxy
+/// shutdown chain to deliver SIGTERM via the OS process tree on macOS,
+/// or via [`terminate_child`] explicitly on Windows; the historian
+/// child's signal handler in [`run_historian_worker`] turns that into a
+/// clean shutdown.
+async fn supervise_historian(config_path: PathBuf) {
+    let mut consecutive_failures: u32 = 0;
+    const MAX_BACKOFF_MS: u64 = 60_000;
+    const BASE_BACKOFF_MS: u64 = 500;
+
+    loop {
+        let mut child = match spawn_historian_process(config_path.as_path()).await {
+            Ok(child) => child,
+            Err(error) => {
+                warn!(
+                    %error,
+                    consecutive_failures,
+                    "failed to spawn historian sibling process"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff = (BASE_BACKOFF_MS
+                    .saturating_mul(2u64.saturating_pow(consecutive_failures.min(8))))
+                .min(MAX_BACKOFF_MS);
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                continue;
+            }
+        };
+
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                info!(
+                    "historian sibling exited cleanly (status 0) — not respawning"
+                );
+                return;
+            }
+            Ok(status) => {
+                warn!(
+                    code = ?status.code(),
+                    "historian sibling exited with non-zero status — will respawn"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+            Err(error) => {
+                warn!(%error, "historian sibling wait() errored — will respawn");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+        }
+
+        let backoff = (BASE_BACKOFF_MS
+            .saturating_mul(2u64.saturating_pow(consecutive_failures.min(8))))
+        .min(MAX_BACKOFF_MS);
+        info!(
+            backoff_ms = backoff,
+            consecutive_failures,
+            "respawning historian sibling after backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
+    }
+}
+
+/// Spawn the historian sibling process. Same multi-call binary pattern as
+/// [`spawn_proxy_process`]: re-execs the current binary with
+/// `start --historian-child` and `SOTH_HISTORIAN_WORKER=1`, which the top
+/// of [`run`] dispatches to [`run_historian_worker`].
+///
+/// Inherits stdout/stderr from the supervisor so historian logs land in
+/// the same stream as the proxy worker (foreground terminal or
+/// `~/.soth/logs/edge-autostart.log` when daemonized via launchd).
+async fn spawn_historian_process(config_path: &Path) -> Result<Child> {
+    let current_exe = std::env::current_exe()
+        .context("resolve current executable for historian worker")?;
+    let mut cmd = Command::new(current_exe);
+    cmd.arg("start").arg("--historian-child");
+    cmd.env(HISTORIAN_WORKER_ENV, "1");
+    cmd.env("SOTH_PROXY_CONFIG", config_path);
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    // Lower OS-level priority. The whole point of subprocess mode is that
+    // historian's classify CPU bursts must never starve the mitm runtime
+    // — a `nice +5` here makes the OS scheduler always prefer the proxy
+    // when both want CPU. PRIO_PROCESS+0 means the calling process; this
+    // runs in `pre_exec` so it applies to the child after fork() but
+    // before exec(), without affecting the supervisor's own priority.
+    #[cfg(unix)]
+    {
+        // tokio::process::Command's `pre_exec` is the inherent extension —
+        // no `use std::os::unix::process::CommandExt` needed. Hook in to
+        // call setpriority(2) between fork() and exec() so the new image
+        // inherits the lower priority without ever sharing scheduling
+        // class with the supervisor.
+        unsafe {
+            cmd.pre_exec(|| {
+                // 5 is conservative — visible deprioritization without making
+                // historian crawl. POSIX nice values 0..19; 5 keeps it under
+                // the proxy worker (which inherits the supervisor's nice 0)
+                // while not starving it.
+                let rc = libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+                if rc != 0 {
+                    // Best-effort. Don't fail the spawn if the kernel rejects
+                    // it (rare; happens under restrictive RLIMIT_NICE on
+                    // some hosts).
+                    let err = std::io::Error::last_os_error();
+                    eprintln!(
+                        "warning: setpriority(+5) failed for historian child: {err}"
+                    );
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Windows analog of nice +5: BELOW_NORMAL_PRIORITY_CLASS lowers
+        // the child's base priority by one tier so the proxy worker
+        // (NORMAL) wins CPU contention. CREATE_NO_WINDOW + the new
+        // process group mirror the proxy spawn's flags.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        cmd.creation_flags(
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS,
+        );
+    }
+
+    // Kill historian when its Child handle is dropped (e.g. when the
+    // supervise_historian task is aborted on shutdown). Without this the
+    // historian process would be orphaned to launchd / init when `soth
+    // stop` is invoked, leaving a zombie sibling running with stale
+    // config until the user noticed.
+    cmd.kill_on_drop(true);
+
+    cmd.spawn()
+        .map_err(|error| anyhow::anyhow!("failed launching historian worker: {error}"))
+}
+
 async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Result<Child> {
     let current_exe =
         std::env::current_exe().context("resolve current executable for proxy worker")?;
@@ -294,6 +475,11 @@ async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Re
 /// Env var toggle that re-executed child processes use to enter in-process
 /// MITM runtime mode. Set by [`spawn_proxy_process`].
 pub(crate) const PROXY_WORKER_ENV: &str = "SOTH_PROXY_WORKER";
+
+/// Env var toggle for the historian sibling process. Set by
+/// [`spawn_historian_process`]; consumed at the top of [`run`] to dispatch
+/// into [`run_historian_worker`].
+pub(crate) const HISTORIAN_WORKER_ENV: &str = "SOTH_HISTORIAN_WORKER";
 
 /// Windows-only marker env var. Set by spawners that have already applied
 /// `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` flags so
@@ -1208,18 +1394,16 @@ struct GeneratedTelemetryConfig {
 }
 
 /// In-process MITM runtime, invoked by re-execed supervisor children (see
-/// [`spawn_proxy_process`]). Registers the historian extension (unless the
-/// user disabled it via `extensions.historian.enabled: false` in their
-/// soth.yaml) and delegates to `soth_proxy::runtime::run`.
+/// [`spawn_proxy_process`]). Registers the historian extension only when
+/// `extensions.historian.run_mode == InProcess` (and `enabled == true`);
+/// in the default Subprocess mode, the supervisor spawns historian as a
+/// sibling process via [`spawn_historian_process`] and this worker runs
+/// pure mitm.
 async fn run_proxy_worker() -> Result<()> {
     use std::sync::Arc;
 
     soth_proxy::runtime::init_rustls_provider();
 
-    // Re-load the config here rather than threading it through the
-    // re-exec boundary. The supervisor passes config-file path via
-    // SOTH_CONFIG_PATH (see spawn_proxy_process). Default falls back to
-    // the standard location, matching what the parent already validated.
     let config_path = std::env::var_os("SOTH_CONFIG_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(cli_config::default_config_path);
@@ -1228,12 +1412,24 @@ async fn run_proxy_worker() -> Result<()> {
         .unwrap_or_default();
 
     let mut registry = soth_extensions::ExtensionRegistry::empty();
-    if extensions_config.historian.enabled {
-        registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
-    } else {
-        tracing::info!(
-            "extensions.historian.enabled = false; skipping HistorianExtension registration"
-        );
+    let historian = &extensions_config.historian;
+    match (historian.enabled, historian.run_mode) {
+        (false, _) => {
+            tracing::info!(
+                "extensions.historian.enabled = false; skipping HistorianExtension registration"
+            );
+        }
+        (true, cli_config::HistorianRunMode::Subprocess) => {
+            // Supervisor handles historian as a sibling process; the proxy
+            // worker stays pure mitm so its tokio runtime is never blocked
+            // by classify CPU bursts.
+            tracing::info!(
+                "extensions.historian.run_mode = subprocess; historian runs as sibling process"
+            );
+        }
+        (true, cli_config::HistorianRunMode::InProcess) => {
+            registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
+        }
     }
 
     let tracing_targets = registry.tracing_targets();
@@ -1244,6 +1440,75 @@ async fn run_proxy_worker() -> Result<()> {
     let _observability_guard = soth_proxy::runtime::init_tracing(&tracing_targets);
 
     soth_proxy::runtime::run(registry).await
+}
+
+/// Historian sibling process entry point. Re-execed by the supervisor
+/// (see [`spawn_historian_process`]) when
+/// `extensions.historian.run_mode == Subprocess`. Runs the same lifecycle
+/// the in-process variant does — discovery → backfill → watch — but in
+/// its own OS process at lower scheduling priority.
+///
+/// Exits when:
+/// - SIGTERM/SIGINT is received (returns cleanly so the supervisor can
+///   reap without restart-loop noise on intentional shutdown).
+/// - Discovery finds no AI tools (logs and exits 0; the supervisor can
+///   choose not to respawn).
+/// - The watch loop exits unexpectedly (returns Err so the supervisor
+///   restarts with backoff).
+async fn run_historian_worker() -> Result<()> {
+    use soth_extensions::ExtensionRuntimeContext;
+
+    let _observability_guard = soth_proxy::runtime::init_tracing(&[
+        "soth_historian=info",
+        "soth_extensions=info",
+        "soth_classify=info",
+        "soth_telemetry=info",
+        "warn",
+    ]);
+
+    let ctx = ExtensionRuntimeContext::from_defaults();
+    let extension = soth_historian::HistorianExtension::with_defaults();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        // Watch for SIGTERM/SIGINT so the supervisor's `terminate_child`
+        // (used on `soth stop`, network change, etc.) drains historian
+        // cleanly instead of forcing a SIGKILL.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(sig) => sig,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to install SIGTERM handler in historian worker");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("historian worker received SIGTERM"),
+                _ = tokio::signal::ctrl_c() => tracing::info!("historian worker received SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("historian worker received Ctrl+C");
+        }
+        let _ = shutdown_tx_signal.send(true);
+    });
+
+    tracing::info!("historian worker starting (subprocess mode)");
+    extension.run_backfill(&ctx).await;
+    if *shutdown_rx.borrow() {
+        tracing::info!("historian worker shutting down before watch (signal during backfill)");
+        return Ok(());
+    }
+
+    extension.run_watch(&ctx, shutdown_rx).await;
+    tracing::info!("historian worker exiting");
+    drop(shutdown_tx);
+    Ok(())
 }
 
 #[cfg(test)]
