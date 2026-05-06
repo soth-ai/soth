@@ -11,6 +11,7 @@ use soth_historian::db;
 use soth_historian::dedup::DedupChecker;
 use soth_historian::discovery::ToolDiscovery;
 use soth_historian::engine::PlaybookReader;
+use soth_historian::enrich::ClassifyEnricher;
 use soth_historian::playbooks::default_playbooks;
 use soth_historian::watch::WatchEngine;
 
@@ -101,7 +102,7 @@ async fn main() {
 
     // Backfill
     let readers = build_readers();
-    let engine = BackfillEngine::new(
+    let mut engine = BackfillEngine::new(
         readers,
         report.tools.clone(),
         Arc::clone(&dedup),
@@ -109,6 +110,10 @@ async fn main() {
         cli.db_path.clone(),
     )
     .with_rate_limit(cli.rate_limit);
+    if let Some(enricher) = ClassifyEnricher::try_new(&ctx) {
+        info!("classify enrichment enabled for historian backfill");
+        engine = engine.with_enricher(enricher);
+    }
 
     let summary = engine.run(cli.since).await;
     info!(
@@ -146,7 +151,11 @@ async fn main() {
     let watch_dedup = Arc::new(DedupChecker::new(watch_conn));
     let watch_readers = build_readers();
     let watch_writer = TelemetryQueueWriter::for_extension(&ctx, "historian");
-    let watch_engine = WatchEngine::new(watch_readers, report.tools, watch_dedup, watch_writer);
+    let mut watch_engine = WatchEngine::new(watch_readers, report.tools, watch_dedup, watch_writer);
+    if let Some(enricher) = ClassifyEnricher::try_new(&ctx) {
+        info!("classify enrichment enabled for historian watch");
+        watch_engine = watch_engine.with_enricher(enricher);
+    }
     watch_engine.run(shutdown_rx).await;
 
     drop(shutdown_tx);
