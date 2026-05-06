@@ -26,6 +26,35 @@ pub enum UseCaseLabel {
     ImageAnalysis,
     AudioTranscription,
     SystemPromptOnly,
+    // ── Variants below were introduced when the use-case MLP was retrained
+    // on the 400k corpus. The model now distinguishes these as separate
+    // categories instead of bucketing them; the proxy preserves that
+    // granularity so the dashboard can surface them as first-class buckets
+    // rather than collapsing into TextGeneration / ToolOrchestration /
+    // CodeReview / DataAnalysis. Order matters for `LABEL_SPACE` in
+    // soth-classify::model: appended *after* the legacy 16 variants and
+    // *before* `Unknown` so the legacy index range (0–15) for the raw-
+    // weights fallback parser is preserved.
+    /// Infra / DevOps work — k8s manifests, terraform, CI/CD config,
+    /// shell scripts targeted at platform operations. Used to map to
+    /// `ToolOrchestration` which is now reserved for actual agent
+    /// tool-call orchestration.
+    InfraDevops,
+    /// Legal / contract drafting and review — agreements, policies,
+    /// compliance text. Used to map to `TextGeneration` which masked
+    /// the higher sensitivity of this category.
+    LegalContract,
+    /// Long-form research synthesis — multi-source reading, literature
+    /// review, briefings. Used to map to `DataAnalysis`.
+    ResearchSynthesis,
+    /// Security analysis — vulnerability triage, threat modelling,
+    /// pen-test scoping. Used to map to `CodeReview` which conflated
+    /// it with general code quality review.
+    SecurityAnalysis,
+    /// Editing existing content — copyedits, style passes, grammar
+    /// fixes. Used to map to `TextGeneration` which conflated it
+    /// with drafting net-new content.
+    ContentEditing,
     Unknown,
 }
 
