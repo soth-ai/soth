@@ -47,12 +47,20 @@ impl DedupChecker {
             }
         };
 
-        // Primary: exact (tool, session, index) match
+        // Primary: exact (tool, session, index, content_hash) match.
+        // Content-aware: a long-lived session (Cursor composer, Claude Code
+        // thread) keeps growing, each new turn produces a new content_hash.
+        // If we matched only on (tool, session, index), the first emission
+        // would freeze the session forever. The tertiary content_hash check
+        // below still suppresses true verbatim re-emissions.
         let primary: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM already_processed
-                 WHERE tool_type = ?1 AND session_id = ?2 AND message_index = ?3",
-                params![tool.key(), session_id, message_index],
+                 WHERE tool_type = ?1
+                   AND session_id = ?2
+                   AND message_index = ?3
+                   AND content_hash = ?4",
+                params![tool.key(), session_id, message_index, content_hash],
                 |row| row.get(0),
             )
             .optional()
@@ -134,10 +142,20 @@ impl DedupChecker {
             }
         };
         let now = chrono::Utc::now().timestamp();
+        // UPSERT: when a session grows, the existing row at
+        // (tool, session, index) holds the OLD content_hash. We overwrite
+        // it with the new content_hash + new event_id so the next dedup
+        // primary check correctly says "yes, that exact content was seen".
         conn.execute(
-            "INSERT OR IGNORE INTO already_processed
+            "INSERT INTO already_processed
              (tool_type, session_id, message_index, event_id, content_hash, semantic_hash, processed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(tool_type, session_id, message_index)
+             DO UPDATE SET
+                event_id      = excluded.event_id,
+                content_hash  = excluded.content_hash,
+                semantic_hash = excluded.semantic_hash,
+                processed_at  = excluded.processed_at",
             params![
                 tool.key(),
                 session_id,
