@@ -20,6 +20,21 @@ name: node-binaries
 # devDependencies for the build itself).
 
 on:
+  # Per-arch wheel/binary builds are expensive: 7-target matrix with
+  # 2 macOS + 1 Windows runners (≈10× and 2× the per-minute cost of
+  # Linux runners). They mostly exist as a release gate, not a PR
+  # smoke test — `ci.yml::bindings-build-check` already compiles
+  # `soth-py` and `soth-node` on Linux for every PR and catches
+  # FFI-surface regressions cheaply.
+  #
+  # Trigger policy:
+  #   • push to main / sdk-*  → full matrix, broad core-crate paths
+  #     (release gate; we want the prebuilt artifacts ready before
+  #     merge to a release line).
+  #   • pull_request          → only when the bindings themselves are
+  #     touched. A `Cargo.toml` tweak no longer fires this workflow
+  #     on PRs; the next push to main exercises it then.
+  #   • workflow_dispatch     → ad-hoc (release prep, debugging).
   push:
     branches:
       - main
@@ -36,10 +51,15 @@ on:
   pull_request:
     paths:
       - 'bindings/soth-node/**'
-      - 'crates/soth-sdk-core/**'
-      - 'Cargo.toml'
       - '.github/workflows/node-binaries.yml'
   workflow_dispatch:
+
+# Cancel duplicate runs on the same PR (push-rebase-push cycles).
+# fail-fast is already off for the matrix, so individual target
+# cancellations don't poison sibling jobs.
+concurrency:
+  group: node-binaries-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   DEBUG: napi:*

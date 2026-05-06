@@ -2,8 +2,29 @@ name: ci
 
 on:
   pull_request:
+    # Skip CI on PRs that only touch docs / markdown — saves a full
+    # workflow run (9 jobs) per readme tweak. The ignore filter is
+    # path-based: any code/config change still triggers everything.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
   push:
-    branches: [main]
+    # Add `staging` so direct pushes (cargo-fmt fixups, ops tweaks)
+    # get verified — `staging` is a real merge target, not just a
+    # branch name.
+    branches: [main, staging]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
+
+# Cancel superseded runs on the same ref. Push-rebase-push cycles on
+# an open PR were burning duplicate minutes; only the latest commit's
+# run is load-bearing.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

@@ -24,6 +24,11 @@ on:
       - 'crates/soth-conformance-tests/fixtures/**'
       - '.github/workflows/ffi-conformance.yml'
 
+# Cancel superseded runs (push-rebase cycles on a long-running PR).
+concurrency:
+  group: ffi-conformance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   python:
     runs-on: ubuntu-latest

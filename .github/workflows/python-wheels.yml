@@ -13,6 +13,11 @@ name: python-wheels
 # release workflow that gates on artifacts uploaded here.
 
 on:
+  # 5-target wheel matrix (3 of which run on macos-14 / windows-latest).
+  # Same trigger policy as node-binaries.yml — release gate on push,
+  # bindings-only on PR. `ci.yml::bindings-build-check` already
+  # compiles `soth-py` on Linux every PR; the per-arch wheel matrix
+  # is for release publication readiness, not PR smoke testing.
   push:
     branches:
       - main
@@ -29,10 +34,12 @@ on:
   pull_request:
     paths:
       - 'bindings/soth-py/**'
-      - 'crates/soth-sdk-core/**'
-      - 'Cargo.toml'
       - '.github/workflows/python-wheels.yml'
   workflow_dispatch:
+
+concurrency:
+  group: python-wheels-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
