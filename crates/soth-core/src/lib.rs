@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod bundle;
 pub mod classify;
+pub mod correlation;
 pub mod crypto;
 pub mod detect;
 pub mod error;
@@ -26,6 +27,9 @@ pub use error::{Result, SothError};
 pub use crypto::{
     cache_key_from_normalized, commitment_hash, derive_proxy_signing_seed, sha256_hex,
 };
+
+// ── correlation ───────────────────────────────────────────────────────────────
+pub use correlation::correlation_key;
 
 // ── providers ─────────────────────────────────────────────────────────────────
 pub use providers::DetectedProvider;
@@ -63,6 +67,8 @@ pub use classify::{
 // ── extensions ────────────────────────────────────────────────────────────────
 pub use extensions::{
     EventSource, ExtensionContext, ExtensionSource, ExtensionType, GovernableEvent,
+    META_ACTION_SEQ, META_ACTION_TYPE, META_AGENT_NATIVE_SESSION_ID, META_CORRELATION_KEY,
+    META_EVENT_LAYER,
 };
 
 // ── observation ───────────────────────────────────────────────────────────────
@@ -87,9 +93,9 @@ pub use session::{
 
 // ── telemetry ─────────────────────────────────────────────────────────────────
 pub use telemetry::{
-    BundleTrustLevel, CacheLevel, ClassificationFlag, DataSource, ImportCategory, InteractionMode,
-    ProgrammingLanguage, RequestMethod, RoutingReason, SensitiveCodeFlags, TelemetryEvent,
-    TelemetryPolicyKind, UseCaseLabel, UseCaseLabelReason, VolatilityClass,
+    BundleTrustLevel, CacheLevel, ClassificationFlag, DataSource, EventLayer, ImportCategory,
+    InteractionMode, ProgrammingLanguage, RequestMethod, RoutingReason, SensitiveCodeFlags,
+    TelemetryEvent, TelemetryPolicyKind, UseCaseLabel, UseCaseLabelReason, VolatilityClass,
 };
 
 // ── native_bundle ─────────────────────────────────────────────────────────────

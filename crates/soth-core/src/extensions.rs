@@ -7,6 +7,39 @@ use crate::artifacts::{CaptureMode, SensitiveArtifact};
 use crate::normalized::{EndpointType, NormalizedRequest};
 
 // ---------------------------------------------------------------------------
+// Metadata key constants
+// ---------------------------------------------------------------------------
+//
+// Standardized keys for `ExtensionContext::metadata`. Constants — not inline
+// string literals — so producers and consumers across crates agree on the
+// canonical name. New keys land here when more than one crate reads them.
+// (→ `docs/gryph/plan.md` §10.6 for the boundary spec.)
+
+/// Agent's own session identifier as carried in the hook payload
+/// (Claude Code's project-hash-derived ID, Cursor's chat thread ID, etc.).
+/// Populated by `soth-code` adapters; consumed when computing
+/// [`META_CORRELATION_KEY`].
+pub const META_AGENT_NATIVE_SESSION_ID: &str = "agent_native_session_id";
+
+/// Per-action type tag (e.g. `"file_read"`, `"command_exec"`, `"tool_use"`).
+/// Populated by `soth-code` adapters.
+pub const META_ACTION_TYPE: &str = "action_type";
+
+/// Per-action sequence number within an agent session, when the hook
+/// payload supplies one (e.g. Claude Code's PreToolUse step counter).
+pub const META_ACTION_SEQ: &str = "action_seq";
+
+/// Cross-layer correlation key — `sha256(agent_name || ":" || agent_native_session_id)`.
+/// Joins network/action/session events for the same agent session in the
+/// dashboard. See [`crate::correlation::correlation_key`].
+pub const META_CORRELATION_KEY: &str = "correlation_key";
+
+/// Explicit event-layer tag mirrored into `metadata` for consumers that
+/// read `GovernableEvent` rather than `TelemetryEvent` (which has the
+/// first-class `event_layer` field). Values match `EventLayer` snake_case.
+pub const META_EVENT_LAYER: &str = "event_layer";
+
+// ---------------------------------------------------------------------------
 // GovernableEvent — normalized event shape governance extensions produce
 // ---------------------------------------------------------------------------
 

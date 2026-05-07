@@ -171,6 +171,11 @@ pub(crate) fn run(
         product_id: proxy_ctx.attribution.product_id.clone(),
         surface_type: proxy_ctx.attribution.surface_type,
         is_shadow_it: proxy_ctx.attribution.is_shadow_it,
+        // Live-proxy events. effective_event_layer() resolves to Network from
+        // data_source, so leaving this None keeps wire compat with older
+        // serialized events. Set explicit Some(EventLayer::Network) here only
+        // if the proxy ever emits something other than LiveProxy.
+        event_layer: None,
     };
 
     TelemetryOutput {

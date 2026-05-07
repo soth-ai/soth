@@ -244,11 +244,69 @@ pub enum DataSource {
     HistorianContinue,
     HistorianOpenClaw,
     HistorianUnknown,
+    // ── soth-code extension: per-action live capture from agent hooks.
+    //    Distinct from Historian* variants which are post-hoc session
+    //    backfill. See docs/gryph/plan.md §10 for layer boundaries.
+    CodeClaudeCode,
+    CodeCursor,
+    CodeCodex,
+    CodeGeminiCli,
+    CodeWindsurf,
+    CodeOpenCode,
+    CodePiAgent,
 }
 
 impl Default for DataSource {
     fn default() -> Self {
         Self::LiveProxy
+    }
+}
+
+/// Event-stream observation layer.
+///
+/// SOTH observes AI agent activity at three orthogonal layers
+/// (→ `docs/gryph/plan.md` §10):
+///
+/// - **Network** — proxy MITM observation, one event per HTTP request/response.
+/// - **Action** — `soth-code` hook capture, one event per agent tool call.
+/// - **Session** — historian file-watch reconstruction, one event per
+///   conversation session.
+///
+/// The dashboard renders these as distinct streams; counts are reported
+/// per-layer and never summed across layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventLayer {
+    Network,
+    Action,
+    Session,
+}
+
+impl EventLayer {
+    /// Derive the canonical layer from a `DataSource`.
+    ///
+    /// Used when an event predates the explicit `event_layer` field, or
+    /// when a writer leaves it unset and the layer can be inferred
+    /// unambiguously from data source. See [`TelemetryEvent::effective_event_layer`].
+    pub fn from_data_source(ds: DataSource) -> Self {
+        match ds {
+            DataSource::LiveProxy => Self::Network,
+            DataSource::HistorianClaudeCode
+            | DataSource::HistorianGemini
+            | DataSource::HistorianCodex
+            | DataSource::HistorianCursor
+            | DataSource::HistorianGithubCopilot
+            | DataSource::HistorianContinue
+            | DataSource::HistorianOpenClaw
+            | DataSource::HistorianUnknown => Self::Session,
+            DataSource::CodeClaudeCode
+            | DataSource::CodeCursor
+            | DataSource::CodeCodex
+            | DataSource::CodeGeminiCli
+            | DataSource::CodeWindsurf
+            | DataSource::CodeOpenCode
+            | DataSource::CodePiAgent => Self::Action,
+        }
     }
 }
 
@@ -394,6 +452,13 @@ pub struct TelemetryEvent {
     pub surface_type: SurfaceType,
     #[serde(default)]
     pub is_shadow_it: bool,
+
+    /// Event-stream observation layer tag (→ `docs/gryph/plan.md` §10).
+    /// `None` for legacy events; resolve via [`TelemetryEvent::effective_event_layer`]
+    /// which falls back to deriving from `data_source`. New writers
+    /// (`soth-code`, future explicit-layer producers) populate this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_layer: Option<EventLayer>,
 }
 
 impl Default for TelemetryEvent {
@@ -475,11 +540,22 @@ impl Default for TelemetryEvent {
             surface_type: SurfaceType::Unknown,
             is_shadow_it: false,
             interaction_mode: InteractionMode::Unknown,
+            event_layer: None,
         }
     }
 }
 
 impl TelemetryEvent {
+    /// Effective event layer.
+    ///
+    /// Returns the explicit `event_layer` field when set (new writers),
+    /// otherwise derives from `data_source` for backwards compat with
+    /// legacy events that predate this field (→ `docs/gryph/plan.md` §10.6).
+    pub fn effective_event_layer(&self) -> EventLayer {
+        self.event_layer
+            .unwrap_or_else(|| EventLayer::from_data_source(self.data_source))
+    }
+
     /// Convert a GovernableEvent (from extensions like historian) into a
     /// TelemetryEvent suitable for the telemetry pipeline.
     ///
@@ -824,4 +900,145 @@ fn compute_code_fraction_from_artifacts(
     let total_tokens = estimated_input_tokens.max(1) as f32;
     let estimated_code_tokens = (code_block_count as f32) * 200.0;
     (estimated_code_tokens / total_tokens).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod data_source_serde_tests {
+    use super::{DataSource, EventLayer, TelemetryEvent};
+
+    #[test]
+    fn code_variants_serialize_to_snake_case() {
+        let cases = [
+            (DataSource::CodeClaudeCode, "\"code_claude_code\""),
+            (DataSource::CodeCursor, "\"code_cursor\""),
+            (DataSource::CodeCodex, "\"code_codex\""),
+            (DataSource::CodeGeminiCli, "\"code_gemini_cli\""),
+            (DataSource::CodeWindsurf, "\"code_windsurf\""),
+            (DataSource::CodeOpenCode, "\"code_open_code\""),
+            (DataSource::CodePiAgent, "\"code_pi_agent\""),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                expected,
+                "serialization for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_variants_round_trip() {
+        let variants = [
+            DataSource::CodeClaudeCode,
+            DataSource::CodeCursor,
+            DataSource::CodeCodex,
+            DataSource::CodeGeminiCli,
+            DataSource::CodeWindsurf,
+            DataSource::CodeOpenCode,
+            DataSource::CodePiAgent,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: DataSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "round-trip for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn historian_variants_unchanged() {
+        // Regression guard: existing Historian variants must keep their
+        // wire form so cloud rollups don't silently re-bucket them.
+        assert_eq!(
+            serde_json::to_string(&DataSource::HistorianClaudeCode).unwrap(),
+            "\"historian_claude_code\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DataSource::LiveProxy).unwrap(),
+            "\"live_proxy\""
+        );
+    }
+
+    #[test]
+    fn event_layer_from_data_source_buckets() {
+        assert_eq!(
+            EventLayer::from_data_source(DataSource::LiveProxy),
+            EventLayer::Network
+        );
+        for ds in [
+            DataSource::HistorianClaudeCode,
+            DataSource::HistorianGemini,
+            DataSource::HistorianCodex,
+            DataSource::HistorianCursor,
+            DataSource::HistorianGithubCopilot,
+            DataSource::HistorianContinue,
+            DataSource::HistorianOpenClaw,
+            DataSource::HistorianUnknown,
+        ] {
+            assert_eq!(
+                EventLayer::from_data_source(ds),
+                EventLayer::Session,
+                "{ds:?} should be Session layer"
+            );
+        }
+        for ds in [
+            DataSource::CodeClaudeCode,
+            DataSource::CodeCursor,
+            DataSource::CodeCodex,
+            DataSource::CodeGeminiCli,
+            DataSource::CodeWindsurf,
+            DataSource::CodeOpenCode,
+            DataSource::CodePiAgent,
+        ] {
+            assert_eq!(
+                EventLayer::from_data_source(ds),
+                EventLayer::Action,
+                "{ds:?} should be Action layer"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_event_layer_falls_back_to_data_source() {
+        // Legacy event: explicit field None, data_source dictates layer.
+        let mut ev = TelemetryEvent::default();
+        ev.data_source = DataSource::HistorianClaudeCode;
+        assert_eq!(ev.event_layer, None);
+        assert_eq!(ev.effective_event_layer(), EventLayer::Session);
+
+        // New writer: explicit field set, takes precedence.
+        ev.event_layer = Some(EventLayer::Action);
+        assert_eq!(ev.effective_event_layer(), EventLayer::Action);
+    }
+
+    #[test]
+    fn event_layer_serializes_to_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EventLayer::Network).unwrap(),
+            "\"network\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventLayer::Action).unwrap(),
+            "\"action\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventLayer::Session).unwrap(),
+            "\"session\""
+        );
+    }
+
+    #[test]
+    fn telemetry_event_legacy_json_deserializes_with_no_event_layer() {
+        // Regression guard: an event serialized before this field existed
+        // must still deserialize, with `event_layer: None`.
+        let mut ev = TelemetryEvent::default();
+        ev.data_source = DataSource::LiveProxy;
+        let json = serde_json::to_value(&ev).unwrap();
+        // Strip event_layer to simulate older wire form.
+        let mut obj = json.as_object().unwrap().clone();
+        obj.remove("event_layer");
+        let stripped = serde_json::Value::Object(obj);
+        let back: TelemetryEvent = serde_json::from_value(stripped).unwrap();
+        assert_eq!(back.event_layer, None);
+        assert_eq!(back.effective_event_layer(), EventLayer::Network);
+    }
 }
