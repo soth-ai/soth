@@ -224,6 +224,14 @@ pub struct DoctorArgs {
     /// Emit machine-readable JSON
     #[arg(long)]
     pub json: bool,
+
+    /// One-shot recovery for "I can't browse even with proxy off" situations.
+    /// Disables system proxy (signature-aware), removes the bypass list
+    /// soth installed, flushes mDNSResponder's cache (sudo required for the
+    /// system-level part), and emits the shell-env deactivation patch.
+    /// Idempotent — safe to run repeatedly.
+    #[arg(long)]
+    pub reset_network: bool,
 }
 
 #[derive(Args, Clone)]
@@ -371,7 +379,11 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
             }
         }
         Commands::Doctor(args) => {
-            commands::proxy::run_doctor(global_config, args.json).await?;
+            if args.reset_network {
+                commands::proxy::run_doctor_reset_network().await?;
+            } else {
+                commands::proxy::run_doctor(global_config, args.json).await?;
+            }
         }
         Commands::Init(args) => {
             let output = cli_config::expand_tilde(args.output.as_path());
