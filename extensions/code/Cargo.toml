@@ -1,0 +1,24 @@
+[package]
+name = "soth-code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+clap.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+soth-core = { workspace = true }
+soth-classify = { workspace = true, features = ["policy"] }
+soth-extensions = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

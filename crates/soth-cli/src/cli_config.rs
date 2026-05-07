@@ -58,6 +58,26 @@ pub struct ForwardProxyConfig {
     pub max_flow_event_backlog: usize,
     pub max_in_flight_bytes: usize,
     pub max_concurrent_flows: usize,
+
+    // ── soth-code per-agent gating (→ docs/gryph/plan.md §10.11/.12) ──
+    /// User-Agent glob patterns for AI coding agents whose traffic is
+    /// **fully bypassed** at the proxy: TLS pass-through, no telemetry,
+    /// no classify. The `soth-code` extension is the canonical source
+    /// for these agents (action layer + historian session layer cover
+    /// the visibility need). Default empty — no bypass until explicitly
+    /// flipped per-agent following the A→C trajectory gate
+    /// (plan §10.11).
+    #[serde(default)]
+    pub bypass_agents: Vec<String>,
+    /// User-Agent glob patterns for agents in **cost-skim** mode: proxy
+    /// emits a narrow event with provider/model/tokens/cost only, no
+    /// classify, no tool-use parsing. Used as a transitional fallback
+    /// for agents whose historian playbook does not yet capture
+    /// authoritative `usage` blocks (plan §10.12). Migrates to
+    /// `bypass_agents` once historian usage coverage is audited.
+    /// Default empty.
+    #[serde(default)]
+    pub cost_skim_agents: Vec<String>,
 }
 
 impl Default for ForwardProxyConfig {
@@ -102,6 +122,8 @@ impl Default for ForwardProxyConfig {
             max_flow_event_backlog: 8 * 1024,
             max_in_flight_bytes: 64 * 1024 * 1024,
             max_concurrent_flows: 2_048,
+            bypass_agents: Vec::new(),
+            cost_skim_agents: Vec::new(),
         }
     }
 }
@@ -457,12 +479,14 @@ pub struct PipelineOverrides {
 #[serde(default)]
 pub struct ExtensionsConfig {
     pub historian: HistorianExtensionConfig,
+    pub code: CodeExtensionConfig,
 }
 
 impl Default for ExtensionsConfig {
     fn default() -> Self {
         Self {
             historian: HistorianExtensionConfig::default(),
+            code: CodeExtensionConfig::default(),
         }
     }
 }
@@ -517,6 +541,88 @@ pub enum HistorianRunMode {
 impl Default for HistorianRunMode {
     fn default() -> Self {
         Self::Subprocess
+    }
+}
+
+/// `soth-code` extension config. Per-action policy gate at the AI coding
+/// agent's hook boundary (Claude Code, Cursor, Codex, …). See
+/// `docs/gryph/plan.md` §10 for the layer model and §10.11 for the
+/// per-agent A→C trajectory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeExtensionConfig {
+    /// Master switch. Off → `soth code hook` invocations no-op (allow
+    /// all, no enqueue, no classify). On → hook handler runs the full
+    /// parse → redact → classify → policy → enqueue pipeline.
+    pub enabled: bool,
+
+    /// Behavior when policy evaluation fails (OPA bundle missing,
+    /// timeout exceeded, etc.).
+    ///
+    /// `Block` (default — security tool stance): a failure halts the
+    /// agent action with an error message. Surfaces problems loudly.
+    ///
+    /// `Allow`: failures are logged and the action proceeds. Operator
+    /// must accept the visibility risk; surfaces a `WARN` log line on
+    /// every fall-through (gryph Issue #20: silent fail-open is how
+    /// Pi Agent shipped policy enforcement that secretly didn't enforce).
+    pub on_policy_error: PolicyErrorMode,
+
+    /// Hard ceiling for the synchronous hook path. The agent waits this
+    /// long before assuming the hook has hung. Default 30s, matching
+    /// gryph PR #22's chosen value (anything longer freezes the agent).
+    pub timeout_ms: u32,
+
+    /// Per-agent enablement. Agents with no entry default to disabled
+    /// — adapters opt in explicitly so a misconfigured `code` block
+    /// doesn't accidentally route through every adapter shipped.
+    ///
+    /// Example yaml:
+    /// ```yaml
+    /// code:
+    ///   enabled: true
+    ///   agents:
+    ///     claude_code: { enabled: true }
+    /// ```
+    pub agents: std::collections::HashMap<String, CodeAgentConfig>,
+}
+
+impl Default for CodeExtensionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on_policy_error: PolicyErrorMode::Block,
+            timeout_ms: 30_000,
+            agents: std::collections::HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyErrorMode {
+    Block,
+    Allow,
+}
+
+impl Default for PolicyErrorMode {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeAgentConfig {
+    /// Whether the adapter is active. Off-by-default per agent so a
+    /// misconfigured `code` block doesn't route through unintended
+    /// adapters.
+    pub enabled: bool,
+}
+
+impl Default for CodeAgentConfig {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -684,4 +790,100 @@ pub fn sync_client_device_id(
 
 pub fn resolved_db_path(config: &SothConfig) -> PathBuf {
     expand_tilde(Path::new(config.proxy.db_path.as_str()))
+}
+
+#[cfg(test)]
+mod code_extension_config_tests {
+    use super::{
+        CodeAgentConfig, CodeExtensionConfig, ExtensionsConfig, ForwardProxyConfig,
+        PolicyErrorMode, SothConfig,
+    };
+
+    #[test]
+    fn code_config_default_matches_documented() {
+        // README example default must match code default — gryph Issue #41
+        // shipped because docs claimed `minimal` log level was default while
+        // code default was `standard`. Pin the contract here.
+        let c = CodeExtensionConfig::default();
+        assert!(c.enabled, "extension default is on");
+        assert_eq!(c.on_policy_error, PolicyErrorMode::Block);
+        assert_eq!(c.timeout_ms, 30_000);
+        assert!(
+            c.agents.is_empty(),
+            "no agents default to enabled — adapters opt in explicitly"
+        );
+    }
+
+    #[test]
+    fn agent_default_is_disabled() {
+        // Per-agent default off so a misconfigured `code` block doesn't
+        // route through unintended adapters.
+        let a = CodeAgentConfig::default();
+        assert!(!a.enabled);
+    }
+
+    #[test]
+    fn yaml_round_trip_with_claude_code_only() {
+        let yaml = r#"
+extensions:
+  code:
+    enabled: true
+    on_policy_error: block
+    timeout_ms: 30000
+    agents:
+      claude_code:
+        enabled: true
+"#;
+        let cfg: SothConfig = serde_yaml::from_str(yaml).expect("parse soth config");
+        let code = &cfg.extensions.code;
+        assert!(code.enabled);
+        assert_eq!(code.timeout_ms, 30_000);
+        assert_eq!(code.on_policy_error, PolicyErrorMode::Block);
+        let claude = code
+            .agents
+            .get("claude_code")
+            .expect("claude_code adapter entry present");
+        assert!(claude.enabled);
+    }
+
+    #[test]
+    fn missing_code_block_uses_defaults() {
+        // Backwards-compat: existing soth.yaml files with no `code:` block
+        // must keep working. `extensions:` is `serde(default)`, and
+        // `code:` inherits CodeExtensionConfig::default().
+        let yaml = "forward_proxy:\n  enabled: true\n";
+        let cfg: SothConfig = serde_yaml::from_str(yaml).expect("parse minimal config");
+        let code = &cfg.extensions.code;
+        assert!(code.enabled, "missing block should default-enable");
+        assert!(code.agents.is_empty());
+    }
+
+    #[test]
+    fn proxy_bypass_and_cost_skim_default_empty() {
+        let cfg = ForwardProxyConfig::default();
+        assert!(cfg.bypass_agents.is_empty(), "no bypass until explicit per-agent flip");
+        assert!(cfg.cost_skim_agents.is_empty(), "no cost-skim until usage-coverage audit gates flip");
+    }
+
+    #[test]
+    fn yaml_round_trip_with_proxy_bypass_lists() {
+        let yaml = r#"
+forward_proxy:
+  bypass_agents:
+    - "claude-cli/*"
+  cost_skim_agents:
+    - "cursor/*"
+"#;
+        let cfg: SothConfig = serde_yaml::from_str(yaml).expect("parse with bypass lists");
+        assert_eq!(cfg.forward_proxy.bypass_agents, vec!["claude-cli/*"]);
+        assert_eq!(cfg.forward_proxy.cost_skim_agents, vec!["cursor/*"]);
+    }
+
+    #[test]
+    fn extensions_config_default_includes_code() {
+        let ext = ExtensionsConfig::default();
+        assert!(ext.code.enabled);
+        // historian still defaulting (regression guard)
+        assert!(ext.historian.enabled);
+    }
 }

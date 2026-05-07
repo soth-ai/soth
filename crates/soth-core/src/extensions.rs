@@ -86,6 +86,10 @@ pub enum ExtensionSource {
     McpReticle,
     Historian,
     SubscriptionDetector,
+    /// Per-action live capture from agent hooks (Claude Code, Cursor, Codex,
+    /// …). Distinct from the post-hoc Historian source which reconstructs
+    /// sessions from local file watching. See `docs/gryph/plan.md` §10.
+    Code,
     Custom(String),
 }
 
@@ -97,6 +101,7 @@ impl ExtensionSource {
             Self::McpReticle => "mcp_reticle",
             Self::Historian => "historian",
             Self::SubscriptionDetector => "subscription_detector",
+            Self::Code => "code",
             Self::Custom(name) => name.as_str(),
         }
     }

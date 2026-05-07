@@ -4104,6 +4104,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "soth-code"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "dirs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "soth-classify",
+ "soth-core",
+ "soth-extensions",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "soth-conformance-tests"
 version = "0.1.0"
 dependencies = [
