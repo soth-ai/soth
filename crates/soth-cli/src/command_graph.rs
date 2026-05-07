@@ -90,6 +90,13 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigCommands,
     },
+
+    /// Synchronous policy gate at the AI coding agent's hook boundary
+    /// (Claude Code, Cursor, Codex, …). See `docs/gryph/plan.md`.
+    Code {
+        #[command(subcommand)]
+        action: commands::code::CodeCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -416,6 +423,14 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
         }
         Commands::Config { action } => {
             run_config_command(action, global_config)?;
+        }
+        Commands::Code { action } => {
+            // `commands::code::run` calls `std::process::exit` directly
+            // when the adapter chooses a non-zero code (Block etc.) —
+            // the agent expects a precise exit value the dispatcher
+            // can't reshape. Returning Ok(()) here is unreachable for
+            // the hook subcommand; `status` does normally return.
+            commands::code::run(action, global_config).await?;
         }
     }
 

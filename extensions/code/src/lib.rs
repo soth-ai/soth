@@ -18,7 +18,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adapter;
+pub mod decision;
+pub mod event;
+pub mod hook;
 pub mod paths;
+
+pub use decision::{AdapterResponse, HookDecision};
+pub use event::{ActionType, CodeEvent, SubagentContext};
+pub use hook::{read_stdin_to_end, run_hook, write_outcome, HookError, HookOutcome};
 
 use soth_core::ExtensionSource;
 use soth_extensions::{

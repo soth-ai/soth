@@ -4088,6 +4088,7 @@ dependencies = [
  "sha1",
  "sha2",
  "soth-bundle",
+ "soth-code",
  "soth-core",
  "soth-extensions",
  "soth-historian",
