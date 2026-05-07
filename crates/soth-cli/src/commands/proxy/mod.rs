@@ -112,3 +112,73 @@ pub async fn run_status(config: Option<PathBuf>, json: bool) -> anyhow::Result<b
 pub async fn run_doctor(config: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     doctor::run(config, json).await
 }
+
+/// One-shot recovery for "I can't browse even with proxy off" — usually
+/// means stale system-proxy state, lingering shell env vars, and a stale
+/// mDNSResponder cache from a prior network. Idempotent.
+pub async fn run_doctor_reset_network() -> anyhow::Result<()> {
+    use crate::style;
+
+    println!(
+        "{} Running soth network reset...",
+        style::ARROW_RIGHT
+    );
+
+    // 1. Disable system proxy. With the signature-based path in
+    //    `system::disable`, this works even if the state-file is missing.
+    if let Err(error) = system::disable().await {
+        eprintln!(
+            "   {} system proxy disable returned: {error}",
+            style::WARNING
+        );
+    }
+
+    // 2. Emit the shell env deactivate patch so a sibling shell that
+    //    sources it (`eval "$(soth env --unset)"`) drops HTTP_PROXY etc.
+    if let Err(error) = emit_shell_env_deactivate() {
+        eprintln!(
+            "   {} shell env deactivate emit failed: {error}",
+            style::WARNING
+        );
+    }
+
+    // 3. Flush DNS caches. User-level dscacheutil never needs sudo;
+    //    mDNSResponder kill does. We attempt user-level unconditionally
+    //    and prompt on the system-level — non-fatal either way.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("dscacheutil")
+            .arg("-flushcache")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        println!("   {} Flushed dscacheutil cache", style::CHECK);
+
+        // Best-effort sudo invocation. If the user can't sudo without a
+        // password, we just print the manual command and continue.
+        let mdns_status = std::process::Command::new("sudo")
+            .args(["-n", "killall", "-HUP", "mDNSResponder"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match mdns_status {
+            Ok(s) if s.success() => {
+                println!("   {} HUP'd mDNSResponder (system DNS cache cleared)", style::CHECK);
+            }
+            _ => {
+                println!(
+                    "   {} Could not HUP mDNSResponder without prompt; run manually:\n      sudo killall -HUP mDNSResponder",
+                    style::INFO
+                );
+            }
+        }
+    }
+
+    println!(
+        "\n{} Network reset complete. If problems persist, restart your browser to clear its proxy/DNS caches.",
+        style::success_prefix()
+    );
+    Ok(())
+}

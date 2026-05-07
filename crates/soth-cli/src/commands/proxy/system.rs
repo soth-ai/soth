@@ -39,6 +39,15 @@ const SYSTEM_PROXY_STATE_FILE: &str = "system_proxy_state.json";
 const SYSTEM_PROXY_OWNER_FILE: &str = "system_proxy_owner.id";
 
 /// Domains to bypass proxy (localhost and local network).
+///
+/// The first block is RFC1918 + loopback. The second block is the
+/// captive-portal detection allow-list — these probes are time-sensitive,
+/// HTTP-only, and Apple's Captive Network Assistant (CNA) is fragile about
+/// any latency or header rewriting through a forward proxy. Routing them
+/// direct (bypassing soth entirely) is the load-bearing fix; without
+/// this, public-Wi-Fi captive logins silently fail. mitmproxy hit the
+/// same class of bug and lands the same allow-list at the OS layer (see
+/// mitmproxy/mitmproxy#7035).
 const PROXY_BYPASS_DOMAINS: &[&str] = &[
     "localhost",
     "127.0.0.1",
@@ -62,6 +71,18 @@ const PROXY_BYPASS_DOMAINS: &[&str] = &[
     "172.29.*",
     "172.30.*",
     "172.31.*",
+    // Captive-portal detection — must go direct, not via soth.
+    "captive.apple.com",
+    "www.apple.com",
+    "connectivitycheck.gstatic.com",
+    "www.gstatic.com",
+    "www.msftconnecttest.com",
+    "dns.msftncsi.com",
+    "detectportal.firefox.com",
+    "*.gvt1.com",
+    "clients3.google.com",
+    "clients4.google.com",
+    "nmcheck.gnome.org",
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -517,14 +538,53 @@ async fn configure_macos_proxy(enable: bool, port: u16, print_user_output: bool)
             );
         }
     } else {
-        // Fail-open + safety: never attempt a blind disable without a known snapshot.
-        // If the proxy appears inactive, treat this as idempotent success.
-        // If loopback proxies are active, preserve them and warn (manual intervention).
+        // No state file. Fall back to signature-based disable: if the
+        // current active proxy points at our loopback IP and our port, it
+        // *is* soth even if our state file is missing (deleted state file,
+        // OS reset, manual `networksetup` invocation that clobbered the
+        // snapshot, etc.). Disable without restoring snapshot — same end
+        // result as a fresh start.
+        //
+        // Mirrors mitmproxy/mitmproxy#5946 — never trust local state alone;
+        // verify against what the OS actually reports.
+        //
+        // If the active proxy is loopback but on a different port, we
+        // assume it's another tool (Charles, mitmproxy, dev tooling) and
+        // preserve. That's the only case where the legacy "preserve"
+        // behavior still fires.
+        let expected_port = soth_configured_port_or_default();
+        let soth_owned_services =
+            list_macos_services_using_soth_signature(&services, expected_port);
+
+        if !soth_owned_services.is_empty() {
+            warn!(
+                services = ?soth_owned_services,
+                expected_port,
+                "system proxy state missing but active proxy matches soth signature (loopback:{expected_port}); proceeding with disable"
+            );
+            if print_user_output {
+                println!(
+                    "   {} State file missing — disabling soth-signature proxy on: {}",
+                    style::INFO,
+                    soth_owned_services.join(", ")
+                );
+            }
+            for service in &soth_owned_services {
+                let _ = run_networksetup(&["-setwebproxystate", service, "off"]);
+                let _ = run_networksetup(&["-setsecurewebproxystate", service, "off"]);
+            }
+            // Drop our owner marker so a subsequent `soth on` re-snapshots
+            // cleanly — keeps the next enable/disable cycle idempotent.
+            let _ = std::fs::remove_file(soth_home_dir().join("run").join("system_proxy_owner.id"));
+            return Ok(());
+        }
+
+        // Either nothing is active, or the active loopback proxy is on a
+        // port that isn't ours. Preserve and tell the user (legacy
+        // behavior — only path that doesn't auto-disable).
         let active_loopback_services = list_macos_services_using_loopback_proxy(&services);
         if active_loopback_services.is_empty() {
-            warn!(
-                "System proxy state missing during macOS disable; no loopback proxy active, treating as no-op"
-            );
+            warn!("system proxy state missing during macOS disable; no loopback proxy active, treating as no-op");
             if print_user_output {
                 println!(
                     "   {} System proxy state missing; no loopback proxy active (no-op).",
@@ -537,18 +597,19 @@ async fn configure_macos_proxy(enable: bool, port: u16, print_user_output: bool)
         let service_list = active_loopback_services.join(", ");
         warn!(
             services = %service_list,
-            "System proxy state missing during macOS disable; preserving active loopback proxies (no blind changes)"
+            expected_port,
+            "system proxy state missing; loopback proxy active on a non-soth port; preserving (no changes)"
         );
         if print_user_output {
             println!(
-                "   {} System proxy state missing; preserving active loopback proxy settings for: {}",
+                "   {} System proxy state missing; loopback proxy is on a non-soth port — preserving: {}",
                 style::WARNING,
                 service_list
             );
             println!(
                 "   {} If this is stale SOTH state, run: soth on --port {}  then  soth off",
                 style::INFO,
-                port
+                expected_port
             );
         }
         return Ok(());
@@ -576,6 +637,45 @@ fn is_loopback_host(host: &str) -> bool {
         host.trim().to_ascii_lowercase().as_str(),
         "127.0.0.1" | "localhost" | "::1"
     )
+}
+
+/// Read the user's configured proxy port. Falls back to the schema default
+/// if the config can't be loaded (corrupted yaml, fresh install). Used by
+/// the signature-based disable path so we only auto-clear proxies that
+/// actually belong to soth, never another loopback dev tool.
+#[cfg(target_os = "macos")]
+fn soth_configured_port_or_default() -> u16 {
+    crate::cli_config::load_effective_config(None, None)
+        .map(|cfg| cfg.forward_proxy.port)
+        .unwrap_or(8080)
+}
+
+/// Like [`list_macos_services_using_loopback_proxy`] but stricter: matches
+/// only when the active proxy's host is loopback **and** its port is
+/// `expected_port`. This is the soth signature.
+#[cfg(target_os = "macos")]
+fn list_macos_services_using_soth_signature(
+    services: &[String],
+    expected_port: u16,
+) -> Vec<String> {
+    let mut owned = Vec::new();
+    for service in services {
+        let web = get_macos_proxy_endpoint(service, false).ok();
+        let secure = get_macos_proxy_endpoint(service, true).ok();
+
+        let matches = |snap: &ProxyEndpointSnapshot| -> bool {
+            snap.enabled
+                && snap.host.as_deref().map(is_loopback_host).unwrap_or(false)
+                && snap.port == Some(expected_port)
+        };
+
+        if web.as_ref().map(matches).unwrap_or(false)
+            || secure.as_ref().map(matches).unwrap_or(false)
+        {
+            owned.push(service.clone());
+        }
+    }
+    owned
 }
 
 #[cfg(target_os = "macos")]

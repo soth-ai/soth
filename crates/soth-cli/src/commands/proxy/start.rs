@@ -10,7 +10,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 // Default budget for the supervisor to wait for the worker proxy to bind
@@ -623,6 +623,31 @@ async fn supervise_proxy(
                 *child = new_child;
                 last_healthy = Instant::now();
                 consecutive_failures = 0;
+
+                // Network-change rotation often leaves stale entries in
+                // mDNSResponder's cache pointing at the previous gateway.
+                // The new proxy worker has a fresh hickory cache, but
+                // *applications* (browsers, the user's shell) still
+                // resolve through mDNSResponder. Flush its user-level
+                // cache best-effort so the next request actually re-
+                // resolves. The system-level part (`killall -HUP
+                // mDNSResponder`) needs sudo and is left to `soth doctor
+                // --reset-network` for the explicit case.
+                #[cfg(target_os = "macos")]
+                {
+                    if let Err(error) = std::process::Command::new("dscacheutil")
+                        .arg("-flushcache")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                    {
+                        warn!(%error, "dscacheutil -flushcache failed after rotation (non-fatal)");
+                    } else {
+                        debug!("dscacheutil -flushcache after network-change rotation");
+                    }
+                }
+
                 info!("graceful child rotation complete");
                 continue;
             }
