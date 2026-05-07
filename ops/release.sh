@@ -148,7 +148,7 @@ cmd_help() {
 	  MINIO_SECRET_KEY        publish-cli ENV=staging
 	  PLATFORM_ADMIN_TOKEN    publish-classify, *-catalog
 	  ADMIN_API               publish-classify, *-catalog (auto-defaults per ENV)
-	  (prod CLI publish uses \`wrangler login\` — no extra creds.)
+	  (prod CLI publish uses \`npx -y wrangler@4.75.0 login\` — no extra creds.)
 
 	Phase 4 (status/diff cross-env) and Phase 5 (GHA wrappers) follow.
 	EOF
@@ -261,14 +261,26 @@ cmd_publish_cli_staging() {
 
 cmd_publish_cli_prod() {
   ensure_dist_present
-  require_cmd wrangler
-  wrangler whoami >/dev/null 2>&1 || err "wrangler not logged in (run \`wrangler login\`)"
+  require_cmd npx
+
+  # Pin wrangler via npx instead of relying on the globally installed
+  # version. Two reasons:
+  #   1) The Homebrew-installed wrangler 4.60.x consistently 504s on R2
+  #      uploads of binaries >30 MiB (saw it on soth-linux-amd64 and
+  #      soth-windows-amd64.exe during the 2026-05-06 staging→prod cut).
+  #      4.75.x landed an upload retry/timeout fix that resolves it.
+  #   2) wrangler 4.88+ requires Node 22; 4.75.0 is the highest line that
+  #      still works on the Node 20 we ship with. Pin here so the version
+  #      bump doesn't surprise anyone running this from a fresh checkout.
+  local WRANGLER="npx -y wrangler@4.75.0"
+
+  $WRANGLER whoami >/dev/null 2>&1 || err "wrangler not logged in (run \`npx -y wrangler@4.75.0 login\`)"
 
   unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
 
   for f in "${CLI_BINARIES[@]}" "${CLI_BINARIES[@]/%/.sha256}"; do
     echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}${f}"
-    wrangler r2 object put "${R2_BUCKET}/${R2_PREFIX}${f}" \
+    $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}${f}" \
       --file="${DIST_DIR}/${f}" \
       --remote \
       --cache-control "no-store, max-age=0"
