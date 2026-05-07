@@ -119,10 +119,7 @@ pub async fn run_doctor(config: Option<PathBuf>, json: bool) -> anyhow::Result<(
 pub async fn run_doctor_reset_network() -> anyhow::Result<()> {
     use crate::style;
 
-    println!(
-        "{} Running soth network reset...",
-        style::ARROW_RIGHT
-    );
+    println!("{} Running soth network reset...", style::ARROW_RIGHT);
 
     // 1. Disable system proxy. With the signature-based path in
     //    `system::disable`, this works even if the state-file is missing.
@@ -165,7 +162,10 @@ pub async fn run_doctor_reset_network() -> anyhow::Result<()> {
             .status();
         match mdns_status {
             Ok(s) if s.success() => {
-                println!("   {} HUP'd mDNSResponder (system DNS cache cleared)", style::CHECK);
+                println!(
+                    "   {} HUP'd mDNSResponder (system DNS cache cleared)",
+                    style::CHECK
+                );
             }
             _ => {
                 println!(

@@ -328,9 +328,7 @@ async fn supervise_historian(config_path: PathBuf) {
 
         match child.wait().await {
             Ok(status) if status.success() => {
-                info!(
-                    "historian sibling exited cleanly (status 0) — not respawning"
-                );
+                info!("historian sibling exited cleanly (status 0) — not respawning");
                 return;
             }
             Ok(status) => {
@@ -351,8 +349,7 @@ async fn supervise_historian(config_path: PathBuf) {
         .min(MAX_BACKOFF_MS);
         info!(
             backoff_ms = backoff,
-            consecutive_failures,
-            "respawning historian sibling after backoff"
+            consecutive_failures, "respawning historian sibling after backoff"
         );
         tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
@@ -367,8 +364,8 @@ async fn supervise_historian(config_path: PathBuf) {
 /// the same stream as the proxy worker (foreground terminal or
 /// `~/.soth/logs/edge-autostart.log` when daemonized via launchd).
 async fn spawn_historian_process(config_path: &Path) -> Result<Child> {
-    let current_exe = std::env::current_exe()
-        .context("resolve current executable for historian worker")?;
+    let current_exe =
+        std::env::current_exe().context("resolve current executable for historian worker")?;
     let mut cmd = Command::new(current_exe);
     cmd.arg("start").arg("--historian-child");
     cmd.env(HISTORIAN_WORKER_ENV, "1");
@@ -405,9 +402,7 @@ async fn spawn_historian_process(config_path: &Path) -> Result<Child> {
                     // it (rare; happens under restrictive RLIMIT_NICE on
                     // some hosts).
                     let err = std::io::Error::last_os_error();
-                    eprintln!(
-                        "warning: setpriority(+5) failed for historian child: {err}"
-                    );
+                    eprintln!("warning: setpriority(+5) failed for historian child: {err}");
                 }
                 Ok(())
             });
