@@ -122,19 +122,43 @@ pub fn default_codex_hooks_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
 }
 
-/// Default Windsurf hooks file location. Windsurf stores hook config
-/// under `~/.codeium/windsurf/hooks.json` (Codeium's editor namespace).
+/// Default Windsurf hooks file location.
+///
+/// Per-OS resolution:
+/// - macOS / Linux: `~/.codeium/windsurf/hooks.json`
+/// - Windows: `%APPDATA%\Codeium\Windsurf\hooks.json`
+///
+/// Windsurf on Windows uses Codeium's `%APPDATA%`-rooted layout
+/// (verified live at `C:\Users\<user>\AppData\Roaming\Codeium\
+/// Windsurf\`), which differs from the macOS / Linux dotfile
+/// convention.  Without the cfg(windows) branch the install
+/// command would write the hook config to a path the editor
+/// never reads from.  gryph upstream's `agent/windsurf/detect.go`
+/// has the same bug — falls back to the dotfile path on every
+/// OS — and our fix is the upstream fix.
 pub fn default_windsurf_hooks_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join(".codeium")
-            .join("windsurf")
-            .join("hooks.json")
-    })
+    #[cfg(windows)]
+    {
+        // %APPDATA% — config_dir() returns this on Windows
+        // (Roaming AppData per Microsoft KNOWNFOLDERID spec).
+        dirs::config_dir().map(|c| c.join("Codeium").join("Windsurf").join("hooks.json"))
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::home_dir().map(|h| {
+            h.join(".codeium")
+                .join("windsurf")
+                .join("hooks.json")
+        })
+    }
 }
 
 /// Default Pi Agent plugin location. Pi Agent loads extensions from
 /// `~/.pi/agent/extensions/`; the soth-code plugin file lands as
-/// `soth-code.ts` in that directory.
+/// `soth-code.ts` in that directory.  Pi Agent uses the dotfile
+/// convention consistently across macOS / Linux / Windows
+/// (resolves to `%USERPROFILE%\.pi\agent\extensions\` on Windows
+/// via `dirs::home_dir()`), so no per-OS branch needed.
 pub fn default_pi_agent_plugin_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| {
         h.join(".pi")
@@ -144,16 +168,36 @@ pub fn default_pi_agent_plugin_path() -> Option<PathBuf> {
     })
 }
 
-/// Default OpenCode plugin location. OpenCode loads plugins from
-/// `~/.config/opencode/plugins/`; the soth-code plugin file lands as
-/// `soth-code.mjs` (ES module) in that directory.
+/// Default OpenCode plugin location.
+///
+/// Per-OS resolution:
+/// - macOS / Linux: `~/.config/opencode/plugins/soth-code.mjs`
+/// - Windows: `%APPDATA%\opencode\plugins\soth-code.mjs`
+///
+/// OpenCode on Windows explicitly bypasses the XDG /
+/// `~/.config/` convention and forces `%APPDATA%\opencode\`
+/// (verified upstream — see opencode-antigravity-auth issue
+/// #251 / #265 / #295 acknowledging the platform-specific
+/// override).  Without the cfg(windows) branch the install
+/// command would write to `%USERPROFILE%\.config\opencode\
+/// plugins\` which OpenCode does not read on Windows.  gryph
+/// upstream's `agent/opencode/detect.go` also misses this
+/// (single platform-agnostic `~/.config/opencode` constant);
+/// our fix is the upstream fix.
 pub fn default_opencode_plugin_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join(".config")
-            .join("opencode")
-            .join("plugins")
-            .join("soth-code.mjs")
-    })
+    #[cfg(windows)]
+    {
+        dirs::config_dir().map(|c| c.join("opencode").join("plugins").join("soth-code.mjs"))
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::home_dir().map(|h| {
+            h.join(".config")
+                .join("opencode")
+                .join("plugins")
+                .join("soth-code.mjs")
+        })
+    }
 }
 
 /// One row in the auto-detection result — the agent the
@@ -277,14 +321,37 @@ fn agent_present_on_host(agent: &str, settings_path: &Path) -> bool {
     // agent has a stable parent prefix we can test; matching
     // this against the path's components avoids hardcoding a
     // duplicate "where does this agent live" table.
+    //
+    // Per-OS branches for windsurf and opencode mirror the
+    // `default_*_path` functions — Windsurf and OpenCode
+    // both use `%APPDATA%`-rooted layouts on Windows that
+    // differ from the macOS / Linux dotfile / XDG locations.
     let home_dir = match agent {
         "claude_code" => dirs::home_dir().map(|h| h.join(".claude")),
         "cursor" => dirs::home_dir().map(|h| h.join(".cursor")),
         "openai_codex" => dirs::home_dir().map(|h| h.join(".codex")),
         "gemini_cli" => dirs::home_dir().map(|h| h.join(".gemini")),
-        "windsurf" => dirs::home_dir().map(|h| h.join(".codeium").join("windsurf")),
+        "windsurf" => {
+            #[cfg(windows)]
+            {
+                dirs::config_dir().map(|c| c.join("Codeium").join("Windsurf"))
+            }
+            #[cfg(not(windows))]
+            {
+                dirs::home_dir().map(|h| h.join(".codeium").join("windsurf"))
+            }
+        }
         "pi_agent" => dirs::home_dir().map(|h| h.join(".pi")),
-        "opencode" => dirs::home_dir().map(|h| h.join(".config").join("opencode")),
+        "opencode" => {
+            #[cfg(windows)]
+            {
+                dirs::config_dir().map(|c| c.join("opencode"))
+            }
+            #[cfg(not(windows))]
+            {
+                dirs::home_dir().map(|h| h.join(".config").join("opencode"))
+            }
+        }
         _ => None,
     };
     home_dir.map(|d| d.is_dir()).unwrap_or(false)
