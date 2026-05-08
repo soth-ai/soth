@@ -214,6 +214,27 @@ pub struct TailArgs {
     /// Output format.
     #[arg(long, default_value = "compact")]
     pub format: TailFormat,
+
+    /// Filter by agent (e.g. `claude_code`, `cursor`). Repeatable.
+    /// When omitted, all agents pass through.
+    #[arg(long)]
+    pub agent: Vec<String>,
+
+    /// Filter by policy decision (`allow`, `block`, `flag`,
+    /// `redact`, `reroute`). Repeatable.
+    #[arg(long)]
+    pub decision: Vec<String>,
+
+    /// Filter by action type (`command_exec`, `file_read`,
+    /// `file_write`, `tool_use`, …). Repeatable.
+    #[arg(long)]
+    pub action: Vec<String>,
+
+    /// Follow mode: after printing the history, keep polling
+    /// the queue file and stream new rows as they're appended.
+    /// Cancel with Ctrl-C.
+    #[arg(short = 'f', long)]
+    pub follow: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -466,8 +487,8 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
 }
 
 fn run_tail(args: TailArgs) -> Result<()> {
-    let paths = match args.root {
-        Some(root) => CodePaths::from_root(&root),
+    let paths = match &args.root {
+        Some(root) => CodePaths::from_root(root),
         None => CodePaths::from_default_root(),
     };
     let content = match fs::read_to_string(&paths.queue) {
@@ -489,12 +510,91 @@ fn run_tail(args: TailArgs) -> Result<()> {
     };
     let start = lines.len().saturating_sub(take);
     for line in &lines[start..] {
-        match args.format {
-            TailFormat::Json => println!("{line}"),
-            TailFormat::Compact => print_compact(line),
+        if !line_passes_filters(line, &args) {
+            continue;
+        }
+        emit_line(line, args.format);
+    }
+
+    if args.follow {
+        // Poll-based tail follow. The queue is append-only so
+        // tracking byte length is enough to find new content;
+        // truncation (caller wipes the queue) restarts from
+        // the new offset. 200ms polling matches `tail -F`
+        // defaults and keeps CPU at zero when idle.
+        let queue_path = paths.queue.clone();
+        let mut last_size = std::fs::metadata(&queue_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let new_size = match std::fs::metadata(&queue_path) {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+            if new_size <= last_size {
+                if new_size < last_size {
+                    last_size = new_size; // truncated
+                }
+                continue;
+            }
+            // Read the delta and split on newlines. We re-read
+            // the whole file rather than seeking — keeps the
+            // implementation small and the queue file isn't
+            // expected to grow huge between polls.
+            let new_content = match fs::read_to_string(&queue_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for line in new_content[last_size as usize..].lines() {
+                if line.is_empty() || !line_passes_filters(line, &args) {
+                    continue;
+                }
+                emit_line(line, args.format);
+            }
+            last_size = new_size;
         }
     }
     Ok(())
+}
+
+fn emit_line(line: &str, format: TailFormat) {
+    match format {
+        TailFormat::Json => println!("{line}"),
+        TailFormat::Compact => print_compact(line),
+    }
+}
+
+/// Returns true when a queue row passes every active filter.
+/// Empty filter slice = "no constraint on this dimension".
+/// Filters AND together so `--agent claude_code --decision block`
+/// shows only Claude Code Block events.
+fn line_passes_filters(line: &str, args: &TailArgs) -> bool {
+    if args.agent.is_empty() && args.decision.is_empty() && args.action.is_empty() {
+        return true;
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        // Unparseable rows pass through under no-filter, but
+        // get dropped under any filter — there's no way to
+        // know if they match.
+        Err(_) => return false,
+    };
+    let meta = &parsed["event"]["context"]["metadata"];
+    let agent = meta["agent"].as_str().unwrap_or("");
+    let action = meta["action_type"].as_str().unwrap_or("");
+    let decision = parsed["decision"]["kind"]["kind"].as_str().unwrap_or("");
+
+    if !args.agent.is_empty() && !args.agent.iter().any(|a| a == agent) {
+        return false;
+    }
+    if !args.decision.is_empty() && !args.decision.iter().any(|d| d == decision) {
+        return false;
+    }
+    if !args.action.is_empty() && !args.action.iter().any(|x| x == action) {
+        return false;
+    }
+    true
 }
 
 fn print_compact(line: &str) {
