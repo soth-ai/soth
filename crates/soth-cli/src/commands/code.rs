@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -309,35 +309,18 @@ fn run_hook(args: HookArgs) -> Result<()> {
 }
 
 fn run_install(args: InstallArgs) -> Result<()> {
-    let report = match args.target.as_str() {
-        "claude_code" => {
-            let path = resolve_install_path(&args, default_claude_settings_path, "~/.claude/settings.json")?;
-            install_claude_code(&path, None).context("install claude_code hooks")?
-        }
-        "cursor" => {
-            let path = resolve_install_path(&args, default_cursor_hooks_path, "~/.cursor/hooks.json")?;
-            install_cursor(&path, None).context("install cursor hooks")?
-        }
-        "gemini_cli" | "gemini" => {
-            let path = resolve_install_path(&args, default_gemini_settings_path, "~/.gemini/settings.json")?;
-            install_gemini_cli(&path, None).context("install gemini_cli hooks")?
-        }
-        "codex" => {
-            let path = resolve_install_path(&args, default_codex_hooks_path, "~/.codex/hooks.json")?;
-            install_codex(&path, None).context("install codex hooks")?
-        }
-        "windsurf" => {
-            let path = resolve_install_path(&args, default_windsurf_hooks_path, "~/.codeium/windsurf/hooks.json")?;
-            install_windsurf(&path, None).context("install windsurf hooks")?
-        }
-        "pi_agent" | "piagent" => {
-            let path = resolve_install_path(&args, default_pi_agent_plugin_path, "~/.pi/agent/extensions/soth-code.ts")?;
-            install_pi_agent(&path, None).context("install pi_agent plugin")?
-        }
-        "opencode" => {
-            let path = resolve_install_path(&args, default_opencode_plugin_path, "~/.config/opencode/plugins/soth-code.mjs")?;
-            install_opencode(&path, None).context("install opencode plugin")?
-        }
+    // Resolve the canonical adapter name for the state file
+    // (`gemini`/`piagent` aliases collapse to their canonical
+    // form so subsequent doctor / drift checks find the right
+    // entry).
+    let canonical_agent = match args.target.as_str() {
+        "claude_code" => "claude_code",
+        "cursor" => "cursor",
+        "gemini_cli" | "gemini" => "gemini_cli",
+        "codex" => "codex",
+        "windsurf" => "windsurf",
+        "pi_agent" | "piagent" => "pi_agent",
+        "opencode" => "opencode",
         "openclaw" => anyhow::bail!(
             "OpenClaw install is parser-only — the runtime adapter, classify, \
              and policy paths all work, but the upstream hook-config format \
@@ -353,6 +336,59 @@ fn run_install(args: InstallArgs) -> Result<()> {
              auto-install is pending upstream config-format spec."
         ),
     };
+
+    let report = match canonical_agent {
+        "claude_code" => {
+            let path = resolve_install_path(&args, default_claude_settings_path, "~/.claude/settings.json")?;
+            install_claude_code(&path, None).context("install claude_code hooks")?
+        }
+        "cursor" => {
+            let path = resolve_install_path(&args, default_cursor_hooks_path, "~/.cursor/hooks.json")?;
+            install_cursor(&path, None).context("install cursor hooks")?
+        }
+        "gemini_cli" => {
+            let path = resolve_install_path(&args, default_gemini_settings_path, "~/.gemini/settings.json")?;
+            install_gemini_cli(&path, None).context("install gemini_cli hooks")?
+        }
+        "codex" => {
+            let path = resolve_install_path(&args, default_codex_hooks_path, "~/.codex/hooks.json")?;
+            install_codex(&path, None).context("install codex hooks")?
+        }
+        "windsurf" => {
+            let path = resolve_install_path(&args, default_windsurf_hooks_path, "~/.codeium/windsurf/hooks.json")?;
+            install_windsurf(&path, None).context("install windsurf hooks")?
+        }
+        "pi_agent" => {
+            let path = resolve_install_path(&args, default_pi_agent_plugin_path, "~/.pi/agent/extensions/soth-code.ts")?;
+            install_pi_agent(&path, None).context("install pi_agent plugin")?
+        }
+        "opencode" => {
+            let path = resolve_install_path(&args, default_opencode_plugin_path, "~/.config/opencode/plugins/soth-code.mjs")?;
+            install_opencode(&path, None).context("install opencode plugin")?
+        }
+        // canonical_agent is exhaustively pre-validated above.
+        _ => unreachable!("canonical_agent must be one of the dispatched values"),
+    };
+
+    // Record the install in ~/.soth/installed.json so doctor /
+    // drift detection / `soth up`'s next run all see this
+    // agent as wired.  Without this, only `soth up`'s
+    // auto-install would update state — operators using the
+    // direct `soth code install` path would leave state and
+    // on-disk reality silently out of sync.
+    if let Err(e) = update_state_after_install(
+        canonical_agent,
+        &report.settings_path,
+        &report.binary_path,
+    ) {
+        // State is a fast-path cache; a write failure here
+        // doesn't undo the install or fail the command.
+        // Operators see a WARN; the install itself still
+        // succeeded and the on-disk settings file is the
+        // source of truth.
+        tracing::warn!(error = %format!("{e:#}"), "soth code install: state file update failed");
+    }
+
     println!("settings: {}", report.settings_path.display());
     if let Some(bak) = &report.backup_path {
         println!("backup:   {}", bak.display());
@@ -365,6 +401,37 @@ fn run_install(args: InstallArgs) -> Result<()> {
         println!("already:  {}", report.hooks_already_present.join(", "));
     }
     Ok(())
+}
+
+/// Persist a successful install to `~/.soth/installed.json`.
+/// Best-effort: the state file is a fast-path cache for
+/// drift detection, not the source of truth (the agent's
+/// own settings file is).  When the load itself fails (e.g.
+/// corrupted JSON), we fall back to a fresh state rather
+/// than blocking the install on a stale-cache problem.
+fn update_state_after_install(
+    agent: &str,
+    settings_path: &Path,
+    binary_path: &Path,
+) -> Result<()> {
+    use soth_code::state::InstalledHostState;
+    let state_path = InstalledHostState::default_path()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve ~/.soth/installed.json"))?;
+    let mut state = InstalledHostState::load(&state_path).unwrap_or_default();
+    state.record_install(agent, settings_path.to_path_buf(), binary_path.to_path_buf());
+    state.save(&state_path)
+}
+
+/// Same as `update_state_after_install` but for the uninstall
+/// path — removes the agent's entry so doctor and the next
+/// `soth up` see it as no-longer-governed.
+fn update_state_after_uninstall(agent: &str) -> Result<()> {
+    use soth_code::state::InstalledHostState;
+    let state_path = InstalledHostState::default_path()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve ~/.soth/installed.json"))?;
+    let mut state = InstalledHostState::load(&state_path).unwrap_or_default();
+    state.record_uninstall(agent);
+    state.save(&state_path)
 }
 
 fn run_uninstall(args: UninstallArgs) -> Result<()> {
@@ -406,15 +473,45 @@ fn run_uninstall(args: UninstallArgs) -> Result<()> {
         println!("nothing to uninstall — {} does not exist", path.display());
         return Ok(());
     }
-    match kind {
-        UninstallKind::ClaudeCode => uninstall_claude_code(&path).context("uninstall claude_code hooks")?,
-        UninstallKind::Cursor => uninstall_cursor(&path).context("uninstall cursor hooks")?,
-        UninstallKind::Gemini => uninstall_gemini_cli(&path).context("uninstall gemini_cli hooks")?,
-        UninstallKind::Codex => uninstall_codex(&path).context("uninstall codex hooks")?,
-        UninstallKind::Windsurf => uninstall_windsurf(&path).context("uninstall windsurf hooks")?,
-        UninstallKind::PiAgent => uninstall_pi_agent(&path).context("uninstall pi_agent plugin")?,
-        UninstallKind::OpenCode => uninstall_opencode(&path).context("uninstall opencode plugin")?,
+    let canonical_agent = match kind {
+        UninstallKind::ClaudeCode => {
+            uninstall_claude_code(&path).context("uninstall claude_code hooks")?;
+            "claude_code"
+        }
+        UninstallKind::Cursor => {
+            uninstall_cursor(&path).context("uninstall cursor hooks")?;
+            "cursor"
+        }
+        UninstallKind::Gemini => {
+            uninstall_gemini_cli(&path).context("uninstall gemini_cli hooks")?;
+            "gemini_cli"
+        }
+        UninstallKind::Codex => {
+            uninstall_codex(&path).context("uninstall codex hooks")?;
+            "codex"
+        }
+        UninstallKind::Windsurf => {
+            uninstall_windsurf(&path).context("uninstall windsurf hooks")?;
+            "windsurf"
+        }
+        UninstallKind::PiAgent => {
+            uninstall_pi_agent(&path).context("uninstall pi_agent plugin")?;
+            "pi_agent"
+        }
+        UninstallKind::OpenCode => {
+            uninstall_opencode(&path).context("uninstall opencode plugin")?;
+            "opencode"
+        }
+    };
+
+    // State file: drop the agent's record so doctor / drift
+    // checks / next `soth up` all see the agent as no-longer-
+    // governed.  Best-effort — uninstall succeeds even if the
+    // state-file write fails.
+    if let Err(e) = update_state_after_uninstall(canonical_agent) {
+        tracing::warn!(error = %format!("{e:#}"), "soth code uninstall: state file update failed");
     }
+
     println!("settings: {}", path.display());
     println!("removed soth-managed hook entries");
     Ok(())
