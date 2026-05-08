@@ -232,6 +232,7 @@ fn parse_conversation_json(
             content: text,
             timestamp: ts,
             token_estimate,
+            usage: None,
         });
     }
 

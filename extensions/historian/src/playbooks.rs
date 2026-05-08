@@ -123,7 +123,25 @@ fn claude_code() -> Playbook {
                 session_start_field: None,
                 session_end_field: None,
             },
-            tokens: None,
+            // Claude Code's session log carries the full
+            // Anthropic-style usage block per assistant turn at
+            // `message.usage.{input,output,cache_creation_input,
+            // cache_read_input}_tokens`.  Extract all four for
+            // billing-grade reconstruction in §10.11 bypass mode.
+            // Verified 2026-05-08 against real session logs at
+            // ~/.claude/projects/.../*.jsonl.
+            tokens: Some(TokenConfig {
+                field: None,
+                input_tokens_field: Some("message.usage.input_tokens".into()),
+                output_tokens_field: Some("message.usage.output_tokens".into()),
+                cache_creation_input_tokens_field: Some(
+                    "message.usage.cache_creation_input_tokens".into(),
+                ),
+                cache_read_input_tokens_field: Some(
+                    "message.usage.cache_read_input_tokens".into(),
+                ),
+                total_tokens_field: None,
+            }),
         },
     }
 }
@@ -172,9 +190,16 @@ fn gemini_cli() -> Playbook {
                 session_start_field: Some("startTime".into()),
                 session_end_field: Some("lastUpdated".into()),
             },
-            tokens: Some(TokenConfig {
-                field: "tokens.total".into(),
-            }),
+            // Gemini's session log carries a single scalar
+            // total — not billing-grade per Anthropic-style
+            // input/output/cache breakdown.  The playbook
+            // surfaces it through `total_tokens_field` so
+            // downstream code can still use it as a coarse
+            // signal, but `is_billing_grade()` returns false
+            // and the §10.11 audit gate stays closed for
+            // gemini_cli until upstream starts emitting per-
+            // direction counts.
+            tokens: Some(TokenConfig::from_total_field("tokens.total")),
         },
     }
 }

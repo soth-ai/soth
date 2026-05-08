@@ -365,12 +365,14 @@ fn read_kv_sessions(
                     .or(session_ts);
 
                     let token_estimate = extract_tokens(&record_doc, &extraction.tokens, &text);
+                    let usage = super::extract_token_usage(&record_doc, &extraction.tokens);
 
                     messages.push(HistoricalMessage {
                         role,
                         content: text,
                         timestamp: ts,
                         token_estimate,
+                        usage,
                     });
                 }
             }
@@ -398,12 +400,14 @@ fn read_kv_sessions(
                 .or(session_ts);
 
                 let token_estimate = extract_tokens(record, &extraction.tokens, &text);
+                let usage = super::extract_token_usage(record, &extraction.tokens);
 
                 messages.push(HistoricalMessage {
                     role,
                     content: text,
                     timestamp: ts,
                     token_estimate,
+                    usage,
                 });
             }
         }

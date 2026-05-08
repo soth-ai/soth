@@ -204,6 +204,7 @@ fn parse_session(
                             content: text.clone(),
                             timestamp: ts,
                             token_estimate: estimate_tokens(&text),
+                            usage: None,
                         });
                     }
                     continue;
@@ -247,6 +248,7 @@ fn parse_session(
             content: text,
             timestamp: ts,
             token_estimate,
+            usage: None,
         });
     }
 

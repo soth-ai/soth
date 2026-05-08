@@ -277,6 +277,7 @@ fn parse_session_jsonl(
             content: text,
             timestamp: ts,
             token_estimate,
+            usage: None,
         });
     }
 
@@ -383,6 +384,7 @@ fn parse_history_jsonl(
                 content: entry.text.clone(),
                 timestamp: Some(ts_ms),
                 token_estimate,
+                usage: None,
             });
         }
 

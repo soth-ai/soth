@@ -202,19 +202,76 @@ pub fn parse_timestamp(
 }
 
 /// Extract token count from a record if token config is set.
+///
+/// Back-compat shim: returns the scalar token estimate that the
+/// engines have always used for `HistoricalMessage.token_estimate`.
+/// Internally calls `extract_token_usage` and reduces the
+/// structured shape to a single number — preferring (input +
+/// output) when the playbook declares both, otherwise the
+/// scalar `total`, otherwise the heuristic estimate from
+/// content text.
 pub fn extract_tokens(
     record: &serde_json::Value,
     config: &Option<TokenConfig>,
     content: &str,
 ) -> u32 {
-    if let Some(tc) = config {
-        if let Some(v) = resolve_path(record, &tc.field) {
-            if let Some(n) = v.as_u64() {
-                return n as u32;
-            }
-        }
+    let usage = extract_token_usage(record, config);
+    match (
+        usage.as_ref().and_then(|u| u.input_tokens),
+        usage.as_ref().and_then(|u| u.output_tokens),
+        usage.as_ref().and_then(|u| u.total_tokens),
+    ) {
+        (Some(i), Some(o), _) => i.saturating_add(o),
+        (_, _, Some(t)) => t,
+        _ => estimate_tokens(content),
     }
-    estimate_tokens(content)
+}
+
+/// Extract structured per-turn token usage from a source record.
+/// Returns `None` when the playbook hasn't declared any token
+/// paths.  Returns `Some(MessageTokenUsage)` when at least one
+/// path resolved — sub-fields the playbook didn't set or that
+/// the source record didn't carry stay `None`.
+///
+/// The legacy `TokenConfig.field` (a single scalar dot-path) is
+/// honored as `total_tokens` so already-shipped playbooks keep
+/// producing the same number.
+pub fn extract_token_usage(
+    record: &serde_json::Value,
+    config: &Option<TokenConfig>,
+) -> Option<crate::types::MessageTokenUsage> {
+    let tc = config.as_ref()?;
+    if !tc.has_any_field() {
+        return None;
+    }
+    let pull = |path: &Option<String>| -> Option<u32> {
+        path.as_ref()
+            .and_then(|p| resolve_path(record, p))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(u32::MAX as u64) as u32)
+    };
+    let input_tokens = pull(&tc.input_tokens_field);
+    let output_tokens = pull(&tc.output_tokens_field);
+    let cache_creation_input_tokens = pull(&tc.cache_creation_input_tokens_field);
+    let cache_read_input_tokens = pull(&tc.cache_read_input_tokens_field);
+    // Total: prefer explicit total_tokens_field, fall back to the
+    // legacy `field` for back-compat with old playbooks.
+    let total_tokens = pull(&tc.total_tokens_field).or_else(|| pull(&tc.field));
+    let usage = crate::types::MessageTokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        total_tokens,
+    };
+    if usage == crate::types::MessageTokenUsage::default() {
+        // Playbook declared paths but nothing resolved on this
+        // record — return None so the back-compat estimator
+        // falls back to text-length estimation.
+        None
+    } else {
+        Some(usage)
+    }
 }
 
 /// Parse ISO 8601 / RFC 3339 timestamps to epoch milliseconds.

@@ -170,12 +170,14 @@ fn parse_json_file(
         }
 
         let token_estimate = extract_tokens(record, &extraction.tokens, &text);
+        let usage = super::extract_token_usage(record, &extraction.tokens);
 
         messages.push(HistoricalMessage {
             role,
             content: text,
             timestamp: ts,
             token_estimate,
+            usage,
         });
     }
 
@@ -377,9 +379,7 @@ mod tests {
                     session_start_field: Some("startTime".into()),
                     session_end_field: Some("lastUpdated".into()),
                 },
-                tokens: Some(TokenConfig {
-                    field: "tokens.total".into(),
-                }),
+                tokens: Some(TokenConfig::from_total_field("tokens.total")),
             },
         }
     }
