@@ -605,29 +605,112 @@ pub struct HistorianExtensionConfig {
 }
 
 fn default_historian_adapters() -> BTreeMap<String, HistorianAdapterAudit> {
+    // Sample-run audit performed 2026-05-08 against real session
+    // logs on a developer host (Claude Code + Cursor + Codex
+    // available locally; Gemini CLI / OpenClaw / Pi Agent /
+    // Windsurf / OpenCode unavailable).  Findings:
+    //
+    //   claude_code  source has rich `message.usage` (input,
+    //                output, cache_creation_input,
+    //                cache_read_input) — billing-grade — but
+    //                the historian playbook has `tokens: None`,
+    //                so the data is NOT extracted.  Plan §9's
+    //                "claude_code is audited" was based on
+    //                content extraction, not usage extraction.
+    //                Playbook update required before this
+    //                verdict can flip true.
+    //
+    //   cursor       sample of 123 chat rows had 0 `input_tokens`
+    //                in composerData and 1 in bubbleId — Cursor
+    //                does not record per-turn usage in its
+    //                chat storage at all.  No playbook fix can
+    //                recover what isn't there.
+    //
+    //   openai_codex source has token info at
+    //                `payload.info.total_token_usage.{input,output,
+    //                total}_tokens` BUT only on `type:event_msg`
+    //                lines.  The current playbook filters
+    //                `type:response_item` only, so event_msg
+    //                token data is dropped.  Fix: include
+    //                event_msg in the filter + structured token
+    //                extraction (TokenConfig today supports a
+    //                single scalar field — needs extension to
+    //                multi-field for billing-grade data).
+    //
+    //   gemini_cli   no local data on this audit host. Playbook
+    //                declares `tokens.total` (scalar). Even when
+    //                it works, this is single-total only — not
+    //                billing-grade per Anthropic-style usage.
+    //                Verdict deferred pending real session log.
+    //
+    //   openclaw     no local data. tokens=None in playbook.
+    //
+    //   pi_agent / windsurf / opencode  NO historian playbook
+    //                exists at all.  Cannot be audited until a
+    //                playbook lands.
+    //
+    // Net: NO agent currently passes the audit.  The defaults
+    // below reflect that.  Operators who need bypass mode
+    // before the engineering work is done can hand-flip a
+    // verdict in soth.yaml — `audited_at` carries who-and-when
+    // attribution if they do.
+
     let mut adapters = BTreeMap::new();
     adapters.insert(
         "claude_code".to_string(),
         HistorianAdapterAudit {
-            usage_coverage_audited: true,
-            audited_at: Some("2026-04 (plan §9)".to_string()),
-            caveats: None,
+            usage_coverage_audited: false,
+            audited_at: Some("2026-05-08 desk+sample audit".to_string()),
+            caveats: Some(
+                "source has full message.usage block; playbook tokens=None — \
+                 needs playbook update to extract before bypass is safe"
+                    .to_string(),
+            ),
         },
     );
-    for agent in [
-        "cursor",
-        "openai_codex",
-        "gemini_cli",
-        "pi_agent",
-        "windsurf",
-        "opencode",
-    ] {
+    adapters.insert(
+        "cursor".to_string(),
+        HistorianAdapterAudit {
+            usage_coverage_audited: false,
+            audited_at: Some("2026-05-08 sample audit".to_string()),
+            caveats: Some(
+                "Cursor does not record per-turn usage in chat storage \
+                 (state.vscdb composerData/bubbleId) — nothing to extract"
+                    .to_string(),
+            ),
+        },
+    );
+    adapters.insert(
+        "openai_codex".to_string(),
+        HistorianAdapterAudit {
+            usage_coverage_audited: false,
+            audited_at: Some("2026-05-08 sample audit".to_string()),
+            caveats: Some(
+                "source has payload.info.{total,last}_token_usage but only \
+                 on type:event_msg lines; playbook filter excludes those"
+                    .to_string(),
+            ),
+        },
+    );
+    adapters.insert(
+        "gemini_cli".to_string(),
+        HistorianAdapterAudit {
+            usage_coverage_audited: false,
+            audited_at: Some("2026-05-08 desk audit (no local data)".to_string()),
+            caveats: Some(
+                "playbook declares tokens.total (scalar) — not billing-grade \
+                 per-turn structured usage"
+                    .to_string(),
+            ),
+        },
+    );
+    for agent in ["pi_agent", "windsurf", "opencode"] {
         adapters.insert(
             agent.to_string(),
             HistorianAdapterAudit {
                 usage_coverage_audited: false,
-                audited_at: None,
-                caveats: None,
+                audited_at: Some("2026-05-08 desk audit".to_string()),
+                caveats: Some("no historian playbook exists for this agent yet".to_string()),
             },
         );
     }
@@ -1089,15 +1172,19 @@ forward_proxy:
     }
 
     #[test]
-    fn historian_audit_defaults_only_claude_code_true() {
-        // Pin the per-agent verdict shape: Claude Code is
-        // audited (plan §9 confirmation), every other supported
-        // adapter ships `false` so the proxy bypass-eligibility
-        // filter cannot accidentally honor a misconfigured knob
-        // before the per-agent audit work happens.
+    fn historian_audit_defaults_all_false_post_2026_05_audit() {
+        // Audit performed 2026-05-08 against real local session
+        // logs flipped *every* agent including claude_code to
+        // `false`. The plan §9 verdict that "claude_code is
+        // audited" was based on content extraction; the
+        // historian playbook for claude_code does not actually
+        // extract `message.usage` (tokens=None).  Pin the
+        // post-audit reality so any future code that flips a
+        // verdict to true is paired with the playbook update
+        // that earned the flip.
         let h = HistorianExtensionConfig::default();
-        assert!(h.is_usage_coverage_audited("claude_code"));
-        for unaudited in [
+        for agent in [
+            "claude_code",
             "cursor",
             "openai_codex",
             "gemini_cli",
@@ -1106,58 +1193,58 @@ forward_proxy:
             "opencode",
         ] {
             assert!(
-                !h.is_usage_coverage_audited(unaudited),
-                "{unaudited} must default to not-audited until plan §9 audit completes"
+                !h.is_usage_coverage_audited(agent),
+                "{agent} default verdict must be false post-2026-05-08 audit"
             );
         }
-        // Unknown agents (not in the map) — also "not audited".
-        // Default-deny rather than default-allow.
+        // Unknown agents — also "not audited".  Default-deny.
         assert!(!h.is_usage_coverage_audited("unknown_future_agent"));
     }
 
     #[test]
-    fn audited_bypass_filters_unaudited_agents_with_warn_signal() {
-        // Operator wires both audited and unaudited agents into
-        // forward_proxy.bypass_agents — the filter must split:
-        // audited ones flow through to the runtime, unaudited
-        // ones land in the `dropped` slice for caller-side WARN
-        // logging.  Silent acceptance would let an operator
-        // believe bypass is engaged when in fact the proxy is
-        // still doing full inspection.
+    fn audited_bypass_filters_everything_at_default() {
+        // With every agent's audit at false (post-2026-05-08
+        // verdict), the filter must drop EVERY entry in the
+        // bypass list.  Operator who wires this up gets every
+        // pattern WARN-flagged so they know bypass isn't
+        // actually engaging.
         let mut proxy = ForwardProxyConfig::default();
         proxy.bypass_agents = vec![
-            "claude-cli/*".to_string(),       // audited — passes
-            "cursor/*".to_string(),           // unaudited — dropped
-            "windsurf-extension/*".to_string(), // unaudited — dropped
+            "claude-cli/*".to_string(),
+            "cursor/*".to_string(),
+            "windsurf-extension/*".to_string(),
         ];
         let historian = HistorianExtensionConfig::default();
         let (allowed, dropped) = proxy.audited_bypass_agents(&historian);
-        assert_eq!(allowed, vec!["claude-cli/*"]);
-        assert_eq!(dropped.len(), 2);
-        assert!(dropped.contains(&"cursor/*".to_string()));
-        assert!(dropped.contains(&"windsurf-extension/*".to_string()));
+        assert!(
+            allowed.is_empty(),
+            "no agent passes audit at default verdicts; got allowed={allowed:?}"
+        );
+        assert_eq!(dropped.len(), 3);
     }
 
     #[test]
-    fn audited_bypass_honors_runtime_audit_flip() {
-        // The audit happens when an engineer manually flips a
-        // bool — the next process boot should immediately honor
-        // the new verdict without any code change.  Confirm the
-        // filter reads through the map, not a frozen snapshot.
+    fn audited_bypass_passes_when_operator_flips_verdict() {
+        // Operators whose engineering work has earned a flip
+        // can manually set the verdict in soth.yaml. Pin that
+        // flow: a hand-flipped claude_code verdict makes
+        // claude-cli/* pass the filter even though the default
+        // is false.  This is the "I did the audit, here's the
+        // evidence" path.
         let mut proxy = ForwardProxyConfig::default();
-        proxy.bypass_agents = vec!["cursor/*".to_string()];
+        proxy.bypass_agents = vec!["claude-cli/*".to_string()];
         let mut historian = HistorianExtensionConfig::default();
-        // Flip Cursor's audit verdict.
         historian.adapters.insert(
-            "cursor".to_string(),
+            "claude_code".to_string(),
             HistorianAdapterAudit {
                 usage_coverage_audited: true,
-                audited_at: Some("2026-05-08 manual sample".to_string()),
+                audited_at: Some("2026-06-01 manual after playbook fix".to_string()),
                 caveats: None,
             },
         );
         let (allowed, dropped) = proxy.audited_bypass_agents(&historian);
-        assert_eq!(allowed, vec!["cursor/*"]);
+        assert_eq!(allowed, vec!["claude-cli/*"]);
         assert!(dropped.is_empty());
     }
+
 }
