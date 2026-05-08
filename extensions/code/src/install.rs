@@ -104,6 +104,29 @@ pub fn default_cursor_hooks_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".cursor").join("hooks.json"))
 }
 
+/// Default Gemini CLI settings file location. Gemini embeds hooks
+/// inside `~/.gemini/settings.json` (mirroring Claude Code's pattern).
+pub fn default_gemini_settings_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".gemini").join("settings.json"))
+}
+
+/// Default Codex hooks file location. Codex uses a dedicated
+/// `~/.codex/hooks.json` file separate from any larger settings doc
+/// (per gryph `agent/codex/detect.go::HooksPath`).
+pub fn default_codex_hooks_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
+}
+
+/// Default Windsurf hooks file location. Windsurf stores hook config
+/// under `~/.codeium/windsurf/hooks.json` (Codeium's editor namespace).
+pub fn default_windsurf_hooks_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".codeium")
+            .join("windsurf")
+            .join("hooks.json")
+    })
+}
+
 /// Install the soth-code hook into Claude Code's `settings.json`.
 ///
 /// `settings_path` must be the absolute path to the settings file —
@@ -207,6 +230,49 @@ pub fn install_claude_code(
         binary_path,
     })
 }
+
+/// Gemini CLI's hook events. Upstream uses PascalCase (`BeforeTool`,
+/// `AfterTool`, `SessionStart`); we normalize to snake_case for the
+/// soth-code CLI surface uniform across agents. The 5 hook types
+/// gryph installs (slim set — Gemini's hook protocol is younger than
+/// Claude Code's).
+const GEMINI_HOOK_TYPES: &[(&str, &str)] = &[
+    ("BeforeTool", "before_tool_call"),
+    ("AfterTool", "after_tool_call"),
+    ("SessionStart", "session_start"),
+    ("SessionEnd", "session_end"),
+    ("Notification", "notification"),
+];
+
+/// Codex's 5 canonical hook events (rust-codex 0.114.0). Upstream
+/// PascalCase, normalized to snake_case at install. Alpha-gated —
+/// Codex's protocol is the youngest of all agents we support.
+const CODEX_HOOK_TYPES: &[(&str, &str)] = &[
+    ("SessionStart", "session_start"),
+    ("PreToolUse", "pre_tool_use"),
+    ("PostToolUse", "post_tool_use"),
+    ("UserPromptSubmit", "user_prompt_submit"),
+    ("Stop", "stop"),
+];
+
+/// Windsurf's hook events. Already snake_case upstream — install
+/// passes through identically. 11 hook types covering pre/post for
+/// each tool surface (read_code, write_code, run_command, mcp,
+/// user_prompt) plus `post_cascade_response` and `post_setup_worktree`
+/// lifecycle hooks.
+const WINDSURF_HOOK_TYPES: &[(&str, &str)] = &[
+    ("pre_read_code", "pre_read_code"),
+    ("post_read_code", "post_read_code"),
+    ("pre_write_code", "pre_write_code"),
+    ("post_write_code", "post_write_code"),
+    ("pre_run_command", "pre_run_command"),
+    ("post_run_command", "post_run_command"),
+    ("pre_mcp_tool_use", "pre_mcp_tool_use"),
+    ("post_mcp_tool_use", "post_mcp_tool_use"),
+    ("pre_user_prompt", "pre_user_prompt"),
+    ("post_cascade_response", "post_cascade_response"),
+    ("post_setup_worktree", "post_setup_worktree"),
+];
 
 /// Cursor's hook event names paired with the snake_case form passed
 /// to the soth-code subprocess via `--type`. Cursor uses camelCase
@@ -387,8 +453,361 @@ pub fn uninstall_cursor(hooks_path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// Install soth-code hooks into Gemini CLI's `~/.gemini/settings.json`.
+/// Same nested-matcher shape Claude Code uses — gryph's
+/// `agent/gemini/hooks.go` confirms `HookMatcher{matcher, hooks:[{type,command}]}`
+/// is the wire form Gemini accepts. Reuses the Claude Code helper to
+/// minimize divergent install paths.
+pub fn install_gemini_cli(
+    settings_path: &Path,
+    binary_path_override: Option<PathBuf>,
+) -> Result<InstallReport, InstallError> {
+    install_matcher_style(
+        settings_path,
+        binary_path_override,
+        "gemini_cli",
+        GEMINI_HOOK_TYPES,
+    )
+}
+
+/// Uninstall soth-code's gemini_cli hook entries. Drops only entries
+/// carrying `_soth_managed`; user-authored hooks preserved.
+pub fn uninstall_gemini_cli(settings_path: &Path) -> Result<(), InstallError> {
+    uninstall_matcher_style(settings_path)
+}
+
+/// Install soth-code hooks into Codex's `~/.codex/hooks.json`.
+/// Alpha-gated — Codex's hook protocol is the youngest of all
+/// supported agents.
+pub fn install_codex(
+    hooks_path: &Path,
+    binary_path_override: Option<PathBuf>,
+) -> Result<InstallReport, InstallError> {
+    install_matcher_style(
+        hooks_path,
+        binary_path_override,
+        "codex",
+        CODEX_HOOK_TYPES,
+    )
+}
+
+pub fn uninstall_codex(hooks_path: &Path) -> Result<(), InstallError> {
+    uninstall_matcher_style(hooks_path)
+}
+
+/// Install soth-code hooks into Windsurf's
+/// `~/.codeium/windsurf/hooks.json`. Cursor-style flat shape per
+/// gryph `agent/windsurf/hooks.go`.
+pub fn install_windsurf(
+    hooks_path: &Path,
+    binary_path_override: Option<PathBuf>,
+) -> Result<InstallReport, InstallError> {
+    install_flat_style(
+        hooks_path,
+        binary_path_override,
+        "windsurf",
+        WINDSURF_HOOK_TYPES,
+    )
+}
+
+pub fn uninstall_windsurf(hooks_path: &Path) -> Result<(), InstallError> {
+    uninstall_flat_style(hooks_path)
+}
+
+/// Generic install for matcher-style hook configs (Claude Code, Gemini,
+/// Codex). The settings doc has a top-level `hooks` map of
+/// `<event_name> → [{matcher, hooks: [{type, command}]}]`. Each
+/// per-agent install function delegates here with its hook-type table
+/// and agent name.
+fn install_matcher_style(
+    settings_path: &Path,
+    binary_path_override: Option<PathBuf>,
+    agent: &str,
+    hook_types: &[(&str, &str)],
+) -> Result<InstallReport, InstallError> {
+    let binary_path = match binary_path_override {
+        Some(p) => p,
+        None => std::env::current_exe().map_err(InstallError::NoBinary)?,
+    };
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| InstallError::Mkdir {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    let original_content = read_settings_or_empty(settings_path)?;
+    let mut settings: Value = if original_content.trim().is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(&original_content).map_err(|e| InstallError::Malformed {
+            path: settings_path.to_path_buf(),
+            source: e,
+        })?
+    };
+    if !settings.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(&settings),
+        });
+    }
+    let backup_path = if settings_path.exists() && !original_content.is_empty() {
+        let bak = settings_path.with_extension("json.bak");
+        write_atomic(&bak, original_content.as_bytes())?;
+        Some(bak)
+    } else {
+        None
+    };
+
+    let mut hooks_added = Vec::new();
+    let mut hooks_already_present = Vec::new();
+    let hooks_obj = settings
+        .as_object_mut()
+        .expect("checked")
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !hooks_obj.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(hooks_obj),
+        });
+    }
+
+    for (upstream_event, soth_hook_type) in hook_types {
+        let added = ensure_matcher_entry(hooks_obj, upstream_event, agent, soth_hook_type, &binary_path);
+        if added {
+            hooks_added.push((*upstream_event).to_string());
+        } else {
+            hooks_already_present.push((*upstream_event).to_string());
+        }
+    }
+
+    let updated = serde_json::to_string_pretty(&settings)?;
+    write_atomic(settings_path, updated.as_bytes())?;
+    let written = fs::read_to_string(settings_path).map_err(|e| InstallError::Read {
+        path: settings_path.to_path_buf(),
+        source: e,
+    })?;
+    serde_json::from_str::<Value>(&written).map_err(|e| InstallError::Malformed {
+        path: settings_path.to_path_buf(),
+        source: e,
+    })?;
+
+    Ok(InstallReport {
+        settings_path: settings_path.to_path_buf(),
+        backup_path,
+        hooks_added,
+        hooks_already_present,
+        binary_path,
+    })
+}
+
+fn ensure_matcher_entry(
+    hooks: &mut Value,
+    upstream_event: &str,
+    agent: &str,
+    soth_hook_type: &str,
+    binary_path: &Path,
+) -> bool {
+    let hooks_map = hooks.as_object_mut().unwrap();
+    let entries = hooks_map
+        .entry(upstream_event)
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let arr = match entries.as_array_mut() {
+        Some(a) => a,
+        None => {
+            *entries = Value::Array(vec![entries.clone()]);
+            entries.as_array_mut().unwrap()
+        }
+    };
+    if arr.iter().any(is_soth_managed) {
+        return false;
+    }
+    arr.push(json!({
+        SOTH_MARKER_KEY: true,
+        "matcher": ".*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": format!(
+                    "{} code hook --agent {} --type {}",
+                    binary_path.display(),
+                    agent,
+                    soth_hook_type
+                )
+            }
+        ]
+    }));
+    true
+}
+
+fn uninstall_matcher_style(settings_path: &Path) -> Result<(), InstallError> {
+    // Same shape as uninstall_claude_code's hook removal — extracted
+    // here so the matcher-style installs (Claude Code, Gemini, Codex)
+    // share the cleanup path.
+    let content = read_settings_or_empty(settings_path)?;
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    let mut settings: Value = serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
+        path: settings_path.to_path_buf(),
+        source: e,
+    })?;
+    if !settings.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(&settings),
+        });
+    }
+    if let Some(hooks) = settings
+        .as_object_mut()
+        .and_then(|root| root.get_mut("hooks"))
+        .and_then(Value::as_object_mut)
+    {
+        for (_, group) in hooks.iter_mut() {
+            if let Some(arr) = group.as_array_mut() {
+                arr.retain(|entry| !is_soth_managed(entry));
+            }
+        }
+        let all_empty = hooks
+            .iter()
+            .all(|(_, v)| v.as_array().map(|a| a.is_empty()).unwrap_or(false));
+        if all_empty {
+            settings.as_object_mut().unwrap().remove("hooks");
+        }
+    }
+    write_atomic(settings_path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
+    Ok(())
+}
+
+/// Generic install for flat-style hook configs (Cursor, Windsurf).
+/// The settings doc has a top-level `hooks` map of
+/// `<event_name> → [{command}]` with no inner matcher level.
+fn install_flat_style(
+    hooks_path: &Path,
+    binary_path_override: Option<PathBuf>,
+    agent: &str,
+    hook_types: &[(&str, &str)],
+) -> Result<InstallReport, InstallError> {
+    let binary_path = match binary_path_override {
+        Some(p) => p,
+        None => std::env::current_exe().map_err(InstallError::NoBinary)?,
+    };
+    if let Some(parent) = hooks_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| InstallError::Mkdir {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    let original_content = read_settings_or_empty(hooks_path)?;
+    let mut doc: Value = if original_content.trim().is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(&original_content).map_err(|e| InstallError::Malformed {
+            path: hooks_path.to_path_buf(),
+            source: e,
+        })?
+    };
+    if !doc.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(&doc),
+        });
+    }
+    let backup_path = if hooks_path.exists() && !original_content.is_empty() {
+        let bak = hooks_path.with_extension("json.bak");
+        write_atomic(&bak, original_content.as_bytes())?;
+        Some(bak)
+    } else {
+        None
+    };
+
+    // Cursor uses a top-level `version` field; Windsurf does not.
+    // Add it for Cursor-shape parity when the agent is "cursor"; skip
+    // for Windsurf since the upstream doesn't write it.
+    if agent == "cursor" {
+        doc.as_object_mut()
+            .expect("checked")
+            .entry("version")
+            .or_insert_with(|| Value::Number(1.into()));
+    }
+
+    let hooks_obj = doc
+        .as_object_mut()
+        .expect("checked")
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !hooks_obj.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(hooks_obj),
+        });
+    }
+
+    let mut hooks_added = Vec::new();
+    let mut hooks_already_present = Vec::new();
+    for (upstream_event, soth_hook_type) in hook_types {
+        let added = ensure_cursor_hook_entry(hooks_obj, upstream_event, soth_hook_type, agent, &binary_path);
+        if added {
+            hooks_added.push((*upstream_event).to_string());
+        } else {
+            hooks_already_present.push((*upstream_event).to_string());
+        }
+    }
+
+    let updated = serde_json::to_string_pretty(&doc)?;
+    write_atomic(hooks_path, updated.as_bytes())?;
+    let written = fs::read_to_string(hooks_path).map_err(|e| InstallError::Read {
+        path: hooks_path.to_path_buf(),
+        source: e,
+    })?;
+    serde_json::from_str::<Value>(&written).map_err(|e| InstallError::Malformed {
+        path: hooks_path.to_path_buf(),
+        source: e,
+    })?;
+
+    Ok(InstallReport {
+        settings_path: hooks_path.to_path_buf(),
+        backup_path,
+        hooks_added,
+        hooks_already_present,
+        binary_path,
+    })
+}
+
+fn uninstall_flat_style(hooks_path: &Path) -> Result<(), InstallError> {
+    let content = read_settings_or_empty(hooks_path)?;
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    let mut doc: Value = serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
+        path: hooks_path.to_path_buf(),
+        source: e,
+    })?;
+    if !doc.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(&doc),
+        });
+    }
+    if let Some(hooks) = doc
+        .as_object_mut()
+        .and_then(|root| root.get_mut("hooks"))
+        .and_then(Value::as_object_mut)
+    {
+        for (_, group) in hooks.iter_mut() {
+            if let Some(arr) = group.as_array_mut() {
+                arr.retain(|entry| !is_soth_managed(entry));
+            }
+        }
+        let all_empty = hooks
+            .iter()
+            .all(|(_, v)| v.as_array().map(|a| a.is_empty()).unwrap_or(false));
+        if all_empty {
+            doc.as_object_mut().unwrap().remove("hooks");
+            doc.as_object_mut().unwrap().remove("version");
+        }
+    }
+    write_atomic(hooks_path, serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    Ok(())
+}
+
 /// Cursor-specific hook entry shape: `{command: "..."}`. Simpler
-/// than Claude Code's `{matcher, hooks: [{type, command}]}`.
+/// than Claude Code's `{matcher, hooks: [{type, command}]}`. Shared
+/// by both Cursor and Windsurf installs (both flat-shape).
 fn ensure_cursor_hook_entry(
     hooks: &mut Value,
     cursor_event: &str,
@@ -744,6 +1163,106 @@ mod tests {
         let (_tmp, path) = fixture_settings(r#"{ broken }"#);
         let r = uninstall_claude_code(&path);
         assert!(matches!(r, Err(InstallError::Malformed { .. })));
+    }
+
+    #[test]
+    fn gemini_install_writes_matcher_style_entries() {
+        let (_tmp, path) = fixture_settings("");
+        let report = install_gemini_cli(&path, Some(binary_path())).unwrap();
+        assert_eq!(report.hooks_added.len(), GEMINI_HOOK_TYPES.len());
+        let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // Gemini uses matcher-style: hooks.<event>[].matcher + hooks[].command
+        let entries = body["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let cmd = entries[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("--agent gemini_cli"));
+        assert!(cmd.contains("--type before_tool_call"));
+    }
+
+    #[test]
+    fn codex_install_writes_five_canonical_hook_types() {
+        let (_tmp, path) = fixture_settings("");
+        let report = install_codex(&path, Some(binary_path())).unwrap();
+        // Codex's slim 5-hook set per rust-codex 0.114.0.
+        assert_eq!(report.hooks_added.len(), 5);
+        let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for upstream in ["SessionStart", "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"] {
+            assert!(
+                body["hooks"][upstream].is_array(),
+                "codex must install hook for {upstream}"
+            );
+        }
+    }
+
+    #[test]
+    fn windsurf_install_writes_flat_style_entries() {
+        let (_tmp, path) = fixture_settings("");
+        let report = install_windsurf(&path, Some(binary_path())).unwrap();
+        assert_eq!(report.hooks_added.len(), WINDSURF_HOOK_TYPES.len());
+        let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // Windsurf uses flat: hooks.<event>[].command (no matcher level)
+        let entries = body["hooks"]["pre_run_command"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let cmd = entries[0]["command"].as_str().unwrap();
+        assert!(cmd.contains("--agent windsurf"));
+        assert!(cmd.contains("--type pre_run_command"));
+        // Windsurf does not write a top-level `version` field (Cursor-only).
+        assert!(body.get("version").is_none());
+    }
+
+    #[test]
+    fn cursor_install_still_writes_version_field() {
+        // Regression guard: the shared `install_flat_style` helper is
+        // also used by Cursor; the `version: 1` field should only
+        // appear for Cursor (per gryph upstream), not Windsurf.
+        let (_tmp, path) = fixture_settings("");
+        super::install_cursor(&path, Some(binary_path())).unwrap();
+        let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(body["version"], 1);
+    }
+
+    #[test]
+    fn install_uninstall_idempotent_for_all_json_targets() {
+        // Same idempotency contract as install_is_idempotent but
+        // exercising the matcher-style and flat-style helpers
+        // together. Catches "uninstall left an artifact and reinstall
+        // sees ghost entries" class bugs.
+        for installer in [
+            (
+                "gemini_cli",
+                install_gemini_cli as fn(&Path, Option<PathBuf>) -> _,
+                uninstall_gemini_cli as fn(&Path) -> _,
+            ),
+            ("codex", install_codex, uninstall_codex),
+            ("windsurf", install_windsurf, uninstall_windsurf),
+        ] {
+            let (name, install, uninstall) = installer;
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(format!("{name}.json"));
+            install(&path, Some(binary_path())).unwrap();
+            let r2 = install(&path, Some(binary_path())).unwrap();
+            assert!(
+                r2.hooks_added.is_empty(),
+                "{name}: second install added entries (not idempotent)"
+            );
+            uninstall(&path).unwrap();
+            uninstall(&path).unwrap();
+            // After two uninstalls, no soth_managed entries remain.
+            let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let any_soth = body
+                .as_object()
+                .and_then(|m| m.get("hooks"))
+                .and_then(|h| h.as_object())
+                .map(|hooks| {
+                    hooks.values().any(|v| {
+                        v.as_array()
+                            .map(|arr| arr.iter().any(|e| is_soth_managed(e)))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            assert!(!any_soth, "{name}: uninstall left soth-managed entries");
+        }
     }
 
     #[test]

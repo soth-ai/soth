@@ -11,8 +11,10 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
 use soth_code::install::{
-    default_claude_settings_path, default_cursor_hooks_path, install_claude_code, install_cursor,
-    uninstall_claude_code, uninstall_cursor,
+    default_claude_settings_path, default_codex_hooks_path, default_cursor_hooks_path,
+    default_gemini_settings_path, default_windsurf_hooks_path, install_claude_code, install_codex,
+    install_cursor, install_gemini_cli, install_windsurf, uninstall_claude_code, uninstall_codex,
+    uninstall_cursor, uninstall_gemini_cli, uninstall_windsurf,
 };
 use soth_code::paths::CodePaths;
 use soth_code::CodeExtension;
@@ -183,30 +185,30 @@ fn run_hook(args: HookArgs) -> Result<()> {
 fn run_install(args: InstallArgs) -> Result<()> {
     let report = match args.target.as_str() {
         "claude_code" => {
-            let path = args
-                .settings_path
-                .or_else(default_claude_settings_path)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "could not determine ~/.claude/settings.json — pass --settings-path"
-                    )
-                })?;
+            let path = resolve_install_path(&args, default_claude_settings_path, "~/.claude/settings.json")?;
             install_claude_code(&path, None).context("install claude_code hooks")?
         }
         "cursor" => {
-            let path = args
-                .settings_path
-                .or_else(default_cursor_hooks_path)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "could not determine ~/.cursor/hooks.json — pass --settings-path"
-                    )
-                })?;
+            let path = resolve_install_path(&args, default_cursor_hooks_path, "~/.cursor/hooks.json")?;
             install_cursor(&path, None).context("install cursor hooks")?
         }
+        "gemini_cli" | "gemini" => {
+            let path = resolve_install_path(&args, default_gemini_settings_path, "~/.gemini/settings.json")?;
+            install_gemini_cli(&path, None).context("install gemini_cli hooks")?
+        }
+        "codex" => {
+            let path = resolve_install_path(&args, default_codex_hooks_path, "~/.codex/hooks.json")?;
+            install_codex(&path, None).context("install codex hooks")?
+        }
+        "windsurf" => {
+            let path = resolve_install_path(&args, default_windsurf_hooks_path, "~/.codeium/windsurf/hooks.json")?;
+            install_windsurf(&path, None).context("install windsurf hooks")?
+        }
         other => anyhow::bail!(
-            "unknown target '{other}': supported targets are `claude_code`, `cursor`. \
-             Pi Agent / Codex / Gemini CLI / Windsurf / OpenCode land in subsequent Phase 3 commits."
+            "unknown target '{other}': JSON-config installs supported are \
+             `claude_code`, `cursor`, `gemini_cli`, `codex`, `windsurf`. \
+             Pi Agent and OpenCode use JS-plugin shipping — manual configuration \
+             only in v0; install land in a follow-up commit."
         ),
     };
     println!("settings: {}", report.settings_path.display());
@@ -224,35 +226,76 @@ fn run_install(args: InstallArgs) -> Result<()> {
 }
 
 fn run_uninstall(args: UninstallArgs) -> Result<()> {
-    let path = match args.target.as_str() {
-        "claude_code" => args
-            .settings_path
-            .or_else(default_claude_settings_path)
-            .ok_or_else(|| {
-                anyhow::anyhow!("could not determine ~/.claude/settings.json — pass --settings-path")
-            })?,
-        "cursor" => args
-            .settings_path
-            .or_else(default_cursor_hooks_path)
-            .ok_or_else(|| {
-                anyhow::anyhow!("could not determine ~/.cursor/hooks.json — pass --settings-path")
-            })?,
+    let (path, kind) = match args.target.as_str() {
+        "claude_code" => (
+            resolve_uninstall_path(&args, default_claude_settings_path, "~/.claude/settings.json")?,
+            UninstallKind::ClaudeCode,
+        ),
+        "cursor" => (
+            resolve_uninstall_path(&args, default_cursor_hooks_path, "~/.cursor/hooks.json")?,
+            UninstallKind::Cursor,
+        ),
+        "gemini_cli" | "gemini" => (
+            resolve_uninstall_path(&args, default_gemini_settings_path, "~/.gemini/settings.json")?,
+            UninstallKind::Gemini,
+        ),
+        "codex" => (
+            resolve_uninstall_path(&args, default_codex_hooks_path, "~/.codex/hooks.json")?,
+            UninstallKind::Codex,
+        ),
+        "windsurf" => (
+            resolve_uninstall_path(&args, default_windsurf_hooks_path, "~/.codeium/windsurf/hooks.json")?,
+            UninstallKind::Windsurf,
+        ),
         other => anyhow::bail!(
-            "unknown target '{other}': supported targets are `claude_code`, `cursor`"
+            "unknown target '{other}': supported targets are `claude_code`, `cursor`, \
+             `gemini_cli`, `codex`, `windsurf`"
         ),
     };
     if !path.exists() {
         println!("nothing to uninstall — {} does not exist", path.display());
         return Ok(());
     }
-    match args.target.as_str() {
-        "claude_code" => uninstall_claude_code(&path).context("uninstall claude_code hooks")?,
-        "cursor" => uninstall_cursor(&path).context("uninstall cursor hooks")?,
-        _ => unreachable!("validated above"),
+    match kind {
+        UninstallKind::ClaudeCode => uninstall_claude_code(&path).context("uninstall claude_code hooks")?,
+        UninstallKind::Cursor => uninstall_cursor(&path).context("uninstall cursor hooks")?,
+        UninstallKind::Gemini => uninstall_gemini_cli(&path).context("uninstall gemini_cli hooks")?,
+        UninstallKind::Codex => uninstall_codex(&path).context("uninstall codex hooks")?,
+        UninstallKind::Windsurf => uninstall_windsurf(&path).context("uninstall windsurf hooks")?,
     }
     println!("settings: {}", path.display());
     println!("removed soth-managed hook entries");
     Ok(())
+}
+
+enum UninstallKind {
+    ClaudeCode,
+    Cursor,
+    Gemini,
+    Codex,
+    Windsurf,
+}
+
+fn resolve_install_path(
+    args: &InstallArgs,
+    default: fn() -> Option<PathBuf>,
+    label: &str,
+) -> Result<PathBuf> {
+    args.settings_path
+        .clone()
+        .or_else(default)
+        .ok_or_else(|| anyhow::anyhow!("could not determine {label} — pass --settings-path"))
+}
+
+fn resolve_uninstall_path(
+    args: &UninstallArgs,
+    default: fn() -> Option<PathBuf>,
+    label: &str,
+) -> Result<PathBuf> {
+    args.settings_path
+        .clone()
+        .or_else(default)
+        .ok_or_else(|| anyhow::anyhow!("could not determine {label} — pass --settings-path"))
 }
 
 fn run_doctor(args: DoctorArgs) -> Result<()> {
