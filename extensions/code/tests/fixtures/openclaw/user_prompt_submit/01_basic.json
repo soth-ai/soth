@@ -1,0 +1,9 @@
+{
+  "session_id": "openclaw-prompt",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/prompt.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-4o",
+  "turn_id": "turn-prompt-1",
+  "prompt": "Refactor the auth middleware to use a JWKS cache."
+}

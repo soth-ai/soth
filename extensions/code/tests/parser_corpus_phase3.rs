@@ -20,7 +20,8 @@ use std::fs;
 use std::path::Path;
 
 use soth_code::adapter::{
-    Adapter, CodexAdapter, GeminiCliAdapter, OpenCodeAdapter, PiAgentAdapter, WindsurfAdapter,
+    Adapter, CodexAdapter, GeminiCliAdapter, OpenClawAdapter, OpenCodeAdapter, PiAgentAdapter,
+    WindsurfAdapter,
 };
 
 const FIXTURE_ROOT: &str = "tests/fixtures";
@@ -57,6 +58,11 @@ fn agents() -> Vec<AgentCase> {
             name: "opencode",
             dir: "opencode",
             adapter: Box::new(OpenCodeAdapter::new()),
+        },
+        AgentCase {
+            name: "openclaw",
+            dir: "openclaw",
+            adapter: Box::new(OpenClawAdapter::new()),
         },
     ]
 }

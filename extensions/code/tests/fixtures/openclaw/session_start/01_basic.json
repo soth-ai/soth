@@ -1,0 +1,8 @@
+{
+  "session_id": "openclaw-start",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/start.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-4o",
+  "source": "startup"
+}

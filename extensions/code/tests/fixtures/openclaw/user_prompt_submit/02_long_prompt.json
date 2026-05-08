@@ -1,0 +1,9 @@
+{
+  "session_id": "openclaw-long",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/long.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-4o",
+  "turn_id": "turn-long-1",
+  "prompt": "Walk me through the request lifecycle for a typical API call: parse → auth → rate-limit → handler → response. For each stage, identify a metric we should be capturing and where in the code that metric is currently emitted (or where it should be added). Be specific — name the file path and a line number range — and call out any stage where the current code path silently drops timing data."
+}

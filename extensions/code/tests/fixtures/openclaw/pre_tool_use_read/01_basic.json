@@ -1,0 +1,13 @@
+{
+  "session_id": "openclaw-read",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/read.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-4o-mini",
+  "turn_id": "turn-read-1",
+  "tool_name": "Read",
+  "tool_use_id": "tool-read-1",
+  "tool_input": {
+    "file_path": "/home/user/project/src/lib.rs"
+  }
+}

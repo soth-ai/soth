@@ -338,10 +338,19 @@ fn run_install(args: InstallArgs) -> Result<()> {
             let path = resolve_install_path(&args, default_opencode_plugin_path, "~/.config/opencode/plugins/soth-code.mjs")?;
             install_opencode(&path, None).context("install opencode plugin")?
         }
+        "openclaw" => anyhow::bail!(
+            "OpenClaw install is parser-only — the runtime adapter, classify, \
+             and policy paths all work, but the upstream hook-config format \
+             is unstable (gryph PR #31). Configure hooks manually to point \
+             at `soth code hook --agent openclaw --type <hook_type>` and \
+             `soth code tail --agent openclaw` will surface them once \
+             enabled."
+        ),
         other => anyhow::bail!(
             "unknown target '{other}': supported targets are `claude_code`, `cursor`, \
              `gemini_cli`, `codex`, `windsurf`, `pi_agent`, `opencode`. \
-             OpenClaw is deferred (gryph PR #31 unstable upstream)."
+             OpenClaw runtime works (`soth code hook --agent openclaw`) but \
+             auto-install is pending upstream config-format spec."
         ),
     };
     println!("settings: {}", report.settings_path.display());
@@ -496,6 +505,11 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
             }
         }
     }
+    // OpenClaw: parser/runtime ready, install path pending.
+    // Surface this distinctly so operators can tell the
+    // difference between "agent unsupported" and "supported but
+    // configure manually".
+    println!("  openclaw    -  manual         (auto-install pending upstream config spec)");
 
     // Policy bundle — the soth-code hook handler's third
     // operational dependency (after queue + config). Surface

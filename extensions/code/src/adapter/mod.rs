@@ -14,6 +14,7 @@ mod codex;
 mod cursor;
 mod gemini_cli;
 mod opencode;
+mod openclaw;
 mod piagent;
 mod stub;
 mod windsurf;
@@ -23,6 +24,7 @@ pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
 pub use gemini_cli::GeminiCliAdapter;
 pub use opencode::OpenCodeAdapter;
+pub use openclaw::OpenClawAdapter;
 pub use piagent::PiAgentAdapter;
 pub use stub::StubAdapter;
 pub use windsurf::WindsurfAdapter;
@@ -113,8 +115,13 @@ pub fn for_agent(name: &str) -> Option<Box<dyn Adapter>> {
         "codex" => Some(Box::new(CodexAdapter::new())),
         "windsurf" => Some(Box::new(WindsurfAdapter::new())),
         "opencode" => Some(Box::new(OpenCodeAdapter::new())),
-        // OpenClaw deferred — gryph PR #31 still open upstream
-        // (schema unstable). Falls through to the stub.
+        // OpenClaw: parser + classify + decision rendering live;
+        // `soth code install --target openclaw` is the deferred
+        // piece (upstream config-format unstable per gryph PR
+        // #31). Manually-configured hooks pointing at
+        // `soth code hook --agent openclaw --type ...` work
+        // end-to-end against this adapter.
+        "openclaw" | "open_claw" | "open-claw" => Some(Box::new(OpenClawAdapter::new())),
         _ => Some(Box::new(StubAdapter::new(name.to_string()))),
     }
 }
