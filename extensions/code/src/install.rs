@@ -161,7 +161,13 @@ pub fn default_opencode_plugin_path() -> Option<PathBuf> {
 /// canonical settings path the install would write to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedAgent {
-    /// Adapter name (`claude_code`, `cursor`, …).
+    /// Canonical agent name (`claude_code`, `cursor`,
+    /// `openai_codex`, …) — the same form historian's audit
+    /// table keys on, so cross-table joins
+    /// (`installed.json` ↔ `historian.adapters` ↔ doctor)
+    /// don't silently miss because of name drift.  Operator-
+    /// facing CLI flags accept `codex` and other friendly
+    /// aliases; those collapse to canonical here.
     pub agent: &'static str,
     /// The settings / plugin file the install command would
     /// touch for this agent.
@@ -172,6 +178,34 @@ pub struct DetectedAgent {
     /// uses this to skip already-configured agents and just
     /// refresh state.
     pub already_installed: bool,
+}
+
+/// Canonical agent name — one source of truth.  Operator-
+/// facing CLI flags accept friendly aliases (`codex`,
+/// `gemini`, `piagent`, `open-claw`); state files, audit
+/// lookups, and doctor output use the canonical form so
+/// cross-surface joins work without silent drift.  Pre-push
+/// review surfaced that historian audit keyed on
+/// `openai_codex` while soth-code state keyed on `codex` —
+/// any future code that joined them would have silently
+/// missed.  This helper closes that gap.
+///
+/// Returns `None` for genuinely unknown names so callers
+/// fail loud instead of writing state under bogus keys.
+pub fn canonical_agent_name(agent: &str) -> Option<&'static str> {
+    match agent {
+        "claude_code" => Some("claude_code"),
+        "cursor" => Some("cursor"),
+        // Match historian's playbook key — was the
+        // longest-standing source of name drift.
+        "codex" | "openai_codex" | "openai-codex" => Some("openai_codex"),
+        "gemini_cli" | "gemini" => Some("gemini_cli"),
+        "windsurf" => Some("windsurf"),
+        "pi_agent" | "piagent" => Some("pi_agent"),
+        "opencode" => Some("opencode"),
+        "openclaw" | "open_claw" | "open-claw" => Some("openclaw"),
+        _ => None,
+    }
 }
 
 /// Detect AI coding agents on this host — defined as "the
@@ -195,10 +229,12 @@ pub fn detect_installable_agents() -> Vec<DetectedAgent> {
     // Each entry: (agent_name, default-path-fn, soth-managed-marker
     // string).  The marker matches what each installer writes;
     // grep-checking for it tells us if hooks are already wired.
+    // Agents listed under their canonical names — same keys
+    // historian audit, doctor, and state file all use.
     let candidates: &[(&'static str, fn() -> Option<PathBuf>, &'static str)] = &[
         ("claude_code", default_claude_settings_path, "_soth_managed"),
         ("cursor", default_cursor_hooks_path, "_soth_managed"),
-        ("codex", default_codex_hooks_path, "_soth_managed"),
+        ("openai_codex", default_codex_hooks_path, "_soth_managed"),
         ("gemini_cli", default_gemini_settings_path, "_soth_managed"),
         ("windsurf", default_windsurf_hooks_path, "_soth_managed"),
         // For plugin-style agents we detect on the parent
@@ -244,7 +280,7 @@ fn agent_present_on_host(agent: &str, settings_path: &Path) -> bool {
     let home_dir = match agent {
         "claude_code" => dirs::home_dir().map(|h| h.join(".claude")),
         "cursor" => dirs::home_dir().map(|h| h.join(".cursor")),
-        "codex" => dirs::home_dir().map(|h| h.join(".codex")),
+        "openai_codex" => dirs::home_dir().map(|h| h.join(".codex")),
         "gemini_cli" => dirs::home_dir().map(|h| h.join(".gemini")),
         "windsurf" => dirs::home_dir().map(|h| h.join(".codeium").join("windsurf")),
         "pi_agent" => dirs::home_dir().map(|h| h.join(".pi")),

@@ -310,14 +310,19 @@ fn run_hook(args: HookArgs) -> Result<()> {
 
 fn run_install(args: InstallArgs) -> Result<()> {
     // Resolve the canonical adapter name for the state file
-    // (`gemini`/`piagent` aliases collapse to their canonical
-    // form so subsequent doctor / drift checks find the right
-    // entry).
+    // (CLI accepts friendly aliases — `gemini`, `piagent`,
+    // `codex` — which collapse to historian-aligned canonical
+    // forms here so state file ↔ audit map ↔ doctor all join
+    // on the same key).  See
+    // `soth_code::install::canonical_agent_name` for the
+    // single source of truth.
     let canonical_agent = match args.target.as_str() {
         "claude_code" => "claude_code",
         "cursor" => "cursor",
         "gemini_cli" | "gemini" => "gemini_cli",
-        "codex" => "codex",
+        // CLI surface accepts `codex` for ergonomics; state
+        // and audit lookups use historian's `openai_codex`.
+        "codex" | "openai_codex" => "openai_codex",
         "windsurf" => "windsurf",
         "pi_agent" | "piagent" => "pi_agent",
         "opencode" => "opencode",
@@ -350,7 +355,7 @@ fn run_install(args: InstallArgs) -> Result<()> {
             let path = resolve_install_path(&args, default_gemini_settings_path, "~/.gemini/settings.json")?;
             install_gemini_cli(&path, None).context("install gemini_cli hooks")?
         }
-        "codex" => {
+        "openai_codex" => {
             let path = resolve_install_path(&args, default_codex_hooks_path, "~/.codex/hooks.json")?;
             install_codex(&path, None).context("install codex hooks")?
         }
@@ -488,7 +493,7 @@ fn run_uninstall(args: UninstallArgs) -> Result<()> {
         }
         UninstallKind::Codex => {
             uninstall_codex(&path).context("uninstall codex hooks")?;
-            "codex"
+            "openai_codex"
         }
         UninstallKind::Windsurf => {
             uninstall_windsurf(&path).context("uninstall windsurf hooks")?;
@@ -579,7 +584,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     let agents: &[(&str, fn() -> Option<PathBuf>, &str)] = &[
         ("claude_code", default_claude_settings_path, "_soth_managed"),
         ("cursor", default_cursor_hooks_path, "_soth_managed"),
-        ("codex", default_codex_hooks_path, "_soth_managed"),
+        ("openai_codex", default_codex_hooks_path, "_soth_managed"),
         ("gemini_cli", default_gemini_settings_path, "_soth_managed"),
         ("windsurf", default_windsurf_hooks_path, "_soth_managed"),
         ("pi_agent", default_pi_agent_plugin_path, "soth-code"),
@@ -1090,11 +1095,16 @@ fn run_audit_status(config_path: Option<PathBuf>) -> Result<()> {
         let (allowed, dropped) = proxy.audited_bypass_agents(h);
         println!("forward_proxy.bypass_agents → audit-eligibility filter:");
         for entry in &allowed {
-            println!("  ✓ {entry} — passes audit, will bypass at proxy");
+            println!("  ✓ {entry} — passes audit, will bypass at proxy (when wiring lands)");
         }
         for entry in &dropped {
             println!("  ✗ {entry} — DROPPED, agent not audited");
         }
+        println!();
+        println!(
+            "  note: proxy listener does not yet consume this list — entries are forward-\n  \
+             looking until the §10.11 A→C runtime gate ships.  See cli_config.rs comment."
+        );
     }
 
     Ok(())

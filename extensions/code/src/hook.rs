@@ -372,30 +372,74 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
 /// lifetime of the hook process; for ephemeral subprocess invocations
 /// this means one load per agent action — acceptable since the bundle
 /// loader is small.
+/// Resolve and load the operator's CEL policy bundle.
+///
+/// Production path uses a process-wide `OnceLock` cache so the
+/// hook subprocess only pays the bundle-load cost once per
+/// invocation (subprocess is short-lived; cache lives a few ms).
+/// Test path bypasses the cache: each call re-reads from disk
+/// or honors the `SOTH_CODE_POLICY_BUNDLE_DISABLE` opt-out, so
+/// tests aren't polluted by the first test's env var "winning
+/// forever" through the cache (a real issue surfaced by
+/// pre-push review — tests that expected
+/// `policy_bundle() -> None` were silently picking up the
+/// developer's real `~/.soth/code-policy.bundle` because the
+/// OnceLock resolved against it during the first non-isolated
+/// test).
 fn policy_bundle() -> Option<&'static PolicyBundle> {
-    static CACHE: OnceLock<Option<PolicyBundle>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let path = bundle_path()?;
-            if !path.exists() {
-                return None;
+    #[cfg(test)]
+    {
+        // In tests, opt-out via `SOTH_CODE_POLICY_BUNDLE_DISABLE=1`
+        // forces None regardless of what's on disk.  No cache
+        // — each test gets a fresh resolution so per-test env
+        // mutations take effect immediately.  The intentional
+        // leak (Box::leak) keeps the &'static contract; tests
+        // run for milliseconds and tear down the process, so
+        // leaked bundles cost nothing.
+        if std::env::var("SOTH_CODE_POLICY_BUNDLE_DISABLE")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let path = bundle_path()?;
+        if !path.exists() {
+            return None;
+        }
+        match soth_policy::load_bundle(&path) {
+            Ok(bundle) => {
+                soth_policy::warm(&bundle);
+                Some(Box::leak(Box::new(bundle)))
             }
-            match soth_policy::load_bundle(&path) {
-                Ok(bundle) => {
-                    soth_policy::warm(&bundle);
-                    Some(bundle)
+            Err(_) => None,
+        }
+    }
+    #[cfg(not(test))]
+    {
+        static CACHE: OnceLock<Option<PolicyBundle>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                let path = bundle_path()?;
+                if !path.exists() {
+                    return None;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        bundle_path = %path.display(),
-                        error = ?e,
-                        "soth-code: failed to load policy bundle; falling through to artifact default-deny"
-                    );
-                    None
+                match soth_policy::load_bundle(&path) {
+                    Ok(bundle) => {
+                        soth_policy::warm(&bundle);
+                        Some(bundle)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            bundle_path = %path.display(),
+                            error = ?e,
+                            "soth-code: failed to load policy bundle; falling through to artifact default-deny"
+                        );
+                        None
+                    }
                 }
-            }
-        })
-        .as_ref()
+            })
+            .as_ref()
+    }
 }
 
 fn bundle_path() -> Option<PathBuf> {
@@ -1237,6 +1281,14 @@ mod tests {
 
     #[test]
     fn capture_audit_persists_only_for_block_decisions() {
+        // Force `policy_bundle()` to return None so this test
+        // exercises the artifact-default-deny path regardless
+        // of whatever bundle the dev host has at
+        // `~/.soth/code-policy.bundle`.  Without this opt-out,
+        // a host with a real bundle that allows the test's
+        // synthesized AKIA pattern would skip the Block path
+        // and the assertion below would fail.
+        std::env::set_var("SOTH_CODE_POLICY_BUNDLE_DISABLE", "1");
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
         let cap = HookCaptureConfig {
@@ -1328,6 +1380,10 @@ mod tests {
         // Regression guard: the enforcement gate must NOT downgrade
         // Block on enforceable hook types. PreToolUse with a
         // credential remains a Block.
+        // Force the policy-bundle path to None so this test
+        // exercises the artifact-default-deny code path
+        // regardless of any real bundle on the dev host.
+        std::env::set_var("SOTH_CODE_POLICY_BUNDLE_DISABLE", "1");
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
         let stdin = br#"{

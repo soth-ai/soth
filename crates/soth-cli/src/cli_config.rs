@@ -60,13 +60,18 @@ pub struct ForwardProxyConfig {
     pub max_concurrent_flows: usize,
 
     // ── soth-code per-agent gating (→ docs/gryph/plan.md §10.11/.12) ──
-    /// User-Agent glob patterns for AI coding agents whose traffic is
-    /// **fully bypassed** at the proxy: TLS pass-through, no telemetry,
-    /// no classify. The `soth-code` extension is the canonical source
-    /// for these agents (action layer + historian session layer cover
-    /// the visibility need). Default empty — no bypass until explicitly
-    /// flipped per-agent following the A→C trajectory gate
-    /// (plan §10.11).
+    /// **Planned, not yet effective.** User-Agent glob patterns for
+    /// AI coding agents whose traffic should bypass MITM at the proxy
+    /// once the §10.11 A→C trajectory closes for that agent.  Today
+    /// the `audited_bypass_agents` filter validates membership against
+    /// `historian.adapters.<agent>.usage_coverage_audited` and
+    /// `soth code audit-status` reports the result, but **the proxy's
+    /// listener loop does not yet consume this list** — adding an
+    /// entry here is observable in `audit-status` but does not
+    /// actually cause the proxy to bypass that agent.  Wiring lands
+    /// when the bypass-eligibility gate becomes a runtime concern;
+    /// until then this knob is forward-looking config only.
+    /// Default empty.
     #[serde(default)]
     pub bypass_agents: Vec<String>,
     /// User-Agent glob patterns for agents in **cost-skim** mode: proxy

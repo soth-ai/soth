@@ -1868,7 +1868,7 @@ mod sweep_tests {
         let detected_agents = vec![
             detected("claude_code", tmp.path(), false),
             detected("cursor", tmp.path(), false),
-            detected("codex", tmp.path(), false),
+            detected("openai_codex", tmp.path(), false),
         ];
 
         let install_fn = |agent: &str, _path: &Path| -> anyhow::Result<()> {
@@ -1880,7 +1880,7 @@ mod sweep_tests {
 
         let result = run_sweep(&detected_agents, &state_path, &bin, false, install_fn);
 
-        assert_eq!(result.installed, vec!["claude_code", "codex"]);
+        assert_eq!(result.installed, vec!["claude_code", "openai_codex"]);
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].0, "cursor");
         assert!(
@@ -1891,7 +1891,7 @@ mod sweep_tests {
         // State persisted only the successful installs.
         let state = InstalledHostState::load(&state_path).unwrap();
         assert!(state.hooks.contains_key("claude_code"));
-        assert!(state.hooks.contains_key("codex"));
+        assert!(state.hooks.contains_key("openai_codex"));
         assert!(!state.hooks.contains_key("cursor"));
     }
 
