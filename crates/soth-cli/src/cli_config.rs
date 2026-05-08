@@ -585,6 +585,52 @@ pub struct CodeExtensionConfig {
     ///     claude_code: { enabled: true }
     /// ```
     pub agents: std::collections::HashMap<String, CodeAgentConfig>,
+
+    /// Raw payload capture knob. Default is `Metadata` — only derived
+    /// signals (classify outputs, hashes, artifact metadata) get
+    /// persisted to the queue and shipped to the cloud. Operators
+    /// opting into `Audit` (raw payload on Block decisions only) or
+    /// `Full` (raw payload on every event) accept compliance and
+    /// retention responsibility for the captured content. Cloud-side
+    /// gating per-org provides defense-in-depth.
+    pub capture: CodeCaptureConfig,
+}
+
+/// `code.capture` block. See [`CodeCaptureMode`] for semantics; the
+/// `max_payload_bytes` cap protects against megabyte-sized MCP tool
+/// responses (gryph PR #32) blowing up queue-row size when raw
+/// capture is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeCaptureConfig {
+    pub mode: CodeCaptureMode,
+    pub max_payload_bytes: usize,
+}
+
+impl Default for CodeCaptureConfig {
+    fn default() -> Self {
+        Self {
+            mode: CodeCaptureMode::Metadata,
+            max_payload_bytes: 64 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeCaptureMode {
+    /// Default: derived signals only; raw payload dropped before enqueue.
+    Metadata,
+    /// Raw payload preserved only for Block decisions (forensics).
+    Audit,
+    /// Raw payload preserved on every event (debugging / compliance).
+    Full,
+}
+
+impl Default for CodeCaptureMode {
+    fn default() -> Self {
+        Self::Metadata
+    }
 }
 
 impl Default for CodeExtensionConfig {
@@ -594,6 +640,7 @@ impl Default for CodeExtensionConfig {
             on_policy_error: PolicyErrorMode::Block,
             timeout_ms: 30_000,
             agents: std::collections::HashMap::new(),
+            capture: CodeCaptureConfig::default(),
         }
     }
 }

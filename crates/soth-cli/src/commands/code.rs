@@ -18,6 +18,9 @@ use soth_code::install::{
     uninstall_claude_code, uninstall_codex, uninstall_cursor, uninstall_gemini_cli,
     uninstall_opencode, uninstall_pi_agent, uninstall_windsurf,
 };
+use soth_code::{CodeCaptureMode as SothCodeCaptureMode, HookCaptureConfig};
+
+use crate::cli_config::{self, CodeCaptureMode as CliCodeCaptureMode};
 use soth_code::paths::CodePaths;
 use soth_code::CodeExtension;
 
@@ -152,7 +155,12 @@ fn run_hook(args: HookArgs) -> Result<()> {
         None => CodePaths::from_default_root(),
     };
     let stdin = soth_code::read_stdin_to_end().context("reading hook stdin payload")?;
-    match soth_code::run_hook(&args.agent, &args.hook_type, &stdin, &paths) {
+    // Resolve capture config from soth.yaml. Default Metadata when no
+    // config or no `code.capture` block — raw payload stays in the
+    // hook subprocess's memory and never reaches the queue. Operators
+    // opting into Audit or Full have explicitly set the YAML knob.
+    let capture = resolve_capture_config();
+    match soth_code::run_hook(&args.agent, &args.hook_type, &stdin, &paths, &capture) {
         Ok(outcome) => {
             soth_code::write_outcome(&outcome).ok();
             // The adapter's `AdapterResponse` is the contract — exit
@@ -417,6 +425,24 @@ fn print_compact(line: &str) {
         "[action] {decision_kind:<5} {agent}/{hook} {action} session={session} \
          artifacts={artifacts} event_id={event_id}"
     );
+}
+
+/// Load the `code.capture` block from `~/.soth/soth.yaml` and
+/// translate to the soth-code-side type. Returns the default
+/// (`Metadata`, 64 KiB cap) if no config is present or parseable —
+/// safe-default semantics keep raw payload off the wire when the
+/// operator hasn't explicitly opted in.
+fn resolve_capture_config() -> HookCaptureConfig {
+    let cfg = cli_config::load_effective_config(None, None).unwrap_or_default();
+    let cap = &cfg.extensions.code.capture;
+    HookCaptureConfig {
+        mode: match cap.mode {
+            CliCodeCaptureMode::Metadata => SothCodeCaptureMode::Metadata,
+            CliCodeCaptureMode::Audit => SothCodeCaptureMode::Audit,
+            CliCodeCaptureMode::Full => SothCodeCaptureMode::Full,
+        },
+        max_payload_bytes: cap.max_payload_bytes,
+    }
 }
 
 fn run_status(args: StatusArgs) -> Result<()> {

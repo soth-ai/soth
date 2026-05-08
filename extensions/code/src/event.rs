@@ -14,6 +14,83 @@ use serde::{Deserialize, Serialize};
 use soth_classify::{ClassifiedResult, HookContentKind};
 use uuid::Uuid;
 
+/// How much of the raw hook payload survives into the queue.
+///
+/// **`Metadata` is the default.** Raw user content (prompts,
+/// commands, file contents, tool args/results) lives only in the
+/// hook subprocess's memory; only derived signals — classify outputs,
+/// artifact metadata (kind+location, no raw values), identity, and
+/// the policy decision — get persisted to the queue and shipped to
+/// the cloud.
+///
+/// `Audit` and `Full` are operator opt-in. They preserve the raw
+/// payload in `metadata["raw_payload"]` (JSON-stringified, truncated
+/// to [`HookCaptureConfig::max_payload_bytes`]). Use cases:
+/// - **Audit**: forensic depth on enforcement events. Raw payload
+///   stored only when the policy decision is Block or Flag — the
+///   events worth investigating later. Allow-path events stay
+///   metadata-only, capping storage cost.
+/// - **Full**: every event keeps its raw payload. For dev
+///   environments and compliance recording where total observability
+///   matters more than the storage / privacy cost.
+///
+/// Operators committing to `Audit` or `Full` accept compliance and
+/// retention responsibility for the captured content. Cloud-side
+/// gating (`organizations.code_raw_capture_allowed`) is a
+/// belt-and-suspenders defense; the cloud refuses to surface raw
+/// payload from dashboards unless the org has opted in there too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeCaptureMode {
+    /// Default. Drop the raw payload before enqueue; queue carries
+    /// only derived signals.
+    Metadata,
+    /// Capture raw payload only for Block / Flag decisions.
+    Audit,
+    /// Capture raw payload for every event regardless of decision.
+    Full,
+}
+
+impl Default for CodeCaptureMode {
+    fn default() -> Self {
+        Self::Metadata
+    }
+}
+
+impl CodeCaptureMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Audit => "audit",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Per-hook-invocation knob set: governs raw payload capture and the
+/// upper bound on payload size that lands in the queue. Constructed
+/// by the CLI (which loads `soth.yaml`) and passed to
+/// [`crate::run_hook`].
+#[derive(Debug, Clone)]
+pub struct HookCaptureConfig {
+    pub mode: CodeCaptureMode,
+    /// Hard cap on bytes of JSON-stringified raw payload that survive
+    /// into the queue. Larger payloads are truncated with a marker
+    /// suffix. 64 KiB by default — enough for typical Bash commands
+    /// and Read content but bounded against MCP tool responses
+    /// (which gryph PR #32 found can be megabyte-sized).
+    pub max_payload_bytes: usize,
+}
+
+impl Default for HookCaptureConfig {
+    fn default() -> Self {
+        Self {
+            mode: CodeCaptureMode::Metadata,
+            max_payload_bytes: 64 * 1024,
+        }
+    }
+}
+
 /// What kind of action the hook event represents. The full mapping from
 /// agent-native hook types (Claude Code's `pre_tool_use`, Cursor's
 /// `before_shell_execution`, etc.) to these variants is the job of each

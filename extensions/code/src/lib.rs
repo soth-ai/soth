@@ -28,7 +28,10 @@ pub mod install;
 pub mod paths;
 
 pub use decision::{AdapterResponse, HookDecision};
-pub use event::{ActionType, ClassifySidecar, CodeEvent, HookContentExtract, SubagentContext};
+pub use event::{
+    ActionType, ClassifySidecar, CodeCaptureMode, CodeEvent, HookCaptureConfig, HookContentExtract,
+    SubagentContext,
+};
 pub use hook::{read_stdin_to_end, run_hook, write_outcome, HookError, HookOutcome};
 
 use soth_core::ExtensionSource;

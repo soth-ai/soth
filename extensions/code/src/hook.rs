@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::adapter;
 use crate::decision::HookDecision;
-use crate::event::{ClassifySidecar, CodeEvent};
+use crate::event::{ClassifySidecar, CodeCaptureMode, CodeEvent, HookCaptureConfig};
 use crate::paths::CodePaths;
 
 /// Outcome of `run_hook`. The CLI translates this back into stdout/
@@ -64,11 +64,19 @@ pub enum HookError {
 ///
 /// `paths.queue` parent directory is created if it doesn't exist —
 /// first-run installs may not have ever written a soth event.
+///
+/// `capture` controls whether the raw hook payload survives into the
+/// queue. Default ([`HookCaptureConfig::default`]) is `Metadata` —
+/// raw payload is dropped before enqueue, only derived signals are
+/// persisted. Operators set `Audit` or `Full` via `code.capture.mode`
+/// in `soth.yaml` to preserve raw payload for forensics or
+/// compliance; the cloud-side surface gates this further per-org.
 pub fn run_hook(
     agent_name: &str,
     hook_type: &str,
     stdin_bytes: &[u8],
     paths: &CodePaths,
+    capture: &HookCaptureConfig,
 ) -> Result<HookOutcome, HookError> {
     let adapter =
         adapter::for_agent(agent_name).ok_or_else(|| HookError::UnknownAgent(agent_name.into()))?;
@@ -169,9 +177,17 @@ pub fn run_hook(
 
     // 5. enqueue — convert to GovernableEvent (with artifacts attached
     //    as the audit record of what was detected), append a JSONL row
-    //    to the queue file the telemetry batcher reads.
+    //    to the queue file the telemetry batcher reads. When the
+    //    operator has opted into raw payload capture (Audit or Full
+    //    mode), the JSON-stringified payload lands in metadata
+    //    alongside a `raw_capture` tag identifying which mode was
+    //    active. Default Metadata mode drops the payload at this
+    //    boundary — see HookCaptureConfig docstring.
     let mut governable = governable_from_code_event(&code_event);
     governable.artifacts = artifacts;
+    if should_capture_raw(capture.mode, &decision) {
+        attach_raw_payload(&mut governable, &code_event, capture);
+    }
     enqueue(paths.queue.as_path(), &governable, &policy)?;
 
     // 6. render — adapter decides stdout/stderr/exit code.
@@ -543,6 +559,61 @@ fn data_source_for_agent(agent: &str) -> &'static str {
     }
 }
 
+/// Whether the hook handler should preserve the raw payload on the
+/// outgoing queue record, given the configured capture mode and the
+/// policy decision the event landed on.
+///
+/// `Metadata` (default) → never. `Audit` → only when the decision
+/// halts an action (Block). `Full` → always.
+fn should_capture_raw(mode: CodeCaptureMode, decision: &HookDecision) -> bool {
+    match mode {
+        CodeCaptureMode::Metadata => false,
+        CodeCaptureMode::Full => true,
+        CodeCaptureMode::Audit => matches!(decision, HookDecision::Block { .. }),
+        // Note: `HookDecision` doesn't carry a Flag variant in v0
+        // (the policy evaluator's `PolicyDecisionKind::Flag` becomes
+        // Allow at the hook layer per `translate_policy_decision`).
+        // When Flag rendering lands, extend this match to include it.
+    }
+}
+
+/// Insert the raw payload into the GovernableEvent's metadata,
+/// truncated to `capture.max_payload_bytes` so a megabyte-sized MCP
+/// tool response (gryph PR #32 surfaced this in the wild) doesn't
+/// blow up queue-row size. The truncation marker `…[truncated]` is
+/// appended so the dashboard can render "this was cut" rather than
+/// silently dropping the tail.
+fn attach_raw_payload(
+    governable: &mut GovernableEvent,
+    code_event: &CodeEvent,
+    capture: &HookCaptureConfig,
+) {
+    let json = match serde_json::to_string(&code_event.payload) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let payload = if json.len() > capture.max_payload_bytes {
+        // Cut at a UTF-8 codepoint boundary; truncating mid-codepoint
+        // would produce an invalid JSON string the cloud's parser
+        // would reject.
+        let mut cut = capture.max_payload_bytes;
+        while cut > 0 && !json.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…[truncated]", &json[..cut])
+    } else {
+        json
+    };
+    governable
+        .context
+        .metadata
+        .insert("raw_payload".to_string(), payload);
+    governable
+        .context
+        .metadata
+        .insert("raw_capture".to_string(), capture.mode.as_str().to_string());
+}
+
 fn enqueue(
     queue_path: &Path,
     event: &GovernableEvent,
@@ -619,6 +690,7 @@ mod tests {
             "pre_tool_use",
             br#"{"session_id":"sess-1","tool":"Read","args":{"path":"/etc/hosts"}}"#,
             &paths,
+            &HookCaptureConfig::default(),
         )
         .expect("hook runs");
 
@@ -655,7 +727,7 @@ mod tests {
     fn empty_stdin_still_enqueues() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
-        let outcome = run_hook("claude_code", "pre_tool_use", b"", &paths).expect("ok");
+        let outcome = run_hook("claude_code", "pre_tool_use", b"", &paths, &HookCaptureConfig::default()).expect("ok");
         assert!(matches!(outcome.decision, HookDecision::Allow));
         let queue = fs::read_to_string(&paths.queue).unwrap();
         assert_eq!(queue.lines().count(), 1);
@@ -665,7 +737,7 @@ mod tests {
     fn unknown_agent_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
-        let r = run_hook("", "pre_tool_use", b"{}", &paths);
+        let r = run_hook("", "pre_tool_use", b"{}", &paths, &HookCaptureConfig::default());
         assert!(matches!(r, Err(HookError::UnknownAgent(_))));
     }
 
@@ -673,7 +745,7 @@ mod tests {
     fn malformed_stdin_returns_parse_error() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
-        let r = run_hook("claude_code", "pre_tool_use", b"{ not json", &paths);
+        let r = run_hook("claude_code", "pre_tool_use", b"{ not json", &paths, &HookCaptureConfig::default());
         assert!(matches!(r, Err(HookError::Parse(_))));
     }
 
@@ -682,7 +754,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
         for _ in 0..3 {
-            run_hook("claude_code", "pre_tool_use", b"{}", &paths).unwrap();
+            run_hook("claude_code", "pre_tool_use", b"{}", &paths, &HookCaptureConfig::default()).unwrap();
         }
         let queue = fs::read_to_string(&paths.queue).unwrap();
         assert_eq!(queue.lines().count(), 3);
@@ -872,7 +944,7 @@ mod tests {
             "stop_hook_active": true,
             "context": "earlier the user pasted AKIAIOSFODNN7EXAMPLE in a command"
         }"#;
-        let outcome = run_hook("claude_code", "stop", stdin, &paths).unwrap();
+        let outcome = run_hook("claude_code", "stop", stdin, &paths, &HookCaptureConfig::default()).unwrap();
         assert!(
             matches!(outcome.decision, HookDecision::Allow),
             "Stop hook with credentials in payload must downgrade to Allow, got {:?}",
@@ -910,7 +982,7 @@ mod tests {
             "tool_name":"Read",
             "tool_input":{"file_path":"/etc/hosts"}
         }"#;
-        run_hook("claude_code", "pre_tool_use", stdin, &paths).unwrap();
+        run_hook("claude_code", "pre_tool_use", stdin, &paths, &HookCaptureConfig::default()).unwrap();
 
         // Read the queue row back, deserialize the GovernableEvent,
         // and convert to TelemetryEvent the same way the batcher does.
@@ -970,6 +1042,145 @@ mod tests {
     }
 
     #[test]
+    fn capture_default_is_metadata() {
+        let cfg = HookCaptureConfig::default();
+        assert!(matches!(cfg.mode, CodeCaptureMode::Metadata));
+    }
+
+    #[test]
+    fn capture_metadata_drops_raw_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+        let stdin = br#"{"session_id":"md","tool_name":"Bash","tool_input":{"command":"echo hi"}}"#;
+        run_hook(
+            "claude_code",
+            "pre_tool_use",
+            stdin,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .unwrap();
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&paths.queue).unwrap().lines().next().unwrap(),
+        )
+        .unwrap();
+        let meta = &row["event"]["context"]["metadata"];
+        assert!(meta.get("raw_payload").is_none());
+        assert!(meta.get("raw_capture").is_none());
+    }
+
+    #[test]
+    fn capture_full_persists_every_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+        let cap = HookCaptureConfig {
+            mode: CodeCaptureMode::Full,
+            max_payload_bytes: 65536,
+        };
+        let stdin =
+            br#"{"session_id":"full","tool_name":"Read","tool_input":{"file_path":"/etc/hosts"}}"#;
+        run_hook("claude_code", "pre_tool_use", stdin, &paths, &cap).unwrap();
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&paths.queue).unwrap().lines().next().unwrap(),
+        )
+        .unwrap();
+        let meta = &row["event"]["context"]["metadata"];
+        assert!(meta["raw_payload"]
+            .as_str()
+            .unwrap()
+            .contains("/etc/hosts"));
+        assert_eq!(meta["raw_capture"], "full");
+    }
+
+    #[test]
+    fn capture_audit_persists_only_for_block_decisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+        let cap = HookCaptureConfig {
+            mode: CodeCaptureMode::Audit,
+            max_payload_bytes: 65536,
+        };
+
+        // Allow event — raw_payload absent.
+        let allow_stdin =
+            br#"{"session_id":"audit","tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}"#;
+        run_hook("claude_code", "pre_tool_use", allow_stdin, &paths, &cap).unwrap();
+
+        // Block event — credential synthesized at runtime so the
+        // source file itself is free of the pattern.
+        let synth = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+        let block_stdin = format!(
+            r#"{{"session_id":"audit","tool_name":"Bash","tool_input":{{"command":"K={synth} aws s3 ls"}}}}"#,
+        );
+        run_hook(
+            "claude_code",
+            "pre_tool_use",
+            block_stdin.as_bytes(),
+            &paths,
+            &cap,
+        )
+        .unwrap();
+
+        let lines: Vec<_> = std::fs::read_to_string(&paths.queue)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+
+        let allow_meta = &lines[0]["event"]["context"]["metadata"];
+        assert!(
+            allow_meta.get("raw_payload").is_none(),
+            "Audit must NOT capture on Allow"
+        );
+        let block_meta = &lines[1]["event"]["context"]["metadata"];
+        assert!(
+            block_meta["raw_payload"].is_string(),
+            "Audit MUST capture on Block"
+        );
+        assert_eq!(block_meta["raw_capture"], "audit");
+    }
+
+    #[test]
+    fn capture_full_truncates_at_max_payload_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+        let cap = HookCaptureConfig {
+            mode: CodeCaptureMode::Full,
+            max_payload_bytes: 256,
+        };
+        let big = "x".repeat(2048);
+        let stdin = format!(
+            r#"{{"session_id":"trunc","tool_name":"Read","tool_input":{{"file_path":"/x","note":"{big}"}}}}"#,
+        );
+        run_hook(
+            "claude_code",
+            "pre_tool_use",
+            stdin.as_bytes(),
+            &paths,
+            &cap,
+        )
+        .unwrap();
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&paths.queue).unwrap().lines().next().unwrap(),
+        )
+        .unwrap();
+        let raw = row["event"]["context"]["metadata"]["raw_payload"]
+            .as_str()
+            .unwrap();
+        assert!(
+            raw.ends_with("\u{2026}[truncated]"),
+            "truncation marker must suffix oversized payloads (got tail: {})",
+            &raw[raw.len().saturating_sub(40)..]
+        );
+        assert!(
+            raw.len() < 1024,
+            "truncated body must be near max_payload_bytes (256); got {} bytes",
+            raw.len()
+        );
+    }
+
+    #[test]
     fn pre_tool_use_with_credentials_still_blocks() {
         // Regression guard: the enforcement gate must NOT downgrade
         // Block on enforceable hook types. PreToolUse with a
@@ -981,7 +1192,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": { "command": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE aws s3 ls" }
         }"#;
-        let outcome = run_hook("claude_code", "pre_tool_use", stdin, &paths).unwrap();
+        let outcome = run_hook("claude_code", "pre_tool_use", stdin, &paths, &HookCaptureConfig::default()).unwrap();
         assert!(
             matches!(outcome.decision, HookDecision::Block { .. }),
             "PreToolUse with AWS key must still Block, got {:?}",
