@@ -20,8 +20,14 @@ uuid.workspace = true
 soth-core = { workspace = true }
 soth-classify = { workspace = true, features = ["policy"] }
 soth-extensions = { workspace = true }
+soth-policy = { workspace = true }
 
 tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion = "0.5"
+
+[[bench]]
+name = "hook_latency"
+harness = false

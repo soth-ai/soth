@@ -19,9 +19,10 @@
 //!   handled in `crate::diff`.
 
 use serde_json::Value;
+use soth_classify::HookContentKind;
 
 use crate::decision::{AdapterResponse, HookDecision};
-use crate::event::{ActionType, CodeEvent, SubagentContext};
+use crate::event::{ActionType, CodeEvent, HookContentExtract, SubagentContext};
 
 use super::{Adapter, ParseError};
 
@@ -69,6 +70,54 @@ impl Adapter for ClaudeCodeAdapter {
         }
 
         Ok(event)
+    }
+
+    fn classify_input(&self, event: &CodeEvent) -> Option<HookContentExtract> {
+        match event.hook_type.as_str() {
+            "user_prompt_submit" => {
+                let prompt = event.payload.get("prompt").and_then(Value::as_str)?;
+                Some(HookContentExtract {
+                    kind: HookContentKind::PromptText,
+                    content: prompt.to_string(),
+                })
+            }
+            "pre_tool_use" => {
+                let tool = event
+                    .payload
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let input = event.payload.get("tool_input").cloned().unwrap_or(Value::Null);
+                let body = serde_json::to_string(&input).ok()?;
+                Some(HookContentExtract {
+                    kind: HookContentKind::ToolArgs,
+                    content: format!("{tool}\n{body}"),
+                })
+            }
+            "post_tool_use" => {
+                let result = event.payload.get("tool_response").cloned().unwrap_or(Value::Null);
+                let body = serde_json::to_string(&result).ok()?;
+                if body.is_empty() || body == "null" {
+                    return None;
+                }
+                Some(HookContentExtract {
+                    kind: HookContentKind::ToolResult,
+                    content: body,
+                })
+            }
+            "stop" => {
+                // Some Claude Code variants pass an assistant turn here;
+                // older variants don't. Best-effort extract.
+                let turn = event.payload.get("assistant_message").and_then(Value::as_str)?;
+                Some(HookContentExtract {
+                    kind: HookContentKind::AssistantTurn,
+                    content: turn.to_string(),
+                })
+            }
+            // session_start / session_end / notification / subagent_*
+            // are bookkeeping — no classifiable content.
+            _ => None,
+        }
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {

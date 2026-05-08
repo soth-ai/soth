@@ -11,6 +11,7 @@
 //! the public contract.
 
 use serde::{Deserialize, Serialize};
+use soth_classify::{ClassifiedResult, HookContentKind};
 use uuid::Uuid;
 
 /// What kind of action the hook event represents. The full mapping from
@@ -70,8 +71,60 @@ pub struct SubagentContext {
     pub parent_session_id: Option<String>,
 }
 
+/// What an adapter wants to feed into classify for a given event.
+///
+/// Adapters return `Some(HookContentExtract)` when the payload carries
+/// content the embedding/anomaly stages should see (prompt text, tool
+/// args, tool result, assistant turn). They return `None` for
+/// bookkeeping events (session_start/end, notifications without text)
+/// — classify is then skipped and `CodeEvent::classify` stays `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookContentExtract {
+    pub kind: HookContentKind,
+    pub content: String,
+}
+
+/// Subset of [`ClassifiedResult`] surfaced into the queued event.
+///
+/// Excludes the embedding vector itself (LOCAL ONLY — never serialized)
+/// and a few proxy-only fields. Mirrors what the policy evaluator's
+/// `PolicyContext::semantic` consumes plus the visible anomaly score
+/// the dashboard renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifySidecar {
+    pub semantic_hash: String,
+    pub use_case_label: String,
+    pub use_case_confidence: f32,
+    pub complexity_score: u8,
+    pub anomaly_score: f32,
+    pub anomaly_flags: Vec<String>,
+    pub estimated_input_tokens: u32,
+    pub topic_cluster_id: u32,
+    pub stage_total_us: u64,
+}
+
+impl From<&ClassifiedResult> for ClassifySidecar {
+    fn from(c: &ClassifiedResult) -> Self {
+        Self {
+            semantic_hash: c.semantic_hash.clone(),
+            use_case_label: format!("{:?}", c.use_case_label),
+            use_case_confidence: c.use_case_confidence,
+            complexity_score: c.complexity_score,
+            anomaly_score: c.anomaly_score,
+            anomaly_flags: c
+                .anomaly_flags
+                .iter()
+                .map(|f| format!("{f:?}"))
+                .collect(),
+            estimated_input_tokens: c.telemetry_event.estimated_input_tokens.unwrap_or(0),
+            topic_cluster_id: c.topic_cluster_id,
+            stage_total_us: c.stage_latencies.total_us,
+        }
+    }
+}
+
 /// Internal action-layer event the adapter produces and the hook handler
-/// transports through redact → classify → policy → enqueue.
+/// transports through detect → classify → policy → enqueue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeEvent {
     pub event_id: Uuid,
@@ -97,6 +150,12 @@ pub struct CodeEvent {
     /// don't predict; defensively typed access to the few fields we need
     /// at parse time, full payload preserved here for telemetry / debug.
     pub payload: serde_json::Value,
+    /// Outputs from the synchronous classify call run on the hook
+    /// payload. `None` when the hook event isn't classifiable
+    /// (bookkeeping events) or when classify was skipped (e.g.
+    /// classify is disabled in config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classify: Option<ClassifySidecar>,
 }
 
 impl CodeEvent {
@@ -125,6 +184,7 @@ impl CodeEvent {
             subagent: None,
             correlation_key,
             payload,
+            classify: None,
         }
     }
 }

@@ -4110,6 +4110,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
+ "criterion",
  "dirs",
  "regex",
  "serde",
@@ -4118,6 +4119,7 @@ dependencies = [
  "soth-classify",
  "soth-core",
  "soth-extensions",
+ "soth-policy",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",

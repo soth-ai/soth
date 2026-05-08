@@ -7,7 +7,7 @@
 //! adapter and the per-agent fixture corpus.
 
 use crate::decision::{AdapterResponse, HookDecision};
-use crate::event::CodeEvent;
+use crate::event::{CodeEvent, HookContentExtract};
 
 mod claude_code;
 mod stub;
@@ -36,6 +36,14 @@ pub trait Adapter: Send + Sync {
     /// Render a generic `HookDecision` into the agent's native
     /// stdout/stderr/exit-code contract.
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse;
+
+    /// Extract the content the classify pipeline should see for this
+    /// event. `None` for bookkeeping hooks (session_start, etc.).
+    /// The default implementation returns `None`; adapters override
+    /// per agent's hook taxonomy. See `docs/gryph/plan.md` §10.10.
+    fn classify_input(&self, _event: &CodeEvent) -> Option<HookContentExtract> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
