@@ -1,0 +1,4 @@
+{
+  "session_id": "claude-session-up-02",
+  "prompt": "Refactor this function:\n```rust\nfn old() {}\n```\nto use generics."
+}

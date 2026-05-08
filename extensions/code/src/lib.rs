@@ -20,6 +20,7 @@
 
 pub mod adapter;
 pub mod decision;
+pub mod diff;
 pub mod event;
 pub mod hook;
 pub mod paths;

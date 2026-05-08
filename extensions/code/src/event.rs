@@ -63,7 +63,11 @@ impl ActionType {
 pub struct SubagentContext {
     pub subagent_id: String,
     pub subagent_type: String,
-    pub parent_session_id: String,
+    /// Parent session id when the agent payload supplies one. Claude
+    /// Code does not currently surface this through hooks — left
+    /// `None` rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 /// Internal action-layer event the adapter produces and the hook handler

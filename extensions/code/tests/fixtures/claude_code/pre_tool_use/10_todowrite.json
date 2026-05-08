@@ -1,0 +1,9 @@
+{
+  "session_id": "claude-session-10",
+  "tool_name": "TodoWrite",
+  "tool_input": {
+    "todos": [
+      { "content": "first task", "status": "pending", "activeForm": "Doing first task" }
+    ]
+  }
+}

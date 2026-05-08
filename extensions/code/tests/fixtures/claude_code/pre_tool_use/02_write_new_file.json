@@ -1,0 +1,10 @@
+{
+  "session_id": "claude-session-02",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/Users/u/code/proj",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/Users/u/code/proj/src/new.rs",
+    "content": "pub fn hello() {}\n"
+  }
+}

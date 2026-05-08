@@ -9,8 +9,10 @@
 use crate::decision::{AdapterResponse, HookDecision};
 use crate::event::CodeEvent;
 
+mod claude_code;
 mod stub;
 
+pub use claude_code::ClaudeCodeAdapter;
 pub use stub::StubAdapter;
 
 /// Per-agent adapter contract. Each agent's hook payload format,
@@ -50,15 +52,26 @@ pub enum ParseError {
     },
 }
 
-/// Static lookup by adapter name. Lives behind a function (not a
-/// `static`) so the smoke E2E doesn't need a global registry mutex —
-/// the stub adapter is zero-cost to construct.
+/// Adapter lookup by agent name. Lives behind a function (not a static
+/// registry) so adapters are zero-cost to construct per hook
+/// invocation — the hook subprocess is ephemeral, no shared state to
+/// share across calls.
+///
+/// Known agents return their real adapter; unknown names fall through
+/// to the permissive `StubAdapter` so the smoke E2E and integration
+/// tests can exercise the pipeline without a registered adapter.
+/// Production deployments only see traffic for agents in the
+/// `code.agents.<name>.enabled = true` map (cli_config.rs), so the
+/// stub is unreachable on the hot path.
 pub fn for_agent(name: &str) -> Option<Box<dyn Adapter>> {
-    // Group 3: only the stub. Group 4 adds Claude Code; Group 6 adds
-    // the rest. The stub accepts any agent name so the smoke E2E
-    // works without a real adapter installed.
     if name.is_empty() {
         return None;
     }
-    Some(Box::new(StubAdapter::new(name.to_string())))
+    match name {
+        "claude_code" => Some(Box::new(ClaudeCodeAdapter::new())),
+        // Other adapters land in subsequent groups (Pi Agent, Cursor,
+        // Codex, Gemini CLI, Windsurf, OpenCode). Until then any other
+        // name lands on the stub.
+        _ => Some(Box::new(StubAdapter::new(name.to_string()))),
+    }
 }

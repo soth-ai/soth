@@ -1,0 +1,11 @@
+{
+  "session_id": "claude-session-07",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/Users/u/code/proj",
+  "tool_name": "Task",
+  "tool_input": {
+    "subagent_type": "general-purpose",
+    "description": "research X",
+    "prompt": "find references to..."
+  }
+}
