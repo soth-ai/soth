@@ -987,7 +987,7 @@ fn install_one(agent: &str, settings_path: &Path) -> anyhow::Result<()> {
         "cursor" => install_cursor(settings_path, None)
             .map(|_| ())
             .context("install cursor hooks"),
-        "codex" => install_codex(settings_path, None)
+        "openai_codex" => install_codex(settings_path, None)
             .map(|_| ())
             .context("install codex hooks"),
         "gemini_cli" => install_gemini_cli(settings_path, None)
@@ -1893,6 +1893,46 @@ mod sweep_tests {
         assert!(state.hooks.contains_key("claude_code"));
         assert!(state.hooks.contains_key("openai_codex"));
         assert!(!state.hooks.contains_key("cursor"));
+    }
+
+    #[test]
+    fn install_one_dispatches_every_canonical_agent_name() {
+        // Pin the contract: every canonical agent name that
+        // `detect_installable_agents` may emit MUST have a
+        // matching arm in `install_one`'s dispatch.  A mismatch
+        // there silently fails real installs at runtime — the
+        // sweep_tests above all use a mocked install_fn so a
+        // stale `install_one` arm wasn't catchable from those.
+        // This test exercises the real `install_one` against
+        // throwaway paths; we don't care if the underlying
+        // installer succeeds (it usually fails because the
+        // tmp path doesn't have a real settings.json), only
+        // that the dispatch DOESN'T return the
+        // "auto-install does not support agent: X" bail.
+        let tmp = TempDir::new().unwrap();
+        let canonical_names = [
+            "claude_code",
+            "cursor",
+            "openai_codex",
+            "gemini_cli",
+            "windsurf",
+            "pi_agent",
+            "opencode",
+        ];
+        for agent in canonical_names {
+            let path = tmp.path().join(format!("{agent}-fake-settings"));
+            let result = super::install_one(agent, &path);
+            if let Err(e) = &result {
+                let msg = format!("{e:#}");
+                assert!(
+                    !msg.contains("auto-install does not support agent"),
+                    "install_one returned dispatch-miss bail for {agent}: {msg}\n\
+                     This means detect_installable_agents emits {agent} but install_one\n\
+                     has no matching arm — the sweep would silently skip this agent at\n\
+                     runtime."
+                );
+            }
+        }
     }
 
     #[test]
