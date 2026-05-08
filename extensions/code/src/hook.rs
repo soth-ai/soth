@@ -69,21 +69,64 @@ pub fn run_hook(
     // 1. parse — adapter produces a CodeEvent.
     let code_event = adapter.parse_event(hook_type, stdin_bytes)?;
 
-    // 2. redact (Group 4 — D-3 lands #[code(sensitive)] walker). For
-    //    Group 3 we just enqueue the raw payload.
-    // 3. classify (Group 5 — E-2). Stub: skip.
-    // 4. policy (Group 5 — E-3). Stub: always Allow.
-    let policy = PolicyDecision {
-        kind: PolicyDecisionKind::Allow,
-        matched_rule: None,
-        warnings: Vec::new(),
-        eval_latency_us: 0,
-    };
-    let decision = HookDecision::Allow;
+    // 2. detect — scan payload for credential shapes, produce
+    //    SensitiveArtifact per match. Same model the proxy uses.
+    //    Detection NEVER mutates the payload (gryph PR #40 / proxy
+    //    semantics): mutation would be a policy decision
+    //    (`PolicyDecisionKind::Redact`), not the detector's.
+    let tool_name = code_event
+        .payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let artifacts = crate::detect::scan(&code_event.payload, &tool_name);
 
-    // 5. enqueue — convert to GovernableEvent, append a JSONL row to
-    //    the queue file the telemetry batcher reads.
-    let governable = governable_from_code_event(&code_event);
+    // 3. classify (Group 5 — E-2). Stub: skip.
+    // 4. decide — Group-4 default: any credential detection produces a
+    //    Block. Group 5 (E-3) replaces this with `soth_policy::evaluate`
+    //    so per-org OPA rules can override (e.g. flag-only mode in
+    //    dev). Default-deny matches the security-tool stance — gryph
+    //    Issue #20 was filed because Pi Agent shipped silent fail-open.
+    let (decision, policy) = if artifacts.is_empty() {
+        (
+            HookDecision::Allow,
+            PolicyDecision {
+                kind: PolicyDecisionKind::Allow,
+                matched_rule: None,
+                warnings: Vec::new(),
+                eval_latency_us: 0,
+            },
+        )
+    } else {
+        let kinds: Vec<String> = artifacts
+            .iter()
+            .filter_map(|a| a.credential_kind.clone())
+            .collect();
+        let reason = format!("credentials detected ({})", kinds.join(", "));
+        let guidance = "remove credentials from the payload before retrying";
+        (
+            HookDecision::Block {
+                reason: reason.clone(),
+                guidance: Some(guidance.to_string()),
+            },
+            PolicyDecision {
+                kind: PolicyDecisionKind::Block {
+                    status: 403,
+                    message: reason,
+                },
+                matched_rule: None,
+                warnings: Vec::new(),
+                eval_latency_us: 0,
+            },
+        )
+    };
+
+    // 5. enqueue — convert to GovernableEvent (with artifacts attached
+    //    as the audit record of what was detected), append a JSONL row
+    //    to the queue file the telemetry batcher reads.
+    let mut governable = governable_from_code_event(&code_event);
+    governable.artifacts = artifacts;
     enqueue(paths.queue.as_path(), &governable, &policy)?;
 
     // 6. render — adapter decides stdout/stderr/exit code.
@@ -127,6 +170,11 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
         metadata.insert("subagent_id".to_string(), sub.subagent_id.clone());
         metadata.insert("subagent_type".to_string(), sub.subagent_type.clone());
     }
+    // Note: raw payload is not surfaced in metadata. Detection
+    // produces artifacts (no raw values) on the GovernableEvent;
+    // payload-content telemetry that requires the agent's text lands
+    // via classify (Group 5) which is bound by the same redacted-
+    // hint convention soth-core uses everywhere else.
 
     GovernableEvent {
         event_id: ev.event_id,

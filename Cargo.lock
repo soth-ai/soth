@@ -4111,6 +4111,7 @@ dependencies = [
  "async-trait",
  "clap",
  "dirs",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
