@@ -215,26 +215,66 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
         metadata.insert("subagent_id".to_string(), sub.subagent_id.clone());
         metadata.insert("subagent_type".to_string(), sub.subagent_type.clone());
     }
-    // Surface classify outputs in metadata so the dashboard's
-    // /code page can render anomaly score + use-case label without
-    // re-running classify. Stored as a JSON-stringified
-    // ClassifySidecar; cloud-side consumers parse it back.
+    // Surface classify outputs as **flat metadata keys** matching the
+    // convention established by historian's ClassifyEnricher
+    // (`extensions/historian/src/enrich.rs::keys`). `TelemetryEvent::
+    // from_governable` reads these keys; if they're absent it sets
+    // `use_case_label_reason = ExtensionNotEnriched` (formerly
+    // HistorianNotEnriched, generalized once soth-code became the
+    // second extension). Earlier drafts used a single JSON-stringified
+    // sidecar under `metadata["classify"]`, which from_governable
+    // didn't know about — every soth-code event ended up tagged
+    // `ExtensionNotEnriched` and the WARN fired on every batch.
+    //
+    // Use-case label and reason are written as serde-serialized JSON
+    // strings (e.g. `"\"Unknown\""`, `"\"fallback_bundle\""`) since
+    // historian writes them via `serde_json::to_string` and
+    // from_governable parses them via `serde_json::from_str`.
     if let Some(sidecar) = &ev.classify {
-        if let Ok(j) = serde_json::to_string(sidecar) {
-            metadata.insert("classify".to_string(), j);
-        }
+        // use_case label needs the JSON-quoted **snake_case** form so
+        // from_governable's `serde_json::from_str::<UseCaseLabel>`
+        // deserializes it. ClassifySidecar stores the Debug PascalCase
+        // form (e.g. "Unknown"), so convert before writing — without
+        // this conversion the use_case key was unreadable by
+        // from_governable and every soth-code event fell back to
+        // ExtensionNotEnriched, defeating the whole flat-keys fix.
         metadata.insert(
-            "semantic_hash".to_string(),
-            sidecar.semantic_hash.clone(),
+            "classify.use_case".into(),
+            format!("\"{}\"", to_snake(&sidecar.use_case_label)),
         );
         metadata.insert(
-            "anomaly_score".to_string(),
-            format!("{:.4}", sidecar.anomaly_score),
+            "classify.use_case_confidence".into(),
+            sidecar.use_case_confidence.to_string(),
         );
+        // FallbackBundle is the right reason while Group 5 ships with
+        // KeywordClassifier (no ONNX model). When a real bundle is
+        // installed, classify will produce Confident or LowConfidence
+        // and we'll source the reason from the ClassifiedResult.
+        metadata.insert(
+            "classify.use_case_label_reason".into(),
+            "\"fallback_bundle\"".into(),
+        );
+        metadata.insert(
+            "classify.anomaly_score".into(),
+            sidecar.anomaly_score.to_string(),
+        );
+        metadata.insert(
+            "classify.complexity_score".into(),
+            sidecar.complexity_score.to_string(),
+        );
+        metadata.insert(
+            "classify.topic_cluster_id".into(),
+            sidecar.topic_cluster_id.to_string(),
+        );
+        // Volatility / dynamic_fraction would land here too once
+        // `ClassifySidecar` carries them. The JSON-string sidecar
+        // (`metadata["classify"]`) is intentionally NOT written —
+        // `from_governable` would ignore it and we'd carry duplicate
+        // information.
     }
     // Note: raw payload is not surfaced. Detection produces artifacts
     // (no raw values) on the GovernableEvent; classify summary lives
-    // in metadata above.
+    // in the flat keys above.
 
     GovernableEvent {
         event_id: ev.event_id,
@@ -868,6 +908,83 @@ mod tests {
             !artifacts.is_empty(),
             "artifacts must still be recorded even when decision is downgraded"
         );
+    }
+
+    #[test]
+    fn classify_outputs_land_in_flat_metadata_keys_not_json_blob() {
+        // Regression for the production WARN: soth-code's queue rows
+        // were tagged `extension_not_enriched` because they wrote a
+        // JSON-stringified sidecar instead of historian's flat
+        // `classify.*` key convention. After this fix,
+        // `TelemetryEvent::from_governable` reads the keys directly
+        // and the reason becomes `FallbackBundle` (or Confident, when
+        // a real bundle ships).
+        use soth_core::TelemetryEvent;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+        let stdin = br#"{
+            "session_id":"flat-keys-test",
+            "tool_name":"Read",
+            "tool_input":{"file_path":"/etc/hosts"}
+        }"#;
+        run_hook("claude_code", "pre_tool_use", stdin, &paths).unwrap();
+
+        // Read the queue row back, deserialize the GovernableEvent,
+        // and convert to TelemetryEvent the same way the batcher does.
+        let queue = std::fs::read_to_string(&paths.queue).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(queue.lines().next().unwrap()).unwrap();
+        let governable: soth_core::GovernableEvent =
+            serde_json::from_value(row["event"].clone()).unwrap();
+
+        let meta = &governable.context.metadata;
+        // Flat keys present
+        assert!(
+            meta.contains_key("classify.use_case"),
+            "missing classify.use_case key — from_governable can't read it"
+        );
+        assert!(meta.contains_key("classify.use_case_confidence"));
+        assert!(meta.contains_key("classify.use_case_label_reason"));
+        assert!(meta.contains_key("classify.anomaly_score"));
+        // JSON sidecar should be GONE (replaced by flat keys)
+        assert!(
+            !meta.contains_key("classify"),
+            "JSON sidecar 'classify' should not be written alongside flat keys (duplicate info)"
+        );
+
+        // The actual closing-the-loop check: TelemetryEvent::from_governable
+        // resolves the use_case_label_reason to FallbackBundle, NOT
+        // ExtensionNotEnriched. This is what stops the production
+        // WARN from firing on every batch.
+        let telem = TelemetryEvent::from_governable(&governable, None);
+        assert_ne!(
+            telem.use_case_label_reason,
+            soth_core::UseCaseLabelReason::ExtensionNotEnriched,
+            "from_governable must read soth-code's flat classify keys and not fall back to ExtensionNotEnriched"
+        );
+        assert_eq!(
+            telem.use_case_label_reason,
+            soth_core::UseCaseLabelReason::FallbackBundle,
+            "with the KeywordClassifier fallback bundle, reason should be FallbackBundle"
+        );
+    }
+
+    #[test]
+    fn historian_not_enriched_serde_alias_still_deserializes() {
+        // Wire-compat regression: any in-flight events from the era
+        // before this rename serialized as
+        // `"historian_not_enriched"`. Cloud sinks or replay tooling
+        // reading those records must still parse them — `#[serde(
+        // alias = "historian_not_enriched")]` on `ExtensionNotEnriched`
+        // pins this contract.
+        let v: soth_core::UseCaseLabelReason =
+            serde_json::from_str("\"historian_not_enriched\"").unwrap();
+        assert_eq!(v, soth_core::UseCaseLabelReason::ExtensionNotEnriched);
+        // New variant also round-trips.
+        let v: soth_core::UseCaseLabelReason =
+            serde_json::from_str("\"extension_not_enriched\"").unwrap();
+        assert_eq!(v, soth_core::UseCaseLabelReason::ExtensionNotEnriched);
     }
 
     #[test]

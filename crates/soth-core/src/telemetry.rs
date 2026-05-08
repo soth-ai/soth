@@ -89,8 +89,14 @@ pub enum UseCaseLabelReason {
     UnmappedBundleLabel,
     /// Model weights/biases/labels shape mismatch (defensive check).
     ModelShapeError,
-    /// Historian event was queued without running `ClassifyEnricher`.
-    HistorianNotEnriched,
+    /// Extension event was queued without running `ClassifyEnricher`.
+    /// Applies to any extension that produces `GovernableEvent`s
+    /// (historian, soth-code, future extensions). Original variant
+    /// name was `HistorianNotEnriched` from when historian was the
+    /// only extension; serde alias preserves backwards compat for
+    /// any in-flight events with the old wire form.
+    #[serde(alias = "historian_not_enriched")]
+    ExtensionNotEnriched,
     /// Struct default — never populated by a real classify run.
     UninitializedDefault,
 }
@@ -625,18 +631,19 @@ impl TelemetryEvent {
                 .unwrap_or(0),
         );
 
-        // Pre-computed classify enrichment (written by historian's ClassifyEnricher
-        // before queue serialization, since embed_content is #[serde(skip)]).
-        // Detect "historian queued an event without running ClassifyEnricher"
-        // by checking for the presence of any classify.* metadata. Callers
-        // (sync sender, historian) emit a WARN log when they see the
-        // `HistorianNotEnriched` reason — soth-core stays log-free for the
-        // SDK/WASM build.
+        // Pre-computed classify enrichment (written by an extension's
+        // write-time enricher — historian's `ClassifyEnricher`,
+        // soth-code's hook handler, etc. — before queue serialization,
+        // since embed_content is #[serde(skip)]). Detect "extension
+        // queued an event without running enrichment" by checking for
+        // the presence of any classify.* metadata. Callers (sync
+        // sender) emit a WARN when they see the `ExtensionNotEnriched`
+        // reason — soth-core stays log-free for the SDK/WASM build.
         let raw_use_case = meta
             .get("classify.use_case")
             .and_then(|s| serde_json::from_str::<UseCaseLabel>(s).ok());
         let use_case_label_reason = if raw_use_case.is_none() {
-            UseCaseLabelReason::HistorianNotEnriched
+            UseCaseLabelReason::ExtensionNotEnriched
         } else {
             meta.get("classify.use_case_label_reason")
                 .and_then(|s| serde_json::from_str::<UseCaseLabelReason>(s).ok())

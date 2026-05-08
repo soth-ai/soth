@@ -141,18 +141,23 @@ impl TelemetrySender {
     }
 
     fn signed_batch_to_request(&self, signed: &SignedBatch) -> Result<TelemetryBatchRequest> {
-        // Mirror the historian-not-enriched WARN that used to sit inside
-        // `map_event`. It now lives at the call site so the shared
+        // Mirror the extension-not-enriched WARN that used to sit
+        // inside `map_event`. It lives at the call site so the shared
         // `soth-api-types` crate stays free of a `tracing` dep.
+        // Generalised from "historian event" to "extension event" once
+        // soth-code became the second extension producing
+        // GovernableEvents — message now identifies the source via the
+        // event's data_source rather than assuming historian.
         for event in &signed.batch.events {
             if matches!(
                 event.use_case_label_reason,
-                UseCaseLabelReason::HistorianNotEnriched
+                UseCaseLabelReason::ExtensionNotEnriched
             ) {
                 tracing::warn!(
                     event_id = %event.event_id,
-                    "shipping historian event with use_case_label_reason=historian_not_enriched; \
-                     ClassifyEnricher likely failed or was skipped at ingest time"
+                    data_source = ?event.data_source,
+                    "shipping extension event with use_case_label_reason=extension_not_enriched; \
+                     write-time enrichment likely failed or was skipped"
                 );
             }
         }

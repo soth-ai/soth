@@ -100,13 +100,13 @@ pub fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         tags.insert("h2_stream_id".to_string(), h2sid.to_string());
     }
 
-    // Historian-not-enriched warning is intentionally NOT emitted here
+    // Extension-not-enriched warning is intentionally NOT emitted here
     // (`soth-api-types` is a pure-types crate with no `tracing` dep).
     // The proxy logs it at the call site that builds the batch; the
-    // SDK doesn't run historian enrichment so the case never fires.
+    // SDK doesn't run extension enrichment so the case never fires.
     let _ = matches!(
         event.use_case_label_reason,
-        UseCaseLabelReason::HistorianNotEnriched
+        UseCaseLabelReason::ExtensionNotEnriched
     );
 
     TelemetryEvent {
