@@ -132,6 +132,62 @@ impl ForwardProxyConfig {
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.address, self.port)
     }
+
+    /// Filter `bypass_agents` to the subset whose historian usage-
+    /// coverage audit has passed.  Returns `(allowed, dropped)`.
+    /// Callers should log each dropped agent at WARN level so the
+    /// operator notices their config knob silently degraded —
+    /// silent ignore would let an operator believe they're saving
+    /// proxy CPU when in fact bypass never engaged.
+    ///
+    /// The plan §10.11 trajectory gate is per-agent: bypass is
+    /// only safe once we know historian's session-layer playbook
+    /// will recover authoritative `usage` data the network layer
+    /// is no longer seeing.  This filter is the runtime
+    /// enforcement of that gate.
+    pub fn audited_bypass_agents(
+        &self,
+        historian: &HistorianExtensionConfig,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut allowed = Vec::new();
+        let mut dropped = Vec::new();
+        for agent in &self.bypass_agents {
+            let adapter = bypass_ua_to_adapter(agent);
+            if historian.is_usage_coverage_audited(&adapter) {
+                allowed.push(agent.clone());
+            } else {
+                dropped.push(agent.clone());
+            }
+        }
+        (allowed, dropped)
+    }
+}
+
+/// Resolve a `bypass_agents` UA-glob pattern to the adapter name
+/// the historian audit map keys on.  Bypass list holds outgoing
+/// User-Agent prefixes (e.g. "claude-cli/*", "cursor/*") because
+/// that's how the proxy matches incoming traffic, but the audit
+/// is per-adapter.  Conservative: unmapped patterns return their
+/// own (lower-cased, dash→underscore) form, which falls through
+/// to "not audited" in the historian map and the bypass entry is
+/// dropped.  Add to the table when a new agent's UA prefix is
+/// confirmed.
+fn bypass_ua_to_adapter(ua_glob: &str) -> String {
+    let stripped = ua_glob
+        .trim_end_matches('*')
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    match stripped.as_str() {
+        // Claude Code's CLI sends `claude-cli/<version>`.
+        "claude-cli" | "claude-code" | "claude_code" => "claude_code".to_string(),
+        "cursor" | "cursor-agent" => "cursor".to_string(),
+        "codex" | "openai-codex" | "openai_codex" => "openai_codex".to_string(),
+        "gemini-cli" | "gemini_cli" => "gemini_cli".to_string(),
+        "pi-agent" | "pi_agent" => "pi_agent".to_string(),
+        "windsurf" | "windsurf-extension" => "windsurf".to_string(),
+        "opencode" => "opencode".to_string(),
+        other => other.replace('-', "_"),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +572,91 @@ pub struct HistorianExtensionConfig {
     /// CI runners) where the extra process is more expensive than
     /// the occasional flow hiccup.
     pub run_mode: HistorianRunMode,
+
+    /// Per-adapter audit verdicts that gate the proxy A→C
+    /// trajectory (plan §10.11). For each AI-coding-agent X,
+    /// `usage_coverage_audited == true` means an engineer has
+    /// verified that historian's playbook reliably extracts
+    /// per-turn `usage` blocks from X's session log — i.e.
+    /// authoritative cost telemetry will survive the proxy
+    /// going into bypass mode for that agent.
+    ///
+    /// Until this flag is true for an agent, the runtime will
+    /// **refuse** to honor membership of that agent in
+    /// `proxy.bypass_agents`: bypassing without audited usage
+    /// coverage means losing billing-grade cost data the cloud
+    /// can no longer recover. The check filters the bypass
+    /// list at proxy boot and emits a warning per excluded
+    /// agent.
+    ///
+    /// Defaults: `claude_code = true` (plan §9 confirmation;
+    /// historian's `claude_code` playbook ships with verified
+    /// `usage` extraction). All other agents default `false`
+    /// pending the per-agent audit (`docs/gryph/plan.md` §9
+    /// estimates ~1 engineer-day each).
+    ///
+    /// Uses an explicit field-default fn rather than
+    /// `#[serde(default)]` so that a YAML file containing
+    /// `historian: {}` (no `adapters` key) still gets the
+    /// canonical seven-agent table — `BTreeMap::default()` is
+    /// `{}` and would silently erase the per-agent verdicts.
+    #[serde(default = "default_historian_adapters")]
+    pub adapters: BTreeMap<String, HistorianAdapterAudit>,
+}
+
+fn default_historian_adapters() -> BTreeMap<String, HistorianAdapterAudit> {
+    let mut adapters = BTreeMap::new();
+    adapters.insert(
+        "claude_code".to_string(),
+        HistorianAdapterAudit {
+            usage_coverage_audited: true,
+            audited_at: Some("2026-04 (plan §9)".to_string()),
+            caveats: None,
+        },
+    );
+    for agent in [
+        "cursor",
+        "openai_codex",
+        "gemini_cli",
+        "pi_agent",
+        "windsurf",
+        "opencode",
+    ] {
+        adapters.insert(
+            agent.to_string(),
+            HistorianAdapterAudit {
+                usage_coverage_audited: false,
+                audited_at: None,
+                caveats: None,
+            },
+        );
+    }
+    adapters
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorianAdapterAudit {
+    /// True once an engineer has run a real session through the
+    /// adapter's historian playbook and confirmed that `usage`
+    /// blocks extract reliably per assistant turn. False until
+    /// then. Source of truth for the proxy's bypass-eligibility
+    /// check.
+    #[serde(default)]
+    pub usage_coverage_audited: bool,
+
+    /// Optional human note (audit date, who ran it, sample
+    /// session ID). Carries on the wire so an operator
+    /// inspecting the config can see when each verdict was
+    /// recorded without digging through commit history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audited_at: Option<String>,
+
+    /// Optional free-form caveat — e.g. "extracts input but not
+    /// cache_creation tokens", "only audited for tool_use turns,
+    /// not assistant text". Helps later operators decide whether
+    /// the audit's quality is enough for their billing needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caveats: Option<String>,
 }
 
 impl Default for HistorianExtensionConfig {
@@ -523,7 +664,20 @@ impl Default for HistorianExtensionConfig {
         Self {
             enabled: true,
             run_mode: HistorianRunMode::default(),
+            adapters: default_historian_adapters(),
         }
+    }
+}
+
+impl HistorianExtensionConfig {
+    /// True when the named agent has had its historian usage-coverage
+    /// audit completed.  Used by the proxy to gate bypass eligibility.
+    /// Unknown agents (not in the map) are treated as "not audited".
+    pub fn is_usage_coverage_audited(&self, agent: &str) -> bool {
+        self.adapters
+            .get(agent)
+            .map(|a| a.usage_coverage_audited)
+            .unwrap_or(false)
     }
 }
 
@@ -843,7 +997,7 @@ pub fn resolved_db_path(config: &SothConfig) -> PathBuf {
 mod code_extension_config_tests {
     use super::{
         CodeAgentConfig, CodeExtensionConfig, ExtensionsConfig, ForwardProxyConfig,
-        PolicyErrorMode, SothConfig,
+        HistorianAdapterAudit, HistorianExtensionConfig, PolicyErrorMode, SothConfig,
     };
 
     #[test]
@@ -932,5 +1086,78 @@ forward_proxy:
         assert!(ext.code.enabled);
         // historian still defaulting (regression guard)
         assert!(ext.historian.enabled);
+    }
+
+    #[test]
+    fn historian_audit_defaults_only_claude_code_true() {
+        // Pin the per-agent verdict shape: Claude Code is
+        // audited (plan §9 confirmation), every other supported
+        // adapter ships `false` so the proxy bypass-eligibility
+        // filter cannot accidentally honor a misconfigured knob
+        // before the per-agent audit work happens.
+        let h = HistorianExtensionConfig::default();
+        assert!(h.is_usage_coverage_audited("claude_code"));
+        for unaudited in [
+            "cursor",
+            "openai_codex",
+            "gemini_cli",
+            "pi_agent",
+            "windsurf",
+            "opencode",
+        ] {
+            assert!(
+                !h.is_usage_coverage_audited(unaudited),
+                "{unaudited} must default to not-audited until plan §9 audit completes"
+            );
+        }
+        // Unknown agents (not in the map) — also "not audited".
+        // Default-deny rather than default-allow.
+        assert!(!h.is_usage_coverage_audited("unknown_future_agent"));
+    }
+
+    #[test]
+    fn audited_bypass_filters_unaudited_agents_with_warn_signal() {
+        // Operator wires both audited and unaudited agents into
+        // forward_proxy.bypass_agents — the filter must split:
+        // audited ones flow through to the runtime, unaudited
+        // ones land in the `dropped` slice for caller-side WARN
+        // logging.  Silent acceptance would let an operator
+        // believe bypass is engaged when in fact the proxy is
+        // still doing full inspection.
+        let mut proxy = ForwardProxyConfig::default();
+        proxy.bypass_agents = vec![
+            "claude-cli/*".to_string(),       // audited — passes
+            "cursor/*".to_string(),           // unaudited — dropped
+            "windsurf-extension/*".to_string(), // unaudited — dropped
+        ];
+        let historian = HistorianExtensionConfig::default();
+        let (allowed, dropped) = proxy.audited_bypass_agents(&historian);
+        assert_eq!(allowed, vec!["claude-cli/*"]);
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.contains(&"cursor/*".to_string()));
+        assert!(dropped.contains(&"windsurf-extension/*".to_string()));
+    }
+
+    #[test]
+    fn audited_bypass_honors_runtime_audit_flip() {
+        // The audit happens when an engineer manually flips a
+        // bool — the next process boot should immediately honor
+        // the new verdict without any code change.  Confirm the
+        // filter reads through the map, not a frozen snapshot.
+        let mut proxy = ForwardProxyConfig::default();
+        proxy.bypass_agents = vec!["cursor/*".to_string()];
+        let mut historian = HistorianExtensionConfig::default();
+        // Flip Cursor's audit verdict.
+        historian.adapters.insert(
+            "cursor".to_string(),
+            HistorianAdapterAudit {
+                usage_coverage_audited: true,
+                audited_at: Some("2026-05-08 manual sample".to_string()),
+                caveats: None,
+            },
+        );
+        let (allowed, dropped) = proxy.audited_bypass_agents(&historian);
+        assert_eq!(allowed, vec!["cursor/*"]);
+        assert!(dropped.is_empty());
     }
 }

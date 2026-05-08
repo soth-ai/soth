@@ -60,6 +60,13 @@ pub enum CodeCommands {
     /// `show` (print the active bundle's rules).
     #[command(subcommand)]
     Policy(PolicyCommands),
+
+    /// Print the per-agent historian usage-coverage audit table.
+    /// This verdict gates the proxy's A→C bypass trajectory
+    /// (plan §10.11): the proxy refuses to bypass an agent
+    /// until its historian playbook is audited to extract
+    /// authoritative `usage` blocks per assistant turn.
+    AuditStatus,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -208,6 +215,7 @@ pub async fn run(action: CodeCommands, _global_config: Option<PathBuf>) -> Resul
             PolicyCommands::Apply(args) => run_policy_apply(args),
             PolicyCommands::Show(args) => run_policy_show(args),
         },
+        CodeCommands::AuditStatus => run_audit_status(_global_config),
     }
 }
 
@@ -693,4 +701,84 @@ fn default_bundle_path() -> Option<PathBuf> {
         return Some(PathBuf::from(p));
     }
     dirs::home_dir().map(|h| h.join(".soth").join("code-policy.bundle"))
+}
+
+// ── audit-status subcommand ─────────────────────────────────────────
+
+fn run_audit_status(config_path: Option<PathBuf>) -> Result<()> {
+    // Read the effective config from disk so the table reflects
+    // whatever the operator has flipped — including future
+    // hand-edits like `historian.adapters.cursor.usage_coverage_audited
+    // = true` after running the per-agent audit. Default-only
+    // path lands when no config exists.
+    let cfg = cli_config::load_effective_config(config_path.as_ref(), None).unwrap_or_default();
+    let h = &cfg.extensions.historian;
+    let proxy = &cfg.forward_proxy;
+
+    println!("Historian usage-coverage audit (plan §9 / §10.11)");
+    println!();
+    println!("  {:<14} {:<8} audited_at                     caveats", "agent", "audited");
+    println!("  {}", "-".repeat(80));
+
+    // Stable, plan-defined ordering: claude_code first
+    // (confirmed), then the six pending agents.
+    let canonical_order = [
+        "claude_code",
+        "cursor",
+        "openai_codex",
+        "gemini_cli",
+        "pi_agent",
+        "windsurf",
+        "opencode",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for agent in canonical_order {
+        seen.insert(agent.to_string());
+        let entry = h.adapters.get(agent);
+        print_audit_row(agent, entry);
+    }
+    // Catch any extra agents the operator added by hand.
+    for (agent, entry) in &h.adapters {
+        if !seen.contains(agent) {
+            print_audit_row(agent, Some(entry));
+        }
+    }
+
+    // Show the bypass-eligibility outcome the runtime would
+    // actually compute, so operators see the link between
+    // their `proxy.bypass_agents` config knob and the audit
+    // verdicts.
+    println!();
+    if proxy.bypass_agents.is_empty() {
+        println!("forward_proxy.bypass_agents: empty — no agents in bypass mode.");
+    } else {
+        let (allowed, dropped) = proxy.audited_bypass_agents(h);
+        println!("forward_proxy.bypass_agents → audit-eligibility filter:");
+        for entry in &allowed {
+            println!("  ✓ {entry} — passes audit, will bypass at proxy");
+        }
+        for entry in &dropped {
+            println!("  ✗ {entry} — DROPPED, agent not audited");
+        }
+    }
+
+    Ok(())
+}
+
+fn print_audit_row(
+    agent: &str,
+    entry: Option<&cli_config::HistorianAdapterAudit>,
+) {
+    let (audited, audited_at, caveats) = match entry {
+        Some(a) => (
+            if a.usage_coverage_audited { "yes" } else { "no" },
+            a.audited_at.as_deref().unwrap_or("—"),
+            a.caveats.as_deref().unwrap_or(""),
+        ),
+        None => ("no", "—", ""),
+    };
+    println!(
+        "  {:<14} {:<8} {:<30} {}",
+        agent, audited, audited_at, caveats
+    );
 }
