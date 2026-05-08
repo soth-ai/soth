@@ -511,6 +511,36 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     // configure manually".
     println!("  openclaw    -  manual         (auto-install pending upstream config spec)");
 
+    // Per-host install state (~/.soth/installed.json) — what
+    // `soth up` actually wrote, when, and pointing at which
+    // binary.  Surfaces drift between the auto-installer's
+    // record and the on-disk settings file (operator manually
+    // edited a settings file the auto-installer thought it
+    // owned, etc.).  Empty when `soth up` has never run on
+    // this host with hook auto-install enabled.
+    if let Some(state_path) = soth_code::state::InstalledHostState::default_path() {
+        match soth_code::state::InstalledHostState::load(&state_path) {
+            Ok(state) if !state.hooks.is_empty() => {
+                println!("install_state: {}", state_path.display());
+                for (agent, rec) in &state.hooks {
+                    println!(
+                        "  {:<11} {} (binary {})",
+                        agent,
+                        rec.installed_at,
+                        rec.binary_path.display()
+                    );
+                }
+            }
+            Ok(_) => {
+                println!(
+                    "install_state: {} (empty — `soth up` has not auto-installed any hooks)",
+                    state_path.display()
+                );
+            }
+            Err(e) => println!("install_state: {} (read error: {e:#})", state_path.display()),
+        }
+    }
+
     // Policy bundle — the soth-code hook handler's third
     // operational dependency (after queue + config). Surface
     // load state so an operator who's wondering "why isn't my

@@ -156,6 +156,104 @@ pub fn default_opencode_plugin_path() -> Option<PathBuf> {
     })
 }
 
+/// One row in the auto-detection result — the agent the
+/// detector recognized as "present on this host" plus the
+/// canonical settings path the install would write to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedAgent {
+    /// Adapter name (`claude_code`, `cursor`, …).
+    pub agent: &'static str,
+    /// The settings / plugin file the install command would
+    /// touch for this agent.
+    pub settings_path: PathBuf,
+    /// True when the agent's settings file already contains
+    /// the soth-managed marker — i.e. hooks are already wired
+    /// (possibly by a prior `soth up`).  The auto-installer
+    /// uses this to skip already-configured agents and just
+    /// refresh state.
+    pub already_installed: bool,
+}
+
+/// Detect AI coding agents on this host — defined as "the
+/// canonical home directory for the agent exists or the
+/// agent's settings file is already present."  Cheaper than
+/// shelling out to `which`; doesn't require the agent's
+/// binary to be on PATH.  Used by `soth up` to decide which
+/// per-agent installers to run.
+///
+/// Returns one entry per supported agent that's detected.
+/// Agents not on the box are simply omitted (no entry, not a
+/// "missing" record).  When the agent is here AND already
+/// has the soth-managed marker, the entry's
+/// `already_installed = true` so the caller can skip
+/// re-running the install but still update state for audit
+/// trail.
+///
+/// OpenClaw is intentionally excluded — its install path is
+/// pending upstream config-format spec (gryph PR #31).
+pub fn detect_installable_agents() -> Vec<DetectedAgent> {
+    // Each entry: (agent_name, default-path-fn, soth-managed-marker
+    // string).  The marker matches what each installer writes;
+    // grep-checking for it tells us if hooks are already wired.
+    let candidates: &[(&'static str, fn() -> Option<PathBuf>, &'static str)] = &[
+        ("claude_code", default_claude_settings_path, "_soth_managed"),
+        ("cursor", default_cursor_hooks_path, "_soth_managed"),
+        ("codex", default_codex_hooks_path, "_soth_managed"),
+        ("gemini_cli", default_gemini_settings_path, "_soth_managed"),
+        ("windsurf", default_windsurf_hooks_path, "_soth_managed"),
+        // For plugin-style agents we detect on the parent
+        // directory rather than the plugin file itself, since
+        // the file only exists post-install.  An agent whose
+        // home directory is missing isn't on this host.
+        ("pi_agent", default_pi_agent_plugin_path, "soth-code"),
+        ("opencode", default_opencode_plugin_path, "soth-code"),
+    ];
+    let mut detected = Vec::new();
+    for (agent, path_fn, marker) in candidates {
+        let Some(path) = path_fn() else {
+            continue;
+        };
+        if !agent_present_on_host(agent, &path) {
+            continue;
+        }
+        let already_installed = std::fs::read_to_string(&path)
+            .map(|c| c.contains(marker))
+            .unwrap_or(false);
+        detected.push(DetectedAgent {
+            agent,
+            settings_path: path,
+            already_installed,
+        });
+    }
+    detected
+}
+
+/// "Is this agent on the host?"  Two signals:
+/// - The settings/plugin file already exists (most reliable).
+/// - The agent's home directory exists (cheap directory probe;
+///   covers the case where the operator installed the agent
+///   but never opened it, so no settings file yet).
+fn agent_present_on_host(agent: &str, settings_path: &Path) -> bool {
+    if settings_path.exists() {
+        return true;
+    }
+    // Walk up to the agent's home directory and probe.  Each
+    // agent has a stable parent prefix we can test; matching
+    // this against the path's components avoids hardcoding a
+    // duplicate "where does this agent live" table.
+    let home_dir = match agent {
+        "claude_code" => dirs::home_dir().map(|h| h.join(".claude")),
+        "cursor" => dirs::home_dir().map(|h| h.join(".cursor")),
+        "codex" => dirs::home_dir().map(|h| h.join(".codex")),
+        "gemini_cli" => dirs::home_dir().map(|h| h.join(".gemini")),
+        "windsurf" => dirs::home_dir().map(|h| h.join(".codeium").join("windsurf")),
+        "pi_agent" => dirs::home_dir().map(|h| h.join(".pi")),
+        "opencode" => dirs::home_dir().map(|h| h.join(".config").join("opencode")),
+        _ => None,
+    };
+    home_dir.map(|d| d.is_dir()).unwrap_or(false)
+}
+
 /// Pi Agent plugin source — TypeScript, ~100 LOC. Embedded via
 /// `include_str!` so the soth binary is self-contained: install
 /// writes this file to `~/.pi/agent/extensions/soth-code.ts` with

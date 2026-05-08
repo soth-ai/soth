@@ -195,6 +195,22 @@ pub struct UpArgs {
     /// Allow fallback to daemon-child mode when managed service startup is unavailable
     #[arg(long)]
     pub allow_daemon_child_fallback: bool,
+
+    /// Skip the soth-code hook auto-install sweep that would
+    /// otherwise wire hooks for every detected AI coding agent
+    /// (Claude Code, Cursor, Codex, Gemini CLI, Pi Agent,
+    /// Windsurf, OpenCode) on this host.  Use when you want
+    /// proxy-only governance and intend to install hooks
+    /// per-agent by hand.
+    #[arg(long)]
+    pub skip_hooks: bool,
+
+    /// Force re-install of every detected agent's hooks even
+    /// when state says they're already wired.  Use after a
+    /// soth binary upgrade that moved the executable path.
+    /// Implied automatically when binary drift is detected.
+    #[arg(long)]
+    pub repair_hooks: bool,
 }
 
 #[derive(Args, Clone)]
@@ -784,7 +800,165 @@ async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow:
             "Proxy up completed but failed to emit shell env activation patch"
         );
     }
+
+    // Auto-install soth-code hooks for every AI coding agent
+    // detected on this host.  Idempotent: a state file at
+    // ~/.soth/installed.json records which agents the install
+    // already wrote; agents already in state with a matching
+    // binary path get skipped, the rest get fresh installs.
+    // The state file makes a re-run of `soth up` cheap (no
+    // unnecessary settings.json rewrites) and gives operators
+    // a single place to see "which agents this host has
+    // governed."
+    if !args.skip_hooks {
+        if let Err(error) = auto_install_detected_hooks(args.repair_hooks, args.quiet) {
+            tracing::warn!(error = %format!("{error:#}"), "soth-code auto-install sweep failed");
+            if !args.quiet {
+                style::warning(&format!(
+                    "soth-code hook auto-install failed: {error:#}\n\
+                     Per-agent install is still available via `soth code install --target <agent>`."
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+/// Detect AI coding agents on this host and install soth-code
+/// hooks for any that aren't already governed.  Idempotent —
+/// the per-host state file at ~/.soth/installed.json records
+/// what's been done so re-runs are cheap.  Per-agent install
+/// failures don't abort the sweep; we report them in the final
+/// summary so operators can see which agents need a manual
+/// follow-up.
+fn auto_install_detected_hooks(force_repair: bool, quiet: bool) -> anyhow::Result<()> {
+    use soth_code::install;
+    use soth_code::state::InstalledHostState;
+
+    let detected = install::detect_installable_agents();
+    if detected.is_empty() {
+        if !quiet {
+            style::info(
+                "No AI coding agents detected on this host. Skipping soth-code hook \
+                 auto-install. Re-run `soth up` after installing Claude Code, Cursor, \
+                 Codex, Gemini CLI, Pi Agent, Windsurf, or OpenCode.",
+            );
+        }
+        return Ok(());
+    }
+
+    let state_path = InstalledHostState::default_path()
+        .context("could not resolve ~/.soth/installed.json — pass HOME or run with --skip-hooks")?;
+    let mut state = InstalledHostState::load(&state_path).unwrap_or_default();
+    let current_binary = std::env::current_exe()
+        .context("could not resolve current binary path for state recording")?;
+
+    let mut installed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut repaired = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for det in &detected {
+        let drifted = state.binary_drifted(det.agent, &current_binary);
+        let needs_install = force_repair || drifted || !det.already_installed;
+        if !needs_install {
+            // Already wired; just refresh state's
+            // installed_at to prove this host saw the agent
+            // recently.
+            state.record_install(
+                det.agent,
+                det.settings_path.clone(),
+                current_binary.clone(),
+            );
+            skipped.push(det.agent.to_string());
+            continue;
+        }
+        match install_one(det.agent, &det.settings_path) {
+            Ok(()) => {
+                state.record_install(
+                    det.agent,
+                    det.settings_path.clone(),
+                    current_binary.clone(),
+                );
+                if drifted {
+                    repaired.push(det.agent.to_string());
+                } else {
+                    installed.push(det.agent.to_string());
+                }
+            }
+            Err(e) => {
+                failed.push((det.agent.to_string(), format!("{e:#}")));
+            }
+        }
+    }
+
+    if let Err(e) = state.save(&state_path) {
+        tracing::warn!(error = %format!("{e:#}"), "failed to persist install state");
+    }
+
+    if !quiet {
+        if !installed.is_empty() {
+            style::info(&format!(
+                "soth-code hooks installed: {}",
+                installed.join(", ")
+            ));
+        }
+        if !repaired.is_empty() {
+            style::info(&format!(
+                "soth-code hooks repaired (binary path drift): {}",
+                repaired.join(", ")
+            ));
+        }
+        if !skipped.is_empty() {
+            style::info(&format!(
+                "soth-code hooks already up-to-date: {}",
+                skipped.join(", ")
+            ));
+        }
+        for (agent, err) in &failed {
+            style::warning(&format!(
+                "soth-code hook install failed for {agent}: {err}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Per-agent install dispatch.  Mirrors the `soth code install`
+/// match arm but is invoked from the auto-install sweep with
+/// the canonical settings path (no `--settings-path` override).
+fn install_one(agent: &str, settings_path: &Path) -> anyhow::Result<()> {
+    use soth_code::install::{
+        install_claude_code, install_codex, install_cursor, install_gemini_cli,
+        install_opencode, install_pi_agent, install_windsurf,
+    };
+    match agent {
+        "claude_code" => install_claude_code(settings_path, None)
+            .map(|_| ())
+            .context("install claude_code hooks"),
+        "cursor" => install_cursor(settings_path, None)
+            .map(|_| ())
+            .context("install cursor hooks"),
+        "codex" => install_codex(settings_path, None)
+            .map(|_| ())
+            .context("install codex hooks"),
+        "gemini_cli" => install_gemini_cli(settings_path, None)
+            .map(|_| ())
+            .context("install gemini_cli hooks"),
+        "windsurf" => install_windsurf(settings_path, None)
+            .map(|_| ())
+            .context("install windsurf hooks"),
+        "pi_agent" => install_pi_agent(settings_path, None)
+            .map(|_| ())
+            .context("install pi_agent plugin"),
+        "opencode" => install_opencode(settings_path, None)
+            .map(|_| ())
+            .context("install opencode plugin"),
+        // OpenClaw deliberately omitted from the auto-installer
+        // — config format pending upstream (gryph PR #31).
+        other => anyhow::bail!("auto-install does not support agent: {other}"),
+    }
 }
 
 async fn ensure_config_for_up(
