@@ -465,6 +465,25 @@ pub struct TelemetryEvent {
     /// (`soth-code`, future explicit-layer producers) populate this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_layer: Option<EventLayer>,
+
+    /// Raw hook-payload JSON, captured by `soth-code` only when an
+    /// operator opts into Audit or Full capture modes. `None` is the
+    /// default, the wire-format invariant, and what every other
+    /// extension (historian, the proxy LiveProxy path) emits.
+    /// Truncated at the edge to a configurable cap; the truncation
+    /// marker `…[truncated]` is preserved on the suffix.
+    /// Cloud-side ingestion stores this verbatim into the
+    /// `intercept_events.raw_payload` column when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_payload: Option<String>,
+
+    /// Which capture mode produced `raw_payload` — `"audit"` or
+    /// `"full"`. `None` when no raw capture happened. Useful in the
+    /// cloud both for the dashboard banner ("raw capture is on for
+    /// this org") and for audit-log entries when an operator views
+    /// raw content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_capture_mode: Option<String>,
 }
 
 impl Default for TelemetryEvent {
@@ -547,6 +566,8 @@ impl Default for TelemetryEvent {
             is_shadow_it: false,
             interaction_mode: InteractionMode::Unknown,
             event_layer: None,
+            raw_payload: None,
+            raw_capture_mode: None,
         }
     }
 }
@@ -675,6 +696,14 @@ impl TelemetryEvent {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
+        // Raw-payload capture: only present when `soth-code` is in
+        // Audit or Full mode (operator-opt-in). Default Metadata mode
+        // doesn't write these keys, so they round-trip as None for
+        // the proxy LiveProxy path and historian. See
+        // extensions/code/src/event.rs::CodeCaptureMode.
+        let raw_payload = meta.get("raw_payload").cloned();
+        let raw_capture_mode = meta.get("raw_capture").cloned();
+
         // Synthesize a ProcessResolution from identity metadata so the sync
         // sender emits tool_identity_key/source_class/tool_name/tool_kind/
         // tool_category/provider_id tags for historian events — matching the
@@ -736,6 +765,8 @@ impl TelemetryEvent {
             complexity_score,
             topic_cluster_id,
             process_resolution,
+            raw_payload,
+            raw_capture_mode,
             interaction_mode: meta
                 .get("interaction_mode")
                 .and_then(|s| serde_json::from_value(serde_json::Value::String(s.clone())).ok())
@@ -1031,6 +1062,57 @@ mod data_source_serde_tests {
             serde_json::to_string(&EventLayer::Session).unwrap(),
             "\"session\""
         );
+    }
+
+    #[test]
+    fn from_governable_extracts_raw_payload_when_present() {
+        // Pin the contract: when an extension (soth-code in Audit /
+        // Full mode) writes `raw_payload` and `raw_capture` into
+        // GovernableEvent metadata, `from_governable` surfaces them
+        // as TelemetryEvent fields so the cloud's ingestion can
+        // store them in `intercept_events.raw_payload` /
+        // `raw_capture_mode` columns. Default Metadata mode keeps
+        // both `None`.
+        use crate::extensions::{ExtensionContext, ExtensionSource, GovernableEvent};
+        use crate::EventSource;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        // Case 1: capture happened — fields present.
+        let mut meta = HashMap::new();
+        meta.insert("raw_payload".to_string(), r#"{"command":"ls"}"#.to_string());
+        meta.insert("raw_capture".to_string(), "audit".to_string());
+        let gov = GovernableEvent {
+            event_id: Uuid::nil(),
+            timestamp_epoch_ms: 0,
+            source: EventSource::Extension {
+                source: ExtensionSource::Code,
+            },
+            provider: "code".to_string(),
+            model: None,
+            endpoint_type: super::EndpointType::Unknown,
+            normalized: None,
+            artifacts: vec![],
+            capture_mode: super::CaptureMode::MetadataOnly,
+            embed_content: None,
+            context: ExtensionContext {
+                extension_name: "code".to_string(),
+                extension_version: "0.1.0".to_string(),
+                metadata: meta,
+            },
+        };
+        let te = TelemetryEvent::from_governable(&gov, None);
+        assert_eq!(te.raw_payload.as_deref(), Some(r#"{"command":"ls"}"#));
+        assert_eq!(te.raw_capture_mode.as_deref(), Some("audit"));
+
+        // Case 2: no capture metadata — fields stay None (default
+        // Metadata mode behavior, which is what every event
+        // historically looked like).
+        let mut gov = gov;
+        gov.context.metadata.clear();
+        let te = TelemetryEvent::from_governable(&gov, None);
+        assert!(te.raw_payload.is_none());
+        assert!(te.raw_capture_mode.is_none());
     }
 
     #[test]

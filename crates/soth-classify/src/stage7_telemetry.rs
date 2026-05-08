@@ -176,6 +176,8 @@ pub(crate) fn run(
         // serialized events. Set explicit Some(EventLayer::Network) here only
         // if the proxy ever emits something other than LiveProxy.
         event_layer: None,
+        raw_payload: None,
+        raw_capture_mode: None,
     };
 
     TelemetryOutput {
