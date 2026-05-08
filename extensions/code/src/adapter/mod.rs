@@ -10,12 +10,22 @@ use crate::decision::{AdapterResponse, HookDecision};
 use crate::event::{CodeEvent, HookContentExtract};
 
 mod claude_code;
+mod codex;
 mod cursor;
+mod gemini_cli;
+mod opencode;
+mod piagent;
 mod stub;
+mod windsurf;
 
 pub use claude_code::ClaudeCodeAdapter;
+pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
+pub use gemini_cli::GeminiCliAdapter;
+pub use opencode::OpenCodeAdapter;
+pub use piagent::PiAgentAdapter;
 pub use stub::StubAdapter;
+pub use windsurf::WindsurfAdapter;
 
 /// Per-agent adapter contract. Each agent's hook payload format,
 /// decision-rendering convention, and install/uninstall flow lives
@@ -98,9 +108,13 @@ pub fn for_agent(name: &str) -> Option<Box<dyn Adapter>> {
     match name {
         "claude_code" => Some(Box::new(ClaudeCodeAdapter::new())),
         "cursor" => Some(Box::new(CursorAdapter::new())),
-        // Pi Agent, Codex, Gemini CLI, Windsurf, OpenCode land in
-        // subsequent Phase 3 commits. Until then any other name
-        // routes to the permissive stub.
+        "pi_agent" | "piagent" => Some(Box::new(PiAgentAdapter::new())),
+        "gemini_cli" | "gemini" => Some(Box::new(GeminiCliAdapter::new())),
+        "codex" => Some(Box::new(CodexAdapter::new())),
+        "windsurf" => Some(Box::new(WindsurfAdapter::new())),
+        "opencode" => Some(Box::new(OpenCodeAdapter::new())),
+        // OpenClaw deferred — gryph PR #31 still open upstream
+        // (schema unstable). Falls through to the stub.
         _ => Some(Box::new(StubAdapter::new(name.to_string()))),
     }
 }
