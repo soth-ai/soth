@@ -24,16 +24,6 @@
       }
     },
     {
-      "rule_id": "code_block_credential_in_payload",
-      "rule_name": "Block hook payloads where edge detect found a credential",
-      "cel_expr": "detect.credential_detected == true",
-      "action": {
-        "kind": "block",
-        "status": 403,
-        "message": "credential detected in hook payload — action blocked to prevent leak"
-      }
-    },
-    {
       "rule_id": "code_block_ssh_dir_write",
       "rule_name": "Block writes inside ~/.ssh/",
       "cel_expr": "action.type == \"file_write\" && action.file_path.contains(\".ssh/\")",
