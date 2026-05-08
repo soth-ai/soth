@@ -1,0 +1,10 @@
+{
+  "hook_type": "tool.execute.before",
+  "session_id": "opencode-block-rm",
+  "tool": "bash",
+  "args": {
+    "command": "rm -rf ./dist",
+    "description": "Wipe dist directory before rebuild"
+  },
+  "cwd": "/home/user/project"
+}

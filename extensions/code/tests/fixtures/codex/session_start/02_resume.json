@@ -1,0 +1,8 @@
+{
+  "session_id": "codex-resume",
+  "transcript_path": "/home/user/.codex/transcripts/dev.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-5",
+  "source": "resume"
+}

@@ -1,0 +1,11 @@
+{
+  "session_id": "gemini-block",
+  "transcript_path": "/home/user/.gemini/transcripts/dev.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "BeforeTool",
+  "tool_name": "run_shell_command",
+  "tool_input": {
+    "command": "rm -rf /tmp/build",
+    "description": "Clear build artifacts"
+  }
+}

@@ -145,15 +145,12 @@ fn every_fixture_parses_for_every_agent() {
 fn each_agent_meets_minimum_fixture_count() {
     // Per docs/gryph/implementation.md D-2: each new adapter ships
     // ≥10 captured payloads (Phase 1 gate). Phase 3 keeps this bar.
-    // Codex is alpha-gated and gets a relaxed minimum since the
-    // upstream protocol is itself young (only 5 hook types as of
-    // rust-codex 0.114.0); 5 fixtures is acceptable for v0.
     for case in agents() {
         let count: usize = hook_type_dirs(case.dir)
             .iter()
             .map(|h| fixtures_in(case.dir, h).len())
             .sum();
-        let minimum = if case.name == "codex" { 5 } else { 5 };
+        let minimum = 10;
         assert!(
             count >= minimum,
             "agent {} has {count} fixtures; minimum is {minimum}. Capture more from real \

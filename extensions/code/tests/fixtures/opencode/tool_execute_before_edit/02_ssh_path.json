@@ -1,0 +1,11 @@
+{
+  "hook_type": "tool.execute.before",
+  "session_id": "opencode-ssh-edit",
+  "tool": "edit",
+  "args": {
+    "file_path": "/home/user/.ssh/known_hosts",
+    "old_string": "old.host.example",
+    "new_string": "new.host.example"
+  },
+  "cwd": "/home/user"
+}

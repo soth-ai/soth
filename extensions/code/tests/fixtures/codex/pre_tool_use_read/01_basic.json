@@ -1,0 +1,13 @@
+{
+  "session_id": "codex-read",
+  "transcript_path": "/home/user/.codex/transcripts/dev.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "o4-mini",
+  "turn_id": "turn-read-1",
+  "tool_name": "Read",
+  "tool_use_id": "tool-read-1",
+  "tool_input": {
+    "file_path": "/home/user/project/src/main.go"
+  }
+}
