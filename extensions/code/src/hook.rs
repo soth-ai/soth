@@ -117,7 +117,7 @@ pub fn run_hook(
     //    When no bundle is loaded, fall through to the artifact-
     //    driven default-deny — gryph Issue #20's silent fail-open
     //    lesson, encoded as a security-tool default.
-    let (decision, policy) = match policy_bundle() {
+    let (mut decision, mut policy) = match policy_bundle() {
         Some(bundle) => {
             let normalized = build_normalized_for_policy(&code_event);
             let policy_ctx = build_policy_context(&code_event);
@@ -127,6 +127,45 @@ pub fn run_hook(
         }
         None => default_deny_from_artifacts(&artifacts),
     };
+
+    // 4b. enforcement gate — Block decisions only halt **pre-action**
+    //     hooks where blocking actually prevents the action from
+    //     running. PostToolUse / Stop / SessionEnd / Notification
+    //     fire AFTER the fact; returning Block from them creates a
+    //     feedback loop (the Stop payload often echoes the
+    //     conversation context which may contain the same credential
+    //     pattern that just got blocked, leading to recursive Block
+    //     on every Stop hook). The action is already done — there is
+    //     nothing to halt, only to record. Surfaced live during the
+    //     2026-05-08 soak with Claude Code: Bash containing an AKIA
+    //     key was correctly blocked by PreToolUse, then the Stop
+    //     hook saw the same pattern in the conversation and started
+    //     blocking every turn.
+    //
+    //     Artifacts and decisions are still recorded in the queue;
+    //     only the agent-facing exit code is downgraded to Allow.
+    if matches!(decision, HookDecision::Block { .. }) && !is_enforceable_hook(hook_type) {
+        tracing::warn!(
+            hook_type = hook_type,
+            artifact_count = artifacts.len(),
+            "soth-code: Block produced on post-action hook; downgrading to Allow (artifacts still audited)"
+        );
+        decision = HookDecision::Allow;
+        // Note: the queue's PolicyDecision goes to `Allow`, but the
+        // GovernableEvent.artifacts list (set below) preserves the
+        // detection record. Operator querying `tail -F` sees
+        // `decision: allow, artifacts: [...]` — clear that something
+        // was detected but not enforced. The downgrade reason lives
+        // in the tracing log line above; not surfaced via
+        // `PolicyWarning` because serde can't round-trip the
+        // tag-newtype variant cleanly.
+        policy = PolicyDecision {
+            kind: PolicyDecisionKind::Allow,
+            matched_rule: None,
+            warnings: Vec::new(),
+            eval_latency_us: 0,
+        };
+    }
 
     // 5. enqueue — convert to GovernableEvent (with artifacts attached
     //    as the audit record of what was detected), append a JSONL row
@@ -216,6 +255,26 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
             metadata,
         },
     }
+}
+
+/// Whether a Block decision on this hook type would actually prevent
+/// an action from running. Pre-action hooks (`pre_tool_use`,
+/// `user_prompt_submit`, `subagent_start`) halt the upcoming action
+/// when they exit non-zero. Post-action hooks (`post_tool_use`,
+/// `stop`, `session_end`, `notification`, `subagent_stop`) fire after
+/// the fact — blocking them prevents nothing and creates feedback
+/// loops when the post-event payload echoes content that triggered
+/// the original detection.
+///
+/// `session_start` is excluded from the enforceable set: blocking a
+/// session start would refuse to let Claude Code initialize, and the
+/// payload at that point doesn't yet carry user content worth
+/// gating on.
+fn is_enforceable_hook(hook_type: &str) -> bool {
+    matches!(
+        hook_type,
+        "pre_tool_use" | "user_prompt_submit" | "subagent_start"
+    )
 }
 
 /// Which LLM provider sits behind each agent. Surfaces in
@@ -749,6 +808,86 @@ mod tests {
         );
         let pctx = build_policy_context(&ev);
         assert!(pctx.semantic.is_none());
+    }
+
+    #[test]
+    fn is_enforceable_hook_classification() {
+        // Pre-action: blocking actually halts the action.
+        assert!(is_enforceable_hook("pre_tool_use"));
+        assert!(is_enforceable_hook("user_prompt_submit"));
+        assert!(is_enforceable_hook("subagent_start"));
+
+        // Post-action: blocking would create feedback loops.
+        assert!(!is_enforceable_hook("post_tool_use"));
+        assert!(!is_enforceable_hook("stop"));
+        assert!(!is_enforceable_hook("session_end"));
+        assert!(!is_enforceable_hook("notification"));
+        assert!(!is_enforceable_hook("subagent_stop"));
+
+        // Lifecycle: not enforceable (refusing session start would
+        // refuse to let Claude Code initialize).
+        assert!(!is_enforceable_hook("session_start"));
+
+        // Unknown: treat as non-enforceable for safety.
+        assert!(!is_enforceable_hook("totally_made_up"));
+    }
+
+    #[test]
+    fn stop_hook_with_credentials_in_payload_does_not_block() {
+        // Surfaced live during 2026-05-08 soak: the Stop hook payload
+        // sometimes echoes conversation context which may contain a
+        // credential pattern that just got blocked by PreToolUse.
+        // Without the enforcement gate, Stop would Block on the same
+        // pattern → Claude Code can't finish its turn → feedback loop.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+
+        // Payload includes an AKIA pattern that detect() will catch.
+        // Stop hook must still Allow regardless.
+        let stdin = br#"{
+            "session_id": "sess-stop-loop",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "stop_hook_active": true,
+            "context": "earlier the user pasted AKIAIOSFODNN7EXAMPLE in a command"
+        }"#;
+        let outcome = run_hook("claude_code", "stop", stdin, &paths).unwrap();
+        assert!(
+            matches!(outcome.decision, HookDecision::Allow),
+            "Stop hook with credentials in payload must downgrade to Allow, got {:?}",
+            outcome.decision
+        );
+
+        // The artifact is still recorded in the queue for audit —
+        // operator can see *what* leaked, just doesn't get Block on
+        // the wrong hook type.
+        let queue = std::fs::read_to_string(&paths.queue).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(queue.lines().next().unwrap()).unwrap();
+        let artifacts = row["event"]["artifacts"].as_array().unwrap();
+        assert!(
+            !artifacts.is_empty(),
+            "artifacts must still be recorded even when decision is downgraded"
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_with_credentials_still_blocks() {
+        // Regression guard: the enforcement gate must NOT downgrade
+        // Block on enforceable hook types. PreToolUse with a
+        // credential remains a Block.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+        let stdin = br#"{
+            "session_id": "sess-block-still",
+            "tool_name": "Bash",
+            "tool_input": { "command": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE aws s3 ls" }
+        }"#;
+        let outcome = run_hook("claude_code", "pre_tool_use", stdin, &paths).unwrap();
+        assert!(
+            matches!(outcome.decision, HookDecision::Block { .. }),
+            "PreToolUse with AWS key must still Block, got {:?}",
+            outcome.decision
+        );
     }
 
     #[test]
