@@ -24,6 +24,7 @@ pub mod detect;
 pub mod diff;
 pub mod event;
 pub mod hook;
+pub mod install;
 pub mod paths;
 
 pub use decision::{AdapterResponse, HookDecision};

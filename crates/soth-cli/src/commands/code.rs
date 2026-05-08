@@ -2,16 +2,17 @@
 //! coding agent's hook boundary. See `docs/gryph/plan.md` §10 for the
 //! architecture; this module is the CLI surface that the agent's
 //! `spawnSync` invocation ultimately hits.
-//!
-//! Group 3 ships `hook` (smoke E2E) + `status`. Group 4 (D-5/D-6)
-//! lands `install` / `uninstall` / `doctor` / `tail`.
 
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
+use soth_code::install::{
+    default_claude_settings_path, install_claude_code, uninstall_claude_code,
+};
 use soth_code::paths::CodePaths;
 use soth_code::CodeExtension;
 
@@ -19,15 +20,30 @@ use soth_code::CodeExtension;
 pub enum CodeCommands {
     /// Hook entry point invoked by the agent's spawnSync. Reads the
     /// hook payload from stdin, runs the soth-code pipeline (parse →
-    /// redact → classify → policy → enqueue), and writes the agent's
-    /// native blocking-shape response back. Exit code: 0 = allow,
+    /// detect → policy → enqueue), and writes the agent's native
+    /// blocking-shape response back. Exit code: 0 = allow,
     /// 2 = block (per-agent contract). Not intended to be run
     /// interactively except for smoke testing.
     Hook(HookArgs),
 
-    /// Print extension status: installed/enabled, queue depth, adapter
-    /// health.
+    /// Install soth-code hooks into an agent's native config.
+    Install(InstallArgs),
+
+    /// Remove soth-managed hook entries from an agent's config.
+    /// User-authored entries are preserved.
+    Uninstall(UninstallArgs),
+
+    /// Print extension status: installed/enabled, queue depth.
     Status(StatusArgs),
+
+    /// Diagnostics: resolved paths, install state, queue size,
+    /// adapter availability. Always uses the same path resolver as
+    /// the runtime (gryph PR #37).
+    Doctor(DoctorArgs),
+
+    /// Print recent action events from the queue file. Defaults to
+    /// the last 10 lines; pass `-n -1` for the whole queue.
+    Tail(TailArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -60,10 +76,64 @@ pub enum StatusFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct InstallArgs {
+    /// Target agent. v0 supports `claude_code`; more in subsequent groups.
+    #[arg(long, default_value = "claude_code")]
+    pub target: String,
+
+    /// Override the agent's settings file path (e.g. for tests or
+    /// non-default installs). Default resolves per-target —
+    /// `~/.claude/settings.json` for `claude_code`.
+    #[arg(long)]
+    pub settings_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct UninstallArgs {
+    #[arg(long, default_value = "claude_code")]
+    pub target: String,
+
+    #[arg(long)]
+    pub settings_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DoctorArgs {
+    /// Override the data-root directory (mostly for tests).
+    #[arg(long, hide = true)]
+    pub root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TailArgs {
+    /// Override the data-root directory.
+    #[arg(long, hide = true)]
+    pub root: Option<PathBuf>,
+
+    /// Number of recent events to print. `-1` prints everything.
+    #[arg(long, short = 'n', default_value_t = 10)]
+    pub history: i32,
+
+    /// Output format.
+    #[arg(long, default_value = "compact")]
+    pub format: TailFormat,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum TailFormat {
+    Compact,
+    Json,
+}
+
 pub async fn run(action: CodeCommands, _global_config: Option<PathBuf>) -> Result<()> {
     match action {
         CodeCommands::Hook(args) => run_hook(args),
+        CodeCommands::Install(args) => run_install(args),
+        CodeCommands::Uninstall(args) => run_uninstall(args),
         CodeCommands::Status(args) => run_status(args),
+        CodeCommands::Doctor(args) => run_doctor(args),
+        CodeCommands::Tail(args) => run_tail(args),
     }
 }
 
@@ -107,6 +177,154 @@ fn run_hook(args: HookArgs) -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+fn run_install(args: InstallArgs) -> Result<()> {
+    if args.target != "claude_code" {
+        anyhow::bail!(
+            "unknown target '{}': v0 supports `claude_code` only (Cursor, Codex, etc. land in subsequent phases)",
+            args.target
+        );
+    }
+    let path = args
+        .settings_path
+        .or_else(default_claude_settings_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not determine ~/.claude/settings.json — pass --settings-path")
+        })?;
+    let report = install_claude_code(&path, None).context("install claude_code hooks")?;
+    println!("settings: {}", report.settings_path.display());
+    if let Some(bak) = &report.backup_path {
+        println!("backup:   {}", bak.display());
+    }
+    println!("binary:   {}", report.binary_path.display());
+    if !report.hooks_added.is_empty() {
+        println!("added:    {}", report.hooks_added.join(", "));
+    }
+    if !report.hooks_already_present.is_empty() {
+        println!("already:  {}", report.hooks_already_present.join(", "));
+    }
+    Ok(())
+}
+
+fn run_uninstall(args: UninstallArgs) -> Result<()> {
+    if args.target != "claude_code" {
+        anyhow::bail!("unknown target '{}': v0 supports `claude_code` only", args.target);
+    }
+    let path = args
+        .settings_path
+        .or_else(default_claude_settings_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not determine ~/.claude/settings.json — pass --settings-path")
+        })?;
+    if !path.exists() {
+        println!("nothing to uninstall — {} does not exist", path.display());
+        return Ok(());
+    }
+    uninstall_claude_code(&path).context("uninstall claude_code hooks")?;
+    println!("settings: {}", path.display());
+    println!("removed soth-managed hook entries");
+    Ok(())
+}
+
+fn run_doctor(args: DoctorArgs) -> Result<()> {
+    // Single-source path resolver — the gryph PR #37 contract.
+    // Doctor must not have its own resolution path that disagrees
+    // with the runtime hook handler.
+    let paths = match args.root {
+        Some(root) => CodePaths::from_root(&root),
+        None => CodePaths::from_default_root(),
+    };
+    let exists = |p: &std::path::Path| if p.exists() { "✓" } else { "·" };
+    println!("paths:");
+    println!("  db        {} {}", exists(&paths.db), paths.db.display());
+    println!("  queue     {} {}", exists(&paths.queue), paths.queue.display());
+    println!("  config    {} {}", exists(&paths.config), paths.config.display());
+    println!(
+        "  plugin    {} {}",
+        exists(&paths.plugin_dir),
+        paths.plugin_dir.display()
+    );
+    println!("  blobs     {} {}", exists(&paths.blob_dir), paths.blob_dir.display());
+
+    if let Some(claude_settings) = default_claude_settings_path() {
+        let installed = match fs::read_to_string(&claude_settings) {
+            Ok(content) => content.contains("\"_soth_managed\""),
+            Err(_) => false,
+        };
+        println!("agents:");
+        println!(
+            "  claude_code {} settings={} installed={}",
+            exists(&claude_settings),
+            claude_settings.display(),
+            installed
+        );
+    }
+
+    let queue_lines = match fs::read_to_string(&paths.queue) {
+        Ok(s) => s.lines().count(),
+        Err(_) => 0,
+    };
+    println!("queue:");
+    println!("  events    {queue_lines} rows");
+    Ok(())
+}
+
+fn run_tail(args: TailArgs) -> Result<()> {
+    let paths = match args.root {
+        Some(root) => CodePaths::from_root(&root),
+        None => CodePaths::from_default_root(),
+    };
+    let content = match fs::read_to_string(&paths.queue) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "queue file does not exist yet ({}); run `soth code hook ...` first",
+                paths.queue.display()
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e).context("read queue file"),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let take = if args.history < 0 {
+        lines.len()
+    } else {
+        std::cmp::min(args.history as usize, lines.len())
+    };
+    let start = lines.len().saturating_sub(take);
+    for line in &lines[start..] {
+        match args.format {
+            TailFormat::Json => println!("{line}"),
+            TailFormat::Compact => print_compact(line),
+        }
+    }
+    Ok(())
+}
+
+fn print_compact(line: &str) {
+    // Best-effort compact rendering — falls back to raw line on parse
+    // failure so operators always see what's in the queue.
+    let parsed: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => {
+            println!("{line}");
+            return;
+        }
+    };
+    let event = &parsed["event"];
+    let meta = &event["context"]["metadata"];
+    let decision_kind = parsed["decision"]["kind"]["kind"].as_str().unwrap_or("?");
+    let agent = meta["agent"].as_str().unwrap_or("?");
+    let action = meta["action_type"].as_str().unwrap_or("?");
+    let hook = meta["hook_type"].as_str().unwrap_or("?");
+    let session = meta["agent_native_session_id"].as_str().unwrap_or("?");
+    let artifacts = event["artifacts"].as_array().map(|a| a.len()).unwrap_or(0);
+    let event_id = event["event_id"].as_str().unwrap_or("?");
+    println!(
+        "[action] {decision_kind:<5} {agent}/{hook} {action} session={session} \
+         artifacts={artifacts} event_id={event_id}"
+    );
 }
 
 fn run_status(args: StatusArgs) -> Result<()> {
