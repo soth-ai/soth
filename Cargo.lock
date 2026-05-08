@@ -4092,6 +4092,7 @@ dependencies = [
  "soth-core",
  "soth-extensions",
  "soth-historian",
+ "soth-policy",
  "soth-proxy",
  "soth-sync",
  "tempfile",

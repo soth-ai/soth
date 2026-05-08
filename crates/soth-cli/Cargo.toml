@@ -22,6 +22,7 @@ soth-proxy = { workspace = true }
 soth-extensions = { workspace = true }
 soth-historian = { workspace = true }
 soth-code = { workspace = true }
+soth-policy = { workspace = true }
 soth-sync = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "signal", "time", "process"] }

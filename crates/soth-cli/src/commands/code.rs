@@ -52,6 +52,67 @@ pub enum CodeCommands {
     /// Print recent action events from the queue file. Defaults to
     /// the last 10 lines; pass `-n -1` for the whole queue.
     Tail(TailArgs),
+
+    /// Manage the CEL policy bundle that the hook handler
+    /// evaluates against on every action. Subcommands:
+    /// `install-default` (bake the shipped starter pack),
+    /// `apply <path>` (verify + copy a custom signed bundle),
+    /// `show` (print the active bundle's rules).
+    #[command(subcommand)]
+    Policy(PolicyCommands),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PolicyCommands {
+    /// Sign + write the bundled starter rule pack to
+    /// `~/.soth/code-policy.bundle`. Uses a built-in dev signing
+    /// key — clearly marked in the bundle metadata. Production
+    /// deployments should replace this with a cloud-signed
+    /// bundle via `soth code policy apply`.
+    InstallDefault(PolicyInstallDefaultArgs),
+
+    /// Copy an externally-signed bundle to
+    /// `~/.soth/code-policy.bundle`. Verifies the signature
+    /// before writing — a malformed or unsigned file is
+    /// rejected.
+    Apply(PolicyApplyArgs),
+
+    /// Print the rules in the active bundle (system + org).
+    Show(PolicyShowArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PolicyInstallDefaultArgs {
+    /// Where to write the signed bundle. Default
+    /// `~/.soth/code-policy.bundle`, which is the path the hook
+    /// handler reads.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    /// Override the org_id stamped into the bundle metadata.
+    /// Default `local-dev` — the built-in dev key indicates
+    /// this is a non-prod bundle.
+    #[arg(long, default_value = "local-dev")]
+    pub org_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PolicyApplyArgs {
+    /// Path to the signed bundle JSON file to install.
+    pub bundle: PathBuf,
+
+    /// Where to copy the verified bundle. Default
+    /// `~/.soth/code-policy.bundle`.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PolicyShowArgs {
+    /// Optional override for the bundle path. Default
+    /// `~/.soth/code-policy.bundle`.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -142,6 +203,11 @@ pub async fn run(action: CodeCommands, _global_config: Option<PathBuf>) -> Resul
         CodeCommands::Status(args) => run_status(args),
         CodeCommands::Doctor(args) => run_doctor(args),
         CodeCommands::Tail(args) => run_tail(args),
+        CodeCommands::Policy(cmd) => match cmd {
+            PolicyCommands::InstallDefault(args) => run_policy_install_default(args),
+            PolicyCommands::Apply(args) => run_policy_apply(args),
+            PolicyCommands::Show(args) => run_policy_show(args),
+        },
     }
 }
 
@@ -471,4 +537,160 @@ fn run_status(args: StatusArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── policy subcommand ─────────────────────────────────────────────
+
+/// Built-in dev signing key for `soth code policy install-default`.
+/// Deterministic — every host that runs `install-default` produces a
+/// bundle signed by the same key, so the runtime can verify locally
+/// without a key-distribution dance. **NOT** suitable for prod
+/// deployments: production bundles should be signed by the cloud's
+/// rotated key and pushed via `soth code policy apply` (or the
+/// future automatic bundle-delivery channel).
+const DEV_SIGNING_SEED: [u8; 32] = [
+    0x73, 0x6f, 0x74, 0x68, 0x2d, 0x63, 0x6f, 0x64, 0x65, 0x2d, 0x64, 0x65, 0x76, 0x2d, 0x70, 0x6f,
+    0x6c, 0x69, 0x63, 0x79, 0x2d, 0x76, 0x31, 0x2d, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x21, 0x21, 0x21,
+];
+
+/// JSON source of the starter rule pack. Bundled at compile time —
+/// embedded into the binary so `soth code policy install-default`
+/// works on a fresh host with no extra files.
+const DEFAULT_RULES_JSON: &str =
+    include_str!("../../../../extensions/code/policies/code-default-rules.json");
+
+#[derive(serde::Deserialize)]
+struct DefaultRulesSource {
+    #[serde(default)]
+    system_rules: Vec<soth_policy::RuleDefinition>,
+    #[serde(default)]
+    org_rules: Vec<soth_policy::RuleDefinition>,
+    #[serde(default)]
+    org_patterns: soth_policy::OrgPatterns,
+    #[serde(default)]
+    budget_limits: soth_policy::BudgetLimits,
+}
+
+fn run_policy_install_default(args: PolicyInstallDefaultArgs) -> Result<()> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::time::SystemTime;
+
+    let source: DefaultRulesSource = serde_json::from_str(DEFAULT_RULES_JSON)
+        .context("parse embedded code-default-rules.json")?;
+
+    let signed_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let payload = soth_policy::PolicyBundlePayload {
+        metadata: soth_policy::PolicyBundleMetadata {
+            bundle_version: format!("soth-code-default-{signed_at}"),
+            schema_version: "1".to_string(),
+            org_id: args.org_id,
+            signed_at,
+        },
+        system_rules: source.system_rules,
+        org_rules: source.org_rules,
+        org_patterns: source.org_patterns,
+        budget_limits: source.budget_limits,
+    };
+
+    let key = SigningKey::from_bytes(&DEV_SIGNING_SEED);
+    let payload_bytes =
+        serde_json::to_vec(&payload).context("serialize default policy payload for signing")?;
+    let signature = key.sign(&payload_bytes);
+    let envelope = soth_policy::SignedPolicyBundle {
+        payload,
+        signature: B64.encode(signature.to_bytes()),
+        public_key: B64.encode(key.verifying_key().to_bytes()),
+    };
+
+    let out_path = match args.out {
+        Some(p) => p,
+        None => default_bundle_path()
+            .context("could not determine default bundle path — pass --out")?,
+    };
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let envelope_bytes =
+        serde_json::to_vec_pretty(&envelope).context("serialize signed policy envelope")?;
+    fs::write(&out_path, &envelope_bytes)
+        .with_context(|| format!("write policy bundle to {}", out_path.display()))?;
+
+    let total_rules = envelope.payload.system_rules.len() + envelope.payload.org_rules.len();
+    println!(
+        "wrote signed dev bundle: {} ({} rule{}, dev-key signed)",
+        out_path.display(),
+        total_rules,
+        if total_rules == 1 { "" } else { "s" }
+    );
+    println!(
+        "the hook handler reads from this path automatically; \
+         override with SOTH_CODE_POLICY_BUNDLE if needed."
+    );
+    Ok(())
+}
+
+fn run_policy_apply(args: PolicyApplyArgs) -> Result<()> {
+    let bytes = fs::read(&args.bundle)
+        .with_context(|| format!("read policy bundle: {}", args.bundle.display()))?;
+    // Run the same verifier the hook handler uses — fails closed
+    // if the signature doesn't validate.
+    soth_policy::load_bundle_from_bytes(&bytes)
+        .with_context(|| format!("verify policy bundle at {}", args.bundle.display()))?;
+
+    let out_path = match args.out {
+        Some(p) => p,
+        None => default_bundle_path()
+            .context("could not determine default bundle path — pass --out")?,
+    };
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    fs::write(&out_path, &bytes)
+        .with_context(|| format!("write policy bundle to {}", out_path.display()))?;
+    println!(
+        "applied verified policy bundle from {} → {}",
+        args.bundle.display(),
+        out_path.display()
+    );
+    Ok(())
+}
+
+fn run_policy_show(args: PolicyShowArgs) -> Result<()> {
+    let path = match args.bundle {
+        Some(p) => p,
+        None => default_bundle_path().context("could not determine default bundle path")?,
+    };
+    if !path.exists() {
+        println!("no bundle at {} — run `soth code policy install-default` first", path.display());
+        return Ok(());
+    }
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let bundle = soth_policy::load_bundle_from_bytes(&bytes)
+        .with_context(|| format!("verify {}", path.display()))?;
+    println!("bundle: {}", path.display());
+    println!("  bundle_version: {}", bundle.metadata.bundle_version);
+    println!("  schema_version: {}", bundle.metadata.schema_version);
+    println!("  org_id:         {}", bundle.metadata.org_id);
+    println!("  signed_at:      {}", bundle.metadata.signed_at);
+    println!(
+        "  rules:          {} system + {} org",
+        bundle.system_rules.rules.len(),
+        bundle.org_rules.rules.len()
+    );
+    for r in bundle.system_rules.rules.iter().chain(bundle.org_rules.rules.iter()) {
+        println!("    [{:?}] {} — {}", r.rule_kind, r.rule_id, r.cel_expr);
+    }
+    Ok(())
+}
+
+fn default_bundle_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SOTH_CODE_POLICY_BUNDLE") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::home_dir().map(|h| h.join(".soth").join("code-policy.bundle"))
 }
