@@ -74,6 +74,11 @@ pub enum InstallError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    #[error(
+        "plugin file at {path} exists but lacks the soth-managed marker — refusing to overwrite \
+         a hand-authored plugin. Rename it or pass --settings-path to a different location."
+    )]
+    NotSothManaged { path: PathBuf },
     #[error("settings root must be a JSON object, got {kind}")]
     NotAnObject { kind: &'static str },
     #[error("write {path}: {source}")]
@@ -125,6 +130,168 @@ pub fn default_windsurf_hooks_path() -> Option<PathBuf> {
             .join("windsurf")
             .join("hooks.json")
     })
+}
+
+/// Default Pi Agent plugin location. Pi Agent loads extensions from
+/// `~/.pi/agent/extensions/`; the soth-code plugin file lands as
+/// `soth-code.ts` in that directory.
+pub fn default_pi_agent_plugin_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".pi")
+            .join("agent")
+            .join("extensions")
+            .join("soth-code.ts")
+    })
+}
+
+/// Default OpenCode plugin location. OpenCode loads plugins from
+/// `~/.config/opencode/plugins/`; the soth-code plugin file lands as
+/// `soth-code.mjs` (ES module) in that directory.
+pub fn default_opencode_plugin_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".config")
+            .join("opencode")
+            .join("plugins")
+            .join("soth-code.mjs")
+    })
+}
+
+/// Pi Agent plugin source — TypeScript, ~100 LOC. Embedded via
+/// `include_str!` so the soth binary is self-contained: install
+/// writes this file to `~/.pi/agent/extensions/soth-code.ts` with
+/// the `__SOTH_BIN__` placeholder substituted to the absolute soth
+/// binary path. Pi Agent loads it on next session.
+const PI_AGENT_PLUGIN_SOURCE: &str = include_str!("../plugins/piagent.ts");
+
+/// OpenCode plugin source — JS ES module, ~70 LOC. Same shipping
+/// model as Pi Agent's plugin: include_str! at compile, write at
+/// install with `__SOTH_BIN__` substituted.
+const OPENCODE_PLUGIN_SOURCE: &str = include_str!("../plugins/opencode.mjs");
+
+/// Marker line written into the plugin file so install/uninstall can
+/// confirm we're touching a soth-managed plugin, not a hand-authored
+/// one with the same filename. Mirrors `SOTH_MARKER_KEY` for JSON
+/// installers but in comment form (plugin files aren't JSON).
+const PLUGIN_MARKER_LINE: &str = "// __SOTH_CODE_MANAGED__";
+
+/// Install the soth-code Pi Agent plugin. Writes the embedded TS
+/// source to `plugin_path` with `__SOTH_BIN__` replaced by the soth
+/// binary's absolute path.
+///
+/// **Pi Agent must be restarted** for the new plugin to load.
+pub fn install_pi_agent(
+    plugin_path: &Path,
+    binary_path_override: Option<PathBuf>,
+) -> Result<InstallReport, InstallError> {
+    install_plugin_file(
+        plugin_path,
+        binary_path_override,
+        "pi_agent",
+        PI_AGENT_PLUGIN_SOURCE,
+    )
+}
+
+pub fn uninstall_pi_agent(plugin_path: &Path) -> Result<(), InstallError> {
+    uninstall_plugin_file(plugin_path)
+}
+
+/// Install the soth-code OpenCode plugin.
+pub fn install_opencode(
+    plugin_path: &Path,
+    binary_path_override: Option<PathBuf>,
+) -> Result<InstallReport, InstallError> {
+    install_plugin_file(
+        plugin_path,
+        binary_path_override,
+        "opencode",
+        OPENCODE_PLUGIN_SOURCE,
+    )
+}
+
+pub fn uninstall_opencode(plugin_path: &Path) -> Result<(), InstallError> {
+    uninstall_plugin_file(plugin_path)
+}
+
+/// Generic plugin-file installer. Different from JSON installers in
+/// shape: there's no "merge with existing config" — the plugin file
+/// is wholly owned by soth-code. If a file with the same name exists
+/// AND lacks the soth marker line, refuse to overwrite (operator
+/// presumably has a hand-authored plugin with the same name).
+fn install_plugin_file(
+    plugin_path: &Path,
+    binary_path_override: Option<PathBuf>,
+    agent: &str,
+    source_template: &str,
+) -> Result<InstallReport, InstallError> {
+    let binary_path = match binary_path_override {
+        Some(p) => p,
+        None => std::env::current_exe().map_err(InstallError::NoBinary)?,
+    };
+    if let Some(parent) = plugin_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| InstallError::Mkdir {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+
+    let backup_path = if plugin_path.exists() {
+        let existing = fs::read_to_string(plugin_path).map_err(|e| InstallError::Read {
+            path: plugin_path.to_path_buf(),
+            source: e,
+        })?;
+        if !existing.contains(PLUGIN_MARKER_LINE) {
+            // Hand-authored plugin with the same filename. Refuse to
+            // overwrite — operator must rename theirs first or pass
+            // a different --settings-path.
+            return Err(InstallError::NotSothManaged {
+                path: plugin_path.to_path_buf(),
+            });
+        }
+        let bak = plugin_path.with_extension(
+            plugin_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|e| format!("{e}.bak"))
+                .unwrap_or_else(|| "bak".to_string()),
+        );
+        write_atomic(&bak, existing.as_bytes())?;
+        Some(bak)
+    } else {
+        None
+    };
+
+    let source = source_template
+        .replace("__SOTH_BIN__", &binary_path.display().to_string());
+    write_atomic(plugin_path, source.as_bytes())?;
+
+    Ok(InstallReport {
+        settings_path: plugin_path.to_path_buf(),
+        backup_path,
+        hooks_added: vec![format!("{agent} plugin")],
+        hooks_already_present: Vec::new(),
+        binary_path,
+    })
+}
+
+fn uninstall_plugin_file(plugin_path: &Path) -> Result<(), InstallError> {
+    if !plugin_path.exists() {
+        return Ok(());
+    }
+    let existing = fs::read_to_string(plugin_path).map_err(|e| InstallError::Read {
+        path: plugin_path.to_path_buf(),
+        source: e,
+    })?;
+    if !existing.contains(PLUGIN_MARKER_LINE) {
+        // Not soth-managed; don't touch it. Same defense in depth as
+        // install — a user-authored plugin with the same filename
+        // shouldn't be deleted by a careless uninstall.
+        return Ok(());
+    }
+    fs::remove_file(plugin_path).map_err(|e| InstallError::Write {
+        path: plugin_path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(())
 }
 
 /// Install the soth-code hook into Claude Code's `settings.json`.
@@ -1219,6 +1386,105 @@ mod tests {
         super::install_cursor(&path, Some(binary_path())).unwrap();
         let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(body["version"], 1);
+    }
+
+    #[test]
+    fn pi_agent_plugin_installs_with_binary_substituted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ext").join("soth-code.ts");
+        let report = install_pi_agent(&path, Some(binary_path())).unwrap();
+        assert!(path.exists());
+        let body = fs::read_to_string(&path).unwrap();
+        // Marker line preserved so reinstall/uninstall recognizes
+        // this as our file.
+        assert!(body.contains(PLUGIN_MARKER_LINE));
+        // Binary path substituted.
+        assert!(body.contains(&binary_path().display().to_string()));
+        assert!(!body.contains("__SOTH_BIN__"), "placeholder must be substituted at install");
+        // Hook command shape: agent + canonical hook_type. The
+        // hook_type is passed as a variable in the spawnSync call,
+        // but the plugin's per-event handlers reference the literals
+        // (e.g. `callSoth("pre_tool_use", ...)` for the tool_call
+        // handler). Check both the agent literal and any pre/post
+        // hook literal lands in the file.
+        assert!(body.contains("\"pi_agent\""));
+        assert!(body.contains("\"pre_tool_use\""));
+        assert!(body.contains("\"post_tool_use\""));
+        assert_eq!(report.hooks_added, vec!["pi_agent plugin".to_string()]);
+    }
+
+    #[test]
+    fn opencode_plugin_installs_with_binary_substituted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("plugins").join("soth-code.mjs");
+        let report = install_opencode(&path, Some(binary_path())).unwrap();
+        assert!(path.exists());
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains(PLUGIN_MARKER_LINE));
+        assert!(body.contains(&binary_path().display().to_string()));
+        assert!(body.contains("\"opencode\""));
+        assert!(body.contains("\"tool_execute_before\""));
+        assert_eq!(report.hooks_added, vec!["opencode plugin".to_string()]);
+    }
+
+    #[test]
+    fn plugin_install_refuses_to_overwrite_user_authored_file() {
+        // Pre-install a hand-authored plugin without our marker. The
+        // installer must refuse to overwrite — operator's plugin is
+        // theirs, not ours.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("soth-code.ts");
+        fs::write(&path, "// my own plugin, not soth's\nexport default () => {};").unwrap();
+        let r = install_pi_agent(&path, Some(binary_path()));
+        assert!(matches!(r, Err(InstallError::NotSothManaged { .. })));
+        // File unchanged.
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("my own plugin"));
+    }
+
+    #[test]
+    fn plugin_uninstall_idempotent_and_marker_aware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("soth-code.ts");
+        install_pi_agent(&path, Some(binary_path())).unwrap();
+        assert!(path.exists());
+        uninstall_pi_agent(&path).unwrap();
+        assert!(!path.exists(), "uninstall removes a soth-managed plugin");
+        // Idempotent: uninstall on a missing file is fine.
+        uninstall_pi_agent(&path).unwrap();
+    }
+
+    #[test]
+    fn plugin_uninstall_does_not_touch_user_authored_file() {
+        // If somehow a non-marker file ends up at the plugin path
+        // (operator hand-wrote it after we uninstalled), uninstall
+        // must NOT delete it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("soth-code.ts");
+        fs::write(&path, "// user's plugin\n").unwrap();
+        uninstall_pi_agent(&path).unwrap();
+        // Still there.
+        assert!(path.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "// user's plugin\n");
+    }
+
+    #[test]
+    fn plugin_install_reinstall_keeps_marker_and_substitutes_binary() {
+        // Re-install with a different binary path: file gets rewritten
+        // with the new binary substituted, marker preserved, original
+        // becomes the .bak.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("soth-code.ts");
+        install_pi_agent(&path, Some(PathBuf::from("/old/path/soth"))).unwrap();
+        let r = install_pi_agent(&path, Some(PathBuf::from("/new/path/soth"))).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("/new/path/soth"));
+        assert!(!body.contains("/old/path/soth"));
+        // Backup of the previous (also soth-managed) file.
+        let bak = r.backup_path.expect(".bak created on overwrite");
+        assert!(bak.exists());
+        let bak_body = fs::read_to_string(&bak).unwrap();
+        assert!(bak_body.contains("/old/path/soth"));
     }
 
     #[test]

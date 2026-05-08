@@ -12,9 +12,11 @@ use clap::{Args, Subcommand};
 
 use soth_code::install::{
     default_claude_settings_path, default_codex_hooks_path, default_cursor_hooks_path,
-    default_gemini_settings_path, default_windsurf_hooks_path, install_claude_code, install_codex,
-    install_cursor, install_gemini_cli, install_windsurf, uninstall_claude_code, uninstall_codex,
-    uninstall_cursor, uninstall_gemini_cli, uninstall_windsurf,
+    default_gemini_settings_path, default_opencode_plugin_path, default_pi_agent_plugin_path,
+    default_windsurf_hooks_path, install_claude_code, install_codex, install_cursor,
+    install_gemini_cli, install_opencode, install_pi_agent, install_windsurf,
+    uninstall_claude_code, uninstall_codex, uninstall_cursor, uninstall_gemini_cli,
+    uninstall_opencode, uninstall_pi_agent, uninstall_windsurf,
 };
 use soth_code::paths::CodePaths;
 use soth_code::CodeExtension;
@@ -204,11 +206,18 @@ fn run_install(args: InstallArgs) -> Result<()> {
             let path = resolve_install_path(&args, default_windsurf_hooks_path, "~/.codeium/windsurf/hooks.json")?;
             install_windsurf(&path, None).context("install windsurf hooks")?
         }
+        "pi_agent" | "piagent" => {
+            let path = resolve_install_path(&args, default_pi_agent_plugin_path, "~/.pi/agent/extensions/soth-code.ts")?;
+            install_pi_agent(&path, None).context("install pi_agent plugin")?
+        }
+        "opencode" => {
+            let path = resolve_install_path(&args, default_opencode_plugin_path, "~/.config/opencode/plugins/soth-code.mjs")?;
+            install_opencode(&path, None).context("install opencode plugin")?
+        }
         other => anyhow::bail!(
-            "unknown target '{other}': JSON-config installs supported are \
-             `claude_code`, `cursor`, `gemini_cli`, `codex`, `windsurf`. \
-             Pi Agent and OpenCode use JS-plugin shipping — manual configuration \
-             only in v0; install land in a follow-up commit."
+            "unknown target '{other}': supported targets are `claude_code`, `cursor`, \
+             `gemini_cli`, `codex`, `windsurf`, `pi_agent`, `opencode`. \
+             OpenClaw is deferred (gryph PR #31 unstable upstream)."
         ),
     };
     println!("settings: {}", report.settings_path.display());
@@ -247,9 +256,17 @@ fn run_uninstall(args: UninstallArgs) -> Result<()> {
             resolve_uninstall_path(&args, default_windsurf_hooks_path, "~/.codeium/windsurf/hooks.json")?,
             UninstallKind::Windsurf,
         ),
+        "pi_agent" | "piagent" => (
+            resolve_uninstall_path(&args, default_pi_agent_plugin_path, "~/.pi/agent/extensions/soth-code.ts")?,
+            UninstallKind::PiAgent,
+        ),
+        "opencode" => (
+            resolve_uninstall_path(&args, default_opencode_plugin_path, "~/.config/opencode/plugins/soth-code.mjs")?,
+            UninstallKind::OpenCode,
+        ),
         other => anyhow::bail!(
             "unknown target '{other}': supported targets are `claude_code`, `cursor`, \
-             `gemini_cli`, `codex`, `windsurf`"
+             `gemini_cli`, `codex`, `windsurf`, `pi_agent`, `opencode`"
         ),
     };
     if !path.exists() {
@@ -262,6 +279,8 @@ fn run_uninstall(args: UninstallArgs) -> Result<()> {
         UninstallKind::Gemini => uninstall_gemini_cli(&path).context("uninstall gemini_cli hooks")?,
         UninstallKind::Codex => uninstall_codex(&path).context("uninstall codex hooks")?,
         UninstallKind::Windsurf => uninstall_windsurf(&path).context("uninstall windsurf hooks")?,
+        UninstallKind::PiAgent => uninstall_pi_agent(&path).context("uninstall pi_agent plugin")?,
+        UninstallKind::OpenCode => uninstall_opencode(&path).context("uninstall opencode plugin")?,
     }
     println!("settings: {}", path.display());
     println!("removed soth-managed hook entries");
@@ -274,6 +293,8 @@ enum UninstallKind {
     Gemini,
     Codex,
     Windsurf,
+    PiAgent,
+    OpenCode,
 }
 
 fn resolve_install_path(
