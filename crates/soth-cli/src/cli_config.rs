@@ -843,6 +843,59 @@ pub struct CodeExtensionConfig {
     /// retention responsibility for the captured content. Cloud-side
     /// gating per-org provides defense-in-depth.
     pub capture: CodeCaptureConfig,
+
+    /// How the per-action classify path runs.  Hooks are short-lived
+    /// subprocesses, so loading the 23 MB ONNX bundle per invocation
+    /// blows the latency target.  When `Subprocess` (default), `soth
+    /// start` supervises a long-running classify daemon alongside
+    /// historian and hooks talk to it over localhost TCP.
+    pub classify: CodeClassifyConfig,
+}
+
+/// `code.classify` block.  Controls how the per-hook classify call
+/// is dispatched — daemon, in-process, or off entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeClassifyConfig {
+    pub run_mode: ClassifyRunMode,
+}
+
+impl Default for CodeClassifyConfig {
+    fn default() -> Self {
+        Self {
+            run_mode: ClassifyRunMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifyRunMode {
+    /// Default.  `soth start` supervises a long-running classify
+    /// daemon (sibling to historian).  Hook subprocesses talk to it
+    /// over localhost TCP NDJSON, amortizing the ONNX
+    /// `Session::new` cost (≈50–150 ms cold) across every action
+    /// for the daemon's lifetime.  Falls back to `InProcess` per-
+    /// invocation when the daemon is unreachable.
+    Subprocess,
+    /// Each hook subprocess loads `~/.soth/bundle/` itself.
+    /// Adds ~50–150 ms cold latency per action — fine for low-
+    /// traffic dev hosts but blows the gate-latency budget on
+    /// active sessions.  Useful when the supervisor isn't running
+    /// (e.g.  CI runners that invoke `soth code hook` directly).
+    InProcess,
+    /// Skip classify entirely.  Sidecar fields render as
+    /// `unknown`/0 on the dashboard.  Operators choose this when
+    /// the agent's traffic is purely structural (no NL prompts) or
+    /// when they want to take classify off the hot path during
+    /// debugging.
+    Disabled,
+}
+
+impl Default for ClassifyRunMode {
+    fn default() -> Self {
+        Self::Subprocess
+    }
 }
 
 /// `code.capture` block. See [`CodeCaptureMode`] for semantics; the
@@ -890,6 +943,7 @@ impl Default for CodeExtensionConfig {
             timeout_ms: 30_000,
             agents: std::collections::HashMap::new(),
             capture: CodeCaptureConfig::default(),
+            classify: CodeClassifyConfig::default(),
         }
     }
 }
@@ -1107,6 +1161,12 @@ mod code_extension_config_tests {
         assert!(
             c.agents.is_empty(),
             "no agents default to enabled — adapters opt in explicitly"
+        );
+        assert_eq!(
+            c.classify.run_mode,
+            super::ClassifyRunMode::Subprocess,
+            "default classify run mode is supervised daemon — pinning so the \
+             upgrade path doesn't silently regress to per-hook ONNX loads"
         );
     }
 

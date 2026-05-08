@@ -108,21 +108,38 @@ pub fn run_hook(
     //    classify ran, attach the sidecar so the policy evaluator
     //    (step 4) can read `PolicyContext.semantic` and the dashboard
     //    can render anomaly score + use-case label per-action.
+    // Try the long-running classify daemon first (`soth start`
+    // supervises one alongside historian).  When it's reachable
+    // the per-hook ONNX cost is amortized to one Session::new for
+    // the daemon's lifetime instead of one per agent action.  A
+    // missing/crashed daemon falls through to the in-process
+    // fallback bundle — sidecar quality degrades but the gate
+    // still runs.
     let classify_start = std::time::Instant::now();
     if let Some(extract) = adapter.classify_input(&code_event) {
-        let identity = ClassifyIdentity::default();
-        let input = HookClassifyInput {
-            agent_name: &code_event.agent,
-            provider: provider_for_agent(&code_event.agent),
-            model: None,
-            content: &extract.content,
-            kind: extract.kind,
-            identity: &identity,
-        };
-        let bundle = classify_bundle();
-        let config = ClassifyConfig::default();
-        let result = soth_classify::classify_for_hook(input, &bundle, &config);
-        code_event.classify = Some(ClassifySidecar::from(&result));
+        let req = crate::classify_daemon::build_request(
+            &code_event.agent,
+            provider_for_agent(&code_event.agent),
+            None,
+            &extract.content,
+            extract.kind,
+        );
+        let sidecar = crate::classify_daemon::try_classify(&req).or_else(|| {
+            let identity = ClassifyIdentity::default();
+            let input = HookClassifyInput {
+                agent_name: &code_event.agent,
+                provider: provider_for_agent(&code_event.agent),
+                model: None,
+                content: &extract.content,
+                kind: extract.kind,
+                identity: &identity,
+            };
+            let bundle = classify_bundle();
+            let config = ClassifyConfig::default();
+            let result = soth_classify::classify_for_hook(input, &bundle, &config);
+            Some(ClassifySidecar::from(&result))
+        });
+        code_event.classify = sidecar;
     }
     let classify_us = elapsed_us(classify_start);
 
@@ -659,15 +676,65 @@ fn default_deny_from_artifacts(artifacts: &[SensitiveArtifact]) -> (HookDecision
     )
 }
 
-/// Lazy-loaded classify bundle. Group 5 ships with `fallback_bundle()`
-/// (deterministic-hash embedding, no ONNX) — fast load per hook
-/// subprocess and identical outputs across machines without the
-/// model file. Real ONNX-backed bundles would require either a
-/// long-running daemon (we explicitly skipped, see plan §5) or a
-/// shared-memory model cache (Phase 5).
+/// Lazy-loaded classify bundle.  Tries the real ONNX-backed
+/// bundle at `~/.soth/bundle/` (same directory the proxy loads
+/// from — the bundle delivery system already keeps it
+/// up-to-date via `soth-sync`).  Falls through to the
+/// keyword-only `fallback_bundle()` only when the real bundle
+/// is missing or fails to load.
+///
+/// Per-subprocess cost: ONNX session initialization is the
+/// dominant term (~50-150ms cold, ~10-30ms warm via OS page
+/// cache).  We accept that cost over `fallback_bundle()`'s
+/// "every event labels Unknown" outcome, which made the /code
+/// dashboard's classify columns useless in practice.
+/// Bookkeeping hooks (Stop, Notification, SessionStart) bypass
+/// classify entirely via `Adapter::classify_input` returning
+/// `None`, so the cost only lands on events that actually need
+/// classification.
+///
+/// Override path via `SOTH_CLASSIFY_BUNDLE_DIR` for tests or
+/// non-default installs.
 fn classify_bundle() -> Arc<ClassifyBundle> {
     static CACHE: OnceLock<Arc<ClassifyBundle>> = OnceLock::new();
-    CACHE.get_or_init(soth_classify::fallback_bundle).clone()
+    CACHE
+        .get_or_init(|| {
+            let dir = classify_bundle_dir();
+            if let Some(path) = dir.as_ref() {
+                if path.exists() {
+                    match soth_classify::load_bundle(path) {
+                        Ok(b) => {
+                            tracing::debug!(
+                                bundle_dir = %path.display(),
+                                "soth-code: loaded real classify bundle"
+                            );
+                            return b;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                bundle_dir = %path.display(),
+                                error = ?e,
+                                "soth-code: classify bundle load failed; falling through to keyword fallback"
+                            );
+                        }
+                    }
+                }
+            }
+            tracing::warn!(
+                "soth-code: no classify bundle on disk at ~/.soth/bundle/; \
+                 use_case_label and anomaly_score will be Unknown.  Run \
+                 `soth up` to fetch the bundle from the cloud."
+            );
+            soth_classify::fallback_bundle()
+        })
+        .clone()
+}
+
+fn classify_bundle_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SOTH_CLASSIFY_BUNDLE_DIR") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::home_dir().map(|h| h.join(".soth").join("bundle"))
 }
 
 fn data_source_for_agent(agent: &str) -> &'static str {

@@ -670,6 +670,38 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         },
     }
 
+    // Classify daemon — the long-running ONNX server that hooks
+    // talk to instead of loading the 23 MB bundle per
+    // invocation.  Reports port-file presence, listener
+    // reachability, and pid so operators can tell whether the
+    // dashboard's "unknown" sidecar is a missing daemon vs. a
+    // missing bundle vs. the disabled-mode knob.
+    println!("classify:");
+    match soth_code::classify_daemon::status() {
+        None => println!("  daemon    —  (HOME unresolvable)"),
+        Some(s) if !s.port_file_path.exists() => {
+            println!(
+                "  daemon    · {} (no port file — run `soth start` to bring up the supervisor)",
+                s.port_file_path.display()
+            );
+        }
+        Some(s) => match (s.port, s.reachable) {
+            (Some(port), true) => println!(
+                "  daemon    ✓ 127.0.0.1:{port} (pid {}, started {})",
+                s.pid.unwrap_or(0),
+                s.started_at.as_deref().unwrap_or("?")
+            ),
+            (Some(port), false) => println!(
+                "  daemon    ✗ 127.0.0.1:{port} unreachable (port file at {} — supervisor may be respawning, or the daemon crashed)",
+                s.port_file_path.display()
+            ),
+            (None, _) => println!(
+                "  daemon    ✗ {} (port file present but unparseable)",
+                s.port_file_path.display()
+            ),
+        },
+    }
+
     // Queue + timings telemetry — what the cloud is shipping
     // and what `soth code stats` will summarize.
     println!("queue:");

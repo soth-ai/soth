@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod classify_daemon;
 pub mod decision;
 pub mod detect;
 pub mod diff;

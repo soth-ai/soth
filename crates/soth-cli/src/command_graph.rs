@@ -142,6 +142,15 @@ pub struct StartArgs {
     #[arg(long, hide = true)]
     pub historian_child: bool,
 
+    /// Internal classify-daemon sibling worker mode. Same pattern as
+    /// `historian_child` — set by the supervisor when re-execing this
+    /// binary as the classify daemon worker (see
+    /// `spawn_classify_daemon_process`). Hidden from `--help`. The
+    /// `SOTH_CODE_CLASSIFY_WORKER=1` env paired with this flag is what
+    /// actually dispatches into `run_classify_daemon_worker`.
+    #[arg(long, hide = true)]
+    pub classify_daemon_child: bool,
+
     /// Do not register startup autostart
     #[arg(long)]
     pub no_autostart: bool,
@@ -1470,6 +1479,7 @@ mod tests {
                     foreground: false,
                     daemon_child: false,
                     historian_child: false,
+                    classify_daemon_child: false,
                     no_autostart: true,
                     allow_daemon_child_fallback: true,
                 },
@@ -1657,6 +1667,7 @@ mod tests {
                         foreground: false,
                         daemon_child: false,
                         historian_child: false,
+                        classify_daemon_child: false,
                         no_autostart: true,
                         allow_daemon_child_fallback: false,
                     },

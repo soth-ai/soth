@@ -78,6 +78,17 @@ pub async fn run(
         return run_historian_worker().await;
     }
 
+    // Classify-daemon worker mode: re-execed by the supervisor to
+    // run the long-running ONNX classify server.  Same multi-call
+    // binary pattern as historian — keeps the install surface
+    // single-binary while letting hook subprocesses dispatch
+    // classify in 5–15 ms (warm) instead of 50–150 ms (cold per
+    // call) by sharing one in-memory bundle for the daemon's
+    // lifetime.
+    if std::env::var(CLASSIFY_DAEMON_WORKER_ENV).is_ok() {
+        return run_classify_daemon_worker().await;
+    }
+
     // Windows autostart self-detach: when `soth start --daemon-child` is
     // invoked from HKCU\...\Run at user login, explorer.exe spawns it with
     // default creation flags — the binary gets a visible console and is
@@ -178,6 +189,25 @@ pub async fn run(
         } else {
             None
         };
+
+    // Classify daemon sibling process.  Same supervision pattern as
+    // historian: spawn-and-respawn-with-backoff in its own task so a
+    // wedged classify daemon never blocks the mitm runtime.  A
+    // crashed daemon also doesn't crash the gate — hook subprocesses
+    // fall back to an in-process keyword bundle when the port file
+    // is stale or connect refuses.
+    let _classify_supervisor: Option<tokio::task::JoinHandle<()>> = if config.extensions.code.enabled
+        && matches!(
+            config.extensions.code.classify.run_mode,
+            cli_config::ClassifyRunMode::Subprocess
+        ) {
+        let classify_config_path = generated_path.clone();
+        Some(tokio::spawn(async move {
+            supervise_classify_daemon(classify_config_path).await;
+        }))
+    } else {
+        None
+    };
 
     // Engage the OS-level system proxy so traffic actually flows through us.
     // Reached by both foreground (`soth up --foreground`) and daemon-child
@@ -433,6 +463,117 @@ async fn spawn_historian_process(config_path: &Path) -> Result<Child> {
         .map_err(|error| anyhow::anyhow!("failed launching historian worker: {error}"))
 }
 
+/// Supervise the classify-daemon sibling process. Same crash-and-respawn
+/// shape as [`supervise_historian`]: exponential backoff (500 ms base,
+/// 60 s cap) on failure, exit cleanly when the child exits 0.
+///
+/// A crashed daemon must not crash the hook gate — the hook handler
+/// already falls back to an in-process keyword bundle when
+/// `try_classify` returns None — so this loop's only job is to keep
+/// the long-running daemon alive without burning the supervisor's CPU
+/// in a tight respawn loop.
+async fn supervise_classify_daemon(config_path: PathBuf) {
+    let mut consecutive_failures: u32 = 0;
+    const MAX_BACKOFF_MS: u64 = 60_000;
+    const BASE_BACKOFF_MS: u64 = 500;
+
+    loop {
+        let mut child = match spawn_classify_daemon_process(config_path.as_path()).await {
+            Ok(child) => child,
+            Err(error) => {
+                warn!(
+                    %error,
+                    consecutive_failures,
+                    "failed to spawn classify daemon sibling process"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff = (BASE_BACKOFF_MS
+                    .saturating_mul(2u64.saturating_pow(consecutive_failures.min(8))))
+                .min(MAX_BACKOFF_MS);
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                continue;
+            }
+        };
+
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                info!("classify daemon sibling exited cleanly (status 0) — not respawning");
+                return;
+            }
+            Ok(status) => {
+                warn!(
+                    code = ?status.code(),
+                    "classify daemon sibling exited with non-zero status — will respawn"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+            Err(error) => {
+                warn!(%error, "classify daemon sibling wait() errored — will respawn");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+        }
+
+        let backoff = (BASE_BACKOFF_MS
+            .saturating_mul(2u64.saturating_pow(consecutive_failures.min(8))))
+        .min(MAX_BACKOFF_MS);
+        info!(
+            backoff_ms = backoff,
+            consecutive_failures, "respawning classify daemon sibling after backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
+    }
+}
+
+/// Spawn the classify-daemon sibling process. Re-execs the current
+/// binary with `start --classify-daemon-child` and the worker env
+/// var, which the top of [`run`] dispatches to
+/// [`run_classify_daemon_worker`]. Lower scheduler priority via the
+/// same `nice +5` / BELOW_NORMAL_PRIORITY_CLASS knobs historian
+/// uses, for the same reason: classify CPU bursts must never starve
+/// the mitm runtime.
+async fn spawn_classify_daemon_process(config_path: &Path) -> Result<Child> {
+    let current_exe =
+        std::env::current_exe().context("resolve current executable for classify daemon worker")?;
+    let mut cmd = Command::new(current_exe);
+    cmd.arg("start").arg("--classify-daemon-child");
+    cmd.env(CLASSIFY_DAEMON_WORKER_ENV, "1");
+    cmd.env("SOTH_PROXY_CONFIG", config_path);
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    #[cfg(unix)]
+    {
+        unsafe {
+            cmd.pre_exec(|| {
+                let rc = libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    eprintln!("warning: setpriority(+5) failed for classify daemon child: {err}");
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        cmd.creation_flags(
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS,
+        );
+    }
+
+    cmd.kill_on_drop(true);
+
+    cmd.spawn()
+        .map_err(|error| anyhow::anyhow!("failed launching classify daemon worker: {error}"))
+}
+
 async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Result<Child> {
     let current_exe =
         std::env::current_exe().context("resolve current executable for proxy worker")?;
@@ -475,6 +616,11 @@ pub(crate) const PROXY_WORKER_ENV: &str = "SOTH_PROXY_WORKER";
 /// [`spawn_historian_process`]; consumed at the top of [`run`] to dispatch
 /// into [`run_historian_worker`].
 pub(crate) const HISTORIAN_WORKER_ENV: &str = "SOTH_HISTORIAN_WORKER";
+
+/// Env var toggle for the classify-daemon sibling process. Set by
+/// [`spawn_classify_daemon_process`]; consumed at the top of [`run`] to
+/// dispatch into [`run_classify_daemon_worker`].
+pub(crate) const CLASSIFY_DAEMON_WORKER_ENV: &str = "SOTH_CODE_CLASSIFY_WORKER";
 
 /// Windows-only marker env var. Set by spawners that have already applied
 /// `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` flags so
@@ -1528,6 +1674,66 @@ async fn run_historian_worker() -> Result<()> {
     extension.run_watch(&ctx, shutdown_rx).await;
     tracing::info!("historian worker exiting");
     drop(shutdown_tx);
+    Ok(())
+}
+
+/// Classify-daemon worker entry. Re-execed by the supervisor when
+/// `extensions.code.classify.run_mode == Subprocess`. Loads
+/// `~/.soth/bundle/` once, binds an ephemeral localhost TCP port,
+/// writes `~/.soth/classify-daemon.json` so hook subprocesses can
+/// find it, and serves NDJSON-framed classify requests.
+///
+/// `serve()` is blocking std::net (not tokio), so we run it in
+/// `spawn_blocking` to keep the runtime responsive to shutdown
+/// signals. Exits when:
+///
+/// - SIGTERM/SIGINT received (returns Ok so the supervisor reaps
+///   without restart-loop noise on intentional shutdown)
+/// - The bundle path is missing (returns Err — the supervisor's
+///   backoff handles the case where the user hasn't run
+///   `soth setup-ca` / bundle install yet)
+async fn run_classify_daemon_worker() -> Result<()> {
+    let _observability_guard = soth_proxy::runtime::init_tracing(&[
+        "soth_code=info",
+        "soth_classify=info",
+        "warn",
+    ]);
+
+    let bundle_dir = dirs::home_dir()
+        .map(|h| h.join(".soth").join("bundle"))
+        .context("resolve ~/.soth/bundle for classify daemon")?;
+    if !bundle_dir.exists() {
+        anyhow::bail!(
+            "classify daemon: bundle directory missing at {} — run `soth setup-ca` / install the policy bundle, or set extensions.code.classify.run_mode = disabled",
+            bundle_dir.display()
+        );
+    }
+
+    let bundle_for_thread = bundle_dir.clone();
+    let serve_handle = std::thread::spawn(move || soth_code::classify_daemon::serve(&bundle_for_thread, 0));
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .context("install SIGTERM handler in classify daemon worker")?;
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("classify daemon worker received SIGTERM"),
+            _ = tokio::signal::ctrl_c() => tracing::info!("classify daemon worker received SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("classify daemon worker received Ctrl+C");
+    }
+
+    // The serve loop has no graceful-shutdown channel today (it's
+    // an `accept()` loop on TcpListener) — letting the process
+    // exit drops the listener and joins the thread implicitly via
+    // OS teardown. The worker re-binds on respawn so this is
+    // recoverable.
+    drop(serve_handle);
     Ok(())
 }
 
