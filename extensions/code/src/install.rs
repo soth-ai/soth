@@ -97,6 +97,13 @@ pub fn default_claude_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
 
+/// Default Cursor hooks file location. Cursor uses a separate
+/// `hooks.json` file (not the larger `settings.json`) for hook
+/// configuration, mirroring gryph's `agent/cursor/detect.go::HooksPath`.
+pub fn default_cursor_hooks_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cursor").join("hooks.json"))
+}
+
 /// Install the soth-code hook into Claude Code's `settings.json`.
 ///
 /// `settings_path` must be the absolute path to the settings file —
@@ -199,6 +206,222 @@ pub fn install_claude_code(
         hooks_already_present,
         binary_path,
     })
+}
+
+/// Cursor's hook event names paired with the snake_case form passed
+/// to the soth-code subprocess via `--type`. Cursor uses camelCase
+/// natively; we normalize at install time so the hook subprocess
+/// accepts a uniform CLI shape across all agents.
+const CURSOR_HOOK_TYPES: &[(&str, &str)] = &[
+    // Pre-action (can block)
+    ("preToolUse", "pre_tool_use"),
+    ("beforeShellExecution", "before_shell_execution"),
+    ("beforeReadFile", "before_read_file"),
+    ("beforeSubmitPrompt", "before_submit_prompt"),
+    // Post-action (audit)
+    ("postToolUse", "post_tool_use"),
+    ("afterFileEdit", "after_file_edit"),
+    ("afterShellExecution", "after_shell_execution"),
+    // Lifecycle
+    ("sessionStart", "session_start"),
+    ("sessionEnd", "session_end"),
+    ("stop", "stop"),
+];
+
+/// Install soth-code hooks into Cursor's `~/.cursor/hooks.json`.
+///
+/// Cursor's hooks.json shape (per gryph's `cursor/hooks.go`):
+///
+/// ```json
+/// {
+///   "version": 1,
+///   "hooks": {
+///     "preToolUse": [{"command": "/path/to/binary ..."}],
+///     "beforeShellExecution": [{"command": "..."}],
+///     ...
+///   }
+/// }
+/// ```
+///
+/// Simpler than Claude Code's nested `matcher`/`hooks` shape. We add
+/// a `_soth_managed: true` marker field to each entry so future
+/// install/uninstall runs can find their own work without touching
+/// user-authored hook entries.
+///
+/// Same atomic-write + `.bak` + pre-flight-parse discipline as
+/// `install_claude_code` (gryph PR #37 lessons).
+pub fn install_cursor(
+    hooks_path: &Path,
+    binary_path_override: Option<PathBuf>,
+) -> Result<InstallReport, InstallError> {
+    let binary_path = match binary_path_override {
+        Some(p) => p,
+        None => std::env::current_exe().map_err(InstallError::NoBinary)?,
+    };
+
+    if let Some(parent) = hooks_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| InstallError::Mkdir {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+
+    let original_content = read_settings_or_empty(hooks_path)?;
+    let mut hooks_doc: Value = if original_content.trim().is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(&original_content).map_err(|e| InstallError::Malformed {
+            path: hooks_path.to_path_buf(),
+            source: e,
+        })?
+    };
+
+    if !hooks_doc.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(&hooks_doc),
+        });
+    }
+
+    let backup_path = if hooks_path.exists() && !original_content.is_empty() {
+        let bak = hooks_path.with_extension("json.bak");
+        write_atomic(&bak, original_content.as_bytes())?;
+        Some(bak)
+    } else {
+        None
+    };
+
+    // Cursor's top-level `version` field — populate if absent.
+    {
+        let map = hooks_doc.as_object_mut().expect("checked");
+        map.entry("version").or_insert_with(|| Value::Number(1.into()));
+    }
+
+    let hooks_obj = hooks_doc
+        .as_object_mut()
+        .expect("checked")
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
+    if !hooks_obj.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(hooks_obj),
+        });
+    }
+
+    let mut hooks_added = Vec::new();
+    let mut hooks_already_present = Vec::new();
+
+    for (cursor_event, soth_hook_type) in CURSOR_HOOK_TYPES {
+        let entry_added =
+            ensure_cursor_hook_entry(hooks_obj, cursor_event, soth_hook_type, "cursor", &binary_path);
+        if entry_added {
+            hooks_added.push((*cursor_event).to_string());
+        } else {
+            hooks_already_present.push((*cursor_event).to_string());
+        }
+    }
+
+    let updated = serde_json::to_string_pretty(&hooks_doc)?;
+    write_atomic(hooks_path, updated.as_bytes())?;
+
+    // Sanity re-parse.
+    let written = fs::read_to_string(hooks_path).map_err(|e| InstallError::Read {
+        path: hooks_path.to_path_buf(),
+        source: e,
+    })?;
+    serde_json::from_str::<Value>(&written).map_err(|e| InstallError::Malformed {
+        path: hooks_path.to_path_buf(),
+        source: e,
+    })?;
+
+    Ok(InstallReport {
+        settings_path: hooks_path.to_path_buf(),
+        backup_path,
+        hooks_added,
+        hooks_already_present,
+        binary_path,
+    })
+}
+
+/// Remove soth-managed hook entries from Cursor's `~/.cursor/hooks.json`.
+/// User-authored entries are preserved.
+pub fn uninstall_cursor(hooks_path: &Path) -> Result<(), InstallError> {
+    let content = read_settings_or_empty(hooks_path)?;
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    let mut doc: Value = serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
+        path: hooks_path.to_path_buf(),
+        source: e,
+    })?;
+    if !doc.is_object() {
+        return Err(InstallError::NotAnObject {
+            kind: kind_label(&doc),
+        });
+    }
+
+    if let Some(hooks) = doc
+        .as_object_mut()
+        .and_then(|root| root.get_mut("hooks"))
+        .and_then(Value::as_object_mut)
+    {
+        for (_, group) in hooks.iter_mut() {
+            if let Some(arr) = group.as_array_mut() {
+                arr.retain(|entry| !is_soth_managed(entry));
+            }
+        }
+        let all_empty = hooks
+            .iter()
+            .all(|(_, v)| v.as_array().map(|a| a.is_empty()).unwrap_or(false));
+        if all_empty {
+            doc.as_object_mut().unwrap().remove("hooks");
+            // Also drop the `version` key when we're the only writer
+            // (no other hook entries left), so an uninstall on a
+            // soth-only file leaves an empty `{}`.
+            doc.as_object_mut().unwrap().remove("version");
+        }
+    }
+
+    let updated = serde_json::to_string_pretty(&doc)?;
+    write_atomic(hooks_path, updated.as_bytes())?;
+    Ok(())
+}
+
+/// Cursor-specific hook entry shape: `{command: "..."}`. Simpler
+/// than Claude Code's `{matcher, hooks: [{type, command}]}`.
+fn ensure_cursor_hook_entry(
+    hooks: &mut Value,
+    cursor_event: &str,
+    soth_hook_type: &str,
+    agent: &str,
+    binary_path: &Path,
+) -> bool {
+    let hooks_map = hooks.as_object_mut().unwrap();
+    let entries = hooks_map
+        .entry(cursor_event)
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let arr = match entries.as_array_mut() {
+        Some(a) => a,
+        None => {
+            *entries = Value::Array(vec![entries.clone()]);
+            entries.as_array_mut().unwrap()
+        }
+    };
+
+    if arr.iter().any(is_soth_managed) {
+        return false;
+    }
+
+    arr.push(json!({
+        SOTH_MARKER_KEY: true,
+        "command": format!(
+            "{} code hook --agent {} --type {}",
+            binary_path.display(),
+            agent,
+            soth_hook_type
+        )
+    }));
+    true
 }
 
 /// Remove every soth-managed hook entry from Claude Code's

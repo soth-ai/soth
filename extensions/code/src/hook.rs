@@ -144,7 +144,7 @@ pub fn run_hook(
     //
     //     Artifacts and decisions are still recorded in the queue;
     //     only the agent-facing exit code is downgraded to Allow.
-    if matches!(decision, HookDecision::Block { .. }) && !is_enforceable_hook(hook_type) {
+    if matches!(decision, HookDecision::Block { .. }) && !adapter.is_pre_action_hook(hook_type) {
         tracing::warn!(
             hook_type = hook_type,
             artifact_count = artifacts.len(),
@@ -295,26 +295,6 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
             metadata,
         },
     }
-}
-
-/// Whether a Block decision on this hook type would actually prevent
-/// an action from running. Pre-action hooks (`pre_tool_use`,
-/// `user_prompt_submit`, `subagent_start`) halt the upcoming action
-/// when they exit non-zero. Post-action hooks (`post_tool_use`,
-/// `stop`, `session_end`, `notification`, `subagent_stop`) fire after
-/// the fact — blocking them prevents nothing and creates feedback
-/// loops when the post-event payload echoes content that triggered
-/// the original detection.
-///
-/// `session_start` is excluded from the enforceable set: blocking a
-/// session start would refuse to let Claude Code initialize, and the
-/// payload at that point doesn't yet carry user content worth
-/// gating on.
-fn is_enforceable_hook(hook_type: &str) -> bool {
-    matches!(
-        hook_type,
-        "pre_tool_use" | "user_prompt_submit" | "subagent_start"
-    )
 }
 
 /// Which LLM provider sits behind each agent. Surfaces in
@@ -851,25 +831,27 @@ mod tests {
     }
 
     #[test]
-    fn is_enforceable_hook_classification() {
+    fn claude_code_pre_action_hook_classification() {
         // Pre-action: blocking actually halts the action.
-        assert!(is_enforceable_hook("pre_tool_use"));
-        assert!(is_enforceable_hook("user_prompt_submit"));
-        assert!(is_enforceable_hook("subagent_start"));
+        let a = adapter::ClaudeCodeAdapter::new();
+        use crate::adapter::Adapter;
+        assert!(a.is_pre_action_hook("pre_tool_use"));
+        assert!(a.is_pre_action_hook("user_prompt_submit"));
+        assert!(a.is_pre_action_hook("subagent_start"));
 
         // Post-action: blocking would create feedback loops.
-        assert!(!is_enforceable_hook("post_tool_use"));
-        assert!(!is_enforceable_hook("stop"));
-        assert!(!is_enforceable_hook("session_end"));
-        assert!(!is_enforceable_hook("notification"));
-        assert!(!is_enforceable_hook("subagent_stop"));
+        assert!(!a.is_pre_action_hook("post_tool_use"));
+        assert!(!a.is_pre_action_hook("stop"));
+        assert!(!a.is_pre_action_hook("session_end"));
+        assert!(!a.is_pre_action_hook("notification"));
+        assert!(!a.is_pre_action_hook("subagent_stop"));
 
         // Lifecycle: not enforceable (refusing session start would
         // refuse to let Claude Code initialize).
-        assert!(!is_enforceable_hook("session_start"));
+        assert!(!a.is_pre_action_hook("session_start"));
 
         // Unknown: treat as non-enforceable for safety.
-        assert!(!is_enforceable_hook("totally_made_up"));
+        assert!(!a.is_pre_action_hook("totally_made_up"));
     }
 
     #[test]

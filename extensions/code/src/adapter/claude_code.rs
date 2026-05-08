@@ -72,6 +72,13 @@ impl Adapter for ClaudeCodeAdapter {
         Ok(event)
     }
 
+    fn is_pre_action_hook(&self, hook_type: &str) -> bool {
+        matches!(
+            hook_type,
+            "pre_tool_use" | "user_prompt_submit" | "subagent_start"
+        )
+    }
+
     fn classify_input(&self, event: &CodeEvent) -> Option<HookContentExtract> {
         match event.hook_type.as_str() {
             "user_prompt_submit" => {

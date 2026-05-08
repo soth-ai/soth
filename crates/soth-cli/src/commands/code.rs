@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
 use soth_code::install::{
-    default_claude_settings_path, install_claude_code, uninstall_claude_code,
+    default_claude_settings_path, default_cursor_hooks_path, install_claude_code, install_cursor,
+    uninstall_claude_code, uninstall_cursor,
 };
 use soth_code::paths::CodePaths;
 use soth_code::CodeExtension;
@@ -180,19 +181,34 @@ fn run_hook(args: HookArgs) -> Result<()> {
 }
 
 fn run_install(args: InstallArgs) -> Result<()> {
-    if args.target != "claude_code" {
-        anyhow::bail!(
-            "unknown target '{}': v0 supports `claude_code` only (Cursor, Codex, etc. land in subsequent phases)",
-            args.target
-        );
-    }
-    let path = args
-        .settings_path
-        .or_else(default_claude_settings_path)
-        .ok_or_else(|| {
-            anyhow::anyhow!("could not determine ~/.claude/settings.json — pass --settings-path")
-        })?;
-    let report = install_claude_code(&path, None).context("install claude_code hooks")?;
+    let report = match args.target.as_str() {
+        "claude_code" => {
+            let path = args
+                .settings_path
+                .or_else(default_claude_settings_path)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "could not determine ~/.claude/settings.json — pass --settings-path"
+                    )
+                })?;
+            install_claude_code(&path, None).context("install claude_code hooks")?
+        }
+        "cursor" => {
+            let path = args
+                .settings_path
+                .or_else(default_cursor_hooks_path)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "could not determine ~/.cursor/hooks.json — pass --settings-path"
+                    )
+                })?;
+            install_cursor(&path, None).context("install cursor hooks")?
+        }
+        other => anyhow::bail!(
+            "unknown target '{other}': supported targets are `claude_code`, `cursor`. \
+             Pi Agent / Codex / Gemini CLI / Windsurf / OpenCode land in subsequent Phase 3 commits."
+        ),
+    };
     println!("settings: {}", report.settings_path.display());
     if let Some(bak) = &report.backup_path {
         println!("backup:   {}", bak.display());
@@ -208,20 +224,32 @@ fn run_install(args: InstallArgs) -> Result<()> {
 }
 
 fn run_uninstall(args: UninstallArgs) -> Result<()> {
-    if args.target != "claude_code" {
-        anyhow::bail!("unknown target '{}': v0 supports `claude_code` only", args.target);
-    }
-    let path = args
-        .settings_path
-        .or_else(default_claude_settings_path)
-        .ok_or_else(|| {
-            anyhow::anyhow!("could not determine ~/.claude/settings.json — pass --settings-path")
-        })?;
+    let path = match args.target.as_str() {
+        "claude_code" => args
+            .settings_path
+            .or_else(default_claude_settings_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("could not determine ~/.claude/settings.json — pass --settings-path")
+            })?,
+        "cursor" => args
+            .settings_path
+            .or_else(default_cursor_hooks_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("could not determine ~/.cursor/hooks.json — pass --settings-path")
+            })?,
+        other => anyhow::bail!(
+            "unknown target '{other}': supported targets are `claude_code`, `cursor`"
+        ),
+    };
     if !path.exists() {
         println!("nothing to uninstall — {} does not exist", path.display());
         return Ok(());
     }
-    uninstall_claude_code(&path).context("uninstall claude_code hooks")?;
+    match args.target.as_str() {
+        "claude_code" => uninstall_claude_code(&path).context("uninstall claude_code hooks")?,
+        "cursor" => uninstall_cursor(&path).context("uninstall cursor hooks")?,
+        _ => unreachable!("validated above"),
+    }
     println!("settings: {}", path.display());
     println!("removed soth-managed hook entries");
     Ok(())

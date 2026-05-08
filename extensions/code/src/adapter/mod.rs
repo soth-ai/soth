@@ -10,9 +10,11 @@ use crate::decision::{AdapterResponse, HookDecision};
 use crate::event::{CodeEvent, HookContentExtract};
 
 mod claude_code;
+mod cursor;
 mod stub;
 
 pub use claude_code::ClaudeCodeAdapter;
+pub use cursor::CursorAdapter;
 pub use stub::StubAdapter;
 
 /// Per-agent adapter contract. Each agent's hook payload format,
@@ -43,6 +45,24 @@ pub trait Adapter: Send + Sync {
     /// per agent's hook taxonomy. See `docs/gryph/plan.md` §10.10.
     fn classify_input(&self, _event: &CodeEvent) -> Option<HookContentExtract> {
         None
+    }
+
+    /// Whether this hook type, for this agent, fires **before** the
+    /// action runs. Only pre-action hooks can usefully Block — post-
+    /// action hooks (Stop, PostToolUse, Notification, …) fire after
+    /// the fact, where Block prevents nothing and creates feedback
+    /// loops when post-event payloads echo content that triggered
+    /// the original detection (gryph 2026-05-08 soak finding;
+    /// hook.rs `is_enforceable_hook` regression test pins this
+    /// guarantee).
+    ///
+    /// Default `false` (safe — adapters must opt their pre-action
+    /// hooks in explicitly). Each agent's pre-action hook taxonomy
+    /// differs; e.g. Claude Code uses snake_case `pre_tool_use`,
+    /// Cursor uses snake_case `pre_tool_use` + a richer set
+    /// (`before_shell_execution`, `before_read_file`, …).
+    fn is_pre_action_hook(&self, _hook_type: &str) -> bool {
+        false
     }
 }
 
@@ -77,9 +97,10 @@ pub fn for_agent(name: &str) -> Option<Box<dyn Adapter>> {
     }
     match name {
         "claude_code" => Some(Box::new(ClaudeCodeAdapter::new())),
-        // Other adapters land in subsequent groups (Pi Agent, Cursor,
-        // Codex, Gemini CLI, Windsurf, OpenCode). Until then any other
-        // name lands on the stub.
+        "cursor" => Some(Box::new(CursorAdapter::new())),
+        // Pi Agent, Codex, Gemini CLI, Windsurf, OpenCode land in
+        // subsequent Phase 3 commits. Until then any other name
+        // routes to the permissive stub.
         _ => Some(Box::new(StubAdapter::new(name.to_string()))),
     }
 }
