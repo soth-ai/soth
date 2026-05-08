@@ -463,27 +463,100 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     );
     println!("  blobs     {} {}", exists(&paths.blob_dir), paths.blob_dir.display());
 
-    if let Some(claude_settings) = default_claude_settings_path() {
-        let installed = match fs::read_to_string(&claude_settings) {
-            Ok(content) => content.contains("\"_soth_managed\""),
-            Err(_) => false,
-        };
-        println!("agents:");
-        println!(
-            "  claude_code {} settings={} installed={}",
-            exists(&claude_settings),
-            claude_settings.display(),
-            installed
-        );
+    // Agents — per-adapter install state.  Each row tries the
+    // canonical settings path for that agent; "installed" means
+    // the file contains the soth-managed marker.  No file →
+    // "missing" (agent likely not on this host); file present
+    // but no marker → "not_installed" (agent here, soth-code
+    // hooks not wired).
+    println!("agents:");
+    let agents: &[(&str, fn() -> Option<PathBuf>, &str)] = &[
+        ("claude_code", default_claude_settings_path, "_soth_managed"),
+        ("cursor", default_cursor_hooks_path, "_soth_managed"),
+        ("codex", default_codex_hooks_path, "_soth_managed"),
+        ("gemini_cli", default_gemini_settings_path, "_soth_managed"),
+        ("windsurf", default_windsurf_hooks_path, "_soth_managed"),
+        ("pi_agent", default_pi_agent_plugin_path, "soth-code"),
+        ("opencode", default_opencode_plugin_path, "soth-code"),
+    ];
+    for (name, default_fn, marker) in agents {
+        match default_fn() {
+            None => println!("  {name:<11} —  (no canonical path on this OS)"),
+            Some(path) => {
+                let state = match fs::read_to_string(&path) {
+                    Ok(content) if content.contains(marker) => "installed",
+                    Ok(_) => "not_installed",
+                    Err(_) => "missing",
+                };
+                println!(
+                    "  {name:<11} {} {state:<14} {}",
+                    exists(&path),
+                    path.display()
+                );
+            }
+        }
     }
 
-    let queue_lines = match fs::read_to_string(&paths.queue) {
-        Ok(s) => s.lines().count(),
-        Err(_) => 0,
-    };
+    // Policy bundle — the soth-code hook handler's third
+    // operational dependency (after queue + config). Surface
+    // load state so an operator who's wondering "why isn't my
+    // CEL rule firing?" has a clear next step.
+    let bundle_path = default_bundle_path();
+    println!("policy:");
+    match &bundle_path {
+        None => println!("  bundle    —  (HOME unresolvable)"),
+        Some(p) if !p.exists() => println!(
+            "  bundle    · {} (not present — run `soth code policy install-default`)",
+            p.display()
+        ),
+        Some(p) => match fs::read(p) {
+            Err(e) => println!("  bundle    ✗ {} (read error: {e})", p.display()),
+            Ok(bytes) => match soth_policy::load_bundle_from_bytes(&bytes) {
+                Err(e) => println!("  bundle    ✗ {} (verify failed: {e})", p.display()),
+                Ok(b) => println!(
+                    "  bundle    ✓ {} ({} system + {} org rules, signed_at={})",
+                    p.display(),
+                    b.system_rules.rules.len(),
+                    b.org_rules.rules.len(),
+                    b.metadata.signed_at,
+                ),
+            },
+        },
+    }
+
+    // Queue + timings telemetry — what the cloud is shipping
+    // and what `soth code stats` will summarize.
     println!("queue:");
-    println!("  events    {queue_lines} rows");
+    match fs::read_to_string(&paths.queue) {
+        Ok(s) => {
+            let rows = s.lines().count();
+            let bytes = s.len();
+            println!("  events    {rows} rows ({})", fmt_bytes(bytes));
+        }
+        Err(_) => println!("  events    · (not yet written)"),
+    }
+    let timings = soth_code::hook::timings_path(&paths);
+    match fs::read_to_string(&timings) {
+        Ok(s) => {
+            let rows = s.lines().count();
+            println!("  timings   {rows} rows  ({})", timings.display());
+        }
+        Err(_) => println!("  timings   · {}", timings.display()),
+    }
+
     Ok(())
+}
+
+fn fmt_bytes(n: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if n >= MIB {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.1} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 fn run_tail(args: TailArgs) -> Result<()> {
