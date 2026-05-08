@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use soth_classify::{
     ClassifyBundle, ClassifyConfig, HookClassifyInput, HookIdentity as ClassifyIdentity,
@@ -78,17 +79,21 @@ pub fn run_hook(
     paths: &CodePaths,
     capture: &HookCaptureConfig,
 ) -> Result<HookOutcome, HookError> {
+    let total_start = std::time::Instant::now();
     let adapter =
         adapter::for_agent(agent_name).ok_or_else(|| HookError::UnknownAgent(agent_name.into()))?;
 
     // 1. parse — adapter produces a CodeEvent.
+    let parse_start = std::time::Instant::now();
     let mut code_event = adapter.parse_event(hook_type, stdin_bytes)?;
+    let parse_us = elapsed_us(parse_start);
 
     // 2. detect — scan payload for credential shapes, produce
     //    SensitiveArtifact per match. Same model the proxy uses.
     //    Detection NEVER mutates the payload (gryph PR #40 / proxy
     //    semantics): mutation would be a policy decision
     //    (`PolicyDecisionKind::Redact`), not the detector's.
+    let detect_start = std::time::Instant::now();
     let tool_name = code_event
         .payload
         .get("tool_name")
@@ -96,12 +101,14 @@ pub fn run_hook(
         .unwrap_or("")
         .to_string();
     let artifacts = crate::detect::scan(&code_event.payload, &tool_name);
+    let detect_us = elapsed_us(detect_start);
 
     // 3. classify — adapter declares which slice of the payload is
     //    classifiable (prompt text, tool args, tool result). When
     //    classify ran, attach the sidecar so the policy evaluator
     //    (step 4) can read `PolicyContext.semantic` and the dashboard
     //    can render anomaly score + use-case label per-action.
+    let classify_start = std::time::Instant::now();
     if let Some(extract) = adapter.classify_input(&code_event) {
         let identity = ClassifyIdentity::default();
         let input = HookClassifyInput {
@@ -117,6 +124,7 @@ pub fn run_hook(
         let result = soth_classify::classify_for_hook(input, &bundle, &config);
         code_event.classify = Some(ClassifySidecar::from(&result));
     }
+    let classify_us = elapsed_us(classify_start);
 
     // 4. decide — when an OPA bundle is loaded (via env var
     //    SOTH_CODE_POLICY_BUNDLE or a default path), the bundle's
@@ -125,6 +133,7 @@ pub fn run_hook(
     //    When no bundle is loaded, fall through to the artifact-
     //    driven default-deny — gryph Issue #20's silent fail-open
     //    lesson, encoded as a security-tool default.
+    let policy_start = std::time::Instant::now();
     let (mut decision, mut policy) = match policy_bundle() {
         Some(bundle) => {
             let normalized = build_normalized_for_policy(&code_event);
@@ -135,6 +144,7 @@ pub fn run_hook(
         }
         None => default_deny_from_artifacts(&artifacts),
     };
+    let policy_us = elapsed_us(policy_start);
 
     // 4b. enforcement gate — Block decisions only halt **pre-action**
     //     hooks where blocking actually prevents the action from
@@ -188,7 +198,35 @@ pub fn run_hook(
     if should_capture_raw(capture.mode, &decision) {
         attach_raw_payload(&mut governable, &code_event, capture);
     }
+    let enqueue_start = std::time::Instant::now();
     enqueue(paths.queue.as_path(), &governable, &policy)?;
+    let enqueue_us = elapsed_us(enqueue_start);
+
+    // Stamp per-stage timings into the *just-written* row by
+    // computing total here and re-writing the metadata. We do
+    // this via a follow-up append of the timing summary
+    // (in-place rewrite would race with concurrent writers).
+    // The main row already carries decision/artifacts; the
+    // timing sidecar is a separate JSONL row keyed by event_id
+    // that the cloud ingestion / `soth code stats` can join.
+    let total_us = elapsed_us(total_start);
+    let timings = HookTimings {
+        event_id: code_event.event_id,
+        agent: code_event.agent.clone(),
+        action_type: code_event.action_type.as_str().to_string(),
+        decision: decision_label(&decision).to_string(),
+        parse_us,
+        detect_us,
+        classify_us,
+        policy_us,
+        enqueue_us,
+        total_us,
+    };
+    if let Err(e) = append_timing_row(timings_path(paths).as_path(), &timings) {
+        // Timing telemetry is best-effort — never block the
+        // hook because we couldn't write the timings sidecar.
+        tracing::warn!("soth-code: failed to append hook timings: {e}");
+    }
 
     // 6. render — adapter decides stdout/stderr/exit code.
     let response = adapter.render_decision(&decision);
@@ -660,6 +698,63 @@ fn attach_raw_payload(
         .context
         .metadata
         .insert("raw_capture".to_string(), capture.mode.as_str().to_string());
+}
+
+/// Per-hook timing summary written to the local timings sidecar.
+/// One row per hook invocation; `soth code stats` reads the file
+/// to compute p50/p95/p99 percentiles per stage. Kept separate
+/// from the main GovernableEvent queue so cloud ingestion isn't
+/// polluted with operational telemetry — the cloud has its own
+/// per-event latency surface via the existing classify
+/// `eval_latency_us` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookTimings {
+    pub event_id: uuid::Uuid,
+    pub agent: String,
+    pub action_type: String,
+    pub decision: String,
+    pub parse_us: u64,
+    pub detect_us: u64,
+    pub classify_us: u64,
+    pub policy_us: u64,
+    pub enqueue_us: u64,
+    pub total_us: u64,
+}
+
+fn elapsed_us(start: std::time::Instant) -> u64 {
+    start.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+
+fn decision_label(d: &HookDecision) -> &'static str {
+    match d {
+        HookDecision::Allow => "allow",
+        HookDecision::Block { .. } => "block",
+        HookDecision::Error(_) => "error",
+    }
+}
+
+/// Sidecar path for hook-timing JSONL — co-located with the
+/// queue under `<queue-dir>/code-hook-timings.jsonl`.
+pub fn timings_path(paths: &CodePaths) -> PathBuf {
+    let queue_dir = paths
+        .queue
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| paths.queue.clone());
+    queue_dir.join("code-hook-timings.jsonl")
+}
+
+fn append_timing_row(path: &Path, timings: &HookTimings) -> std::io::Result<()> {
+    use std::fs::{create_dir_all, OpenOptions};
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(timings)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    line.push('\n');
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 fn enqueue(

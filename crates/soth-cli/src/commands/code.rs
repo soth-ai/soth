@@ -67,6 +67,26 @@ pub enum CodeCommands {
     /// until its historian playbook is audited to extract
     /// authoritative `usage` blocks per assistant turn.
     AuditStatus,
+
+    /// Summarize hook-pipeline latency from the local timings
+    /// sidecar (~/.soth/queue/code-hook-timings.jsonl). Reports
+    /// p50/p95/p99 per stage so operators can answer "is the
+    /// hook fast enough?" without leaving the host. Targets per
+    /// plan §10.10: p99 ≤ 50ms cached, ≤ 100ms cold.
+    Stats(StatsArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct StatsArgs {
+    /// Override the timings file path. Default
+    /// `~/.soth/queue/code-hook-timings.jsonl`.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+
+    /// Look back at most N rows (most recent). Default 1000.
+    /// Pass 0 for "all rows".
+    #[arg(long, default_value = "1000")]
+    pub last: usize,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -216,6 +236,7 @@ pub async fn run(action: CodeCommands, _global_config: Option<PathBuf>) -> Resul
             PolicyCommands::Show(args) => run_policy_show(args),
         },
         CodeCommands::AuditStatus => run_audit_status(_global_config),
+        CodeCommands::Stats(args) => run_stats(args),
     }
 }
 
@@ -763,6 +784,91 @@ fn run_audit_status(config_path: Option<PathBuf>) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── stats subcommand ────────────────────────────────────────────────
+
+fn run_stats(args: StatsArgs) -> Result<()> {
+    let path = args.file.unwrap_or_else(|| {
+        // Default to the path the hook handler writes — derived
+        // from CodePaths::from_default_root.
+        let paths = CodePaths::from_default_root();
+        soth_code::hook::timings_path(&paths)
+    });
+    if !path.exists() {
+        println!("no timings file at {} — run a few hooks first", path.display());
+        return Ok(());
+    }
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut rows: Vec<soth_code::hook::HookTimings> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if rows.is_empty() {
+        println!("timings file at {} is empty", path.display());
+        return Ok(());
+    }
+    if args.last > 0 && rows.len() > args.last {
+        let drop = rows.len() - args.last;
+        rows.drain(..drop);
+    }
+
+    println!("hook latency summary ({} samples)", rows.len());
+    println!("targets: p99 ≤ 50ms cached / ≤ 100ms cold (plan §10.10)");
+    println!();
+    println!("  {:<12} {:>8} {:>8} {:>8} {:>8}", "stage", "p50_us", "p95_us", "p99_us", "max_us");
+    println!("  {}", "-".repeat(56));
+    let stages: &[(&str, fn(&soth_code::hook::HookTimings) -> u64)] = &[
+        ("parse", |t| t.parse_us),
+        ("detect", |t| t.detect_us),
+        ("classify", |t| t.classify_us),
+        ("policy", |t| t.policy_us),
+        ("enqueue", |t| t.enqueue_us),
+        ("total", |t| t.total_us),
+    ];
+    for (name, picker) in stages {
+        let mut samples: Vec<u64> = rows.iter().map(|r| picker(r)).collect();
+        samples.sort_unstable();
+        let p50 = percentile(&samples, 50);
+        let p95 = percentile(&samples, 95);
+        let p99 = percentile(&samples, 99);
+        let max = *samples.last().unwrap_or(&0);
+        println!("  {:<12} {:>8} {:>8} {:>8} {:>8}", name, p50, p95, p99, max);
+    }
+
+    // Decision breakdown — operators want to know how many hits
+    // are blocking vs allowing, since Block path includes policy
+    // serialization and stderr write that Allow doesn't.
+    let mut block_count = 0;
+    let mut allow_count = 0;
+    let mut error_count = 0;
+    for r in &rows {
+        match r.decision.as_str() {
+            "block" => block_count += 1,
+            "allow" => allow_count += 1,
+            _ => error_count += 1,
+        }
+    }
+    println!();
+    println!(
+        "decisions: {} allow, {} block, {} error",
+        allow_count, block_count, error_count
+    );
+    Ok(())
+}
+
+fn percentile(sorted: &[u64], p: u8) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    // p ∈ [0, 100]. Use ceil-based index so p99 of 100 samples =
+    // sorted[99] (the last one), which matches the operator's
+    // intuition of "the worst 1% of cases".
+    let idx = ((sorted.len() as f64) * (p as f64 / 100.0)).ceil() as usize;
+    let i = idx.saturating_sub(1).min(sorted.len() - 1);
+    sorted[i]
 }
 
 fn print_audit_row(
