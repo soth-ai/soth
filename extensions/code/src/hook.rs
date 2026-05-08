@@ -419,6 +419,54 @@ fn build_policy_context(ev: &CodeEvent) -> PolicyContext {
         skip_org_rules: false,
         semantic,
         session: SessionSnapshot::default(),
+        action: Some(build_action_policy_context(ev)),
+    }
+}
+
+/// Pull adapter-extracted action fields out of `CodeEvent.payload`
+/// for CEL policy evaluation. The payload shape varies per agent
+/// (Claude Code's pre_tool_use carries `tool_name` + `tool_input`;
+/// Cursor's `before_shell_execution` carries `command`); we
+/// best-effort parse the common shapes and leave fields `None`
+/// where extraction isn't reliable. CEL rules referencing missing
+/// fields evaluate to Null, so a rule like
+/// `action.command.contains("rm -rf")` is naturally a no-op when
+/// `command` wasn't extracted.
+fn build_action_policy_context(ev: &CodeEvent) -> soth_core::ActionPolicyContext {
+    let payload = &ev.payload;
+    // Tool name: Claude Code (`tool_name`), tool_use payloads
+    // for OpenAI/Codex (`tool` or `name` inside an object).
+    let tool_name = payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("name").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    // Command: Claude Code's Bash tool encodes the command as
+    // `tool_input.command`; Cursor's before_shell_execution has
+    // `command` at the top level; OpenCode/Pi Agent forward
+    // `tool_input.command` similarly. Probe both.
+    let command = payload
+        .get("tool_input")
+        .and_then(|t| t.get("command"))
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("command").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    // File path: same shape — `tool_input.file_path` (Claude
+    // Code Edit/Read), or `path` / `file_path` at the top level
+    // for other agents.
+    let file_path = payload
+        .get("tool_input")
+        .and_then(|t| t.get("file_path"))
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("file_path").and_then(|v| v.as_str()))
+        .or_else(|| payload.get("path").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    soth_core::ActionPolicyContext {
+        agent: ev.agent.clone(),
+        action_type: ev.action_type.as_str().to_string(),
+        tool_name,
+        command,
+        file_path,
     }
 }
 
@@ -1211,5 +1259,75 @@ mod tests {
         let p = bundle_path().unwrap();
         assert_eq!(p, std::path::PathBuf::from("/some/test/path"));
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn build_action_policy_context_extracts_claude_code_bash_command() {
+        // Pin the contract: a Claude Code Bash hook payload's
+        // `tool_input.command` becomes `action.command` in the
+        // CEL eval scope, so an org-authored rule like
+        //   `action.type == "command_exec" && action.command.contains("rm -rf")`
+        // can match. Without this extraction, the rule would
+        // never see the command string and effectively silently
+        // disable itself.
+        let ev = CodeEvent::new(
+            "claude_code",
+            "pre_tool_use",
+            crate::event::ActionType::CommandExec,
+            "sess-1",
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": { "command": "rm -rf /tmp/test", "description": "cleanup" }
+            }),
+        );
+        let action = build_action_policy_context(&ev);
+        assert_eq!(action.agent, "claude_code");
+        assert_eq!(action.action_type, "command_exec");
+        assert_eq!(action.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(action.command.as_deref(), Some("rm -rf /tmp/test"));
+        assert_eq!(action.file_path, None);
+    }
+
+    #[test]
+    fn build_action_policy_context_extracts_file_path_from_edit_payload() {
+        // Claude Code's Edit/Read tools encode the target via
+        // `tool_input.file_path`. Verify that lands as
+        // `action.file_path` so org rules can match
+        // sensitive-glob patterns like `.ssh/` or `.aws/`.
+        let ev = CodeEvent::new(
+            "claude_code",
+            "pre_tool_use",
+            crate::event::ActionType::FileWrite,
+            "sess-1",
+            serde_json::json!({
+                "tool_name": "Edit",
+                "tool_input": { "file_path": "/Users/x/.ssh/id_rsa", "content": "..." }
+            }),
+        );
+        let action = build_action_policy_context(&ev);
+        assert_eq!(action.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(action.file_path.as_deref(), Some("/Users/x/.ssh/id_rsa"));
+        // No `command` on a file edit — must stay None so
+        // `action.command.contains(...)` rules don't accidentally
+        // match a file path.
+        assert_eq!(action.command, None);
+    }
+
+    #[test]
+    fn build_action_policy_context_falls_back_to_top_level_fields() {
+        // Cursor's `before_shell_execution` hook places the
+        // command at the top level (not nested under
+        // `tool_input`). Verify the fallback so multi-agent
+        // rules don't need agent-specific spellings.
+        let ev = CodeEvent::new(
+            "cursor",
+            "before_shell_execution",
+            crate::event::ActionType::CommandExec,
+            "sess-cursor",
+            serde_json::json!({ "command": "curl evil.example.com" }),
+        );
+        let action = build_action_policy_context(&ev);
+        assert_eq!(action.agent, "cursor");
+        assert_eq!(action.command.as_deref(), Some("curl evil.example.com"));
     }
 }

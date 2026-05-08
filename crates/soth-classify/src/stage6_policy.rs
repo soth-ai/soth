@@ -65,6 +65,7 @@ pub(crate) fn run(
             .session_snapshot
             .clone()
             .unwrap_or_default(),
+        action: None,
     };
 
     let decision = soth_policy::evaluate(

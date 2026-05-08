@@ -78,8 +78,8 @@ pub use observation::{
 
 // ── policy ────────────────────────────────────────────────────────────────────
 pub use policy::{
-    DeploymentModel, MatchedRule, PolicyContext, PolicyDecision, PolicyDecisionKind, PolicyWarning,
-    RedactTarget, RerouteTarget, RuleKind, SemanticPolicyContext,
+    ActionPolicyContext, DeploymentModel, MatchedRule, PolicyContext, PolicyDecision,
+    PolicyDecisionKind, PolicyWarning, RedactTarget, RerouteTarget, RuleKind, SemanticPolicyContext,
 };
 
 // ── pre_emit ──────────────────────────────────────────────────────────────────

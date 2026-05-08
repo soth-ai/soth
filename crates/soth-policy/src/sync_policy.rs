@@ -1147,6 +1147,47 @@ fn build_eval_scope(
         EvalValue::Number(semantic_topic_cluster_id),
     );
 
+    // Action layer (soth-code hooks). `None` for proxy/historian
+    // evaluations — fields resolve to Null and rules referencing
+    // them naturally fall through. Adapter-extracted from
+    // CodeEvent.payload by the hook handler — see
+    // `extensions/code/src/hook.rs::build_policy_context`.
+    let action = ctx.action.as_ref();
+    scope.insert("action.present", EvalValue::Bool(action.is_some()));
+    scope.insert(
+        "action.agent",
+        action
+            .map(|a| EvalValue::String(a.agent.clone()))
+            .unwrap_or(EvalValue::Null),
+    );
+    scope.insert(
+        "action.type",
+        action
+            .map(|a| EvalValue::String(a.action_type.clone()))
+            .unwrap_or(EvalValue::Null),
+    );
+    scope.insert(
+        "action.tool_name",
+        action
+            .and_then(|a| a.tool_name.clone())
+            .map(EvalValue::String)
+            .unwrap_or(EvalValue::Null),
+    );
+    scope.insert(
+        "action.command",
+        action
+            .and_then(|a| a.command.clone())
+            .map(EvalValue::String)
+            .unwrap_or(EvalValue::Null),
+    );
+    scope.insert(
+        "action.file_path",
+        action
+            .and_then(|a| a.file_path.clone())
+            .map(EvalValue::String)
+            .unwrap_or(EvalValue::Null),
+    );
+
     scope
 }
 
@@ -1696,6 +1737,7 @@ mod tests {
             skip_org_rules: false,
             semantic: None,
             session: session.unwrap_or_default(),
+            action: None,
         }
     }
 
@@ -1858,6 +1900,49 @@ mod tests {
 
         let out = evaluate(&normalized, &artifacts, &ctx, &bundle);
         assert_block_rule(&out, "sys_private_key_detected");
+    }
+
+    #[test]
+    fn action_layer_command_contains_blocks_destructive_command() {
+        // Pin the action.* CEL extension contract end-to-end:
+        // an org-authored bundle referencing
+        // `action.command.contains("rm -rf")` must Block when
+        // the soth-code hook handler populates ActionPolicyContext
+        // with a matching command. Without this test the
+        // extension could silently regress (e.g. if a future
+        // refactor stopped emitting `action.command` into the
+        // CEL scope, no other test would catch it).
+        let payload = fixture_payload_with_org_rules(vec![org_rule(
+            "block_destructive_shell",
+            "action.command.contains(\"rm -rf\")",
+            RuleAction::Block {
+                status: 403,
+                message: "destructive command blocked".to_string(),
+            },
+        )]);
+        let bundle = match load_bundle_from_bytes(&signed_bundle_bytes(payload)) {
+            Ok(bundle) => bundle,
+            Err(error) => panic!("bundle should load: {error}"),
+        };
+        let normalized = fixture_request();
+        let mut ctx = fixture_context(None);
+        ctx.action = Some(soth_core::ActionPolicyContext {
+            agent: "claude_code".to_string(),
+            action_type: "command_exec".to_string(),
+            tool_name: Some("Bash".to_string()),
+            command: Some("rm -rf /tmp/anything".to_string()),
+            file_path: None,
+        });
+
+        let out = evaluate(&normalized, &[], &ctx, &bundle);
+        assert_block_rule(&out, "block_destructive_shell");
+
+        // Negative control: same rule, a benign command should
+        // not match. Confirms .contains() isn't accidentally
+        // matching everything.
+        ctx.action.as_mut().unwrap().command = Some("ls -la".to_string());
+        let out = evaluate(&normalized, &[], &ctx, &bundle);
+        assert!(matches!(out.kind, PolicyDecisionKind::Allow));
     }
 
     #[test]

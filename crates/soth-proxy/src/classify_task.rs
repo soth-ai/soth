@@ -693,6 +693,7 @@ fn fast_block_decision(
             .session_snapshot
             .clone()
             .unwrap_or_default(),
+        action: None,
     };
 
     let decision = soth_policy::evaluate(
