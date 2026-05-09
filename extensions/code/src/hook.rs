@@ -173,17 +173,70 @@ pub fn run_hook(
     );
     let classify_start = std::time::Instant::now();
     if is_tool_action {
-        // Synthesize tool-name sidecar with phase from
-        // `is_pre_action_hook`. Per-agent logic owns the phase
-        // detection (Cursor's `before_shell_execution` is pre,
-        // its `after_shell_execution` is post — only the
-        // adapter knows).
+        // Route tool events through the daemon too — even though
+        // the embedding/MLP path short-circuits for non-NL kinds,
+        // stage 5's deterministic anomaly rules
+        // (`RapidFireRequests`, `ToolCallDepthSpike`,
+        // `ModelSwitch`, `CredentialBurst`, `TokenBurst`,
+        // `AgentLoopPattern`) DO run on session state regardless
+        // of embedding.  Routing through the daemon updates
+        // `request_count_this_hour` / `last_request_timestamp` /
+        // `models_used_this_session` / `prior_semantic_hashes` so
+        // the *next* event in the session sees the right priors
+        // and anomaly fires when it should.
+        //
+        // Then we override only the use_case_label with the tool
+        // name (keeping anomaly_score / anomaly_flags /
+        // volatility_class / dynamic_fraction from the daemon's
+        // session-aware computation) so the dashboard gets a
+        // human-meaningful row.
         let phase = if adapter.is_pre_action_hook(&code_event.hook_type) {
             ToolHookPhase::Pre
         } else {
             ToolHookPhase::Post
         };
-        code_event.classify = Some(synthesize_tool_call_sidecar(&code_event, phase));
+        let session_id = if code_event.agent_native_session_id.is_empty() {
+            None
+        } else {
+            Some(code_event.agent_native_session_id.as_str())
+        };
+        // Use the tool name + tool_input as the daemon's content
+        // for hashing only — embedding stage will skip on
+        // ToolArgs kind, but the session state still updates.
+        let tool_name_str = extract_tool_name(&code_event);
+        let tool_input = code_event
+            .payload
+            .get("tool_input")
+            .or_else(|| code_event.payload.get("args"))
+            .or_else(|| code_event.payload.get("input"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let content = format!(
+            "{tool_name_str}\n{}",
+            serde_json::to_string(&tool_input).unwrap_or_default()
+        );
+        let req = crate::classify_daemon::build_request(
+            &code_event.agent,
+            provider_for_agent(&code_event.agent),
+            code_event.model.as_deref(),
+            &content,
+            soth_classify::HookContentKind::ToolArgs,
+            session_id,
+        );
+        let mut sidecar = crate::classify_daemon::try_classify(&req)
+            .unwrap_or_else(|| synthesize_tool_call_sidecar(&code_event, phase));
+        // Override the label/secondary/reason — daemon returns
+        // Unknown for ToolArgs (correct, no embedding ran), but
+        // we want the tool name visible.  Anomaly /
+        // volatility / dynamic_fraction etc. stay as the
+        // daemon's session-state-aware values.
+        sidecar.use_case_label = tool_name_str;
+        sidecar.use_case_secondary_label = Some(format!("{:?}", code_event.action_type));
+        sidecar.use_case_label_reason = match phase {
+            ToolHookPhase::Pre => "PreToolCall".to_string(),
+            ToolHookPhase::Post => "PostToolCall".to_string(),
+        };
+        code_event.classify = Some(sidecar);
     } else if let Some(extract) = adapter.classify_input(&code_event) {
         let session_id = if code_event.agent_native_session_id.is_empty() {
             None
