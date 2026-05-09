@@ -76,6 +76,20 @@ impl Adapter for CursorAdapter {
             event.subagent = Some(sub);
         }
 
+        // Cursor carries `model` in the top-level hook payload on
+        // every hook (`agent/cursor/parser.go:18` in gryph). Note:
+        // when a `subagent_start` event includes a separate
+        // `subagent.model`, gryph treats the subagent's model as
+        // the authoritative one for that branch — we mirror that.
+        let model = event
+            .payload
+            .pointer("/subagent/model")
+            .and_then(Value::as_str)
+            .or_else(|| event.payload.get("model").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        event.model = model;
+
         Ok(event)
     }
 
@@ -412,5 +426,29 @@ mod tests {
             .parse_event("totally_made_up_event", br#"{"conversation_id":"c"}"#)
             .unwrap();
         assert_eq!(ev.action_type, ActionType::Notification);
+    }
+
+    #[test]
+    fn extract_model_from_top_level_payload() {
+        let a = CursorAdapter::new();
+        let p = br#"{"conversation_id":"c1","hook_event_name":"pre_tool_use","model":"claude-4-sonnet"}"#;
+        let ev = a.parse_event("pre_tool_use", p).unwrap();
+        assert_eq!(ev.model.as_deref(), Some("claude-4-sonnet"));
+    }
+
+    #[test]
+    fn extract_model_prefers_subagent_when_present() {
+        // gryph treats subagent.model as authoritative for
+        // subagent_start branches (gryph cursor parser handles
+        // the same way).  Pin that ordering.
+        let a = CursorAdapter::new();
+        let p = br#"{
+            "conversation_id":"c1",
+            "hook_event_name":"subagent_start",
+            "model":"gpt-4o",
+            "subagent":{"model":"claude-4-sonnet"}
+        }"#;
+        let ev = a.parse_event("subagent_start", p).unwrap();
+        assert_eq!(ev.model.as_deref(), Some("claude-4-sonnet"));
     }
 }

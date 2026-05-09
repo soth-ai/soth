@@ -54,7 +54,21 @@ impl Adapter for GeminiCliAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Ok(CodeEvent::new(NAME, hook_type, action, session, payload))
+        // Gemini CLI's hook payload does NOT carry a model field
+        // (gryph leaves Model empty for this agent).  Best-effort
+        // fallback: read `~/.gemini/settings.json`'s `model` value
+        // (Gemini's CLI persists the active model there) or the
+        // `GEMINI_MODEL` env var.  Best-effort — failure here keeps
+        // the hook running with `model = None`.
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(extract_model_fallback);
+        let mut event = CodeEvent::new(NAME, hook_type, action, session, payload);
+        event.model = model;
+        Ok(event)
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {
@@ -193,6 +207,28 @@ fn tool_to_action(tool_name: &str) -> ActionType {
     }
 }
 
+/// Fallback model lookup for Gemini CLI when the hook payload
+/// doesn't carry one.  Order:
+/// 1. `GEMINI_MODEL` env var (CI/dev override).
+/// 2. `~/.gemini/settings.json` `model` field — Gemini CLI's
+///    persistent active-model record.
+/// All failures swallowed; the hook just sets `model = None` and
+/// the dashboard renders "unknown" for that event.
+fn extract_model_fallback() -> Option<String> {
+    if let Ok(env) = std::env::var("GEMINI_MODEL") {
+        if !env.is_empty() {
+            return Some(env);
+        }
+    }
+    let path = dirs::home_dir()?.join(".gemini").join("settings.json");
+    let bytes = std::fs::read(&path).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +269,22 @@ mod tests {
         assert!(a.is_pre_action_hook("pre_tool_use"));
         assert!(!a.is_pre_action_hook("after_tool_read"));
         assert!(!a.is_pre_action_hook("after_tool_failure"));
+    }
+
+    #[test]
+    fn extract_model_from_env_fallback() {
+        // Gemini hooks never include model in the payload, so
+        // we lean on `GEMINI_MODEL` as the fastest fallback
+        // before touching disk.
+        let a = GeminiCliAdapter::new();
+        std::env::set_var("GEMINI_MODEL", "gemini-2.5-pro");
+        let ev = a
+            .parse_event(
+                "before_tool_shell",
+                br#"{"session_id":"s","hook_event_name":"before_tool_shell"}"#,
+            )
+            .unwrap();
+        assert_eq!(ev.model.as_deref(), Some("gemini-2.5-pro"));
+        std::env::remove_var("GEMINI_MODEL");
     }
 }

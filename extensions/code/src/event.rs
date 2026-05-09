@@ -172,12 +172,44 @@ pub struct ClassifySidecar {
     pub semantic_hash: String,
     pub use_case_label: String,
     pub use_case_confidence: f32,
+    /// Runner-up label from the MLP head's top-2 softmax output.
+    /// `None` when the classifier is fully confident (per
+    /// `stage3_usecase.rs`, secondary is only emitted when primary
+    /// confidence is below the ambiguity threshold ~0.40).
+    /// Useful for policy authors who want to react to "the model
+    /// thinks this is X but might also be Y" cases — and for the
+    /// dashboard's tooltip on borderline classifications.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_case_secondary_label: Option<String>,
+    /// Why `use_case_label` ended up where it did —
+    /// `confident` (high primary confidence), `low_confidence`
+    /// (primary below threshold; secondary may help),
+    /// `fallback_bundle` (KeywordClassifier — bundle missing
+    /// model assets, classifier did not run), `non_natural_language`
+    /// (input was tool args / result that the pipeline skips),
+    /// `cluster_lookup_only`, etc.  Mirrors
+    /// `soth_core::UseCaseLabelReason`.  Lets the dashboard show
+    /// "why this is Unknown" instead of conflating
+    /// fallback-bundle-installed with the pipeline correctly
+    /// declining to classify a JSON tool-args payload.
+    pub use_case_label_reason: String,
     pub complexity_score: u8,
     pub anomaly_score: f32,
     pub anomaly_flags: Vec<String>,
     pub estimated_input_tokens: u32,
     pub topic_cluster_id: u32,
     pub stage_total_us: u64,
+    /// Volatility class from stage 4 (`Static`, `LowVolatile`,
+    /// `Dynamic`, `HighlyDynamic`).  Mirrors what historian's
+    /// `ClassifyEnricher` writes — soth-code was previously
+    /// dropping it on the floor, so dashboards lost the
+    /// variability signal for action-layer events.
+    pub volatility_class: String,
+    /// Fraction of the embedding that's classified as
+    /// dynamic / high-entropy (0.0–1.0).  Pairs with
+    /// `volatility_class` to drive the dashboard's "stable vs
+    /// drifting" indicator per row.
+    pub dynamic_fraction: f32,
 }
 
 impl From<&ClassifiedResult> for ClassifySidecar {
@@ -186,6 +218,8 @@ impl From<&ClassifiedResult> for ClassifySidecar {
             semantic_hash: c.semantic_hash.clone(),
             use_case_label: format!("{:?}", c.use_case_label),
             use_case_confidence: c.use_case_confidence,
+            use_case_secondary_label: c.secondary_label.as_ref().map(|l| format!("{l:?}")),
+            use_case_label_reason: format!("{:?}", c.use_case_label_reason),
             complexity_score: c.complexity_score,
             anomaly_score: c.anomaly_score,
             anomaly_flags: c
@@ -196,6 +230,8 @@ impl From<&ClassifiedResult> for ClassifySidecar {
             estimated_input_tokens: c.telemetry_event.estimated_input_tokens.unwrap_or(0),
             topic_cluster_id: c.topic_cluster_id,
             stage_total_us: c.stage_latencies.total_us,
+            volatility_class: format!("{:?}", c.volatility_class),
+            dynamic_fraction: c.dynamic_fraction,
         }
     }
 }
@@ -233,6 +269,18 @@ pub struct CodeEvent {
     /// classify is disabled in config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classify: Option<ClassifySidecar>,
+
+    /// Concrete model name the agent is currently using
+    /// (`"claude-sonnet-4-5-20251022"`, `"gpt-5-codex"`, etc.).
+    /// Per-agent extraction lives in each adapter's `parse_event`:
+    /// Codex and Cursor carry this in the top-level hook payload on
+    /// every event; Claude Code carries it on `session_start` only and
+    /// for per-tool events the adapter tails `transcript_path`'s
+    /// JSONL for the latest assistant turn's `message.model`. None
+    /// for agents whose hook payloads don't carry a model
+    /// (Windsurf, OpenClaw, often Pi Agent / OpenCode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl CodeEvent {
@@ -262,6 +310,7 @@ impl CodeEvent {
             correlation_key,
             payload,
             classify: None,
+            model: None,
         }
     }
 }

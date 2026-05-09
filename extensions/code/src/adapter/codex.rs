@@ -56,7 +56,19 @@ impl Adapter for CodexAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Ok(CodeEvent::new(NAME, hook_type, action, session, payload))
+        // Codex CLI carries `model` in the top-level hook payload on
+        // every hook (`agent/codex/parser.go:19,140` in gryph) — gryph
+        // only reads it for `session_start`, but the field is in fact
+        // present on PreToolUse / PostToolUse too.  Stamp it on every
+        // event so the dashboard can render per-tool model attribution.
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut event = CodeEvent::new(NAME, hook_type, action, session, payload);
+        event.model = model;
+        Ok(event)
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {
@@ -182,5 +194,33 @@ mod tests {
         // session_start NOT enforceable (refusing init breaks the agent).
         assert!(!a.is_pre_action_hook("session_start"));
         assert!(!a.is_pre_action_hook("stop"));
+    }
+
+    #[test]
+    fn extract_model_from_top_level_payload() {
+        // Codex CLI carries `model` on every hook (gryph
+        // `agent/codex/parser.go:19`) — pin extraction across
+        // hook types and reject empty strings.
+        let a = CodexAdapter::new();
+        for hook in ["session_start", "pre_tool_use", "post_tool_use"] {
+            let body = format!(
+                r#"{{"session_id":"s1","hook_event_name":"{hook}","model":"gpt-5-codex"}}"#
+            );
+            let ev = a.parse_event(hook, body.as_bytes()).unwrap();
+            assert_eq!(
+                ev.model.as_deref(),
+                Some("gpt-5-codex"),
+                "hook={hook} should expose model"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_model_returns_none_when_payload_omits_or_empty() {
+        let a = CodexAdapter::new();
+        let none_payload = br#"{"session_id":"s"}"#;
+        assert!(a.parse_event("pre_tool_use", none_payload).unwrap().model.is_none());
+        let empty_payload = br#"{"session_id":"s","model":""}"#;
+        assert!(a.parse_event("pre_tool_use", empty_payload).unwrap().model.is_none());
     }
 }

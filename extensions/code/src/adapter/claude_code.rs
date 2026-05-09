@@ -69,6 +69,8 @@ impl Adapter for ClaudeCodeAdapter {
             event.subagent = Some(sub);
         }
 
+        event.model = extract_model(&payload);
+
         Ok(event)
     }
 
@@ -88,30 +90,15 @@ impl Adapter for ClaudeCodeAdapter {
                     content: prompt.to_string(),
                 })
             }
-            "pre_tool_use" => {
-                let tool = event
-                    .payload
-                    .get("tool_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let input = event.payload.get("tool_input").cloned().unwrap_or(Value::Null);
-                let body = serde_json::to_string(&input).ok()?;
-                Some(HookContentExtract {
-                    kind: HookContentKind::ToolArgs,
-                    content: format!("{tool}\n{body}"),
-                })
-            }
-            "post_tool_use" => {
-                let result = event.payload.get("tool_response").cloned().unwrap_or(Value::Null);
-                let body = serde_json::to_string(&result).ok()?;
-                if body.is_empty() || body == "null" {
-                    return None;
-                }
-                Some(HookContentExtract {
-                    kind: HookContentKind::ToolResult,
-                    content: body,
-                })
-            }
+            // Per-tool hooks return None: classify on JSON tool args
+            // / results is meaningless (`hook_entry.rs:157` short-
+            // circuits non-NL kinds), so we skip the daemon round-
+            // trip entirely.  hook.rs synthesizes a tool-call
+            // sidecar instead, keyed off `tool_name`, so the
+            // dashboard sees a meaningful primary label
+            // ("Bash tool call", "Read file action") for every event
+            // rather than running ONNX on garbage and getting Unknown.
+            "pre_tool_use" | "post_tool_use" => None,
             "stop" => {
                 // Some Claude Code variants pass an assistant turn here;
                 // older variants don't. Best-effort extract.
@@ -222,6 +209,67 @@ fn extract_session_id(payload: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// Pull the model name for this hook event.
+///
+/// Claude Code's hook payload carries `model` as a top-level
+/// string on `session_start` (`"claude-sonnet-4-5-20251022"`)
+/// and on some other events when the agent feels like it. For
+/// per-tool hooks (`pre_tool_use` / `post_tool_use`) the field
+/// is absent — gryph leaves Model empty in that case
+/// (`agent/claudecode/parser.go:48,261`). We do better by
+/// tailing `transcript_path` (a JSONL transcript path Claude
+/// Code includes in every hook payload) and reading the most
+/// recent assistant turn's `message.model`. Same source gryph
+/// uses for token-usage aggregation
+/// (`agent/claudecode/transcript.go:54`) — we just lift it
+/// for live event tagging instead of just billing.
+fn extract_model(payload: &Value) -> Option<String> {
+    if let Some(m) = payload.get("model").and_then(Value::as_str) {
+        if !m.is_empty() {
+            return Some(m.to_string());
+        }
+    }
+    let path = payload.get("transcript_path").and_then(Value::as_str)?;
+    last_assistant_model_from_transcript(std::path::Path::new(path))
+}
+
+/// Read the tail of the JSONL transcript and return the most
+/// recent assistant turn's `message.model`.
+///
+/// Bounded read (64 KiB tail) so a multi-MB transcript doesn't
+/// blow the hook gate's latency budget. We walk lines in
+/// reverse and return the first `message.model` we find.
+/// Synthetic / empty model strings are skipped.
+fn last_assistant_model_from_transcript(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 64 * 1024;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let from = size.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::with_capacity((size - from) as usize);
+    file.read_to_end(&mut buf).ok()?;
+
+    let body = String::from_utf8_lossy(&buf);
+    for line in body.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(m) = v.pointer("/message/model").and_then(Value::as_str) {
+            if !m.is_empty() && m != "<synthetic>" {
+                return Some(m.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Subagent fields per gryph PR #38: presence of `agent_id` (UUID) and
@@ -449,5 +497,114 @@ mod tests {
         let r = a.render_decision(&HookDecision::Error("parse failed".into()));
         assert_eq!(r.exit_code, 1);
         assert_ne!(r.exit_code, 2);
+    }
+
+    #[test]
+    fn extract_model_from_top_level_session_start() {
+        let a = ClaudeCodeAdapter::new();
+        let p = br#"{
+            "session_id":"s1",
+            "hook_event_name":"session_start",
+            "model":"claude-sonnet-4-5-20251022"
+        }"#;
+        let ev = a.parse_event("session_start", p).unwrap();
+        assert_eq!(ev.model.as_deref(), Some("claude-sonnet-4-5-20251022"));
+    }
+
+    #[test]
+    fn extract_model_from_transcript_tail_when_payload_lacks_it() {
+        // Per-tool hooks (`pre_tool_use`) don't carry model in
+        // their payload — gryph leaves Model empty here.  We do
+        // better by tailing transcript_path's JSONL.
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}
+{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7-20260101","content":[{"type":"text","text":"hi"}]}}
+{"type":"user","message":{"role":"user","content":"go"}}
+"#,
+        )
+        .unwrap();
+
+        let a = ClaudeCodeAdapter::new();
+        let payload = serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "pre_tool_use",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "transcript_path": transcript.to_str().unwrap(),
+        });
+        let ev = a
+            .parse_event("pre_tool_use", payload.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(ev.model.as_deref(), Some("claude-opus-4-7-20260101"));
+    }
+
+    #[test]
+    fn extract_model_returns_most_recent_assistant_turn() {
+        // Walk transcript in reverse: the *latest* assistant
+        // model wins, even when older turns ran a different
+        // model.  Pins behavior for sessions that switch models
+        // mid-run.
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-4-5"}}
+{"type":"user","message":{"role":"user","content":"hi"}}
+{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7"}}
+"#,
+        )
+        .unwrap();
+
+        let a = ClaudeCodeAdapter::new();
+        let payload = serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "pre_tool_use",
+            "transcript_path": transcript.to_str().unwrap(),
+        });
+        let ev = a
+            .parse_event("pre_tool_use", payload.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(ev.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn extract_model_returns_none_when_neither_top_level_nor_transcript() {
+        let a = ClaudeCodeAdapter::new();
+        let p = br#"{"session_id":"s","hook_event_name":"pre_tool_use"}"#;
+        let ev = a.parse_event("pre_tool_use", p).unwrap();
+        assert!(ev.model.is_none());
+    }
+
+    #[test]
+    fn pre_tool_use_returns_none_for_classify_input() {
+        // Per-tool hooks skip classify entirely.  hook.rs
+        // synthesizes a tool-call sidecar instead of running the
+        // pipeline on JSON tool args (which would short-circuit
+        // to Unknown anyway).  Pin the contract.
+        let a = ClaudeCodeAdapter::new();
+        let p = br#"{
+            "session_id":"s",
+            "hook_event_name":"pre_tool_use",
+            "tool_name":"Bash",
+            "tool_input":{"command":"ls"}
+        }"#;
+        let ev = a.parse_event("pre_tool_use", p).unwrap();
+        assert!(a.classify_input(&ev).is_none());
+    }
+
+    #[test]
+    fn post_tool_use_returns_none_for_classify_input() {
+        let a = ClaudeCodeAdapter::new();
+        let p = br#"{
+            "session_id":"s",
+            "hook_event_name":"post_tool_use",
+            "tool_name":"Read",
+            "tool_response":{"content":"file body"}
+        }"#;
+        let ev = a.parse_event("post_tool_use", p).unwrap();
+        assert!(a.classify_input(&ev).is_none());
     }
 }

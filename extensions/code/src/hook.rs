@@ -100,7 +100,33 @@ pub fn run_hook(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let artifacts = crate::detect::scan(&code_event.payload, &tool_name);
+    let mut artifacts = crate::detect::scan(&code_event.payload, &tool_name);
+
+    // soth-detect: tree-sitter analysis on classifiable content
+    // — returns import categories, language detection, function
+    // count, complexity, and additional sensitive artifacts the
+    // local regex scanner doesn't catch.  Run only on content
+    // the adapter declared classifiable (skips bookkeeping
+    // events) so we don't burn AST parsing on session_start /
+    // notification noise.
+    let mut code_detect_meta: Option<CodeDetectMetadata> = None;
+    if let Some(extract) = adapter.classify_input(&code_event) {
+        let location = match extract.kind {
+            soth_classify::HookContentKind::AssistantTurn => {
+                soth_core::ArtifactLocation::AssistantContent { turn: 0, char_offset: 0 }
+            }
+            soth_classify::HookContentKind::ToolResult => {
+                soth_core::ArtifactLocation::ToolResult { tool_name: None }
+            }
+            _ => soth_core::ArtifactLocation::UserContent { turn: 0, char_offset: 0 },
+        };
+        let result = soth_detect::code::detect_code_artifacts(&extract.content, location);
+        artifacts.extend(result.artifacts);
+        code_detect_meta = Some(CodeDetectMetadata {
+            language: result.detected_language,
+            tree_sitter: result.tree_sitter,
+        });
+    }
     let detect_us = elapsed_us(detect_start);
 
     // 3. classify — adapter declares which slice of the payload is
@@ -115,24 +141,51 @@ pub fn run_hook(
     // missing/crashed daemon falls through to the in-process
     // fallback bundle — sidecar quality degrades but the gate
     // still runs.
+    // Two paths land a sidecar on `code_event.classify`:
+    //
+    //   1. NL events (user_prompt_submit, stop, AssistantTurn) — the
+    //      adapter returns `Some(extract)` with `kind=PromptText` /
+    //      `AssistantTurn`, so the full classify pipeline runs and
+    //      emits real labels + anomaly + secondary head.
+    //   2. Per-tool events (pre/post_tool_use) — the adapter returns
+    //      `None` to skip classify entirely (JSON tool args aren't
+    //      classifiable; running the pipeline burns a daemon round-
+    //      trip for an Unknown).  Instead we synthesize a sidecar
+    //      with a tool-name-derived label so the dashboard renders a
+    //      meaningful action description per event.
     let classify_start = std::time::Instant::now();
     if let Some(extract) = adapter.classify_input(&code_event) {
+        let session_id = if code_event.agent_native_session_id.is_empty() {
+            None
+        } else {
+            Some(code_event.agent_native_session_id.as_str())
+        };
         let req = crate::classify_daemon::build_request(
             &code_event.agent,
             provider_for_agent(&code_event.agent),
-            None,
+            code_event.model.as_deref(),
             &extract.content,
             extract.kind,
+            session_id,
         );
         let sidecar = crate::classify_daemon::try_classify(&req).or_else(|| {
+            // Fallback path runs in-process when the daemon is
+            // unreachable.  No session snapshot here — hook
+            // subprocesses are short-lived and don't share state
+            // across calls.  Volatility / anomaly will be zero;
+            // that's fine for the rare daemon-down case.
             let identity = ClassifyIdentity::default();
             let input = HookClassifyInput {
                 agent_name: &code_event.agent,
                 provider: provider_for_agent(&code_event.agent),
-                model: None,
+                model: code_event.model.as_deref(),
                 content: &extract.content,
                 kind: extract.kind,
                 identity: &identity,
+                session_snapshot: None,
+                conversation_turn: None,
+                has_tool_definitions: false,
+                has_tool_results: false,
             };
             let bundle = classify_bundle();
             let config = ClassifyConfig::default();
@@ -140,6 +193,11 @@ pub fn run_hook(
             Some(ClassifySidecar::from(&result))
         });
         code_event.classify = sidecar;
+    } else if matches!(
+        code_event.hook_type.as_str(),
+        "pre_tool_use" | "post_tool_use"
+    ) {
+        code_event.classify = Some(synthesize_tool_call_sidecar(&code_event));
     }
     let classify_us = elapsed_us(classify_start);
 
@@ -212,6 +270,9 @@ pub fn run_hook(
     //    boundary — see HookCaptureConfig docstring.
     let mut governable = governable_from_code_event(&code_event);
     governable.artifacts = artifacts;
+    if let Some(meta) = code_detect_meta.as_ref() {
+        attach_code_detect_metadata(&mut governable, meta);
+    }
     if should_capture_raw(capture.mode, &decision) {
         attach_raw_payload(&mut governable, &code_event, capture);
     }
@@ -317,13 +378,18 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
             "classify.use_case_confidence".into(),
             sidecar.use_case_confidence.to_string(),
         );
-        // FallbackBundle is the right reason while Group 5 ships with
-        // KeywordClassifier (no ONNX model). When a real bundle is
-        // installed, classify will produce Confident or LowConfidence
-        // and we'll source the reason from the ClassifiedResult.
+        // Source the reason from the sidecar so the dashboard can
+        // distinguish (a) `confident` real ONNX classifications,
+        // (b) `low_confidence` ONNX classifications (where the
+        // secondary label may matter), (c) `fallback_bundle` —
+        // bundle missing model assets, KeywordClassifier wired,
+        // (d) `not_ai_call` — pipeline short-circuited because
+        // input was non-NL, (e) `pre_tool_call` /
+        // `post_tool_call` — synthesized by hook.rs for per-tool
+        // events without running classify at all.
         metadata.insert(
             "classify.use_case_label_reason".into(),
-            "\"fallback_bundle\"".into(),
+            format!("\"{}\"", to_snake(&sidecar.use_case_label_reason)),
         );
         metadata.insert(
             "classify.anomaly_score".into(),
@@ -337,11 +403,51 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
             "classify.topic_cluster_id".into(),
             sidecar.topic_cluster_id.to_string(),
         );
-        // Volatility / dynamic_fraction would land here too once
-        // `ClassifySidecar` carries them. The JSON-string sidecar
-        // (`metadata["classify"]`) is intentionally NOT written —
-        // `from_governable` would ignore it and we'd carry duplicate
-        // information.
+        // Reach feature parity with historian's `ClassifyEnricher`:
+        // volatility class + dynamic fraction drive the dashboard's
+        // stable-vs-drifting indicator per row, and were the
+        // remaining gap between soth-code's metadata and the
+        // historian / proxy paths.
+        metadata.insert(
+            "classify.volatility_class".into(),
+            format!("\"{}\"", to_snake(&sidecar.volatility_class)),
+        );
+        metadata.insert(
+            "classify.dynamic_fraction".into(),
+            sidecar.dynamic_fraction.to_string(),
+        );
+        // Secondary label = MLP head's runner-up when the primary
+        // is below the ambiguity threshold.  Optional — only
+        // written when the classifier emitted one — so
+        // `from_governable` can read it through the same JSON
+        // string convention as the primary.
+        if let Some(secondary) = sidecar.use_case_secondary_label.as_deref() {
+            metadata.insert(
+                "classify.use_case_secondary_label".into(),
+                format!("\"{}\"", to_snake(secondary)),
+            );
+        }
+        if !sidecar.anomaly_flags.is_empty() {
+            metadata.insert(
+                "classify.anomaly_flags".into(),
+                serde_json::to_string(&sidecar.anomaly_flags).unwrap_or_default(),
+            );
+        }
+        // Top-level keys (NOT under `classify.`) — `from_governable`
+        // reads these directly off the metadata map.  Mirrors the
+        // proxy's flat-key convention so soth-code rows look
+        // identical to proxy rows on the wire.
+        if !sidecar.semantic_hash.is_empty()
+            && sidecar.semantic_hash != "00000000000000000000000000000000"
+        {
+            metadata.insert("semantic_hash".into(), sidecar.semantic_hash.clone());
+        }
+        if sidecar.estimated_input_tokens > 0 {
+            metadata.insert(
+                "estimated_input_tokens".into(),
+                sidecar.estimated_input_tokens.to_string(),
+            );
+        }
     }
     // Note: raw payload is not surfaced. Detection produces artifacts
     // (no raw values) on the GovernableEvent; classify summary lives
@@ -354,7 +460,7 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
             source: ExtensionSource::Code,
         },
         provider: "code".into(),
-        model: None,
+        model: ev.model.clone(),
         endpoint_type: EndpointType::Unknown,
         normalized: None,
         artifacts: Vec::new(),
@@ -365,6 +471,135 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
             extension_version: env!("CARGO_PKG_VERSION").into(),
             metadata,
         },
+    }
+}
+
+/// Tree-sitter outputs from `soth_detect::code::detect_code_artifacts`
+/// captured at detect time and folded into event metadata at
+/// enqueue time so cloud-side `from_governable` can derive
+/// `code_fraction` / `network_calls_detected` / `function_count`
+/// directly off the event row.
+struct CodeDetectMetadata {
+    language: Option<String>,
+    tree_sitter: Option<soth_detect::code::TreeSitterResult>,
+}
+
+/// Surface tree-sitter outputs as flat metadata keys.  Mirrors
+/// the proxy's `derive_code_flags` convention so cloud rollups
+/// see soth-code rows the same way they see proxy rows.
+///
+/// Keys written:
+///   * `detected_language` — `"rust"`, `"python"`, … (heuristic +
+///     tree-sitter confirmation)
+///   * `import_categories` — JSON array of categories (`network`,
+///     `filesystem`, `crypto`, `auth`, …) for cloud-side
+///     `from_governable` to decode into the
+///     `network_calls_detected` / `file_io_detected` / etc bool
+///     bag.
+///   * `function_count` — number of functions in the parsed AST
+///   * `complexity_estimate` — rough cyclomatic complexity
+///     estimate (0–255 scale).  Drives the dashboard's
+///     "complex prompt" badge.
+///   * `has_auth_logic` / `has_crypto_operations` /
+///     `has_network_calls` / `has_file_io` — duplicated as
+///     direct bool keys so the dashboard can render flags
+///     without parsing the categories JSON.
+fn attach_code_detect_metadata(gov: &mut GovernableEvent, meta: &CodeDetectMetadata) {
+    let m = &mut gov.context.metadata;
+    if let Some(lang) = meta.language.as_deref() {
+        m.insert("detected_language".to_string(), lang.to_string());
+    }
+    let Some(ts) = meta.tree_sitter.as_ref() else {
+        return;
+    };
+    if let Some(confirmed) = ts.confirmed_language.as_deref() {
+        m.insert(
+            "tree_sitter.confirmed_language".to_string(),
+            confirmed.to_string(),
+        );
+    }
+    if !ts.import_categories.is_empty() {
+        let cats: Vec<String> = ts
+            .import_categories
+            .iter()
+            .map(|c| {
+                serde_json::to_string(c)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<String>(&s).ok())
+                    .unwrap_or_else(|| format!("{c:?}").to_lowercase())
+            })
+            .collect();
+        if let Ok(json) = serde_json::to_string(&cats) {
+            m.insert("import_categories".to_string(), json);
+        }
+    }
+    m.insert("function_count".to_string(), ts.function_count.to_string());
+    m.insert(
+        "complexity_estimate".to_string(),
+        ts.complexity_estimate.to_string(),
+    );
+    if ts.has_auth_logic {
+        m.insert("has_auth_logic".to_string(), "true".to_string());
+    }
+    if ts.has_crypto_operations {
+        m.insert("has_crypto_operations".to_string(), "true".to_string());
+    }
+    if ts.has_network_calls {
+        m.insert("has_network_calls".to_string(), "true".to_string());
+    }
+    if ts.has_file_io {
+        m.insert("has_file_io".to_string(), "true".to_string());
+    }
+}
+
+/// Synthesize a `ClassifySidecar` for per-tool hooks.
+///
+/// `pre_tool_use` / `post_tool_use` payloads are tool args / tool
+/// results — JSON, not natural language.  Running the classify
+/// pipeline on them costs a daemon round-trip and returns Unknown
+/// (`is_ai_call` short-circuits non-NL kinds in
+/// `soth-classify/src/hook_entry.rs:157`).  Instead, we synthesize
+/// a sidecar locally:
+///
+///   * `use_case_label`  — the **tool name** itself ("Bash",
+///     "Read", "Edit") so the dashboard renders one row per tool
+///     call with a deterministic, human-meaningful label.
+///   * `use_case_secondary_label` — canonical `ActionType`
+///     ("FileRead", "CommandExec", …) for grouping multiple tool
+///     names that share an action category.
+///   * `use_case_label_reason` — `pre_tool_call` /
+///     `post_tool_call` so dashboards / rollups can distinguish
+///     synthesized tool rows from real ONNX classifications and
+///     filter pre vs post phase explicitly.
+///   * Numeric scores zeroed (no embedding ran) — prevents
+///     anomaly / complexity rollups from being polluted by
+///     non-NL events.
+fn synthesize_tool_call_sidecar(ev: &CodeEvent) -> ClassifySidecar {
+    let tool_name = ev
+        .payload
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Tool");
+    let reason = match ev.hook_type.as_str() {
+        "pre_tool_use" => "PreToolCall",
+        "post_tool_use" => "PostToolCall",
+        other => other,
+    };
+    ClassifySidecar {
+        semantic_hash: "00000000000000000000000000000000".to_string(),
+        use_case_label: tool_name.to_string(),
+        use_case_confidence: 1.0,
+        use_case_secondary_label: Some(format!("{:?}", ev.action_type)),
+        use_case_label_reason: reason.to_string(),
+        complexity_score: 0,
+        anomaly_score: 0.0,
+        anomaly_flags: Vec::new(),
+        estimated_input_tokens: 0,
+        topic_cluster_id: 0,
+        stage_total_us: 0,
+        volatility_class: "Static".to_string(),
+        dynamic_fraction: 0.0,
     }
 }
 
@@ -935,6 +1170,54 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn pre_tool_use_synthesizes_label_from_tool_name() {
+        // Pin the user-facing contract: per-tool events get the
+        // tool name as primary label, the canonical action_type
+        // as secondary, and a reason of `pre_tool_call` —
+        // distinguishing synthesized rows from real ONNX
+        // classifications and pre-phase from post-phase.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+
+        let outcome = run_hook(
+            "claude_code",
+            "pre_tool_use",
+            br#"{"session_id":"s","tool_name":"Bash","tool_input":{"command":"rg foo"}}"#,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .expect("hook runs");
+
+        assert!(matches!(outcome.decision, HookDecision::Allow));
+        let queue = fs::read_to_string(&paths.queue).unwrap();
+        let row: serde_json::Value = serde_json::from_str(queue.lines().next().unwrap()).unwrap();
+        let md = &row["event"]["context"]["metadata"];
+        assert_eq!(md["classify.use_case"], "\"bash\"");
+        assert_eq!(md["classify.use_case_label_reason"], "\"pre_tool_call\"");
+    }
+
+    #[test]
+    fn post_tool_use_synthesizes_label_with_result_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+
+        let _ = run_hook(
+            "claude_code",
+            "post_tool_use",
+            br#"{"session_id":"s","tool_name":"Read","tool_response":{"content":"ok"}}"#,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .unwrap();
+
+        let queue = fs::read_to_string(&paths.queue).unwrap();
+        let row: serde_json::Value = serde_json::from_str(queue.lines().next().unwrap()).unwrap();
+        let md = &row["event"]["context"]["metadata"];
+        assert_eq!(md["classify.use_case"], "\"read\"");
+        assert_eq!(md["classify.use_case_label_reason"], "\"post_tool_call\"");
+    }
+
+    #[test]
     fn smoke_e2e_writes_queue_row_and_exits_allow() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
@@ -1129,12 +1412,16 @@ mod tests {
             semantic_hash: "abc".into(),
             use_case_label: "Unknown".into(),
             use_case_confidence: 0.5,
+            use_case_secondary_label: None,
+            use_case_label_reason: "Confident".into(),
             complexity_score: 3,
             anomaly_score: 0.7,
             anomaly_flags: vec![],
             estimated_input_tokens: 10,
             topic_cluster_id: 42,
             stage_total_us: 100,
+            volatility_class: "Static".into(),
+            dynamic_fraction: 0.0,
         });
         let pctx = build_policy_context(&ev);
         let semantic = pctx.semantic.expect("semantic populated when classify ran");
@@ -1271,10 +1558,15 @@ mod tests {
             soth_core::UseCaseLabelReason::ExtensionNotEnriched,
             "from_governable must read soth-code's flat classify keys and not fall back to ExtensionNotEnriched"
         );
+        // pre_tool_use is now synthesized (no classify runs), so
+        // the reason is `pre_tool_call` — pinning the new
+        // contract.  Real classify runs only on prompt/turn
+        // events; per-tool rows get the deterministic synthesized
+        // tag so cloud rollups can split them out.
         assert_eq!(
             telem.use_case_label_reason,
-            soth_core::UseCaseLabelReason::FallbackBundle,
-            "with the KeywordClassifier fallback bundle, reason should be FallbackBundle"
+            soth_core::UseCaseLabelReason::PreToolCall,
+            "pre_tool_use should report PreToolCall reason now that hook.rs synthesizes the sidecar"
         );
     }
 

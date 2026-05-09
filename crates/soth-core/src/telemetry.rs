@@ -97,6 +97,16 @@ pub enum UseCaseLabelReason {
     /// any in-flight events with the old wire form.
     #[serde(alias = "historian_not_enriched")]
     ExtensionNotEnriched,
+    /// soth-code synthesized this row for a `pre_tool_use` hook.
+    /// Classify pipeline did not run — the dashboard's `use_case`
+    /// is the tool name itself (`Bash`, `Read`, …).  Lets rollups
+    /// distinguish synthesized tool rows from real ONNX
+    /// classifications.
+    PreToolCall,
+    /// Same as `PreToolCall` but for `post_tool_use` events.
+    /// Phase split lets dashboards count "tool calls issued" vs
+    /// "tool calls completed" without a JOIN on action_seq.
+    PostToolCall,
     /// Struct default — never populated by a real classify run.
     UninitializedDefault,
 }
@@ -624,7 +634,7 @@ impl TelemetryEvent {
             estimated_cost_usd,
             system_prompt_token_length,
             tool_definition_hash,
-            import_categories,
+            mut import_categories,
         ) = if let Some(ref norm) = gov.normalized {
             (
                 Some(norm.estimated_input_tokens),
@@ -637,6 +647,21 @@ impl TelemetryEvent {
         } else {
             (None, None, None, None, None, Vec::new())
         };
+
+        // Extensions (soth-code, future ones) attach import
+        // categories from their own tree-sitter detect run as a
+        // JSON-array metadata key.  Fold them into the
+        // canonical list so the proxy / extension paths drive
+        // the same `network_calls_detected` /
+        // `file_io_detected` / `crypto_operations_detected` /
+        // `auth_logic_detected` flags downstream.
+        if import_categories.is_empty() {
+            if let Some(raw) = meta.get("import_categories") {
+                if let Ok(parsed) = serde_json::from_str::<Vec<ImportCategory>>(raw) {
+                    import_categories = parsed;
+                }
+            }
+        }
 
         // Artifact-based enrichment — mirrors the logic in soth-classify stage7
         let languages = extract_languages_from_artifacts(&gov.artifacts);
@@ -663,12 +688,22 @@ impl TelemetryEvent {
         let raw_use_case = meta
             .get("classify.use_case")
             .and_then(|s| serde_json::from_str::<UseCaseLabel>(s).ok());
-        let use_case_label_reason = if raw_use_case.is_none() {
-            UseCaseLabelReason::ExtensionNotEnriched
-        } else {
-            meta.get("classify.use_case_label_reason")
-                .and_then(|s| serde_json::from_str::<UseCaseLabelReason>(s).ok())
-                .unwrap_or(UseCaseLabelReason::Confident)
+        let raw_reason = meta
+            .get("classify.use_case_label_reason")
+            .and_then(|s| serde_json::from_str::<UseCaseLabelReason>(s).ok());
+        let use_case_label_reason = match (raw_use_case.is_some(), raw_reason) {
+            // Real classify ran AND emitted a reason → trust it.
+            (true, Some(r)) => r,
+            // Real classify ran but reason missing → assume Confident.
+            (true, None) => UseCaseLabelReason::Confident,
+            // No `classify.use_case` enum match BUT we have a reason
+            // — that's the soth-code per-tool synthesized path
+            // (label is a literal tool name like "Bash" that doesn't
+            // map to UseCaseLabel).  Trust the explicit reason
+            // instead of erasing it as ExtensionNotEnriched.
+            (false, Some(r)) => r,
+            // Neither label nor reason — extension didn't enrich.
+            (false, None) => UseCaseLabelReason::ExtensionNotEnriched,
         };
         let use_case = raw_use_case.unwrap_or(UseCaseLabel::Unknown);
         let use_case_confidence = meta

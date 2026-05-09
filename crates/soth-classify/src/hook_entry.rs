@@ -13,7 +13,8 @@
 
 use soth_core::{
     sha256_hex, CaptureMode, ClassificationSource, DetectResult, IdentityContext,
-    NormalizedRequest, ParseConfidence, ParseSource, ProxyContext, TrafficClassification,
+    NormalizedRequest, ParseConfidence, ParseSource, ProxyContext, SessionSnapshot,
+    TrafficClassification,
 };
 
 use crate::{classify, ClassifiedResult, ClassifyBundle, ClassifyConfig};
@@ -87,6 +88,36 @@ pub struct HookClassifyInput<'a> {
     /// Caller identity. Hook handler resolves these from SOTH config
     /// at process startup.
     pub identity: &'a HookIdentity,
+    /// Per-session prior state (most recent semantic hashes,
+    /// embedding centroid, request count, …).  When present, the
+    /// pipeline's stage 2 (cluster reuse / dedup), stage 4
+    /// (volatility), and stage 5 (anomaly) compare the current
+    /// embedding against these priors and emit non-zero
+    /// `volatility_class` / `dynamic_fraction` / `anomaly_score`.
+    /// When `None` the call is treated as a one-shot and those
+    /// fields collapse to defaults — that's fine for short-lived
+    /// hook subprocesses but loses the "drift across the same
+    /// session" signal the user-facing dashboard needs.
+    /// Long-running daemons (the soth-code classify daemon)
+    /// should track this per `session_id` and pass it in.
+    #[doc(hidden)]
+    pub session_snapshot: Option<&'a SessionSnapshot>,
+    /// Conversation turn (1-based) within the agent session.
+    /// Stage 4 (volatility) reads this to score request-shape
+    /// volatility — long sessions with active tool loops register
+    /// as `Dynamic` / `HighlyDynamic`.  `None` collapses to
+    /// `Static` baseline.  Daemon derives from
+    /// `session_snapshot.request_count`.
+    pub conversation_turn: Option<u32>,
+    /// Whether the agent has tool definitions in its current
+    /// context (system prompt declared tools).  Surfaces in
+    /// volatility scoring + downstream agent-loop anomaly
+    /// detection.
+    pub has_tool_definitions: bool,
+    /// Whether the current request includes tool results from a
+    /// prior turn (i.e., the agent is mid-tool-loop).  Strong
+    /// volatility signal.
+    pub has_tool_results: bool,
 }
 
 /// Synchronous hook-layer classify entry point.
@@ -122,7 +153,7 @@ pub fn classify_for_hook(
         capture_mode: CaptureMode::Full,
         traffic_classification: input.kind.traffic_classification(),
         classification_source: ClassificationSource::Sdk,
-        session_snapshot: None,
+        session_snapshot: input.session_snapshot.cloned(),
         declared_provider: input.provider.map(|s| s.to_string()),
         declared_application: Some(input.agent_name.to_string()),
         session_id: None,
@@ -167,6 +198,9 @@ fn build_normalized(input: &HookClassifyInput<'_>) -> NormalizedRequest {
         canonical_cache_key,
         user_prompt: Some(input.content.to_string()),
         parse_source: ParseSource::Sdk,
+        conversation_turn: input.conversation_turn,
+        has_tool_definitions: input.has_tool_definitions,
+        has_tool_results: input.has_tool_results,
         ..NormalizedRequest::default()
     }
 }
