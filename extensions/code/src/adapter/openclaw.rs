@@ -75,7 +75,14 @@ impl Adapter for OpenClawAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Ok(CodeEvent::new(NAME, hook_type, action, session, payload))
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut event = CodeEvent::new(NAME, hook_type, action, session, payload);
+        event.model = model;
+        Ok(event)
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {

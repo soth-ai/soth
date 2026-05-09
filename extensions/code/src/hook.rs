@@ -153,8 +153,38 @@ pub fn run_hook(
     //      trip for an Unknown).  Instead we synthesize a sidecar
     //      with a tool-name-derived label so the dashboard renders a
     //      meaningful action description per event.
+    // Cross-agent gate: tool-shaped action_types skip classify
+    // entirely and synthesize a tool-name sidecar instead. This
+    // is normalized across all 8 agents (Claude Code, Cursor,
+    // Codex, Gemini CLI, Windsurf, OpenCode, Pi Agent, OpenClaw)
+    // since each adapter's `parse_event` already maps
+    // agent-specific hook types to a canonical `ActionType`.
+    // Using action_type means the gate works regardless of
+    // whether the hook is named `pre_tool_use` (Claude Code,
+    // Codex, Cursor, Pi Agent, OpenClaw), `before_tool_call`
+    // (Pi Agent, Gemini), `tool_execute_before` (OpenCode), or
+    // `pre_run_command` (Windsurf).
+    let is_tool_action = matches!(
+        code_event.action_type,
+        crate::event::ActionType::FileRead
+            | crate::event::ActionType::FileWrite
+            | crate::event::ActionType::CommandExec
+            | crate::event::ActionType::ToolUse
+    );
     let classify_start = std::time::Instant::now();
-    if let Some(extract) = adapter.classify_input(&code_event) {
+    if is_tool_action {
+        // Synthesize tool-name sidecar with phase from
+        // `is_pre_action_hook`. Per-agent logic owns the phase
+        // detection (Cursor's `before_shell_execution` is pre,
+        // its `after_shell_execution` is post — only the
+        // adapter knows).
+        let phase = if adapter.is_pre_action_hook(&code_event.hook_type) {
+            ToolHookPhase::Pre
+        } else {
+            ToolHookPhase::Post
+        };
+        code_event.classify = Some(synthesize_tool_call_sidecar(&code_event, phase));
+    } else if let Some(extract) = adapter.classify_input(&code_event) {
         let session_id = if code_event.agent_native_session_id.is_empty() {
             None
         } else {
@@ -193,11 +223,6 @@ pub fn run_hook(
             Some(ClassifySidecar::from(&result))
         });
         code_event.classify = sidecar;
-    } else if matches!(
-        code_event.hook_type.as_str(),
-        "pre_tool_use" | "post_tool_use"
-    ) {
-        code_event.classify = Some(synthesize_tool_call_sidecar(&code_event));
     }
     let classify_us = elapsed_us(classify_start);
 
@@ -574,21 +599,52 @@ fn attach_code_detect_metadata(gov: &mut GovernableEvent, meta: &CodeDetectMetad
 ///   * Numeric scores zeroed (no embedding ran) — prevents
 ///     anomaly / complexity rollups from being polluted by
 ///     non-NL events.
-fn synthesize_tool_call_sidecar(ev: &CodeEvent) -> ClassifySidecar {
-    let tool_name = ev
-        .payload
-        .get("tool_name")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Tool");
-    let reason = match ev.hook_type.as_str() {
-        "pre_tool_use" => "PreToolCall",
-        "post_tool_use" => "PostToolCall",
-        other => other,
+/// Pre vs post tool-call hook phase. Stamped as
+/// `UseCaseLabelReason::PreToolCall` / `::PostToolCall` so cloud
+/// rollups can split "tool calls issued" from "tool calls
+/// completed" without joining on action_seq.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ToolHookPhase {
+    Pre,
+    Post,
+}
+
+/// Pull the tool name from the hook payload, agent-aware.
+/// Each agent uses a slightly different field name for the
+/// tool ID it's about to call:
+///
+///   - Claude Code, Codex, Cursor, Pi Agent, OpenClaw,
+///     Gemini CLI, Windsurf: `tool_name` (or `command` for
+///     Windsurf's `pre_run_command`)
+///   - OpenCode: `tool` (sent by the JS plugin)
+///
+/// Falls back to the canonical `ActionType` rendering when no
+/// tool name is on the payload — that way every synthesized
+/// row still has a human-meaningful label.
+fn extract_tool_name(ev: &CodeEvent) -> String {
+    let payload = &ev.payload;
+    for key in ["tool_name", "tool", "command", "cmd"] {
+        if let Some(name) = payload.get(key).and_then(serde_json::Value::as_str) {
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    // Windsurf's `pre_read_code` / `pre_write_code` carry no
+    // tool name field — synthesize from action_type so the
+    // dashboard still gets something readable.
+    format!("{:?}", ev.action_type)
+}
+
+fn synthesize_tool_call_sidecar(ev: &CodeEvent, phase: ToolHookPhase) -> ClassifySidecar {
+    let tool_name = extract_tool_name(ev);
+    let reason = match phase {
+        ToolHookPhase::Pre => "PreToolCall",
+        ToolHookPhase::Post => "PostToolCall",
     };
     ClassifySidecar {
         semantic_hash: "00000000000000000000000000000000".to_string(),
-        use_case_label: tool_name.to_string(),
+        use_case_label: tool_name,
         use_case_confidence: 1.0,
         use_case_secondary_label: Some(format!("{:?}", ev.action_type)),
         use_case_label_reason: reason.to_string(),
@@ -1215,6 +1271,107 @@ mod tests {
         let md = &row["event"]["context"]["metadata"];
         assert_eq!(md["classify.use_case"], "\"read\"");
         assert_eq!(md["classify.use_case_label_reason"], "\"post_tool_call\"");
+    }
+
+    #[test]
+    fn cross_agent_tool_action_synthesizes_label_for_every_adapter() {
+        // The synthesis gate is `action_type` (FileRead /
+        // FileWrite / CommandExec / ToolUse), not hook-type
+        // strings — so it works across all 8 agents whose hook
+        // taxonomies use different names (claude_code uses
+        // pre_tool_use; opencode uses tool_execute_before;
+        // gemini uses before_tool_call; windsurf uses
+        // pre_run_command; etc.).  Pin: every agent's
+        // tool-shape hook produces a synthesized sidecar with
+        // a non-Unknown label.
+        struct Case {
+            agent: &'static str,
+            hook_type: &'static str,
+            payload: &'static [u8],
+            expected_label_contains: &'static str,
+        }
+        let cases = [
+            Case {
+                agent: "claude_code",
+                hook_type: "pre_tool_use",
+                payload: br#"{"session_id":"s","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+                expected_label_contains: "bash",
+            },
+            Case {
+                agent: "cursor",
+                hook_type: "before_shell_execution",
+                payload: br#"{"conversation_id":"c","command":"ls"}"#,
+                expected_label_contains: "ls",
+            },
+            Case {
+                agent: "codex",
+                hook_type: "pre_tool_use",
+                payload: br#"{"session_id":"s","tool_name":"shell","tool_input":{"command":"ls"}}"#,
+                expected_label_contains: "shell",
+            },
+            Case {
+                agent: "gemini_cli",
+                hook_type: "before_tool_call",
+                payload: br#"{"session_id":"s","tool_name":"shell","tool_input":{"command":"ls"}}"#,
+                expected_label_contains: "shell",
+            },
+            Case {
+                agent: "opencode",
+                hook_type: "tool_execute_before",
+                payload: br#"{"session_id":"s","tool":"bash","args":{"command":"ls"}}"#,
+                expected_label_contains: "bash",
+            },
+            Case {
+                agent: "pi_agent",
+                hook_type: "pre_tool_use",
+                payload: br#"{"session_id":"s","tool_name":"shell","input":{"command":"ls"}}"#,
+                expected_label_contains: "shell",
+            },
+            Case {
+                agent: "openclaw",
+                hook_type: "pre_tool_use",
+                payload: br#"{"session_id":"s","tool_name":"bash","tool_input":{"command":"ls"}}"#,
+                expected_label_contains: "bash",
+            },
+        ];
+        for case in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = CodePaths::from_root(tmp.path());
+            run_hook(
+                case.agent,
+                case.hook_type,
+                case.payload,
+                &paths,
+                &HookCaptureConfig::default(),
+            )
+            .unwrap_or_else(|e| panic!("agent={} hook err: {e:#}", case.agent));
+            let queue = fs::read_to_string(&paths.queue).unwrap();
+            let row: serde_json::Value =
+                serde_json::from_str(queue.lines().next().unwrap()).unwrap();
+            let md = &row["event"]["context"]["metadata"];
+            let label = md
+                .get("classify.use_case")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert!(
+                label.contains(case.expected_label_contains),
+                "agent={} hook_type={}: expected label to contain '{}', got '{}'",
+                case.agent,
+                case.hook_type,
+                case.expected_label_contains,
+                label
+            );
+            let reason = md
+                .get("classify.use_case_label_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert!(
+                reason.contains("tool_call"),
+                "agent={} should report a tool_call reason, got '{}'",
+                case.agent,
+                reason
+            );
+        }
     }
 
     #[test]

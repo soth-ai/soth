@@ -53,7 +53,17 @@ impl Adapter for OpenCodeAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Ok(CodeEvent::new(NAME, hook_type, action, session, payload))
+        // OpenCode's JS plugin can attach `model` / `ctx.model` to
+        // the stdin payload — wire it through when present.
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .or_else(|| payload.pointer("/ctx/model").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut event = CodeEvent::new(NAME, hook_type, action, session, payload);
+        event.model = model;
+        Ok(event)
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {

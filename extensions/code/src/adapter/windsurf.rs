@@ -58,7 +58,17 @@ impl Adapter for WindsurfAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Ok(CodeEvent::new(NAME, hook_type, action, session, payload))
+        // Windsurf's hook payload doesn't always carry model, but
+        // `model_name` appears on `pre_cascade_request`. Best-effort.
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("model_name").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut event = CodeEvent::new(NAME, hook_type, action, session, payload);
+        event.model = model;
+        Ok(event)
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {

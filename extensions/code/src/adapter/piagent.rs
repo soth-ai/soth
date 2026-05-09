@@ -54,7 +54,19 @@ impl Adapter for PiAgentAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Ok(CodeEvent::new(NAME, hook_type, action, session, payload))
+        // Pi Agent's plugin can include `model` / `ctx.model` /
+        // `agent_model` on the hook payload (varies by version).
+        // Best-effort lookup so cloud rows show the model when
+        // the plugin provides it; None otherwise.
+        let model = ["model", "agent_model"]
+            .iter()
+            .find_map(|k| payload.get(*k).and_then(Value::as_str))
+            .or_else(|| payload.pointer("/ctx/model").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut event = CodeEvent::new(NAME, hook_type, action, session, payload);
+        event.model = model;
+        Ok(event)
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {
