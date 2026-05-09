@@ -122,23 +122,42 @@ pub enum InstallError {
 /// PowerShell.
 pub(crate) fn quote_binary_path(path: &Path) -> String {
     let raw = path.display().to_string();
-    // Always wrap in double quotes — JSON-safe (escaped to `\"`),
-    // works on bash/zsh, cmd.exe, and PowerShell.  The path is
-    // ours (we control writes via `current_exe()` / install
-    // override) so escaping shell metachars beyond the wrapping
-    // quotes isn't necessary.  Sanity-belts via shlex below for
-    // the edge case where a tester points the install at a path
-    // containing a literal `"` (which would corrupt the JSON
-    // string).
-    if raw.contains('"') {
-        // Drop into shlex's POSIX-quote form for paths with
-        // embedded quotes.  Vanishingly rare on installed
-        // binaries; included for defense in depth.
-        return shlex::try_quote(&raw)
+    // Normalize Windows backslashes to forward slashes BEFORE
+    // wrapping.  Three reasons (per cross-research of Claude
+    // Code / Cursor Windows hook executors + cmd.exe `/C`
+    // parsing rules):
+    //
+    //   1. cmd.exe, PowerShell, and Git Bash (which Claude
+    //      Code + Cursor 2.x both shell out via on Windows)
+    //      all accept `C:/Users/Prabhat ACER/.local/bin/soth.exe`
+    //      as a valid binary path.  Forward slashes never
+    //      collide with JSON or shell escaping.
+    //   2. Backslashes in JSON strings need `\\` escaping; in a
+    //      hand-edited settings.json that's a footgun.  Forward
+    //      slashes serialize as themselves.
+    //   3. The Anthropic Claude Code issue #16451 (Burak Demir,
+    //      `C:\Users\Burak Demir`) shows the failure mode bites
+    //      both backslash + space cases.  Switching to forward
+    //      slashes eliminates the backslash side of the problem
+    //      while the double-quote wrapping handles the space.
+    let normalized = raw.replace('\\', "/");
+
+    // Defense-in-depth: a path containing a literal `"` would
+    // corrupt the JSON string.  Drop into shlex's POSIX-quote
+    // form ("battle-tested escape rules") for that case.
+    // Vanishingly rare on installed binaries.
+    if normalized.contains('"') {
+        return shlex::try_quote(&normalized)
             .map(|c| c.into_owned())
-            .unwrap_or_else(|_| format!("\"{raw}\""));
+            .unwrap_or_else(|_| format!("\"{normalized}\""));
     }
-    format!("\"{raw}\"")
+
+    // Standard double-quote wrapping — works on bash/zsh,
+    // cmd.exe (preserves leading `"` per `/C` rules when the
+    // command starts with `"executable"` and the executable
+    // itself is the first quoted token), PowerShell, and Git
+    // Bash.  cf. ss64.com/nt/cmd.html, daviddeley.com.
+    format!("\"{normalized}\"")
 }
 
 pub fn default_claude_settings_path() -> Option<PathBuf> {
@@ -1433,47 +1452,50 @@ mod tests {
 
     #[test]
     fn install_command_quotes_binary_path_with_spaces() {
-        // Repro for the Windows + space-in-username bug: a user
-        // named `Prabhat ACER` gets a binary path like
-        // `C:\Users\Prabhat ACER\.local\bin\soth.exe`.  The hook
-        // command must double-quote that path so the agent's
-        // shell invokes the right binary instead of splitting on
-        // the space and silently failing — which lets dangerous
-        // commands like `rm -rf` through the policy gate.
-        //
-        // Asserts on Claude Code (preToolUse), Codex
-        // (preToolUse, different settings shape), and the
-        // generic settings.json path.  Same quoting helper
-        // backs all three.
+        // Repro for the Windows + space-in-username bug.
+        // Engineer's actual path: `C:\Users\Prabhat ACER\…`.
+        // Quoted form must double-quote-wrap, normalize
+        // backslashes to forward slashes (works on cmd.exe,
+        // PowerShell, Git Bash, Node), and preserve the
+        // space-bearing folder name as one token.
         let win_path = PathBuf::from(r"C:\Users\Prabhat ACER\.local\bin\soth.exe");
         let quoted = quote_binary_path(&win_path);
-        assert!(
-            quoted.starts_with('"') && quoted.ends_with('"'),
-            "binary path must be double-quoted; got {quoted}"
+        assert_eq!(
+            quoted,
+            "\"C:/Users/Prabhat ACER/.local/bin/soth.exe\"",
+            "Windows path must be forward-slash-normalized + double-quoted"
         );
-        assert!(quoted.contains("Prabhat ACER"));
 
-        // mac path with no space — still quoted (consistent
-        // shape) so a future user with a space doesn't surface a
-        // new code path.
+        // Mac / Linux path: forward slashes already; still
+        // double-quoted so a future user with a space doesn't
+        // need a separate code path.
         let mac_path = PathBuf::from("/Users/dev/.local/bin/soth");
-        let mac_quoted = quote_binary_path(&mac_path);
-        assert!(mac_quoted.starts_with('"') && mac_quoted.ends_with('"'));
+        assert_eq!(
+            quote_binary_path(&mac_path),
+            "\"/Users/dev/.local/bin/soth\"",
+            "POSIX path must be double-quoted as-is"
+        );
     }
 
     #[test]
     fn install_claude_code_writes_quoted_command_for_space_path() {
-        // End-to-end: install on a space-bearing path and
-        // confirm the resulting settings.json contains the
-        // quoted command.  Guards against a future regression
-        // where one of the three install paths drops the helper.
+        // End-to-end: install on a space-bearing Windows path
+        // and confirm the resulting settings.json contains the
+        // forward-slash-normalized + double-quoted command.
+        // After deserialization the JSON value is exactly:
+        //   "C:/Users/Prabhat ACER/.local/bin/soth.exe" code hook --agent claude_code --type ...
+        // — which Claude Code's Git Bash / cmd.exe shell
+        // invokes correctly.
         let space_path = PathBuf::from(r"C:\Users\Prabhat ACER\.local\bin\soth.exe");
         let (_tmp, settings_path) = fixture_settings("");
         install_claude_code(&settings_path, Some(space_path)).unwrap();
         let body = fs::read_to_string(&settings_path).unwrap();
+        // JSON-encoded: `\"` for inner double-quotes.  No
+        // backslashes in the path so no `\\` escapes either —
+        // exactly the hand-readable shape engineers want.
         assert!(
-            body.contains(r#""\"C:\\Users\\Prabhat ACER\\.local\\bin\\soth.exe\""#),
-            "settings.json must embed quoted binary path; got: {body}"
+            body.contains(r#""\"C:/Users/Prabhat ACER/.local/bin/soth.exe\""#),
+            "settings.json must embed forward-slashed quoted path; got: {body}"
         );
     }
 
