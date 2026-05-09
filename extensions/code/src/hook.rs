@@ -526,6 +526,19 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
                 sidecar.estimated_input_tokens.to_string(),
             );
         }
+        // Top-level (NOT under `classify.`) — `from_governable`
+        // reads `interaction_mode` directly off the metadata
+        // map and feeds it into `TelemetryEvent.interaction_mode`,
+        // which the wire converter already passes through to the
+        // cloud's `intercept_events.interaction_mode` column.
+        // The classifier emits `augmentative` / `directive` /
+        // `expressive` / `unknown` from its second MLP head.
+        if !sidecar.interaction_mode.is_empty() && sidecar.interaction_mode != "unknown" {
+            metadata.insert(
+                "interaction_mode".into(),
+                format!("\"{}\"", sidecar.interaction_mode),
+            );
+        }
     }
     // Note: raw payload is not surfaced. Detection produces artifacts
     // (no raw values) on the GovernableEvent; classify summary lives
@@ -709,6 +722,7 @@ fn synthesize_tool_call_sidecar(ev: &CodeEvent, phase: ToolHookPhase) -> Classif
         stage_total_us: 0,
         volatility_class: "Static".to_string(),
         dynamic_fraction: 0.0,
+        interaction_mode: "unknown".to_string(),
     }
 }
 
@@ -1632,6 +1646,7 @@ mod tests {
             stage_total_us: 100,
             volatility_class: "Static".into(),
             dynamic_fraction: 0.0,
+            interaction_mode: "unknown".into(),
         });
         let pctx = build_policy_context(&ev);
         let semantic = pctx.semantic.expect("semantic populated when classify ran");

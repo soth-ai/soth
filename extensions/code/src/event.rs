@@ -210,6 +210,13 @@ pub struct ClassifySidecar {
     /// `volatility_class` to drive the dashboard's "stable vs
     /// drifting" indicator per row.
     pub dynamic_fraction: f32,
+    /// ONNX MLP auxiliary head output (snake_case):
+    /// `augmentative` / `directive` / `expressive` /
+    /// `unknown`.  The model's second head puts every
+    /// classifiable prompt in one of these three buckets —
+    /// surfacing it lets the dashboard slice "what kind of
+    /// conversation is this" alongside the use-case label.
+    pub interaction_mode: String,
 }
 
 impl From<&ClassifiedResult> for ClassifySidecar {
@@ -246,6 +253,15 @@ impl From<&ClassifiedResult> for ClassifySidecar {
             stage_total_us: c.stage_latencies.total_us,
             volatility_class: format!("{:?}", c.volatility_class),
             dynamic_fraction: c.dynamic_fraction,
+            // The interaction mode lives on the
+            // `telemetry_event` field of `ClassifiedResult`
+            // (set by stage 7 from stage 3's
+            // `UsecaseOutput.interaction_mode`).  Format via
+            // serde so we get the snake_case wire form.
+            interaction_mode: serde_json::to_value(c.telemetry_event.interaction_mode)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
         }
     }
 }

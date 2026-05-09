@@ -864,6 +864,7 @@ mod tests {
                     estimated_input_tokens: 12,
                     topic_cluster_id: 0,
                     stage_total_us: 4321,
+                    interaction_mode: "augmentative".to_string(),
                 },
             };
             let mut bytes = serde_json::to_vec(&resp).unwrap();
@@ -917,6 +918,7 @@ mod tests {
             stage_total_us: 1234,
             volatility_class: "LowVolatile".to_string(),
             dynamic_fraction: 0.15,
+            interaction_mode: "directive".to_string(),
         };
         let resp = ClassifyResponse::Ok { sidecar };
         let json = serde_json::to_string(&resp).unwrap();
