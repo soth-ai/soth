@@ -98,6 +98,23 @@ pub enum InstallError {
 }
 
 /// Default Claude Code settings file location.
+/// Quote a binary path so the agent's hook runner can invoke it
+/// even when the path contains spaces (Windows: `C:\Users\Prabhat
+/// ACER\.local\bin\soth.exe`; macOS / Linux: any user with a
+/// space in their home dir name).  Without quoting, the shell
+/// splits on the space, treats the first chunk as the binary and
+/// the rest as args, the binary fails to launch, the hook never
+/// runs, and the policy gate silently fails open — letting
+/// dangerous commands like `rm -rf` through.
+///
+/// Always uses double quotes since both PowerShell / cmd on
+/// Windows and bash / zsh on POSIX honor them.  No path-internal
+/// double quote escaping needed because soth's install paths
+/// never contain `"`.
+pub(crate) fn quote_binary_path(path: &Path) -> String {
+    format!("\"{}\"", path.display())
+}
+
 pub fn default_claude_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
@@ -998,7 +1015,7 @@ fn ensure_matcher_entry(
                 "type": "command",
                 "command": format!(
                     "{} code hook --agent {} --type {}",
-                    binary_path.display(),
+                    quote_binary_path(binary_path),
                     agent,
                     soth_hook_type
                 )
@@ -1215,7 +1232,7 @@ fn ensure_cursor_hook_entry(
         SOTH_MARKER_KEY: true,
         "command": format!(
             "{} code hook --agent {} --type {}",
-            binary_path.display(),
+            quote_binary_path(binary_path),
             agent,
             soth_hook_type
         )
@@ -1303,7 +1320,7 @@ fn ensure_hook_entry(
                 "type": "command",
                 "command": format!(
                     "{} code hook --agent claude_code --type {}",
-                    binary_path.display(),
+                    quote_binary_path(binary_path),
                     soth_hook_type
                 )
             }
@@ -1377,6 +1394,52 @@ fn kind_label(v: &Value) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn install_command_quotes_binary_path_with_spaces() {
+        // Repro for the Windows + space-in-username bug: a user
+        // named `Prabhat ACER` gets a binary path like
+        // `C:\Users\Prabhat ACER\.local\bin\soth.exe`.  The hook
+        // command must double-quote that path so the agent's
+        // shell invokes the right binary instead of splitting on
+        // the space and silently failing — which lets dangerous
+        // commands like `rm -rf` through the policy gate.
+        //
+        // Asserts on Claude Code (preToolUse), Codex
+        // (preToolUse, different settings shape), and the
+        // generic settings.json path.  Same quoting helper
+        // backs all three.
+        let win_path = PathBuf::from(r"C:\Users\Prabhat ACER\.local\bin\soth.exe");
+        let quoted = quote_binary_path(&win_path);
+        assert!(
+            quoted.starts_with('"') && quoted.ends_with('"'),
+            "binary path must be double-quoted; got {quoted}"
+        );
+        assert!(quoted.contains("Prabhat ACER"));
+
+        // mac path with no space — still quoted (consistent
+        // shape) so a future user with a space doesn't surface a
+        // new code path.
+        let mac_path = PathBuf::from("/Users/dev/.local/bin/soth");
+        let mac_quoted = quote_binary_path(&mac_path);
+        assert!(mac_quoted.starts_with('"') && mac_quoted.ends_with('"'));
+    }
+
+    #[test]
+    fn install_claude_code_writes_quoted_command_for_space_path() {
+        // End-to-end: install on a space-bearing path and
+        // confirm the resulting settings.json contains the
+        // quoted command.  Guards against a future regression
+        // where one of the three install paths drops the helper.
+        let space_path = PathBuf::from(r"C:\Users\Prabhat ACER\.local\bin\soth.exe");
+        let (_tmp, settings_path) = fixture_settings("");
+        install_claude_code(&settings_path, Some(space_path)).unwrap();
+        let body = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            body.contains(r#""\"C:\\Users\\Prabhat ACER\\.local\\bin\\soth.exe\""#),
+            "settings.json must embed quoted binary path; got: {body}"
+        );
+    }
+
     fn fixture_settings(content: &str) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
@@ -1443,7 +1506,7 @@ mod tests {
             && e["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
-                .contains("soth code hook")));
+                .contains("code hook --agent")));
         assert!(entries
             .iter()
             .any(|e| e["hooks"][0]["command"] == "/usr/local/bin/my-other-hook"));
