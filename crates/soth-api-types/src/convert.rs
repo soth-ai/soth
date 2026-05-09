@@ -114,7 +114,18 @@ pub fn map_event(event: &soth_core::TelemetryEvent) -> TelemetryEvent {
         timestamp: event.timestamp_epoch_ms / 1_000,
         provider: Some(event.provider.clone()),
         model: event.model.clone(),
-        use_case_label: enum_name(&event.use_case),
+        // Prefer the literal-label override when set (soth-code's
+        // per-tool synthesized rows carry tool names like
+        // `"bash"` / `"read"` that don't map to `UseCaseLabel`
+        // enum variants).  Falls back to the enum's snake-case
+        // form for proxy / historian rows where the typed enum
+        // is authoritative.  Without this, the wire would always
+        // emit `"unknown"` for soth-code tool rows (which is
+        // exactly the symptom the dashboard surfaced).
+        use_case_label: event
+            .use_case_label_override
+            .clone()
+            .or_else(|| enum_name(&event.use_case)),
         use_case_label_reason: enum_name(&event.use_case_label_reason),
         use_case_confidence: if event.use_case_confidence > 0.0 {
             Some(event.use_case_confidence)

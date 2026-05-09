@@ -222,10 +222,24 @@ impl From<&ClassifiedResult> for ClassifySidecar {
             use_case_label_reason: format!("{:?}", c.use_case_label_reason),
             complexity_score: c.complexity_score,
             anomaly_score: c.anomaly_score,
+            // Snake-case via serde (`AnomalyFlag` derives
+            // `rename_all = "snake_case"`) instead of `Debug`'s
+            // PascalCase, so the metadata key value can be
+            // round-tripped through `from_governable` as
+            // `Vec<AnomalyFlag>`.  Without this conversion
+            // `from_governable` sees `"TopicDrift"`,
+            // `serde_json` rejects it (expects `topic_drift`),
+            // and the dashboard's anomaly flag column comes
+            // back empty for every row — exactly the symptom
+            // the dashboard surfaced.
             anomaly_flags: c
                 .anomaly_flags
                 .iter()
-                .map(|f| format!("{f:?}"))
+                .filter_map(|f| {
+                    serde_json::to_value(f)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                })
                 .collect(),
             estimated_input_tokens: c.telemetry_event.estimated_input_tokens.unwrap_or(0),
             topic_cluster_id: c.topic_cluster_id,

@@ -338,6 +338,17 @@ pub struct TelemetryEvent {
     pub parse_source: ParseSource,
     pub capture_mode: CaptureMode,
     pub use_case: UseCaseLabel,
+    /// Raw label string when the edge wrote a value that doesn't
+    /// match a `UseCaseLabel` enum variant — typically the
+    /// soth-code per-tool synthesized labels (`"bash"`, `"read"`,
+    /// `"edit"`, MCP tool names, …).  When `Some(_)`, the wire
+    /// converter (`soth-api-types/src/convert.rs`) prefers it
+    /// over the enum's snake-case name so the dashboard sees
+    /// the literal tool name instead of `"unknown"`.  `None` for
+    /// proxy / historian rows where the typed enum is
+    /// authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_case_label_override: Option<String>,
     pub volatility_class: VolatilityClass,
     pub cache_level: Option<CacheLevel>,
     pub routing_reason: Option<RoutingReason>,
@@ -509,6 +520,7 @@ impl Default for TelemetryEvent {
             parse_source: ParseSource::Heuristic,
             capture_mode: CaptureMode::MetadataOnly,
             use_case: UseCaseLabel::Unknown,
+            use_case_label_override: None,
             volatility_class: VolatilityClass::Static,
             cache_level: None,
             routing_reason: None,
@@ -706,6 +718,21 @@ impl TelemetryEvent {
             (false, None) => UseCaseLabelReason::ExtensionNotEnriched,
         };
         let use_case = raw_use_case.unwrap_or(UseCaseLabel::Unknown);
+        // When the metadata key carries a value that doesn't match
+        // a `UseCaseLabel` enum variant — soth-code's per-tool
+        // synthesized labels (`"bash"`, `"read"`, `"edit"`, MCP
+        // tool names, …) — preserve the literal string so the
+        // wire converter can pass it through to the dashboard.
+        // Otherwise the enum collapses to Unknown and the
+        // `use_case_label` column shows "unknown" for every tool
+        // call row.
+        let use_case_label_override = if raw_use_case.is_none() {
+            meta.get("classify.use_case")
+                .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         let use_case_confidence = meta
             .get("classify.use_case_confidence")
             .and_then(|s| s.parse::<f32>().ok())
@@ -722,6 +749,16 @@ impl TelemetryEvent {
             .get("classify.anomaly_score")
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|&v| v > 0.0);
+        // `classify.anomaly_flags` is a JSON-array-of-strings
+        // (snake_case enum forms — `["topic_drift",
+        // "token_burst"]`).  Without this read the
+        // `anomaly_flags` field stays `Vec::new()` even when the
+        // edge daemon detected drift, and the dashboard's
+        // anomaly column shows empty for every row.
+        let extension_anomaly_flags = meta
+            .get("classify.anomaly_flags")
+            .and_then(|s| serde_json::from_str::<Vec<crate::AnomalyFlag>>(s).ok())
+            .unwrap_or_default();
         let complexity_score = meta
             .get("classify.complexity_score")
             .and_then(|s| s.parse::<u8>().ok())
@@ -792,11 +829,13 @@ impl TelemetryEvent {
             sensitive_code_flags,
             code_fraction,
             use_case,
+            use_case_label_override,
             use_case_confidence,
             use_case_label_reason,
             volatility_class,
             dynamic_fraction,
             anomaly_score,
+            anomaly_flags: extension_anomaly_flags,
             complexity_score,
             topic_cluster_id,
             process_resolution,
@@ -1148,6 +1187,115 @@ mod data_source_serde_tests {
         let te = TelemetryEvent::from_governable(&gov, None);
         assert!(te.raw_payload.is_none());
         assert!(te.raw_capture_mode.is_none());
+    }
+
+    #[test]
+    fn from_governable_preserves_synthesized_tool_label_via_override() {
+        use crate::{UseCaseLabel, UseCaseLabelReason};
+        // soth-code's per-tool synthesized rows write
+        // `classify.use_case = "\"bash\""` (a literal tool name
+        // that doesn't deserialize as the typed `UseCaseLabel`
+        // enum).  Without the override field these rows would
+        // wire-encode `use_case_label = "unknown"` and the
+        // dashboard's `/code` endpoint would show "unknown" for
+        // every tool call — exactly the bug we shipped a fix
+        // for.  Pin both legs:
+        //   * `use_case` collapses to `Unknown` (typed enum
+        //     can't hold "bash") — accepted, the wire converter
+        //     handles it.
+        //   * `use_case_label_override` carries the literal
+        //     "bash" so `convert.rs` can prefer it and the
+        //     cloud sees the real tool name.
+        //   * Reason is the explicit `pre_tool_call` from
+        //     metadata, NOT `ExtensionNotEnriched`.
+        use crate::extensions::{ExtensionContext, ExtensionSource, GovernableEvent};
+        use crate::EventSource;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "classify.use_case".to_string(),
+            "\"bash\"".to_string(),
+        );
+        meta.insert(
+            "classify.use_case_label_reason".to_string(),
+            "\"pre_tool_call\"".to_string(),
+        );
+        let gov = GovernableEvent {
+            event_id: Uuid::nil(),
+            timestamp_epoch_ms: 0,
+            source: EventSource::Extension {
+                source: ExtensionSource::Code,
+            },
+            provider: "code".to_string(),
+            model: Some("claude-opus-4-7".to_string()),
+            endpoint_type: super::EndpointType::Unknown,
+            normalized: None,
+            artifacts: vec![],
+            capture_mode: super::CaptureMode::MetadataOnly,
+            embed_content: None,
+            context: ExtensionContext {
+                extension_name: "code".to_string(),
+                extension_version: "0.1.0".to_string(),
+                metadata: meta,
+            },
+        };
+        let te = TelemetryEvent::from_governable(&gov, None);
+        assert_eq!(te.use_case, UseCaseLabel::Unknown);
+        assert_eq!(te.use_case_label_override.as_deref(), Some("bash"));
+        assert_eq!(te.use_case_label_reason, UseCaseLabelReason::PreToolCall);
+        assert_eq!(te.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn from_governable_reads_anomaly_flags_from_extension_metadata() {
+        use crate::AnomalyFlag;
+        // The classify daemon emits real anomaly flags
+        // (`topic_drift`, `token_burst`, `tool_call_depth_spike`,
+        // …) in session-tracked mode.  Hook handler writes
+        // `classify.anomaly_flags` as a JSON array of snake_case
+        // enum names.  Pin the read path so a future change
+        // can't silently drop them — every flag the daemon
+        // detected must round-trip through `from_governable` and
+        // surface in the dashboard's anomaly column.
+        use crate::extensions::{ExtensionContext, ExtensionSource, GovernableEvent};
+        use crate::EventSource;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "classify.use_case".to_string(),
+            "\"code_generation\"".to_string(),
+        );
+        meta.insert(
+            "classify.anomaly_flags".to_string(),
+            r#"["topic_drift","token_burst"]"#.to_string(),
+        );
+        let gov = GovernableEvent {
+            event_id: Uuid::nil(),
+            timestamp_epoch_ms: 0,
+            source: EventSource::Extension {
+                source: ExtensionSource::Code,
+            },
+            provider: "code".to_string(),
+            model: None,
+            endpoint_type: super::EndpointType::Unknown,
+            normalized: None,
+            artifacts: vec![],
+            capture_mode: super::CaptureMode::MetadataOnly,
+            embed_content: None,
+            context: ExtensionContext {
+                extension_name: "code".to_string(),
+                extension_version: "0.1.0".to_string(),
+                metadata: meta,
+            },
+        };
+        let te = TelemetryEvent::from_governable(&gov, None);
+        assert!(te.anomaly_flags.contains(&AnomalyFlag::TopicDrift));
+        assert!(te.anomaly_flags.contains(&AnomalyFlag::TokenBurst));
+        assert_eq!(te.anomaly_flags.len(), 2);
     }
 
     #[test]

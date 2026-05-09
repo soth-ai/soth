@@ -69,6 +69,7 @@ pub(crate) fn run(
         parse_source: detect_result.parse_source,
         capture_mode: detect_result.capture_mode,
         use_case: usecase.label,
+        use_case_label_override: None,
         volatility_class: volatility.class,
         cache_level: None,
         routing_reason: derive_routing_reason(&policy.decision.kind),
