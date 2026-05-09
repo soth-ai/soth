@@ -121,42 +121,39 @@ pub enum InstallError {
 /// command works whether the agent's shell is bash, cmd, or
 /// PowerShell.
 pub(crate) fn quote_binary_path(path: &Path) -> String {
-    let raw = path.display().to_string();
-    // Normalize Windows backslashes to forward slashes BEFORE
-    // wrapping.  Three reasons (per cross-research of Claude
-    // Code / Cursor Windows hook executors + cmd.exe `/C`
-    // parsing rules):
-    //
-    //   1. cmd.exe, PowerShell, and Git Bash (which Claude
-    //      Code + Cursor 2.x both shell out via on Windows)
-    //      all accept `C:/Users/Prabhat ACER/.local/bin/soth.exe`
-    //      as a valid binary path.  Forward slashes never
-    //      collide with JSON or shell escaping.
-    //   2. Backslashes in JSON strings need `\\` escaping; in a
-    //      hand-edited settings.json that's a footgun.  Forward
-    //      slashes serialize as themselves.
-    //   3. The Anthropic Claude Code issue #16451 (Burak Demir,
-    //      `C:\Users\Burak Demir`) shows the failure mode bites
-    //      both backslash + space cases.  Switching to forward
-    //      slashes eliminates the backslash side of the problem
-    //      while the double-quote wrapping handles the space.
-    let normalized = raw.replace('\\', "/");
+    // Backslash → forward-slash normalization.  Looked at the
+    // `path-slash` and `dunce` crates to "offload" this; they
+    // both branch on the host OS's path separator at runtime,
+    // which is correct file-system semantics but wrong for our
+    // case where we're producing a string that always targets
+    // a Windows-or-POSIX shell regardless of the host that
+    // wrote it.  A 1-line `replace` is the right tool here:
+    // forward slashes are accepted by cmd.exe, PowerShell, Git
+    // Bash (default Windows shell for Claude Code + Cursor
+    // 2.x hooks), bash, zsh, and Node — and they serialize as
+    // themselves in JSON, eliminating the `\\`-escape footgun
+    // engineers hit when reading a hand-edited settings.json.
+    // (Anthropic Claude Code issue #16451 — `C:\Users\Burak
+    // Demir` — shows backslash + space is the root failure
+    // pattern; this plus the double-quote wrapping below
+    // covers both axes.)
+    let normalized = path.display().to_string().replace('\\', "/");
 
-    // Defense-in-depth: a path containing a literal `"` would
+    // Defense in depth: a path containing a literal `"` would
     // corrupt the JSON string.  Drop into shlex's POSIX-quote
-    // form ("battle-tested escape rules") for that case.
-    // Vanishingly rare on installed binaries.
+    // form (`'…'` wrapping) for that case.  Vanishingly rare
+    // on real installed binaries.
     if normalized.contains('"') {
         return shlex::try_quote(&normalized)
             .map(|c| c.into_owned())
             .unwrap_or_else(|_| format!("\"{normalized}\""));
     }
 
-    // Standard double-quote wrapping — works on bash/zsh,
-    // cmd.exe (preserves leading `"` per `/C` rules when the
-    // command starts with `"executable"` and the executable
-    // itself is the first quoted token), PowerShell, and Git
-    // Bash.  cf. ss64.com/nt/cmd.html, daviddeley.com.
+    // Standard double-quote wrapping.  Works on bash/zsh,
+    // cmd.exe (cmd `/C` preserves the leading `"` when the
+    // command shape is `"executable" args` and the executable
+    // is the first quoted token; cf. ss64.com/nt/cmd.html),
+    // PowerShell, and Git Bash.
     format!("\"{normalized}\"")
 }
 
