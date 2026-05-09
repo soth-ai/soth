@@ -918,14 +918,23 @@ fn build_action_policy_context(ev: &CodeEvent) -> soth_core::ActionPolicyContext
         .map(|s| s.to_string());
     // File path: same shape — `tool_input.file_path` (Claude
     // Code Edit/Read), or `path` / `file_path` at the top level
-    // for other agents.
+    // for other agents.  Normalize backslash separators to
+    // forward slashes so CEL rules using `.ssh/` /
+    // `.aws/credentials` match Windows paths
+    // (`C:\Users\Prabhat ACER\.ssh\id_rsa`) too — without
+    // normalization the install-time-equivalent rules would
+    // silently no-op on Windows and the policy gate would fail
+    // open for credential-write attempts.  Forward slashes work
+    // as path separators on Windows for nearly every API
+    // soth-code interacts with, so the canonicalized form is
+    // also functionally valid.
     let file_path = payload
         .get("tool_input")
         .and_then(|t| t.get("file_path"))
         .and_then(|v| v.as_str())
         .or_else(|| payload.get("file_path").and_then(|v| v.as_str()))
         .or_else(|| payload.get("path").and_then(|v| v.as_str()))
-        .map(|s| s.to_string());
+        .map(|s| s.replace('\\', "/"));
     soth_core::ActionPolicyContext {
         agent: ev.agent.clone(),
         action_type: ev.action_type.as_str().to_string(),
@@ -2110,6 +2119,40 @@ mod tests {
         // `action.command.contains(...)` rules don't accidentally
         // match a file path.
         assert_eq!(action.command, None);
+    }
+
+    #[test]
+    #[test]
+    fn build_action_policy_context_normalizes_windows_backslash_paths() {
+        // Windows paths use backslashes
+        // (`C:\Users\Prabhat ACER\.ssh\id_rsa`) but org policy
+        // rules are authored with forward-slash patterns
+        // (`.ssh/`, `.aws/credentials`) since most engineers
+        // write rules on macOS / Linux first.  Without
+        // normalization at the policy-context build step, the
+        // CEL `action.file_path.contains(".ssh/")` rule never
+        // matches on Windows and the policy gate fails open for
+        // credential-write attempts.  Pin the normalization so
+        // the same rule pack works on all 3 platforms.
+        let ev = CodeEvent::new(
+            "cursor",
+            "pre_write_file",
+            crate::event::ActionType::FileWrite,
+            "sess-win",
+            serde_json::json!({
+                "tool_input": {
+                    "file_path": r"C:\Users\Prabhat ACER\.ssh\id_rsa",
+                    "content": "fake-key"
+                }
+            }),
+        );
+        let action = build_action_policy_context(&ev);
+        assert_eq!(
+            action.file_path.as_deref(),
+            Some("C:/Users/Prabhat ACER/.ssh/id_rsa"),
+            "Windows backslash paths must normalize to forward slashes \
+             so `action.file_path.contains(\".ssh/\")` rules match"
+        );
     }
 
     #[test]
