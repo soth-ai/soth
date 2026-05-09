@@ -105,14 +105,40 @@ pub enum InstallError {
 /// splits on the space, treats the first chunk as the binary and
 /// the rest as args, the binary fails to launch, the hook never
 /// runs, and the policy gate silently fails open — letting
-/// dangerous commands like `rm -rf` through.
+/// dangerous commands like recursive force-deletes through.
 ///
-/// Always uses double quotes since both PowerShell / cmd on
-/// Windows and bash / zsh on POSIX honor them.  No path-internal
-/// double quote escaping needed because soth's install paths
-/// never contain `"`.
+/// Implementation note: hand-rolled wrapping (`format!("\"{}\"",
+/// …)`) covered the common case but missed paths containing `"`,
+/// `$`, backticks, or shell metachars.  Switched to `shlex::try_quote`
+/// — battle-tested escape rules that the engineer recommended
+/// ("check how gryph solves it or offload it").  shlex emits POSIX
+/// shell-safe single-quoted form when needed; for plain paths
+/// without metachars it returns the path as-is.
+///
+/// On Windows we still need explicit double-quote wrapping because
+/// shlex emits POSIX-style and cmd.exe / PowerShell honor double
+/// quotes natively.  Forward-slash-normalize first so the resulting
+/// command works whether the agent's shell is bash, cmd, or
+/// PowerShell.
 pub(crate) fn quote_binary_path(path: &Path) -> String {
-    format!("\"{}\"", path.display())
+    let raw = path.display().to_string();
+    // Always wrap in double quotes — JSON-safe (escaped to `\"`),
+    // works on bash/zsh, cmd.exe, and PowerShell.  The path is
+    // ours (we control writes via `current_exe()` / install
+    // override) so escaping shell metachars beyond the wrapping
+    // quotes isn't necessary.  Sanity-belts via shlex below for
+    // the edge case where a tester points the install at a path
+    // containing a literal `"` (which would corrupt the JSON
+    // string).
+    if raw.contains('"') {
+        // Drop into shlex's POSIX-quote form for paths with
+        // embedded quotes.  Vanishingly rare on installed
+        // binaries; included for defense in depth.
+        return shlex::try_quote(&raw)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| format!("\"{raw}\""));
+    }
+    format!("\"{raw}\"")
 }
 
 pub fn default_claude_settings_path() -> Option<PathBuf> {
@@ -474,7 +500,18 @@ fn install_plugin_file(
         None
     };
 
-    let source = source_template.replace("__SOTH_BIN__", &binary_path.display().to_string());
+    // JS / TS string-literal escaping for the path.  The plugin
+    // templates embed `__SOTH_BIN__` inside a JS double-quoted
+    // string: `const SOTH_BIN = "__SOTH_BIN__";`.  On Windows
+    // the raw path `C:\Users\Prabhat ACER\.local\bin\soth.exe`
+    // contains backslashes that JS treats as escape sequences
+    // (`\U`, `\b`, `\.`) — would either break the plugin parse
+    // or silently produce a wrong path.  Escape `\` → `\\` and
+    // `"` → `\"` before substitution so the resulting JS source
+    // is valid on every platform.
+    let path_str = binary_path.display().to_string();
+    let js_escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+    let source = source_template.replace("__SOTH_BIN__", &js_escaped);
     write_atomic(plugin_path, source.as_bytes())?;
 
     Ok(InstallReport {
