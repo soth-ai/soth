@@ -932,7 +932,9 @@ where
                 }
             }
             Err(e) => {
-                result.failed.push((det.agent.to_string(), format!("{e:#}")));
+                result
+                    .failed
+                    .push((det.agent.to_string(), format!("{e:#}")));
             }
         }
     }
@@ -975,9 +977,7 @@ fn report_sweep(detected: &[soth_code::install::DetectedAgent], result: &SweepRe
         ));
     }
     for (agent, err) in &result.failed {
-        style::warning(&format!(
-            "soth-code hook install failed for {agent}: {err}"
-        ));
+        style::warning(&format!("soth-code hook install failed for {agent}: {err}"));
     }
 }
 
@@ -986,8 +986,8 @@ fn report_sweep(detected: &[soth_code::install::DetectedAgent], result: &SweepRe
 /// the canonical settings path (no `--settings-path` override).
 fn install_one(agent: &str, settings_path: &Path) -> anyhow::Result<()> {
     use soth_code::install::{
-        install_claude_code, install_codex, install_cursor, install_gemini_cli,
-        install_opencode, install_pi_agent, install_windsurf,
+        install_claude_code, install_codex, install_cursor, install_gemini_cli, install_opencode,
+        install_pi_agent, install_windsurf,
     };
     match agent {
         "claude_code" => install_claude_code(settings_path, None)
@@ -1615,8 +1615,8 @@ mod tests {
                     foreground: false,
                     no_autostart: false,
                     allow_daemon_child_fallback: false,
-                        skip_hooks: true,
-                        repair_hooks: false,
+                    skip_hooks: true,
+                    repair_hooks: false,
                 },
                 None,
             ))
@@ -1708,9 +1708,14 @@ mod sweep_tests {
 
     /// Always-success install fn that records every call so
     /// the test can assert which agents were actually installed.
-    fn recording_install(calls: &Mutex<Vec<(String, PathBuf)>>) -> impl Fn(&str, &Path) -> anyhow::Result<()> + '_ {
+    fn recording_install(
+        calls: &Mutex<Vec<(String, PathBuf)>>,
+    ) -> impl Fn(&str, &Path) -> anyhow::Result<()> + '_ {
         move |agent: &str, path: &Path| {
-            calls.lock().unwrap().push((agent.to_string(), path.to_path_buf()));
+            calls
+                .lock()
+                .unwrap()
+                .push((agent.to_string(), path.to_path_buf()));
             Ok(())
         }
     }
@@ -1777,7 +1782,10 @@ mod sweep_tests {
             false,
             recording_install(&calls2),
         );
-        assert!(calls2.lock().unwrap().is_empty(), "install must be skipped on re-run");
+        assert!(
+            calls2.lock().unwrap().is_empty(),
+            "install must be skipped on re-run"
+        );
         assert_eq!(result.skipped, vec!["claude_code"]);
         assert!(result.installed.is_empty());
         assert!(result.repaired.is_empty());
@@ -1818,7 +1826,11 @@ mod sweep_tests {
             false,
             recording_install(&calls2),
         );
-        assert_eq!(calls2.lock().unwrap().len(), 1, "drift must trigger re-install");
+        assert_eq!(
+            calls2.lock().unwrap().len(),
+            1,
+            "drift must trigger re-install"
+        );
         assert_eq!(result.repaired, vec!["claude_code"]);
         assert!(result.installed.is_empty());
 
@@ -1895,7 +1907,9 @@ mod sweep_tests {
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].0, "cursor");
         assert!(
-            result.failed[0].1.contains("simulated cursor install failure"),
+            result.failed[0]
+                .1
+                .contains("simulated cursor install failure"),
             "failure detail must surface the underlying error"
         );
 

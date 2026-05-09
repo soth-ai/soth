@@ -133,8 +133,7 @@ fn conversation_id_extracted_as_session() {
 
 fn parse(hook_type: &str, file_name: &str) -> CodeEvent {
     let path = Path::new(FIXTURE_ROOT).join(hook_type).join(file_name);
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
     CursorAdapter::new()
         .parse_event(hook_type, &bytes)
         .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))

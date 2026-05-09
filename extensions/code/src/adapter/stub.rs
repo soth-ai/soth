@@ -152,9 +152,7 @@ mod tests {
         // produced UX that bisected on hook-name typos. Stub avoids
         // that for the smoke E2E.
         let a = StubAdapter::new("claude_code".to_string());
-        let ev = a
-            .parse_event("totally_made_up", b"{}")
-            .expect("permissive");
+        let ev = a.parse_event("totally_made_up", b"{}").expect("permissive");
         assert_eq!(ev.action_type, ActionType::Notification);
     }
 }

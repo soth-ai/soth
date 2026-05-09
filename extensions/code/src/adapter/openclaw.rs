@@ -205,7 +205,8 @@ mod tests {
             "stop",
             "session_start",
         ] {
-            let payload = br#"{"session_id":"s1","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+            let payload =
+                br#"{"session_id":"s1","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
             let ev = a.parse_event(ht, payload).expect("parse");
             assert_eq!(ev.agent, "openclaw");
             assert_eq!(ev.agent_native_session_id, "s1");
@@ -307,6 +308,9 @@ mod tests {
         assert_eq!(tool_to_action("Write"), ActionType::FileWrite);
         // Unknown tool name → generic ToolUse so MCP-style
         // tool calls don't get silently mis-categorized.
-        assert_eq!(tool_to_action("mcp__github__list_issues"), ActionType::ToolUse);
+        assert_eq!(
+            tool_to_action("mcp__github__list_issues"),
+            ActionType::ToolUse
+        );
     }
 }

@@ -147,7 +147,10 @@ impl ClassifyEnricher {
         if !result.semantic_hash.is_empty()
             && result.semantic_hash != "00000000000000000000000000000000"
         {
-            meta.insert(keys::SEMANTIC_HASH.to_string(), result.semantic_hash.clone());
+            meta.insert(
+                keys::SEMANTIC_HASH.to_string(),
+                result.semantic_hash.clone(),
+            );
         }
         if let Some(tokens) = result.telemetry_event.estimated_input_tokens {
             if tokens > 0 {

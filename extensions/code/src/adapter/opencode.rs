@@ -139,10 +139,7 @@ impl Adapter for OpenCodeAdapter {
 fn action_type_for(hook_type: &str, payload: &Value) -> ActionType {
     match hook_type {
         "tool_execute_before" | "tool_execute_after" => {
-            let tool = payload
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let tool = payload.get("tool").and_then(Value::as_str).unwrap_or("");
             tool_to_action(tool)
         }
         "user_prompt_submit" => ActionType::UserPromptSubmit,

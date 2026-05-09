@@ -145,11 +145,7 @@ pub fn default_windsurf_hooks_path() -> Option<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        dirs::home_dir().map(|h| {
-            h.join(".codeium")
-                .join("windsurf")
-                .join("hooks.json")
-        })
+        dirs::home_dir().map(|h| h.join(".codeium").join("windsurf").join("hooks.json"))
     }
 }
 
@@ -461,8 +457,7 @@ fn install_plugin_file(
         None
     };
 
-    let source = source_template
-        .replace("__SOTH_BIN__", &binary_path.display().to_string());
+    let source = source_template.replace("__SOTH_BIN__", &binary_path.display().to_string());
     write_atomic(plugin_path, source.as_bytes())?;
 
     Ok(InstallReport {
@@ -727,7 +722,8 @@ pub fn install_cursor(
     // Cursor's top-level `version` field — populate if absent.
     {
         let map = hooks_doc.as_object_mut().expect("checked");
-        map.entry("version").or_insert_with(|| Value::Number(1.into()));
+        map.entry("version")
+            .or_insert_with(|| Value::Number(1.into()));
     }
 
     let hooks_obj = hooks_doc
@@ -746,8 +742,13 @@ pub fn install_cursor(
     let mut hooks_already_present = Vec::new();
 
     for (cursor_event, soth_hook_type) in CURSOR_HOOK_TYPES {
-        let entry_added =
-            ensure_cursor_hook_entry(hooks_obj, cursor_event, soth_hook_type, "cursor", &binary_path);
+        let entry_added = ensure_cursor_hook_entry(
+            hooks_obj,
+            cursor_event,
+            soth_hook_type,
+            "cursor",
+            &binary_path,
+        );
         if entry_added {
             hooks_added.push((*cursor_event).to_string());
         } else {
@@ -851,12 +852,7 @@ pub fn install_codex(
     hooks_path: &Path,
     binary_path_override: Option<PathBuf>,
 ) -> Result<InstallReport, InstallError> {
-    install_matcher_style(
-        hooks_path,
-        binary_path_override,
-        "codex",
-        CODEX_HOOK_TYPES,
-    )
+    install_matcher_style(hooks_path, binary_path_override, "codex", CODEX_HOOK_TYPES)
 }
 
 pub fn uninstall_codex(hooks_path: &Path) -> Result<(), InstallError> {
@@ -939,7 +935,13 @@ fn install_matcher_style(
     }
 
     for (upstream_event, soth_hook_type) in hook_types {
-        let added = ensure_matcher_entry(hooks_obj, upstream_event, agent, soth_hook_type, &binary_path);
+        let added = ensure_matcher_entry(
+            hooks_obj,
+            upstream_event,
+            agent,
+            soth_hook_type,
+            &binary_path,
+        );
         if added {
             hooks_added.push((*upstream_event).to_string());
         } else {
@@ -1014,10 +1016,11 @@ fn uninstall_matcher_style(settings_path: &Path) -> Result<(), InstallError> {
     if content.trim().is_empty() {
         return Ok(());
     }
-    let mut settings: Value = serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
-        path: settings_path.to_path_buf(),
-        source: e,
-    })?;
+    let mut settings: Value =
+        serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
+            path: settings_path.to_path_buf(),
+            source: e,
+        })?;
     if !settings.is_object() {
         return Err(InstallError::NotAnObject {
             kind: kind_label(&settings),
@@ -1040,7 +1043,10 @@ fn uninstall_matcher_style(settings_path: &Path) -> Result<(), InstallError> {
             settings.as_object_mut().unwrap().remove("hooks");
         }
     }
-    write_atomic(settings_path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
+    write_atomic(
+        settings_path,
+        serde_json::to_string_pretty(&settings)?.as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -1109,7 +1115,13 @@ fn install_flat_style(
     let mut hooks_added = Vec::new();
     let mut hooks_already_present = Vec::new();
     for (upstream_event, soth_hook_type) in hook_types {
-        let added = ensure_cursor_hook_entry(hooks_obj, upstream_event, soth_hook_type, agent, &binary_path);
+        let added = ensure_cursor_hook_entry(
+            hooks_obj,
+            upstream_event,
+            soth_hook_type,
+            agent,
+            &binary_path,
+        );
         if added {
             hooks_added.push((*upstream_event).to_string());
         } else {
@@ -1219,10 +1231,11 @@ pub fn uninstall_claude_code(settings_path: &Path) -> Result<(), InstallError> {
     if content.trim().is_empty() {
         return Ok(());
     }
-    let mut settings: Value = serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
-        path: settings_path.to_path_buf(),
-        source: e,
-    })?;
+    let mut settings: Value =
+        serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
+            path: settings_path.to_path_buf(),
+            source: e,
+        })?;
     if !settings.is_object() {
         return Err(InstallError::NotAnObject {
             kind: kind_label(&settings),
@@ -1383,7 +1396,10 @@ mod tests {
         let path = tmp.path().join("nested").join("settings.json");
         let report = install_claude_code(&path, Some(binary_path())).unwrap();
         assert!(path.exists());
-        assert!(report.backup_path.is_none(), "no backup needed when nothing existed");
+        assert!(
+            report.backup_path.is_none(),
+            "no backup needed when nothing existed"
+        );
         assert_eq!(report.hooks_added.len(), HOOK_TYPES.len());
         let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(body["hooks"]["PreToolUse"].is_array());
@@ -1418,10 +1434,13 @@ mod tests {
         install_claude_code(&path, Some(binary_path())).unwrap();
         let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let entries = body["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 2, "user's existing entry preserved alongside soth's");
-        assert!(entries
-            .iter()
-            .any(|e| e[SOTH_MARKER_KEY] == true && e["hooks"][0]["command"]
+        assert_eq!(
+            entries.len(),
+            2,
+            "user's existing entry preserved alongside soth's"
+        );
+        assert!(entries.iter().any(|e| e[SOTH_MARKER_KEY] == true
+            && e["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
                 .contains("soth code hook")));
@@ -1457,7 +1476,10 @@ mod tests {
         let bak = report.backup_path.expect(".bak written");
         assert!(bak.exists());
         let bak_body = fs::read_to_string(&bak).unwrap();
-        assert!(bak_body.contains("\"theme\""), "backup is the ORIGINAL content");
+        assert!(
+            bak_body.contains("\"theme\""),
+            "backup is the ORIGINAL content"
+        );
         assert!(
             !bak_body.contains("PreToolUse"),
             "backup must not contain new install — it's the snapshot before"
@@ -1504,7 +1526,10 @@ mod tests {
         let pre_tool_use = after["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre_tool_use.len(), 1, "user hook preserved");
         assert!(!is_soth_managed(&pre_tool_use[0]));
-        assert_eq!(pre_tool_use[0]["hooks"][0]["command"], "/usr/local/bin/my-other-hook");
+        assert_eq!(
+            pre_tool_use[0]["hooks"][0]["command"],
+            "/usr/local/bin/my-other-hook"
+        );
     }
 
     #[test]
@@ -1554,7 +1579,13 @@ mod tests {
         // Codex's slim 5-hook set per rust-codex 0.114.0.
         assert_eq!(report.hooks_added.len(), 5);
         let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        for upstream in ["SessionStart", "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"] {
+        for upstream in [
+            "SessionStart",
+            "PreToolUse",
+            "PostToolUse",
+            "UserPromptSubmit",
+            "Stop",
+        ] {
             assert!(
                 body["hooks"][upstream].is_array(),
                 "codex must install hook for {upstream}"
@@ -1601,7 +1632,10 @@ mod tests {
         assert!(body.contains(PLUGIN_MARKER_LINE));
         // Binary path substituted.
         assert!(body.contains(&binary_path().display().to_string()));
-        assert!(!body.contains("__SOTH_BIN__"), "placeholder must be substituted at install");
+        assert!(
+            !body.contains("__SOTH_BIN__"),
+            "placeholder must be substituted at install"
+        );
         // Hook command shape: agent + canonical hook_type. The
         // hook_type is passed as a variable in the spawnSync call,
         // but the plugin's per-event handlers reference the literals
@@ -1635,7 +1669,11 @@ mod tests {
         // theirs, not ours.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("soth-code.ts");
-        fs::write(&path, "// my own plugin, not soth's\nexport default () => {};").unwrap();
+        fs::write(
+            &path,
+            "// my own plugin, not soth's\nexport default () => {};",
+        )
+        .unwrap();
         let r = install_pi_agent(&path, Some(binary_path()));
         assert!(matches!(r, Err(InstallError::NotSothManaged { .. })));
         // File unchanged.

@@ -137,9 +137,7 @@ fn claude_code() -> Playbook {
                 cache_creation_input_tokens_field: Some(
                     "message.usage.cache_creation_input_tokens".into(),
                 ),
-                cache_read_input_tokens_field: Some(
-                    "message.usage.cache_read_input_tokens".into(),
-                ),
+                cache_read_input_tokens_field: Some("message.usage.cache_read_input_tokens".into()),
                 total_tokens_field: None,
             }),
         },

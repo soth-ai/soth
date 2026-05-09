@@ -196,18 +196,20 @@ pub async fn run(
     // crashed daemon also doesn't crash the gate — hook subprocesses
     // fall back to an in-process keyword bundle when the port file
     // is stale or connect refuses.
-    let _classify_supervisor: Option<tokio::task::JoinHandle<()>> = if config.extensions.code.enabled
-        && matches!(
-            config.extensions.code.classify.run_mode,
-            cli_config::ClassifyRunMode::Subprocess
-        ) {
-        let classify_config_path = generated_path.clone();
-        Some(tokio::spawn(async move {
-            supervise_classify_daemon(classify_config_path).await;
-        }))
-    } else {
-        None
-    };
+    let _classify_supervisor: Option<tokio::task::JoinHandle<()>> =
+        if config.extensions.code.enabled
+            && matches!(
+                config.extensions.code.classify.run_mode,
+                cli_config::ClassifyRunMode::Subprocess
+            )
+        {
+            let classify_config_path = generated_path.clone();
+            Some(tokio::spawn(async move {
+                supervise_classify_daemon(classify_config_path).await;
+            }))
+        } else {
+            None
+        };
 
     // Engage the OS-level system proxy so traffic actually flows through us.
     // Reached by both foreground (`soth up --foreground`) and daemon-child
@@ -1693,11 +1695,8 @@ async fn run_historian_worker() -> Result<()> {
 ///   backoff handles the case where the user hasn't run
 ///   `soth setup-ca` / bundle install yet)
 async fn run_classify_daemon_worker() -> Result<()> {
-    let _observability_guard = soth_proxy::runtime::init_tracing(&[
-        "soth_code=info",
-        "soth_classify=info",
-        "warn",
-    ]);
+    let _observability_guard =
+        soth_proxy::runtime::init_tracing(&["soth_code=info", "soth_classify=info", "warn"]);
 
     let bundle_dir = dirs::home_dir()
         .map(|h| h.join(".soth").join("bundle"))
@@ -1710,7 +1709,8 @@ async fn run_classify_daemon_worker() -> Result<()> {
     }
 
     let bundle_for_thread = bundle_dir.clone();
-    let serve_handle = std::thread::spawn(move || soth_code::classify_daemon::serve(&bundle_for_thread, 0));
+    let serve_handle =
+        std::thread::spawn(move || soth_code::classify_daemon::serve(&bundle_for_thread, 0));
 
     #[cfg(unix)]
     {

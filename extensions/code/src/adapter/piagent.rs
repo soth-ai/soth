@@ -91,10 +91,7 @@ impl Adapter for PiAgentAdapter {
     fn is_pre_action_hook(&self, hook_type: &str) -> bool {
         matches!(
             hook_type,
-            "pre_tool_use"
-                | "user_prompt_submit"
-                | "before_tool_call"
-                | "subagent_start"
+            "pre_tool_use" | "user_prompt_submit" | "before_tool_call" | "subagent_start"
         )
     }
 

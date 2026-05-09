@@ -298,9 +298,7 @@ fn run_hook(args: HookArgs) -> Result<()> {
             writeln!(
                 stderr,
                 "{{\"error\":\"{}\",\"agent\":\"{}\",\"hook_type\":\"{}\"}}",
-                e,
-                args.agent,
-                args.hook_type
+                e, args.agent, args.hook_type
             )
             .ok();
             std::process::exit(1);
@@ -344,31 +342,53 @@ fn run_install(args: InstallArgs) -> Result<()> {
 
     let report = match canonical_agent {
         "claude_code" => {
-            let path = resolve_install_path(&args, default_claude_settings_path, "~/.claude/settings.json")?;
+            let path = resolve_install_path(
+                &args,
+                default_claude_settings_path,
+                "~/.claude/settings.json",
+            )?;
             install_claude_code(&path, None).context("install claude_code hooks")?
         }
         "cursor" => {
-            let path = resolve_install_path(&args, default_cursor_hooks_path, "~/.cursor/hooks.json")?;
+            let path =
+                resolve_install_path(&args, default_cursor_hooks_path, "~/.cursor/hooks.json")?;
             install_cursor(&path, None).context("install cursor hooks")?
         }
         "gemini_cli" => {
-            let path = resolve_install_path(&args, default_gemini_settings_path, "~/.gemini/settings.json")?;
+            let path = resolve_install_path(
+                &args,
+                default_gemini_settings_path,
+                "~/.gemini/settings.json",
+            )?;
             install_gemini_cli(&path, None).context("install gemini_cli hooks")?
         }
         "openai_codex" => {
-            let path = resolve_install_path(&args, default_codex_hooks_path, "~/.codex/hooks.json")?;
+            let path =
+                resolve_install_path(&args, default_codex_hooks_path, "~/.codex/hooks.json")?;
             install_codex(&path, None).context("install codex hooks")?
         }
         "windsurf" => {
-            let path = resolve_install_path(&args, default_windsurf_hooks_path, "~/.codeium/windsurf/hooks.json")?;
+            let path = resolve_install_path(
+                &args,
+                default_windsurf_hooks_path,
+                "~/.codeium/windsurf/hooks.json",
+            )?;
             install_windsurf(&path, None).context("install windsurf hooks")?
         }
         "pi_agent" => {
-            let path = resolve_install_path(&args, default_pi_agent_plugin_path, "~/.pi/agent/extensions/soth-code.ts")?;
+            let path = resolve_install_path(
+                &args,
+                default_pi_agent_plugin_path,
+                "~/.pi/agent/extensions/soth-code.ts",
+            )?;
             install_pi_agent(&path, None).context("install pi_agent plugin")?
         }
         "opencode" => {
-            let path = resolve_install_path(&args, default_opencode_plugin_path, "~/.config/opencode/plugins/soth-code.mjs")?;
+            let path = resolve_install_path(
+                &args,
+                default_opencode_plugin_path,
+                "~/.config/opencode/plugins/soth-code.mjs",
+            )?;
             install_opencode(&path, None).context("install opencode plugin")?
         }
         // canonical_agent is exhaustively pre-validated above.
@@ -381,11 +401,9 @@ fn run_install(args: InstallArgs) -> Result<()> {
     // auto-install would update state — operators using the
     // direct `soth code install` path would leave state and
     // on-disk reality silently out of sync.
-    if let Err(e) = update_state_after_install(
-        canonical_agent,
-        &report.settings_path,
-        &report.binary_path,
-    ) {
+    if let Err(e) =
+        update_state_after_install(canonical_agent, &report.settings_path, &report.binary_path)
+    {
         // State is a fast-path cache; a write failure here
         // doesn't undo the install or fail the command.
         // Operators see a WARN; the install itself still
@@ -414,16 +432,16 @@ fn run_install(args: InstallArgs) -> Result<()> {
 /// own settings file is).  When the load itself fails (e.g.
 /// corrupted JSON), we fall back to a fresh state rather
 /// than blocking the install on a stale-cache problem.
-fn update_state_after_install(
-    agent: &str,
-    settings_path: &Path,
-    binary_path: &Path,
-) -> Result<()> {
+fn update_state_after_install(agent: &str, settings_path: &Path, binary_path: &Path) -> Result<()> {
     use soth_code::state::InstalledHostState;
     let state_path = InstalledHostState::default_path()
         .ok_or_else(|| anyhow::anyhow!("could not resolve ~/.soth/installed.json"))?;
     let mut state = InstalledHostState::load(&state_path).unwrap_or_default();
-    state.record_install(agent, settings_path.to_path_buf(), binary_path.to_path_buf());
+    state.record_install(
+        agent,
+        settings_path.to_path_buf(),
+        binary_path.to_path_buf(),
+    );
     state.save(&state_path)
 }
 
@@ -442,7 +460,11 @@ fn update_state_after_uninstall(agent: &str) -> Result<()> {
 fn run_uninstall(args: UninstallArgs) -> Result<()> {
     let (path, kind) = match args.target.as_str() {
         "claude_code" => (
-            resolve_uninstall_path(&args, default_claude_settings_path, "~/.claude/settings.json")?,
+            resolve_uninstall_path(
+                &args,
+                default_claude_settings_path,
+                "~/.claude/settings.json",
+            )?,
             UninstallKind::ClaudeCode,
         ),
         "cursor" => (
@@ -450,7 +472,11 @@ fn run_uninstall(args: UninstallArgs) -> Result<()> {
             UninstallKind::Cursor,
         ),
         "gemini_cli" | "gemini" => (
-            resolve_uninstall_path(&args, default_gemini_settings_path, "~/.gemini/settings.json")?,
+            resolve_uninstall_path(
+                &args,
+                default_gemini_settings_path,
+                "~/.gemini/settings.json",
+            )?,
             UninstallKind::Gemini,
         ),
         "codex" => (
@@ -458,15 +484,27 @@ fn run_uninstall(args: UninstallArgs) -> Result<()> {
             UninstallKind::Codex,
         ),
         "windsurf" => (
-            resolve_uninstall_path(&args, default_windsurf_hooks_path, "~/.codeium/windsurf/hooks.json")?,
+            resolve_uninstall_path(
+                &args,
+                default_windsurf_hooks_path,
+                "~/.codeium/windsurf/hooks.json",
+            )?,
             UninstallKind::Windsurf,
         ),
         "pi_agent" | "piagent" => (
-            resolve_uninstall_path(&args, default_pi_agent_plugin_path, "~/.pi/agent/extensions/soth-code.ts")?,
+            resolve_uninstall_path(
+                &args,
+                default_pi_agent_plugin_path,
+                "~/.pi/agent/extensions/soth-code.ts",
+            )?,
             UninstallKind::PiAgent,
         ),
         "opencode" => (
-            resolve_uninstall_path(&args, default_opencode_plugin_path, "~/.config/opencode/plugins/soth-code.mjs")?,
+            resolve_uninstall_path(
+                &args,
+                default_opencode_plugin_path,
+                "~/.config/opencode/plugins/soth-code.mjs",
+            )?,
             UninstallKind::OpenCode,
         ),
         other => anyhow::bail!(
@@ -565,14 +603,26 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     let exists = |p: &std::path::Path| if p.exists() { "✓" } else { "·" };
     println!("paths:");
     println!("  db        {} {}", exists(&paths.db), paths.db.display());
-    println!("  queue     {} {}", exists(&paths.queue), paths.queue.display());
-    println!("  config    {} {}", exists(&paths.config), paths.config.display());
+    println!(
+        "  queue     {} {}",
+        exists(&paths.queue),
+        paths.queue.display()
+    );
+    println!(
+        "  config    {} {}",
+        exists(&paths.config),
+        paths.config.display()
+    );
     println!(
         "  plugin    {} {}",
         exists(&paths.plugin_dir),
         paths.plugin_dir.display()
     );
-    println!("  blobs     {} {}", exists(&paths.blob_dir), paths.blob_dir.display());
+    println!(
+        "  blobs     {} {}",
+        exists(&paths.blob_dir),
+        paths.blob_dir.display()
+    );
 
     // Agents — per-adapter install state.  Each row tries the
     // canonical settings path for that agent; "installed" means
@@ -639,7 +689,10 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
                     state_path.display()
                 );
             }
-            Err(e) => println!("install_state: {} (read error: {e:#})", state_path.display()),
+            Err(e) => println!(
+                "install_state: {} (read error: {e:#})",
+                state_path.display()
+            ),
         }
     }
 
@@ -774,9 +827,7 @@ fn run_tail(args: TailArgs) -> Result<()> {
         // the new offset. 200ms polling matches `tail -F`
         // defaults and keeps CPU at zero when idle.
         let queue_path = paths.queue.clone();
-        let mut last_size = std::fs::metadata(&queue_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let mut last_size = std::fs::metadata(&queue_path).map(|m| m.len()).unwrap_or(0);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             let new_size = match std::fs::metadata(&queue_path) {
@@ -989,8 +1040,9 @@ fn run_policy_install_default(args: PolicyInstallDefaultArgs) -> Result<()> {
 
     let out_path = match args.out {
         Some(p) => p,
-        None => default_bundle_path()
-            .context("could not determine default bundle path — pass --out")?,
+        None => {
+            default_bundle_path().context("could not determine default bundle path — pass --out")?
+        }
     };
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -1024,8 +1076,9 @@ fn run_policy_apply(args: PolicyApplyArgs) -> Result<()> {
 
     let out_path = match args.out {
         Some(p) => p,
-        None => default_bundle_path()
-            .context("could not determine default bundle path — pass --out")?,
+        None => {
+            default_bundle_path().context("could not determine default bundle path — pass --out")?
+        }
     };
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -1046,7 +1099,10 @@ fn run_policy_show(args: PolicyShowArgs) -> Result<()> {
         None => default_bundle_path().context("could not determine default bundle path")?,
     };
     if !path.exists() {
-        println!("no bundle at {} — run `soth code policy install-default` first", path.display());
+        println!(
+            "no bundle at {} — run `soth code policy install-default` first",
+            path.display()
+        );
         return Ok(());
     }
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
@@ -1062,7 +1118,12 @@ fn run_policy_show(args: PolicyShowArgs) -> Result<()> {
         bundle.system_rules.rules.len(),
         bundle.org_rules.rules.len()
     );
-    for r in bundle.system_rules.rules.iter().chain(bundle.org_rules.rules.iter()) {
+    for r in bundle
+        .system_rules
+        .rules
+        .iter()
+        .chain(bundle.org_rules.rules.iter())
+    {
         println!("    [{:?}] {} — {}", r.rule_kind, r.rule_id, r.cel_expr);
     }
     Ok(())
@@ -1089,7 +1150,10 @@ fn run_audit_status(config_path: Option<PathBuf>) -> Result<()> {
 
     println!("Historian usage-coverage audit (plan §9 / §10.11)");
     println!();
-    println!("  {:<14} {:<8} audited_at                     caveats", "agent", "audited");
+    println!(
+        "  {:<14} {:<8} audited_at                     caveats",
+        "agent", "audited"
+    );
     println!("  {}", "-".repeat(80));
 
     // Stable, plan-defined ordering: claude_code first
@@ -1152,11 +1216,13 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         soth_code::hook::timings_path(&paths)
     });
     if !path.exists() {
-        println!("no timings file at {} — run a few hooks first", path.display());
+        println!(
+            "no timings file at {} — run a few hooks first",
+            path.display()
+        );
         return Ok(());
     }
-    let content =
-        fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut rows: Vec<soth_code::hook::HookTimings> = content
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -1174,7 +1240,10 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     println!("hook latency summary ({} samples)", rows.len());
     println!("targets: p99 ≤ 50ms cached / ≤ 100ms cold (plan §10.10)");
     println!();
-    println!("  {:<12} {:>8} {:>8} {:>8} {:>8}", "stage", "p50_us", "p95_us", "p99_us", "max_us");
+    println!(
+        "  {:<12} {:>8} {:>8} {:>8} {:>8}",
+        "stage", "p50_us", "p95_us", "p99_us", "max_us"
+    );
     println!("  {}", "-".repeat(56));
     let stages: &[(&str, fn(&soth_code::hook::HookTimings) -> u64)] = &[
         ("parse", |t| t.parse_us),
@@ -1227,13 +1296,14 @@ fn percentile(sorted: &[u64], p: u8) -> u64 {
     sorted[i]
 }
 
-fn print_audit_row(
-    agent: &str,
-    entry: Option<&cli_config::HistorianAdapterAudit>,
-) {
+fn print_audit_row(agent: &str, entry: Option<&cli_config::HistorianAdapterAudit>) {
     let (audited, audited_at, caveats) = match entry {
         Some(a) => (
-            if a.usage_coverage_audited { "yes" } else { "no" },
+            if a.usage_coverage_audited {
+                "yes"
+            } else {
+                "no"
+            },
             a.audited_at.as_deref().unwrap_or("—"),
             a.caveats.as_deref().unwrap_or(""),
         ),

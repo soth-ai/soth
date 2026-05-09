@@ -79,7 +79,8 @@ pub use observation::{
 // ── policy ────────────────────────────────────────────────────────────────────
 pub use policy::{
     ActionPolicyContext, DeploymentModel, MatchedRule, PolicyContext, PolicyDecision,
-    PolicyDecisionKind, PolicyWarning, RedactTarget, RerouteTarget, RuleKind, SemanticPolicyContext,
+    PolicyDecisionKind, PolicyWarning, RedactTarget, RerouteTarget, RuleKind,
+    SemanticPolicyContext,
 };
 
 // ── pre_emit ──────────────────────────────────────────────────────────────────

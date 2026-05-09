@@ -63,7 +63,8 @@ mod tests {
         let k = correlation_key("claude_code", "session-1");
         assert_eq!(k.len(), 64, "sha256 hex is 64 chars");
         assert!(
-            k.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            k.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
             "key must be lowercase hex"
         );
     }

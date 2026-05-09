@@ -74,9 +74,7 @@ impl CodeExtension {
 
     /// Construct with explicit paths (tests, alternate roots).
     pub fn with_paths(paths: CodePaths) -> Self {
-        Self {
-            paths,
-        }
+        Self { paths }
     }
 
     /// Paths owned by this extension. Always resolve via this method —

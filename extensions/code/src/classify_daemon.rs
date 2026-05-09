@@ -213,14 +213,17 @@ fn update_snapshot_with_result(
     if !result.semantic_hash.is_empty()
         && result.semantic_hash != "00000000000000000000000000000000"
     {
-        snap.prior_semantic_hashes.push(result.semantic_hash.clone());
+        snap.prior_semantic_hashes
+            .push(result.semantic_hash.clone());
         if snap.prior_semantic_hashes.len() > MAX_PRIOR_HASHES {
             let drop_n = snap.prior_semantic_hashes.len() - MAX_PRIOR_HASHES;
             snap.prior_semantic_hashes.drain(0..drop_n);
         }
     }
     if result.topic_cluster_id != 0
-        && !snap.topic_cluster_ids_seen.contains(&result.topic_cluster_id)
+        && !snap
+            .topic_cluster_ids_seen
+            .contains(&result.topic_cluster_id)
     {
         snap.topic_cluster_ids_seen.push(result.topic_cluster_id);
         if snap.topic_cluster_ids_seen.len() > MAX_CLUSTER_IDS {
@@ -287,7 +290,11 @@ pub fn serve(bundle_dir: &Path, bind_port: u16) -> std::io::Result<()> {
     let bundle = soth_classify::load_bundle(bundle_dir).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("classify bundle load failed at {}: {}", bundle_dir.display(), e),
+            format!(
+                "classify bundle load failed at {}: {}",
+                bundle_dir.display(),
+                e
+            ),
         )
     })?;
 
@@ -332,8 +339,7 @@ fn write_port_file(port: u16) -> std::io::Result<()> {
         pid: std::process::id(),
         started_at: chrono::Utc::now().to_rfc3339(),
     };
-    let bytes = serde_json::to_vec_pretty(&pf)
-        .map_err(std::io::Error::other)?;
+    let bytes = serde_json::to_vec_pretty(&pf).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, &path)?;
@@ -457,8 +463,7 @@ fn handle_connection(
 }
 
 fn write_response(stream: &TcpStream, resp: &ClassifyResponse) -> std::io::Result<()> {
-    let mut bytes = serde_json::to_vec(resp)
-        .map_err(std::io::Error::other)?;
+    let mut bytes = serde_json::to_vec(resp).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     let mut s = stream;
     s.write_all(&bytes)?;
@@ -495,7 +500,10 @@ pub fn try_classify(req: &ClassifyRequest) -> Option<ClassifySidecar> {
             return;
         }
         if let Some(home) = dirs::home_dir() {
-            let path = home.join(".soth").join("queue").join("classify-daemon-trace.log");
+            let path = home
+                .join(".soth")
+                .join("queue")
+                .join("classify-daemon-trace.log");
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -648,8 +656,7 @@ pub fn status() -> Option<DaemonStatus> {
         }
     };
     let addr = SocketAddr::from(([127, 0, 0, 1], pf.port));
-    let reachable =
-        TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok();
+    let reachable = TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok();
     Some(DaemonStatus {
         port_file_path: path,
         port: Some(pf.port),
@@ -788,8 +795,7 @@ mod tests {
         // with sentinels — the anomaly stage compares against
         // them and a zero hash skews drift detection.
         let mut snap = SessionSnapshot::default();
-        let result =
-            make_classified_result("00000000000000000000000000000000", 0);
+        let result = make_classified_result("00000000000000000000000000000000", 0);
         update_snapshot_with_result(&mut snap, &result, None, 0);
         assert!(snap.prior_semantic_hashes.is_empty());
         assert!(snap.topic_cluster_ids_seen.is_empty());

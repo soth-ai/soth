@@ -536,9 +536,10 @@ mod tests {
         assert!(session.messages[0].usage.is_none());
 
         // Assistant turn: full Anthropic-style usage extracted.
-        let usage = session.messages[1].usage.as_ref().expect(
-            "assistant message must carry usage — this is the §10.11 audit gate",
-        );
+        let usage = session.messages[1]
+            .usage
+            .as_ref()
+            .expect("assistant message must carry usage — this is the §10.11 audit gate");
         assert_eq!(usage.input_tokens, Some(6));
         assert_eq!(usage.output_tokens, Some(298));
         assert_eq!(usage.cache_creation_input_tokens, Some(41175));

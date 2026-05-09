@@ -1217,8 +1217,14 @@ extensions:
     #[test]
     fn proxy_bypass_and_cost_skim_default_empty() {
         let cfg = ForwardProxyConfig::default();
-        assert!(cfg.bypass_agents.is_empty(), "no bypass until explicit per-agent flip");
-        assert!(cfg.cost_skim_agents.is_empty(), "no cost-skim until usage-coverage audit gates flip");
+        assert!(
+            cfg.bypass_agents.is_empty(),
+            "no bypass until explicit per-agent flip"
+        );
+        assert!(
+            cfg.cost_skim_agents.is_empty(),
+            "no cost-skim until usage-coverage audit gates flip"
+        );
     }
 
     #[test]
@@ -1320,5 +1326,4 @@ forward_proxy:
         assert_eq!(allowed, vec!["claude-cli/*"]);
         assert!(dropped.is_empty());
     }
-
 }

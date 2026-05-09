@@ -113,6 +113,9 @@ mod tests {
     #[test]
     fn single_line_no_trailing_newline() {
         assert_eq!(line_count_delta(None, Some("hello")), (1, 0));
-        assert_eq!(line_count_delta(Some("hello"), Some("hello\nworld")), (1, 0));
+        assert_eq!(
+            line_count_delta(Some("hello"), Some("hello\nworld")),
+            (1, 0)
+        );
     }
 }

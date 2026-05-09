@@ -144,7 +144,10 @@ fn every_fixture_parses_for_every_agent() {
             }
         }
     }
-    assert!(total >= 30, "Phase-3 corpus expected ≥30 fixtures across all agents, got {total}");
+    assert!(
+        total >= 30,
+        "Phase-3 corpus expected ≥30 fixtures across all agents, got {total}"
+    );
 }
 
 #[test]

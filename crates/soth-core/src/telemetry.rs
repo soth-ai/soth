@@ -1214,10 +1214,7 @@ mod data_source_serde_tests {
         use uuid::Uuid;
 
         let mut meta = HashMap::new();
-        meta.insert(
-            "classify.use_case".to_string(),
-            "\"bash\"".to_string(),
-        );
+        meta.insert("classify.use_case".to_string(), "\"bash\"".to_string());
         meta.insert(
             "classify.use_case_label_reason".to_string(),
             "\"pre_tool_call\"".to_string(),

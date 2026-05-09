@@ -87,7 +87,10 @@ fn every_fixture_parses() {
             count += 1;
         }
     }
-    assert!(count > 0, "no fixtures discovered — guard against empty corpus");
+    assert!(
+        count > 0,
+        "no fixtures discovered — guard against empty corpus"
+    );
 }
 
 /// Per-fixture spot checks. New checks land here when an adapter
@@ -203,8 +206,7 @@ fn correlation_key_is_populated_for_every_fixture_with_session_id() {
 
 fn parse(hook_type: &str, file_name: &str) -> CodeEvent {
     let path = Path::new(FIXTURE_ROOT).join(hook_type).join(file_name);
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
     ClaudeCodeAdapter::new()
         .parse_event(hook_type, &bytes)
         .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))

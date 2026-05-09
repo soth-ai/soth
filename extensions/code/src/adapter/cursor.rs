@@ -167,7 +167,11 @@ impl Adapter for CursorAdapter {
                     .get("tool_name")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let input = event.payload.get("tool_input").cloned().unwrap_or(Value::Null);
+                let input = event
+                    .payload
+                    .get("tool_input")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 let body = serde_json::to_string(&input).ok()?;
                 Some(HookContentExtract {
                     kind: HookContentKind::ToolArgs,
@@ -197,7 +201,11 @@ impl Adapter for CursorAdapter {
                 })
             }
             "post_tool_use" => {
-                let result = event.payload.get("tool_output").cloned().unwrap_or(Value::Null);
+                let result = event
+                    .payload
+                    .get("tool_output")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 let body = serde_json::to_string(&result).ok()?;
                 if body.is_empty() || body == "null" {
                     return None;
@@ -354,10 +362,7 @@ mod tests {
         assert_eq!(ev.agent_native_session_id, "conv-abc");
         // generation_id alone (no conversation_id) is a fallback.
         let ev = a
-            .parse_event(
-                "session_start",
-                br#"{"generation_id":"gen-1"}"#,
-            )
+            .parse_event("session_start", br#"{"generation_id":"gen-1"}"#)
             .unwrap();
         assert_eq!(ev.agent_native_session_id, "gen-1");
     }

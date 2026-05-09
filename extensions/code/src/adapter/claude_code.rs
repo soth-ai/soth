@@ -102,7 +102,10 @@ impl Adapter for ClaudeCodeAdapter {
             "stop" => {
                 // Some Claude Code variants pass an assistant turn here;
                 // older variants don't. Best-effort extract.
-                let turn = event.payload.get("assistant_message").and_then(Value::as_str)?;
+                let turn = event
+                    .payload
+                    .get("assistant_message")
+                    .and_then(Value::as_str)?;
                 Some(HookContentExtract {
                     kind: HookContentKind::AssistantTurn,
                     content: turn.to_string(),

@@ -180,7 +180,13 @@ mod tests {
     #[test]
     fn five_canonical_hook_types_parse() {
         let a = CodexAdapter::new();
-        for h in ["session_start", "pre_tool_use", "post_tool_use", "user_prompt_submit", "stop"] {
+        for h in [
+            "session_start",
+            "pre_tool_use",
+            "post_tool_use",
+            "user_prompt_submit",
+            "stop",
+        ] {
             let r = a.parse_event(h, br#"{"session_id":"s"}"#);
             assert!(r.is_ok(), "hook {h} must parse");
         }
@@ -219,8 +225,16 @@ mod tests {
     fn extract_model_returns_none_when_payload_omits_or_empty() {
         let a = CodexAdapter::new();
         let none_payload = br#"{"session_id":"s"}"#;
-        assert!(a.parse_event("pre_tool_use", none_payload).unwrap().model.is_none());
+        assert!(a
+            .parse_event("pre_tool_use", none_payload)
+            .unwrap()
+            .model
+            .is_none());
         let empty_payload = br#"{"session_id":"s","model":""}"#;
-        assert!(a.parse_event("pre_tool_use", empty_payload).unwrap().model.is_none());
+        assert!(a
+            .parse_event("pre_tool_use", empty_payload)
+            .unwrap()
+            .model
+            .is_none());
     }
 }

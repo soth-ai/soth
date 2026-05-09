@@ -146,10 +146,8 @@ fn patterns() -> &'static [PatternEntry] {
                 severity: ArtifactSeverity::Medium,
             },
             PatternEntry {
-                regex: Regex::new(
-                    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-                )
-                .unwrap(),
+                regex: Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+                    .unwrap(),
                 kind: ArtifactKind::Jwt,
                 credential_kind: "jwt",
                 severity: ArtifactSeverity::Medium,
@@ -178,7 +176,13 @@ mod tests {
         });
         let arts = scan(&p, "Bash");
         assert!(kinds(&arts).contains(&"aws_access_key"));
-        assert_eq!(arts.iter().find(|a| a.credential_kind.as_deref() == Some("aws_access_key")).unwrap().severity, ArtifactSeverity::Critical);
+        assert_eq!(
+            arts.iter()
+                .find(|a| a.credential_kind.as_deref() == Some("aws_access_key"))
+                .unwrap()
+                .severity,
+            ArtifactSeverity::Critical
+        );
     }
 
     #[test]

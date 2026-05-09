@@ -56,18 +56,22 @@ fn bench_hook_pipeline(c: &mut Criterion) {
     group.sample_size(200);
 
     for (label, payload) in inputs() {
-        group.bench_with_input(BenchmarkId::from_parameter(label), &payload, |b, payload| {
-            b.iter(|| {
-                let outcome = soth_code::run_hook(
-                    black_box("claude_code"),
-                    black_box("pre_tool_use"),
-                    black_box(payload),
-                    black_box(&paths),
-                )
-                .expect("hook ok");
-                black_box(outcome.event_id)
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &payload,
+            |b, payload| {
+                b.iter(|| {
+                    let outcome = soth_code::run_hook(
+                        black_box("claude_code"),
+                        black_box("pre_tool_use"),
+                        black_box(payload),
+                        black_box(&paths),
+                    )
+                    .expect("hook ok");
+                    black_box(outcome.event_id)
+                })
+            },
+        );
     }
     group.finish();
 }

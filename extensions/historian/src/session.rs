@@ -73,8 +73,7 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
                     billing_cache_creation_input_tokens.saturating_add(n);
             }
             if let Some(n) = usage.cache_read_input_tokens {
-                billing_cache_read_input_tokens =
-                    billing_cache_read_input_tokens.saturating_add(n);
+                billing_cache_read_input_tokens = billing_cache_read_input_tokens.saturating_add(n);
             }
         }
     }
@@ -497,7 +496,7 @@ mod tests {
                 content: "Write  A  Function".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 4,
-                    usage: None,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -510,7 +509,7 @@ mod tests {
                 content: "write a function".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 4,
-                    usage: None,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -539,7 +538,7 @@ mod tests {
                 content: "use key sk-abcdefghijklmnopqrstuvwxyz1234 for auth".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 10,
-                    usage: None,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -596,7 +595,7 @@ mod tests {
                 content: "What is the weather today?".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 6,
-                    usage: None,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -620,7 +619,7 @@ mod tests {
                         .to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 15,
-                    usage: None,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -642,7 +641,7 @@ mod tests {
                 content: "hello".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 2,
-                    usage: None,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),

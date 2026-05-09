@@ -13,8 +13,8 @@ mod claude_code;
 mod codex;
 mod cursor;
 mod gemini_cli;
-mod opencode;
 mod openclaw;
+mod opencode;
 mod piagent;
 mod stub;
 mod windsurf;
@@ -23,8 +23,8 @@ pub use claude_code::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
 pub use gemini_cli::GeminiCliAdapter;
-pub use opencode::OpenCodeAdapter;
 pub use openclaw::OpenClawAdapter;
+pub use opencode::OpenCodeAdapter;
 pub use piagent::PiAgentAdapter;
 pub use stub::StubAdapter;
 pub use windsurf::WindsurfAdapter;
@@ -83,7 +83,10 @@ pub enum ParseError {
     #[error("invalid JSON in hook stdin: {0}")]
     InvalidJson(#[from] serde_json::Error),
     #[error("unknown hook type for {agent}: {hook_type}")]
-    UnknownHookType { agent: &'static str, hook_type: String },
+    UnknownHookType {
+        agent: &'static str,
+        hook_type: String,
+    },
     #[error("missing required field {field} for {agent} hook {hook_type}")]
     MissingField {
         agent: &'static str,

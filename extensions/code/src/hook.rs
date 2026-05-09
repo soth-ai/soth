@@ -113,12 +113,18 @@ pub fn run_hook(
     if let Some(extract) = adapter.classify_input(&code_event) {
         let location = match extract.kind {
             soth_classify::HookContentKind::AssistantTurn => {
-                soth_core::ArtifactLocation::AssistantContent { turn: 0, char_offset: 0 }
+                soth_core::ArtifactLocation::AssistantContent {
+                    turn: 0,
+                    char_offset: 0,
+                }
             }
             soth_classify::HookContentKind::ToolResult => {
                 soth_core::ArtifactLocation::ToolResult { tool_name: None }
             }
-            _ => soth_core::ArtifactLocation::UserContent { turn: 0, char_offset: 0 },
+            _ => soth_core::ArtifactLocation::UserContent {
+                turn: 0,
+                char_offset: 0,
+            },
         };
         let result = soth_detect::code::detect_code_artifacts(&extract.content, location);
         artifacts.extend(result.artifacts);
@@ -839,7 +845,9 @@ fn build_normalized_for_policy(ev: &CodeEvent) -> NormalizedRequest {
             ev.action_type,
             crate::event::ActionType::UserPromptSubmit | crate::event::ActionType::Stop
         ),
-        provider: provider_for_agent(&ev.agent).unwrap_or("unknown").to_string(),
+        provider: provider_for_agent(&ev.agent)
+            .unwrap_or("unknown")
+            .to_string(),
         user_content_hash: user_content.clone(),
         conversation_hash: user_content,
         ..NormalizedRequest::default()
@@ -1247,8 +1255,8 @@ fn enqueue(
         "event": event,
         "decision": decision,
     });
-    let mut line = serde_json::to_string(&record)
-        .map_err(|e| HookError::Queue(format!("serialize: {e}")))?;
+    let mut line =
+        serde_json::to_string(&record).map_err(|e| HookError::Queue(format!("serialize: {e}")))?;
     line.push('\n');
 
     let mut file = OpenOptions::new()
@@ -1488,7 +1496,14 @@ mod tests {
     fn empty_stdin_still_enqueues() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
-        let outcome = run_hook("claude_code", "pre_tool_use", b"", &paths, &HookCaptureConfig::default()).expect("ok");
+        let outcome = run_hook(
+            "claude_code",
+            "pre_tool_use",
+            b"",
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .expect("ok");
         assert!(matches!(outcome.decision, HookDecision::Allow));
         let queue = fs::read_to_string(&paths.queue).unwrap();
         assert_eq!(queue.lines().count(), 1);
@@ -1498,7 +1513,13 @@ mod tests {
     fn unknown_agent_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
-        let r = run_hook("", "pre_tool_use", b"{}", &paths, &HookCaptureConfig::default());
+        let r = run_hook(
+            "",
+            "pre_tool_use",
+            b"{}",
+            &paths,
+            &HookCaptureConfig::default(),
+        );
         assert!(matches!(r, Err(HookError::UnknownAgent(_))));
     }
 
@@ -1506,7 +1527,13 @@ mod tests {
     fn malformed_stdin_returns_parse_error() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
-        let r = run_hook("claude_code", "pre_tool_use", b"{ not json", &paths, &HookCaptureConfig::default());
+        let r = run_hook(
+            "claude_code",
+            "pre_tool_use",
+            b"{ not json",
+            &paths,
+            &HookCaptureConfig::default(),
+        );
         assert!(matches!(r, Err(HookError::Parse(_))));
     }
 
@@ -1515,7 +1542,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
         for _ in 0..3 {
-            run_hook("claude_code", "pre_tool_use", b"{}", &paths, &HookCaptureConfig::default()).unwrap();
+            run_hook(
+                "claude_code",
+                "pre_tool_use",
+                b"{}",
+                &paths,
+                &HookCaptureConfig::default(),
+            )
+            .unwrap();
         }
         let queue = fs::read_to_string(&paths.queue).unwrap();
         assert_eq!(queue.lines().count(), 3);
@@ -1580,7 +1614,9 @@ mod tests {
         // the agent's payload, redact decisions degrade to block —
         // operator gets a clear message that redaction was requested.
         let pd = PolicyDecision {
-            kind: PolicyDecisionKind::Redact { targets: Vec::new() },
+            kind: PolicyDecisionKind::Redact {
+                targets: Vec::new(),
+            },
             matched_rule: None,
             warnings: Vec::new(),
             eval_latency_us: 0,
@@ -1710,7 +1746,14 @@ mod tests {
             "stop_hook_active": true,
             "context": "earlier the user pasted AKIAIOSFODNN7EXAMPLE in a command"
         }"#;
-        let outcome = run_hook("claude_code", "stop", stdin, &paths, &HookCaptureConfig::default()).unwrap();
+        let outcome = run_hook(
+            "claude_code",
+            "stop",
+            stdin,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .unwrap();
         assert!(
             matches!(outcome.decision, HookDecision::Allow),
             "Stop hook with credentials in payload must downgrade to Allow, got {:?}",
@@ -1721,8 +1764,7 @@ mod tests {
         // operator can see *what* leaked, just doesn't get Block on
         // the wrong hook type.
         let queue = std::fs::read_to_string(&paths.queue).unwrap();
-        let row: serde_json::Value =
-            serde_json::from_str(queue.lines().next().unwrap()).unwrap();
+        let row: serde_json::Value = serde_json::from_str(queue.lines().next().unwrap()).unwrap();
         let artifacts = row["event"]["artifacts"].as_array().unwrap();
         assert!(
             !artifacts.is_empty(),
@@ -1748,13 +1790,19 @@ mod tests {
             "tool_name":"Read",
             "tool_input":{"file_path":"/etc/hosts"}
         }"#;
-        run_hook("claude_code", "pre_tool_use", stdin, &paths, &HookCaptureConfig::default()).unwrap();
+        run_hook(
+            "claude_code",
+            "pre_tool_use",
+            stdin,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .unwrap();
 
         // Read the queue row back, deserialize the GovernableEvent,
         // and convert to TelemetryEvent the same way the batcher does.
         let queue = std::fs::read_to_string(&paths.queue).unwrap();
-        let row: serde_json::Value =
-            serde_json::from_str(queue.lines().next().unwrap()).unwrap();
+        let row: serde_json::Value = serde_json::from_str(queue.lines().next().unwrap()).unwrap();
         let governable: soth_core::GovernableEvent =
             serde_json::from_value(row["event"].clone()).unwrap();
 
@@ -1832,7 +1880,11 @@ mod tests {
         )
         .unwrap();
         let row: serde_json::Value = serde_json::from_str(
-            std::fs::read_to_string(&paths.queue).unwrap().lines().next().unwrap(),
+            std::fs::read_to_string(&paths.queue)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
         )
         .unwrap();
         let meta = &row["event"]["context"]["metadata"];
@@ -1852,14 +1904,15 @@ mod tests {
             br#"{"session_id":"full","tool_name":"Read","tool_input":{"file_path":"/etc/hosts"}}"#;
         run_hook("claude_code", "pre_tool_use", stdin, &paths, &cap).unwrap();
         let row: serde_json::Value = serde_json::from_str(
-            std::fs::read_to_string(&paths.queue).unwrap().lines().next().unwrap(),
+            std::fs::read_to_string(&paths.queue)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
         )
         .unwrap();
         let meta = &row["event"]["context"]["metadata"];
-        assert!(meta["raw_payload"]
-            .as_str()
-            .unwrap()
-            .contains("/etc/hosts"));
+        assert!(meta["raw_payload"].as_str().unwrap().contains("/etc/hosts"));
         assert_eq!(meta["raw_capture"], "full");
     }
 
@@ -1941,7 +1994,11 @@ mod tests {
         )
         .unwrap();
         let row: serde_json::Value = serde_json::from_str(
-            std::fs::read_to_string(&paths.queue).unwrap().lines().next().unwrap(),
+            std::fs::read_to_string(&paths.queue)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
         )
         .unwrap();
         let raw = row["event"]["context"]["metadata"]["raw_payload"]
@@ -1975,7 +2032,14 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": { "command": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE aws s3 ls" }
         }"#;
-        let outcome = run_hook("claude_code", "pre_tool_use", stdin, &paths, &HookCaptureConfig::default()).unwrap();
+        let outcome = run_hook(
+            "claude_code",
+            "pre_tool_use",
+            stdin,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .unwrap();
         assert!(
             matches!(outcome.decision, HookDecision::Block { .. }),
             "PreToolUse with AWS key must still Block, got {:?}",
