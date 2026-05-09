@@ -21,6 +21,7 @@ pub(crate) fn sample_event(event_id: Uuid) -> TelemetryEvent {
         },
         capture_mode: CaptureMode::MetadataOnly,
         use_case: UseCaseLabel::Unknown,
+        use_case_label_override: None,
         volatility_class: VolatilityClass::Static,
         cache_level: None,
         routing_reason: None,

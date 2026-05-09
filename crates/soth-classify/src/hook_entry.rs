@@ -227,6 +227,10 @@ mod tests {
             content,
             kind,
             identity: &identity,
+            session_snapshot: None,
+            conversation_turn: None,
+            has_tool_definitions: false,
+            has_tool_results: false,
         };
         let bundle = fallback_bundle();
         let config = ClassifyConfig::default();

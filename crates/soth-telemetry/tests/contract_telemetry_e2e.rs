@@ -133,6 +133,7 @@ fn corpus_event(index: usize, threshold_mode: bool) -> TelemetryEvent {
         } else {
             UseCaseLabel::QuestionAnswering
         },
+        use_case_label_override: None,
         volatility_class: if index % 3 == 0 {
             VolatilityClass::Dynamic
         } else {

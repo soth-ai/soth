@@ -165,6 +165,7 @@ fn proxy_context_and_policy_context_semantic_extension_contract() {
             topic_cluster_id: 9,
         }),
         session: SessionSnapshot::default(),
+        action: None,
     };
 
     let encoded = serde_json::to_value(policy_ctx).expect("serialize policy context");

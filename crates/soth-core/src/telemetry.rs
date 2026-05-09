@@ -1112,8 +1112,10 @@ mod data_source_serde_tests {
     #[test]
     fn effective_event_layer_falls_back_to_data_source() {
         // Legacy event: explicit field None, data_source dictates layer.
-        let mut ev = TelemetryEvent::default();
-        ev.data_source = DataSource::HistorianClaudeCode;
+        let mut ev = TelemetryEvent {
+            data_source: DataSource::HistorianClaudeCode,
+            ..TelemetryEvent::default()
+        };
         assert_eq!(ev.event_layer, None);
         assert_eq!(ev.effective_event_layer(), EventLayer::Session);
 
@@ -1299,8 +1301,10 @@ mod data_source_serde_tests {
     fn telemetry_event_legacy_json_deserializes_with_no_event_layer() {
         // Regression guard: an event serialized before this field existed
         // must still deserialize, with `event_layer: None`.
-        let mut ev = TelemetryEvent::default();
-        ev.data_source = DataSource::LiveProxy;
+        let ev = TelemetryEvent {
+            data_source: DataSource::LiveProxy,
+            ..TelemetryEvent::default()
+        };
         let json = serde_json::to_value(&ev).unwrap();
         // Strip event_layer to simulate older wire form.
         let mut obj = json.as_object().unwrap().clone();
