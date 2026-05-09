@@ -1,0 +1,10 @@
+{
+  "session_id": "claude-session-05",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/Users/u/code/proj",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "ls -la /tmp",
+    "description": "list /tmp"
+  }
+}

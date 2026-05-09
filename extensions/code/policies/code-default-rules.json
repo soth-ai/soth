@@ -1,0 +1,58 @@
+{
+  "_comment": "Starter CEL policy pack for soth-code action-layer enforcement. Sourced as data; signed at install time by `soth code policy install-default` with a built-in dev key. Production deployments should replace this with a cloud-signed bundle.",
+  "_fields_available": "request.* (provider, model, …), detect.* (private_key_detected, credential_detected, code_present, max_severity, …), semantic.* (use_case_label, anomaly_score, anomaly_flags, …), action.* (agent, type, tool_name, command, file_path, …)",
+  "system_rules": [],
+  "org_rules": [
+    {
+      "rule_id": "code_block_destructive_rm_rf",
+      "rule_name": "Block recursive force-delete (`rm -rf`)",
+      "cel_expr": "action.type == \"command_exec\" && action.command.contains(\"rm -rf\")",
+      "action": {
+        "kind": "block",
+        "status": 403,
+        "message": "destructive command blocked — `rm -rf` is high-risk and disallowed by org policy"
+      }
+    },
+    {
+      "rule_id": "code_block_dd_to_device",
+      "rule_name": "Block raw device write (`dd of=/dev/...`)",
+      "cel_expr": "action.type == \"command_exec\" && action.command.contains(\"dd of=/dev/\")",
+      "action": {
+        "kind": "block",
+        "status": 403,
+        "message": "raw device write blocked — `dd of=/dev/...` can corrupt the host"
+      }
+    },
+    {
+      "rule_id": "code_block_ssh_dir_write",
+      "rule_name": "Block writes inside ~/.ssh/",
+      "cel_expr": "action.type == \"file_write\" && action.file_path.contains(\".ssh/\")",
+      "action": {
+        "kind": "block",
+        "status": 403,
+        "message": "writes to ~/.ssh/ are blocked — agent should not modify SSH credentials"
+      }
+    },
+    {
+      "rule_id": "code_block_aws_credentials_write",
+      "rule_name": "Block writes to ~/.aws/credentials",
+      "cel_expr": "action.type == \"file_write\" && action.file_path.contains(\".aws/credentials\")",
+      "action": {
+        "kind": "block",
+        "status": 403,
+        "message": "writes to ~/.aws/credentials are blocked — agent should not modify AWS keys"
+      }
+    },
+    {
+      "rule_id": "code_flag_high_anomaly_score",
+      "rule_name": "Flag actions with very high classify anomaly score",
+      "cel_expr": "semantic.anomaly_score > 0.85",
+      "action": {
+        "kind": "flag",
+        "reason": "anomaly_score_above_85"
+      }
+    }
+  ],
+  "org_patterns": { "patterns": [] },
+  "budget_limits": {}
+}

@@ -1,0 +1,9 @@
+{
+  "session_id": "claude-session-01",
+  "tool_name": "Read",
+  "tool_input": { "file_path": "/etc/hosts" },
+  "tool_response": {
+    "content": "127.0.0.1 localhost\n::1 localhost\n",
+    "type": "text"
+  }
+}

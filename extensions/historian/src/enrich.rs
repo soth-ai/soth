@@ -25,11 +25,17 @@ pub mod keys {
     pub const USE_CASE: &str = "classify.use_case";
     pub const USE_CASE_CONFIDENCE: &str = "classify.use_case_confidence";
     pub const USE_CASE_LABEL_REASON: &str = "classify.use_case_label_reason";
+    pub const USE_CASE_SECONDARY_LABEL: &str = "classify.use_case_secondary_label";
     pub const VOLATILITY_CLASS: &str = "classify.volatility_class";
     pub const DYNAMIC_FRACTION: &str = "classify.dynamic_fraction";
     pub const ANOMALY_SCORE: &str = "classify.anomaly_score";
+    pub const ANOMALY_FLAGS: &str = "classify.anomaly_flags";
     pub const COMPLEXITY_SCORE: &str = "classify.complexity_score";
     pub const TOPIC_CLUSTER_ID: &str = "classify.topic_cluster_id";
+    /// Top-level (NOT under `classify.`) — `from_governable`
+    /// reads this directly off the metadata map.
+    pub const SEMANTIC_HASH: &str = "semantic_hash";
+    pub const ESTIMATED_INPUT_TOKENS: &str = "estimated_input_tokens";
 }
 
 /// Holds the loaded classify bundle + config for the duration of a
@@ -114,6 +120,43 @@ impl ClassifyEnricher {
             keys::TOPIC_CLUSTER_ID.to_string(),
             result.topic_cluster_id.to_string(),
         );
+
+        // Parity with soth-code's hook handler: secondary label,
+        // anomaly flags, semantic hash, estimated input tokens.
+        // These were previously only written by the proxy +
+        // soth-code paths; historian rows ended up with NULL
+        // secondary / empty flags / NULL semantic_hash on the
+        // dashboard, breaking cross-source rollups.
+        if let Some(secondary) = result.secondary_label.as_ref() {
+            meta.insert(
+                keys::USE_CASE_SECONDARY_LABEL.to_string(),
+                serde_json::to_string(secondary).unwrap_or_default(),
+            );
+        }
+        if !result.anomaly_flags.is_empty() {
+            // JSON-array of snake_case enum names — same shape
+            // soth-code writes, same shape `from_governable`
+            // reads via `serde_json::from_str::<Vec<AnomalyFlag>>`.
+            if let Ok(json) = serde_json::to_string(&result.anomaly_flags) {
+                meta.insert(keys::ANOMALY_FLAGS.to_string(), json);
+            }
+        }
+        // Top-level (NOT under `classify.`) keys.  Skip the
+        // all-zero sentinel — that means the embedding stage
+        // didn't run (unlikely for historian but defensive).
+        if !result.semantic_hash.is_empty()
+            && result.semantic_hash != "00000000000000000000000000000000"
+        {
+            meta.insert(
+                keys::SEMANTIC_HASH.to_string(),
+                result.semantic_hash.clone(),
+            );
+        }
+        if let Some(tokens) = result.telemetry_event.estimated_input_tokens {
+            if tokens > 0 {
+                meta.insert(keys::ESTIMATED_INPUT_TOKENS.to_string(), tokens.to_string());
+            }
+        }
     }
 }
 

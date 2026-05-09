@@ -6,7 +6,10 @@ pub mod sync_policy;
 
 pub use soth_core::error::{Result, SothError};
 pub use soth_core::policy::*;
-pub use sync_policy::{PolicyBundle, PolicyBundleError as PolicyError};
+pub use sync_policy::{
+    BudgetLimits, OrgPatterns, PolicyBundle, PolicyBundleError as PolicyError,
+    PolicyBundleMetadata, PolicyBundlePayload, RuleAction, RuleDefinition, SignedPolicyBundle,
+};
 
 /// Evaluate a normalized request and detected artifacts against the active policy bundle.
 ///

@@ -57,6 +57,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --lib --bins
 
+  # Parser / detect / policy / install tests on Windows — gryph
+  # PR #42's `unzip` Windows-specific bug shipped because there
+  # was no Windows runner in CI. We do ship Windows soth-cli
+  # binaries (see node-binaries.yml release lane), so any
+  # Windows-only regression in parser/detect/policy/install code
+  # paths must land on a real Windows runner before merge.
+  #
+  # Scoped to library tests for the crates whose code paths
+  # actually differ on Windows: path resolution
+  # (`extensions/code/src/paths.rs` reads dirs::home_dir →
+  # %USERPROFILE% on Windows), settings.json install
+  # (different default per agent — `~/.claude/...` vs
+  # `%USERPROFILE%\.claude\...`), regex / unicode handling in
+  # detect, and signature-verify on policy.  soth-proxy is
+  # excluded — its async networking surface includes Linux-
+  # specific syscalls (epoll, AF_UNIX) that don't compile on
+  # Windows and are not the historical regression site.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: lib tests on Windows
+        shell: bash
+        run: |
+          cargo test --lib -p soth-core
+          cargo test --lib -p soth-classify
+          cargo test --lib -p soth-detect
+          cargo test --lib -p soth-policy
+          cargo test --lib -p soth-bundle
+          cargo test --lib -p soth-extensions
+          cargo test --lib -p soth-parse
+          cargo test --lib -p soth-code
+
   # SDK-related jobs (conformance / wasm matrix / bindings-build-check) are
   # intentionally NOT in this workflow.
   #

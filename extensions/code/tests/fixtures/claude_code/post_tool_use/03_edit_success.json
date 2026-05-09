@@ -1,0 +1,13 @@
+{
+  "session_id": "claude-session-03",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/Users/u/code/proj/src/main.rs",
+    "old_string": "println!(\"hi\")",
+    "new_string": "println!(\"hello\")"
+  },
+  "tool_response": {
+    "filePath": "/Users/u/code/proj/src/main.rs",
+    "structuredPatch": []
+  }
+}

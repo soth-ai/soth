@@ -1,0 +1,5 @@
+{
+  "session_id": "claude-session-up-01",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "prompt": "Add a unit test for the parse function"
+}

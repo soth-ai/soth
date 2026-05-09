@@ -1,0 +1,10 @@
+{
+  "session_id": "openclaw-stop",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/stop.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "Stop",
+  "model": "gpt-4o",
+  "turn_id": "turn-stop-1",
+  "stop_hook_active": true,
+  "last_assistant_message": "Refactor complete. All tests pass."
+}

@@ -189,7 +189,41 @@ pub struct HistoricalMessage {
     pub role: String,
     pub content: String,
     pub timestamp: Option<i64>,
+    /// Heuristic / playbook-extracted token count.  When the
+    /// playbook's `TokenConfig` extracts only a scalar total this
+    /// holds it; when structured tokens are extracted, this is
+    /// the sum (input + output) for back-compat with consumers
+    /// that only read this field.  Per-turn billing-grade
+    /// breakdown lives in `usage` below.
     pub token_estimate: u32,
+    /// Structured per-turn usage extracted by the playbook —
+    /// `None` when the playbook didn't declare any token paths,
+    /// or when the source record didn't carry the expected
+    /// shape.  When `Some`, the four sub-fields are
+    /// independently optional: a Gemini-style scalar total
+    /// surfaces as `Some(MessageTokenUsage { total_tokens:
+    /// Some(N), .. })` with the per-direction fields `None`.
+    /// A full Anthropic-style usage block surfaces all four.
+    pub usage: Option<MessageTokenUsage>,
+}
+
+/// Per-message structured token usage — the building block of
+/// session-level billing reconstruction.  Mirrors the
+/// `TokenConfig` field set: every component is optional so a
+/// playbook that only extracts some sub-fields (e.g. OpenAI's
+/// `prompt_tokens` + `completion_tokens` without cache
+/// information) still produces meaningful data.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageTokenUsage {
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub cache_creation_input_tokens: Option<u32>,
+    pub cache_read_input_tokens: Option<u32>,
+    /// Provider-supplied scalar total.  Present when the
+    /// playbook declares `total_tokens_field` or the legacy
+    /// `field`.  When all four directional fields are present,
+    /// callers usually prefer summing those over this field.
+    pub total_tokens: Option<u32>,
 }
 
 /// Cursor for incremental reads — persisted in historian.db.

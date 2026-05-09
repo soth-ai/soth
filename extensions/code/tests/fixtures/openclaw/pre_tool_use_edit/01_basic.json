@@ -1,0 +1,15 @@
+{
+  "session_id": "openclaw-edit",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/edit.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-4o",
+  "turn_id": "turn-edit-1",
+  "tool_name": "Edit",
+  "tool_use_id": "tool-edit-1",
+  "tool_input": {
+    "file_path": "/home/user/project/src/main.rs",
+    "old_string": "fn main() {}",
+    "new_string": "fn main() {\n    println!(\"hello\");\n}"
+  }
+}

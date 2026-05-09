@@ -89,8 +89,24 @@ pub enum UseCaseLabelReason {
     UnmappedBundleLabel,
     /// Model weights/biases/labels shape mismatch (defensive check).
     ModelShapeError,
-    /// Historian event was queued without running `ClassifyEnricher`.
-    HistorianNotEnriched,
+    /// Extension event was queued without running `ClassifyEnricher`.
+    /// Applies to any extension that produces `GovernableEvent`s
+    /// (historian, soth-code, future extensions). Original variant
+    /// name was `HistorianNotEnriched` from when historian was the
+    /// only extension; serde alias preserves backwards compat for
+    /// any in-flight events with the old wire form.
+    #[serde(alias = "historian_not_enriched")]
+    ExtensionNotEnriched,
+    /// soth-code synthesized this row for a `pre_tool_use` hook.
+    /// Classify pipeline did not run — the dashboard's `use_case`
+    /// is the tool name itself (`Bash`, `Read`, …).  Lets rollups
+    /// distinguish synthesized tool rows from real ONNX
+    /// classifications.
+    PreToolCall,
+    /// Same as `PreToolCall` but for `post_tool_use` events.
+    /// Phase split lets dashboards count "tool calls issued" vs
+    /// "tool calls completed" without a JOIN on action_seq.
+    PostToolCall,
     /// Struct default — never populated by a real classify run.
     UninitializedDefault,
 }
@@ -244,11 +260,69 @@ pub enum DataSource {
     HistorianContinue,
     HistorianOpenClaw,
     HistorianUnknown,
+    // ── soth-code extension: per-action live capture from agent hooks.
+    //    Distinct from Historian* variants which are post-hoc session
+    //    backfill. See docs/gryph/plan.md §10 for layer boundaries.
+    CodeClaudeCode,
+    CodeCursor,
+    CodeCodex,
+    CodeGeminiCli,
+    CodeWindsurf,
+    CodeOpenCode,
+    CodePiAgent,
 }
 
 impl Default for DataSource {
     fn default() -> Self {
         Self::LiveProxy
+    }
+}
+
+/// Event-stream observation layer.
+///
+/// SOTH observes AI agent activity at three orthogonal layers
+/// (→ `docs/gryph/plan.md` §10):
+///
+/// - **Network** — proxy MITM observation, one event per HTTP request/response.
+/// - **Action** — `soth-code` hook capture, one event per agent tool call.
+/// - **Session** — historian file-watch reconstruction, one event per
+///   conversation session.
+///
+/// The dashboard renders these as distinct streams; counts are reported
+/// per-layer and never summed across layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventLayer {
+    Network,
+    Action,
+    Session,
+}
+
+impl EventLayer {
+    /// Derive the canonical layer from a `DataSource`.
+    ///
+    /// Used when an event predates the explicit `event_layer` field, or
+    /// when a writer leaves it unset and the layer can be inferred
+    /// unambiguously from data source. See [`TelemetryEvent::effective_event_layer`].
+    pub fn from_data_source(ds: DataSource) -> Self {
+        match ds {
+            DataSource::LiveProxy => Self::Network,
+            DataSource::HistorianClaudeCode
+            | DataSource::HistorianGemini
+            | DataSource::HistorianCodex
+            | DataSource::HistorianCursor
+            | DataSource::HistorianGithubCopilot
+            | DataSource::HistorianContinue
+            | DataSource::HistorianOpenClaw
+            | DataSource::HistorianUnknown => Self::Session,
+            DataSource::CodeClaudeCode
+            | DataSource::CodeCursor
+            | DataSource::CodeCodex
+            | DataSource::CodeGeminiCli
+            | DataSource::CodeWindsurf
+            | DataSource::CodeOpenCode
+            | DataSource::CodePiAgent => Self::Action,
+        }
     }
 }
 
@@ -264,6 +338,17 @@ pub struct TelemetryEvent {
     pub parse_source: ParseSource,
     pub capture_mode: CaptureMode,
     pub use_case: UseCaseLabel,
+    /// Raw label string when the edge wrote a value that doesn't
+    /// match a `UseCaseLabel` enum variant — typically the
+    /// soth-code per-tool synthesized labels (`"bash"`, `"read"`,
+    /// `"edit"`, MCP tool names, …).  When `Some(_)`, the wire
+    /// converter (`soth-api-types/src/convert.rs`) prefers it
+    /// over the enum's snake-case name so the dashboard sees
+    /// the literal tool name instead of `"unknown"`.  `None` for
+    /// proxy / historian rows where the typed enum is
+    /// authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_case_label_override: Option<String>,
     pub volatility_class: VolatilityClass,
     pub cache_level: Option<CacheLevel>,
     pub routing_reason: Option<RoutingReason>,
@@ -394,6 +479,32 @@ pub struct TelemetryEvent {
     pub surface_type: SurfaceType,
     #[serde(default)]
     pub is_shadow_it: bool,
+
+    /// Event-stream observation layer tag (→ `docs/gryph/plan.md` §10).
+    /// `None` for legacy events; resolve via [`TelemetryEvent::effective_event_layer`]
+    /// which falls back to deriving from `data_source`. New writers
+    /// (`soth-code`, future explicit-layer producers) populate this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_layer: Option<EventLayer>,
+
+    /// Raw hook-payload JSON, captured by `soth-code` only when an
+    /// operator opts into Audit or Full capture modes. `None` is the
+    /// default, the wire-format invariant, and what every other
+    /// extension (historian, the proxy LiveProxy path) emits.
+    /// Truncated at the edge to a configurable cap; the truncation
+    /// marker `…[truncated]` is preserved on the suffix.
+    /// Cloud-side ingestion stores this verbatim into the
+    /// `intercept_events.raw_payload` column when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_payload: Option<String>,
+
+    /// Which capture mode produced `raw_payload` — `"audit"` or
+    /// `"full"`. `None` when no raw capture happened. Useful in the
+    /// cloud both for the dashboard banner ("raw capture is on for
+    /// this org") and for audit-log entries when an operator views
+    /// raw content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_capture_mode: Option<String>,
 }
 
 impl Default for TelemetryEvent {
@@ -409,6 +520,7 @@ impl Default for TelemetryEvent {
             parse_source: ParseSource::Heuristic,
             capture_mode: CaptureMode::MetadataOnly,
             use_case: UseCaseLabel::Unknown,
+            use_case_label_override: None,
             volatility_class: VolatilityClass::Static,
             cache_level: None,
             routing_reason: None,
@@ -475,11 +587,24 @@ impl Default for TelemetryEvent {
             surface_type: SurfaceType::Unknown,
             is_shadow_it: false,
             interaction_mode: InteractionMode::Unknown,
+            event_layer: None,
+            raw_payload: None,
+            raw_capture_mode: None,
         }
     }
 }
 
 impl TelemetryEvent {
+    /// Effective event layer.
+    ///
+    /// Returns the explicit `event_layer` field when set (new writers),
+    /// otherwise derives from `data_source` for backwards compat with
+    /// legacy events that predate this field (→ `docs/gryph/plan.md` §10.6).
+    pub fn effective_event_layer(&self) -> EventLayer {
+        self.event_layer
+            .unwrap_or_else(|| EventLayer::from_data_source(self.data_source))
+    }
+
     /// Convert a GovernableEvent (from extensions like historian) into a
     /// TelemetryEvent suitable for the telemetry pipeline.
     ///
@@ -521,7 +646,7 @@ impl TelemetryEvent {
             estimated_cost_usd,
             system_prompt_token_length,
             tool_definition_hash,
-            import_categories,
+            mut import_categories,
         ) = if let Some(ref norm) = gov.normalized {
             (
                 Some(norm.estimated_input_tokens),
@@ -534,6 +659,21 @@ impl TelemetryEvent {
         } else {
             (None, None, None, None, None, Vec::new())
         };
+
+        // Extensions (soth-code, future ones) attach import
+        // categories from their own tree-sitter detect run as a
+        // JSON-array metadata key.  Fold them into the
+        // canonical list so the proxy / extension paths drive
+        // the same `network_calls_detected` /
+        // `file_io_detected` / `crypto_operations_detected` /
+        // `auth_logic_detected` flags downstream.
+        if import_categories.is_empty() {
+            if let Some(raw) = meta.get("import_categories") {
+                if let Ok(parsed) = serde_json::from_str::<Vec<ImportCategory>>(raw) {
+                    import_categories = parsed;
+                }
+            }
+        }
 
         // Artifact-based enrichment — mirrors the logic in soth-classify stage7
         let languages = extract_languages_from_artifacts(&gov.artifacts);
@@ -549,24 +689,50 @@ impl TelemetryEvent {
                 .unwrap_or(0),
         );
 
-        // Pre-computed classify enrichment (written by historian's ClassifyEnricher
-        // before queue serialization, since embed_content is #[serde(skip)]).
-        // Detect "historian queued an event without running ClassifyEnricher"
-        // by checking for the presence of any classify.* metadata. Callers
-        // (sync sender, historian) emit a WARN log when they see the
-        // `HistorianNotEnriched` reason — soth-core stays log-free for the
-        // SDK/WASM build.
+        // Pre-computed classify enrichment (written by an extension's
+        // write-time enricher — historian's `ClassifyEnricher`,
+        // soth-code's hook handler, etc. — before queue serialization,
+        // since embed_content is #[serde(skip)]). Detect "extension
+        // queued an event without running enrichment" by checking for
+        // the presence of any classify.* metadata. Callers (sync
+        // sender) emit a WARN when they see the `ExtensionNotEnriched`
+        // reason — soth-core stays log-free for the SDK/WASM build.
         let raw_use_case = meta
             .get("classify.use_case")
             .and_then(|s| serde_json::from_str::<UseCaseLabel>(s).ok());
-        let use_case_label_reason = if raw_use_case.is_none() {
-            UseCaseLabelReason::HistorianNotEnriched
-        } else {
-            meta.get("classify.use_case_label_reason")
-                .and_then(|s| serde_json::from_str::<UseCaseLabelReason>(s).ok())
-                .unwrap_or(UseCaseLabelReason::Confident)
+        let raw_reason = meta
+            .get("classify.use_case_label_reason")
+            .and_then(|s| serde_json::from_str::<UseCaseLabelReason>(s).ok());
+        let use_case_label_reason = match (raw_use_case.is_some(), raw_reason) {
+            // Real classify ran AND emitted a reason → trust it.
+            (true, Some(r)) => r,
+            // Real classify ran but reason missing → assume Confident.
+            (true, None) => UseCaseLabelReason::Confident,
+            // No `classify.use_case` enum match BUT we have a reason
+            // — that's the soth-code per-tool synthesized path
+            // (label is a literal tool name like "Bash" that doesn't
+            // map to UseCaseLabel).  Trust the explicit reason
+            // instead of erasing it as ExtensionNotEnriched.
+            (false, Some(r)) => r,
+            // Neither label nor reason — extension didn't enrich.
+            (false, None) => UseCaseLabelReason::ExtensionNotEnriched,
         };
         let use_case = raw_use_case.unwrap_or(UseCaseLabel::Unknown);
+        // When the metadata key carries a value that doesn't match
+        // a `UseCaseLabel` enum variant — soth-code's per-tool
+        // synthesized labels (`"bash"`, `"read"`, `"edit"`, MCP
+        // tool names, …) — preserve the literal string so the
+        // wire converter can pass it through to the dashboard.
+        // Otherwise the enum collapses to Unknown and the
+        // `use_case_label` column shows "unknown" for every tool
+        // call row.
+        let use_case_label_override = if raw_use_case.is_none() {
+            meta.get("classify.use_case")
+                .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         let use_case_confidence = meta
             .get("classify.use_case_confidence")
             .and_then(|s| s.parse::<f32>().ok())
@@ -583,6 +749,16 @@ impl TelemetryEvent {
             .get("classify.anomaly_score")
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|&v| v > 0.0);
+        // `classify.anomaly_flags` is a JSON-array-of-strings
+        // (snake_case enum forms — `["topic_drift",
+        // "token_burst"]`).  Without this read the
+        // `anomaly_flags` field stays `Vec::new()` even when the
+        // edge daemon detected drift, and the dashboard's
+        // anomaly column shows empty for every row.
+        let extension_anomaly_flags = meta
+            .get("classify.anomaly_flags")
+            .and_then(|s| serde_json::from_str::<Vec<crate::AnomalyFlag>>(s).ok())
+            .unwrap_or_default();
         let complexity_score = meta
             .get("classify.complexity_score")
             .and_then(|s| s.parse::<u8>().ok())
@@ -591,6 +767,14 @@ impl TelemetryEvent {
             .get("classify.topic_cluster_id")
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
+
+        // Raw-payload capture: only present when `soth-code` is in
+        // Audit or Full mode (operator-opt-in). Default Metadata mode
+        // doesn't write these keys, so they round-trip as None for
+        // the proxy LiveProxy path and historian. See
+        // extensions/code/src/event.rs::CodeCaptureMode.
+        let raw_payload = meta.get("raw_payload").cloned();
+        let raw_capture_mode = meta.get("raw_capture").cloned();
 
         // Synthesize a ProcessResolution from identity metadata so the sync
         // sender emits tool_identity_key/source_class/tool_name/tool_kind/
@@ -645,14 +829,18 @@ impl TelemetryEvent {
             sensitive_code_flags,
             code_fraction,
             use_case,
+            use_case_label_override,
             use_case_confidence,
             use_case_label_reason,
             volatility_class,
             dynamic_fraction,
             anomaly_score,
+            anomaly_flags: extension_anomaly_flags,
             complexity_score,
             topic_cluster_id,
             process_resolution,
+            raw_payload,
+            raw_capture_mode,
             interaction_mode: meta
                 .get("interaction_mode")
                 .and_then(|s| serde_json::from_value(serde_json::Value::String(s.clone())).ok())
@@ -824,4 +1012,306 @@ fn compute_code_fraction_from_artifacts(
     let total_tokens = estimated_input_tokens.max(1) as f32;
     let estimated_code_tokens = (code_block_count as f32) * 200.0;
     (estimated_code_tokens / total_tokens).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod data_source_serde_tests {
+    use super::{DataSource, EventLayer, TelemetryEvent};
+
+    #[test]
+    fn code_variants_serialize_to_snake_case() {
+        let cases = [
+            (DataSource::CodeClaudeCode, "\"code_claude_code\""),
+            (DataSource::CodeCursor, "\"code_cursor\""),
+            (DataSource::CodeCodex, "\"code_codex\""),
+            (DataSource::CodeGeminiCli, "\"code_gemini_cli\""),
+            (DataSource::CodeWindsurf, "\"code_windsurf\""),
+            (DataSource::CodeOpenCode, "\"code_open_code\""),
+            (DataSource::CodePiAgent, "\"code_pi_agent\""),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                expected,
+                "serialization for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_variants_round_trip() {
+        let variants = [
+            DataSource::CodeClaudeCode,
+            DataSource::CodeCursor,
+            DataSource::CodeCodex,
+            DataSource::CodeGeminiCli,
+            DataSource::CodeWindsurf,
+            DataSource::CodeOpenCode,
+            DataSource::CodePiAgent,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: DataSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "round-trip for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn historian_variants_unchanged() {
+        // Regression guard: existing Historian variants must keep their
+        // wire form so cloud rollups don't silently re-bucket them.
+        assert_eq!(
+            serde_json::to_string(&DataSource::HistorianClaudeCode).unwrap(),
+            "\"historian_claude_code\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DataSource::LiveProxy).unwrap(),
+            "\"live_proxy\""
+        );
+    }
+
+    #[test]
+    fn event_layer_from_data_source_buckets() {
+        assert_eq!(
+            EventLayer::from_data_source(DataSource::LiveProxy),
+            EventLayer::Network
+        );
+        for ds in [
+            DataSource::HistorianClaudeCode,
+            DataSource::HistorianGemini,
+            DataSource::HistorianCodex,
+            DataSource::HistorianCursor,
+            DataSource::HistorianGithubCopilot,
+            DataSource::HistorianContinue,
+            DataSource::HistorianOpenClaw,
+            DataSource::HistorianUnknown,
+        ] {
+            assert_eq!(
+                EventLayer::from_data_source(ds),
+                EventLayer::Session,
+                "{ds:?} should be Session layer"
+            );
+        }
+        for ds in [
+            DataSource::CodeClaudeCode,
+            DataSource::CodeCursor,
+            DataSource::CodeCodex,
+            DataSource::CodeGeminiCli,
+            DataSource::CodeWindsurf,
+            DataSource::CodeOpenCode,
+            DataSource::CodePiAgent,
+        ] {
+            assert_eq!(
+                EventLayer::from_data_source(ds),
+                EventLayer::Action,
+                "{ds:?} should be Action layer"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_event_layer_falls_back_to_data_source() {
+        // Legacy event: explicit field None, data_source dictates layer.
+        let mut ev = TelemetryEvent {
+            data_source: DataSource::HistorianClaudeCode,
+            ..TelemetryEvent::default()
+        };
+        assert_eq!(ev.event_layer, None);
+        assert_eq!(ev.effective_event_layer(), EventLayer::Session);
+
+        // New writer: explicit field set, takes precedence.
+        ev.event_layer = Some(EventLayer::Action);
+        assert_eq!(ev.effective_event_layer(), EventLayer::Action);
+    }
+
+    #[test]
+    fn event_layer_serializes_to_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EventLayer::Network).unwrap(),
+            "\"network\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventLayer::Action).unwrap(),
+            "\"action\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventLayer::Session).unwrap(),
+            "\"session\""
+        );
+    }
+
+    #[test]
+    fn from_governable_extracts_raw_payload_when_present() {
+        // Pin the contract: when an extension (soth-code in Audit /
+        // Full mode) writes `raw_payload` and `raw_capture` into
+        // GovernableEvent metadata, `from_governable` surfaces them
+        // as TelemetryEvent fields so the cloud's ingestion can
+        // store them in `intercept_events.raw_payload` /
+        // `raw_capture_mode` columns. Default Metadata mode keeps
+        // both `None`.
+        use crate::extensions::{ExtensionContext, ExtensionSource, GovernableEvent};
+        use crate::EventSource;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        // Case 1: capture happened — fields present.
+        let mut meta = HashMap::new();
+        meta.insert("raw_payload".to_string(), r#"{"command":"ls"}"#.to_string());
+        meta.insert("raw_capture".to_string(), "audit".to_string());
+        let gov = GovernableEvent {
+            event_id: Uuid::nil(),
+            timestamp_epoch_ms: 0,
+            source: EventSource::Extension {
+                source: ExtensionSource::Code,
+            },
+            provider: "code".to_string(),
+            model: None,
+            endpoint_type: super::EndpointType::Unknown,
+            normalized: None,
+            artifacts: vec![],
+            capture_mode: super::CaptureMode::MetadataOnly,
+            embed_content: None,
+            context: ExtensionContext {
+                extension_name: "code".to_string(),
+                extension_version: "0.1.0".to_string(),
+                metadata: meta,
+            },
+        };
+        let te = TelemetryEvent::from_governable(&gov, None);
+        assert_eq!(te.raw_payload.as_deref(), Some(r#"{"command":"ls"}"#));
+        assert_eq!(te.raw_capture_mode.as_deref(), Some("audit"));
+
+        // Case 2: no capture metadata — fields stay None (default
+        // Metadata mode behavior, which is what every event
+        // historically looked like).
+        let mut gov = gov;
+        gov.context.metadata.clear();
+        let te = TelemetryEvent::from_governable(&gov, None);
+        assert!(te.raw_payload.is_none());
+        assert!(te.raw_capture_mode.is_none());
+    }
+
+    #[test]
+    fn from_governable_preserves_synthesized_tool_label_via_override() {
+        use crate::{UseCaseLabel, UseCaseLabelReason};
+        // soth-code's per-tool synthesized rows write
+        // `classify.use_case = "\"bash\""` (a literal tool name
+        // that doesn't deserialize as the typed `UseCaseLabel`
+        // enum).  Without the override field these rows would
+        // wire-encode `use_case_label = "unknown"` and the
+        // dashboard's `/code` endpoint would show "unknown" for
+        // every tool call — exactly the bug we shipped a fix
+        // for.  Pin both legs:
+        //   * `use_case` collapses to `Unknown` (typed enum
+        //     can't hold "bash") — accepted, the wire converter
+        //     handles it.
+        //   * `use_case_label_override` carries the literal
+        //     "bash" so `convert.rs` can prefer it and the
+        //     cloud sees the real tool name.
+        //   * Reason is the explicit `pre_tool_call` from
+        //     metadata, NOT `ExtensionNotEnriched`.
+        use crate::extensions::{ExtensionContext, ExtensionSource, GovernableEvent};
+        use crate::EventSource;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let mut meta = HashMap::new();
+        meta.insert("classify.use_case".to_string(), "\"bash\"".to_string());
+        meta.insert(
+            "classify.use_case_label_reason".to_string(),
+            "\"pre_tool_call\"".to_string(),
+        );
+        let gov = GovernableEvent {
+            event_id: Uuid::nil(),
+            timestamp_epoch_ms: 0,
+            source: EventSource::Extension {
+                source: ExtensionSource::Code,
+            },
+            provider: "code".to_string(),
+            model: Some("claude-opus-4-7".to_string()),
+            endpoint_type: super::EndpointType::Unknown,
+            normalized: None,
+            artifacts: vec![],
+            capture_mode: super::CaptureMode::MetadataOnly,
+            embed_content: None,
+            context: ExtensionContext {
+                extension_name: "code".to_string(),
+                extension_version: "0.1.0".to_string(),
+                metadata: meta,
+            },
+        };
+        let te = TelemetryEvent::from_governable(&gov, None);
+        assert_eq!(te.use_case, UseCaseLabel::Unknown);
+        assert_eq!(te.use_case_label_override.as_deref(), Some("bash"));
+        assert_eq!(te.use_case_label_reason, UseCaseLabelReason::PreToolCall);
+        assert_eq!(te.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn from_governable_reads_anomaly_flags_from_extension_metadata() {
+        use crate::AnomalyFlag;
+        // The classify daemon emits real anomaly flags
+        // (`topic_drift`, `token_burst`, `tool_call_depth_spike`,
+        // …) in session-tracked mode.  Hook handler writes
+        // `classify.anomaly_flags` as a JSON array of snake_case
+        // enum names.  Pin the read path so a future change
+        // can't silently drop them — every flag the daemon
+        // detected must round-trip through `from_governable` and
+        // surface in the dashboard's anomaly column.
+        use crate::extensions::{ExtensionContext, ExtensionSource, GovernableEvent};
+        use crate::EventSource;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            "classify.use_case".to_string(),
+            "\"code_generation\"".to_string(),
+        );
+        meta.insert(
+            "classify.anomaly_flags".to_string(),
+            r#"["topic_drift","token_burst"]"#.to_string(),
+        );
+        let gov = GovernableEvent {
+            event_id: Uuid::nil(),
+            timestamp_epoch_ms: 0,
+            source: EventSource::Extension {
+                source: ExtensionSource::Code,
+            },
+            provider: "code".to_string(),
+            model: None,
+            endpoint_type: super::EndpointType::Unknown,
+            normalized: None,
+            artifacts: vec![],
+            capture_mode: super::CaptureMode::MetadataOnly,
+            embed_content: None,
+            context: ExtensionContext {
+                extension_name: "code".to_string(),
+                extension_version: "0.1.0".to_string(),
+                metadata: meta,
+            },
+        };
+        let te = TelemetryEvent::from_governable(&gov, None);
+        assert!(te.anomaly_flags.contains(&AnomalyFlag::TopicDrift));
+        assert!(te.anomaly_flags.contains(&AnomalyFlag::TokenBurst));
+        assert_eq!(te.anomaly_flags.len(), 2);
+    }
+
+    #[test]
+    fn telemetry_event_legacy_json_deserializes_with_no_event_layer() {
+        // Regression guard: an event serialized before this field existed
+        // must still deserialize, with `event_layer: None`.
+        let ev = TelemetryEvent {
+            data_source: DataSource::LiveProxy,
+            ..TelemetryEvent::default()
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        // Strip event_layer to simulate older wire form.
+        let mut obj = json.as_object().unwrap().clone();
+        obj.remove("event_layer");
+        let stripped = serde_json::Value::Object(obj);
+        let back: TelemetryEvent = serde_json::from_value(stripped).unwrap();
+        assert_eq!(back.event_layer, None);
+        assert_eq!(back.effective_event_layer(), EventLayer::Network);
+    }
 }

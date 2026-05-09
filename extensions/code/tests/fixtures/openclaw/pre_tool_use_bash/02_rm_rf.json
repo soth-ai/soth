@@ -1,0 +1,13 @@
+{
+  "session_id": "openclaw-block-rm",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/block.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-4o",
+  "turn_id": "turn-block-1",
+  "tool_name": "Bash",
+  "tool_use_id": "tool-block-1",
+  "tool_input": {
+    "command": "rm -rf /tmp/test_artifacts"
+  }
+}

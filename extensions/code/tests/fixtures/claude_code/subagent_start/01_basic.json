@@ -1,0 +1,7 @@
+{
+  "session_id": "claude-subagent-09",
+  "agent_id": "ag-uuid-9000",
+  "agent_type": "general-purpose",
+  "parent_session_id": "claude-session-09-parent",
+  "description": "research X"
+}

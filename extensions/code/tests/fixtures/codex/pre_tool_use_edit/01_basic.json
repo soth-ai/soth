@@ -1,0 +1,15 @@
+{
+  "session_id": "codex-edit",
+  "transcript_path": "/home/user/.codex/transcripts/dev.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "o4-mini",
+  "turn_id": "turn-edit-1",
+  "tool_name": "Edit",
+  "tool_use_id": "tool-edit-1",
+  "tool_input": {
+    "file_path": "/home/user/project/cmd/server/main.go",
+    "old_string": "log.Println(\"booting\")",
+    "new_string": "log.Println(\"server up on :8080\")"
+  }
+}

@@ -4088,9 +4088,11 @@ dependencies = [
  "sha1",
  "sha2",
  "soth-bundle",
+ "soth-code",
  "soth-core",
  "soth-extensions",
  "soth-historian",
+ "soth-policy",
  "soth-proxy",
  "soth-sync",
  "tempfile",
@@ -4101,6 +4103,32 @@ dependencies = [
  "uuid",
  "which",
  "x509-parser",
+]
+
+[[package]]
+name = "soth-code"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "criterion",
+ "dirs",
+ "lru 0.12.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "soth-classify",
+ "soth-core",
+ "soth-detect",
+ "soth-extensions",
+ "soth-policy",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

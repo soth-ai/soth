@@ -236,6 +236,7 @@ fn parse_session(
                     content: text.clone(),
                     timestamp: ts,
                     token_estimate: estimate_tokens(&text),
+                    usage: None,
                 });
             }
             // Skip event_msg, turn_context, and anything else.

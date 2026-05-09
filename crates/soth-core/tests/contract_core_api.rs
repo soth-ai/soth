@@ -165,6 +165,7 @@ fn proxy_context_and_policy_context_semantic_extension_contract() {
             topic_cluster_id: 9,
         }),
         session: SessionSnapshot::default(),
+        action: None,
     };
 
     let encoded = serde_json::to_value(policy_ctx).expect("serialize policy context");
@@ -185,6 +186,7 @@ fn telemetry_event_surface_excludes_raw_content_fields() {
         parse_source: ParseSource::JsonRpc,
         capture_mode: CaptureMode::MetadataOnly,
         use_case: UseCaseLabel::CodeGeneration,
+        use_case_label_override: None,
         volatility_class: VolatilityClass::Static,
         cache_level: Some(soth_core::CacheLevel::Exact),
         routing_reason: None,
@@ -245,6 +247,9 @@ fn telemetry_event_surface_excludes_raw_content_fields() {
         product_id: None,
         surface_type: SurfaceType::Unknown,
         is_shadow_it: false,
+        event_layer: None,
+        raw_payload: None,
+        raw_capture_mode: None,
         ja4_hash: None,
         tls_version: None,
         alpn_protocol: None,
@@ -573,6 +578,7 @@ fn telemetry_event_new_fields_serde_roundtrip() {
         parse_source: ParseSource::Heuristic,
         capture_mode: CaptureMode::MetadataOnly,
         use_case: UseCaseLabel::Unknown,
+        use_case_label_override: None,
         volatility_class: VolatilityClass::Static,
         cache_level: None,
         routing_reason: None,
@@ -621,6 +627,9 @@ fn telemetry_event_new_fields_serde_roundtrip() {
         product_id: None,
         surface_type: SurfaceType::Unknown,
         is_shadow_it: false,
+        event_layer: None,
+        raw_payload: None,
+        raw_capture_mode: None,
         ja4_hash: None,
         tls_version: None,
         alpn_protocol: None,

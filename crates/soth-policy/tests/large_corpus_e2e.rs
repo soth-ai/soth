@@ -432,5 +432,6 @@ fn default_context() -> PolicyContext {
         skip_org_rules: false,
         semantic: None,
         session: SessionSnapshot::default(),
+        action: None,
     }
 }

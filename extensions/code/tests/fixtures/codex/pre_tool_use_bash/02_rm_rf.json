@@ -1,0 +1,13 @@
+{
+  "session_id": "codex-block-target",
+  "transcript_path": "/home/user/.codex/transcripts/dev.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "o4-mini",
+  "turn_id": "turn-block-1",
+  "tool_name": "Bash",
+  "tool_use_id": "tool-block-1",
+  "tool_input": {
+    "command": "rm -rf /tmp/build_artifacts"
+  }
+}

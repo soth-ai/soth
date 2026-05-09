@@ -1,0 +1,9 @@
+{
+  "session_id": "codex-long-prompt",
+  "transcript_path": "/home/user/.codex/transcripts/dev.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-5",
+  "turn_id": "turn-long-1",
+  "prompt": "Review the auth middleware in cmd/server/middleware.go. Identify any race conditions in the session token refresh path, then propose a minimal patch that uses sync.Once for the JWKS cache initialization. After that, walk me through how the patch interacts with the existing connection pool defined in pkg/db/pool.go — specifically whether the JWKS HTTP client we're caching needs its own context cancellation hooks tied to the pool shutdown signal, or whether the standard context cancellation through the request handler chain is sufficient."
+}

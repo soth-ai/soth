@@ -16,6 +16,7 @@ members = [
     "crates/soth-detect",
     "crates/soth-extensions",
     "extensions/historian",
+    "extensions/code",
     "bindings/soth-py",
     "bindings/soth-node",
 ]
@@ -64,6 +65,7 @@ soth-parse = { path = "crates/soth-parse" }
 soth-detect = { path = "crates/soth-detect", default-features = false }
 soth-extensions = { path = "crates/soth-extensions" }
 soth-historian = { path = "extensions/historian" }
+soth-code = { path = "extensions/code" }
 
 # Async runtime
 tokio = { version = "1", features = [

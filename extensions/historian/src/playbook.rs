@@ -263,10 +263,96 @@ pub enum TimestampFormat {
 }
 
 /// How to extract token counts from the data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Two shapes coexist:
+///
+/// 1. **Legacy scalar** (`{ "field": "tokens.total" }`) — single
+///    dot-path resolving to a u64.  Treated as `total_tokens` if
+///    no structured paths are set.  Carried forward for backwards
+///    compatibility with playbooks shipped before 2026-05-08.
+///
+/// 2. **Structured** — separate optional dot-paths for the four
+///    Anthropic-style usage fields (`input_tokens`,
+///    `output_tokens`, `cache_creation_input_tokens`,
+///    `cache_read_input_tokens`) plus an optional
+///    `total_tokens_field` for providers that only expose a
+///    single scalar (e.g. Gemini's `tokens.total`).
+///
+/// The structured shape is what the §10.11 A→C bypass trajectory
+/// requires — proxy-side billing data is `usage{input,output,
+/// cache_*}` per assistant turn, and historian must recover all
+/// four to be a credible substitute.
+///
+/// Resolution rule: when both `field` and any structured path are
+/// set, structured takes precedence.  When only `field` is set,
+/// it's mapped to `total_tokens_field`.  When nothing is set, the
+/// engine falls back to a heuristic estimate from message text.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenConfig {
-    /// Dot-path to the token count field (e.g. "tokens.total").
-    pub field: String,
+    /// Legacy single-field path.  Kept for back-compat with
+    /// playbooks authored before 2026-05-08.  When present and no
+    /// structured field is set, treated as `total_tokens_field`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+
+    /// Dot-path to per-turn input tokens (Anthropic
+    /// `usage.input_tokens`, OpenAI `prompt_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens_field: Option<String>,
+
+    /// Dot-path to per-turn output tokens (Anthropic
+    /// `usage.output_tokens`, OpenAI `completion_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_field: Option<String>,
+
+    /// Dot-path to cache-creation input tokens (Anthropic-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens_field: Option<String>,
+
+    /// Dot-path to cache-read input tokens (Anthropic-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens_field: Option<String>,
+
+    /// Dot-path to a single scalar total — Gemini-style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens_field: Option<String>,
+}
+
+impl TokenConfig {
+    /// Construct from a single scalar field — convenience for
+    /// playbooks that only need total.  Equivalent to setting
+    /// `total_tokens_field` directly.
+    pub fn from_total_field(path: impl Into<String>) -> Self {
+        Self {
+            total_tokens_field: Some(path.into()),
+            ..Default::default()
+        }
+    }
+
+    /// True when any structured field is set OR the legacy
+    /// `field` is present — i.e. the playbook can extract some
+    /// quantity of token data, no matter how thin.
+    pub fn has_any_field(&self) -> bool {
+        self.field.is_some()
+            || self.input_tokens_field.is_some()
+            || self.output_tokens_field.is_some()
+            || self.cache_creation_input_tokens_field.is_some()
+            || self.cache_read_input_tokens_field.is_some()
+            || self.total_tokens_field.is_some()
+    }
+
+    /// True when ALL four billing-grade Anthropic-style fields
+    /// are set.  This is what the §10.11 audit gate ultimately
+    /// looks for: Cloud-side billing reconstruction needs
+    /// input + output + both cache breakdowns to match the
+    /// proxy's `usage{}` shape.  Single-scalar totals are not
+    /// audit-passing.
+    pub fn is_billing_grade(&self) -> bool {
+        self.input_tokens_field.is_some()
+            && self.output_tokens_field.is_some()
+            && self.cache_creation_input_tokens_field.is_some()
+            && self.cache_read_input_tokens_field.is_some()
+    }
 }
 
 #[cfg(test)]

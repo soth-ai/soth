@@ -27,7 +27,17 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
     let mut all_parts = Vec::new();
     let mut system_prompt: Option<String> = None;
     let mut total_input_tokens: u32 = 0;
-    let mut _total_output_tokens: u32 = 0;
+    let mut total_output_tokens: u32 = 0;
+
+    // Structured per-session usage — sum of per-message
+    // billing-grade tokens when the playbook extracts them.
+    // Stays at zero / None when no message had `usage`
+    // populated (the heuristic-only path).
+    let mut billing_input_tokens: u32 = 0;
+    let mut billing_output_tokens: u32 = 0;
+    let mut billing_cache_creation_input_tokens: u32 = 0;
+    let mut billing_cache_read_input_tokens: u32 = 0;
+    let mut had_billing_usage = false;
 
     for msg in &session.messages {
         all_parts.push(format!("{}:{}", msg.role, msg.content));
@@ -43,10 +53,27 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
                 total_input_tokens += msg.token_estimate;
             }
             "assistant" | "model" => {
-                _total_output_tokens += msg.token_estimate;
+                total_output_tokens += msg.token_estimate;
             }
             _ => {
                 total_input_tokens += msg.token_estimate;
+            }
+        }
+
+        if let Some(usage) = msg.usage.as_ref() {
+            had_billing_usage = true;
+            if let Some(n) = usage.input_tokens {
+                billing_input_tokens = billing_input_tokens.saturating_add(n);
+            }
+            if let Some(n) = usage.output_tokens {
+                billing_output_tokens = billing_output_tokens.saturating_add(n);
+            }
+            if let Some(n) = usage.cache_creation_input_tokens {
+                billing_cache_creation_input_tokens =
+                    billing_cache_creation_input_tokens.saturating_add(n);
+            }
+            if let Some(n) = usage.cache_read_input_tokens {
+                billing_cache_read_input_tokens = billing_cache_read_input_tokens.saturating_add(n);
             }
         }
     }
@@ -119,6 +146,35 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
     metadata.insert("provider_id".to_string(), identity.provider_id.to_string());
     metadata.insert("source_class".to_string(), "agent_app".to_string());
 
+    // Billing-grade structured usage — surfaces only when the
+    // playbook extracted at least one `message.usage` block.
+    // Cloud-side ingestion reads these flat-key conventions to
+    // populate ClickHouse `usage_*` columns; the keys mirror
+    // what soth-classify writes in its enrichment so a single
+    // soth-core `from_governable` mapping handles both
+    // origins.  When absent (heuristic-only path), the keys
+    // stay missing so `from_governable` doesn't synthesize
+    // false billing data.
+    if had_billing_usage {
+        metadata.insert(
+            "usage_input_tokens".to_string(),
+            billing_input_tokens.to_string(),
+        );
+        metadata.insert(
+            "usage_output_tokens".to_string(),
+            billing_output_tokens.to_string(),
+        );
+        metadata.insert(
+            "usage_cache_creation_input_tokens".to_string(),
+            billing_cache_creation_input_tokens.to_string(),
+        );
+        metadata.insert(
+            "usage_cache_read_input_tokens".to_string(),
+            billing_cache_read_input_tokens.to_string(),
+        );
+        metadata.insert("usage_source".to_string(), "playbook_extracted".to_string());
+    }
+
     let normalized = soth_core::normalized::NormalizedRequest {
         parse_confidence: soth_core::artifacts::ParseConfidence::Heuristic,
         parser_id: "historian".to_string(),
@@ -152,7 +208,18 @@ pub fn reconstruct_event(session: &HistoricalSession) -> GovernableEvent {
         },
         has_structured_output: false,
         has_tool_results: false,
-        estimated_output_tokens: None,
+        // When the playbook extracted billing-grade output
+        // tokens, surface that on the wire instead of leaving
+        // it None.  Cloud-side aggregations care about the
+        // distinction (None = "we don't know", 0 = "we know it
+        // was nothing").
+        estimated_output_tokens: if had_billing_usage {
+            Some(billing_output_tokens)
+        } else if total_output_tokens > 0 {
+            Some(total_output_tokens)
+        } else {
+            None
+        },
         user_prompt: None,
     };
 
@@ -288,12 +355,14 @@ mod tests {
                     content: "write a function".to_string(),
                     timestamp: Some(1700000000000),
                     token_estimate: 4,
+                    usage: None,
                 },
                 HistoricalMessage {
                     role: "assistant".to_string(),
                     content: "fn hello() {}".to_string(),
                     timestamp: Some(1700000001000),
                     token_estimate: 4,
+                    usage: None,
                 },
             ],
             started_at: Some(1700000000000),
@@ -427,6 +496,7 @@ mod tests {
                 content: "Write  A  Function".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 4,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -439,6 +509,7 @@ mod tests {
                 content: "write a function".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 4,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -467,6 +538,7 @@ mod tests {
                 content: "use key sk-abcdefghijklmnopqrstuvwxyz1234 for auth".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 10,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -490,12 +562,14 @@ mod tests {
                     content: "write a rust function".to_string(),
                     timestamp: Some(1700000000000),
                     token_estimate: 5,
+                    usage: None,
                 },
                 HistoricalMessage {
                     role: "assistant".to_string(),
                     content: "fn main() {\n    let mut x = 5;\n    impl Foo { pub struct Bar; }\n    use std::io;\n}".to_string(),
                     timestamp: Some(1700000001000),
                     token_estimate: 20,
+                    usage: None,
                 },
             ],
             started_at: Some(1700000000000),
@@ -521,6 +595,7 @@ mod tests {
                 content: "What is the weather today?".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 6,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -544,6 +619,7 @@ mod tests {
                         .to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 15,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),
@@ -565,6 +641,7 @@ mod tests {
                 content: "hello".to_string(),
                 timestamp: Some(1700000000000),
                 token_estimate: 2,
+                usage: None,
             }],
             started_at: Some(1700000000000),
             ended_at: Some(1700000000000),

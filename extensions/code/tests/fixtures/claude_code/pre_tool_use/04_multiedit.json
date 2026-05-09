@@ -1,0 +1,13 @@
+{
+  "session_id": "claude-session-04",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/Users/u/code/proj",
+  "tool_name": "MultiEdit",
+  "tool_input": {
+    "file_path": "/Users/u/code/proj/src/lib.rs",
+    "edits": [
+      { "old_string": "use foo;", "new_string": "use bar;" },
+      { "old_string": "fn old()", "new_string": "fn renamed()" }
+    ]
+  }
+}
