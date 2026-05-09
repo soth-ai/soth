@@ -1458,8 +1458,7 @@ mod tests {
         let win_path = PathBuf::from(r"C:\Users\Prabhat ACER\.local\bin\soth.exe");
         let quoted = quote_binary_path(&win_path);
         assert_eq!(
-            quoted,
-            "\"C:/Users/Prabhat ACER/.local/bin/soth.exe\"",
+            quoted, "\"C:/Users/Prabhat ACER/.local/bin/soth.exe\"",
             "Windows path must be forward-slash-normalized + double-quoted"
         );
 
