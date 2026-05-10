@@ -139,6 +139,7 @@ cmd_help() {
 	  sign-manifest          ed25519-sign manifest with SOTH_RELEASE_KEY_DIR/<key>.private.pem
 	  publish-manifest       Upload manifest.json + .sig to ENV's storage URL
 	  verify-manifest        Round-trip: re-fetch, re-verify against ops/keys/<key>.public.pem
+	  register-release       POST manifest metadata to ADMIN_API/api/v1/admin/cli/releases
 
 	Classify bundle (Phase 2):
 	  build-classify         tar -czf ${DIST_DIR}/classify-\$VERSION.tar.gz from \$DATA_DIR/classify/
@@ -542,6 +543,86 @@ cmd_publish_manifest() {
   esac
 }
 
+# Register the just-published release with soth-cloud's admin API
+# (Phase 3a). The hot-update resolver reads `cli_releases` on every
+# heartbeat; without this row, a channel pointing at this version will
+# never emit an offer.
+#
+# Idempotent: re-posting the same (version, platform) overwrites url +
+# sha256. Soft-fail (warn) — the manifest is the trust root, so a
+# registration failure means "fleet won't auto-discover this version
+# yet" not "this release is broken".
+#
+# Requires PLATFORM_ADMIN_TOKEN + ADMIN_API. Skipped for ENV=local.
+cmd_register_release() {
+  case "$ENV" in
+    local)
+      echo "==> ENV=local: skipping release registration."
+      return 0
+      ;;
+    staging | prod) ;;
+    *) err "ENV must be local|staging|prod (got '$ENV')" ;;
+  esac
+
+  if [ -z "$PLATFORM_ADMIN_TOKEN" ] || [ -z "$ADMIN_API" ]; then
+    echo "==> WARN: PLATFORM_ADMIN_TOKEN or ADMIN_API empty; skipping release registration."
+    echo "         The release is published but won't be served by the heartbeat resolver"
+    echo "         until you POST it to ${ADMIN_API:-<unset>}/api/v1/admin/cli/releases."
+    return 0
+  fi
+
+  require_cmd python3
+  require_cmd curl
+
+  local channel manifest
+  channel=$(resolve_channel)
+  manifest="${DIST_DIR}/manifest/${channel}.json"
+  [ -f "$manifest" ] || err "manifest missing: $manifest (run generate-manifest first)"
+
+  echo "==> register release ${ADMIN_API}/api/v1/admin/cli/releases"
+
+  # The admin API's request body is a strict subset of the manifest
+  # (no channel, schema_version, min_supported_version, released_at).
+  # python3 transforms the existing manifest into the registration
+  # payload to avoid drift between the two shapes.
+  local body
+  body=$(python3 - "$manifest" <<-'PYEOF'
+	import json, sys
+	with open(sys.argv[1]) as fh:
+	    m = json.load(fh)
+	out = {
+	    "version": m["version"],
+	    "release_seq": m["release_seq"],
+	    "platforms": m["platforms"],
+	}
+	if m.get("release_notes_url"):
+	    out["release_notes_url"] = m["release_notes_url"]
+	print(json.dumps(out, separators=(",", ":")))
+PYEOF
+  )
+
+  local http_code
+  http_code=$(curl -sS -o /tmp/soth-release-register-resp.json -w "%{http_code}" \
+    -X POST "${ADMIN_API}/api/v1/admin/cli/releases" \
+    -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data-raw "$body" 2>&1) || true
+
+  if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+    printf "  HTTP %s\n" "$http_code"
+    python3 - <<-'PYEOF'
+	import json
+	with open("/tmp/soth-release-register-resp.json") as fh:
+	    r = json.load(fh)
+	print(f"  registered version={r['version']} release_seq={r['release_seq']} platforms={len(r['platforms'])}")
+PYEOF
+  else
+    echo "  WARN: release registration returned HTTP ${http_code}; body:"
+    sed 's/^/    /' /tmp/soth-release-register-resp.json 2>/dev/null || true
+    echo "  Manifest is published; resolver won't serve this version until /admin/cli/releases is populated."
+  fi
+}
+
 # Round-trip verify: download the freshly-published manifest, verify the
 # sig with the committed public key, ensure version + sha entries match
 # what we just uploaded. Belt-and-braces — same idea as cmd_verify_against
@@ -781,6 +862,9 @@ cmd_release_cli() {
     cmd_sign_manifest
     cmd_publish_manifest
     cmd_verify_manifest
+    # Phase 3a: register the artifact metadata with soth-cloud's
+    # admin API so the heartbeat resolver can serve it. Soft-fail.
+    cmd_register_release
   fi
 }
 
@@ -1153,6 +1237,7 @@ case "$VERB" in
   sign-manifest)     cmd_sign_manifest ;;
   publish-manifest)  cmd_publish_manifest ;;
   verify-manifest)   cmd_verify_manifest ;;
+  register-release)  cmd_register_release ;;
   build-classify)    cmd_build_classify ;;
   publish-classify)  cmd_publish_classify ;;
   release-classify)  cmd_release_classify ;;
