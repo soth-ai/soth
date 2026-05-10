@@ -3707,6 +3707,10 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "sentry"
@@ -4079,6 +4083,7 @@ name = "soth-cli"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -4089,9 +4094,11 @@ dependencies = [
  "hex",
  "libc",
  "owo-colors",
+ "rand 0.8.5",
  "rcgen 0.13.2",
  "reqwest",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

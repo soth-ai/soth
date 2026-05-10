@@ -8,3 +8,4 @@ pub mod events;
 pub mod init;
 pub mod login;
 pub mod proxy;
+pub mod update;

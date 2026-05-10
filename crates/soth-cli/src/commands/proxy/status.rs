@@ -248,6 +248,7 @@ fn render_human(status: &StatusJson) {
     println!("Flagged:        {}", status.last_24h.flagged);
     println!("Est. cost:      ${:.2}", status.last_24h.cost_usd);
     println!();
+    render_update_line();
     if status.healthy {
         style::success("healthy");
     } else {
@@ -270,6 +271,41 @@ fn render_human(status: &StatusJson) {
             style::warning(&format!("degraded ({})", reasons.join(", ")));
         }
     }
+}
+
+/// Surface a one-line "update available" hint if the most recent
+/// `soth update --check` recorded a newer version. Reads
+/// `~/.soth/run/update_cache.json`; silent when the cache is missing
+/// or stale.
+fn render_update_line() {
+    let cached = match crate::update::UpdateCache::read() {
+        Ok(Some(c)) => c,
+        _ => return,
+    };
+    let latest = match cached.latest_version.as_deref() {
+        Some(v) => v,
+        None => return,
+    };
+    let is_newer = match (
+        semver::Version::parse(latest),
+        semver::Version::parse(&cached.current_version),
+    ) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => latest != cached.current_version,
+    };
+    if !is_newer {
+        return;
+    }
+    let channel = if cached.channel.is_empty() {
+        "stable".to_string()
+    } else {
+        cached.channel.clone()
+    };
+    println!(
+        "🔔 Update available: {} → {} (channel {}). Run `soth update --apply --channel {}`.",
+        cached.current_version, latest, channel, channel,
+    );
+    println!();
 }
 
 fn collect_proxy_status(
