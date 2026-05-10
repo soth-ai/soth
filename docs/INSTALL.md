@@ -4,6 +4,38 @@ This is the authoritative spec for **where the `soth` binary lives** on each
 supported platform. The Phase 1+ self-update code (`crates/soth-cli/src/update/swap_*.rs`)
 relies on these paths being stable. Treat changes here as breaking.
 
+## Quick start (BETA)
+
+```bash
+# macOS / Linux
+curl -fsSL https://soth.ai/install.sh | bash
+
+# Windows (PowerShell 7.5+)
+iwr -useb https://soth.ai/install.ps1 | iex
+```
+
+Channel + install-dir overrides:
+
+```bash
+# Bash
+SOTH_CHANNEL=canary curl -fsSL https://soth.ai/install.sh | bash
+curl -fsSL https://soth.ai/install.sh | bash -s -- --install-dir /opt/soth/bin
+
+# PowerShell
+$env:SOTH_CHANNEL = 'canary'; iwr -useb https://soth.ai/install.ps1 | iex
+```
+
+Both scripts:
+1. Fetch `<base>/manifest/<channel>.json{,.sig}` over HTTPS,
+2. Verify the ed25519 signature against a public key embedded in the script,
+3. Download the platform binary (and the soth-update.exe sidecar on Windows),
+4. Verify each artifact's sha256 against the manifest before installing,
+5. Atomically swap into place, preserving the previous binary at `<install>.previous`.
+
+Sources: `scripts/install.sh`, `scripts/install.ps1`. Marked BETA until both
+have run through CI on a real release; safe to use today against the
+production storage URL.
+
 ## Why this exists
 
 `soth update --apply` performs an atomic in-place binary swap. The swap
