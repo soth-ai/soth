@@ -354,6 +354,12 @@ pub struct HeartbeatRequest {
     pub registry: Option<HeartbeatRegistryDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<HeartbeatTelemetry>,
+    /// Phase 4 client-side counter of consecutive failed `--apply` attempts.
+    /// Reset to 0 on a successful apply. Server upserts this into
+    /// `agent_instances.consecutive_update_failures`; the heartbeat
+    /// resolver uses it to back off after the 3-strike cutoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_update_failures: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
