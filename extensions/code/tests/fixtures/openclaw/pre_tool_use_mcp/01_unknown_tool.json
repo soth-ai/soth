@@ -1,0 +1,14 @@
+{
+  "session_id": "openclaw-mcp",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/mcp.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-4o",
+  "turn_id": "turn-mcp-1",
+  "tool_name": "mcp__weather__forecast",
+  "tool_use_id": "tool-mcp-1",
+  "tool_input": {
+    "city": "San Francisco",
+    "days": 3
+  }
+}

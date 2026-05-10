@@ -10,10 +10,21 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-const LISTENER_STARTUP_TIMEOUT_SECS: u64 = 20;
+// Default budget for the supervisor to wait for the worker proxy to bind
+// 127.0.0.1:<port>. The bind happens late in `proxy.start()` — after
+// `verify_bundle_source_ready()` synchronously fetches AND installs the
+// cloud bundle, which on cold-install Windows boxes with Defender
+// real-time scanning can take 15-20s on its own. 60s gives that path
+// headroom without making real failures (port in use, panic at startup)
+// linger forever. Operators can override via
+// `SOTH_PROXY_LISTENER_STARTUP_TIMEOUT_SECS` if their environment is even
+// slower (corporate AV, encrypted volumes, etc.).
+const LISTENER_STARTUP_TIMEOUT_SECS: u64 = 60;
+const MIN_LISTENER_STARTUP_TIMEOUT_SECS: u64 = 5;
+const MAX_LISTENER_STARTUP_TIMEOUT_SECS: u64 = 300;
 const LISTENER_HEALTH_CHECK_INTERVAL_MS: u64 = 1_000;
 /// How long the listener can be unresponsive before the supervisor kills and
 /// restarts the proxy.  Kept short (5s) so laptop sleep/wake recovery is fast.
@@ -55,6 +66,27 @@ pub async fn run(
     // supervisor's job; this process only runs the proxy loop.
     if std::env::var(PROXY_WORKER_ENV).is_ok() {
         return run_proxy_worker().await;
+    }
+
+    // Historian-worker mode: re-execed by the supervisor to run the
+    // HistorianExtension lifecycle (backfill → watch) as an isolated
+    // sibling process. Same multi-call binary pattern as the proxy
+    // worker — keeps the install surface single-binary while letting
+    // OS-level scheduling guarantee the proxy worker can't be CPU-
+    // starved by historian's classify bursts.
+    if std::env::var(HISTORIAN_WORKER_ENV).is_ok() {
+        return run_historian_worker().await;
+    }
+
+    // Classify-daemon worker mode: re-execed by the supervisor to
+    // run the long-running ONNX classify server.  Same multi-call
+    // binary pattern as historian — keeps the install surface
+    // single-binary while letting hook subprocesses dispatch
+    // classify in 5–15 ms (warm) instead of 50–150 ms (cold per
+    // call) by sharing one in-memory bundle for the daemon's
+    // lifetime.
+    if std::env::var(CLASSIFY_DAEMON_WORKER_ENV).is_ok() {
+        return run_classify_daemon_worker().await;
     }
 
     // Windows autostart self-detach: when `soth start --daemon-child` is
@@ -138,6 +170,46 @@ pub async fn run(
         .await
         .context("spawn soth-proxy process")?;
     wait_for_listener_start(&mut child, expected_port).await?;
+
+    // Historian sibling process. Spawned only when both `enabled` and
+    // run_mode == Subprocess. Watched in its own background task so its
+    // lifecycle (crash → backoff → respawn) is independent of the
+    // proxy worker — a wedged historian must never affect mitm flows.
+    let _historian_supervisor: Option<tokio::task::JoinHandle<()>> =
+        if config.extensions.historian.enabled
+            && matches!(
+                config.extensions.historian.run_mode,
+                cli_config::HistorianRunMode::Subprocess
+            )
+        {
+            let historian_config_path = generated_path.clone();
+            Some(tokio::spawn(async move {
+                supervise_historian(historian_config_path).await;
+            }))
+        } else {
+            None
+        };
+
+    // Classify daemon sibling process.  Same supervision pattern as
+    // historian: spawn-and-respawn-with-backoff in its own task so a
+    // wedged classify daemon never blocks the mitm runtime.  A
+    // crashed daemon also doesn't crash the gate — hook subprocesses
+    // fall back to an in-process keyword bundle when the port file
+    // is stale or connect refuses.
+    let _classify_supervisor: Option<tokio::task::JoinHandle<()>> =
+        if config.extensions.code.enabled
+            && matches!(
+                config.extensions.code.classify.run_mode,
+                cli_config::ClassifyRunMode::Subprocess
+            )
+        {
+            let classify_config_path = generated_path.clone();
+            Some(tokio::spawn(async move {
+                supervise_classify_daemon(classify_config_path).await;
+            }))
+        } else {
+            None
+        };
 
     // Engage the OS-level system proxy so traffic actually flows through us.
     // Reached by both foreground (`soth up --foreground`) and daemon-child
@@ -246,6 +318,264 @@ fn ensure_ca_runtime_health(paths: &super::ca_health::ResolvedCaPaths, quiet: bo
     Ok(())
 }
 
+/// Lightweight supervisor for the historian sibling process. Spawns,
+/// waits for exit, applies exponential backoff, and respawns. Runs as a
+/// detached tokio task so historian's lifecycle is fully decoupled from
+/// the proxy worker's — a crashed historian must never affect mitm flows
+/// (and a crashed proxy already has its own supervisor that won't re-enter
+/// this function).
+///
+/// On graceful exit (status 0) the historian is treated as "done" — no
+/// respawn — because the discovery-empty path returns 0 and there's no
+/// useful work to retry. On crash, exponential backoff caps at 60s.
+///
+/// The supervisor task is dropped when `run()` exits (process shutdown),
+/// which drops the JoinHandle and aborts the await. We rely on the proxy
+/// shutdown chain to deliver SIGTERM via the OS process tree on macOS,
+/// or via [`terminate_child`] explicitly on Windows; the historian
+/// child's signal handler in [`run_historian_worker`] turns that into a
+/// clean shutdown.
+async fn supervise_historian(config_path: PathBuf) {
+    let mut consecutive_failures: u32 = 0;
+    const MAX_BACKOFF_MS: u64 = 60_000;
+    const BASE_BACKOFF_MS: u64 = 500;
+
+    loop {
+        let mut child = match spawn_historian_process(config_path.as_path()).await {
+            Ok(child) => child,
+            Err(error) => {
+                warn!(
+                    %error,
+                    consecutive_failures,
+                    "failed to spawn historian sibling process"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff = (BASE_BACKOFF_MS
+                    .saturating_mul(2u64.saturating_pow(consecutive_failures.min(8))))
+                .min(MAX_BACKOFF_MS);
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                continue;
+            }
+        };
+
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                info!("historian sibling exited cleanly (status 0) — not respawning");
+                return;
+            }
+            Ok(status) => {
+                warn!(
+                    code = ?status.code(),
+                    "historian sibling exited with non-zero status — will respawn"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+            Err(error) => {
+                warn!(%error, "historian sibling wait() errored — will respawn");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+        }
+
+        let backoff = (BASE_BACKOFF_MS
+            .saturating_mul(2u64.saturating_pow(consecutive_failures.min(8))))
+        .min(MAX_BACKOFF_MS);
+        info!(
+            backoff_ms = backoff,
+            consecutive_failures, "respawning historian sibling after backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
+    }
+}
+
+/// Spawn the historian sibling process. Same multi-call binary pattern as
+/// [`spawn_proxy_process`]: re-execs the current binary with
+/// `start --historian-child` and `SOTH_HISTORIAN_WORKER=1`, which the top
+/// of [`run`] dispatches to [`run_historian_worker`].
+///
+/// Inherits stdout/stderr from the supervisor so historian logs land in
+/// the same stream as the proxy worker (foreground terminal or
+/// `~/.soth/logs/edge-autostart.log` when daemonized via launchd).
+async fn spawn_historian_process(config_path: &Path) -> Result<Child> {
+    let current_exe =
+        std::env::current_exe().context("resolve current executable for historian worker")?;
+    let mut cmd = Command::new(current_exe);
+    cmd.arg("start").arg("--historian-child");
+    cmd.env(HISTORIAN_WORKER_ENV, "1");
+    cmd.env("SOTH_PROXY_CONFIG", config_path);
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    // Lower OS-level priority. The whole point of subprocess mode is that
+    // historian's classify CPU bursts must never starve the mitm runtime
+    // — a `nice +5` here makes the OS scheduler always prefer the proxy
+    // when both want CPU. PRIO_PROCESS+0 means the calling process; this
+    // runs in `pre_exec` so it applies to the child after fork() but
+    // before exec(), without affecting the supervisor's own priority.
+    #[cfg(unix)]
+    {
+        // tokio::process::Command's `pre_exec` is the inherent extension —
+        // no `use std::os::unix::process::CommandExt` needed. Hook in to
+        // call setpriority(2) between fork() and exec() so the new image
+        // inherits the lower priority without ever sharing scheduling
+        // class with the supervisor.
+        unsafe {
+            cmd.pre_exec(|| {
+                // 5 is conservative — visible deprioritization without making
+                // historian crawl. POSIX nice values 0..19; 5 keeps it under
+                // the proxy worker (which inherits the supervisor's nice 0)
+                // while not starving it.
+                let rc = libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+                if rc != 0 {
+                    // Best-effort. Don't fail the spawn if the kernel rejects
+                    // it (rare; happens under restrictive RLIMIT_NICE on
+                    // some hosts).
+                    let err = std::io::Error::last_os_error();
+                    eprintln!("warning: setpriority(+5) failed for historian child: {err}");
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Windows analog of nice +5: BELOW_NORMAL_PRIORITY_CLASS lowers
+        // the child's base priority by one tier so the proxy worker
+        // (NORMAL) wins CPU contention. CREATE_NO_WINDOW + the new
+        // process group mirror the proxy spawn's flags.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        cmd.creation_flags(
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS,
+        );
+    }
+
+    // Kill historian when its Child handle is dropped (e.g. when the
+    // supervise_historian task is aborted on shutdown). Without this the
+    // historian process would be orphaned to launchd / init when `soth
+    // stop` is invoked, leaving a zombie sibling running with stale
+    // config until the user noticed.
+    cmd.kill_on_drop(true);
+
+    cmd.spawn()
+        .map_err(|error| anyhow::anyhow!("failed launching historian worker: {error}"))
+}
+
+/// Supervise the classify-daemon sibling process. Same crash-and-respawn
+/// shape as [`supervise_historian`]: exponential backoff (500 ms base,
+/// 60 s cap) on failure, exit cleanly when the child exits 0.
+///
+/// A crashed daemon must not crash the hook gate — the hook handler
+/// already falls back to an in-process keyword bundle when
+/// `try_classify` returns None — so this loop's only job is to keep
+/// the long-running daemon alive without burning the supervisor's CPU
+/// in a tight respawn loop.
+async fn supervise_classify_daemon(config_path: PathBuf) {
+    let mut consecutive_failures: u32 = 0;
+    const MAX_BACKOFF_MS: u64 = 60_000;
+    const BASE_BACKOFF_MS: u64 = 500;
+
+    loop {
+        let mut child = match spawn_classify_daemon_process(config_path.as_path()).await {
+            Ok(child) => child,
+            Err(error) => {
+                warn!(
+                    %error,
+                    consecutive_failures,
+                    "failed to spawn classify daemon sibling process"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff = (BASE_BACKOFF_MS
+                    .saturating_mul(2u64.saturating_pow(consecutive_failures.min(8))))
+                .min(MAX_BACKOFF_MS);
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                continue;
+            }
+        };
+
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                info!("classify daemon sibling exited cleanly (status 0) — not respawning");
+                return;
+            }
+            Ok(status) => {
+                warn!(
+                    code = ?status.code(),
+                    "classify daemon sibling exited with non-zero status — will respawn"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+            Err(error) => {
+                warn!(%error, "classify daemon sibling wait() errored — will respawn");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+        }
+
+        let backoff = (BASE_BACKOFF_MS
+            .saturating_mul(2u64.saturating_pow(consecutive_failures.min(8))))
+        .min(MAX_BACKOFF_MS);
+        info!(
+            backoff_ms = backoff,
+            consecutive_failures, "respawning classify daemon sibling after backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
+    }
+}
+
+/// Spawn the classify-daemon sibling process. Re-execs the current
+/// binary with `start --classify-daemon-child` and the worker env
+/// var, which the top of [`run`] dispatches to
+/// [`run_classify_daemon_worker`]. Lower scheduler priority via the
+/// same `nice +5` / BELOW_NORMAL_PRIORITY_CLASS knobs historian
+/// uses, for the same reason: classify CPU bursts must never starve
+/// the mitm runtime.
+async fn spawn_classify_daemon_process(config_path: &Path) -> Result<Child> {
+    let current_exe =
+        std::env::current_exe().context("resolve current executable for classify daemon worker")?;
+    let mut cmd = Command::new(current_exe);
+    cmd.arg("start").arg("--classify-daemon-child");
+    cmd.env(CLASSIFY_DAEMON_WORKER_ENV, "1");
+    cmd.env("SOTH_PROXY_CONFIG", config_path);
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    #[cfg(unix)]
+    {
+        unsafe {
+            cmd.pre_exec(|| {
+                let rc = libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    eprintln!("warning: setpriority(+5) failed for classify daemon child: {err}");
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        cmd.creation_flags(
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS,
+        );
+    }
+
+    cmd.kill_on_drop(true);
+
+    cmd.spawn()
+        .map_err(|error| anyhow::anyhow!("failed launching classify daemon worker: {error}"))
+}
+
 async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Result<Child> {
     let current_exe =
         std::env::current_exe().context("resolve current executable for proxy worker")?;
@@ -283,6 +613,16 @@ async fn spawn_proxy_process(config_path: &Path, listener_fd: Option<i32>) -> Re
 /// Env var toggle that re-executed child processes use to enter in-process
 /// MITM runtime mode. Set by [`spawn_proxy_process`].
 pub(crate) const PROXY_WORKER_ENV: &str = "SOTH_PROXY_WORKER";
+
+/// Env var toggle for the historian sibling process. Set by
+/// [`spawn_historian_process`]; consumed at the top of [`run`] to dispatch
+/// into [`run_historian_worker`].
+pub(crate) const HISTORIAN_WORKER_ENV: &str = "SOTH_HISTORIAN_WORKER";
+
+/// Env var toggle for the classify-daemon sibling process. Set by
+/// [`spawn_classify_daemon_process`]; consumed at the top of [`run`] to
+/// dispatch into [`run_classify_daemon_worker`].
+pub(crate) const CLASSIFY_DAEMON_WORKER_ENV: &str = "SOTH_CODE_CLASSIFY_WORKER";
 
 /// Windows-only marker env var. Set by spawners that have already applied
 /// `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` flags so
@@ -366,10 +706,16 @@ async fn supervise_proxy(
     let mut last_iteration = Instant::now();
     // First restart after a detected wake gets a longer startup grace
     // window — see WAKE_LISTENER_STARTUP_TIMEOUT_SECS for the rationale.
-    let mut next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
+    let mut next_startup_timeout = listener_startup_timeout();
+    // Watches for primary-network changes (wifi switch, captive-portal
+    // address reassignment) and triggers a graceful child rotation so the
+    // upstream connection pool isn't left bound to the old gateway.
+    let mut network_change_rx = super::network_watcher::spawn();
 
     loop {
-        let exit_reason = wait_until_exit_or_unhealthy(child, expected_port, foreground).await;
+        let exit_reason =
+            wait_until_exit_or_unhealthy(child, expected_port, foreground, &mut network_change_rx)
+                .await;
 
         // Detect wake-from-sleep before applying restart-budget logic. A long
         // wall-clock gap between supervisor iterations almost always means
@@ -406,7 +752,7 @@ async fn supervise_proxy(
                 warn!("soth-proxy exited with status {status}");
             }
             ProxyExit::Reload => {
-                info!("SIGHUP received — performing graceful child rotation");
+                info!("reload requested (SIGHUP or network change) — performing graceful child rotation");
                 let mut new_child = spawn_proxy_process(config_path, listener_fd)
                     .await
                     .context("spawn new soth-proxy for graceful rotation")?;
@@ -420,6 +766,31 @@ async fn supervise_proxy(
                 *child = new_child;
                 last_healthy = Instant::now();
                 consecutive_failures = 0;
+
+                // Network-change rotation often leaves stale entries in
+                // mDNSResponder's cache pointing at the previous gateway.
+                // The new proxy worker has a fresh hickory cache, but
+                // *applications* (browsers, the user's shell) still
+                // resolve through mDNSResponder. Flush its user-level
+                // cache best-effort so the next request actually re-
+                // resolves. The system-level part (`killall -HUP
+                // mDNSResponder`) needs sudo and is left to `soth doctor
+                // --reset-network` for the explicit case.
+                #[cfg(target_os = "macos")]
+                {
+                    if let Err(error) = std::process::Command::new("dscacheutil")
+                        .arg("-flushcache")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                    {
+                        warn!(%error, "dscacheutil -flushcache failed after rotation (non-fatal)");
+                    } else {
+                        debug!("dscacheutil -flushcache after network-change rotation");
+                    }
+                }
+
                 info!("graceful child rotation complete");
                 continue;
             }
@@ -477,7 +848,7 @@ async fn supervise_proxy(
         last_healthy = Instant::now();
         // After a successful restart, drop back to the normal startup
         // budget — the wake-up grace window is one-shot.
-        next_startup_timeout = Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS);
+        next_startup_timeout = listener_startup_timeout();
     }
 }
 
@@ -492,6 +863,7 @@ async fn wait_until_exit_or_unhealthy(
     child: &mut Child,
     expected_port: u16,
     foreground: bool,
+    network_change_rx: &mut tokio::sync::watch::Receiver<u64>,
 ) -> ProxyExit {
     let health_monitor = monitor_listener_health(expected_port);
     tokio::pin!(health_monitor);
@@ -505,6 +877,7 @@ async fn wait_until_exit_or_unhealthy(
             }
             _ = tokio::signal::ctrl_c() => ProxyExit::Signal,
             _ = &mut health_monitor => ProxyExit::Unhealthy,
+            _ = network_change_rx.changed() => ProxyExit::Reload,
         }
     } else {
         #[cfg(unix)]
@@ -523,6 +896,7 @@ async fn wait_until_exit_or_unhealthy(
                 _ = interrupt.recv() => ProxyExit::Signal,
                 _ = hangup.recv() => ProxyExit::Reload,
                 _ = &mut health_monitor => ProxyExit::Unhealthy,
+                _ = network_change_rx.changed() => ProxyExit::Reload,
             }
         }
         #[cfg(not(unix))]
@@ -534,6 +908,7 @@ async fn wait_until_exit_or_unhealthy(
                     }))
                 }
                 _ = &mut health_monitor => ProxyExit::Unhealthy,
+                _ = network_change_rx.changed() => ProxyExit::Reload,
             }
         }
     }
@@ -575,12 +950,7 @@ async fn graceful_stop_child(child: &mut Child) -> Result<()> {
 }
 
 async fn wait_for_listener_start(child: &mut Child, port: u16) -> Result<()> {
-    wait_for_listener_start_with_timeout(
-        child,
-        port,
-        Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECS),
-    )
-    .await
+    wait_for_listener_start_with_timeout(child, port, listener_startup_timeout()).await
 }
 
 async fn wait_for_listener_start_with_timeout(
@@ -749,7 +1119,7 @@ fn write_proxy_config(config: &SothConfig, port_override: Option<u16>) -> Result
             .tags
             .get("device_id")
             .cloned()
-            .unwrap_or_else(|| "local-device".to_string()),
+            .unwrap_or_else(|| sync_agent_instance_id.clone()),
         mitm: GeneratedMitmConfig {
             bind: format!(
                 "{}:{}",
@@ -859,6 +1229,18 @@ fn resolve_sync_agent_instance_id(config: &SothConfig, soth_home: &Path) -> Resu
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("failed creating {}", runtime_dir.display()))?;
     let id_path = runtime_dir.join(AGENT_INSTANCE_ID_FILE);
+
+    // Prefer the yaml's `device_id` (written at enrollment) so heartbeat and
+    // telemetry agree on a single identifier — without this they diverge:
+    // heartbeat writes a fresh "edge-<uuid>" to postgres while telemetry
+    // sends "device-<uuid>" from the yaml, and the cloud's hostname-resolution
+    // join can never line them up.
+    if let Some(value) = config.cloud.tags.get("device_id") {
+        if let Some(normalized) = normalize_agent_instance_id(value) {
+            let _ = std::fs::write(&id_path, format!("{normalized}\n"));
+            return Ok(normalized);
+        }
+    }
 
     if let Ok(raw) = std::fs::read_to_string(&id_path) {
         if let Some(normalized) = normalize_agent_instance_id(raw.as_str()) {
@@ -971,6 +1353,22 @@ fn bind_supervisor_listener(address: &str, port: u16) -> Result<std::net::TcpLis
 
 fn parse_env_u64(key: &str) -> Option<u64> {
     env::var(key).ok()?.trim().parse::<u64>().ok()
+}
+
+/// Resolve the listener-bind startup deadline. Defaults to
+/// `LISTENER_STARTUP_TIMEOUT_SECS`; operators can override via
+/// `SOTH_PROXY_LISTENER_STARTUP_TIMEOUT_SECS`. Clamped to
+/// `[MIN_LISTENER_STARTUP_TIMEOUT_SECS, MAX_LISTENER_STARTUP_TIMEOUT_SECS]`
+/// so a misconfiguration can't make the supervisor wait forever or give
+/// up before the worker has a chance to bind.
+fn listener_startup_timeout() -> Duration {
+    let secs = parse_env_u64("SOTH_PROXY_LISTENER_STARTUP_TIMEOUT_SECS")
+        .unwrap_or(LISTENER_STARTUP_TIMEOUT_SECS)
+        .clamp(
+            MIN_LISTENER_STARTUP_TIMEOUT_SECS,
+            MAX_LISTENER_STARTUP_TIMEOUT_SECS,
+        );
+    Duration::from_secs(secs)
 }
 
 #[cfg(unix)]
@@ -1164,15 +1562,43 @@ struct GeneratedTelemetryConfig {
 }
 
 /// In-process MITM runtime, invoked by re-execed supervisor children (see
-/// [`spawn_proxy_process`]). Registers the historian extension and delegates
-/// to `soth_proxy::runtime::run`.
+/// [`spawn_proxy_process`]). Registers the historian extension only when
+/// `extensions.historian.run_mode == InProcess` (and `enabled == true`);
+/// in the default Subprocess mode, the supervisor spawns historian as a
+/// sibling process via [`spawn_historian_process`] and this worker runs
+/// pure mitm.
 async fn run_proxy_worker() -> Result<()> {
     use std::sync::Arc;
 
     soth_proxy::runtime::init_rustls_provider();
 
+    let config_path = std::env::var_os("SOTH_CONFIG_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(cli_config::default_config_path);
+    let extensions_config = cli_config::load_effective_config(Some(&config_path), None)
+        .map(|cfg| cfg.extensions)
+        .unwrap_or_default();
+
     let mut registry = soth_extensions::ExtensionRegistry::empty();
-    registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
+    let historian = &extensions_config.historian;
+    match (historian.enabled, historian.run_mode) {
+        (false, _) => {
+            tracing::info!(
+                "extensions.historian.enabled = false; skipping HistorianExtension registration"
+            );
+        }
+        (true, cli_config::HistorianRunMode::Subprocess) => {
+            // Supervisor handles historian as a sibling process; the proxy
+            // worker stays pure mitm so its tokio runtime is never blocked
+            // by classify CPU bursts.
+            tracing::info!(
+                "extensions.historian.run_mode = subprocess; historian runs as sibling process"
+            );
+        }
+        (true, cli_config::HistorianRunMode::InProcess) => {
+            registry.register(Arc::new(soth_historian::HistorianExtension::with_defaults()));
+        }
+    }
 
     let tracing_targets = registry.tracing_targets();
     // Hold the observability guard until proxy.run() returns so that the
@@ -1182,6 +1608,133 @@ async fn run_proxy_worker() -> Result<()> {
     let _observability_guard = soth_proxy::runtime::init_tracing(&tracing_targets);
 
     soth_proxy::runtime::run(registry).await
+}
+
+/// Historian sibling process entry point. Re-execed by the supervisor
+/// (see [`spawn_historian_process`]) when
+/// `extensions.historian.run_mode == Subprocess`. Runs the same lifecycle
+/// the in-process variant does — discovery → backfill → watch — but in
+/// its own OS process at lower scheduling priority.
+///
+/// Exits when:
+/// - SIGTERM/SIGINT is received (returns cleanly so the supervisor can
+///   reap without restart-loop noise on intentional shutdown).
+/// - Discovery finds no AI tools (logs and exits 0; the supervisor can
+///   choose not to respawn).
+/// - The watch loop exits unexpectedly (returns Err so the supervisor
+///   restarts with backoff).
+async fn run_historian_worker() -> Result<()> {
+    use soth_extensions::ExtensionRuntimeContext;
+
+    let _observability_guard = soth_proxy::runtime::init_tracing(&[
+        "soth_historian=info",
+        "soth_extensions=info",
+        "soth_classify=info",
+        "soth_telemetry=info",
+        "warn",
+    ]);
+
+    let ctx = ExtensionRuntimeContext::from_defaults();
+    let extension = soth_historian::HistorianExtension::with_defaults();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        // Watch for SIGTERM/SIGINT so the supervisor's `terminate_child`
+        // (used on `soth stop`, network change, etc.) drains historian
+        // cleanly instead of forcing a SIGKILL.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(sig) => sig,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to install SIGTERM handler in historian worker");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("historian worker received SIGTERM"),
+                _ = tokio::signal::ctrl_c() => tracing::info!("historian worker received SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("historian worker received Ctrl+C");
+        }
+        let _ = shutdown_tx_signal.send(true);
+    });
+
+    tracing::info!("historian worker starting (subprocess mode)");
+    extension.run_backfill(&ctx).await;
+    if *shutdown_rx.borrow() {
+        tracing::info!("historian worker shutting down before watch (signal during backfill)");
+        return Ok(());
+    }
+
+    extension.run_watch(&ctx, shutdown_rx).await;
+    tracing::info!("historian worker exiting");
+    drop(shutdown_tx);
+    Ok(())
+}
+
+/// Classify-daemon worker entry. Re-execed by the supervisor when
+/// `extensions.code.classify.run_mode == Subprocess`. Loads
+/// `~/.soth/bundle/` once, binds an ephemeral localhost TCP port,
+/// writes `~/.soth/classify-daemon.json` so hook subprocesses can
+/// find it, and serves NDJSON-framed classify requests.
+///
+/// `serve()` is blocking std::net (not tokio), so we run it in
+/// `spawn_blocking` to keep the runtime responsive to shutdown
+/// signals. Exits when:
+///
+/// - SIGTERM/SIGINT received (returns Ok so the supervisor reaps
+///   without restart-loop noise on intentional shutdown)
+/// - The bundle path is missing (returns Err — the supervisor's
+///   backoff handles the case where the user hasn't run
+///   `soth setup-ca` / bundle install yet)
+async fn run_classify_daemon_worker() -> Result<()> {
+    let _observability_guard =
+        soth_proxy::runtime::init_tracing(&["soth_code=info", "soth_classify=info", "warn"]);
+
+    let bundle_dir = dirs::home_dir()
+        .map(|h| h.join(".soth").join("bundle"))
+        .context("resolve ~/.soth/bundle for classify daemon")?;
+    if !bundle_dir.exists() {
+        anyhow::bail!(
+            "classify daemon: bundle directory missing at {} — run `soth setup-ca` / install the policy bundle, or set extensions.code.classify.run_mode = disabled",
+            bundle_dir.display()
+        );
+    }
+
+    let bundle_for_thread = bundle_dir.clone();
+    let serve_handle =
+        std::thread::spawn(move || soth_code::classify_daemon::serve(&bundle_for_thread, 0));
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .context("install SIGTERM handler in classify daemon worker")?;
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("classify daemon worker received SIGTERM"),
+            _ = tokio::signal::ctrl_c() => tracing::info!("classify daemon worker received SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("classify daemon worker received Ctrl+C");
+    }
+
+    // The serve loop has no graceful-shutdown channel today (it's
+    // an `accept()` loop on TcpListener) — letting the process
+    // exit drops the listener and joins the thread implicitly via
+    // OS teardown. The worker re-binds on respawn so this is
+    // recoverable.
+    drop(serve_handle);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1566,12 +2119,14 @@ mod tests {
                 Some("device_primary")
             );
 
+            // agent_instance_id now mirrors the yaml's device_id so heartbeat
+            // and telemetry write the same identifier.
             let agent_instance_id = value
                 .get("sync")
                 .and_then(|v| v.get("agent_instance_id"))
                 .and_then(toml::Value::as_str)
                 .expect("agent_instance_id should be set");
-            assert!(agent_instance_id.starts_with("edge-"));
+            assert_eq!(agent_instance_id, "device_primary");
 
             let persisted = std::fs::read_to_string(
                 home.join(".soth").join("runtime").join("agent_instance_id"),

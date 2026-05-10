@@ -1,0 +1,39 @@
+{
+  "name": "mistral_multiturn",
+  "description": "Mistral chat with a 3-turn conversation history.",
+  "axes": {
+    "provider": "mistral",
+    "streaming": false,
+    "tools": false,
+    "content_class": "clean",
+    "format": "rest_chat_completions",
+    "capture_mode": "metadata_only"
+  },
+  "typed_call": {
+    "provider": "mistral",
+    "model": "mistral-large-latest",
+    "messages": [
+      { "role": "user", "content": "Hi! Quick question about Rust." },
+      { "role": "assistant", "content": "Sure, ask away." },
+      { "role": "user", "content": "When does the borrow checker complain about a returned reference?" }
+    ],
+    "stream": false
+  },
+  "raw_request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "host": "api.mistral.ai",
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "mistral-large-latest",
+      "messages": [
+        { "role": "user", "content": "Hi! Quick question about Rust." },
+        { "role": "assistant", "content": "Sure, ask away." },
+        { "role": "user", "content": "When does the borrow checker complain about a returned reference?" }
+      ]
+    },
+    "matched_provider": "mistral"
+  }
+}

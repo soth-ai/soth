@@ -1,0 +1,9 @@
+{
+  "session_id": "claude-session-08",
+  "tool_name": "mcp__weather__forecast",
+  "tool_input": { "city": "SF" },
+  "tool_response": [
+    { "day": 1, "temp": 60 },
+    { "day": 2, "temp": 65 }
+  ]
+}

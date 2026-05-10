@@ -90,6 +90,37 @@ pub fn build_cloud_client(endpoint: &str) -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Client tuned for large downloads (bundle/registry payloads).
+///
+/// The default `build_cloud_client` enforces a 20-second total request
+/// deadline that covers connect + headers + body. That budget is fine for
+/// short JSON calls (heartbeat, classify) but kills bundle fetches over
+/// genuinely slow networks — a 5 MB bundle on a 50 KB/s link needs ~100s,
+/// well past 20s, and a multi-MB payload behind a buffering corporate
+/// proxy or AV TLS-inspector can take minutes. Symptom: `request or
+/// response body error: operation timed out` after headers were already
+/// read successfully.
+///
+/// This client drops the total `.timeout()` and instead uses
+/// `.read_timeout(30s)` — a per-read inactivity deadline. As long as
+/// bytes keep arriving (even at 1 KB/s), the download proceeds. If the
+/// peer goes silent for 30 consecutive seconds, the request fails — same
+/// guarantee against true hangs as the original `.timeout()` provided,
+/// just no upper bound on healthy slow downloads.
+pub fn build_bundle_client(endpoint: &str) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .pool_max_idle_per_host(2)
+        .pool_idle_timeout(Duration::from_secs(30));
+    if should_bypass_proxy(endpoint) || has_loopback_proxy_env() {
+        builder = builder.no_proxy();
+    }
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[derive(Clone)]
 pub struct SothHttpClient {
     client: reqwest::Client,
@@ -102,6 +133,19 @@ impl SothHttpClient {
         let endpoint = endpoint.into().trim_end_matches('/').to_string();
         Self {
             client: build_cloud_client(endpoint.as_str()),
+            endpoint,
+            api_key: api_key.into(),
+        }
+    }
+
+    /// Construct a client suitable for large downloads (e.g. bundle/registry
+    /// payloads). Uses `build_bundle_client` — no total request deadline,
+    /// only per-read inactivity timeout — so slow links don't kill healthy
+    /// downloads mid-body. See `build_bundle_client` for the rationale.
+    pub fn for_bundles(endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let endpoint = endpoint.into().trim_end_matches('/').to_string();
+        Self {
+            client: build_bundle_client(endpoint.as_str()),
             endpoint,
             api_key: api_key.into(),
         }

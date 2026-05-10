@@ -1,0 +1,14 @@
+{
+  "session_id": "codex-large-resp",
+  "transcript_path": "/home/user/.codex/transcripts/dev.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PostToolUse",
+  "model": "o4-mini",
+  "turn_id": "turn-large-1",
+  "tool_name": "Bash",
+  "tool_use_id": "tool-large-1",
+  "tool_input": {
+    "command": "ls -laR /home/user/project | head -200"
+  },
+  "tool_response": "total 432\ndrwxr-xr-x 32 user user  1024 May  8 22:00 .\ndrwxr-xr-x  4 user user   128 Apr 30 10:12 ..\n-rw-r--r--  1 user user   348 May  8 21:55 .gitignore\ndrwxr-xr-x  6 user user   192 May  8 21:55 .github\ndrwxr-xr-x 24 user user   768 May  8 22:00 .git\n-rw-r--r--  1 user user 41023 May  8 21:58 Cargo.lock\n-rw-r--r--  1 user user  3812 May  8 21:55 Cargo.toml\n-rw-r--r--  1 user user  1071 May  8 21:55 LICENSE\n-rw-r--r--  1 user user  4930 May  8 21:55 README.md\ndrwxr-xr-x  4 user user   128 May  8 21:55 benches\ndrwxr-xr-x  4 user user   128 May  8 21:55 cmd\ndrwxr-xr-x 12 user user   384 May  8 22:00 crates\ndrwxr-xr-x  6 user user   192 May  8 21:55 docs\ndrwxr-xr-x  4 user user   128 May  8 21:55 extensions"
+}

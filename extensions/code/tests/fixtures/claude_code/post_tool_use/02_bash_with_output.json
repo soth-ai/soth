@@ -1,0 +1,10 @@
+{
+  "session_id": "claude-session-05",
+  "tool_name": "Bash",
+  "tool_input": { "command": "ls -la /tmp", "description": "list /tmp" },
+  "tool_response": {
+    "stdout": "total 0\ndrwxrwxrwt ...\n",
+    "stderr": "",
+    "exit_code": 0
+  }
+}

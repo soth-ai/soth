@@ -1,0 +1,12 @@
+{
+  "session_id": "claude-subagent-09",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/Users/u/code/proj",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/Users/u/code/proj/CHANGELOG.md"
+  },
+  "agent_id": "ag-uuid-9000",
+  "agent_type": "general-purpose",
+  "parent_session_id": "claude-session-09-parent"
+}

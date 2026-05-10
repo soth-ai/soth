@@ -1,10 +1,15 @@
-use soth_core::{AnomalyFlag, PolicyDecision, TelemetryEvent, UseCaseLabel, VolatilityClass};
+use soth_core::{
+    AnomalyFlag, PolicyDecision, TelemetryEvent, UseCaseLabel, UseCaseLabelReason, VolatilityClass,
+};
 
 #[derive(Debug, Clone)]
 pub struct ClassifiedResult {
     pub use_case_label: UseCaseLabel,
     pub use_case_confidence: f32,
     pub secondary_label: Option<UseCaseLabel>,
+    /// Discriminator that explains *why* `use_case_label` has its current
+    /// value. See `soth_core::UseCaseLabelReason` for the full taxonomy.
+    pub use_case_label_reason: UseCaseLabelReason,
     pub topic_cluster_id: u32,
     pub semantic_hash: String,
     /// Raw embedding for local SQLite storage only.

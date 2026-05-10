@@ -1,0 +1,11 @@
+{
+  "session_id": "claude-session-06",
+  "tool_name": "Bash",
+  "tool_input": { "command": "false" },
+  "tool_response": {
+    "stdout": "",
+    "stderr": "",
+    "exit_code": 1,
+    "error": "command failed"
+  }
+}

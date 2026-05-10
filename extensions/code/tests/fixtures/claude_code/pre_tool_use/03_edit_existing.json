@@ -1,0 +1,11 @@
+{
+  "session_id": "claude-session-03",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/Users/u/code/proj",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/Users/u/code/proj/src/main.rs",
+    "old_string": "fn main() { println!(\"hi\"); }",
+    "new_string": "fn main() { println!(\"hello\"); }"
+  }
+}

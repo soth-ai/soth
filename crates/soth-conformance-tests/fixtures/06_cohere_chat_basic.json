@@ -1,0 +1,35 @@
+{
+  "name": "cohere_chat_basic",
+  "description": "Cohere chat, single message, non-streaming.",
+  "axes": {
+    "provider": "cohere",
+    "streaming": false,
+    "tools": false,
+    "content_class": "clean",
+    "format": "rest_chat_completions",
+    "capture_mode": "metadata_only"
+  },
+  "typed_call": {
+    "provider": "cohere",
+    "model": "command-r-plus",
+    "messages": [
+      { "role": "user", "content": "Explain what makes a good API design in three bullet points." }
+    ],
+    "stream": false
+  },
+  "raw_request": {
+    "method": "POST",
+    "path": "/v1/chat",
+    "headers": {
+      "host": "api.cohere.com",
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "command-r-plus",
+      "messages": [
+        { "role": "user", "content": "Explain what makes a good API design in three bullet points." }
+      ]
+    },
+    "matched_provider": "cohere"
+  }
+}

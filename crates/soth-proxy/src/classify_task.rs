@@ -419,10 +419,12 @@ pub fn spawn_classify_task(
                     result
                 }
                 Err(error) => {
+                    crate::heartbeat_telemetry::record_classify_panic_drop();
                     warn!(
                         connection_id = %connection_id,
                         error = %error,
-                        "classification worker failed before completion"
+                        "classification worker failed before completion; \
+                         event dropped (counted in classify_panic_dropped_total)"
                     );
                     if let Some(ref store) = pending_emit_store {
                         store.remove(&connection_id);
@@ -579,6 +581,7 @@ pub fn emit_stream_turn(
     event.parse_source = soth_core::ParseSource::AgentApp;
     event.capture_mode = pending.outcome.capture_mode;
     event.request_method = proxy_ctx
+        .transport
         .request_method
         .unwrap_or(soth_core::RequestMethod::Get);
 
@@ -586,27 +589,27 @@ pub fn emit_stream_turn(
     event.estimated_output_tokens = Some(turn.usage.output_tokens as u32);
     event.actual_output_tokens = Some(turn.usage.output_tokens);
 
-    event.process_resolution = Some(proxy_ctx.process_resolution.clone());
-    event.traffic_classification = Some(proxy_ctx.traffic_classification);
-    event.bundle_trust_level = proxy_ctx.bundle_trust_level;
+    event.process_resolution = Some(proxy_ctx.attribution.process_resolution.clone());
+    event.traffic_classification = Some(proxy_ctx.identity.traffic_classification);
+    event.bundle_trust_level = proxy_ctx.identity.bundle_trust_level;
 
     event.ws_turn_number = Some(turn.turn_number);
     event.finish_reason = turn.usage.finish_reason.clone();
 
-    event.endpoint_hash = proxy_ctx.endpoint_hash.clone();
+    event.endpoint_hash = proxy_ctx.identity.endpoint_hash.clone();
 
     // Connection intelligence / product taxonomy — clone from proxy ctx.
-    event.ja4_hash = proxy_ctx.ja4_hash.clone();
-    event.tls_version = proxy_ctx.tls_version.clone();
-    event.alpn_protocol = proxy_ctx.alpn_protocol.clone();
-    event.h2_connection_id = proxy_ctx.h2_connection_id.clone();
-    event.h2_stream_id = proxy_ctx.h2_stream_id;
-    event.session_id = proxy_ctx.session_id;
-    event.product_id = proxy_ctx.product_id.clone();
-    event.surface_type = proxy_ctx.surface_type;
-    event.is_shadow_it = proxy_ctx.is_shadow_it;
+    event.ja4_hash = proxy_ctx.transport.ja4_hash.clone();
+    event.tls_version = proxy_ctx.transport.tls_version.clone();
+    event.alpn_protocol = proxy_ctx.transport.alpn_protocol.clone();
+    event.h2_connection_id = proxy_ctx.transport.h2_connection_id.clone();
+    event.h2_stream_id = proxy_ctx.transport.h2_stream_id;
+    event.session_id = proxy_ctx.identity.session_id;
+    event.product_id = proxy_ctx.attribution.product_id.clone();
+    event.surface_type = proxy_ctx.attribution.surface_type;
+    event.is_shadow_it = proxy_ctx.attribution.is_shadow_it;
 
-    if let Some(ref snap) = proxy_ctx.session_snapshot {
+    if let Some(ref snap) = proxy_ctx.identity.session_snapshot {
         event.session_key_hash = snap.session_key_hash.clone();
         event.session_request_count = Some(snap.request_count);
         event.session_total_tokens = Some(snap.total_tokens);
@@ -679,13 +682,18 @@ fn fast_block_decision(
     policy_bundle: &soth_policy::PolicyBundle,
 ) -> Option<soth_core::PolicyDecisionKind> {
     let context = soth_core::PolicyContext {
-        process_resolution: proxy_ctx.process_resolution.clone(),
-        capture_mode: proxy_ctx.capture_mode,
-        traffic_classification: proxy_ctx.traffic_classification,
-        deployment: deployment_from_source(proxy_ctx.classification_source),
+        process_resolution: proxy_ctx.attribution.process_resolution.clone(),
+        capture_mode: proxy_ctx.identity.capture_mode,
+        traffic_classification: proxy_ctx.identity.traffic_classification,
+        deployment: deployment_from_source(proxy_ctx.identity.classification_source),
         skip_org_rules: true,
         semantic: None,
-        session: proxy_ctx.session_snapshot.clone().unwrap_or_default(),
+        session: proxy_ctx
+            .identity
+            .session_snapshot
+            .clone()
+            .unwrap_or_default(),
+        action: None,
     };
 
     let decision = soth_policy::evaluate(

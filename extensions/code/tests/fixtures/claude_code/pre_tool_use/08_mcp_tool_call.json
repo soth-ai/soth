@@ -1,0 +1,11 @@
+{
+  "session_id": "claude-session-08",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/Users/u/code/proj",
+  "tool_name": "mcp__github__create_issue",
+  "tool_input": {
+    "repo": "owner/name",
+    "title": "Bug: ...",
+    "body": "details"
+  }
+}

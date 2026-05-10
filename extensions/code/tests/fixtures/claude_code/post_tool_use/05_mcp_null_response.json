@@ -1,0 +1,6 @@
+{
+  "session_id": "claude-session-08",
+  "tool_name": "mcp__cache__set",
+  "tool_input": { "key": "k", "value": "v" },
+  "tool_response": null
+}

@@ -126,6 +126,7 @@ fn fixture_context() -> PolicyContext {
             credential_alerts: 0,
             ..Default::default()
         },
+        action: None,
     }
 }
 

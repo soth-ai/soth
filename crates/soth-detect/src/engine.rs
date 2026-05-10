@@ -30,6 +30,15 @@ pub struct ParserRegistry {
     compiled_org: CompiledOrgPatterns,
 }
 
+// Compile-time check: SDK bindings stash an `Arc<ParserRegistry>` for the
+// lifetime of the host process and call `process_normalized` /
+// `process_with_registry` from arbitrary worker threads. Both ends require
+// `Send + Sync`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ParserRegistry>();
+};
+
 impl Default for ParserRegistry {
     fn default() -> Self {
         Self::with_org_patterns(512, &[])
@@ -148,6 +157,215 @@ pub fn process_with_registry_and_intelligence(
     let result = process_inner(req, bundle, registry, &registry.compiled_org, snapshot);
     emit_intelligence(req, &result, sink);
     to_core_detect_result(&result)
+}
+
+/// Pre-parsed entry point for SDK consumers that already have a typed LLM
+/// call — provider, model, messages, system, tools, stream — and don't need
+/// the proxy's HTTP fingerprint/parse phase.
+///
+/// Mirrors `process_with_registry`'s downstream behavior:
+/// 1. Builds a `NormalizedRequest` from the typed call (hashes, token estimates,
+///    canonical cache key) using the same primitives the REST parser uses.
+/// 2. Runs the **scan phase** (credentials, structural artifacts, code,
+///    org patterns) over the message content.
+/// 3. Runs the **session prefix-repeat** phase using the supplied snapshot.
+///
+/// Output uses `parse_source = ParseSource::Sdk` and
+/// `confidence = ParseConfidence::Full`. Org patterns are honored when the
+/// caller supplies a `ParserRegistry` with compiled patterns; pass
+/// `&ParserRegistry::default()` when none are needed.
+pub fn process_normalized(
+    registry: &ParserRegistry,
+    call: &soth_core::TypedLlmCall,
+    _bundle: &DetectBundleSlice<'_>,
+    snapshot: &soth_core::SessionSnapshot,
+    capture_mode: soth_core::CaptureMode,
+) -> soth_core::DetectResult {
+    let started = Instant::now();
+
+    // Phase 1 (parse) is supplied by the caller — build NormalizedRequest
+    // from typed fields directly.
+    let normalized = build_normalized_from_typed_call(call, capture_mode);
+
+    // Phase 2: scan. Build `segments` from the typed messages so credential
+    // detection sees per-turn locations.
+    let scan_input = build_scan_input_from_typed_call(call);
+    let synthetic_body = call.conversation_text();
+    let scan = scan_content(
+        synthetic_body.as_bytes(),
+        &scan_input,
+        &registry.compiled_org,
+    );
+
+    // Phase 3: session prefix-repeat dedup (same primitive as proxy hot path).
+    let (
+        is_prefix_repeat,
+        novel_token_count,
+        repeated_token_count,
+        novel_tail_start_idx,
+        prefix_hash,
+    ) = compute_prefix_repeat(&normalized, snapshot);
+
+    let is_repeated_code_context = scan
+        .ast_normalized_hash
+        .as_deref()
+        .map(|hash| snapshot.seen_code_hashes.iter().any(|h| h == hash))
+        .unwrap_or(false);
+
+    let session_mutations = soth_core::SessionMutations {
+        new_prefix_hash: Some(normalized.conversation_hash.clone()),
+        new_code_hashes: scan
+            .ast_normalized_hash
+            .as_ref()
+            .map(|hash| {
+                vec![soth_core::CodeBlob {
+                    ast_normalized_hash: hash.clone(),
+                    language: String::new(),
+                    first_event_id: uuid::Uuid::nil(),
+                }]
+            })
+            .unwrap_or_default(),
+        ..soth_core::SessionMutations::default()
+    };
+
+    let user_prompt = normalized.user_prompt.clone();
+
+    soth_core::DetectResult {
+        normalized,
+        artifacts: scan.artifacts,
+        capture_mode,
+        parse_source: ParseSource::Sdk,
+        confidence: soth_core::ParseConfidence::Full,
+        detect_latency_us: started.elapsed().as_micros() as u64,
+        warnings: scan.warnings.iter().map(map_detect_warning).collect(),
+        session_mutations,
+        is_prefix_repeat,
+        novel_token_count,
+        repeated_token_count,
+        novel_tail_start_idx,
+        prefix_hash,
+        is_repeated_code_context,
+        ast_normalized_hash: scan.ast_normalized_hash,
+        first_blob_event_id: None,
+        import_categories: scan.import_categories,
+        user_prompt,
+    }
+}
+
+fn build_normalized_from_typed_call(
+    call: &soth_core::TypedLlmCall,
+    _capture_mode: soth_core::CaptureMode,
+) -> NormalizedRequest {
+    use crate::hash::{canonical_hash, estimate_tokens, hash_content};
+
+    let user_content = call.user_content();
+    let conversation = call.conversation_text();
+    let tool_definitions = call.tool_definitions_text();
+
+    // Mirror the REST parser: empty content hashes the sentinel placeholder
+    // so the cloud sees a stable hash for content-not-extracted cases. This
+    // matches `parse_rest::user_content_hash` for parity.
+    let user_content_hash = if user_content.is_empty() {
+        hash_content("[CONTENT_NOT_EXTRACTED]")
+    } else {
+        hash_content(&user_content)
+    };
+    let conversation_hash = hash_content(&conversation);
+    let system_prompt_hash = call.system.as_deref().map(hash_content);
+    let system_prompt_token_estimate = call.system.as_deref().map(estimate_tokens);
+    let tool_definition_hash = tool_definitions.as_deref().map(hash_content);
+    let user_content_token_estimate = estimate_tokens(&user_content);
+    let estimated_input_tokens = system_prompt_token_estimate
+        .unwrap_or(0)
+        .saturating_add(estimate_tokens(&conversation));
+
+    let conversation_turn = if call.messages.is_empty() {
+        None
+    } else {
+        Some(call.messages.len() as u32)
+    };
+
+    let mut normalized = NormalizedRequest {
+        parse_confidence: soth_core::ParseConfidence::Full,
+        parser_id: format!("sdk:{}", call.provider),
+        schema_version: "sdk-1".to_string(),
+        parse_warnings: Vec::new(),
+        is_ai_call: true,
+        provider: call.provider.clone(),
+        model: if call.model.is_empty() {
+            None
+        } else {
+            Some(call.model.clone())
+        },
+        endpoint_type: call.endpoint_type,
+        api_version: None,
+        system_prompt_hash,
+        system_prompt_token_estimate,
+        user_content_hash,
+        user_content_token_estimate,
+        conversation_hash,
+        conversation_turn,
+        has_tool_definitions: !call.tools.is_empty(),
+        tool_definition_hash,
+        temperature: call.temperature,
+        max_tokens: call.max_tokens,
+        stream: call.stream,
+        top_p: call.top_p,
+        stop_sequences: call.stop_sequences.clone(),
+        estimated_input_tokens,
+        estimated_cost_usd: 0.0,
+        parse_source: ParseSource::Sdk,
+        has_structured_output: false,
+        has_tool_results: call.messages.iter().any(|m| m.role == "tool"),
+        estimated_output_tokens: None,
+        canonical_cache_key: String::new(),
+        format_metadata: soth_core::FormatMetadata::Rest {
+            content_type: "application/json".to_string(),
+        },
+        user_prompt: if user_content.is_empty() {
+            None
+        } else {
+            Some(user_content)
+        },
+    };
+
+    normalized.canonical_cache_key = canonical_hash(&normalized);
+    normalized
+}
+
+fn build_scan_input_from_typed_call(call: &soth_core::TypedLlmCall) -> ScanInput {
+    let mut segments = Vec::new();
+
+    if let Some(system) = &call.system {
+        if !system.is_empty() {
+            segments.push((
+                ArtifactLocation::SystemPrompt { char_offset: 0 },
+                system.clone(),
+            ));
+        }
+    }
+
+    for (idx, msg) in call.messages.iter().enumerate() {
+        if msg.content.is_empty() {
+            continue;
+        }
+        let location = match msg.role.as_str() {
+            "assistant" => ArtifactLocation::AssistantContent {
+                turn: idx as u32,
+                char_offset: 0,
+            },
+            _ => ArtifactLocation::UserContent {
+                turn: idx as u32,
+                char_offset: 0,
+            },
+        };
+        segments.push((location, msg.content.clone()));
+    }
+
+    ScanInput {
+        segments,
+        fallback_content: None,
+    }
 }
 
 // ---------------------------------------------------------------------------

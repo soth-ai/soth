@@ -1,0 +1,393 @@
+"""SOTH SDK for Python.
+
+Public API:
+    init(...)                  -> SothSdk
+    SothBlocked                -> exception (does NOT inherit from any
+                                  provider SDK exception type; propagates
+                                  past `try/except openai.APIError`)
+    BlockReason                -> typed reason carried on SothBlocked
+
+The Decision API contract is locked by `docs/common/SDK_DECISION_API_SPEC.md`.
+
+Quick start:
+
+    import soth, openai
+
+    soth.init(
+        api_key="sk-...",
+        org_id="org-123",
+        hmac_key_env="SOTH_HMAC_KEY",
+    )
+    client = openai.OpenAI()
+    try:
+        response = soth.guard(
+            lambda: client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            ),
+            call={
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    except soth.SothBlocked as e:
+        print("blocked:", e.reason)
+"""
+
+from __future__ import annotations
+
+import contextvars
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional, TypeVar
+
+from . import _soth_native  # type: ignore[attr-defined]
+from .exceptions import (
+    BlockReason,
+    SothBlocked,
+    SothFlagged,
+    block_reason_from_dict,
+)
+from .instrumentation import (
+    instrument,
+    is_instrumented,
+    uninstrument,
+)
+
+__version__ = _soth_native.__version__
+
+__all__ = [
+    "init",
+    "shutdown",
+    "guard",
+    "guard_stream",
+    "guard_stream_sync",
+    "context",
+    "instrument",
+    "uninstrument",
+    "is_instrumented",
+    "SothBlocked",
+    "SothFlagged",
+    "BlockReason",
+]
+
+
+# Per-call context lives in a contextvars.ContextVar so it survives
+# `asyncio` task switches naturally — async code that awaits inside a
+# `with soth.context(...)` block sees the same context after the await.
+_current_context: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
+    "soth_current_context", default={}
+)
+
+
+@contextmanager
+def context(
+    *,
+    user_id_hmac: Optional[str] = None,
+    team_id: Optional[str] = None,
+    device_id_hash: Optional[str] = None,
+    session_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> Iterator[None]:
+    """Override identity fields for any `guard()` / `guard_stream()`
+    calls inside this block.
+
+    Uses `contextvars` so async tasks awaited inside the block see the
+    same context. Nested `with soth.context(...)` blocks merge — fields
+    not set in the inner block fall through to the outer block.
+
+    `user_id_hmac` MUST be the HMAC of the customer's user ID,
+    computed by the customer's code using their `SOTH_HMAC_KEY`.
+    The SDK never sees plaintext user IDs.
+    """
+    current = dict(_current_context.get())
+    if user_id_hmac is not None:
+        current["user_id_hmac"] = user_id_hmac
+    if team_id is not None:
+        current["team_id"] = team_id
+    if device_id_hash is not None:
+        current["device_id_hash"] = device_id_hash
+    if session_id is not None:
+        current["session_id"] = session_id
+    if request_id is not None:
+        current["request_id"] = request_id
+    token = _current_context.set(current)
+    try:
+        yield
+    finally:
+        _current_context.reset(token)
+
+# Module-level singleton. Bindings keep one SothSdk per process; per-call
+# context (org/user/team override) is layered on top via `with_context`.
+_singleton: Optional[_soth_native.SothSdk] = None
+
+T = TypeVar("T")
+
+
+def init(
+    *,
+    api_key: str,
+    org_id: str,
+    hmac_key_env: Optional[str] = None,
+    hmac_key_static: Optional[bytes] = None,
+    telemetry_endpoint: Optional[str] = None,
+) -> None:
+    """Initialize the SOTH SDK module-level singleton.
+
+    `hmac_key_env` / `hmac_key_static` are **optional in v1**. When set,
+    the SDK validates the key resolves at init time and reserves it for
+    the future `soth.hash_user_id()` helper. When absent, customers
+    either pre-compute `user_id_hmac` themselves and pass via
+    `with soth.context(user_id_hmac=...)`, or omit user attribution
+    entirely.
+
+    **Privacy tradeoff:** without an HMAC key, anything passed via
+    `user_id_hmac` reaches soth-cloud as-is. Regulated workloads
+    (HIPAA / heavy-PII) SHOULD configure a key. Phase-2.5 SDK adds
+    SDK-side hashing — see
+    `docs/common/SDK_WASM_TRUST_BOUNDARY_SPEC.md` §6.6.
+
+    Specify exactly one of `hmac_key_env` (read from environment) or
+    `hmac_key_static` (raw bytes). Production usage SHOULD prefer
+    `hmac_key_env` so the key never sits in source-controlled config.
+
+    `telemetry_endpoint` (e.g.
+    `"https://api.soth.cloud/v1/edge/telemetry/batch"`) enables the
+    background HTTPS shipper. When omitted, telemetry events accumulate
+    in an in-memory queue with no transport — useful for tests.
+    """
+    global _singleton
+    _singleton = _soth_native.SothSdk(
+        api_key=api_key,
+        org_id=org_id,
+        hmac_key_env=hmac_key_env,
+        hmac_key_static=hmac_key_static,
+        telemetry_endpoint=telemetry_endpoint,
+    )
+
+
+def shutdown() -> None:
+    """Stop the background telemetry shipper and flush pending events.
+
+    Customers SHOULD call this at process exit (e.g. in a `finally`
+    block at the top of `main`) so the last batch window's events
+    aren't lost. Idempotent.
+    """
+    global _singleton
+    if _singleton is not None:
+        _singleton.shutdown()
+
+
+def get_sdk() -> _soth_native.SothSdk:
+    """Return the initialized SDK or raise if `init` hasn't run."""
+    if _singleton is None:
+        raise RuntimeError(
+            "soth.init(...) must be called before any guard() / SDK call"
+        )
+    return _singleton
+
+
+def guard(
+    call_fn: Callable[[], T],
+    *,
+    call: dict[str, Any],
+    response_extractor: Optional[Callable[[T], dict[str, Any]]] = None,
+) -> T:
+    """Wrap an LLM call with SOTH's pre/post decision lifecycle.
+
+    Translates `Decision::Block` into a raised `SothBlocked` and
+    `Decision::Flag` into a logged `SothFlagged` warning. `Allow` and
+    `Redact` proceed to invoke `call_fn`.
+
+    Works with both **sync and async** providers:
+    - sync: `call_fn` returns the response object directly; guard
+      finalizes inline and returns the value.
+    - async: `call_fn` returns a coroutine; guard returns a coroutine
+      that, when awaited, finalizes the lifecycle after the inner
+      coroutine resolves. Customers `await soth.guard(...)`.
+
+    `call_fn` is the customer's existing call (e.g.
+    `client.chat.completions.create(...)`); the wrapper is intentionally
+    narrow so it can be applied per-call with minimal disruption.
+    """
+    import inspect
+
+    sdk = get_sdk()
+    ctx = _current_context.get() or None
+    decision = sdk.pre_call(call, ctx)
+    kind = decision["kind"]
+    token = decision["token"]
+
+    if kind == _soth_native.DECISION_KIND_BLOCK:
+        # Consume the token so the slab balances even on block.
+        sdk.post_call(token, None)
+        raise SothBlocked(
+            decision_id=str(token),
+            reason=block_reason_from_dict(decision.get("reason", {})),
+        )
+
+    if kind == _soth_native.DECISION_KIND_FLAG:
+        # Surface the flag through a logger; customers can install
+        # handlers to act on it. Does NOT raise.
+        import logging
+
+        logging.getLogger("soth").warning(
+            "soth flagged call: severity=%s", decision.get("severity")
+        )
+
+    # Invoke the wrapped call. If it returns a coroutine, post_call
+    # MUST run after the await — return a coroutine that the customer
+    # awaits.
+    try:
+        result = call_fn()
+    except BaseException:
+        sdk.post_call(token, None)
+        raise
+
+    if inspect.iscoroutine(result) or inspect.isawaitable(result):
+        return _finalize_async(sdk, token, result, response_extractor)  # type: ignore[return-value]
+
+    # Sync path — finalize inline.
+    response_dict = response_extractor(result) if response_extractor else None
+    sdk.post_call(token, response_dict)
+    return result
+
+
+async def _finalize_async(
+    sdk: _soth_native.SothSdk,
+    token: int,
+    coro: Any,
+    response_extractor: Optional[Callable[[Any], dict[str, Any]]],
+) -> Any:
+    """Async finalizer: await the inner coroutine, then post_call.
+    Errors propagate after the slab has been balanced."""
+    try:
+        result = await coro
+    except BaseException:
+        sdk.post_call(token, None)
+        raise
+    response_dict = response_extractor(result) if response_extractor else None
+    sdk.post_call(token, response_dict)
+    return result
+
+
+async def guard_stream(
+    iter_factory: Callable[[], Any],
+    *,
+    call: dict[str, Any],
+    chunk_extractor: Callable[[Any], tuple[Optional[str], Optional[str]]] | None = None,
+):
+    """Wrap an **async** streaming LLM call with SOTH's pre/post lifecycle.
+
+    `iter_factory` returns an async iterator (typically the awaited
+    result of e.g. ``await aclient.chat.completions.create(stream=True, ...)``).
+    `chunk_extractor(chunk) -> (delta_content, finish_reason)` pulls the
+    fields the SDK records from each provider chunk; defaults to OpenAI's
+    `chunk.choices[0].delta.content` shape.
+
+    Yields each chunk back to the caller. Raises `SothBlocked` if the
+    decision is `Block`. Always finalizes the stream observation on
+    completion or exception.
+    """
+    sdk = get_sdk()
+    ctx = _current_context.get() or None
+    decision, observation = sdk.stream_begin(call, ctx)
+    kind = decision["kind"]
+
+    if kind == _soth_native.DECISION_KIND_BLOCK:
+        observation.end()  # Consume token even on block.
+        raise SothBlocked(
+            decision_id=str(decision["token"]),
+            reason=block_reason_from_dict(decision.get("reason", {})),
+        )
+
+    if chunk_extractor is None:
+        chunk_extractor = _default_openai_chunk_extractor
+
+    sequence = 0
+    try:
+        provider_iter = iter_factory()
+        # Provider may return an async iterator directly OR a coroutine
+        # that resolves to an async iterator. Handle both.
+        if hasattr(provider_iter, "__await__"):
+            provider_iter = await provider_iter
+        async for chunk in provider_iter:
+            delta_content, finish_reason = chunk_extractor(chunk)
+            observation.chunk(sequence, delta_content, finish_reason)
+            sequence += 1
+            yield chunk
+    finally:
+        observation.end()
+
+
+def guard_stream_sync(
+    iter_factory: Callable[[], Any],
+    *,
+    call: dict[str, Any],
+    chunk_extractor: Callable[[Any], tuple[Optional[str], Optional[str]]] | None = None,
+):
+    """Wrap a **sync** streaming LLM call (e.g. OpenAI's sync `OpenAI`
+    client returning a `Stream[ChatCompletionChunk]`).
+
+    Returns a generator that yields each provider chunk back to the
+    caller. Raises `SothBlocked` if the decision is `Block`. Always
+    finalizes the stream observation on completion or exception.
+
+    Auto-instrumentation routes sync streaming calls here; customers
+    can call this directly when wrapping a sync stream by hand.
+    """
+    sdk = get_sdk()
+    ctx = _current_context.get() or None
+    decision, observation = sdk.stream_begin(call, ctx)
+    kind = decision["kind"]
+
+    if kind == _soth_native.DECISION_KIND_BLOCK:
+        observation.end()
+        raise SothBlocked(
+            decision_id=str(decision["token"]),
+            reason=block_reason_from_dict(decision.get("reason", {})),
+        )
+
+    if chunk_extractor is None:
+        chunk_extractor = _default_openai_chunk_extractor
+
+    def _generator():
+        sequence = 0
+        try:
+            provider_iter = iter_factory()
+            for chunk in provider_iter:
+                delta_content, finish_reason = chunk_extractor(chunk)
+                observation.chunk(sequence, delta_content, finish_reason)
+                sequence += 1
+                yield chunk
+        finally:
+            observation.end()
+
+    return _generator()
+
+
+def _default_openai_chunk_extractor(chunk: Any) -> tuple[Optional[str], Optional[str]]:
+    """Default chunk extractor for OpenAI-shaped streams.
+
+    Looks for `chunk.choices[0].delta.content` and
+    `chunk.choices[0].finish_reason`. Falls back to `(None, None)` for
+    chunks that don't fit (the SDK still sees the chunk count, just no
+    content sample).
+    """
+    try:
+        choice = chunk.choices[0]
+        delta = getattr(choice, "delta", None)
+        delta_content = getattr(delta, "content", None) if delta else None
+        finish_reason = getattr(choice, "finish_reason", None)
+        return delta_content, finish_reason
+    except (AttributeError, IndexError, TypeError):
+        return None, None
+
+
+# Test-only re-exports (used by `tests/test_smoke.py` etc.)
+def _drain_telemetry_for_test() -> list[dict[str, Any]]:
+    return get_sdk().drain_telemetry_for_test()
+
+
+def _in_flight_decisions() -> int:
+    return get_sdk().in_flight_decisions()

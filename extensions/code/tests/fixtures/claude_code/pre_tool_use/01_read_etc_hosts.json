@@ -1,0 +1,9 @@
+{
+  "session_id": "claude-session-01",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/Users/u/code/proj",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/etc/hosts"
+  }
+}

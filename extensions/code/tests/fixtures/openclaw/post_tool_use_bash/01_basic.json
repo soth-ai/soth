@@ -1,0 +1,14 @@
+{
+  "session_id": "openclaw-post",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/post.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-4o",
+  "turn_id": "turn-post-1",
+  "tool_name": "Bash",
+  "tool_use_id": "tool-post-1",
+  "tool_input": {
+    "command": "npm install"
+  },
+  "tool_response": "added 142 packages, audited 156 packages in 8s\nfound 0 vulnerabilities"
+}

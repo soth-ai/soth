@@ -1,0 +1,39 @@
+{
+  "name": "anthropic_messages_basic",
+  "description": "Anthropic Messages API, single user message, no tools, non-streaming.",
+  "axes": {
+    "provider": "anthropic",
+    "streaming": false,
+    "tools": false,
+    "content_class": "clean",
+    "format": "rest_messages",
+    "capture_mode": "metadata_only"
+  },
+  "typed_call": {
+    "provider": "anthropic",
+    "model": "claude-3-5-sonnet-latest",
+    "messages": [
+      { "role": "user", "content": "Summarize the key ideas of distributed consensus in three sentences." }
+    ],
+    "system": "You are a concise technical writer.",
+    "stream": false,
+    "max_tokens": 200
+  },
+  "raw_request": {
+    "method": "POST",
+    "path": "/v1/messages",
+    "headers": {
+      "host": "api.anthropic.com",
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "claude-3-5-sonnet-latest",
+      "system": "You are a concise technical writer.",
+      "messages": [
+        { "role": "user", "content": "Summarize the key ideas of distributed consensus in three sentences." }
+      ],
+      "max_tokens": 200
+    },
+    "matched_provider": "anthropic"
+  }
+}

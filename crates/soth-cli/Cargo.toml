@@ -21,6 +21,8 @@ soth-bundle = { workspace = true }
 soth-proxy = { workspace = true }
 soth-extensions = { workspace = true }
 soth-historian = { workspace = true }
+soth-code = { workspace = true }
+soth-policy = { workspace = true }
 soth-sync = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "signal", "time", "process"] }
@@ -45,11 +47,11 @@ hex = "0.4"
 dirs = "5.0"
 which = "6.0"
 libc = "0.2"
+tempfile = { workspace = true }
 
 # CLI styling
 owo-colors = "4.0"
 comfy-table = "7.0"
 
 [dev-dependencies]
-tempfile = { workspace = true }
 criterion = { version = "0.5", features = ["async_tokio"] }

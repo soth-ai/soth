@@ -1,0 +1,10 @@
+{
+  "session_id": "claude-session-06",
+  "transcript_path": "/Users/u/.claude/projects/proj/transcript.jsonl",
+  "cwd": "/tmp/scratch",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf /",
+    "description": "wipe filesystem"
+  }
+}

@@ -1,172 +1,75 @@
+## SOTH ops Makefile — thin dispatcher.
+##
+## All logic lives in `ops/release.sh`; this file is just the verb surface so
+## the conventional `make <target> ENV=…` workflow keeps working. The
+## delegation pattern dodges GNU Make 3.81's lack of `.ONESHELL:` (Apple's
+## bundled make) and keeps the per-recipe shell quoting sane.
+##
+## Phase 1 covers CLI binaries; Phase 2 (classify bundle) and Phase 3 (tool
+## catalog) extend `ops/release.sh` with new verbs.
+
 SHELL := /usr/bin/env bash
-.SHELLFLAGS := -eu -o pipefail -c
+ENV ?= staging
 
-CARGO ?= cargo
-RUSTUP ?= rustup
-DIST_DIR ?= dist
+# Pass --quiet to avoid double-printing the recipe; ops/release.sh has its
+# own progress output.
+.SILENT:
 
-MACOS_ARM64_TARGET ?= aarch64-apple-darwin
-MACOS_X86_64_TARGET ?= x86_64-apple-darwin
-LINUX_X86_64_TARGET ?= x86_64-unknown-linux-gnu
-LINUX_ARM64_TARGET ?= aarch64-unknown-linux-gnu
-LINUX_ARM64_LINKER ?= aarch64-linux-gnu-gcc
+OPS := ./ops/release.sh
 
-SOTH_UNIVERSAL := $(DIST_DIR)/soth-darwin-universal2
-SOTH_OPS_UNIVERSAL := $(DIST_DIR)/soth-ops-darwin-universal2
-SOTH_LINUX_AMD64 := $(DIST_DIR)/soth-linux-amd64
-SOTH_LINUX_ARM64 := $(DIST_DIR)/soth-linux-arm64
-SOTH_OPS_LINUX_AMD64 := $(DIST_DIR)/soth-ops-linux-amd64
-SOTH_OPS_LINUX_ARM64 := $(DIST_DIR)/soth-ops-linux-arm64
-
-.PHONY: help \
-	macos-universal \
-	macos-universal-soth \
-	macos-universal-soth-ops \
-	macos-universal-verify \
-	macos-universal-prereqs \
-	macos-universal-targets \
-	linux-binaries \
-	linux-binaries-soth \
-	linux-binaries-soth-ops \
-	linux-binaries-verify \
-	linux-binaries-prereqs \
-	linux-binaries-targets \
-	clean-dist
-
+.PHONY: help
 help:
-	@echo "Targets:"
-	@echo "  make macos-universal         Build Universal 2 macOS binaries for soth + soth-ops"
-	@echo "  make macos-universal-soth    Build Universal 2 macOS binary for soth"
-	@echo "  make macos-universal-soth-ops Build Universal 2 macOS binary for soth-ops"
-	@echo "  make macos-universal-verify  Verify universal binaries in $(DIST_DIR)"
-	@echo "  make linux-binaries          Build split Linux binaries (amd64 + arm64) for soth + soth-ops"
-	@echo "  make linux-binaries-soth     Build split Linux binaries for soth"
-	@echo "  make linux-binaries-soth-ops Build split Linux binaries for soth-ops"
-	@echo "  make linux-binaries-verify   Verify Linux split binaries in $(DIST_DIR)"
-	@echo "  make clean-dist              Remove $(DIST_DIR) outputs"
+	$(OPS) help
 
-macos-universal-prereqs:
-	@if [[ "$$(uname -s)" != "Darwin" ]]; then \
-		echo "error: macos-universal targets must run on macOS"; \
-		exit 1; \
-	fi
-	@command -v lipo >/dev/null 2>&1 || { echo "error: missing required tool 'lipo'"; exit 1; }
-	@command -v shasum >/dev/null 2>&1 || { echo "error: missing required tool 'shasum'"; exit 1; }
-	@command -v file >/dev/null 2>&1 || { echo "error: missing required tool 'file'"; exit 1; }
+.PHONY: build-cli publish-cli release-cli verify-cli diff
+build-cli:
+	$(OPS) build-cli '$(ENV)'
 
-macos-universal-targets:
-	@$(RUSTUP) target add $(MACOS_ARM64_TARGET) $(MACOS_X86_64_TARGET)
+publish-cli:
+	$(OPS) publish-cli '$(ENV)'
 
-$(SOTH_UNIVERSAL): macos-universal-prereqs macos-universal-targets
-	@mkdir -p "$(DIST_DIR)"
-	$(CARGO) build -p soth-cli --bin soth --release --target "$(MACOS_ARM64_TARGET)"
-	$(CARGO) build -p soth-cli --bin soth --release --target "$(MACOS_X86_64_TARGET)"
-	lipo -create \
-		"target/$(MACOS_ARM64_TARGET)/release/soth" \
-		"target/$(MACOS_X86_64_TARGET)/release/soth" \
-		-output "$(SOTH_UNIVERSAL)"
-	chmod +x "$(SOTH_UNIVERSAL)"
-	shasum -a 256 "$(SOTH_UNIVERSAL)" > "$(SOTH_UNIVERSAL).sha256"
+release-cli:
+	$(OPS) release-cli '$(ENV)'
 
-$(SOTH_OPS_UNIVERSAL): macos-universal-prereqs macos-universal-targets
-	@mkdir -p "$(DIST_DIR)"
-	$(CARGO) build -p soth-cli --bin soth-ops --release --no-default-features --features ops --target "$(MACOS_ARM64_TARGET)"
-	$(CARGO) build -p soth-cli --bin soth-ops --release --no-default-features --features ops --target "$(MACOS_X86_64_TARGET)"
-	lipo -create \
-		"target/$(MACOS_ARM64_TARGET)/release/soth-ops" \
-		"target/$(MACOS_X86_64_TARGET)/release/soth-ops" \
-		-output "$(SOTH_OPS_UNIVERSAL)"
-	chmod +x "$(SOTH_OPS_UNIVERSAL)"
-	shasum -a 256 "$(SOTH_OPS_UNIVERSAL)" > "$(SOTH_OPS_UNIVERSAL).sha256"
+verify-cli:
+	$(OPS) verify-cli '$(ENV)'
 
-macos-universal-soth: $(SOTH_UNIVERSAL)
-	@echo "Built $(SOTH_UNIVERSAL)"
+diff:
+	$(OPS) diff '$(ENV)'
 
-macos-universal-soth-ops: $(SOTH_OPS_UNIVERSAL)
-	@echo "Built $(SOTH_OPS_UNIVERSAL)"
+.PHONY: build-classify publish-classify release-classify verify-classify
+build-classify:
+	$(OPS) build-classify '$(ENV)'
 
-macos-universal: $(SOTH_UNIVERSAL) $(SOTH_OPS_UNIVERSAL)
-	@$(MAKE) macos-universal-verify
+publish-classify:
+	$(OPS) publish-classify '$(ENV)'
 
-macos-universal-verify: macos-universal-prereqs
-	@test -f "$(SOTH_UNIVERSAL)" || { echo "error: missing $(SOTH_UNIVERSAL)"; exit 1; }
-	@test -f "$(SOTH_OPS_UNIVERSAL)" || { echo "error: missing $(SOTH_OPS_UNIVERSAL)"; exit 1; }
-	file "$(SOTH_UNIVERSAL)" "$(SOTH_OPS_UNIVERSAL)"
-	lipo -archs "$(SOTH_UNIVERSAL)"
-	lipo -archs "$(SOTH_OPS_UNIVERSAL)"
-	@echo "Checksums:"
-	@cat "$(SOTH_UNIVERSAL).sha256"
-	@cat "$(SOTH_OPS_UNIVERSAL).sha256"
+release-classify:
+	$(OPS) release-classify '$(ENV)'
 
-linux-binaries-prereqs:
-	@command -v shasum >/dev/null 2>&1 || { echo "error: missing required tool 'shasum'"; exit 1; }
-	@command -v file >/dev/null 2>&1 || { echo "error: missing required tool 'file'"; exit 1; }
+verify-classify:
+	$(OPS) verify-classify '$(ENV)'
 
-linux-binaries-targets:
-	@$(RUSTUP) target add $(LINUX_X86_64_TARGET) $(LINUX_ARM64_TARGET)
+.PHONY: import-catalog compile-catalog publish-catalog release-catalog
+import-catalog:
+	$(OPS) import-catalog '$(ENV)'
 
-$(SOTH_LINUX_AMD64): linux-binaries-prereqs linux-binaries-targets
-	@mkdir -p "$(DIST_DIR)"
-	$(CARGO) build -p soth-cli --bin soth --release --target "$(LINUX_X86_64_TARGET)"
-	cp "target/$(LINUX_X86_64_TARGET)/release/soth" "$(SOTH_LINUX_AMD64)"
-	chmod +x "$(SOTH_LINUX_AMD64)"
-	shasum -a 256 "$(SOTH_LINUX_AMD64)" > "$(SOTH_LINUX_AMD64).sha256"
+compile-catalog:
+	$(OPS) compile-catalog '$(ENV)'
 
-$(SOTH_LINUX_ARM64): linux-binaries-prereqs linux-binaries-targets
-	@mkdir -p "$(DIST_DIR)"
-	@command -v "$(LINUX_ARM64_LINKER)" >/dev/null 2>&1 || { \
-		echo "error: missing required linker '$(LINUX_ARM64_LINKER)' for $(LINUX_ARM64_TARGET)"; \
-		echo "hint: on Ubuntu/Debian install gcc-aarch64-linux-gnu"; \
-		exit 1; \
-	}
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$(LINUX_ARM64_LINKER)" \
-		$(CARGO) build -p soth-cli --bin soth --release --target "$(LINUX_ARM64_TARGET)"
-	cp "target/$(LINUX_ARM64_TARGET)/release/soth" "$(SOTH_LINUX_ARM64)"
-	chmod +x "$(SOTH_LINUX_ARM64)"
-	shasum -a 256 "$(SOTH_LINUX_ARM64)" > "$(SOTH_LINUX_ARM64).sha256"
+publish-catalog:
+	$(OPS) publish-catalog '$(ENV)'
 
-$(SOTH_OPS_LINUX_AMD64): linux-binaries-prereqs linux-binaries-targets
-	@mkdir -p "$(DIST_DIR)"
-	$(CARGO) build -p soth-cli --bin soth-ops --release --no-default-features --features ops --target "$(LINUX_X86_64_TARGET)"
-	cp "target/$(LINUX_X86_64_TARGET)/release/soth-ops" "$(SOTH_OPS_LINUX_AMD64)"
-	chmod +x "$(SOTH_OPS_LINUX_AMD64)"
-	shasum -a 256 "$(SOTH_OPS_LINUX_AMD64)" > "$(SOTH_OPS_LINUX_AMD64).sha256"
+release-catalog:
+	$(OPS) release-catalog '$(ENV)'
 
-$(SOTH_OPS_LINUX_ARM64): linux-binaries-prereqs linux-binaries-targets
-	@mkdir -p "$(DIST_DIR)"
-	@command -v "$(LINUX_ARM64_LINKER)" >/dev/null 2>&1 || { \
-		echo "error: missing required linker '$(LINUX_ARM64_LINKER)' for $(LINUX_ARM64_TARGET)"; \
-		echo "hint: on Ubuntu/Debian install gcc-aarch64-linux-gnu"; \
-		exit 1; \
-	}
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$(LINUX_ARM64_LINKER)" \
-		$(CARGO) build -p soth-cli --bin soth-ops --release --no-default-features --features ops --target "$(LINUX_ARM64_TARGET)"
-	cp "target/$(LINUX_ARM64_TARGET)/release/soth-ops" "$(SOTH_OPS_LINUX_ARM64)"
-	chmod +x "$(SOTH_OPS_LINUX_ARM64)"
-	shasum -a 256 "$(SOTH_OPS_LINUX_ARM64)" > "$(SOTH_OPS_LINUX_ARM64).sha256"
+.PHONY: status status-all
+status:
+	$(OPS) status '$(ENV)'
 
-linux-binaries-soth: $(SOTH_LINUX_AMD64) $(SOTH_LINUX_ARM64)
-	@echo "Built $(SOTH_LINUX_AMD64)"
-	@echo "Built $(SOTH_LINUX_ARM64)"
+status-all:
+	$(OPS) status-all
 
-linux-binaries-soth-ops: $(SOTH_OPS_LINUX_AMD64) $(SOTH_OPS_LINUX_ARM64)
-	@echo "Built $(SOTH_OPS_LINUX_AMD64)"
-	@echo "Built $(SOTH_OPS_LINUX_ARM64)"
-
-linux-binaries: $(SOTH_LINUX_AMD64) $(SOTH_LINUX_ARM64) $(SOTH_OPS_LINUX_AMD64) $(SOTH_OPS_LINUX_ARM64)
-	@$(MAKE) linux-binaries-verify
-
-linux-binaries-verify: linux-binaries-prereqs
-	@test -f "$(SOTH_LINUX_AMD64)" || { echo "error: missing $(SOTH_LINUX_AMD64)"; exit 1; }
-	@test -f "$(SOTH_LINUX_ARM64)" || { echo "error: missing $(SOTH_LINUX_ARM64)"; exit 1; }
-	@test -f "$(SOTH_OPS_LINUX_AMD64)" || { echo "error: missing $(SOTH_OPS_LINUX_AMD64)"; exit 1; }
-	@test -f "$(SOTH_OPS_LINUX_ARM64)" || { echo "error: missing $(SOTH_OPS_LINUX_ARM64)"; exit 1; }
-	file "$(SOTH_LINUX_AMD64)" "$(SOTH_LINUX_ARM64)" "$(SOTH_OPS_LINUX_AMD64)" "$(SOTH_OPS_LINUX_ARM64)"
-	@echo "Checksums:"
-	@cat "$(SOTH_LINUX_AMD64).sha256"
-	@cat "$(SOTH_LINUX_ARM64).sha256"
-	@cat "$(SOTH_OPS_LINUX_AMD64).sha256"
-	@cat "$(SOTH_OPS_LINUX_ARM64).sha256"
-
+.PHONY: clean-dist
 clean-dist:
-	rm -rf "$(DIST_DIR)"
+	$(OPS) clean-dist

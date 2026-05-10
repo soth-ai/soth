@@ -167,37 +167,7 @@ fn install_trust(cert_path: &Path) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let output = Command::new("certutil")
-            .args(["-addstore", "-f", "Root"])
-            .arg(cert_path)
-            .creation_flags(0x08000000)
-            .output()
-            .context("failed executing certutil")?;
-        if output.status.success() {
-            style::success("CA trusted in Windows Root store.");
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let combined = format!("{stderr}{stdout}");
-        let lower = combined.to_ascii_lowercase();
-        // certutil surfaces admin failure as "access is denied" / 0x80070005 /
-        // "The system cannot find the file specified" when HKLM\...\Root is blocked.
-        if lower.contains("access is denied")
-            || lower.contains("0x80070005")
-            || lower.contains("denied")
-            || output.status.code() == Some(5)
-        {
-            anyhow::bail!(
-                "certutil -addstore failed: access denied. \
-                 Trusting a CA in the Windows Root store requires Administrator privileges. \
-                 Re-run `soth proxy setup-ca` from an elevated PowerShell or Command Prompt \
-                 (right-click → Run as administrator).\n\nraw error: {}",
-                combined.trim()
-            );
-        }
-        anyhow::bail!("certutil -addstore failed: {}", combined.trim());
+        install_trust_windows(cert_path)
     }
 
     #[cfg(target_os = "linux")]
@@ -218,85 +188,252 @@ fn install_trust(cert_path: &Path) -> Result<()> {
 }
 
 /// macOS trust installation strategy:
-/// 1. Add cert to login keychain (non-admin, ensures it's present)
-/// 2. Verify SSL trust with `security verify-cert`
-/// 3. If not trusted, elevate via `osascript` to add to system keychain with admin trust
-/// 4. If elevation fails/declined, print manual instructions
+/// 1. Fast path: if the cert is already in the admin trust domain (prior
+///    install or MDM), succeed without prompting.
+/// 2. Elevate via `sudo`, NOT `osascript with administrator privileges`.
+///    `security add-trusted-cert` performs an internal `SecTrustSettingsSet`
+///    call which, on Big Sur+, requires its own SecurityAgent GUI prompt
+///    for the trust-settings change. AppleScript-elevated shells run in a
+///    session that's isolated from SecurityAgent, so that nested prompt
+///    fails with `The authorization was denied since no user interaction
+///    was possible`. Plain `sudo` from a terminal-connected process tree
+///    keeps the user's launchd/Aqua session reachable, so the GUI prompt
+///    can appear. This is the same approach mkcert and Caddy use.
+/// 3. `sudo` opens `/dev/tty` directly for its password prompt, so this
+///    works even from `curl … | bash` (where stdin is the script pipe)
+///    as long as the install is being driven from a real terminal.
+/// 4. Explicit `-p ssl -p basic` on `add-trusted-cert` ensures the trust
+///    entry contains the SSL policy explicitly — without `-p`, some macOS
+///    releases write an empty policy list that's interpreted narrowly.
+/// 5. Verify by reading `trust-settings-export` (authoritative since Big
+///    Sur). Do NOT use `verify-cert -p ssl`: it rejects a self-signed CA
+///    treated as an SSL leaf even when trust is correctly installed.
 #[cfg(target_os = "macos")]
 fn install_trust_macos(cert_path: &Path) -> Result<()> {
-    let login_keychain = dirs::home_dir()
-        .map(|home| home.join("Library/Keychains/login.keychain-db"))
-        .unwrap_or_else(|| PathBuf::from("login.keychain-db"));
+    use std::process::Stdio;
 
-    // Step 1: Add to login keychain (ensures cert is present, may not set trust).
-    let add_output = Command::new("security")
-        .args(["add-certificates", "-k"])
-        .arg(&login_keychain)
-        .arg(cert_path)
-        .output()
-        .context("failed adding certificate to login keychain")?;
-    let add_stderr = String::from_utf8_lossy(&add_output.stderr).to_ascii_lowercase();
-    if !add_output.status.success()
-        && !add_stderr.contains("already exists")
-        && !add_stderr.contains("the specified item already exists")
-    {
-        style::warning(&format!(
-            "Could not add cert to login keychain: {}",
-            String::from_utf8_lossy(&add_output.stderr).trim()
-        ));
+    // Step 1: Fast path. Re-running `soth up` or a `curl … | bash` upgrade
+    // shouldn't re-prompt if trust is already in place.
+    match super::ca_health::macos_cert_in_admin_trust(cert_path) {
+        Ok(true) => {
+            style::success("CA already trusted in admin trust domain.");
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(error) => {
+            style::warning(&format!(
+                "Could not pre-check admin trust state: {error}. Continuing."
+            ));
+        }
     }
 
-    // Step 2: Check if already trusted for SSL (e.g., from a previous setup-ca or MDM).
-    if macos_verify_ssl_trust(cert_path) {
-        style::success("CA is already trusted for SSL.");
+    // Step 2: Decide between sudo (terminal-connected) and osascript
+    // (truly headless). We probe `/dev/tty` to detect the difference —
+    // `sudo` itself reads its password from `/dev/tty`, not stdin, so a
+    // pipe on stdin (from `curl|bash`) does NOT prevent sudo from
+    // working as long as the controlling terminal is reachable.
+    let has_tty = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/tty")
+        .is_ok();
+
+    if has_tty {
+        style::info(
+            "Trusting CA. macOS may prompt for your password (sudo, then a \
+             trust-settings authorization dialog).",
+        );
+        let status = Command::new("sudo")
+            .args([
+                "security",
+                "add-trusted-cert",
+                "-d",
+                "-r",
+                "trustRoot",
+                "-p",
+                "ssl",
+                "-p",
+                "basic",
+                "-k",
+                "/Library/Keychains/System.keychain",
+            ])
+            .arg(cert_path)
+            // Inherit stdio so sudo can prompt and security can surface
+            // any error directly to the user. sudo opens /dev/tty for the
+            // password regardless of stdin, so the pipe from curl|bash
+            // doesn't interfere.
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("failed launching sudo security add-trusted-cert")?;
+
+        if !status.success() {
+            anyhow::bail!(
+                "sudo security add-trusted-cert exited with status {}. \
+                 Manual fallback:\n  sudo security add-trusted-cert -d -r trustRoot \
+                 -p ssl -p basic -k /Library/Keychains/System.keychain {}",
+                status,
+                cert_path.display()
+            );
+        }
+    } else {
+        // Headless / no controlling terminal. osascript "with administrator
+        // privileges" is unlikely to succeed for trust-settings on Big Sur+
+        // because of the nested SecurityAgent prompt, but it's the only
+        // option here — try it and surface a clear message if it fails.
+        style::warning(
+            "No terminal detected — falling back to GUI elevation. \
+             This often fails for trust-settings changes on macOS Big Sur+; \
+             if it does, run from an interactive terminal.",
+        );
+        let cert_escaped = cert_path.display().to_string().replace('\'', "'\\''");
+        let inner_command = format!(
+            "security add-trusted-cert -d -r trustRoot -p ssl -p basic \
+               -k /Library/Keychains/System.keychain '{cert_escaped}'"
+        );
+        let escaped_inner = inner_command.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!("do shell script \"{escaped_inner}\" with administrator privileges");
+        let elevate = Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .context("failed executing osascript for admin trust elevation")?;
+        if !elevate.status.success() {
+            let stderr = String::from_utf8_lossy(&elevate.stderr);
+            if stderr.to_ascii_lowercase().contains("user canceled") || stderr.contains("-128") {
+                anyhow::bail!(
+                    "Administrator elevation was cancelled. Re-run `soth setup-ca` from \
+                     an interactive terminal so sudo can prompt for your password."
+                );
+            }
+            anyhow::bail!(
+                "osascript trust install failed (this is expected on Big Sur+ \
+                 for trust-settings changes — re-run from a terminal): {}. \
+                 Manual fallback:\n  sudo security add-trusted-cert -d -r trustRoot \
+                 -p ssl -p basic -k /Library/Keychains/System.keychain {}",
+                stderr.trim(),
+                cert_path.display()
+            );
+        }
+    }
+
+    // Step 3: Verify via trust-settings-export.
+    match super::ca_health::macos_cert_in_admin_trust(cert_path) {
+        Ok(true) => {
+            style::success("CA trusted in macOS admin trust domain.");
+            Ok(())
+        }
+        Ok(false) => {
+            anyhow::bail!(
+                "security add-trusted-cert exited successfully but the cert is \
+                 not in the admin trust domain. This typically means MDM or a \
+                 configuration profile is blocking user-added roots. \
+                 Manual workaround: open '{}' in Keychain Access, then set \
+                 'Always Trust' under the Trust section.",
+                cert_path.display()
+            );
+        }
+        Err(error) => {
+            style::warning(&format!(
+                "Trust install command succeeded but verification read failed: {error}"
+            ));
+            Ok(())
+        }
+    }
+}
+
+/// Windows trust installation strategy:
+/// 1. Try `certutil -addstore -f Root <cert>` directly. If the calling
+///    shell is already elevated (or if HKLM\Root happens to be writable
+///    by the user, which it isn't by default), this succeeds with no UAC.
+/// 2. On access-denied, self-elevate via `powershell Start-Process -Verb
+///    RunAs`. This triggers the UAC consent dialog so a `curl … | bash`
+///    install from non-elevated Git Bash / MSYS still completes with one
+///    user click.
+/// 3. Verify by reading the LocalMachine `Root` store via
+///    `windows_root_store_thumbprints`.
+#[cfg(target_os = "windows")]
+fn install_trust_windows(cert_path: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let direct = Command::new("certutil")
+        .args(["-addstore", "-f", "Root"])
+        .arg(cert_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed executing certutil")?;
+    if direct.status.success() {
+        style::success("CA trusted in Windows Root store.");
         return Ok(());
     }
 
-    // Step 3: Elevate to set trust. Uses osascript which shows a native macOS
-    // password dialog — no terminal sudo needed.
-    style::info("Administrator privileges are required to trust the CA for SSL.");
-    let cert_escaped = cert_path.display().to_string().replace('\'', "'\\''");
-    let script = format!(
-        "do shell script \"security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '{cert_escaped}'\" with administrator privileges"
-    );
-    let elevate = Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .context("failed executing osascript for admin trust elevation")?;
+    let direct_stderr = String::from_utf8_lossy(&direct.stderr);
+    let direct_stdout = String::from_utf8_lossy(&direct.stdout);
+    let direct_combined = format!("{direct_stderr}{direct_stdout}");
+    let lower = direct_combined.to_ascii_lowercase();
 
-    if elevate.status.success() {
-        // Verify it actually took effect.
-        if macos_verify_ssl_trust(cert_path) {
-            style::success("CA trusted in macOS system keychain (SSL verified).");
-            return Ok(());
-        }
-        style::warning("Admin trust command succeeded but SSL verification still fails.");
-    } else {
-        let stderr = String::from_utf8_lossy(&elevate.stderr);
-        if stderr.to_ascii_lowercase().contains("user canceled") || stderr.contains("-128") {
-            style::warning("Administrator elevation was cancelled.");
-        } else {
-            style::warning(&format!("Admin elevation failed: {}", stderr.trim()));
-        }
+    // certutil surfaces admin failure as "access is denied" / 0x80070005.
+    let is_access_denied = lower.contains("access is denied")
+        || lower.contains("0x80070005")
+        || lower.contains("denied")
+        || direct.status.code() == Some(5);
+
+    if !is_access_denied {
+        anyhow::bail!("certutil -addstore failed: {}", direct_combined.trim());
     }
 
-    // Step 4: Fallback instructions.
-    style::info(&format!(
-        "To trust the CA manually, run:\n  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
-        cert_path.display()
-    ));
-    Ok(())
-}
+    // Self-elevate via PowerShell. `Start-Process -Verb RunAs` triggers
+    // the UAC consent dialog. `-Wait -PassThru` blocks until the elevated
+    // certutil exits and surfaces its exit code so we know whether the
+    // install actually succeeded after the user clicked "Yes".
+    style::info("Administrator privileges are required to add the CA to the Windows Root store.");
 
-#[cfg(target_os = "macos")]
-fn macos_verify_ssl_trust(cert_path: &Path) -> bool {
-    Command::new("security")
-        .args(["verify-cert", "-c"])
-        .arg(cert_path)
-        .args(["-p", "ssl"])
+    // PowerShell single-quoted strings escape an apostrophe by doubling
+    // it. Cert paths from us never contain quotes but we sanitize anyway.
+    let cert_q = cert_path.display().to_string().replace('\'', "''");
+    let ps_cmd = format!(
+        "$ErrorActionPreference='Stop'; \
+         try {{ \
+           $p = Start-Process -FilePath 'certutil.exe' \
+                              -ArgumentList @('-addstore','-f','Root','{cert_q}') \
+                              -Verb RunAs -Wait -PassThru -WindowStyle Hidden; \
+           exit $p.ExitCode \
+         }} catch {{ \
+           [Console]::Error.WriteLine($_.Exception.Message); exit 1 \
+         }}"
+    );
+
+    let elevated = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+        .context("failed launching elevated PowerShell for certutil")?;
+
+    if !elevated.status.success() {
+        let err = String::from_utf8_lossy(&elevated.stderr);
+        let err_lower = err.to_ascii_lowercase();
+        // UAC dismissal raises "The operation was canceled by the user"
+        // (0x800704C7) from Start-Process.
+        if err_lower.contains("canceled by the user")
+            || err_lower.contains("operation was canceled")
+            || err.contains("0x800704C7")
+        {
+            anyhow::bail!(
+                "UAC elevation was cancelled. Re-run `soth setup-ca` and click Yes \
+                 on the Windows User Account Control prompt to trust the SOTH MITM CA."
+            );
+        }
+        anyhow::bail!(
+            "Elevated certutil failed: {}. \
+             Manual fallback: open an Administrator PowerShell and run \
+             `certutil -addstore -f Root \"{}\"`.",
+            err.trim(),
+            cert_path.display()
+        );
+    }
+
+    style::success("CA trusted in Windows Root store (via UAC elevation).");
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

@@ -3,9 +3,12 @@ resolver = "2"
 members = [
     "crates/soth-cli",
     "crates/soth-core",
+    "crates/soth-api-types",
     "crates/soth-bundle",
     "crates/soth-classify",
+    "crates/soth-conformance-tests",
     "crates/soth-proxy",
+    "crates/soth-sdk-core",
     "crates/soth-telemetry",
     "crates/soth-policy",
     "crates/soth-sync",
@@ -13,6 +16,9 @@ members = [
     "crates/soth-detect",
     "crates/soth-extensions",
     "extensions/historian",
+    "extensions/code",
+    "bindings/soth-py",
+    "bindings/soth-node",
 ]
 default-members = [
     "crates/soth-cli",
@@ -25,6 +31,11 @@ default-members = [
     "crates/soth-sync",
     "crates/soth-extensions",
 ]
+# Bindings (soth-py, soth-node) are explicitly NOT in default-members:
+# they require Python / Node toolchains and produce cdylibs that the
+# rest of the workspace doesn't link against. Build them via
+# `cargo build -p soth-py` / `cargo build -p soth-node` or via the
+# language-level tooling (maturin / @napi-rs/cli).
 exclude = []
 
 [workspace.package]
@@ -38,8 +49,14 @@ authors = ["Labterminal"]
 [workspace.dependencies]
 # Internal crates
 soth-core = { path = "crates/soth-core" }
+soth-api-types = { path = "crates/soth-api-types" }
 soth-bundle = { path = "crates/soth-bundle" }
-soth-classify = { path = "crates/soth-classify" }
+# Default features OFF at the workspace level so the WASM SDK target
+# can build without ONNX. Consumers that want local classification
+# (the proxy, native bindings) opt back in via `features =
+# ["onnx-models", ...]` on their own dep entries — same pattern as
+# `soth-detect` above.
+soth-classify = { path = "crates/soth-classify", default-features = false }
 soth-proxy = { path = "crates/soth-proxy" }
 soth-telemetry = { path = "crates/soth-telemetry" }
 soth-policy = { path = "crates/soth-policy" }
@@ -48,6 +65,7 @@ soth-parse = { path = "crates/soth-parse" }
 soth-detect = { path = "crates/soth-detect", default-features = false }
 soth-extensions = { path = "crates/soth-extensions" }
 soth-historian = { path = "extensions/historian" }
+soth-code = { path = "extensions/code" }
 
 # Async runtime
 tokio = { version = "1", features = [

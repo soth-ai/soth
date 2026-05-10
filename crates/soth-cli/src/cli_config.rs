@@ -21,6 +21,12 @@ pub struct SothConfig {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub pipeline: PipelineOverrides,
+    /// Per-extension on/off and per-extension knobs. Today only governs
+    /// the historian extension (AI-tool-history backfill + watch). The
+    /// `extensions:` block is optional in soth.yaml — missing or empty
+    /// keeps the historical default of "everything enabled".
+    #[serde(default)]
+    pub extensions: ExtensionsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +58,31 @@ pub struct ForwardProxyConfig {
     pub max_flow_event_backlog: usize,
     pub max_in_flight_bytes: usize,
     pub max_concurrent_flows: usize,
+
+    // ── soth-code per-agent gating (→ docs/gryph/plan.md §10.11/.12) ──
+    /// **Planned, not yet effective.** User-Agent glob patterns for
+    /// AI coding agents whose traffic should bypass MITM at the proxy
+    /// once the §10.11 A→C trajectory closes for that agent.  Today
+    /// the `audited_bypass_agents` filter validates membership against
+    /// `historian.adapters.<agent>.usage_coverage_audited` and
+    /// `soth code audit-status` reports the result, but **the proxy's
+    /// listener loop does not yet consume this list** — adding an
+    /// entry here is observable in `audit-status` but does not
+    /// actually cause the proxy to bypass that agent.  Wiring lands
+    /// when the bypass-eligibility gate becomes a runtime concern;
+    /// until then this knob is forward-looking config only.
+    /// Default empty.
+    #[serde(default)]
+    pub bypass_agents: Vec<String>,
+    /// User-Agent glob patterns for agents in **cost-skim** mode: proxy
+    /// emits a narrow event with provider/model/tokens/cost only, no
+    /// classify, no tool-use parsing. Used as a transitional fallback
+    /// for agents whose historian playbook does not yet capture
+    /// authoritative `usage` blocks (plan §10.12). Migrates to
+    /// `bypass_agents` once historian usage coverage is audited.
+    /// Default empty.
+    #[serde(default)]
+    pub cost_skim_agents: Vec<String>,
 }
 
 impl Default for ForwardProxyConfig {
@@ -69,19 +100,35 @@ impl Default for ForwardProxyConfig {
             process_attribution: ForwardProxyProcessAttributionConfig::default(),
             tls: ForwardProxyTlsConfig::default(),
             flow_runtime: ForwardProxyFlowRuntimeConfig::default(),
-            upstream_timeout: DurationSetting::millis(30_000),
+            // Total upstream operation deadline. 30s used to be the default
+            // but it bisected long Claude / GPT tool-calling streams that
+            // routinely run 30-90s end-to-end, so the user-visible symptom
+            // was "API Error: socket connection closed unexpectedly" mid-
+            // response. 120s gives streaming LLM responses the headroom
+            // they need without hiding genuinely-stuck upstreams.
+            upstream_timeout: DurationSetting::millis(120_000),
             upstream_retry_on_failure: false,
             upstream_retry_delay: DurationSetting::millis(200),
-            capture_max_body_bytes: 10 * 1024 * 1024,
+            capture_max_body_bytes: 64 * 1024 * 1024,
             buffer_request_bodies: true,
-            handler_request_timeout: DurationSetting::millis(5_000),
-            handler_response_timeout: DurationSetting::millis(5_000),
+            // Handler stage timeout (per request/response chunk). 5s was
+            // way too tight for HTTP/2 streaming: Claude's first byte on
+            // big inference jobs takes 5-10s, which would trip the
+            // handler timeout and cause soth-mitm to reap the flow with
+            // "reaping stale flow state without explicit stream_end".
+            // 15s matches the underlying soth-proxy default in
+            // crates/soth-proxy/src/config.rs and aligns with what
+            // upstream LLM APIs actually need.
+            handler_request_timeout: DurationSetting::millis(15_000),
+            handler_response_timeout: DurationSetting::millis(15_000),
             handler_recover_from_panics: true,
             max_http_head_bytes: 64 * 1024,
             accept_retry_backoff: DurationSetting::millis(100),
             max_flow_event_backlog: 8 * 1024,
             max_in_flight_bytes: 64 * 1024 * 1024,
             max_concurrent_flows: 2_048,
+            bypass_agents: Vec::new(),
+            cost_skim_agents: Vec::new(),
         }
     }
 }
@@ -89,6 +136,62 @@ impl Default for ForwardProxyConfig {
 impl ForwardProxyConfig {
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.address, self.port)
+    }
+
+    /// Filter `bypass_agents` to the subset whose historian usage-
+    /// coverage audit has passed.  Returns `(allowed, dropped)`.
+    /// Callers should log each dropped agent at WARN level so the
+    /// operator notices their config knob silently degraded —
+    /// silent ignore would let an operator believe they're saving
+    /// proxy CPU when in fact bypass never engaged.
+    ///
+    /// The plan §10.11 trajectory gate is per-agent: bypass is
+    /// only safe once we know historian's session-layer playbook
+    /// will recover authoritative `usage` data the network layer
+    /// is no longer seeing.  This filter is the runtime
+    /// enforcement of that gate.
+    pub fn audited_bypass_agents(
+        &self,
+        historian: &HistorianExtensionConfig,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut allowed = Vec::new();
+        let mut dropped = Vec::new();
+        for agent in &self.bypass_agents {
+            let adapter = bypass_ua_to_adapter(agent);
+            if historian.is_usage_coverage_audited(&adapter) {
+                allowed.push(agent.clone());
+            } else {
+                dropped.push(agent.clone());
+            }
+        }
+        (allowed, dropped)
+    }
+}
+
+/// Resolve a `bypass_agents` UA-glob pattern to the adapter name
+/// the historian audit map keys on.  Bypass list holds outgoing
+/// User-Agent prefixes (e.g. "claude-cli/*", "cursor/*") because
+/// that's how the proxy matches incoming traffic, but the audit
+/// is per-adapter.  Conservative: unmapped patterns return their
+/// own (lower-cased, dash→underscore) form, which falls through
+/// to "not audited" in the historian map and the bypass entry is
+/// dropped.  Add to the table when a new agent's UA prefix is
+/// confirmed.
+fn bypass_ua_to_adapter(ua_glob: &str) -> String {
+    let stripped = ua_glob
+        .trim_end_matches('*')
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    match stripped.as_str() {
+        // Claude Code's CLI sends `claude-cli/<version>`.
+        "claude-cli" | "claude-code" | "claude_code" => "claude_code".to_string(),
+        "cursor" | "cursor-agent" => "cursor".to_string(),
+        "codex" | "openai-codex" | "openai_codex" => "openai_codex".to_string(),
+        "gemini-cli" | "gemini_cli" => "gemini_cli".to_string(),
+        "pi-agent" | "pi_agent" => "pi_agent".to_string(),
+        "windsurf" | "windsurf-extension" => "windsurf".to_string(),
+        "opencode" => "opencode".to_string(),
+        other => other.replace('-', "_"),
     }
 }
 
@@ -131,7 +234,13 @@ impl Default for ForwardProxyPoolConfig {
     fn default() -> Self {
         Self {
             max_connections_per_host: 64,
-            idle_timeout: DurationSetting::millis(60_000),
+            // Pool-side idle timeout: how long an idle upstream connection
+            // sits in the pool before being closed. 60s used to be the
+            // default but it caused the pool to drop conns right when an
+            // LLM client paused between turns, forcing a fresh handshake
+            // on the next request. 90s matches the underlying soth-proxy
+            // default and improves connection reuse.
+            idle_timeout: DurationSetting::millis(90_000),
             connect_timeout: DurationSetting::millis(10_000),
             max_idle_per_host: 16,
         }
@@ -425,6 +534,448 @@ pub struct PipelineOverrides {
     pub non_cataloged_host_action: Option<String>,
 }
 
+/// Per-extension toggles. Each field is its own struct so individual
+/// extensions can grow knobs without affecting the others.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionsConfig {
+    pub historian: HistorianExtensionConfig,
+    pub code: CodeExtensionConfig,
+}
+
+impl Default for ExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            historian: HistorianExtensionConfig::default(),
+            code: CodeExtensionConfig::default(),
+        }
+    }
+}
+
+/// Historian extension config. Backfills + watches local AI-tool history
+/// (Cursor, Claude Code, Gemini CLI, ...) and enriches it with classify.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistorianExtensionConfig {
+    /// Master switch. Off → no backfill, no watch, no periodic SQLite
+    /// scans of Cursor's `state.vscdb`. Set to false when debugging
+    /// network issues that may correlate with historian CPU bursts.
+    pub enabled: bool,
+
+    /// How historian runs in relation to the proxy worker.
+    ///
+    /// `Subprocess` (default): historian runs in its own process at
+    /// nice +5 / BELOW_NORMAL_PRIORITY_CLASS. The proxy worker's
+    /// tokio runtime never sees historian's classify CPU bursts, so
+    /// long-lived TLS tunnels (video, websockets) don't get reaped
+    /// by upstream CDNs because of momentary mitm-runtime starvation.
+    ///
+    /// `InProcess`: historian registers as an ExtensionRegistry hook
+    /// inside the proxy worker. Lower memory floor (~30-50 MiB), but
+    /// classify bursts compete with mitm flow handling. Kept as an
+    /// opt-in for resource-constrained installs (containers,
+    /// CI runners) where the extra process is more expensive than
+    /// the occasional flow hiccup.
+    pub run_mode: HistorianRunMode,
+
+    /// Per-adapter audit verdicts that gate the proxy A→C
+    /// trajectory (plan §10.11). For each AI-coding-agent X,
+    /// `usage_coverage_audited == true` means an engineer has
+    /// verified that historian's playbook reliably extracts
+    /// per-turn `usage` blocks from X's session log — i.e.
+    /// authoritative cost telemetry will survive the proxy
+    /// going into bypass mode for that agent.
+    ///
+    /// Until this flag is true for an agent, the runtime will
+    /// **refuse** to honor membership of that agent in
+    /// `proxy.bypass_agents`: bypassing without audited usage
+    /// coverage means losing billing-grade cost data the cloud
+    /// can no longer recover. The check filters the bypass
+    /// list at proxy boot and emits a warning per excluded
+    /// agent.
+    ///
+    /// Defaults: `claude_code = true` (plan §9 confirmation;
+    /// historian's `claude_code` playbook ships with verified
+    /// `usage` extraction). All other agents default `false`
+    /// pending the per-agent audit (`docs/gryph/plan.md` §9
+    /// estimates ~1 engineer-day each).
+    ///
+    /// Uses an explicit field-default fn rather than
+    /// `#[serde(default)]` so that a YAML file containing
+    /// `historian: {}` (no `adapters` key) still gets the
+    /// canonical seven-agent table — `BTreeMap::default()` is
+    /// `{}` and would silently erase the per-agent verdicts.
+    #[serde(default = "default_historian_adapters")]
+    pub adapters: BTreeMap<String, HistorianAdapterAudit>,
+}
+
+fn default_historian_adapters() -> BTreeMap<String, HistorianAdapterAudit> {
+    // Sample-run audit performed 2026-05-08 against real session
+    // logs on a developer host (Claude Code + Cursor + Codex
+    // available locally; Gemini CLI / OpenClaw / Pi Agent /
+    // Windsurf / OpenCode unavailable).  Findings:
+    //
+    //   claude_code  source has rich `message.usage` (input,
+    //                output, cache_creation_input,
+    //                cache_read_input) — billing-grade — but
+    //                the historian playbook has `tokens: None`,
+    //                so the data is NOT extracted.  Plan §9's
+    //                "claude_code is audited" was based on
+    //                content extraction, not usage extraction.
+    //                Playbook update required before this
+    //                verdict can flip true.
+    //
+    //   cursor       sample of 123 chat rows had 0 `input_tokens`
+    //                in composerData and 1 in bubbleId — Cursor
+    //                does not record per-turn usage in its
+    //                chat storage at all.  No playbook fix can
+    //                recover what isn't there.
+    //
+    //   openai_codex source has token info at
+    //                `payload.info.total_token_usage.{input,output,
+    //                total}_tokens` BUT only on `type:event_msg`
+    //                lines.  The current playbook filters
+    //                `type:response_item` only, so event_msg
+    //                token data is dropped.  Fix: include
+    //                event_msg in the filter + structured token
+    //                extraction (TokenConfig today supports a
+    //                single scalar field — needs extension to
+    //                multi-field for billing-grade data).
+    //
+    //   gemini_cli   no local data on this audit host. Playbook
+    //                declares `tokens.total` (scalar). Even when
+    //                it works, this is single-total only — not
+    //                billing-grade per Anthropic-style usage.
+    //                Verdict deferred pending real session log.
+    //
+    //   openclaw     no local data. tokens=None in playbook.
+    //
+    //   pi_agent / windsurf / opencode  NO historian playbook
+    //                exists at all.  Cannot be audited until a
+    //                playbook lands.
+    //
+    // Net: NO agent currently passes the audit.  The defaults
+    // below reflect that.  Operators who need bypass mode
+    // before the engineering work is done can hand-flip a
+    // verdict in soth.yaml — `audited_at` carries who-and-when
+    // attribution if they do.
+
+    let mut adapters = BTreeMap::new();
+    adapters.insert(
+        "claude_code".to_string(),
+        HistorianAdapterAudit {
+            usage_coverage_audited: true,
+            audited_at: Some("2026-05-08 sample audit + playbook fix".to_string()),
+            caveats: Some(
+                "playbook now extracts message.usage.{input,output,cache_creation_input,\
+                 cache_read_input}_tokens per assistant turn — billing-grade.  Verified \
+                 against real session logs and pinned by jsonl::tests::\
+                 claude_code_playbook_extracts_billing_grade_usage."
+                    .to_string(),
+            ),
+        },
+    );
+    adapters.insert(
+        "cursor".to_string(),
+        HistorianAdapterAudit {
+            usage_coverage_audited: false,
+            audited_at: Some("2026-05-08 sample audit".to_string()),
+            caveats: Some(
+                "Cursor does not record per-turn usage in chat storage \
+                 (state.vscdb composerData/bubbleId) — nothing to extract"
+                    .to_string(),
+            ),
+        },
+    );
+    adapters.insert(
+        "openai_codex".to_string(),
+        HistorianAdapterAudit {
+            usage_coverage_audited: false,
+            audited_at: Some("2026-05-08 sample audit".to_string()),
+            caveats: Some(
+                "source has payload.info.{total,last}_token_usage but ONLY on \
+                 type:event_msg lines (not type:response_item which the playbook \
+                 reads as messages).  Engine refactor required: extract session-\
+                 level tokens from non-message lines, not just per-message — \
+                 different shape than TokenConfig per-record extraction supports.  \
+                 Tracked as engineering work distinct from the claude_code-style \
+                 playbook tweak."
+                    .to_string(),
+            ),
+        },
+    );
+    adapters.insert(
+        "gemini_cli".to_string(),
+        HistorianAdapterAudit {
+            usage_coverage_audited: false,
+            audited_at: Some("2026-05-08 desk audit (no local data)".to_string()),
+            caveats: Some(
+                "playbook declares tokens.total (scalar) — not billing-grade \
+                 per-turn structured usage"
+                    .to_string(),
+            ),
+        },
+    );
+    for agent in ["pi_agent", "windsurf", "opencode"] {
+        adapters.insert(
+            agent.to_string(),
+            HistorianAdapterAudit {
+                usage_coverage_audited: false,
+                audited_at: Some("2026-05-08 desk audit".to_string()),
+                caveats: Some("no historian playbook exists for this agent yet".to_string()),
+            },
+        );
+    }
+    adapters
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorianAdapterAudit {
+    /// True once an engineer has run a real session through the
+    /// adapter's historian playbook and confirmed that `usage`
+    /// blocks extract reliably per assistant turn. False until
+    /// then. Source of truth for the proxy's bypass-eligibility
+    /// check.
+    #[serde(default)]
+    pub usage_coverage_audited: bool,
+
+    /// Optional human note (audit date, who ran it, sample
+    /// session ID). Carries on the wire so an operator
+    /// inspecting the config can see when each verdict was
+    /// recorded without digging through commit history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audited_at: Option<String>,
+
+    /// Optional free-form caveat — e.g. "extracts input but not
+    /// cache_creation tokens", "only audited for tool_use turns,
+    /// not assistant text". Helps later operators decide whether
+    /// the audit's quality is enough for their billing needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caveats: Option<String>,
+}
+
+impl Default for HistorianExtensionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            run_mode: HistorianRunMode::default(),
+            adapters: default_historian_adapters(),
+        }
+    }
+}
+
+impl HistorianExtensionConfig {
+    /// True when the named agent has had its historian usage-coverage
+    /// audit completed.  Used by the proxy to gate bypass eligibility.
+    /// Unknown agents (not in the map) are treated as "not audited".
+    pub fn is_usage_coverage_audited(&self, agent: &str) -> bool {
+        self.adapters
+            .get(agent)
+            .map(|a| a.usage_coverage_audited)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorianRunMode {
+    /// Historian runs as a sibling process supervised by `soth start`.
+    /// Default — isolates classify CPU from the mitm runtime.
+    Subprocess,
+    /// Historian runs as an ExtensionRegistry hook inside the proxy
+    /// worker. Backwards-compatible behavior; explicit opt-in.
+    InProcess,
+}
+
+impl Default for HistorianRunMode {
+    fn default() -> Self {
+        Self::Subprocess
+    }
+}
+
+/// `soth-code` extension config. Per-action policy gate at the AI coding
+/// agent's hook boundary (Claude Code, Cursor, Codex, …). See
+/// `docs/gryph/plan.md` §10 for the layer model and §10.11 for the
+/// per-agent A→C trajectory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeExtensionConfig {
+    /// Master switch. Off → `soth code hook` invocations no-op (allow
+    /// all, no enqueue, no classify). On → hook handler runs the full
+    /// parse → redact → classify → policy → enqueue pipeline.
+    pub enabled: bool,
+
+    /// Behavior when policy evaluation fails (OPA bundle missing,
+    /// timeout exceeded, etc.).
+    ///
+    /// `Block` (default — security tool stance): a failure halts the
+    /// agent action with an error message. Surfaces problems loudly.
+    ///
+    /// `Allow`: failures are logged and the action proceeds. Operator
+    /// must accept the visibility risk; surfaces a `WARN` log line on
+    /// every fall-through (gryph Issue #20: silent fail-open is how
+    /// Pi Agent shipped policy enforcement that secretly didn't enforce).
+    pub on_policy_error: PolicyErrorMode,
+
+    /// Hard ceiling for the synchronous hook path. The agent waits this
+    /// long before assuming the hook has hung. Default 30s, matching
+    /// gryph PR #22's chosen value (anything longer freezes the agent).
+    pub timeout_ms: u32,
+
+    /// Per-agent enablement. Agents with no entry default to disabled
+    /// — adapters opt in explicitly so a misconfigured `code` block
+    /// doesn't accidentally route through every adapter shipped.
+    ///
+    /// Example yaml:
+    /// ```yaml
+    /// code:
+    ///   enabled: true
+    ///   agents:
+    ///     claude_code: { enabled: true }
+    /// ```
+    pub agents: std::collections::HashMap<String, CodeAgentConfig>,
+
+    /// Raw payload capture knob. Default is `Metadata` — only derived
+    /// signals (classify outputs, hashes, artifact metadata) get
+    /// persisted to the queue and shipped to the cloud. Operators
+    /// opting into `Audit` (raw payload on Block decisions only) or
+    /// `Full` (raw payload on every event) accept compliance and
+    /// retention responsibility for the captured content. Cloud-side
+    /// gating per-org provides defense-in-depth.
+    pub capture: CodeCaptureConfig,
+
+    /// How the per-action classify path runs.  Hooks are short-lived
+    /// subprocesses, so loading the 23 MB ONNX bundle per invocation
+    /// blows the latency target.  When `Subprocess` (default), `soth
+    /// start` supervises a long-running classify daemon alongside
+    /// historian and hooks talk to it over localhost TCP.
+    pub classify: CodeClassifyConfig,
+}
+
+/// `code.classify` block.  Controls how the per-hook classify call
+/// is dispatched — daemon, in-process, or off entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeClassifyConfig {
+    pub run_mode: ClassifyRunMode,
+}
+
+impl Default for CodeClassifyConfig {
+    fn default() -> Self {
+        Self {
+            run_mode: ClassifyRunMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifyRunMode {
+    /// Default.  `soth start` supervises a long-running classify
+    /// daemon (sibling to historian).  Hook subprocesses talk to it
+    /// over localhost TCP NDJSON, amortizing the ONNX
+    /// `Session::new` cost (≈50–150 ms cold) across every action
+    /// for the daemon's lifetime.  Falls back to `InProcess` per-
+    /// invocation when the daemon is unreachable.
+    Subprocess,
+    /// Each hook subprocess loads `~/.soth/bundle/` itself.
+    /// Adds ~50–150 ms cold latency per action — fine for low-
+    /// traffic dev hosts but blows the gate-latency budget on
+    /// active sessions.  Useful when the supervisor isn't running
+    /// (e.g.  CI runners that invoke `soth code hook` directly).
+    InProcess,
+    /// Skip classify entirely.  Sidecar fields render as
+    /// `unknown`/0 on the dashboard.  Operators choose this when
+    /// the agent's traffic is purely structural (no NL prompts) or
+    /// when they want to take classify off the hot path during
+    /// debugging.
+    Disabled,
+}
+
+impl Default for ClassifyRunMode {
+    fn default() -> Self {
+        Self::Subprocess
+    }
+}
+
+/// `code.capture` block. See [`CodeCaptureMode`] for semantics; the
+/// `max_payload_bytes` cap protects against megabyte-sized MCP tool
+/// responses (gryph PR #32) blowing up queue-row size when raw
+/// capture is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeCaptureConfig {
+    pub mode: CodeCaptureMode,
+    pub max_payload_bytes: usize,
+}
+
+impl Default for CodeCaptureConfig {
+    fn default() -> Self {
+        Self {
+            mode: CodeCaptureMode::Metadata,
+            max_payload_bytes: 64 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeCaptureMode {
+    /// Default: derived signals only; raw payload dropped before enqueue.
+    Metadata,
+    /// Raw payload preserved only for Block decisions (forensics).
+    Audit,
+    /// Raw payload preserved on every event (debugging / compliance).
+    Full,
+}
+
+impl Default for CodeCaptureMode {
+    fn default() -> Self {
+        Self::Metadata
+    }
+}
+
+impl Default for CodeExtensionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on_policy_error: PolicyErrorMode::Block,
+            timeout_ms: 30_000,
+            agents: std::collections::HashMap::new(),
+            capture: CodeCaptureConfig::default(),
+            classify: CodeClassifyConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyErrorMode {
+    Block,
+    Allow,
+}
+
+impl Default for PolicyErrorMode {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeAgentConfig {
+    /// Whether the adapter is active. Off-by-default per agent so a
+    /// misconfigured `code` block doesn't route through unintended
+    /// adapters.
+    pub enabled: bool,
+}
+
+impl Default for CodeAgentConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 pub fn default_config_path() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".soth").join(DEFAULT_CONFIG_FILE))
@@ -589,4 +1140,190 @@ pub fn sync_client_device_id(
 
 pub fn resolved_db_path(config: &SothConfig) -> PathBuf {
     expand_tilde(Path::new(config.proxy.db_path.as_str()))
+}
+
+#[cfg(test)]
+mod code_extension_config_tests {
+    use super::{
+        CodeAgentConfig, CodeExtensionConfig, ExtensionsConfig, ForwardProxyConfig,
+        HistorianAdapterAudit, HistorianExtensionConfig, PolicyErrorMode, SothConfig,
+    };
+
+    #[test]
+    fn code_config_default_matches_documented() {
+        // README example default must match code default — gryph Issue #41
+        // shipped because docs claimed `minimal` log level was default while
+        // code default was `standard`. Pin the contract here.
+        let c = CodeExtensionConfig::default();
+        assert!(c.enabled, "extension default is on");
+        assert_eq!(c.on_policy_error, PolicyErrorMode::Block);
+        assert_eq!(c.timeout_ms, 30_000);
+        assert!(
+            c.agents.is_empty(),
+            "no agents default to enabled — adapters opt in explicitly"
+        );
+        assert_eq!(
+            c.classify.run_mode,
+            super::ClassifyRunMode::Subprocess,
+            "default classify run mode is supervised daemon — pinning so the \
+             upgrade path doesn't silently regress to per-hook ONNX loads"
+        );
+    }
+
+    #[test]
+    fn agent_default_is_disabled() {
+        // Per-agent default off so a misconfigured `code` block doesn't
+        // route through unintended adapters.
+        let a = CodeAgentConfig::default();
+        assert!(!a.enabled);
+    }
+
+    #[test]
+    fn yaml_round_trip_with_claude_code_only() {
+        let yaml = r#"
+extensions:
+  code:
+    enabled: true
+    on_policy_error: block
+    timeout_ms: 30000
+    agents:
+      claude_code:
+        enabled: true
+"#;
+        let cfg: SothConfig = serde_yaml::from_str(yaml).expect("parse soth config");
+        let code = &cfg.extensions.code;
+        assert!(code.enabled);
+        assert_eq!(code.timeout_ms, 30_000);
+        assert_eq!(code.on_policy_error, PolicyErrorMode::Block);
+        let claude = code
+            .agents
+            .get("claude_code")
+            .expect("claude_code adapter entry present");
+        assert!(claude.enabled);
+    }
+
+    #[test]
+    fn missing_code_block_uses_defaults() {
+        // Backwards-compat: existing soth.yaml files with no `code:` block
+        // must keep working. `extensions:` is `serde(default)`, and
+        // `code:` inherits CodeExtensionConfig::default().
+        let yaml = "forward_proxy:\n  enabled: true\n";
+        let cfg: SothConfig = serde_yaml::from_str(yaml).expect("parse minimal config");
+        let code = &cfg.extensions.code;
+        assert!(code.enabled, "missing block should default-enable");
+        assert!(code.agents.is_empty());
+    }
+
+    #[test]
+    fn proxy_bypass_and_cost_skim_default_empty() {
+        let cfg = ForwardProxyConfig::default();
+        assert!(
+            cfg.bypass_agents.is_empty(),
+            "no bypass until explicit per-agent flip"
+        );
+        assert!(
+            cfg.cost_skim_agents.is_empty(),
+            "no cost-skim until usage-coverage audit gates flip"
+        );
+    }
+
+    #[test]
+    fn yaml_round_trip_with_proxy_bypass_lists() {
+        let yaml = r#"
+forward_proxy:
+  bypass_agents:
+    - "claude-cli/*"
+  cost_skim_agents:
+    - "cursor/*"
+"#;
+        let cfg: SothConfig = serde_yaml::from_str(yaml).expect("parse with bypass lists");
+        assert_eq!(cfg.forward_proxy.bypass_agents, vec!["claude-cli/*"]);
+        assert_eq!(cfg.forward_proxy.cost_skim_agents, vec!["cursor/*"]);
+    }
+
+    #[test]
+    fn extensions_config_default_includes_code() {
+        let ext = ExtensionsConfig::default();
+        assert!(ext.code.enabled);
+        // historian still defaulting (regression guard)
+        assert!(ext.historian.enabled);
+    }
+
+    #[test]
+    fn historian_audit_defaults_post_2026_05_audit() {
+        // Per the 2026-05-08 audit + playbook fix:
+        // - claude_code: TRUE (playbook now extracts
+        //   message.usage.{input,output,cache_creation_input,
+        //   cache_read_input}_tokens per assistant turn,
+        //   billing-grade — pinned by
+        //   `jsonl::tests::claude_code_playbook_extracts_billing_grade_usage`).
+        // - All others: FALSE (Codex blocked on engine
+        //   refactor; gemini_cli ships scalar-only;
+        //   cursor source has nothing to extract;
+        //   pi_agent / windsurf / opencode have no
+        //   playbook).
+        let h = HistorianExtensionConfig::default();
+        assert!(
+            h.is_usage_coverage_audited("claude_code"),
+            "claude_code must be audited true post-playbook-fix"
+        );
+        for agent in [
+            "cursor",
+            "openai_codex",
+            "gemini_cli",
+            "pi_agent",
+            "windsurf",
+            "opencode",
+        ] {
+            assert!(
+                !h.is_usage_coverage_audited(agent),
+                "{agent} default verdict stays false until its blocker is cleared"
+            );
+        }
+        // Unknown agents — also "not audited".  Default-deny.
+        assert!(!h.is_usage_coverage_audited("unknown_future_agent"));
+    }
+
+    #[test]
+    fn audited_bypass_lets_only_claude_through() {
+        // claude_code passes audit post-fix; the others stay
+        // dropped.  Operator who wires up bypass for the full
+        // set sees only `claude-cli/*` engage.
+        let mut proxy = ForwardProxyConfig::default();
+        proxy.bypass_agents = vec![
+            "claude-cli/*".to_string(),
+            "cursor/*".to_string(),
+            "windsurf-extension/*".to_string(),
+        ];
+        let historian = HistorianExtensionConfig::default();
+        let (allowed, dropped) = proxy.audited_bypass_agents(&historian);
+        assert_eq!(allowed, vec!["claude-cli/*"]);
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.contains(&"cursor/*".to_string()));
+        assert!(dropped.contains(&"windsurf-extension/*".to_string()));
+    }
+
+    #[test]
+    fn audited_bypass_passes_when_operator_flips_verdict() {
+        // Operators whose engineering work has earned a flip
+        // can manually set the verdict in soth.yaml. Pin that
+        // flow: a hand-flipped claude_code verdict makes
+        // claude-cli/* pass the filter even though the default
+        // is false.  This is the "I did the audit, here's the
+        // evidence" path.
+        let mut proxy = ForwardProxyConfig::default();
+        proxy.bypass_agents = vec!["claude-cli/*".to_string()];
+        let mut historian = HistorianExtensionConfig::default();
+        historian.adapters.insert(
+            "claude_code".to_string(),
+            HistorianAdapterAudit {
+                usage_coverage_audited: true,
+                audited_at: Some("2026-06-01 manual after playbook fix".to_string()),
+                caveats: None,
+            },
+        );
+        let (allowed, dropped) = proxy.audited_bypass_agents(&historian);
+        assert_eq!(allowed, vec!["claude-cli/*"]);
+        assert!(dropped.is_empty());
+    }
 }

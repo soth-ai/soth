@@ -180,18 +180,40 @@ fn score_rule_based(
     }
 }
 
+/// True cosine distance in `[0, 2]`. Robust to non-normalized inputs because
+/// `embedding_centroid` in `SessionSnapshot` is maintained as a running mean
+/// (`*c = (*c * (n-1) + e) / n` in soth-proxy/session/store.rs) — averaging
+/// unit vectors does not produce a unit vector, so the centroid drifts away
+/// from L2-norm 1.0 as samples accumulate. The previous implementation
+/// asserted unit-norm inputs and used `1 - dot(l, r)` as a fast path; that
+/// silently produced wrong drift values in release builds and panicked in
+/// debug. Now we divide by `||left|| * ||right||` explicitly.
+///
+/// Cost: one extra pass per vector for the norm + a sqrt + a division. The
+/// earlier "L2-normalized" optimisation was unsound for centroid drift, so
+/// the cycles spent normalising are correctness, not waste.
 fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
     if left.len() != right.len() || left.is_empty() {
         return 1.0; // max distance for invalid input
     }
-    debug_assert!(
-        (left.iter().map(|x| x * x).sum::<f32>().sqrt() - 1.0).abs() < 0.01,
-        "cosine_distance expects L2-normalized vectors"
-    );
-    let dot: f32 = left.iter().zip(right.iter()).map(|(l, r)| l * r).sum();
-    // For L2-normalized vectors, cosine similarity = dot product.
-    // Clamp to handle floating-point imprecision near the boundaries.
-    (1.0 - dot).clamp(0.0, 2.0)
+    let mut dot = 0.0f32;
+    let mut left_sq = 0.0f32;
+    let mut right_sq = 0.0f32;
+    for (l, r) in left.iter().zip(right.iter()) {
+        dot += l * r;
+        left_sq += l * l;
+        right_sq += r * r;
+    }
+    let denom = (left_sq * right_sq).sqrt();
+    if denom <= f32::EPSILON {
+        // One side is the zero vector — treat as maximum distance rather than
+        // dividing by ~0 and producing NaN/inf.
+        return 1.0;
+    }
+    let cosine_similarity = dot / denom;
+    // Cosine similarity is mathematically in [-1, 1]; clamp to handle FP
+    // jitter past the boundary. Distance is `1 - similarity` ∈ [0, 2].
+    (1.0 - cosine_similarity.clamp(-1.0, 1.0)).clamp(0.0, 2.0)
 }
 
 fn dedupe_flags(flags: &mut Vec<AnomalyFlag>) {
@@ -279,6 +301,7 @@ mod tests {
             kind: soth_core::ArtifactKind::ApiKey {
                 provider: Some(soth_core::DetectedProvider::OpenAi),
             },
+            credential_kind: None,
             severity: soth_core::ArtifactSeverity::High,
             location: soth_core::ArtifactLocation::UserContent {
                 turn: 0,
@@ -380,6 +403,48 @@ mod tests {
 
         assert!(output.flags.contains(&AnomalyFlag::TopicDrift));
         assert!(output.score > 0.0);
+    }
+
+    /// Regression: `embedding_centroid` is maintained as a running mean by
+    /// `soth-proxy/session/store.rs`, so it drifts away from unit norm as
+    /// samples accumulate. The earlier `cosine_distance` impl asserted
+    /// unit-norm inputs and panicked here in debug builds; in release builds
+    /// it silently produced wrong drift values. Both the panic (this test
+    /// previously crashed) and the silent-incorrect-value case are covered
+    /// by computing true cosine distance via `dot / (||a|| * ||b||)`.
+    #[test]
+    fn topic_drift_handles_non_unit_centroid() {
+        let mut session = baseline_session();
+        // Non-unit centroid: norm is sqrt(384 * 0.25^2) ≈ 4.9, far from 1.0.
+        session.embedding_centroid = Some(vec![0.25; 384]);
+        let mut current_embedding = vec![0.0f32; 384];
+        // Orthogonal-ish embedding: same magnitude pattern but different
+        // direction (positive in first half, negative in second).
+        for (idx, value) in current_embedding.iter_mut().enumerate() {
+            *value = if idx < 192 { 1.0 } else { -1.0 };
+        }
+        // L2-normalise the request embedding the way stage1 would.
+        let norm = (current_embedding.iter().map(|v| v * v).sum::<f32>()).sqrt();
+        for value in current_embedding.iter_mut() {
+            *value /= norm;
+        }
+
+        // Should not panic, and should report a finite drift score.
+        let output = run_stage(
+            Some(current_embedding),
+            baseline_normalized(),
+            Vec::new(),
+            Some(session),
+        );
+
+        assert!(output.score.is_finite());
+        // Centroid is all-positive; embedding is half-positive, half-negative.
+        // Cosine similarity is small/negative → distance is high → TopicDrift fires.
+        assert!(
+            output.flags.contains(&AnomalyFlag::TopicDrift),
+            "expected TopicDrift flag for orthogonal centroid/embedding pair, got {:?}",
+            output.flags
+        );
     }
 
     #[test]

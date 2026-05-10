@@ -34,14 +34,29 @@ impl ExtensionRuntimeContext {
 
     /// Load context from `~/.soth/` defaults.
     ///
-    /// Falls back to empty strings for identity fields when config is unavailable.
+    /// `bundle_path` must point at the same directory the proxy installs
+    /// runtime bundles to (`bundle.bundle_dir` in soth.yaml, default
+    /// `~/.soth/bundle/`). Historian's `ClassifyEnricher` calls
+    /// `soth_classify::load_bundle(&ctx.bundle_path)` and silently falls
+    /// back to `KeywordClassifier` when the directory is missing — so
+    /// every historian-emitted event ships with `use_case_label = Unknown`.
+    ///
+    /// This previously joined `"current"` (`~/.soth/bundle/current/`) to
+    /// support a versioned-layout design (`bundle/<version>/`,
+    /// `bundle/current` symlinking the active version) that was never
+    /// actually implemented in `install_runtime_bundle_files` — the
+    /// install path always wrote files flat into `bundle/`, so the
+    /// `current` subdir was a dead reference.
+    ///
+    /// Falls back to empty strings for identity fields when config is
+    /// unavailable.
     pub fn from_defaults() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let data_dir = home.join(".soth");
         Self {
             queue_dir: data_dir.join("queue"),
             db_path: data_dir.join("soth.db"),
-            bundle_path: data_dir.join("bundle").join("current"),
+            bundle_path: data_dir.join("bundle"),
             data_dir,
             org_id: String::new(),
             device_id: String::new(),
@@ -49,5 +64,35 @@ impl ExtensionRuntimeContext {
             bundle_version: String::new(),
             proxy_version: env!("CARGO_PKG_VERSION").to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin: historian's `bundle_path` must match the proxy's
+    /// `bundle.bundle_dir` default (also `~/.soth/bundle/` in
+    /// `soth-proxy/src/config.rs`). Drift here is silent — classify
+    /// enrichment falls back to a stub and every historian event
+    /// ships `Unknown` until a developer notices in telemetry.
+    #[test]
+    fn from_defaults_bundle_path_has_no_current_subdir() {
+        let ctx = ExtensionRuntimeContext::from_defaults();
+        let last = ctx
+            .bundle_path
+            .file_name()
+            .expect("bundle_path has a final component")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            last, "bundle",
+            "bundle_path must end in 'bundle/' — joining 'current' breaks historian classify because no installer writes that subdir"
+        );
+        assert_eq!(
+            ctx.bundle_path,
+            ctx.data_dir.join("bundle"),
+            "bundle_path must be `<data_dir>/bundle/`, the same path the proxy's install_runtime_bundle_files writes to"
+        );
     }
 }

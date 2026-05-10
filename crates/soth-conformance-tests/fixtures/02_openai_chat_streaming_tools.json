@@ -1,0 +1,61 @@
+{
+  "name": "openai_chat_streaming_tools",
+  "description": "OpenAI chat completion with a function-calling tool definition and stream=true.",
+  "axes": {
+    "provider": "openai",
+    "streaming": true,
+    "tools": true,
+    "content_class": "clean",
+    "format": "rest_chat_completions",
+    "capture_mode": "metadata_only"
+  },
+  "typed_call": {
+    "provider": "openai",
+    "model": "gpt-4o",
+    "messages": [
+      { "role": "system", "content": "You are a helpful weather assistant." },
+      { "role": "user", "content": "What is the weather in Tokyo right now?" }
+    ],
+    "tools": [
+      {
+        "name": "get_current_weather",
+        "description": "Get the current weather for a city",
+        "parameters_json": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}"
+      }
+    ],
+    "stream": true,
+    "max_tokens": 512
+  },
+  "raw_request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "host": "api.openai.com",
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "gpt-4o",
+      "messages": [
+        { "role": "system", "content": "You are a helpful weather assistant." },
+        { "role": "user", "content": "What is the weather in Tokyo right now?" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_current_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+              "type": "object",
+              "properties": { "city": { "type": "string" } },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "stream": true,
+      "max_tokens": 512
+    },
+    "matched_provider": "openai"
+  }
+}

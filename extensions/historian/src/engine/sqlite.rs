@@ -164,15 +164,19 @@ fn read_kv_sessions(
         });
     }
 
-    let where_clause = if let Some(rowid) = since_rowid {
-        format!(
-            "WHERE key LIKE '{}%' AND rowid > {}",
-            key_prefix.replace('\'', "''"),
-            rowid
-        )
-    } else {
-        format!("WHERE key LIKE '{}%'", key_prefix.replace('\'', "''"))
-    };
+    // We deliberately do NOT filter by `rowid > since_rowid`. Cursor (and any
+    // SQLite-backed client that updates a composer in place while appending
+    // bubble rows separately) keeps the COMPOSER rowid stable while new
+    // bubble rows pile up below. If we filter by composer rowid, the first
+    // poll reads every composer and sets the in-memory watermark to the max
+    // (e.g. 718). Every subsequent poll then runs `WHERE rowid > 718` and
+    // returns zero rows — even though `999eb10d` (rowid 627) has 14 new
+    // bubbles waiting. Re-scanning all composer rows on every poll is cheap
+    // (small N), and the content-hash dedup in DedupChecker::is_duplicate
+    // suppresses repeat emissions of unchanged sessions. The `since_rowid`
+    // input is kept for API compatibility but ignored on the read side.
+    let _ = since_rowid;
+    let where_clause = format!("WHERE key LIKE '{}%'", key_prefix.replace('\'', "''"));
 
     let sql =
         format!("SELECT {value_column}, rowid FROM {table} {where_clause} ORDER BY rowid ASC");
@@ -211,23 +215,10 @@ fn read_kv_sessions(
         .collect();
     drop(stmt);
 
-    // Pre-prepare the bubble/split-record lookup statement once; reused for
-    // every header in every session below. Avoids per-bubble re-prepare cost
-    // and — more importantly — lets us surface real errors via `.optional()`
-    // instead of swallowing them with `.ok()`.
-    let mut split_stmt_opt = if split_source.is_some() {
-        Some(
-            conn.prepare(&format!(
-                "SELECT {value_column} FROM {table} WHERE key = ?1"
-            ))
-            .map_err(|e| ReaderError::Reader {
-                tool: playbook.tool.clone(),
-                message: format!("prepare split lookup: {e}"),
-            })?,
-        )
-    } else {
-        None
-    };
+    // (No pre-prepared per-key lookup statement: the split-record path now
+    // scans `bubbleId:<sid>:%` rows directly per-session. See the loop body
+    // below — we run a fresh query rather than per-key lookups via the
+    // composer's lazy `fullConversationHeadersOnly` list.)
 
     for (value, rowid) in composer_rows {
         max_rowid = Some(max_rowid.map_or(rowid, |prev: i64| prev.max(rowid)));
@@ -282,105 +273,107 @@ fn read_kv_sessions(
         let mut split_text_missing: usize = 0;
 
         if records.is_empty() {
-            // Declarative split-record fallback: the inline records array is
-            // empty, so look up each record in a separate DB row using the
-            // playbook-configured header list + key template. Used for
-            // Cursor v14+ (`fullConversationHeadersOnly` → `bubbleId:*` rows).
+            // Split-record fallback. The composer's `conversation` array is
+            // empty; bubbles live in their own `bubbleId:<sid>:<bid>` rows.
+            //
+            // We deliberately do NOT iterate the composer's
+            // `fullConversationHeadersOnly` list. Cursor lazily UPDATEs that
+            // field — bubble rows are INSERTed instantly when the user/AI
+            // adds a turn, but the parent composer's header list often
+            // doesn't catch up for many seconds (sometimes minutes) after.
+            // Trusting the headers list means historian misses recent
+            // turns. Scanning bubbleId rows by rowid ASC gives us every
+            // committed bubble for this session, ordered chronologically,
+            // regardless of when (or if) the composer headers update.
             if let Some(split) = split_source {
-                if let Some(serde_json::Value::Array(headers)) =
-                    resolve_path(&doc, &split.headers_field)
-                {
-                    split_headers_seen = headers.len();
-                    for header in headers {
-                        let record_id =
-                            match header.get(&split.header_id_field).and_then(|v| v.as_str()) {
-                                Some(id) => id,
-                                None => continue,
-                            };
+                let session_prefix = split
+                    .record_key_template
+                    .replace("{session_id}", &session_id)
+                    .replace("{record_id}", "");
+                let pattern = format!("{}%", session_prefix);
 
-                        let record_key = split
-                            .record_key_template
-                            .replace("{session_id}", &session_id)
-                            .replace("{record_id}", record_id);
-
-                        // Use the pre-prepared statement and distinguish
-                        // "no such row" (None) from real errors (log + skip)
-                        // so WAL contention doesn't silently drop bubbles.
-                        let record_json: Option<String> = match split_stmt_opt
-                            .as_mut()
-                            .expect("split_stmt present when split_source is some")
-                            .query_row(rusqlite::params![&record_key], |row| {
-                                row.get::<_, String>(0)
-                            }) {
-                            Ok(v) => Some(v),
-                            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                            Err(e) => {
-                                warn!(
-                                    err = %e,
-                                    key = %record_key,
-                                    "split-record lookup failed, skipping bubble"
-                                );
-                                None
-                            }
-                        };
-
-                        let Some(json_str) = record_json else {
-                            continue;
-                        };
-                        split_lookups_resolved += 1;
-
-                        let Ok(record_doc) = serde_json::from_str::<serde_json::Value>(&json_str)
-                        else {
-                            continue;
-                        };
-
-                        let role = match extract_role(&record_doc, &extraction.role) {
-                            Some(r) => r,
-                            None => {
-                                split_role_missing += 1;
-                                continue;
-                            }
-                        };
-
-                        let text = match extract_content(&record_doc, &extraction.content) {
-                            Some(t) => t,
-                            None => {
-                                split_text_missing += 1;
-                                continue;
-                            }
-                        };
-
-                        // Split-row timestamp: try the configured field/format
-                        // first, then fall back to ISO-8601 parsing for record
-                        // rows that use a different format than the session
-                        // row (e.g. Cursor v14: composer=epoch_ms, bubble=iso8601),
-                        // then to the session-level timestamp.
-                        let ts = parse_timestamp(
-                            &record_doc,
-                            &extraction.timestamp.field,
-                            &extraction.timestamp.format,
-                        )
-                        .or_else(|| {
-                            record_doc
-                                .get(&extraction.timestamp.field)
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| {
-                                    chrono::DateTime::parse_from_rfc3339(s)
-                                        .ok()
-                                        .map(|dt| dt.timestamp_millis())
-                                })
-                        })
-                        .or(session_ts);
-
-                        let token_estimate = extract_tokens(&record_doc, &extraction.tokens, &text);
-
-                        messages.push(HistoricalMessage {
-                            role,
-                            content: text,
-                            timestamp: ts,
-                            token_estimate,
-                        });
+                let scan_sql = format!(
+                    "SELECT {value_column} FROM {table} WHERE key LIKE ?1 ORDER BY rowid ASC"
+                );
+                let bubble_rows: Vec<String> = match conn.prepare(&scan_sql) {
+                    Ok(mut stmt) => match stmt
+                        .query_map(rusqlite::params![&pattern], |row| row.get::<_, String>(0))
+                    {
+                        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                        Err(e) => {
+                            warn!(
+                                err = %e,
+                                session_id = %session_id,
+                                "split-record scan query_map failed"
+                            );
+                            Vec::new()
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            err = %e,
+                            session_id = %session_id,
+                            "split-record scan prepare failed"
+                        );
+                        Vec::new()
                     }
+                };
+
+                split_headers_seen = bubble_rows.len();
+                for json_str in bubble_rows {
+                    split_lookups_resolved += 1;
+
+                    let Ok(record_doc) = serde_json::from_str::<serde_json::Value>(&json_str)
+                    else {
+                        continue;
+                    };
+
+                    let role = match extract_role(&record_doc, &extraction.role) {
+                        Some(r) => r,
+                        None => {
+                            split_role_missing += 1;
+                            continue;
+                        }
+                    };
+
+                    let text = match extract_content(&record_doc, &extraction.content) {
+                        Some(t) => t,
+                        None => {
+                            split_text_missing += 1;
+                            continue;
+                        }
+                    };
+
+                    // Split-row timestamp: try configured field/format, then
+                    // ISO-8601 fallback (Cursor v14: composer=epoch_ms,
+                    // bubble=iso8601), then session-level timestamp.
+                    let ts = parse_timestamp(
+                        &record_doc,
+                        &extraction.timestamp.field,
+                        &extraction.timestamp.format,
+                    )
+                    .or_else(|| {
+                        record_doc
+                            .get(&extraction.timestamp.field)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| {
+                                chrono::DateTime::parse_from_rfc3339(s)
+                                    .ok()
+                                    .map(|dt| dt.timestamp_millis())
+                            })
+                    })
+                    .or(session_ts);
+
+                    let token_estimate = extract_tokens(&record_doc, &extraction.tokens, &text);
+                    let usage = super::extract_token_usage(&record_doc, &extraction.tokens);
+
+                    messages.push(HistoricalMessage {
+                        role,
+                        content: text,
+                        timestamp: ts,
+                        token_estimate,
+                        usage,
+                    });
                 }
             }
         } else {
@@ -407,12 +400,14 @@ fn read_kv_sessions(
                 .or(session_ts);
 
                 let token_estimate = extract_tokens(record, &extraction.tokens, &text);
+                let usage = super::extract_token_usage(record, &extraction.tokens);
 
                 messages.push(HistoricalMessage {
                     role,
                     content: text,
                     timestamp: ts,
                     token_estimate,
+                    usage,
                 });
             }
         }
@@ -651,7 +646,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_reads_via_cursor() {
+    async fn second_read_returns_all_sessions_for_dedup_layer() {
+        // Pin the post-watermark behavior introduced when `read_kv_sessions`
+        // stopped filtering by `rowid > since_rowid`. The composer rowid is
+        // stable across IDE writes (Cursor mutates the composer in place while
+        // appending bubble rows separately), so a watermark over composer rowid
+        // hid bubble updates after the first poll. We now re-emit every
+        // composer on each pass and rely on `DedupChecker::is_duplicate`
+        // (content-hashed) to suppress unchanged sessions downstream.
         let tmp = TempDir::new().unwrap();
         let db_path = create_cursor_db(
             tmp.path(),
@@ -691,13 +693,15 @@ mod tests {
             .unwrap();
         }
 
-        // Second read: only new session.
+        // Second read: full re-scan returns all 3 sessions. Dedup happens at a
+        // higher layer (content-hashed `already_processed` rows), so duplicate
+        // emissions here are filtered before they reach the queue.
         let mut stream = read_sessions_sqlite(&pb, tmp.path(), None, &cursor);
         let mut new_count = 0;
         while let Some(Ok(_)) = stream.next().await {
             new_count += 1;
         }
-        assert_eq!(new_count, 1);
+        assert_eq!(new_count, 3);
     }
 
     fn cursor_v14_playbook() -> Playbook {

@@ -1,0 +1,13 @@
+{
+  "session_id": "openclaw-chained",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/chained.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-4o",
+  "turn_id": "turn-chain-1",
+  "tool_name": "Bash",
+  "tool_use_id": "tool-chain-1",
+  "tool_input": {
+    "command": "git fetch && git checkout staging && git pull --rebase"
+  }
+}

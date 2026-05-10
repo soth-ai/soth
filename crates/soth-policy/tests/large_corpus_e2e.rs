@@ -236,6 +236,7 @@ fn case_inputs(idx: usize) -> (NormalizedRequest, Vec<SensitiveArtifact>, Policy
     if idx % 19 == 0 {
         artifacts.push(SensitiveArtifact {
             kind: ArtifactKind::PrivateKey,
+            credential_kind: None,
             severity: ArtifactSeverity::Critical,
             location: ArtifactLocation::SystemPrompt { char_offset: 0 },
             commitment: None,
@@ -246,6 +247,7 @@ fn case_inputs(idx: usize) -> (NormalizedRequest, Vec<SensitiveArtifact>, Policy
             kind: ArtifactKind::ApiKey {
                 provider: Some(DetectedProvider::OpenAi),
             },
+            credential_kind: None,
             severity: ArtifactSeverity::High,
             location: ArtifactLocation::UserContent {
                 turn: 0,
@@ -430,5 +432,6 @@ fn default_context() -> PolicyContext {
         skip_org_rules: false,
         semantic: None,
         session: SessionSnapshot::default(),
+        action: None,
     }
 }

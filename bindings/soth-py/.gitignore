@@ -1,0 +1,21 @@
+# Python venvs created locally for `maturin develop`. The PyO3 build
+# happens against the active venv; CI uses a fresh one each run.
+.venv/
+venv/
+
+# Compiled native extension produced by `maturin develop`. CI builds
+# wheels via `maturin build` / `cibuildwheel`; nothing needs to be
+# committed here.
+python/soth/_soth_native*.so
+python/soth/_soth_native*.dylib
+python/soth/_soth_native*.pyd
+
+# Byte-compiled Python.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution artefacts.
+build/
+dist/
+*.egg-info/

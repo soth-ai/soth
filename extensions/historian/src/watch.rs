@@ -13,6 +13,7 @@ use tracing::{info, trace, warn};
 use soth_extensions::TelemetryQueueWriter;
 
 use crate::dedup::DedupChecker;
+use crate::enrich::ClassifyEnricher;
 use crate::reader::FormatReader;
 use crate::session::reconstruct_event;
 use crate::types::{AiTool, DiscoveredTool};
@@ -33,6 +34,13 @@ pub struct WatchEngine {
     tools: Vec<DiscoveredTool>,
     dedup: Arc<DedupChecker>,
     writer: TelemetryQueueWriter,
+    /// Optional classify enricher. When unset, events ship without
+    /// `classify.*` metadata and `TelemetryEvent::from_governable` defaults
+    /// `use_case_label_reason` to `historian_not_enriched`, which the sync
+    /// sender then logs a WARN per event for. Backfill always wires this;
+    /// watch did not until this field was added — see lib.rs and
+    /// bin/standalone.rs for the call sites that populate it.
+    enricher: Option<Arc<ClassifyEnricher>>,
     debounce: Duration,
     stats: WatchStats,
 }
@@ -70,9 +78,17 @@ impl WatchEngine {
             tools,
             dedup,
             writer,
+            enricher: None,
             debounce: Duration::from_secs(2),
             stats: WatchStats::default(),
         }
+    }
+
+    /// Attach a classify enricher. Mirrors `BackfillEngine::with_enricher`
+    /// so both ingest paths run the same enrichment stages.
+    pub fn with_enricher(mut self, enricher: ClassifyEnricher) -> Self {
+        self.enricher = Some(Arc::new(enricher));
+        self
     }
 
     /// Snapshot of current watch engine stats.
@@ -117,6 +133,47 @@ impl WatchEngine {
         // Debounce: collect changed paths over the debounce window, then process.
         let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
 
+        // Periodic poll fallback. macOS fsevents on `~/Library/Application
+        // Support/...` is unreliable for SQLite-WAL-mode writers (Cursor in
+        // particular): the live writer holds the .vscdb open and writes
+        // through state.vscdb-wal without bumping the main file's mtime,
+        // so the OS may never fire a notification we can see. Every
+        // POLL_INTERVAL we mark every watched root as "ready to re-scan",
+        // regardless of fsevents. The dedup layer downstream keys on
+        // content-hash, so re-scanning unchanged sessions is cheap.
+        //
+        // 60s is a deliberate trade-off: 15s caused noticeable system
+        // jitter on M-series Macs while users were active in Cursor (the
+        // big composers re-emit and pay classify CPU on every cycle).
+        // 60s still picks up new content "within a minute" for monitoring
+        // / dashboard purposes — historian is not a hot-path latency
+        // signal — while cutting the scan/classify rate 4×.
+        const POLL_INTERVAL: Duration = Duration::from_secs(60);
+        let mut poll = tokio::time::interval(POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick of `interval` fires immediately; consume it so the
+        // initial backfill we just finished doesn't get redone before the
+        // watcher even settles.
+        poll.tick().await;
+
+        // Hard floor on how often `process_changes` may run, regardless of
+        // what triggered it. Without this, an active Cursor session fires
+        // fsevents per keystroke; the 2s debounce collapses bursts but not
+        // sustained typing, so we'd run a full per-session SQLite scan +
+        // event reconstruct ~every 2-5s. That hogs the tokio runtime and
+        // starves soth_mitm flow workers (we saw "reaping stale flow
+        // state without explicit stream_end" in proxy logs). With this
+        // floor, we get *at most* one scan per MIN_CYCLE no matter how
+        // many fsevents arrive — fsevents only act as "wake up earlier
+        // than the 60s poll if something changed", they can't make us
+        // run more often than the poll interval.
+        const MIN_CYCLE: Duration = POLL_INTERVAL;
+        // Initialize so the first cycle is allowed immediately (we just
+        // finished the initial backfill before entering this loop).
+        let mut last_processed = Instant::now()
+            .checked_sub(MIN_CYCLE)
+            .unwrap_or_else(Instant::now);
+
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -129,8 +186,24 @@ impl WatchEngine {
                     self.stats.fs_events_received.fetch_add(1, Ordering::Relaxed);
                     pending.insert(path, Instant::now());
                 }
+                _ = poll.tick() => {
+                    // Force every watched root into the pending set so the
+                    // debounce arm picks them up. Cheap insurance against
+                    // fsevents misses on macOS for SQLite-WAL writers.
+                    for (root, _) in root_to_tool.iter() {
+                        pending.entry(root.clone()).or_insert_with(Instant::now);
+                    }
+                }
                 _ = sleep(self.debounce) => {
                     if pending.is_empty() {
+                        continue;
+                    }
+
+                    // Throttle: enforce MIN_CYCLE between scans regardless
+                    // of how many fsevents/poll ticks queued up paths.
+                    // Pending entries stay in the map and will be picked up
+                    // on the next allowed cycle.
+                    if last_processed.elapsed() < MIN_CYCLE {
                         continue;
                     }
 
@@ -148,6 +221,7 @@ impl WatchEngine {
                     if !ready.is_empty() {
                         self.stats.process_cycles.fetch_add(1, Ordering::Relaxed);
                         self.process_changes(&ready, &root_to_tool).await;
+                        last_processed = Instant::now();
                     }
                 }
             }
@@ -178,8 +252,13 @@ impl WatchEngine {
 
             trace!(tool = %tool, root = %root.display(), "processing changes");
 
-            // Read only recent sessions (last 60 seconds window to catch new data)
-            let since = Some(chrono::Utc::now().timestamp_millis() - 60_000);
+            // No `since` cutoff: long-lived sessions (Cursor composers,
+            // Claude threads) keep growing for days. Filtering by their
+            // ORIGINAL createdAt timestamp would drop every conversation
+            // older than a minute, leaving the watch loop with nothing
+            // to emit. The content-hash dedup downstream prevents
+            // re-emitting unchanged sessions, so passing `None` is safe.
+            let since = None;
             let mut stream = reader.read_sessions(root, since);
 
             while let Some(result) = stream.next().await {
@@ -191,7 +270,18 @@ impl WatchEngine {
                     }
                 };
 
-                let event = reconstruct_event(&session);
+                let mut event = reconstruct_event(&session);
+
+                // Dedup BEFORE enrichment. The 15s poll re-scans every cursor
+                // session each cycle; ~80%+ of those hit dedup as duplicates
+                // (unchanged content_hash). `ClassifyEnricher::enrich` runs the
+                // ML classify pipeline (~10–50ms each on M-series), which
+                // would be wasted on duplicates that are about to be discarded.
+                //
+                // Safe to dedup first: `conversation_hash` and `semantic_hash`
+                // are populated by `reconstruct_event` (see
+                // session.rs:81-82), not by the enricher. The enricher only
+                // adds `classify.*` keys, which the dedup key never reads.
                 let content_hash = event
                     .context
                     .metadata
@@ -212,6 +302,14 @@ impl WatchEngine {
                         .duplicates_skipped
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
+                }
+
+                // Survived dedup — pay the classify cost.
+                // embed_content is `#[serde(skip)]`, so enrichment must run
+                // before `writer.enqueue` (post-serialize would lose the
+                // classify metadata).
+                if let Some(enricher) = self.enricher.as_deref() {
+                    enricher.enrich(&mut event);
                 }
 
                 match self.writer.enqueue(&event, &allow_decision()) {
@@ -245,6 +343,23 @@ impl WatchEngine {
     }
 }
 
+/// Sidecar files SQLite WAL-mode writers touch on every transaction.
+///
+/// Cursor opens `state.vscdb` in WAL mode, which means every keystroke that
+/// commits a transaction writes to `state.vscdb-wal` and bumps
+/// `state.vscdb-shm`. We don't read those files directly — we only read the
+/// main `state.vscdb` (read-only, with `busy_timeout`) — so fsevents on the
+/// sidecars are pure noise. They were the dominant source of fsevent volume
+/// while the user was active in Cursor, and each one used to bypass the
+/// poll cadence and trigger a debounced re-scan. Drop them at the watcher
+/// boundary so they never reach `pending` in the first place.
+fn is_sqlite_sidecar(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+}
+
 fn setup_watcher(
     tools: &[DiscoveredTool],
     tx: mpsc::Sender<PathBuf>,
@@ -252,6 +367,9 @@ fn setup_watcher(
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             for path in event.paths {
+                if is_sqlite_sidecar(&path) {
+                    continue;
+                }
                 let _ = tx.try_send(path);
             }
         }
@@ -270,4 +388,46 @@ fn setup_watcher(
     }
 
     Ok(watcher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sqlite_sidecar;
+    use std::path::PathBuf;
+
+    #[test]
+    fn drops_sqlite_sidecar_paths() {
+        // Cursor's WAL-mode writer hits these on every keystroke commit;
+        // they must not wake the watch loop.
+        for f in [
+            "state.vscdb-wal",
+            "state.vscdb-shm",
+            "history.db-journal",
+            "/abs/path/to/state.vscdb-wal",
+        ] {
+            assert!(
+                is_sqlite_sidecar(&PathBuf::from(f)),
+                "expected {f} to be filtered as a sidecar"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_main_db_and_other_paths() {
+        // Anything that isn't a -wal/-shm/-journal must pass through —
+        // dropping the main DB or directory events would silently break
+        // the watch path.
+        for f in [
+            "state.vscdb",
+            "history.jsonl",
+            "/abs/path/to/state.vscdb",
+            "/abs/path/to/dir",
+            "session-2026-05-06.json",
+        ] {
+            assert!(
+                !is_sqlite_sidecar(&PathBuf::from(f)),
+                "expected {f} to pass through, got filtered"
+            );
+        }
+    }
 }

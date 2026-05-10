@@ -8,8 +8,20 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["tree-sitter", "intelligence"]
-tree-sitter = [
+# Default keeps the trait + helpers (no native deps) so wasm32 / SDK consumers
+# can build with `--no-default-features` and still get parse-quality bookkeeping
+# via `NoopBackend` / `InMemoryBackend`. The proxy opts into native deps via
+# `tree-sitter-code` and `intelligence-sqlite`.
+default = ["intelligence"]
+# In-memory + Noop backends for the IntelligenceSink trait. Adds no native deps.
+intelligence = []
+# Persistent SQLite-backed IntelligenceSink (`IntelligenceStore`, replay tooling).
+# Pulls rusqlite (C dep) — incompatible with wasm32; required by the proxy.
+intelligence-sqlite = ["intelligence", "dep:rusqlite"]
+# Tree-sitter AST analysis for code artifacts. Without this feature, code.rs
+# falls back to heuristic-only analysis (regex import extraction, regex function
+# count). Pulls native C parsers — incompatible with wasm32 (today).
+tree-sitter-code = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",
     "dep:tree-sitter-python",
@@ -18,7 +30,6 @@ tree-sitter = [
     "dep:tree-sitter-go",
     "dep:tree-sitter-java",
 ]
-intelligence = ["dep:rusqlite"]
 
 [dependencies]
 soth-core = { workspace = true }
@@ -51,3 +62,4 @@ soth-bundle = { workspace = true }
 [[bench]]
 name = "intelligence_bench"
 harness = false
+required-features = ["intelligence-sqlite"]

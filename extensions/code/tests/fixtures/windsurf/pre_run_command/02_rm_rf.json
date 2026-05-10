@@ -1,0 +1,10 @@
+{
+  "agent_action_name": "pre_run_command",
+  "trajectory_id": "traj-block-001",
+  "execution_id": "exec-block-001",
+  "timestamp": "2026-05-08T22:33:00Z",
+  "tool_info": {
+    "command_line": "rm -rf node_modules",
+    "cwd": "/home/user/project"
+  }
+}

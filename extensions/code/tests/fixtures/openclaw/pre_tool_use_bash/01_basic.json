@@ -1,0 +1,13 @@
+{
+  "session_id": "openclaw-session-abc",
+  "transcript_path": "/home/user/.openclaw/agents/main/sessions/abc.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-4o",
+  "turn_id": "turn-001",
+  "tool_name": "Bash",
+  "tool_use_id": "tool-001",
+  "tool_input": {
+    "command": "npm install"
+  }
+}

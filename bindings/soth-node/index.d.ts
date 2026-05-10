@@ -1,0 +1,107 @@
+// Type declarations for @soth/sdk.
+
+export interface InitOptions {
+  apiKey: string;
+  orgId: string;
+  /**
+   * Read the HMAC key from this environment variable. The SDK never
+   * sees the plaintext over the wire; soth-cloud never has the key.
+   * See SDK_WASM_TRUST_BOUNDARY_SPEC.md §6.6.
+   */
+  hmacKeyEnv?: string;
+  hmacKeyStatic?: Buffer;
+  telemetryEndpoint?: string;
+}
+
+export interface CallContextOverrides {
+  userIdHmac?: string;
+  teamId?: string;
+  deviceIdHash?: string;
+  sessionId?: string;
+  requestId?: string;
+}
+
+export interface Message {
+  role: string;
+  content: string;
+}
+
+export interface Tool {
+  name: string;
+  description?: string;
+  parametersJson?: string;
+}
+
+export interface LlmCall {
+  provider: string;
+  model: string;
+  messages: Message[];
+  system?: string;
+  tools?: Tool[];
+  stream?: boolean;
+}
+
+export interface BlockReason {
+  /** "sensitive_artifact" | "budget_exceeded" | "policy_rule" | "use_alternative" */
+  kind: string;
+  artifact?: string;
+  severity?: string;
+  budgetKind?: string;
+  observed?: number;
+  limit?: number;
+  ruleId?: string;
+  ruleName?: string;
+  suggestedProvider?: string;
+  suggestedModel?: string;
+}
+
+export class SothBlocked extends Error {
+  decisionId: string;
+  reason: BlockReason;
+}
+
+export class SothFlagged {
+  severity: string;
+}
+
+export interface GuardOptions {
+  call: LlmCall;
+}
+
+export interface ChunkExtractorOutput {
+  deltaContent: string | null;
+  finishReason: string | null;
+}
+
+export interface GuardStreamOptions<TChunk = unknown> {
+  call: LlmCall;
+  chunkExtractor?: (chunk: TChunk) => ChunkExtractorOutput;
+}
+
+export function init(options: InitOptions): void;
+export function shutdown(): void;
+export function guard<T>(callFn: () => Promise<T>, options: GuardOptions): Promise<T>;
+export function guardStream<TChunk = unknown>(
+  iterFactory: () => AsyncIterable<TChunk> | Promise<AsyncIterable<TChunk>>,
+  options: GuardStreamOptions<TChunk>,
+): AsyncIterable<TChunk>;
+export function withContext<T>(
+  overrides: CallContextOverrides,
+  fn: () => Promise<T>,
+): Promise<T>;
+
+export interface InstrumentOptions {
+  /**
+   * Limit instrumentation to a subset of providers. Omitting this
+   * field instruments every registered provider that is importable.
+   */
+  providers?: string[];
+}
+
+export type InstrumentResult = Record<string, string>;
+
+export function instrument(options?: InstrumentOptions): InstrumentResult;
+export function uninstrument(options?: InstrumentOptions): InstrumentResult;
+export function isInstrumented(provider: string): boolean;
+
+export function getSdk(): unknown;

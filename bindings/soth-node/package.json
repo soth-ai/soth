@@ -1,0 +1,47 @@
+{
+  "name": "@soth/sdk",
+  "version": "0.1.0",
+  "description": "SOTH SDK for Node.js — observability + policy enforcement for LLM API calls.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "binding.js",
+    "binding.d.ts",
+    "instrumentation/",
+    "integrations/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "napi build --platform --release --js binding.js --dts binding.d.ts",
+    "build:debug": "napi build --platform --js binding.js --dts binding.d.ts",
+    "test": "node --test __test__/*.test.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18",
+    "openai": "^4.77"
+  },
+  "napi": {
+    "name": "soth-node",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc"
+      ]
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

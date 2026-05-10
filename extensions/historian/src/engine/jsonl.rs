@@ -198,12 +198,14 @@ fn parse_jsonl_file(
         }
 
         let token_estimate = extract_tokens(&parsed, &extraction.tokens, &text);
+        let usage = super::extract_token_usage(&parsed, &extraction.tokens);
 
         messages.push(HistoricalMessage {
             role,
             content: text,
             timestamp: ts,
             token_estimate,
+            usage,
         });
     }
 
@@ -380,7 +382,18 @@ mod tests {
                     session_start_field: None,
                     session_end_field: None,
                 },
-                tokens: None,
+                tokens: Some(TokenConfig {
+                    field: None,
+                    input_tokens_field: Some("message.usage.input_tokens".into()),
+                    output_tokens_field: Some("message.usage.output_tokens".into()),
+                    cache_creation_input_tokens_field: Some(
+                        "message.usage.cache_creation_input_tokens".into(),
+                    ),
+                    cache_read_input_tokens_field: Some(
+                        "message.usage.cache_read_input_tokens".into(),
+                    ),
+                    total_tokens_field: None,
+                }),
             },
         }
     }
@@ -496,6 +509,49 @@ mod tests {
         assert!(session.messages[1].content.contains("auth bug"));
         assert_eq!(session.messages[2].role, "assistant");
         assert!(session.messages[2].content.contains("validates tokens"));
+    }
+
+    #[tokio::test]
+    async fn claude_code_playbook_extracts_billing_grade_usage() {
+        // Pin the §10.11 audit gate: claude_code playbook must
+        // extract `message.usage.{input,output,cache_creation_input,
+        // cache_read_input}_tokens` per assistant turn.  Verified
+        // 2026-05-08 against real session logs at
+        // ~/.claude/projects/.../*.jsonl, replicated here as a
+        // hermetic fixture so a future engine refactor can't
+        // silently drop the extraction.
+        let tmp = TempDir::new().unwrap();
+        let jsonl = r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-01-01T00:00:01.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":6,"output_tokens":298,"cache_creation_input_tokens":41175,"cache_read_input_tokens":0}},"timestamp":"2026-01-01T00:00:02.000Z"}"#;
+        write_file(tmp.path(), "billing-test.jsonl", jsonl);
+
+        let pb = claude_code_playbook();
+        let cursor = Mutex::new(None);
+        let mut stream = read_sessions_jsonl(&pb, tmp.path(), None, &cursor);
+        let session = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(session.messages.len(), 2);
+
+        // User turn: no `usage` block → playbook returns None.
+        assert!(session.messages[0].usage.is_none());
+
+        // Assistant turn: full Anthropic-style usage extracted.
+        let usage = session.messages[1]
+            .usage
+            .as_ref()
+            .expect("assistant message must carry usage — this is the §10.11 audit gate");
+        assert_eq!(usage.input_tokens, Some(6));
+        assert_eq!(usage.output_tokens, Some(298));
+        assert_eq!(usage.cache_creation_input_tokens, Some(41175));
+        assert_eq!(usage.cache_read_input_tokens, Some(0));
+        // total_tokens not declared by the playbook.
+        assert_eq!(usage.total_tokens, None);
+
+        // The legacy `token_estimate` scalar should be the
+        // sum of input + output (not the heuristic estimate
+        // from text), so existing consumers transparently
+        // get billing-grade data.
+        assert_eq!(session.messages[1].token_estimate, 6 + 298);
     }
 
     #[tokio::test]

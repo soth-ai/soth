@@ -18,9 +18,16 @@ const PID_OWNER_TOKEN_FILE: &str = "proxy.pid.token";
 const LOCK_FILE: &str = "proxy.lifecycle.lock";
 const LOG_FILE: &str = "proxy.log";
 const DEFAULT_PROXY_PORT: u16 = 8080;
-const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 12;
+// Cold-install on Windows with Defender real-time scanning can spend
+// 15-20s in the bundle install pass (asset writes scanned per-file)
+// before `proxy.start()` reaches `TcpListener::bind`. The CLI parent
+// waits for `127.0.0.1:<port>` to open, so this ceiling has to comfortably
+// exceed the proxy-side `LISTENER_STARTUP_TIMEOUT_SECS` *plus* a small
+// margin for spawn/handshake. Healthy installs still complete in <5s;
+// the bump just lifts the ceiling for slow machines.
+const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 65;
 const MIN_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 3;
-const MAX_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 60;
+const MAX_DAEMON_STARTUP_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_PROXY_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const MIN_PROXY_LOG_MAX_BYTES: u64 = 1024 * 1024;
 const MAX_PROXY_LOG_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -728,6 +735,7 @@ fn process_executable_path(pid: u32) -> Option<String> {
 /// Pure function so we can unit-test the path-shape matcher without an
 /// actual Windows process to query. Called by [`is_expected_daemon_process`]
 /// on Windows after [`process_executable_path`] resolves the running pid.
+#[cfg(any(test, target_os = "windows"))]
 fn is_soth_executable_path(path: &str) -> bool {
     let normalized = path.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -949,6 +957,35 @@ fn send_kill(pid: u32) {
         apply_windows_hidden_process_flags(&mut cmd);
         let _ = cmd.status();
     }
+}
+
+/// Force-kill every `soth.exe` on the box except the current process. The
+/// supervisor is spawned `DETACHED_PROCESS` (no console, no top-level window)
+/// so a graceful taskkill is a no-op against it, and the worker runs in its
+/// own `CREATE_NEW_PROCESS_GROUP` with no Job Object linking it to the
+/// supervisor — the pidfile-targeted kill therefore tends to leave the worker
+/// orphaned still bound to the proxy port. This nuke is the blunt-but-reliable
+/// way to take down both supervisor and worker. Filtered to image name
+/// `soth.exe` exactly so sibling binaries (soth-admin, soth-app, etc.) are
+/// untouched, and excludes the current pid so `soth down` doesn't terminate
+/// itself mid-cleanup.
+#[cfg(target_os = "windows")]
+fn force_kill_all_soth_daemons_windows() -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let self_pid = std::process::id();
+    let mut cmd = Command::new("taskkill");
+    cmd.args([
+        "/F",
+        "/T",
+        "/IM",
+        "soth.exe",
+        "/FI",
+        &format!("PID ne {self_pid}"),
+    ]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    matches!(cmd.status(), Ok(status) if status.success())
 }
 
 fn stop_pid_and_wait(pid: u32, timeout: Duration) -> bool {
@@ -1382,6 +1419,28 @@ pub async fn run_start_daemon(
 pub async fn run_stop() -> anyhow::Result<()> {
     ensure_runtime_dirs()?;
     let _lifecycle_lock = acquire_lifecycle_lock()?;
+
+    // Windows fast path: the pidfile-targeted graceful kill is unreliable here
+    // (supervisor is DETACHED_PROCESS so it can't receive a graceful taskkill,
+    // worker is in CREATE_NEW_PROCESS_GROUP with no Job Object binding the
+    // pair). Force-kill every soth.exe except ourselves and clean state
+    // directly. Autostart registration (HKCU Run key + wake-recovery task) is
+    // intentionally preserved — `soth down` is a runtime stop, not an
+    // uninstall.
+    #[cfg(target_os = "windows")]
+    {
+        let killed = force_kill_all_soth_daemons_windows();
+        remove_pid_artifacts();
+        let _ = super::system::disable_quiet().await;
+        if killed {
+            style::success("Proxy daemon stopped.");
+        } else {
+            style::warning("No soth daemon processes were running.");
+        }
+        print_env_cleanup_hint_if_needed();
+        return Ok(());
+    }
+
     let mut stopped_any = false;
 
     match super::autostart::stop_managed_runtime_only() {

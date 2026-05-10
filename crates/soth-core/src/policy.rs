@@ -77,6 +77,50 @@ pub struct PolicyContext {
     pub skip_org_rules: bool,
     pub semantic: Option<SemanticPolicyContext>,
     pub session: SessionSnapshot,
+    /// Action-layer fields populated by the `soth-code` hook
+    /// handler from the agent's `CodeEvent`. `None` for
+    /// network-layer (proxy) and session-layer (historian)
+    /// evaluations — those layers don't observe individual
+    /// agent actions, so the `action.*` namespace stays
+    /// unbound (rules referencing it evaluate to Null).
+    ///
+    /// Exposed in CEL scope as `action.agent`, `action.type`,
+    /// `action.tool_name`, `action.command`, `action.file_path`.
+    /// Lets operators author rules like:
+    ///   `action.type == "command_exec" && action.command.contains("rm -rf")`
+    /// or:
+    ///   `action.type == "file_write" && action.file_path.contains(".ssh/")`
+    /// at the action layer where enforcement actually halts the
+    /// agent before the call lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionPolicyContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionPolicyContext {
+    /// Adapter name — `claude_code`, `cursor`, `codex`,
+    /// `gemini_cli`, `pi_agent`, `windsurf`, `opencode`.
+    pub agent: String,
+    /// `ActionType` serialized as snake_case (`file_read`,
+    /// `command_exec`, `tool_use`, …). Mirrors
+    /// `extensions/code/src/event.rs::ActionType::as_str` so
+    /// CEL rules and adapter code agree on the spelling.
+    pub action_type: String,
+    /// Tool name from `tool_use` payloads — `"Bash"`, `"Edit"`,
+    /// `"Read"` for Claude Code, agent-specific for the others.
+    /// `None` for non-tool-use actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Full command string for `command_exec` actions (e.g. the
+    /// argument to Bash). `None` when not a command-exec event
+    /// or when the adapter couldn't extract it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Target file path for `file_read` / `file_write` /
+    /// `file_delete` actions. `None` for non-file actions or
+    /// when the adapter couldn't extract it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

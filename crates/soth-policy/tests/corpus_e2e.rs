@@ -357,6 +357,7 @@ fn build_artifacts(input: &[ArtifactInput]) -> Vec<SensitiveArtifact> {
         for _ in 0..repeat {
             artifacts.push(SensitiveArtifact {
                 kind: kind.clone(),
+                credential_kind: None,
                 severity,
                 location: ArtifactLocation::Unknown,
                 commitment: None,
@@ -459,6 +460,7 @@ fn default_context() -> PolicyContext {
         skip_org_rules: false,
         semantic: None,
         session: SessionSnapshot::default(),
+        action: None,
     }
 }
 

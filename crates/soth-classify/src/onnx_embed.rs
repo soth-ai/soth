@@ -1,8 +1,41 @@
+// Local ONNX embedding runtime.
+//
+// Gated behind the `onnx-models` feature (default ON for proxy + native SDK
+// bindings). When disabled (e.g. WASM / size-constrained targets) the stub
+// type at the bottom of this file keeps `Option<Arc<OnnxEmbeddingRuntime>>`
+// in `ClassifyBundle` compilable; `bundle::build_onnx_runtime` always returns
+// `None` and stage1 takes the hash-embedding fallback path.
+//
+// ── Concurrency rationale ──────────────────────────────────────────────────
+// `ort::session::Session::run` takes `&mut self` in ort 2.0.0-rc.x (verified
+// against `~/.cargo/registry/.../ort-2.0.0-rc.11/src/session/mod.rs:206`).
+// Concurrent calls from multiple host threads — Python via PyO3, Node via
+// napi-rs worker pool, the proxy classify task pool — therefore require
+// exclusive access for the duration of each inference call.
+//
+// We wrap the session in a `std::sync::Mutex`. `RwLock` would not help: every
+// inference call is a writer under the `&mut self` signature. ort 2.x is
+// `Send + Sync` for the `Session` type itself (the underlying ONNX runtime is
+// thread-safe), but the Rust binding's signature is the binding constraint.
+//
+// Performance: ONNX Runtime parallelizes inference internally via its own
+// threadpool (`with_intra_threads` / `with_inter_threads`). The Mutex
+// serializes *Rust-level callers*, but each held call still uses the
+// configured ORT threadpool. Bench `classify_bench` measures the steady-state
+// cost; if Mutex contention becomes the bottleneck under high QPS, the next
+// step is a session pool (multiple `OnnxEmbeddingRuntime` instances behind
+// `crossbeam-queue::ArrayQueue`), not lock-free single-session access.
+
+#[cfg(feature = "onnx-models")]
 use std::sync::Mutex;
 
+#[cfg(feature = "onnx-models")]
 use ort::session::Session;
+#[cfg(feature = "onnx-models")]
 use ort::value::Tensor;
+#[cfg(feature = "onnx-models")]
 use tokenizers::tokenizer::TruncationDirection;
+#[cfg(feature = "onnx-models")]
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
 
 /// Maximum token sequence length for the ONNX embedding model.
@@ -15,13 +48,26 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, Tr
 /// tokens) because for agentic coding prompts the user's actual instruction
 /// is at the end, while pasted context/code is at the beginning.  Shorter
 /// inputs are right-padded to exactly 256 tokens for fixed-size tensors.
+#[cfg(feature = "onnx-models")]
 const TOKENIZER_MAX_LENGTH: usize = 256;
 
+#[cfg(feature = "onnx-models")]
 pub(crate) struct OnnxEmbeddingRuntime {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
 }
 
+// Compile-time assertion: `OnnxEmbeddingRuntime` MUST stay `Send + Sync` so
+// it can sit inside `Arc<...>` in `ClassifyBundle` and be shared across
+// host language thread pools (PyO3 / napi-rs). If a future change adds a
+// non-`Send`/non-`Sync` field this fails to compile.
+#[cfg(feature = "onnx-models")]
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<OnnxEmbeddingRuntime>();
+};
+
+#[cfg(feature = "onnx-models")]
 impl OnnxEmbeddingRuntime {
     pub(crate) fn new(model_bytes: &[u8], tokenizer_json: &[u8]) -> Result<Self, String> {
         let mut tokenizer =
@@ -144,5 +190,50 @@ impl OnnxEmbeddingRuntime {
         // so that embedding_norm reflects the true pre-normalization
         // magnitude (a fleet health signal).
         Ok(pooled)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub used when `onnx-models` is disabled.
+//
+// Keeps `Option<Arc<OnnxEmbeddingRuntime>>` in `ClassifyBundle` compilable
+// without dragging `ort` / `tokenizers` into the build. `new()` returns
+// `EmbedUnavailable::DelegatedToCloud` rather than producing a fake embedding
+// — callers must explicitly handle the `None` runtime case (see stage1).
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "onnx-models"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // surfaced via `OnnxEmbeddingRuntime::new` errors in stub mode
+pub(crate) enum EmbedUnavailable {
+    /// `onnx-models` feature is disabled — local embedding is unavailable.
+    /// SDK / WASM consumers route through the cloud-classify path; the proxy
+    /// always builds with this feature on, so this variant should never be
+    /// observed in proxy code.
+    DelegatedToCloud,
+}
+
+#[cfg(not(feature = "onnx-models"))]
+pub(crate) struct OnnxEmbeddingRuntime {
+    _private: (),
+}
+
+#[cfg(not(feature = "onnx-models"))]
+impl OnnxEmbeddingRuntime {
+    /// Always fails with `DelegatedToCloud` — the runtime is intentionally
+    /// uninstantiable when the feature is disabled. `bundle::build_onnx_runtime`
+    /// short-circuits before reaching this and returns `None`.
+    #[allow(dead_code)]
+    pub(crate) fn new(_model_bytes: &[u8], _tokenizer_json: &[u8]) -> Result<Self, String> {
+        Err("onnx-models feature disabled".to_string())
+    }
+
+    /// Stub `embed` exists only so that any accidental call site type-checks.
+    /// In practice this is unreachable: the `Option<Arc<OnnxEmbeddingRuntime>>`
+    /// in `ClassifyBundle` is always `None` when the feature is off, so stage1
+    /// never dispatches into this method.
+    #[allow(dead_code)]
+    pub(crate) fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+        Err("onnx-models feature disabled".to_string())
     }
 }

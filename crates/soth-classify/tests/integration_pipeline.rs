@@ -4,6 +4,7 @@ mod common;
 fn private_key_artifact() -> soth_core::SensitiveArtifact {
     soth_core::SensitiveArtifact {
         kind: soth_core::ArtifactKind::PrivateKey,
+        credential_kind: None,
         severity: soth_core::ArtifactSeverity::Critical,
         location: soth_core::ArtifactLocation::SystemPrompt { char_offset: 0 },
         commitment: None,
@@ -16,6 +17,7 @@ fn credential_artifact() -> soth_core::SensitiveArtifact {
         kind: soth_core::ArtifactKind::ApiKey {
             provider: Some(soth_core::DetectedProvider::OpenAi),
         },
+        credential_kind: None,
         severity: soth_core::ArtifactSeverity::High,
         location: soth_core::ArtifactLocation::UserContent {
             turn: 0,

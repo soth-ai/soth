@@ -3,31 +3,44 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel};
+use soth_core::{AnomalyFlag, InteractionMode, UseCaseLabel, UseCaseLabelReason};
 
 use crate::traits::{AnomalyScorer, AnomalySignals, ClassificationProvider, ClassificationResult};
 
 use crate::bundle::EMBEDDING_DIM;
 const MLP_ASSET_CANDIDATES: [&str; 2] = ["classify/use_case_mlp.bin", "use_case_mlp.bin"];
 const SOTH_MLP_MAGIC: u32 = 0x534F_5448;
-const LABEL_SPACE: [UseCaseLabel; 17] = [
-    UseCaseLabel::CodeGeneration,
-    UseCaseLabel::CodeReview,
-    UseCaseLabel::CodeDebugging,
-    UseCaseLabel::CodeRefactor,
-    UseCaseLabel::TextSummarization,
-    UseCaseLabel::TextGeneration,
-    UseCaseLabel::Translation,
-    UseCaseLabel::DataAnalysis,
-    UseCaseLabel::DataExtraction,
-    UseCaseLabel::QuestionAnswering,
-    UseCaseLabel::DocumentSearch,
-    UseCaseLabel::AgentTask,
-    UseCaseLabel::ToolOrchestration,
-    UseCaseLabel::ImageAnalysis,
-    UseCaseLabel::AudioTranscription,
-    UseCaseLabel::SystemPromptOnly,
-    UseCaseLabel::Unknown,
+// Order MUST stay backward-compatible with raw-weights bundles (no embedded
+// labels). `parse_classifier_raw` walks the float matrix and assigns each
+// row to LABEL_SPACE[i], so reordering existing entries silently rewires
+// every legacy bundle to the wrong label. New variants from the 400k
+// retrain are appended *after* the legacy 16 (positions 0–15 unchanged)
+// and before `Unknown` so the catch-all stays last. Bundles built with
+// the SOTH binary header carry their own label strings and ignore this
+// array — see `parse_classifier_soth_binary` and `map_bundle_label`.
+const LABEL_SPACE: [UseCaseLabel; 22] = [
+    UseCaseLabel::CodeGeneration,     // 0
+    UseCaseLabel::CodeReview,         // 1
+    UseCaseLabel::CodeDebugging,      // 2
+    UseCaseLabel::CodeRefactor,       // 3
+    UseCaseLabel::TextSummarization,  // 4
+    UseCaseLabel::TextGeneration,     // 5
+    UseCaseLabel::Translation,        // 6
+    UseCaseLabel::DataAnalysis,       // 7
+    UseCaseLabel::DataExtraction,     // 8
+    UseCaseLabel::QuestionAnswering,  // 9
+    UseCaseLabel::DocumentSearch,     // 10
+    UseCaseLabel::AgentTask,          // 11
+    UseCaseLabel::ToolOrchestration,  // 12
+    UseCaseLabel::ImageAnalysis,      // 13
+    UseCaseLabel::AudioTranscription, // 14
+    UseCaseLabel::SystemPromptOnly,   // 15
+    UseCaseLabel::InfraDevops,        // 16 (new — 400k retrain)
+    UseCaseLabel::LegalContract,      // 17 (new)
+    UseCaseLabel::ResearchSynthesis,  // 18 (new)
+    UseCaseLabel::SecurityAnalysis,   // 19 (new)
+    UseCaseLabel::ContentEditing,     // 20 (new)
+    UseCaseLabel::Unknown,            // 21 (catch-all stays last)
 ];
 
 pub(crate) fn build_model_providers(
@@ -120,22 +133,22 @@ impl ClassificationProvider for BundleModelClassifier {
 
 fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> ClassificationResult {
     if embedding.len() != EMBEDDING_DIM {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            actual = embedding.len(),
+            expected = EMBEDDING_DIM,
+            "classify_linear: embedding dim mismatch; emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     let logits = affine_logits(embedding, &model.weights, &model.biases);
     if logits.is_empty() || logits.len() != model.labels.len() {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            logits_len = logits.len(),
+            labels_len = model.labels.len(),
+            "classify_linear: logits/labels length mismatch; emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     classify_from_probs(
@@ -146,12 +159,12 @@ fn classify_linear(model: &LinearClassifier, embedding: &[f32]) -> Classificatio
 
 fn classify_soth_binary(model: &SothBinaryClassifier, embedding: &[f32]) -> ClassificationResult {
     if embedding.len() != EMBEDDING_DIM {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            actual = embedding.len(),
+            expected = EMBEDDING_DIM,
+            "classify_soth_binary: embedding dim mismatch; emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     let mut hidden1 = affine_logits(embedding, &model.hidden1_weights, &model.hidden1_biases);
@@ -172,12 +185,13 @@ fn classify_soth_binary(model: &SothBinaryClassifier, embedding: &[f32]) -> Clas
         &model.usecase_biases,
     );
     if logits.is_empty() || logits.len() != model.usecase_labels.len() {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            logits_len = logits.len(),
+            labels_len = model.usecase_labels.len(),
+            "classify_soth_binary: usecase logits/labels length mismatch; \
+             emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     let probs = softmax(logits.as_slice());
@@ -214,12 +228,13 @@ fn map_auxiliary_label(label: Option<&str>) -> InteractionMode {
 
 fn classify_from_probs(labels: &[UseCaseLabel], probs: &[f32]) -> ClassificationResult {
     if labels.is_empty() || labels.len() != probs.len() {
-        return ClassificationResult {
-            label: UseCaseLabel::Unknown,
-            confidence: 0.0,
-            secondary_label: None,
-            interaction_mode: InteractionMode::Unknown,
-        };
+        tracing::warn!(
+            labels_len = labels.len(),
+            probs_len = probs.len(),
+            "classify_from_probs: labels/probs length mismatch; \
+             emitting Unknown/ModelShapeError"
+        );
+        return shape_error_result();
     }
 
     let (top_idx, top_prob) = top1(probs);
@@ -238,11 +253,39 @@ fn classify_from_probs(labels: &[UseCaseLabel], probs: &[f32]) -> Classification
         None
     };
 
+    let confidence = top_prob.clamp(0.0, 1.0);
+    let top_label = labels[top_idx];
+    // Reason: Confident when top-1 ≥ 0.40 (also the threshold used to suppress
+    // the secondary label); LowConfidence below that. Unknown lands in the
+    // `Unknown` bucket only when the model was trained with `Unknown` as a
+    // class — preserve `Confident` in that case so the dashboard can tell
+    // "model confident this is unclassifiable" from "no signal at all".
+    let label_reason = if confidence < 0.40 {
+        UseCaseLabelReason::LowConfidence
+    } else {
+        UseCaseLabelReason::Confident
+    };
+
     ClassificationResult {
-        label: labels[top_idx],
-        confidence: top_prob.clamp(0.0, 1.0),
+        label: top_label,
+        confidence,
         secondary_label: secondary,
         interaction_mode: InteractionMode::Unknown, // set by caller for soth_binary
+        label_reason,
+    }
+}
+
+/// Shared defensive-error result used by `classify_linear`, `classify_soth_binary`,
+/// and `classify_from_probs` when input shapes don't match expectations.
+/// Carries `ModelShapeError` so the cloud can distinguish a corrupt model
+/// from a legitimate "no signal available" Unknown.
+fn shape_error_result() -> ClassificationResult {
+    ClassificationResult {
+        label: UseCaseLabel::Unknown,
+        confidence: 0.0,
+        secondary_label: None,
+        interaction_mode: InteractionMode::Unknown,
+        label_reason: UseCaseLabelReason::ModelShapeError,
     }
 }
 
@@ -260,6 +303,9 @@ fn aggregate_probs_to_public_labels(source_labels: &[UseCaseLabel], probs: &[f32
 }
 
 fn public_label_index(label: UseCaseLabel) -> usize {
+    // Inverse of LABEL_SPACE — keep in lockstep with that array. New
+    // variants from the 400k retrain occupy 16–20 so legacy variants
+    // 0–15 keep their indices and Unknown stays the last position.
     match label {
         UseCaseLabel::CodeGeneration => 0,
         UseCaseLabel::CodeReview => 1,
@@ -277,7 +323,12 @@ fn public_label_index(label: UseCaseLabel) -> usize {
         UseCaseLabel::ImageAnalysis => 13,
         UseCaseLabel::AudioTranscription => 14,
         UseCaseLabel::SystemPromptOnly => 15,
-        UseCaseLabel::Unknown => 16,
+        UseCaseLabel::InfraDevops => 16,
+        UseCaseLabel::LegalContract => 17,
+        UseCaseLabel::ResearchSynthesis => 18,
+        UseCaseLabel::SecurityAnalysis => 19,
+        UseCaseLabel::ContentEditing => 20,
+        UseCaseLabel::Unknown => 21,
     }
 }
 
@@ -494,8 +545,23 @@ fn parse_classifier_soth_binary(
     let auxiliary_weights = cursor.read_matrix(auxiliary_rows, auxiliary_cols)?;
     let auxiliary_biases = cursor.read_len_prefixed_vector(auxiliary_rows)?;
 
-    let usecase_labels = cursor
-        .read_label_block(usecase_count)?
+    let raw_labels = cursor.read_label_block(usecase_count)?;
+    // Log any vendor labels that don't match our canonical taxonomy — they
+    // get bucketed into UseCaseLabel::Unknown at parse time. Without this
+    // log, "vendor introduced a new label we should add to our enum" was
+    // indistinguishable from a legitimate model Unknown at runtime.
+    for raw in &raw_labels {
+        if matches!(map_bundle_label(raw.as_str()), UseCaseLabel::Unknown)
+            && !raw.trim().eq_ignore_ascii_case("UNKNOWN")
+        {
+            tracing::warn!(
+                bundle_label = %raw,
+                "bundle declared use-case label not in canonical UseCaseLabel enum; \
+                 bucketed as Unknown (UnmappedBundleLabel)"
+            );
+        }
+    }
+    let usecase_labels = raw_labels
         .into_iter()
         .map(|label| map_bundle_label(label.as_str()))
         .collect::<Vec<_>>();
@@ -683,25 +749,38 @@ fn map_bundle_label(label: &str) -> UseCaseLabel {
 
     match normalized.as_str() {
         "CODE_GENERATION" | "TEST_GENERATION" => UseCaseLabel::CodeGeneration,
-        "CODE_REVIEW" | "SECURITY_ANALYSIS" => UseCaseLabel::CodeReview,
+        "CODE_REVIEW" => UseCaseLabel::CodeReview,
         "CODE_DEBUGGING" => UseCaseLabel::CodeDebugging,
         "CODE_REFACTOR" => UseCaseLabel::CodeRefactor,
         "TEXT_SUMMARIZATION" | "DOCUMENT_SUMMARISATION" => UseCaseLabel::TextSummarization,
-        "TEXT_GENERATION" | "CONTENT_DRAFTING" | "CONTENT_EDITING" | "LEGAL_CONTRACT" => {
-            UseCaseLabel::TextGeneration
-        }
+        // CONTENT_DRAFTING stays under TextGeneration — drafting net-new
+        // content is the canonical "text generation" task. CONTENT_EDITING
+        // (revising existing content) gets its own variant below since
+        // edit operations have different sensitivity / governance needs.
+        "TEXT_GENERATION" | "CONTENT_DRAFTING" => UseCaseLabel::TextGeneration,
         "TRANSLATION" => UseCaseLabel::Translation,
-        "DATA_ANALYSIS" | "RESEARCH_SYNTHESIS" | "REGULATORY_COMPLIANCE" => {
-            UseCaseLabel::DataAnalysis
-        }
+        // REGULATORY_COMPLIANCE stays under DataAnalysis — the corpus
+        // examples are predominantly analytical reads of existing rules.
+        // RESEARCH_SYNTHESIS gets its own variant below.
+        "DATA_ANALYSIS" | "REGULATORY_COMPLIANCE" => UseCaseLabel::DataAnalysis,
+        // SQL_DATA_QUERY stays under DataExtraction — it's just a more
+        // specific phrasing of the same task.
         "DATA_EXTRACTION" | "SQL_DATA_QUERY" => UseCaseLabel::DataExtraction,
         "QUESTION_ANSWERING" | "DOCUMENT_QA" | "FACT_QA" => UseCaseLabel::QuestionAnswering,
         "DOCUMENT_SEARCH" => UseCaseLabel::DocumentSearch,
         "AGENT_TASK" => UseCaseLabel::AgentTask,
-        "TOOL_ORCHESTRATION" | "INFRA_DEVOPS" => UseCaseLabel::ToolOrchestration,
+        "TOOL_ORCHESTRATION" => UseCaseLabel::ToolOrchestration,
         "IMAGE_ANALYSIS" => UseCaseLabel::ImageAnalysis,
         "AUDIO_TRANSCRIPTION" => UseCaseLabel::AudioTranscription,
         "SYSTEM_PROMPT_ONLY" => UseCaseLabel::SystemPromptOnly,
+        // ── Variants introduced when the use-case MLP was retrained on
+        // the 400k corpus. Promoted from collapsed arms above so the
+        // dashboard can surface them as first-class buckets.
+        "INFRA_DEVOPS" => UseCaseLabel::InfraDevops,
+        "LEGAL_CONTRACT" => UseCaseLabel::LegalContract,
+        "RESEARCH_SYNTHESIS" => UseCaseLabel::ResearchSynthesis,
+        "SECURITY_ANALYSIS" => UseCaseLabel::SecurityAnalysis,
+        "CONTENT_EDITING" => UseCaseLabel::ContentEditing,
         _ => UseCaseLabel::Unknown,
     }
 }
@@ -924,9 +1003,35 @@ mod tests {
             map_bundle_label("DOCUMENT_QA"),
             UseCaseLabel::QuestionAnswering
         );
+
+        // 400k-corpus retrain promotes these from collapsed arms to
+        // their own first-class variants. See `UseCaseLabel` doc comments
+        // for why each was split out (sensitivity, governance needs,
+        // dashboard granularity).
+        assert_eq!(map_bundle_label("INFRA_DEVOPS"), UseCaseLabel::InfraDevops);
         assert_eq!(
-            map_bundle_label("INFRA_DEVOPS"),
-            UseCaseLabel::ToolOrchestration
+            map_bundle_label("LEGAL_CONTRACT"),
+            UseCaseLabel::LegalContract
+        );
+        assert_eq!(
+            map_bundle_label("RESEARCH_SYNTHESIS"),
+            UseCaseLabel::ResearchSynthesis
+        );
+        assert_eq!(
+            map_bundle_label("SECURITY_ANALYSIS"),
+            UseCaseLabel::SecurityAnalysis
+        );
+        assert_eq!(
+            map_bundle_label("CONTENT_EDITING"),
+            UseCaseLabel::ContentEditing
+        );
+        // Variants intentionally NOT split — verify they still collapse:
+        // CONTENT_DRAFTING → TextGeneration (drafting net-new content)
+        // SQL_DATA_QUERY → DataExtraction (just a specific phrasing)
+        // REGULATORY_COMPLIANCE → DataAnalysis (analytical reads)
+        assert_eq!(
+            map_bundle_label("REGULATORY_COMPLIANCE"),
+            UseCaseLabel::DataAnalysis
         );
     }
 

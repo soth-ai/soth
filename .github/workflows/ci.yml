@@ -2,8 +2,29 @@ name: ci
 
 on:
   pull_request:
+    # Skip CI on PRs that only touch docs / markdown — saves a full
+    # workflow run (9 jobs) per readme tweak. The ignore filter is
+    # path-based: any code/config change still triggers everything.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
   push:
-    branches: [main]
+    # Add `staging` so direct pushes (cargo-fmt fixups, ops tweaks)
+    # get verified — `staging` is a real merge target, not just a
+    # branch name.
+    branches: [main, staging]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
+
+# Cancel superseded runs on the same ref. Push-rebase-push cycles on
+# an open PR were burning duplicate minutes; only the latest commit's
+# run is load-bearing.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,3 +56,52 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --lib --bins
+
+  # Parser / detect / policy / install tests on Windows — gryph
+  # PR #42's `unzip` Windows-specific bug shipped because there
+  # was no Windows runner in CI. We do ship Windows soth-cli
+  # binaries (see node-binaries.yml release lane), so any
+  # Windows-only regression in parser/detect/policy/install code
+  # paths must land on a real Windows runner before merge.
+  #
+  # Scoped to library tests for the crates whose code paths
+  # actually differ on Windows: path resolution
+  # (`extensions/code/src/paths.rs` reads dirs::home_dir →
+  # %USERPROFILE% on Windows), settings.json install
+  # (different default per agent — `~/.claude/...` vs
+  # `%USERPROFILE%\.claude\...`), regex / unicode handling in
+  # detect, and signature-verify on policy.  soth-proxy is
+  # excluded — its async networking surface includes Linux-
+  # specific syscalls (epoll, AF_UNIX) that don't compile on
+  # Windows and are not the historical regression site.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: lib tests on Windows
+        shell: bash
+        run: |
+          cargo test --lib -p soth-core
+          cargo test --lib -p soth-classify
+          cargo test --lib -p soth-detect
+          cargo test --lib -p soth-policy
+          cargo test --lib -p soth-bundle
+          cargo test --lib -p soth-extensions
+          cargo test --lib -p soth-parse
+          cargo test --lib -p soth-code
+
+  # SDK-related jobs (conformance / wasm matrix / bindings-build-check) are
+  # intentionally NOT in this workflow.
+  #
+  # They live in dedicated workflows that are already path-filtered to fire
+  # only when the SDK surface or bindings actually change:
+  #   - ffi-conformance.yml   (bindings + sdk-core fixtures)
+  #   - python-wheels.yml     (bindings/soth-py + sdk-core)
+  #   - node-binaries.yml     (bindings/soth-node + sdk-core)
+  #
+  # Keeping the basic CI lane (fmt + clippy + test) lean speeds up review
+  # for the proxy/historian/cli changes that are >90% of PRs against
+  # staging. The dedicated workflows still run on the relevant paths and
+  # on push to main / sdk-* branches as a release gate.

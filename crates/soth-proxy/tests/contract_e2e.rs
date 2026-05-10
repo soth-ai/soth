@@ -70,44 +70,42 @@ fn sample_request(
 
 fn sample_proxy_context(capture_mode: CaptureMode, timestamp_epoch_ms: i64) -> ProxyContext {
     ProxyContext {
-        org_id: "org-test".to_string(),
-        user_id_hmac: "user-hmac".to_string(),
-        team_id: "team-test".to_string(),
-        device_id_hash: "device-hash".to_string(),
-        endpoint_hash: "endpoint-hash".to_string(),
-        process_resolution: ProcessResolution {
-            match_kind: ProcessMatchKind::Unknown,
-            app_type: AppType::Unknown,
-            capture_mode: Some(capture_mode),
-            process_name: Some("test-proc".to_string()),
-            bundle_id: None,
-            matched_app_id: None,
-            ..Default::default()
+        identity: soth_core::IdentityContext {
+            org_id: "org-test".to_string(),
+            user_id_hmac: "user-hmac".to_string(),
+            team_id: "team-test".to_string(),
+            device_id_hash: "device-hash".to_string(),
+            endpoint_hash: "endpoint-hash".to_string(),
+            capture_mode,
+            traffic_classification: TrafficClassification::ToolUsage,
+            classification_source: ClassificationSource::Proxy,
+            session_snapshot: Some(SessionSnapshot {
+                current_request_timestamp: timestamp_epoch_ms,
+                ..SessionSnapshot::default()
+            }),
+            declared_provider: Some("openai".to_string()),
+            declared_application: None,
+            session_id: None,
+            deployment_context: None,
+            bundle_trust_level: None,
+            precomputed_commitment_nonce: None,
+            precomputed_commitment_hash: None,
         },
-        capture_mode,
-        matched_provider: Some("openai".to_string()),
-        matched_application: None,
-        traffic_classification: TrafficClassification::ToolUsage,
-        classification_source: ClassificationSource::Proxy,
-        session_snapshot: Some(SessionSnapshot {
-            current_request_timestamp: timestamp_epoch_ms,
-            ..SessionSnapshot::default()
-        }),
-        request_method: None,
-        deployment_context: None,
-        precomputed_commitment_nonce: None,
-        precomputed_commitment_hash: None,
-        connection_id: None,
-        bundle_trust_level: None,
-        session_id: None,
-        product_id: None,
-        surface_type: SurfaceType::Unknown,
-        is_shadow_it: false,
-        ja4_hash: None,
-        tls_version: None,
-        alpn_protocol: None,
-        h2_connection_id: None,
-        h2_stream_id: None,
+        transport: soth_core::TransportContext::default(),
+        attribution: soth_core::AttributionContext {
+            process_resolution: ProcessResolution {
+                match_kind: ProcessMatchKind::Unknown,
+                app_type: AppType::Unknown,
+                capture_mode: Some(capture_mode),
+                process_name: Some("test-proc".to_string()),
+                bundle_id: None,
+                matched_app_id: None,
+                ..Default::default()
+            },
+            product_id: None,
+            surface_type: SurfaceType::Unknown,
+            is_shadow_it: false,
+        },
     }
 }
 
@@ -165,6 +163,7 @@ fn classify_contract_input_output() {
     assert_eq!(
         out.telemetry_event.timestamp_epoch_ms,
         proxy_ctx
+            .identity
             .session_snapshot
             .as_ref()
             .expect("session snapshot")

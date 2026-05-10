@@ -90,6 +90,13 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigCommands,
     },
+
+    /// Synchronous policy gate at the AI coding agent's hook boundary
+    /// (Claude Code, Cursor, Codex, …). See `docs/gryph/plan.md`.
+    Code {
+        #[command(subcommand)]
+        action: commands::code::CodeCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -126,6 +133,23 @@ pub struct StartArgs {
     /// Internal daemon child execution mode
     #[arg(long, hide = true)]
     pub daemon_child: bool,
+
+    /// Internal historian sibling worker mode. Set by the supervisor when
+    /// re-execing this binary as the historian worker (see
+    /// `spawn_historian_process`). Hidden from `--help`; user code never
+    /// sets this. The `SOTH_HISTORIAN_WORKER=1` env paired with this
+    /// flag is what actually dispatches into `run_historian_worker`.
+    #[arg(long, hide = true)]
+    pub historian_child: bool,
+
+    /// Internal classify-daemon sibling worker mode. Same pattern as
+    /// `historian_child` — set by the supervisor when re-execing this
+    /// binary as the classify daemon worker (see
+    /// `spawn_classify_daemon_process`). Hidden from `--help`. The
+    /// `SOTH_CODE_CLASSIFY_WORKER=1` env paired with this flag is what
+    /// actually dispatches into `run_classify_daemon_worker`.
+    #[arg(long, hide = true)]
+    pub classify_daemon_child: bool,
 
     /// Do not register startup autostart
     #[arg(long)]
@@ -180,6 +204,22 @@ pub struct UpArgs {
     /// Allow fallback to daemon-child mode when managed service startup is unavailable
     #[arg(long)]
     pub allow_daemon_child_fallback: bool,
+
+    /// Skip the soth-code hook auto-install sweep that would
+    /// otherwise wire hooks for every detected AI coding agent
+    /// (Claude Code, Cursor, Codex, Gemini CLI, Pi Agent,
+    /// Windsurf, OpenCode) on this host.  Use when you want
+    /// proxy-only governance and intend to install hooks
+    /// per-agent by hand.
+    #[arg(long)]
+    pub skip_hooks: bool,
+
+    /// Force re-install of every detected agent's hooks even
+    /// when state says they're already wired.  Use after a
+    /// soth binary upgrade that moved the executable path.
+    /// Implied automatically when binary drift is detected.
+    #[arg(long)]
+    pub repair_hooks: bool,
 }
 
 #[derive(Args, Clone)]
@@ -216,6 +256,14 @@ pub struct DoctorArgs {
     /// Emit machine-readable JSON
     #[arg(long)]
     pub json: bool,
+
+    /// One-shot recovery for "I can't browse even with proxy off" situations.
+    /// Disables system proxy (signature-aware), removes the bypass list
+    /// soth installed, flushes mDNSResponder's cache (sudo required for the
+    /// system-level part), and emits the shell-env deactivation patch.
+    /// Idempotent — safe to run repeatedly.
+    #[arg(long)]
+    pub reset_network: bool,
 }
 
 #[derive(Args, Clone)]
@@ -363,7 +411,11 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
             }
         }
         Commands::Doctor(args) => {
-            commands::proxy::run_doctor(global_config, args.json).await?;
+            if args.reset_network {
+                commands::proxy::run_doctor_reset_network().await?;
+            } else {
+                commands::proxy::run_doctor(global_config, args.json).await?;
+            }
         }
         Commands::Init(args) => {
             let output = cli_config::expand_tilde(args.output.as_path());
@@ -396,6 +448,14 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
         }
         Commands::Config { action } => {
             run_config_command(action, global_config)?;
+        }
+        Commands::Code { action } => {
+            // `commands::code::run` calls `std::process::exit` directly
+            // when the adapter chooses a non-zero code (Block etc.) —
+            // the agent expects a precise exit value the dispatcher
+            // can't reshape. Returning Ok(()) here is unreachable for
+            // the hook subcommand; `status` does normally return.
+            commands::code::run(action, global_config).await?;
         }
     }
 
@@ -749,7 +809,212 @@ async fn run_up_command(args: UpArgs, global_config: Option<PathBuf>) -> anyhow:
             "Proxy up completed but failed to emit shell env activation patch"
         );
     }
+
+    // Auto-install soth-code hooks for every AI coding agent
+    // detected on this host.  Idempotent: a state file at
+    // ~/.soth/installed.json records which agents the install
+    // already wrote; agents already in state with a matching
+    // binary path get skipped, the rest get fresh installs.
+    // The state file makes a re-run of `soth up` cheap (no
+    // unnecessary settings.json rewrites) and gives operators
+    // a single place to see "which agents this host has
+    // governed."
+    if !args.skip_hooks {
+        if let Err(error) = auto_install_detected_hooks(args.repair_hooks, args.quiet) {
+            tracing::warn!(error = %format!("{error:#}"), "soth-code auto-install sweep failed");
+            if !args.quiet {
+                style::warning(&format!(
+                    "soth-code hook auto-install failed: {error:#}\n\
+                     Per-agent install is still available via `soth code install --target <agent>`."
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+/// Detect AI coding agents on this host and install soth-code
+/// hooks for any that aren't already governed.  Idempotent —
+/// the per-host state file at ~/.soth/installed.json records
+/// what's been done so re-runs are cheap.  Per-agent install
+/// failures don't abort the sweep; we report them in the final
+/// summary so operators can see which agents need a manual
+/// follow-up.
+fn auto_install_detected_hooks(force_repair: bool, quiet: bool) -> anyhow::Result<()> {
+    use soth_code::install;
+    use soth_code::state::InstalledHostState;
+
+    let detected = install::detect_installable_agents();
+    let state_path = InstalledHostState::default_path()
+        .context("could not resolve ~/.soth/installed.json — pass HOME or run with --skip-hooks")?;
+    let current_binary = std::env::current_exe()
+        .context("could not resolve current binary path for state recording")?;
+
+    let result = run_sweep(
+        &detected,
+        &state_path,
+        &current_binary,
+        force_repair,
+        install_one,
+    );
+    if !quiet {
+        report_sweep(&detected, &result);
+    }
+    Ok(())
+}
+
+/// One row of sweep output — the `installed` / `skipped` /
+/// `repaired` / `failed` partition for the agents the
+/// orchestrator processed.  Returned to make `run_sweep`
+/// pure-ish (no side-channel via `style::info` calls inside
+/// the loop) and easy to assert on from tests.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SweepResult {
+    installed: Vec<String>,
+    skipped: Vec<String>,
+    repaired: Vec<String>,
+    failed: Vec<(String, String)>,
+}
+
+/// Pure orchestration: walk the detected agents, decide for
+/// each whether to install / skip / repair, call the injected
+/// `install_fn` for the install/repair cases, and persist the
+/// updated state.  No I/O on stdout — the `report_sweep`
+/// helper handles operator-facing output.  No production
+/// dependency on `current_exe()` or `default_path()` — both
+/// are caller-provided, so a test can drive this against a
+/// tmpdir-rooted state file and a synthetic binary path.
+///
+/// Per-agent install failures land in `result.failed` rather
+/// than aborting the sweep — the operator sees which agents
+/// need a manual follow-up.
+fn run_sweep<F>(
+    detected: &[soth_code::install::DetectedAgent],
+    state_path: &Path,
+    current_binary: &Path,
+    force_repair: bool,
+    install_fn: F,
+) -> SweepResult
+where
+    F: Fn(&str, &Path) -> anyhow::Result<()>,
+{
+    use soth_code::state::InstalledHostState;
+
+    let mut state = InstalledHostState::load(state_path).unwrap_or_default();
+    let mut result = SweepResult::default();
+
+    for det in detected {
+        let drifted = state.binary_drifted(det.agent, current_binary);
+        let needs_install = force_repair || drifted || !det.already_installed;
+        if !needs_install {
+            // Already wired and in-state; just refresh
+            // installed_at so the audit trail shows this host
+            // saw the agent on this run too.
+            state.record_install(
+                det.agent,
+                det.settings_path.clone(),
+                current_binary.to_path_buf(),
+            );
+            result.skipped.push(det.agent.to_string());
+            continue;
+        }
+        match install_fn(det.agent, &det.settings_path) {
+            Ok(()) => {
+                state.record_install(
+                    det.agent,
+                    det.settings_path.clone(),
+                    current_binary.to_path_buf(),
+                );
+                if drifted {
+                    result.repaired.push(det.agent.to_string());
+                } else {
+                    result.installed.push(det.agent.to_string());
+                }
+            }
+            Err(e) => {
+                result
+                    .failed
+                    .push((det.agent.to_string(), format!("{e:#}")));
+            }
+        }
+    }
+
+    if let Err(e) = state.save(state_path) {
+        tracing::warn!(error = %format!("{e:#}"), "failed to persist install state");
+    }
+
+    result
+}
+
+/// Operator-facing summary of a sweep.  Pulled out of
+/// `run_sweep` so the pure orchestration is easy to assert
+/// on from tests.
+fn report_sweep(detected: &[soth_code::install::DetectedAgent], result: &SweepResult) {
+    if detected.is_empty() {
+        style::info(
+            "No AI coding agents detected on this host. Skipping soth-code hook \
+             auto-install. Re-run `soth up` after installing Claude Code, Cursor, \
+             Codex, Gemini CLI, Pi Agent, Windsurf, or OpenCode.",
+        );
+        return;
+    }
+    if !result.installed.is_empty() {
+        style::info(&format!(
+            "soth-code hooks installed: {}",
+            result.installed.join(", ")
+        ));
+    }
+    if !result.repaired.is_empty() {
+        style::info(&format!(
+            "soth-code hooks repaired (binary path drift): {}",
+            result.repaired.join(", ")
+        ));
+    }
+    if !result.skipped.is_empty() {
+        style::info(&format!(
+            "soth-code hooks already up-to-date: {}",
+            result.skipped.join(", ")
+        ));
+    }
+    for (agent, err) in &result.failed {
+        style::warning(&format!("soth-code hook install failed for {agent}: {err}"));
+    }
+}
+
+/// Per-agent install dispatch.  Mirrors the `soth code install`
+/// match arm but is invoked from the auto-install sweep with
+/// the canonical settings path (no `--settings-path` override).
+fn install_one(agent: &str, settings_path: &Path) -> anyhow::Result<()> {
+    use soth_code::install::{
+        install_claude_code, install_codex, install_cursor, install_gemini_cli, install_opencode,
+        install_pi_agent, install_windsurf,
+    };
+    match agent {
+        "claude_code" => install_claude_code(settings_path, None)
+            .map(|_| ())
+            .context("install claude_code hooks"),
+        "cursor" => install_cursor(settings_path, None)
+            .map(|_| ())
+            .context("install cursor hooks"),
+        "openai_codex" => install_codex(settings_path, None)
+            .map(|_| ())
+            .context("install codex hooks"),
+        "gemini_cli" => install_gemini_cli(settings_path, None)
+            .map(|_| ())
+            .context("install gemini_cli hooks"),
+        "windsurf" => install_windsurf(settings_path, None)
+            .map(|_| ())
+            .context("install windsurf hooks"),
+        "pi_agent" => install_pi_agent(settings_path, None)
+            .map(|_| ())
+            .context("install pi_agent plugin"),
+        "opencode" => install_opencode(settings_path, None)
+            .map(|_| ())
+            .context("install opencode plugin"),
+        // OpenClaw deliberately omitted from the auto-installer
+        // — config format pending upstream (gryph PR #31).
+        other => anyhow::bail!("auto-install does not support agent: {other}"),
+    }
 }
 
 async fn ensure_config_for_up(
@@ -1213,6 +1478,8 @@ mod tests {
                     quiet: true,
                     foreground: false,
                     daemon_child: false,
+                    historian_child: false,
+                    classify_daemon_child: false,
                     no_autostart: true,
                     allow_daemon_child_fallback: true,
                 },
@@ -1262,6 +1529,8 @@ mod tests {
                         foreground: false,
                         no_autostart: false,
                         allow_daemon_child_fallback: false,
+                        skip_hooks: true,
+                        repair_hooks: false,
                     },
                     None,
                 ))
@@ -1304,6 +1573,8 @@ mod tests {
                         foreground: false,
                         no_autostart: false,
                         allow_daemon_child_fallback: false,
+                        skip_hooks: true,
+                        repair_hooks: false,
                     },
                     None,
                 ))
@@ -1344,6 +1615,8 @@ mod tests {
                     foreground: false,
                     no_autostart: false,
                     allow_daemon_child_fallback: false,
+                    skip_hooks: true,
+                    repair_hooks: false,
                 },
                 None,
             ))
@@ -1393,6 +1666,8 @@ mod tests {
                         quiet: true,
                         foreground: false,
                         daemon_child: false,
+                        historian_child: false,
+                        classify_daemon_child: false,
                         no_autostart: true,
                         allow_daemon_child_fallback: false,
                     },
@@ -1403,5 +1678,301 @@ mod tests {
             assert!(format!("{error:#}").contains("bootstrap cannot fetch bundle"));
             assert!(proxy_test_hooks::calls().is_empty());
         });
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    //! Integration tests for `run_sweep` — the soth-code hook
+    //! auto-installer's pure orchestration core.  Drives the
+    //! orchestrator against tmpdir-rooted state files with an
+    //! injected install function so tests cover the
+    //! idempotency / drift-triggers-repair / failure-tolerance
+    //! contracts without actually mutating any settings.json
+    //! on the test host.
+
+    use super::{run_sweep, SweepResult};
+    use soth_code::install::DetectedAgent;
+    use soth_code::state::InstalledHostState;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    fn detected(agent: &'static str, dir: &Path, already: bool) -> DetectedAgent {
+        DetectedAgent {
+            agent,
+            settings_path: dir.join(format!("{agent}-settings")),
+            already_installed: already,
+        }
+    }
+
+    /// Always-success install fn that records every call so
+    /// the test can assert which agents were actually installed.
+    fn recording_install(
+        calls: &Mutex<Vec<(String, PathBuf)>>,
+    ) -> impl Fn(&str, &Path) -> anyhow::Result<()> + '_ {
+        move |agent: &str, path: &Path| {
+            calls
+                .lock()
+                .unwrap()
+                .push((agent.to_string(), path.to_path_buf()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fresh_sweep_installs_every_detected_agent_and_writes_state() {
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("installed.json");
+        let bin = PathBuf::from("/usr/local/bin/soth");
+        let detected_agents = vec![
+            detected("claude_code", tmp.path(), false),
+            detected("cursor", tmp.path(), false),
+        ];
+        let calls = Mutex::new(Vec::new());
+        let install_fn = recording_install(&calls);
+
+        let result = run_sweep(&detected_agents, &state_path, &bin, false, install_fn);
+
+        assert_eq!(result.installed, vec!["claude_code", "cursor"]);
+        assert!(result.skipped.is_empty());
+        assert!(result.repaired.is_empty());
+        assert!(result.failed.is_empty());
+        // Both agents got their install_fn invoked.
+        assert_eq!(calls.lock().unwrap().len(), 2);
+
+        // State file persisted both records.
+        let state = InstalledHostState::load(&state_path).unwrap();
+        assert!(state.hooks.contains_key("claude_code"));
+        assert!(state.hooks.contains_key("cursor"));
+        assert_eq!(state.hooks["claude_code"].binary_path, bin);
+    }
+
+    #[test]
+    fn rerun_with_already_installed_skips_install_call() {
+        // Pin the idempotency contract: when `already_installed
+        // == true` (the agent's settings file has the soth-
+        // managed marker) AND state shows the same binary path,
+        // re-running shouldn't call install_fn again.
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("installed.json");
+        let bin = PathBuf::from("/usr/local/bin/soth");
+        let detected_agents = vec![detected("claude_code", tmp.path(), false)];
+
+        // First sweep: installs.
+        let calls1 = Mutex::new(Vec::new());
+        let _ = run_sweep(
+            &detected_agents,
+            &state_path,
+            &bin,
+            false,
+            recording_install(&calls1),
+        );
+        assert_eq!(calls1.lock().unwrap().len(), 1);
+
+        // Second sweep: detection now reports already_installed
+        // = true (the marker is in the settings file post-
+        // install).  install_fn must NOT be called again.
+        let detected2 = vec![detected("claude_code", tmp.path(), true)];
+        let calls2 = Mutex::new(Vec::new());
+        let result = run_sweep(
+            &detected2,
+            &state_path,
+            &bin,
+            false,
+            recording_install(&calls2),
+        );
+        assert!(
+            calls2.lock().unwrap().is_empty(),
+            "install must be skipped on re-run"
+        );
+        assert_eq!(result.skipped, vec!["claude_code"]);
+        assert!(result.installed.is_empty());
+        assert!(result.repaired.is_empty());
+    }
+
+    #[test]
+    fn binary_drift_triggers_repair_install_even_when_already_installed() {
+        // Pin the drift contract: when state shows binary
+        // path = X but current_binary = Y (operator brewed a
+        // new soth that landed at a different prefix), the
+        // sweep MUST re-install so the hook entries get
+        // re-pointed.  Otherwise hooks keep dispatching to
+        // the old (possibly missing) binary.
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("installed.json");
+        let bin_old = PathBuf::from("/old/path/soth");
+        let bin_new = PathBuf::from("/new/path/soth");
+        let detected_agents = vec![detected("claude_code", tmp.path(), true)];
+
+        // Bootstrap state with the OLD binary path.
+        let calls1 = Mutex::new(Vec::new());
+        let _ = run_sweep(
+            &detected_agents,
+            &state_path,
+            &bin_old,
+            false,
+            recording_install(&calls1),
+        );
+
+        // Now run with NEW binary path (drift).  Even though
+        // already_installed is still true, the sweep must
+        // detect the drift and re-install.
+        let calls2 = Mutex::new(Vec::new());
+        let result = run_sweep(
+            &detected_agents,
+            &state_path,
+            &bin_new,
+            false,
+            recording_install(&calls2),
+        );
+        assert_eq!(
+            calls2.lock().unwrap().len(),
+            1,
+            "drift must trigger re-install"
+        );
+        assert_eq!(result.repaired, vec!["claude_code"]);
+        assert!(result.installed.is_empty());
+
+        // State updated to the new binary path so the next
+        // sweep treats this as no-drift.
+        let state = InstalledHostState::load(&state_path).unwrap();
+        assert_eq!(state.hooks["claude_code"].binary_path, bin_new);
+    }
+
+    #[test]
+    fn force_repair_reinstalls_even_without_drift() {
+        // `--repair-hooks` forces re-install regardless of
+        // state — operators use it after edge-case binary
+        // moves the drift detector misses (e.g. symlink
+        // changes that resolve to the same canonical path).
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("installed.json");
+        let bin = PathBuf::from("/usr/local/bin/soth");
+        let detected_agents = vec![detected("claude_code", tmp.path(), true)];
+
+        let calls1 = Mutex::new(Vec::new());
+        let _ = run_sweep(
+            &detected_agents,
+            &state_path,
+            &bin,
+            false,
+            recording_install(&calls1),
+        );
+
+        // Same binary, same already_installed=true — but
+        // force_repair=true forces an install_fn call.
+        let calls2 = Mutex::new(Vec::new());
+        let result = run_sweep(
+            &detected_agents,
+            &state_path,
+            &bin,
+            true, // force_repair
+            recording_install(&calls2),
+        );
+        assert_eq!(calls2.lock().unwrap().len(), 1);
+        assert_eq!(result.installed, vec!["claude_code"]);
+        // No drift, so it shows as `installed` not `repaired`.
+        // Drift specifically means "binary moved" — force_repair
+        // is a separate signal.
+    }
+
+    #[test]
+    fn per_agent_failure_does_not_abort_sweep() {
+        // Pin the failure-tolerance contract: when one
+        // agent's install_fn returns an error, the sweep
+        // continues with the remaining agents.  Operators
+        // need to know about the failures (result.failed) but
+        // shouldn't have a single broken agent prevent the
+        // others from being governed.
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("installed.json");
+        let bin = PathBuf::from("/usr/local/bin/soth");
+        let detected_agents = vec![
+            detected("claude_code", tmp.path(), false),
+            detected("cursor", tmp.path(), false),
+            detected("openai_codex", tmp.path(), false),
+        ];
+
+        let install_fn = |agent: &str, _path: &Path| -> anyhow::Result<()> {
+            if agent == "cursor" {
+                anyhow::bail!("simulated cursor install failure")
+            }
+            Ok(())
+        };
+
+        let result = run_sweep(&detected_agents, &state_path, &bin, false, install_fn);
+
+        assert_eq!(result.installed, vec!["claude_code", "openai_codex"]);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].0, "cursor");
+        assert!(
+            result.failed[0]
+                .1
+                .contains("simulated cursor install failure"),
+            "failure detail must surface the underlying error"
+        );
+
+        // State persisted only the successful installs.
+        let state = InstalledHostState::load(&state_path).unwrap();
+        assert!(state.hooks.contains_key("claude_code"));
+        assert!(state.hooks.contains_key("openai_codex"));
+        assert!(!state.hooks.contains_key("cursor"));
+    }
+
+    #[test]
+    fn install_one_dispatches_every_canonical_agent_name() {
+        // Pin the contract: every canonical agent name that
+        // `detect_installable_agents` may emit MUST have a
+        // matching arm in `install_one`'s dispatch.  A mismatch
+        // there silently fails real installs at runtime — the
+        // sweep_tests above all use a mocked install_fn so a
+        // stale `install_one` arm wasn't catchable from those.
+        // This test exercises the real `install_one` against
+        // throwaway paths; we don't care if the underlying
+        // installer succeeds (it usually fails because the
+        // tmp path doesn't have a real settings.json), only
+        // that the dispatch DOESN'T return the
+        // "auto-install does not support agent: X" bail.
+        let tmp = TempDir::new().unwrap();
+        let canonical_names = [
+            "claude_code",
+            "cursor",
+            "openai_codex",
+            "gemini_cli",
+            "windsurf",
+            "pi_agent",
+            "opencode",
+        ];
+        for agent in canonical_names {
+            let path = tmp.path().join(format!("{agent}-fake-settings"));
+            let result = super::install_one(agent, &path);
+            if let Err(e) = &result {
+                let msg = format!("{e:#}");
+                assert!(
+                    !msg.contains("auto-install does not support agent"),
+                    "install_one returned dispatch-miss bail for {agent}: {msg}\n\
+                     This means detect_installable_agents emits {agent} but install_one\n\
+                     has no matching arm — the sweep would silently skip this agent at\n\
+                     runtime."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_detection_produces_empty_result() {
+        // Host with no AI coding agents — sweep is a no-op.
+        // No calls to install_fn, no state file mutation,
+        // empty result partitions.
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("installed.json");
+        let bin = PathBuf::from("/usr/local/bin/soth");
+
+        let calls = Mutex::new(Vec::new());
+        let result = run_sweep(&[], &state_path, &bin, false, recording_install(&calls));
+
+        assert_eq!(result, SweepResult::default());
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

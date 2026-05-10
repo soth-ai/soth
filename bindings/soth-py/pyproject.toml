@@ -1,0 +1,46 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "soth"
+description = "SOTH SDK for Python — observability + policy enforcement for LLM API calls."
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Labterminal" }]
+requires-python = ">=3.10"  # 3.9 reached EOL October 2025
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.34"]
+cohere = ["cohere>=5.0"]
+google = ["google-genai>=0.3"]
+mistral = ["mistralai>=1.0"]
+test = ["pytest>=8", "openai>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/labterminal/soth"
+Repository = "https://github.com/labterminal/soth"
+
+[tool.maturin]
+# `extension-module` is a soth-py crate feature (gates pyo3's
+# extension-module feature transitively). Bare `cargo build -p soth-py`
+# does NOT pass this feature so the workspace build stays link-clean;
+# maturin builds the wheel with it on so Python supplies symbols at
+# load time.
+features = ["extension-module"]
+module-name = "soth._soth_native"
+python-source = "python"
+manifest-path = "Cargo.toml"

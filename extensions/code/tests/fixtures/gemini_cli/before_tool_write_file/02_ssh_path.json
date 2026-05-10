@@ -1,0 +1,11 @@
+{
+  "session_id": "gemini-ssh-write",
+  "transcript_path": "/home/user/.gemini/transcripts/dev.jsonl",
+  "cwd": "/home/user",
+  "hook_event_name": "BeforeTool",
+  "tool_name": "write_file",
+  "tool_input": {
+    "file_path": "/home/user/.ssh/config",
+    "content": "Host bastion\n  User ops\n"
+  }
+}

@@ -8,6 +8,7 @@
 mod bundle;
 mod config;
 mod fallback;
+mod hook_entry;
 mod model;
 mod onnx_embed;
 mod pipeline;
@@ -28,6 +29,7 @@ pub use bundle::{
     BundleLoadError, ClassifyBundle, ModelAssetStatus, CLASSIFY_REQUIRED_MODEL_ASSETS,
 };
 pub use config::{ClassifyConfig, ComplexityWeights, VolatilityConfig};
+pub use hook_entry::{classify_for_hook, HookClassifyInput, HookContentKind, HookIdentity};
 pub use traits::{AnomalyScorer, ClassificationProvider};
 pub use types::{ClassifiedResult, StageTiming};
 

@@ -166,6 +166,7 @@ impl fmt::Display for IntelligenceError {
 
 impl std::error::Error for IntelligenceError {}
 
+#[cfg(feature = "intelligence-sqlite")]
 impl From<rusqlite::Error> for IntelligenceError {
     fn from(value: rusqlite::Error) -> Self {
         Self::new(value.to_string())
@@ -296,6 +297,7 @@ fn parse_source_label(value: &ParseSource) -> String {
         ParseSource::AgentApp => "agent_app".to_string(),
         ParseSource::Heuristic => "heuristic".to_string(),
         ParseSource::Filtered => "filtered".to_string(),
+        ParseSource::Sdk => "sdk".to_string(),
     }
 }
 

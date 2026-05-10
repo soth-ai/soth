@@ -262,6 +262,7 @@ fn read_cursor_sessions(
                 content: text,
                 timestamp: data.created_at,
                 token_estimate,
+                usage: None,
             });
         }
 
@@ -306,6 +307,7 @@ fn read_cursor_sessions(
                     content: text,
                     timestamp: data.created_at,
                     token_estimate,
+                    usage: None,
                 });
             }
         }

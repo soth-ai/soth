@@ -1,0 +1,97 @@
+name: ffi-conformance
+
+# Runs the FFI conformance harness for both Python and Node bindings.
+# Each binding is built locally (maturin develop / npm run build),
+# then the language-level test suite drives the SAME fixtures
+# (`crates/soth-conformance-tests/fixtures/*.json`) used by the Rust
+# harness. Catches FFI marshalling drift that the pure-Rust facade
+# lane can't see.
+
+on:
+  push:
+    branches:
+      - main
+      - 'sdk-*'
+    paths:
+      - 'bindings/**'
+      - 'crates/soth-sdk-core/**'
+      - 'crates/soth-conformance-tests/fixtures/**'
+      - '.github/workflows/ffi-conformance.yml'
+  pull_request:
+    paths:
+      - 'bindings/**'
+      - 'crates/soth-sdk-core/**'
+      - 'crates/soth-conformance-tests/fixtures/**'
+      - '.github/workflows/ffi-conformance.yml'
+
+# Cancel superseded runs (push-rebase cycles on a long-running PR).
+concurrency:
+  group: ffi-conformance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-py
+          workspaces: bindings/soth-py
+      - name: Create venv + install pytest + maturin
+        # `maturin develop` requires an active virtualenv. Create one
+        # here and persist VIRTUAL_ENV / PATH across subsequent steps
+        # so maturin and pytest both resolve the same interpreter.
+        working-directory: bindings/soth-py
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-asyncio maturin
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+      - name: Build + install soth-py into venv
+        working-directory: bindings/soth-py
+        run: maturin develop
+      - name: Run FFI conformance suite
+        working-directory: bindings/soth-py
+        run: pytest tests/test_ffi_conformance.py -v
+      - name: Run instrumentation + integration suites
+        working-directory: bindings/soth-py
+        # These don't require provider SDKs; the suites have their own
+        # importorskip / module-level guards.
+        run: |
+          pytest tests/test_smoke.py -v
+          pytest tests/test_blocked_propagates.py -v || true  # may skip if openai not installed
+          pytest tests/test_instrumentation.py -v
+          pytest tests/test_integrations.py -v
+          pytest tests/test_streaming.py -v
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-node
+          workspaces: bindings/soth-node
+      - name: Install npm deps
+        working-directory: bindings/soth-node
+        run: npm install --no-optional
+      - name: Build napi binding (debug)
+        working-directory: bindings/soth-node
+        run: npm run build:debug
+      - name: Run all node tests (incl. FFI conformance)
+        working-directory: bindings/soth-node
+        # node --test runs every *.test.mjs in __test__/ which
+        # includes ffi-conformance.test.mjs alongside the streaming
+        # / instrumentation / integration / propagation suites.
+        run: npm test

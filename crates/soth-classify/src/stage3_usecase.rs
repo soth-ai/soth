@@ -1,8 +1,9 @@
 use std::time::Instant;
 
-use soth_core::{InteractionMode, UseCaseLabel};
+use soth_core::{InteractionMode, UseCaseLabel, UseCaseLabelReason};
 
 use crate::config::ClassifyConfig;
+use crate::stage1_embed::EmbedSkipReason;
 use crate::traits::ClassificationProvider;
 
 #[derive(Debug, Clone)]
@@ -12,22 +13,35 @@ pub(crate) struct UsecaseOutput {
     pub secondary_label: Option<UseCaseLabel>,
     pub complexity_score: u8,
     pub interaction_mode: InteractionMode,
+    pub label_reason: UseCaseLabelReason,
 }
 
 impl UsecaseOutput {
-    pub fn unknown() -> Self {
+    /// Build an `Unknown` output carrying a specific reason. Used when stage1
+    /// returned no embedding (`embed_skip_reason` propagates here) and no
+    /// model classification can run.
+    pub fn unknown_with_reason(reason: UseCaseLabelReason) -> Self {
         Self {
             label: UseCaseLabel::Unknown,
             confidence: 0.0,
             secondary_label: None,
             complexity_score: 1,
             interaction_mode: InteractionMode::Unknown,
+            label_reason: reason,
         }
+    }
+
+    /// Test/utility shim. Equivalent to `unknown_with_reason(UninitializedDefault)`
+    /// — used in stage6 tests where the reason is irrelevant to the assertion.
+    #[cfg(test)]
+    pub fn unknown() -> Self {
+        Self::unknown_with_reason(UseCaseLabelReason::UninitializedDefault)
     }
 }
 
 pub(crate) fn run(
     embedding: Option<&[f32]>,
+    embed_skip_reason: Option<EmbedSkipReason>,
     classifier: &dyn ClassificationProvider,
     normalized: &soth_core::NormalizedRequest,
     config: &ClassifyConfig,
@@ -36,10 +50,16 @@ pub(crate) fn run(
     let complexity_score = compute_complexity(normalized, &config.complexity_weights);
 
     let Some(embedding) = embedding else {
+        // No embedding → no model classification possible. Carry forward the
+        // stage1 skip reason so the cloud can tell *why* (config off, not an
+        // AI call, code-context-repeat lane, embedder failure, …).
+        let reason = embed_skip_reason
+            .map(EmbedSkipReason::to_label_reason)
+            .unwrap_or(UseCaseLabelReason::NoContent);
         return (
             UsecaseOutput {
                 complexity_score,
-                ..UsecaseOutput::unknown()
+                ..UsecaseOutput::unknown_with_reason(reason)
             },
             started.elapsed().as_micros() as u64,
         );
@@ -62,6 +82,7 @@ pub(crate) fn run(
             secondary_label,
             complexity_score,
             interaction_mode: classified.interaction_mode,
+            label_reason: classified.label_reason,
         },
         started.elapsed().as_micros() as u64,
     )

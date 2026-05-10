@@ -24,11 +24,18 @@ use soth_extensions::ExtensionRuntimeContext;
 pub mod keys {
     pub const USE_CASE: &str = "classify.use_case";
     pub const USE_CASE_CONFIDENCE: &str = "classify.use_case_confidence";
+    pub const USE_CASE_LABEL_REASON: &str = "classify.use_case_label_reason";
+    pub const USE_CASE_SECONDARY_LABEL: &str = "classify.use_case_secondary_label";
     pub const VOLATILITY_CLASS: &str = "classify.volatility_class";
     pub const DYNAMIC_FRACTION: &str = "classify.dynamic_fraction";
     pub const ANOMALY_SCORE: &str = "classify.anomaly_score";
+    pub const ANOMALY_FLAGS: &str = "classify.anomaly_flags";
     pub const COMPLEXITY_SCORE: &str = "classify.complexity_score";
     pub const TOPIC_CLUSTER_ID: &str = "classify.topic_cluster_id";
+    /// Top-level (NOT under `classify.`) — `from_governable`
+    /// reads this directly off the metadata map.
+    pub const SEMANTIC_HASH: &str = "semantic_hash";
+    pub const ESTIMATED_INPUT_TOKENS: &str = "estimated_input_tokens";
 }
 
 /// Holds the loaded classify bundle + config for the duration of a
@@ -90,6 +97,10 @@ impl ClassifyEnricher {
             result.use_case_confidence.to_string(),
         );
         meta.insert(
+            keys::USE_CASE_LABEL_REASON.to_string(),
+            serde_json::to_string(&result.use_case_label_reason).unwrap_or_default(),
+        );
+        meta.insert(
             keys::VOLATILITY_CLASS.to_string(),
             serde_json::to_string(&result.volatility_class).unwrap_or_default(),
         );
@@ -109,6 +120,43 @@ impl ClassifyEnricher {
             keys::TOPIC_CLUSTER_ID.to_string(),
             result.topic_cluster_id.to_string(),
         );
+
+        // Parity with soth-code's hook handler: secondary label,
+        // anomaly flags, semantic hash, estimated input tokens.
+        // These were previously only written by the proxy +
+        // soth-code paths; historian rows ended up with NULL
+        // secondary / empty flags / NULL semantic_hash on the
+        // dashboard, breaking cross-source rollups.
+        if let Some(secondary) = result.secondary_label.as_ref() {
+            meta.insert(
+                keys::USE_CASE_SECONDARY_LABEL.to_string(),
+                serde_json::to_string(secondary).unwrap_or_default(),
+            );
+        }
+        if !result.anomaly_flags.is_empty() {
+            // JSON-array of snake_case enum names — same shape
+            // soth-code writes, same shape `from_governable`
+            // reads via `serde_json::from_str::<Vec<AnomalyFlag>>`.
+            if let Ok(json) = serde_json::to_string(&result.anomaly_flags) {
+                meta.insert(keys::ANOMALY_FLAGS.to_string(), json);
+            }
+        }
+        // Top-level (NOT under `classify.`) keys.  Skip the
+        // all-zero sentinel — that means the embedding stage
+        // didn't run (unlikely for historian but defensive).
+        if !result.semantic_hash.is_empty()
+            && result.semantic_hash != "00000000000000000000000000000000"
+        {
+            meta.insert(
+                keys::SEMANTIC_HASH.to_string(),
+                result.semantic_hash.clone(),
+            );
+        }
+        if let Some(tokens) = result.telemetry_event.estimated_input_tokens {
+            if tokens > 0 {
+                meta.insert(keys::ESTIMATED_INPUT_TOKENS.to_string(), tokens.to_string());
+            }
+        }
     }
 }
 
@@ -138,41 +186,39 @@ fn build_detect_result(event: &GovernableEvent) -> DetectResult {
 /// Build a minimal ProxyContext for historian events.
 fn build_historian_proxy_ctx(ctx: &ExtensionRuntimeContext) -> ProxyContext {
     ProxyContext {
-        org_id: ctx.org_id.clone(),
-        user_id_hmac: ctx.user_id_hmac.clone(),
-        team_id: String::new(),
-        device_id_hash: ctx.device_id.clone(),
-        endpoint_hash: String::new(),
-        process_resolution: ProcessResolution {
-            match_kind: ProcessMatchKind::Unknown,
-            app_type: AppType::NonHost,
-            capture_mode: Some(CaptureMode::MetadataOnly),
-            process_name: None,
-            bundle_id: None,
-            matched_app_id: None,
-            ..Default::default()
+        identity: soth_core::IdentityContext {
+            org_id: ctx.org_id.clone(),
+            user_id_hmac: ctx.user_id_hmac.clone(),
+            team_id: String::new(),
+            device_id_hash: ctx.device_id.clone(),
+            endpoint_hash: String::new(),
+            capture_mode: CaptureMode::MetadataOnly,
+            traffic_classification: TrafficClassification::ToolUsage,
+            classification_source: ClassificationSource::Proxy,
+            session_snapshot: None,
+            declared_provider: None,
+            declared_application: None,
+            session_id: None,
+            deployment_context: None,
+            bundle_trust_level: None,
+            precomputed_commitment_nonce: None,
+            precomputed_commitment_hash: None,
         },
-        capture_mode: CaptureMode::MetadataOnly,
-        matched_provider: None,
-        matched_application: None,
-        traffic_classification: TrafficClassification::ToolUsage,
-        classification_source: ClassificationSource::Proxy,
-        session_snapshot: None,
-        request_method: None,
-        deployment_context: None,
-        precomputed_commitment_nonce: None,
-        precomputed_commitment_hash: None,
-        connection_id: None,
-        bundle_trust_level: None,
-        session_id: None,
-        product_id: None,
-        surface_type: SurfaceType::Unknown,
-        is_shadow_it: false,
-        ja4_hash: None,
-        tls_version: None,
-        alpn_protocol: None,
-        h2_connection_id: None,
-        h2_stream_id: None,
+        transport: soth_core::TransportContext::default(),
+        attribution: soth_core::AttributionContext {
+            process_resolution: ProcessResolution {
+                match_kind: ProcessMatchKind::Unknown,
+                app_type: AppType::NonHost,
+                capture_mode: Some(CaptureMode::MetadataOnly),
+                process_name: None,
+                bundle_id: None,
+                matched_app_id: None,
+                ..Default::default()
+            },
+            product_id: None,
+            surface_type: SurfaceType::Unknown,
+            is_shadow_it: false,
+        },
     }
 }
 
