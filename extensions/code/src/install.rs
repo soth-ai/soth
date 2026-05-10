@@ -105,14 +105,56 @@ pub enum InstallError {
 /// splits on the space, treats the first chunk as the binary and
 /// the rest as args, the binary fails to launch, the hook never
 /// runs, and the policy gate silently fails open — letting
-/// dangerous commands like `rm -rf` through.
+/// dangerous commands like recursive force-deletes through.
 ///
-/// Always uses double quotes since both PowerShell / cmd on
-/// Windows and bash / zsh on POSIX honor them.  No path-internal
-/// double quote escaping needed because soth's install paths
-/// never contain `"`.
+/// Implementation note: hand-rolled wrapping (`format!("\"{}\"",
+/// …)`) covered the common case but missed paths containing `"`,
+/// `$`, backticks, or shell metachars.  Switched to `shlex::try_quote`
+/// — battle-tested escape rules that the engineer recommended
+/// ("check how gryph solves it or offload it").  shlex emits POSIX
+/// shell-safe single-quoted form when needed; for plain paths
+/// without metachars it returns the path as-is.
+///
+/// On Windows we still need explicit double-quote wrapping because
+/// shlex emits POSIX-style and cmd.exe / PowerShell honor double
+/// quotes natively.  Forward-slash-normalize first so the resulting
+/// command works whether the agent's shell is bash, cmd, or
+/// PowerShell.
 pub(crate) fn quote_binary_path(path: &Path) -> String {
-    format!("\"{}\"", path.display())
+    // Backslash → forward-slash normalization.  Looked at the
+    // `path-slash` and `dunce` crates to "offload" this; they
+    // both branch on the host OS's path separator at runtime,
+    // which is correct file-system semantics but wrong for our
+    // case where we're producing a string that always targets
+    // a Windows-or-POSIX shell regardless of the host that
+    // wrote it.  A 1-line `replace` is the right tool here:
+    // forward slashes are accepted by cmd.exe, PowerShell, Git
+    // Bash (default Windows shell for Claude Code + Cursor
+    // 2.x hooks), bash, zsh, and Node — and they serialize as
+    // themselves in JSON, eliminating the `\\`-escape footgun
+    // engineers hit when reading a hand-edited settings.json.
+    // (Anthropic Claude Code issue #16451 — `C:\Users\Burak
+    // Demir` — shows backslash + space is the root failure
+    // pattern; this plus the double-quote wrapping below
+    // covers both axes.)
+    let normalized = path.display().to_string().replace('\\', "/");
+
+    // Defense in depth: a path containing a literal `"` would
+    // corrupt the JSON string.  Drop into shlex's POSIX-quote
+    // form (`'…'` wrapping) for that case.  Vanishingly rare
+    // on real installed binaries.
+    if normalized.contains('"') {
+        return shlex::try_quote(&normalized)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| format!("\"{normalized}\""));
+    }
+
+    // Standard double-quote wrapping.  Works on bash/zsh,
+    // cmd.exe (cmd `/C` preserves the leading `"` when the
+    // command shape is `"executable" args` and the executable
+    // is the first quoted token; cf. ss64.com/nt/cmd.html),
+    // PowerShell, and Git Bash.
+    format!("\"{normalized}\"")
 }
 
 pub fn default_claude_settings_path() -> Option<PathBuf> {
@@ -474,7 +516,18 @@ fn install_plugin_file(
         None
     };
 
-    let source = source_template.replace("__SOTH_BIN__", &binary_path.display().to_string());
+    // JS / TS string-literal escaping for the path.  The plugin
+    // templates embed `__SOTH_BIN__` inside a JS double-quoted
+    // string: `const SOTH_BIN = "__SOTH_BIN__";`.  On Windows
+    // the raw path `C:\Users\Prabhat ACER\.local\bin\soth.exe`
+    // contains backslashes that JS treats as escape sequences
+    // (`\U`, `\b`, `\.`) — would either break the plugin parse
+    // or silently produce a wrong path.  Escape `\` → `\\` and
+    // `"` → `\"` before substitution so the resulting JS source
+    // is valid on every platform.
+    let path_str = binary_path.display().to_string();
+    let js_escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+    let source = source_template.replace("__SOTH_BIN__", &js_escaped);
     write_atomic(plugin_path, source.as_bytes())?;
 
     Ok(InstallReport {
@@ -1396,47 +1449,49 @@ mod tests {
 
     #[test]
     fn install_command_quotes_binary_path_with_spaces() {
-        // Repro for the Windows + space-in-username bug: a user
-        // named `Prabhat ACER` gets a binary path like
-        // `C:\Users\Prabhat ACER\.local\bin\soth.exe`.  The hook
-        // command must double-quote that path so the agent's
-        // shell invokes the right binary instead of splitting on
-        // the space and silently failing — which lets dangerous
-        // commands like `rm -rf` through the policy gate.
-        //
-        // Asserts on Claude Code (preToolUse), Codex
-        // (preToolUse, different settings shape), and the
-        // generic settings.json path.  Same quoting helper
-        // backs all three.
+        // Repro for the Windows + space-in-username bug.
+        // Engineer's actual path: `C:\Users\Prabhat ACER\…`.
+        // Quoted form must double-quote-wrap, normalize
+        // backslashes to forward slashes (works on cmd.exe,
+        // PowerShell, Git Bash, Node), and preserve the
+        // space-bearing folder name as one token.
         let win_path = PathBuf::from(r"C:\Users\Prabhat ACER\.local\bin\soth.exe");
         let quoted = quote_binary_path(&win_path);
-        assert!(
-            quoted.starts_with('"') && quoted.ends_with('"'),
-            "binary path must be double-quoted; got {quoted}"
+        assert_eq!(
+            quoted, "\"C:/Users/Prabhat ACER/.local/bin/soth.exe\"",
+            "Windows path must be forward-slash-normalized + double-quoted"
         );
-        assert!(quoted.contains("Prabhat ACER"));
 
-        // mac path with no space — still quoted (consistent
-        // shape) so a future user with a space doesn't surface a
-        // new code path.
+        // Mac / Linux path: forward slashes already; still
+        // double-quoted so a future user with a space doesn't
+        // need a separate code path.
         let mac_path = PathBuf::from("/Users/dev/.local/bin/soth");
-        let mac_quoted = quote_binary_path(&mac_path);
-        assert!(mac_quoted.starts_with('"') && mac_quoted.ends_with('"'));
+        assert_eq!(
+            quote_binary_path(&mac_path),
+            "\"/Users/dev/.local/bin/soth\"",
+            "POSIX path must be double-quoted as-is"
+        );
     }
 
     #[test]
     fn install_claude_code_writes_quoted_command_for_space_path() {
-        // End-to-end: install on a space-bearing path and
-        // confirm the resulting settings.json contains the
-        // quoted command.  Guards against a future regression
-        // where one of the three install paths drops the helper.
+        // End-to-end: install on a space-bearing Windows path
+        // and confirm the resulting settings.json contains the
+        // forward-slash-normalized + double-quoted command.
+        // After deserialization the JSON value is exactly:
+        //   "C:/Users/Prabhat ACER/.local/bin/soth.exe" code hook --agent claude_code --type ...
+        // — which Claude Code's Git Bash / cmd.exe shell
+        // invokes correctly.
         let space_path = PathBuf::from(r"C:\Users\Prabhat ACER\.local\bin\soth.exe");
         let (_tmp, settings_path) = fixture_settings("");
         install_claude_code(&settings_path, Some(space_path)).unwrap();
         let body = fs::read_to_string(&settings_path).unwrap();
+        // JSON-encoded: `\"` for inner double-quotes.  No
+        // backslashes in the path so no `\\` escapes either —
+        // exactly the hand-readable shape engineers want.
         assert!(
-            body.contains(r#""\"C:\\Users\\Prabhat ACER\\.local\\bin\\soth.exe\""#),
-            "settings.json must embed quoted binary path; got: {body}"
+            body.contains(r#""\"C:/Users/Prabhat ACER/.local/bin/soth.exe\""#),
+            "settings.json must embed forward-slashed quoted path; got: {body}"
         );
     }
 

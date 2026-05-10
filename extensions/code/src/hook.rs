@@ -83,8 +83,23 @@ pub fn run_hook(
     let adapter =
         adapter::for_agent(agent_name).ok_or_else(|| HookError::UnknownAgent(agent_name.into()))?;
 
-    // 1. parse — adapter produces a CodeEvent.
+    // 1. parse — adapter produces a CodeEvent.  Strip a leading
+    //    UTF-8 BOM defensively before handing to the adapter so
+    //    every parse path benefits regardless of how stdin was
+    //    sourced (the supervisor's stdin pipe, an integration
+    //    test passing literal bytes, etc.).  Cursor on Windows
+    //    prepends `0xEF 0xBB 0xBF` to JSON stdin — the engineer
+    //    found this is the actual root cause of the "every
+    //    Cursor hook rejected on Windows" symptom, even though
+    //    the install-quoting fix was already in.
     let parse_start = std::time::Instant::now();
+    let stripped: Vec<u8>;
+    let stdin_bytes: &[u8] = if stdin_bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        stripped = stdin_bytes[3..].to_vec();
+        &stripped
+    } else {
+        stdin_bytes
+    };
     let mut code_event = adapter.parse_event(hook_type, stdin_bytes)?;
     let parse_us = elapsed_us(parse_start);
 
@@ -402,10 +417,29 @@ pub fn run_hook(
 
 /// Read stdin to EOF — all hook payloads are bounded JSON; agents pipe
 /// the whole payload before exec'ing the hook subprocess.
+///
+/// Strips a leading UTF-8 BOM (`0xEF 0xBB 0xBF`) before returning.
+/// Cursor on Windows (Electron-based child_process.spawn) prepends a
+/// BOM to JSON stdin; serde_json doesn't tolerate it and rejects the
+/// payload as `expected value at line 1 column 1`.  gryph upstream
+/// has the identical latent bug — it just hasn't bitten them because
+/// most reporters run macOS / Linux Cursor builds where the BOM
+/// doesn't appear (filed for upstream as well).  Strip defensively
+/// here in the common entry point so every adapter benefits, not
+/// just Cursor.  Costs nothing when no BOM is present.
 pub fn read_stdin_to_end() -> Result<Vec<u8>, io::Error> {
     let mut buf = Vec::with_capacity(8 * 1024);
     io::stdin().read_to_end(&mut buf)?;
-    Ok(buf)
+    Ok(strip_utf8_bom(buf))
+}
+
+fn strip_utf8_bom(buf: Vec<u8>) -> Vec<u8> {
+    const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    if buf.starts_with(BOM) {
+        buf[BOM.len()..].to_vec()
+    } else {
+        buf
+    }
 }
 
 fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
@@ -1456,6 +1490,34 @@ mod tests {
                 reason
             );
         }
+    }
+
+    #[test]
+    #[test]
+    fn run_hook_strips_utf8_bom_from_cursor_stdin() {
+        // Cursor on Windows (Electron child_process.spawn) prepends
+        // a UTF-8 BOM (0xEF 0xBB 0xBF) to JSON stdin — serde_json
+        // doesn't tolerate it and the parse step fails with
+        // `expected value at line 1 column 1`.  Engineer's
+        // discovery: this is THE root cause of "every Cursor hook
+        // rejected on Windows", masked by the earlier install-
+        // quoting fix.  Pin the strip so a future refactor can't
+        // regress it for any agent's parse path.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+
+        let bom_payload: Vec<u8> = b"\xEF\xBB\xBF{\"conversation_id\":\"c1\",\"hook_event_name\":\"beforeSubmitPrompt\",\"prompt\":\"refactor auth\"}"
+            .to_vec();
+
+        let outcome = run_hook(
+            "cursor",
+            "before_submit_prompt",
+            &bom_payload,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .expect("BOM-prefixed stdin must parse");
+        assert!(matches!(outcome.decision, HookDecision::Allow));
     }
 
     #[test]
