@@ -112,6 +112,17 @@ pub async fn run_check(channel: Channel, base_url_override: Option<String>) -> R
 }
 
 /// `soth update --apply` — download, verify, swap, restart.
+///
+/// Note on the heartbeat-delivered offer (Phase 2):
+///   The agent persists `~/.soth/run/update_pending.json` when the
+///   cloud signals an offer over heartbeat. We deliberately do NOT use
+///   that as the source of truth for `--apply`. The signed static
+///   manifest at the storage URL is the trust root — operator-
+///   controlled, independent of cloud auth. A compromised cloud could
+///   push a malicious heartbeat offer; the manifest signature gate
+///   prevents that from translating into a malicious binary install.
+///   We do clear / mark the pending file based on apply outcome, but
+///   the *trust* path is always manifest → signature → sha256.
 pub async fn run_apply(
     channel: Channel,
     base_url_override: Option<String>,
@@ -156,6 +167,7 @@ pub async fn run_apply(
     let swapper = make_swapper(staged)?;
 
     if let Err(e) = swapper.pre_swap().await {
+        mark_pending_apply_failed(&format!("pre-swap: {:#}", e));
         bail!("pre-swap failed: {:#}", e);
     }
     if let Err(e) = swapper.swap().await {
@@ -163,13 +175,16 @@ pub async fn run_apply(
         // restart of whatever is still on disk so the user isn't left
         // without a running proxy.
         let _ = swapper.post_swap().await;
+        mark_pending_apply_failed(&format!("swap: {:#}", e));
         bail!("swap failed: {:#} (daemon restart attempted)", e);
     }
     if let Err(e) = swapper.post_swap().await {
         tracing::warn!(error = %e, "post-swap healthcheck failed; rolling back");
         if let Err(rb) = swapper.rollback().await {
+            mark_pending_apply_failed(&format!("apply+rollback: {:#}", e));
             bail!("apply failed AND rollback failed: apply={:#}; rollback={:#}", e, rb);
         }
+        mark_pending_apply_failed(&format!("post-swap rolled back: {:#}", e));
         bail!("apply failed: {:#}; rolled back to previous binary", e);
     }
 
@@ -186,8 +201,27 @@ pub async fn run_apply(
     };
     UpdateCache::write(&cached)?;
 
+    // Phase 2: clear the heartbeat-delivered offer so subsequent
+    // `soth status` calls don't keep nagging.
+    if let Err(e) = soth_sync::update_pending::clear() {
+        tracing::warn!(error = %e, "failed to clear update_pending.json after successful apply");
+    }
+
     println!("✓ updated to {} (channel {})", manifest.version, manifest.channel);
     Ok(())
+}
+
+/// Mark the in-flight heartbeat offer as failed so the auto-applier
+/// (Phase 4) doesn't immediately re-attempt the same `release_seq`.
+/// Best-effort; never propagates errors out of the apply path.
+fn mark_pending_apply_failed(reason: &str) {
+    if let Ok(Some(mut pending)) = soth_sync::update_pending::read() {
+        pending.apply_failed = true;
+        pending.apply_failed_reason = Some(reason.to_string());
+        if let Err(e) = soth_sync::update_pending::write(&pending) {
+            tracing::warn!(error = %e, "failed to persist apply_failed=true");
+        }
+    }
 }
 
 /// `soth update --rollback` — restore `<install>.previous`.

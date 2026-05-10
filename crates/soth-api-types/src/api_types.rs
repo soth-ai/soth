@@ -361,6 +361,56 @@ pub struct HeartbeatResponse {
     pub ok: bool,
     pub config_changed: bool,
     pub server_time: String,
+    /// Phase 2 hot-update: server-pushed offer when this device has a
+    /// new release waiting on its channel. `None` = up-to-date or no
+    /// matching channel/release combo. Always `#[serde(default)]` so
+    /// 0.1.1 servers (which don't emit this field) deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_available: Option<UpdateAvailable>,
+}
+
+/// Hot-update offer carried on `HeartbeatResponse`. Phase 2.
+/// See `docs/common/2026-05-09/hot-update-plan.md` §3.1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateAvailable {
+    /// Target version (semver, e.g. "0.1.2").
+    pub version: String,
+    /// Monotonic per-channel sequence — used by clients for the anti-
+    /// rollback gate even when the offer arrives via heartbeat.
+    pub release_seq: u64,
+    /// Direct download URL for this device's platform binary.
+    pub url: String,
+    /// sha256 the downloaded binary must match (lowercase hex).
+    pub sha256: String,
+    /// How aggressive the client should be about applying. Phase 4
+    /// auto-applier reads this; Phase 2/3 just persist+display.
+    pub urgency: UpdateUrgency,
+    /// Optional URL the client can show users for this release's notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_notes_url: Option<String>,
+    /// Earliest RFC3339 instant the client should auto-apply. Honored
+    /// by the Phase 4 auto-applier; ignored by manual `soth update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_after: Option<String>,
+}
+
+/// Urgency hint on the heartbeat offer.
+/// - `Notify`: log only; user-driven update.
+/// - `Recommended`: surface in `soth status`; user-driven update.
+/// - `Forced`: Phase 4 auto-applies within minutes (subject to
+///   `apply_after` and the per-channel update window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateUrgency {
+    Notify,
+    Recommended,
+    Forced,
+}
+
+impl Default for UpdateUrgency {
+    fn default() -> Self {
+        UpdateUrgency::Recommended
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

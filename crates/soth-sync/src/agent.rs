@@ -671,6 +671,35 @@ impl SyncAgent {
                         }
                     }
                 }
+                // Phase 2 hot-update: persist any heartbeat-delivered
+                // offer to ~/.soth/run/update_pending.json. Failures are
+                // best-effort warnings — the daemon must continue
+                // running even if disk is full / readonly.
+                if let Some(offer) = response.update_available.clone() {
+                    let entry = crate::update_pending::PendingUpdate {
+                        received_at: crate::update_pending::now_epoch_secs(),
+                        agent_instance_id: self.config.agent_instance_id.clone(),
+                        current_version: env!("CARGO_PKG_VERSION").to_string(),
+                        offer,
+                        apply_failed: false,
+                        apply_failed_reason: None,
+                    };
+                    match crate::update_pending::write(&entry) {
+                        Ok(path) => {
+                            tracing::info!(
+                                version = %entry.offer.version,
+                                release_seq = entry.offer.release_seq,
+                                urgency = ?entry.offer.urgency,
+                                path = %path.display(),
+                                "heartbeat-delivered update offer persisted"
+                            );
+                        }
+                        Err(error) => warn!(
+                            error = %error,
+                            "failed to persist heartbeat update_available offer"
+                        ),
+                    }
+                }
                 Ok(true)
             }
             Ok(None) => {

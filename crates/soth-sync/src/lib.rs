@@ -28,6 +28,7 @@ pub mod metadata_pusher;
 pub mod registry_puller;
 pub mod retry_queue;
 pub mod telemetry;
+pub mod update_pending;
 
 pub use agent::{HeartbeatTelemetryProvider, SyncAgent, SyncAgentConfig, SyncTickSummary};
 pub use config::TelemetrySyncConfig;
