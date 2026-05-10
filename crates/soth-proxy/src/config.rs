@@ -506,7 +506,7 @@ impl Default for TelemetryPipelineConfig {
             anomaly_threshold: 0.8,
             signing_key_hex: None,
             encryption: TelemetryEncryptionConfig::None,
-            proxy_version: "soth-proxy-dev".to_string(),
+            proxy_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 }
@@ -703,7 +703,7 @@ impl SyncRuntimeConfig {
             cache_path: self.cache_path.clone(),
             registry_cache_path,
             agent_instance_id: self.agent_instance_id.clone(),
-            proxy_version: "soth-proxy-dev".to_string(),
+            proxy_version: env!("CARGO_PKG_VERSION").to_string(),
             retry_queue_dir: self.retry_queue_dir.clone(),
             retry_queue_max_bytes: self.retry_queue_max_bytes,
             sync_interval: Duration::from_secs(self.sync_interval_secs.max(1)),
