@@ -85,6 +85,12 @@ CLI_BINARIES=(
   soth-linux-amd64
   soth-linux-arm64
   soth-windows-amd64.exe
+  # Phase 4b sidecar updater. Built by `cmd_build_cli`, published
+  # alongside the main binaries, NOT included in the release manifest's
+  # `platforms` map (it's not a primary install artifact). Operators
+  # download it once into %LOCALAPPDATA%\soth\ and it's reused across
+  # every subsequent main-binary update.
+  soth-update-windows-amd64.exe
 )
 
 # --- Per-env file load ------------------------------------------------------
@@ -222,6 +228,16 @@ cmd_build_cli() {
   build_one soth-linux-amd64        x86_64-unknown-linux-gnu.2.17         zigbuild  soth  x86_64-unknown-linux-gnu
   build_one soth-linux-arm64        aarch64-unknown-linux-gnu.2.17        zigbuild  soth  aarch64-unknown-linux-gnu
   build_one soth-windows-amd64.exe  x86_64-pc-windows-gnu                 cargo     soth.exe
+
+  # Phase 4b Windows sidecar updater. Tiny self-contained binary that
+  # ships alongside soth.exe and owns the lock-release-and-replace
+  # sequence (Windows holds an exclusive lock on the running .exe).
+  echo
+  echo "==> soth-update-windows-amd64.exe  (sidecar updater)"
+  rustup target add x86_64-pc-windows-gnu >/dev/null
+  cargo build -p soth-cli-update-sidecar --bin soth-update --release --target x86_64-pc-windows-gnu
+  cp target/x86_64-pc-windows-gnu/release/soth-update.exe \
+     "${DIST_DIR}/soth-update-windows-amd64.exe"
 
   echo
   echo "==> sha256 manifests"
@@ -432,9 +448,16 @@ cmd_generate_manifest() {
   echo "==> generate manifest (channel=${channel}, version=${version}, release_seq=${next_seq})"
 
   # Build platforms map by walking CLI_BINARIES + their .sha256 sidecars.
+  # The sidecar updater (soth-update-windows-amd64.exe) is published
+  # but kept OUT of the manifest — it's not a primary install artifact;
+  # the client looks for it locally on Windows and never via the
+  # manifest's `platforms` map.
   local platforms_json="{"
   local first=1
   for f in "${CLI_BINARIES[@]}"; do
+    case "$f" in
+      soth-update-*) continue ;;
+    esac
     local key sha
     key=$(binary_to_platform_key "$f")
     sha=$(awk '{print $1}' "${DIST_DIR}/${f}.sha256")

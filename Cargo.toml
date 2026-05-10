@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/soth-cli",
+    "crates/soth-cli-update-sidecar",
     "crates/soth-core",
     "crates/soth-api-types",
     "crates/soth-bundle",
@@ -39,7 +40,7 @@ default-members = [
 exclude = []
 
 [workspace.package]
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"

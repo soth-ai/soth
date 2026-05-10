@@ -45,6 +45,26 @@ After a successful swap, the previous binary is preserved at:
 | Linux | no systemd | pid file `~/.soth/run/proxy.pid` |
 | Windows | Service Control Manager | service name `soth` |
 
+## Windows sidecar updater (Phase 4b, 0.2.0+)
+
+Windows holds an exclusive lock on the running `.exe`, so in-place
+self-update needs a tiny helper binary that owns the lock-release-and-
+replace sequence:
+
+| Path | Purpose |
+|------|---------|
+| `%LOCALAPPDATA%\soth\soth.exe`         | main binary (gets replaced on update) |
+| `%LOCALAPPDATA%\soth\soth-update.exe`  | sidecar updater (rarely changes) |
+
+The sidecar is published as `soth-update-windows-amd64.exe` at the same
+release URL as the main binaries. Install scripts download it once
+during initial setup; subsequent `soth update --apply` calls reuse the
+local copy and do NOT re-download per update.
+
+When the sidecar is missing (pre-0.2.0 install or hand-deployed
+binary), `soth update --apply` returns a clean error pointing at the
+download URL — never attempts a doomed in-place rename.
+
 ## Detecting which install you have
 
 The update flow detects in this order:
