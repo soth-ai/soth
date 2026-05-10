@@ -963,7 +963,10 @@ async fn check_macos_proxy_status() -> Result<bool> {
 #[cfg(target_os = "linux")]
 async fn configure_linux_proxy(enable: bool, port: u16, print_user_output: bool) -> Result<bool> {
     // Try GNOME gsettings first — covers GNOME, Cinnamon, Unity, Pop_OS.
-    if which::which("gsettings").is_ok() {
+    // The binary may exist on minimal/server images while the GNOME schemas are
+    // absent, in which case `gsettings set` errors with "No schemas installed".
+    // Probe the actual schema before committing to this path.
+    if which::which("gsettings").is_ok() && gnome_proxy_schema_available() {
         configure_gnome_proxy(enable, port, print_user_output)?;
         return Ok(true);
     }
@@ -1242,6 +1245,22 @@ fn run_gsettings(args: &[&str]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn gnome_proxy_schema_available() -> bool {
+    // `gsettings list-schemas` exits 0 even when no schemas are installed (it
+    // just prints nothing), so grep its output. Errors and missing schemas
+    // both fall through as "not available" — the env-var path will take over.
+    let Ok(output) = Command::new("gsettings").arg("list-schemas").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim() == "org.gnome.system.proxy")
+}
+
+#[cfg(target_os = "linux")]
 fn run_gsettings_get(schema: &str, key: &str) -> Option<String> {
     let output = Command::new("gsettings")
         .args(["get", schema, key])
@@ -1312,7 +1331,7 @@ fn get_linux_ignore_hosts() -> Option<Vec<String>> {
 
 #[cfg(target_os = "linux")]
 async fn check_linux_proxy_status() -> Result<bool> {
-    if which::which("gsettings").is_ok() {
+    if which::which("gsettings").is_ok() && gnome_proxy_schema_available() {
         let output = Command::new("gsettings")
             .args(["get", "org.gnome.system.proxy", "mode"])
             .output()?;
