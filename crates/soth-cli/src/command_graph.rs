@@ -18,9 +18,16 @@ pub struct GlobalOptions {
     pub verbose: bool,
 }
 
+// Visible build marker. Surfaces in `soth --version` so a hot-update
+// can be eyeballed end-to-end (compare the marker before vs after the
+// swap). Replace per release with a short build identifier that names
+// the meaningful change; CI can substitute the git short SHA later.
+const SOTH_VERSION_LONG: &str =
+    concat!(env!("CARGO_PKG_VERSION"), " (auto-apply fixes 2026-05-11)");
+
 #[derive(Parser)]
 #[command(name = "soth")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = SOTH_VERSION_LONG, about, long_about = None)]
 pub struct Cli {
     #[command(flatten)]
     pub global: GlobalOptions,
@@ -314,6 +321,18 @@ pub struct UpdateArgs {
     /// integration tests and ad-hoc operator overrides.
     #[arg(long, hide = true)]
     pub manifest_url: Option<String>,
+
+    /// Internal: macOS auto-update helper mode. The daemon spawns
+    /// `soth update --finish-staged` as a detached process so the
+    /// `launchctl bootout` step doesn't kill the in-process auto-
+    /// applier mid-swap. Hidden — operators should use --apply.
+    #[arg(long, hide = true, requires = "staged_path")]
+    pub finish_staged: bool,
+
+    /// Internal: path to the binary already downloaded + sha256-checked
+    /// by the daemon's auto-applier. Only meaningful with --finish-staged.
+    #[arg(long, hide = true)]
+    pub staged_path: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -515,14 +534,41 @@ async fn run_update_command(args: UpdateArgs) -> anyhow::Result<()> {
         commands::update::run_rollback().await?;
         return Ok(());
     }
+    if args.finish_staged {
+        // clap already enforced staged_path is set via `requires`, but
+        // we destructure defensively rather than .unwrap().
+        let staged = args
+            .staged_path
+            .ok_or_else(|| anyhow::anyhow!("--finish-staged requires --staged-path"))?;
+        commands::update::run_finish_staged(channel, staged, args.manifest_url, args.version)
+            .await?;
+        return Ok(());
+    }
     if args.apply {
-        commands::update::run_apply(
-            channel,
-            args.manifest_url,
-            args.force_downgrade,
-            args.version,
-        )
-        .await?;
+        // Ergonomic shortcut: if the operator runs `soth update --apply`
+        // with no overrides and there's a heartbeat-delivered offer
+        // waiting, fill in --manifest-url + --version from it. Saves
+        // them re-typing what the cloud already told the daemon. The
+        // signed-manifest trust gate still runs against whatever URL we
+        // end up fetching, so this only changes ergonomics, not trust.
+        let mut manifest_url = args.manifest_url;
+        let mut version = args.version;
+        if manifest_url.is_none() && version.is_none() {
+            if let Ok(Some(pending)) = soth_sync::update_pending::read() {
+                if let Some(base) = commands::update::derive_base_url_from_offer(
+                    &pending.offer.url,
+                    &pending.offer.version,
+                ) {
+                    eprintln!(
+                        "using pending offer: {} (release_seq={}) from {}",
+                        pending.offer.version, pending.offer.release_seq, base,
+                    );
+                    manifest_url = Some(base);
+                    version = Some(pending.offer.version);
+                }
+            }
+        }
+        commands::update::run_apply(channel, manifest_url, args.force_downgrade, version).await?;
         return Ok(());
     }
     // default: --check

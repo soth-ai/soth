@@ -24,7 +24,7 @@ mod swap_macos;
 mod swap_windows;
 
 pub use cache::{CachedUpdate, UpdateCache};
-pub use download::{download_binary, BinarySink};
+pub use download::{download_binary, sha256_of_file, BinarySink};
 // Phase 1 callers only use a subset of these; the rest are kept on the
 // public surface for Phase 2 (heartbeat-delivered offers) and Phase 4
 // (auto-applier). `allow(unused_imports)` to silence dead-re-export

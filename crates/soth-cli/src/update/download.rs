@@ -141,8 +141,9 @@ pub async fn download_binary(
 }
 
 /// Convenience: stream-hash an existing file (used to verify a
-/// previously-downloaded staging artifact, e.g. on rollback paths).
-#[allow(dead_code)]
+/// previously-downloaded staging artifact, e.g. on rollback paths
+/// and on the macOS `--finish-staged` helper that runs after the
+/// daemon already downloaded into the staging file).
 pub async fn sha256_of_file(path: &Path) -> Result<String> {
     use tokio::io::AsyncReadExt;
 

@@ -27,9 +27,20 @@ pub struct CachedUpdate {
     /// Local CARGO_PKG_VERSION at the time of the check — handy for
     /// `soth status` to display "you're on X" without re-reading.
     pub current_version: String,
-    /// Manifest-supplied release_seq for anti-rollback on the next apply.
+    /// Highest manifest-supplied release_seq this client has *seen*
+    /// (populated by `soth update --check`). Informational — surfaced
+    /// in `soth status` so the user can tell the cache is fresh. Do
+    /// NOT feed this into the anti-rollback gate: seeing a release is
+    /// not the same as installing it.
     #[serde(default)]
     pub latest_release_seq: Option<u64>,
+    /// Highest manifest-supplied release_seq this client has actually
+    /// *applied* (written by `soth update --apply` on success). This
+    /// is the value the anti-rollback gate compares against. Stays
+    /// `None` on a fresh install — the first apply has nothing to
+    /// roll back from.
+    #[serde(default)]
+    pub last_applied_release_seq: Option<u64>,
     /// Direct download URL for this host's platform, when applicable.
     #[serde(default)]
     pub download_url: Option<String>,
@@ -81,5 +92,46 @@ impl UpdateCache {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_payload_without_last_applied_defaults_to_none() {
+        // Pre-0.1.2 cache files don't have last_applied_release_seq.
+        // Old readers must keep parsing them as if anti-rollback has
+        // never been triggered yet — otherwise an upgrade-then-apply
+        // sequence would gratuitously trip the gate.
+        let body = br#"{
+            "checked_at": 1,
+            "channel": "stable",
+            "latest_version": "0.1.1",
+            "current_version": "0.1.0",
+            "latest_release_seq": 1
+        }"#;
+        let parsed: CachedUpdate = serde_json::from_slice(body).unwrap();
+        assert_eq!(parsed.last_applied_release_seq, None);
+        assert_eq!(parsed.latest_release_seq, Some(1));
+    }
+
+    #[test]
+    fn cache_payload_roundtrips_last_applied() {
+        let entry = CachedUpdate {
+            checked_at: 1,
+            channel: "stable".into(),
+            latest_version: Some("0.1.1".into()),
+            current_version: "0.1.1".into(),
+            latest_release_seq: Some(2),
+            last_applied_release_seq: Some(2),
+            download_url: None,
+            download_sha256: None,
+            release_notes_url: None,
+        };
+        let body = serde_json::to_vec(&entry).unwrap();
+        let back: CachedUpdate = serde_json::from_slice(&body).unwrap();
+        assert_eq!(back.last_applied_release_seq, Some(2));
     }
 }
