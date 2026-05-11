@@ -134,10 +134,8 @@ For Windows use install.ps1." ;;
 pubkey_for_channel() {
   case "$1" in
     stable) printf "%s" "$STABLE_PUBKEY_PEM" ;;
-    # The "staging" channel is signed with the canary key (it's
-    # internally-unstable, same trust class as canary).
-    canary|staging) printf "%s" "$CANARY_PUBKEY_PEM" ;;
-    *) err "unknown channel '$1' (expected stable|canary|staging)" ;;
+    canary) printf "%s" "$CANARY_PUBKEY_PEM" ;;
+    *) err "unknown channel '$1' (expected stable|canary)" ;;
   esac
 }
 

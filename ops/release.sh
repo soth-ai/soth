@@ -145,7 +145,7 @@ cmd_help() {
 	  sign-manifest          ed25519-sign manifest with SOTH_RELEASE_KEY_DIR/<key>.private.pem
 	  publish-manifest       Upload manifest.json + .sig to ENV's storage URL
 	  verify-manifest        Round-trip: re-fetch, re-verify against ops/keys/<key>.public.pem
-	  register-release       POST manifest metadata to ADMIN_API/api/v1/admin/cli/releases
+	  register-release       POST manifest metadata to ADMIN_API/v1/admin/cli/releases
 
 	Classify bundle (Phase 2):
 	  build-classify         tar -czf ${DIST_DIR}/classify-\$VERSION.tar.gz from \$DATA_DIR/classify/
@@ -361,21 +361,26 @@ cmd_publish_cli_prod() {
 
 default_channel_for_env() {
   case "$1" in
-    staging) echo "staging" ;;
+    # Channel and environment are orthogonal axes:
+    #   environment = base URL (where).
+    #   channel     = trust tier (stable for everyone, canary for
+    #                 risk-tolerant). soth-team tests by pointing
+    #                 the base URL at staging while staying on
+    #                 canary (or stable, for release-candidate
+    #                 dress rehearsals).
+    staging) echo "canary" ;;
     prod)    echo "stable" ;;
-    local)   echo "staging" ;;
+    local)   echo "canary" ;;
     *)       echo "" ;;
   esac
 }
 
-# Map channel → which keypair signs it. Stable releases use the stable
-# key; staging-internal and explicit canary cuts share the canary key
-# (they're both "unstable" from a customer trust perspective).
+# Map channel → which keypair signs it.
 key_basename_for_channel() {
   case "$1" in
-    stable)            echo "stable" ;;
-    canary | staging)  echo "canary" ;;
-    *) err "unknown channel '$1' (expected stable|canary|staging)" ;;
+    stable) echo "stable" ;;
+    canary) echo "canary" ;;
+    *) err "unknown channel '$1' (expected stable|canary)" ;;
   esac
 }
 
@@ -653,7 +658,7 @@ cmd_register_release() {
   if [ -z "$PLATFORM_ADMIN_TOKEN" ] || [ -z "$ADMIN_API" ]; then
     echo "==> WARN: PLATFORM_ADMIN_TOKEN or ADMIN_API empty; skipping release registration."
     echo "         The release is published but won't be served by the heartbeat resolver"
-    echo "         until you POST it to ${ADMIN_API:-<unset>}/api/v1/admin/cli/releases."
+    echo "         until you POST it to ${ADMIN_API:-<unset>}/v1/admin/cli/releases."
     return 0
   fi
 
@@ -665,7 +670,7 @@ cmd_register_release() {
   manifest="${DIST_DIR}/manifest/${channel}.json"
   [ -f "$manifest" ] || err "manifest missing: $manifest (run generate-manifest first)"
 
-  echo "==> register release ${ADMIN_API}/api/v1/admin/cli/releases"
+  echo "==> register release ${ADMIN_API}/v1/admin/cli/releases"
 
   # The admin API's request body is a strict subset of the manifest
   # (no channel, schema_version, min_supported_version, released_at).
@@ -689,7 +694,7 @@ PYEOF
 
   local http_code
   http_code=$(curl -sS -o /tmp/soth-release-register-resp.json -w "%{http_code}" \
-    -X POST "${ADMIN_API}/api/v1/admin/cli/releases" \
+    -X POST "${ADMIN_API}/v1/admin/cli/releases" \
     -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
     -H "Content-Type: application/json" \
     --data-raw "$body" 2>&1) || true
@@ -726,22 +731,25 @@ cmd_verify_manifest() {
   sig_url="${base}/manifest/${channel}.json.sig?cb=$(date +%s)"
 
   tmpdir=$(mktemp -d)
-  trap 'rm -rf "$tmpdir"' RETURN
+  # No RETURN trap — that leaks across subsequent functions in the
+  # composite release-cli flow (cmd_register_release after this one)
+  # and fires with `tmpdir` already out of local scope, surfacing as
+  # `tmpdir: unbound variable` under set -u. Clean up inline instead.
 
   echo "==> fetch ${manifest_url}"
   curl -sfL "$manifest_url" -o "$tmpdir/manifest.json" \
-    || err "manifest fetch failed"
+    || { rm -rf "$tmpdir"; err "manifest fetch failed"; }
   curl -sfL "$sig_url" -o "$tmpdir/manifest.json.sig" \
-    || err "signature fetch failed"
+    || { rm -rf "$tmpdir"; err "signature fetch failed"; }
 
   local key_basename pubkey
   key_basename=$(key_basename_for_channel "$channel")
   pubkey="ops/keys/${key_basename}.public.pem"
-  [ -f "$pubkey" ] || err "public key missing: $pubkey"
+  [ -f "$pubkey" ] || { rm -rf "$tmpdir"; err "public key missing: $pubkey"; }
 
   openssl pkeyutl -verify -pubin -inkey "$pubkey" -rawin \
     -in "$tmpdir/manifest.json" -sigfile "$tmpdir/manifest.json.sig" >/dev/null \
-    || err "remote signature verification FAILED"
+    || { rm -rf "$tmpdir"; err "remote signature verification FAILED"; }
 
   printf "  channel:   %s\n" "$channel"
   printf "  signature: OK (verified with %s)\n" "$pubkey"
@@ -753,6 +761,7 @@ cmd_verify_manifest() {
 	print(f"  released_at: {m['released_at']}")
 	print(f"  platforms: {len(m['platforms'])} entries")
 PYEOF
+  rm -rf "$tmpdir"
 }
 
 # --- verify-cli -------------------------------------------------------------

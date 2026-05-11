@@ -56,8 +56,12 @@ storage.soth.ai/release/
     ├── stable.json.sig
     ├── stable.v0.1.0.json              # Frozen per-version snapshot (immutable)
     ├── stable.v0.1.0.json.sig
-    ├── canary.json{,.sig} + per-version
-    └── staging.json{,.sig} + per-version  (on storage.staging.soth.xyz)
+    └── canary.json{,.sig} + per-version
+
+# storage.staging.soth.xyz hosts the same shape (stable + canary
+# manifests + per-version dirs) for internal release-candidate testing.
+# Environment and channel are orthogonal — staging.soth.xyz is "where",
+# stable/canary is "what trust tier."
 ```
 
 **The manifest is the only routing layer.** Old (unversioned)
