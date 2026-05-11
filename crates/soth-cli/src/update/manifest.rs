@@ -20,7 +20,6 @@ use std::time::Duration;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 const PROD_BASE_URL: &str = "https://storage.soth.ai/release";
-const STAGING_BASE_URL: &str = "https://storage.staging.soth.xyz/release";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Public keys live in ops/keys/. CARGO_MANIFEST_DIR is crates/soth-cli/,
@@ -34,12 +33,15 @@ const CANARY_PUBKEY_PEM: &[u8] = include_bytes!(concat!(
     "/../../ops/keys/canary.public.pem"
 ));
 
+/// Customer-visible release tier. Orthogonal to deployment environment
+/// (which is selected via `VerifyOptions::base_url`). Internal release-
+/// candidate testing on the staging environment uses `Canary` against
+/// the staging base URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
     Stable,
     Canary,
-    Staging,
 }
 
 impl Channel {
@@ -47,7 +49,6 @@ impl Channel {
         match self {
             Channel::Stable => "stable",
             Channel::Canary => "canary",
-            Channel::Staging => "staging",
         }
     }
 
@@ -56,16 +57,15 @@ impl Channel {
     fn pubkey_pem(self) -> &'static [u8] {
         match self {
             Channel::Stable => STABLE_PUBKEY_PEM,
-            Channel::Canary | Channel::Staging => CANARY_PUBKEY_PEM,
+            Channel::Canary => CANARY_PUBKEY_PEM,
         }
     }
 
-    /// Default base URL for this channel. Override via `VerifyOptions::base_url`.
+    /// Default base URL when none is overridden. Always production —
+    /// soth-team tests against staging by passing
+    /// `VerifyOptions::base_url`, not by picking a different channel.
     fn default_base_url(self) -> &'static str {
-        match self {
-            Channel::Stable | Channel::Canary => PROD_BASE_URL,
-            Channel::Staging => STAGING_BASE_URL,
-        }
+        PROD_BASE_URL
     }
 }
 
@@ -75,11 +75,7 @@ impl std::str::FromStr for Channel {
         match s {
             "stable" => Ok(Channel::Stable),
             "canary" => Ok(Channel::Canary),
-            "staging" => Ok(Channel::Staging),
-            other => bail!(
-                "unknown channel '{}' (expected stable|canary|staging)",
-                other
-            ),
+            other => bail!("unknown channel '{}' (expected stable|canary)", other),
         }
     }
 }
@@ -399,12 +395,13 @@ mod tests {
 
     #[test]
     fn channel_roundtrips_via_str() {
-        for c in [Channel::Stable, Channel::Canary, Channel::Staging] {
+        for c in [Channel::Stable, Channel::Canary] {
             let s = c.as_str();
             let parsed: Channel = s.parse().unwrap();
             assert_eq!(parsed, c);
         }
         assert!("bogus".parse::<Channel>().is_err());
+        assert!("staging".parse::<Channel>().is_err());
     }
 
     #[test]

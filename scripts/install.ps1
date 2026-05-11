@@ -59,10 +59,9 @@ function Fail($msg) { Write-Error $msg; exit 1 }
 
 function Get-PubkeyPem($channel) {
     switch ($channel) {
-        'stable'  { return $StablePubkeyPem }
-        'canary'  { return $CanaryPubkeyPem }
-        'staging' { return $CanaryPubkeyPem }  # staging shares canary key
-        default   { Fail "unknown channel '$channel' (expected stable|canary|staging)" }
+        'stable' { return $StablePubkeyPem }
+        'canary' { return $CanaryPubkeyPem }
+        default  { Fail "unknown channel '$channel' (expected stable|canary)" }
     }
 }
 
