@@ -164,7 +164,26 @@ async fn tick() -> Result<()> {
     );
     countdown(COUNTDOWN_SECS).await;
 
-    match crate::commands::update::run_apply(channel, None, false, None).await {
+    // Derive the manifest base URL from the offer's download URL so we
+    // apply against the *same* environment the cloud just pointed us at
+    // (staging cloud → staging storage, prod cloud → prod storage).
+    // Without this the auto-applier would always fall back to the
+    // baked-in prod default, which is wrong for staging-resolved offers.
+    //
+    // Pin the version too: that fetches the frozen per-version manifest
+    // snapshot (immutable) and implicitly opts out of anti-rollback —
+    // the operator pushing a Forced offer for a specific version IS the
+    // explicit authorization to install it.
+    let base_url = crate::commands::update::derive_base_url_from_offer(
+        &pending.offer.url,
+        &pending.offer.version,
+    );
+    let pinned_version = Some(pending.offer.version.clone());
+
+    let outcome =
+        run_apply_for_platform(channel, base_url, pinned_version, &pending.offer.version).await;
+
+    match outcome {
         Ok(()) => {
             tracing::info!(
                 version = %pending.offer.version,
@@ -189,6 +208,166 @@ async fn tick() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Platform-specific apply dispatch.
+///
+/// macOS and Linux both have a self-kill problem: the swap's pre-step
+/// stops the running daemon via the platform supervisor (`launchctl
+/// bootout` on macOS, `systemctl stop` / SIGTERM on Linux), which
+/// kills the very process trying to perform the swap. The fix is to
+/// download in the daemon, then hand off the staged file to a
+/// detached `soth update --finish-staged` helper (forked with
+/// `setsid(2)` so it survives the daemon's death) that drives the
+/// rest of the swap from outside the daemon's process group.
+///
+/// Windows takes the direct `run_apply` path — its `Swapper::swap`
+/// already spawns the `soth-update.exe` sidecar and exits the parent
+/// process cleanly, so the equivalent handoff happens inside the
+/// existing swap implementation.
+#[cfg(unix)]
+async fn run_apply_for_platform(
+    channel: crate::update::Channel,
+    base_url: Option<String>,
+    pinned_version: Option<String>,
+    offer_version: &str,
+) -> anyhow::Result<()> {
+    use crate::update::{
+        download_binary, fetch_and_verify_manifest, platform_key, BinarySink, VerifyOptions,
+    };
+    use anyhow::Context;
+
+    let opts = VerifyOptions {
+        base_url: base_url.clone(),
+        last_release_seq: None,
+        force_downgrade: false,
+        current_version_override: None,
+        pinned_version: pinned_version.clone(),
+    };
+    let manifest = fetch_and_verify_manifest(channel, &opts)
+        .await
+        .with_context(|| format!("manifest fetch/verify for channel {}", channel.as_str()))?;
+
+    if manifest.version != offer_version {
+        anyhow::bail!(
+            "fetched manifest version '{}' does not match offered '{}' — \
+             aborting auto-apply",
+            manifest.version,
+            offer_version
+        );
+    }
+
+    let plat = platform_key();
+    let entry = manifest
+        .platforms
+        .get(plat)
+        .with_context(|| format!("manifest has no platform entry for '{}'", plat))?
+        .clone();
+
+    tracing::info!(
+        version = %manifest.version,
+        url = %entry.url,
+        "auto-applier downloading staged binary"
+    );
+    let sink = BinarySink::default_for_user()?;
+    let staged = download_binary(&entry.url, &entry.sha256, &sink)
+        .await
+        .context("download / sha256-verify failed")?;
+
+    spawn_finish_staged_helper(channel, &staged, base_url, pinned_version)
+        .context("spawning --finish-staged helper")?;
+
+    // Handoff complete; the helper will stop us (launchctl bootout /
+    // systemctl stop) in a moment. Return Ok so the failure counter
+    // doesn't increment — if the helper itself fails, it writes
+    // apply_failed back into update_pending.json which we'll see next
+    // tick (assuming the supervisor respawns us with the OLD binary).
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn run_apply_for_platform(
+    channel: crate::update::Channel,
+    base_url: Option<String>,
+    pinned_version: Option<String>,
+    _offer_version: &str,
+) -> anyhow::Result<()> {
+    crate::commands::update::run_apply(channel, base_url, false, pinned_version).await
+}
+
+/// Fork a detached child running `soth update --finish-staged`. New
+/// session via `setsid(2)` so the supervisor signal (launchctl bootout
+/// on macOS, systemctl stop / SIGTERM on Linux) sent at the daemon
+/// during the helper's pre_swap doesn't propagate to the helper.
+#[cfg(unix)]
+fn spawn_finish_staged_helper(
+    channel: crate::update::Channel,
+    staged_path: &std::path::Path,
+    base_url: Option<String>,
+    pinned_version: Option<String>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("resolving current exe for helper")?;
+
+    let log_path = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("no home dir"))?
+        .join(".soth")
+        .join("logs")
+        .join("auto-update-helper.log");
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening helper log {}", log_path.display()))?;
+    let log_err = log_out
+        .try_clone()
+        .context("cloning helper log handle for stderr")?;
+
+    let mut cmd = Command::new(&exe);
+    cmd.args(["update", "--finish-staged"])
+        .arg("--channel")
+        .arg(channel.as_str())
+        .arg("--staged-path")
+        .arg(staged_path);
+    if let Some(url) = base_url.as_deref() {
+        cmd.arg("--manifest-url").arg(url);
+    }
+    if let Some(v) = pinned_version.as_deref() {
+        cmd.arg("--version").arg(v);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log_err));
+
+    // Detach: new session via setsid so launchctl bootout (sent at the
+    // daemon, the helper's parent) doesn't take the helper out with it.
+    // Safety: pre_exec runs in the child after fork, before exec —
+    // setsid is async-signal-safe so this is fine.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().context("spawning detached helper")?;
+    tracing::info!(
+        helper_pid = child.id(),
+        log = %log_path.display(),
+        "auto-update helper spawned (detached); daemon will be killed by bootout shortly"
+    );
+    // Intentionally don't .wait() — the helper is detached and will
+    // outlive us. If we waited, we'd block forever (we're about to die).
+    std::mem::forget(child);
     Ok(())
 }
 
