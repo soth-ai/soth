@@ -1,0 +1,93 @@
+name: release-ci
+
+# Full release-gate CI. Triggers ONLY on:
+#   - push of a version tag matching `v*` (e.g. `v0.1.5`, `v0.2.0`)
+#   - manual workflow_dispatch (release prep, debugging)
+#
+# Everything in this file is expensive (Windows runners bill at 2x
+# Linux rate; macOS at 10x; per-arch matrices multiply that further).
+# Splitting it out of the per-PR ci.yml means a typical staging PR
+# costs ~14 billable minutes instead of ~100.
+#
+# What lives here:
+#   - test-windows       — Phase 4b sidecar + Windows-divergent crates
+#   - ffi-conformance    — multi-language SDK contract tests
+#   - node-binaries      — 7-target wheel/binary matrix
+#   - python-wheels      — 5-target wheel matrix
+#
+# Conventional release workflow:
+#   1. Cut a release tag locally: `git tag v0.1.5 && git push --tags`
+#   2. This workflow runs once, validates the full release surface
+#   3. If green, operator runs `make release-cli ENV=prod`
+#
+# If you need a one-off run without tagging (e.g. validating a
+# sketchy change before merging), use `workflow_dispatch` from the
+# Actions UI and pass the ref.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or commit SHA to test'
+        required: false
+        type: string
+
+concurrency:
+  group: release-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # release validations should not be interrupted
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Parser / detect / policy / install tests on Windows — gryph
+  # PR #42's `unzip` Windows-specific bug shipped because there
+  # was no Windows runner in CI. We do ship Windows soth-cli
+  # binaries (see node-binaries lane), so any Windows-only
+  # regression in parser/detect/policy/install code paths must
+  # land on a real Windows runner before release.
+  #
+  # Scoped to library tests for the crates whose code paths
+  # actually differ on Windows: path resolution
+  # (`extensions/code/src/paths.rs` reads dirs::home_dir →
+  # %USERPROFILE% on Windows), settings.json install (different
+  # default per agent), regex / unicode handling in detect, and
+  # signature-verify on policy. soth-proxy is excluded — its async
+  # networking surface includes Linux-specific syscalls (epoll,
+  # AF_UNIX) that don't compile on Windows.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: lib tests on Windows
+        shell: bash
+        run: |
+          cargo test --lib -p soth-core
+          cargo test --lib -p soth-classify
+          cargo test --lib -p soth-detect
+          cargo test --lib -p soth-policy
+          cargo test --lib -p soth-bundle
+          cargo test --lib -p soth-extensions
+          cargo test --lib -p soth-parse
+          cargo test --lib -p soth-code
+
+  # Phase 4b sidecar updater — Windows cross-compile validation.
+  # The crate is windows-only at runtime; we cross-compile from
+  # Linux normally, but on tag push we also build it natively to
+  # surface any Windows-specific MoveFileExW / OpenProcess API
+  # mistakes that the cross-compiler skipped.
+  test-windows-sidecar:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - shell: bash
+        run: |
+          cargo build -p soth-cli-update-sidecar --bin soth-update --release
+          cargo test --lib -p soth-cli-update-sidecar

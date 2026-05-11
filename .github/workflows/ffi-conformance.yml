@@ -8,21 +8,20 @@ name: ffi-conformance
 # lane can't see.
 
 on:
+  # Release-gate only. Per-PR FFI signal is already covered by the
+  # bindings-build-check step in ci.yml (Linux Rust compile of both
+  # bindings); the full conformance harness is the release-gate
+  # validation and runs only on version-tag push or manual dispatch.
+  # See release-ci.yml header for the full rationale.
   push:
-    branches:
-      - main
-      - 'sdk-*'
-    paths:
-      - 'bindings/**'
-      - 'crates/soth-sdk-core/**'
-      - 'crates/soth-conformance-tests/fixtures/**'
-      - '.github/workflows/ffi-conformance.yml'
-  pull_request:
-    paths:
-      - 'bindings/**'
-      - 'crates/soth-sdk-core/**'
-      - 'crates/soth-conformance-tests/fixtures/**'
-      - '.github/workflows/ffi-conformance.yml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or commit SHA to test'
+        required: false
+        type: string
 
 # Cancel superseded runs (push-rebase cycles on a long-running PR).
 concurrency:
