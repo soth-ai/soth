@@ -270,6 +270,13 @@ pub enum DataSource {
     CodeWindsurf,
     CodeOpenCode,
     CodePiAgent,
+    /// Code-extension event from an agent that doesn't match any of the
+    /// seven shipped adapter names. Mirrors `HistorianUnknown`: keeps
+    /// the event on the action layer instead of mis-attributing it to
+    /// Claude Code (the prior smoke-friendly default). Surfaces as the
+    /// "unknown" agent on the dashboard so operators can audit the
+    /// source rather than silently bucket it into someone else's tile.
+    CodeUnknown,
 }
 
 impl Default for DataSource {
@@ -321,7 +328,8 @@ impl EventLayer {
             | DataSource::CodeGeminiCli
             | DataSource::CodeWindsurf
             | DataSource::CodeOpenCode
-            | DataSource::CodePiAgent => Self::Action,
+            | DataSource::CodePiAgent
+            | DataSource::CodeUnknown => Self::Action,
         }
     }
 }
@@ -1028,6 +1036,7 @@ mod data_source_serde_tests {
             (DataSource::CodeWindsurf, "\"code_windsurf\""),
             (DataSource::CodeOpenCode, "\"code_open_code\""),
             (DataSource::CodePiAgent, "\"code_pi_agent\""),
+            (DataSource::CodeUnknown, "\"code_unknown\""),
         ];
         for (variant, expected) in cases {
             assert_eq!(
@@ -1048,6 +1057,7 @@ mod data_source_serde_tests {
             DataSource::CodeWindsurf,
             DataSource::CodeOpenCode,
             DataSource::CodePiAgent,
+            DataSource::CodeUnknown,
         ];
         for variant in variants {
             let json = serde_json::to_string(&variant).unwrap();
