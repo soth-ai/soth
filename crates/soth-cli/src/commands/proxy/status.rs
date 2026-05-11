@@ -248,6 +248,7 @@ fn render_human(status: &StatusJson) {
     println!("Flagged:        {}", status.last_24h.flagged);
     println!("Est. cost:      ${:.2}", status.last_24h.cost_usd);
     println!();
+    render_update_line();
     if status.healthy {
         style::success("healthy");
     } else {
@@ -269,6 +270,73 @@ fn render_human(status: &StatusJson) {
         } else {
             style::warning(&format!("degraded ({})", reasons.join(", ")));
         }
+    }
+}
+
+/// Surface a one-line "update available" hint when either:
+///   1. The Phase 2 heartbeat-delivered offer at
+///      `~/.soth/run/update_pending.json` carries a newer version, OR
+///   2. The Phase 1 cache at `~/.soth/run/update_cache.json` carries a
+///      newer version.
+///
+/// Heartbeat-delivered offers take precedence — they're push, not pull,
+/// so they're typically fresher and they carry urgency. Both paths are
+/// silent when no offer is available or already applied.
+fn render_update_line() {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+
+    // Phase 2: prefer the heartbeat-delivered offer if it's strictly
+    // newer than what we run AND not marked apply_failed.
+    if let Ok(Some(pending)) = soth_sync::update_pending::read() {
+        if !pending.apply_failed && version_strictly_newer(&pending.offer.version, &current) {
+            let urgency = match pending.offer.urgency {
+                soth_sync::api_types::UpdateUrgency::Notify => "notify",
+                soth_sync::api_types::UpdateUrgency::Recommended => "recommended",
+                soth_sync::api_types::UpdateUrgency::Forced => "forced",
+            };
+            println!(
+                "🔔 Update available: {} → {} (heartbeat, urgency: {}). Run `soth update --apply`.",
+                current, pending.offer.version, urgency,
+            );
+            if let Some(notes) = &pending.offer.release_notes_url {
+                println!("   Release notes: {}", notes);
+            }
+            println!();
+            return;
+        }
+    }
+
+    // Phase 1 fallback: the local --check cache.
+    let cached = match crate::update::UpdateCache::read() {
+        Ok(Some(c)) => c,
+        _ => return,
+    };
+    let latest = match cached.latest_version.as_deref() {
+        Some(v) => v,
+        None => return,
+    };
+    if !version_strictly_newer(latest, &cached.current_version) {
+        return;
+    }
+    let channel = if cached.channel.is_empty() {
+        "stable".to_string()
+    } else {
+        cached.channel.clone()
+    };
+    println!(
+        "🔔 Update available: {} → {} (channel {}). Run `soth update --apply --channel {}`.",
+        cached.current_version, latest, channel, channel,
+    );
+    println!();
+}
+
+fn version_strictly_newer(candidate: &str, current: &str) -> bool {
+    match (
+        semver::Version::parse(candidate),
+        semver::Version::parse(current),
+    ) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => candidate != current,
     }
 }
 

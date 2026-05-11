@@ -51,6 +51,20 @@ ENV="${2:-staging}"
 # matched here so the auto-default lines up with the existing convention.
 : "${VERSION:=v1-$(date +%Y-%m-%d)}"
 
+# Release-manifest signing (Phase 1 hot-update).
+# Privates live outside the repo (1Password / operator vault); operator
+# pulls the active key into SOTH_RELEASE_KEY_DIR before `make release-cli`.
+: "${SOTH_RELEASE_KEY_DIR:=$HOME/.soth/keys/release}"
+# Override to publish a non-default channel for an ENV (e.g. CHANNEL=canary
+# from prod). Default is derived from ENV via default_channel_for_env.
+: "${CHANNEL:=}"
+# Floor for the client-side min_supported_version anti-rollback gate.
+# Bump only when shipping a release that intentionally drops support for
+# older clients (e.g. breaking the heartbeat protocol).
+: "${MIN_SUPPORTED_VERSION:=0.1.0}"
+# Where release notes live. Manifest stores the URL; clients open it.
+: "${RELEASE_NOTES_URL_TEMPLATE:=https://github.com/soth-ai/soth/releases/tag/v%VERSION%}"
+
 PROD_BASE_URL="https://storage.soth.ai/release"
 STAGING_BASE_URL="https://storage.staging.soth.xyz/release"
 
@@ -71,6 +85,12 @@ CLI_BINARIES=(
   soth-linux-amd64
   soth-linux-arm64
   soth-windows-amd64.exe
+  # Phase 4b sidecar updater. Built by `cmd_build_cli`, published
+  # alongside the main binaries, NOT included in the release manifest's
+  # `platforms` map (it's not a primary install artifact). Operators
+  # download it once into %LOCALAPPDATA%\soth\ and it's reused across
+  # every subsequent main-binary update.
+  soth-update-windows-amd64.exe
 )
 
 # --- Per-env file load ------------------------------------------------------
@@ -116,9 +136,16 @@ cmd_help() {
 	CLI binaries (Phase 1):
 	  build-cli              Build all 5 platform binaries (embedded creds) → ${DIST_DIR}/
 	  publish-cli            Push ${DIST_DIR}/ binaries to ENV destination + verify
-	  release-cli            build-cli + publish-cli
+	  release-cli            build-cli + publish-cli + manifest gen/sign/publish/verify
 	  verify-cli             Re-verify remote sha matches ${DIST_DIR}/ (no build/publish)
 	  diff                   Local sha vs ENV's currently-served sha
+
+	Hot-update manifest (Phase 1):
+	  generate-manifest      Build ${DIST_DIR}/manifest/<channel>.json from sha sidecars
+	  sign-manifest          ed25519-sign manifest with SOTH_RELEASE_KEY_DIR/<key>.private.pem
+	  publish-manifest       Upload manifest.json + .sig to ENV's storage URL
+	  verify-manifest        Round-trip: re-fetch, re-verify against ops/keys/<key>.public.pem
+	  register-release       POST manifest metadata to ADMIN_API/api/v1/admin/cli/releases
 
 	Classify bundle (Phase 2):
 	  build-classify         tar -czf ${DIST_DIR}/classify-\$VERSION.tar.gz from \$DATA_DIR/classify/
@@ -148,6 +175,8 @@ cmd_help() {
 	  MINIO_SECRET_KEY        publish-cli ENV=staging
 	  PLATFORM_ADMIN_TOKEN    publish-classify, *-catalog
 	  ADMIN_API               publish-classify, *-catalog (auto-defaults per ENV)
+	  SOTH_RELEASE_KEY_DIR    sign-manifest (default ~/.soth/keys/release)
+	  CHANNEL                 override channel for ENV (staging→staging, prod→stable)
 	  (prod CLI publish uses \`npx -y wrangler@4.75.0 login\` — no extra creds.)
 
 	Phase 4 (status/diff cross-env) and Phase 5 (GHA wrappers) follow.
@@ -199,6 +228,16 @@ cmd_build_cli() {
   build_one soth-linux-amd64        x86_64-unknown-linux-gnu.2.17         zigbuild  soth  x86_64-unknown-linux-gnu
   build_one soth-linux-arm64        aarch64-unknown-linux-gnu.2.17        zigbuild  soth  aarch64-unknown-linux-gnu
   build_one soth-windows-amd64.exe  x86_64-pc-windows-gnu                 cargo     soth.exe
+
+  # Phase 4b Windows sidecar updater. Tiny self-contained binary that
+  # ships alongside soth.exe and owns the lock-release-and-replace
+  # sequence (Windows holds an exclusive lock on the running .exe).
+  echo
+  echo "==> soth-update-windows-amd64.exe  (sidecar updater)"
+  rustup target add x86_64-pc-windows-gnu >/dev/null
+  cargo build -p soth-cli-update-sidecar --bin soth-update --release --target x86_64-pc-windows-gnu
+  cp target/x86_64-pc-windows-gnu/release/soth-update.exe \
+     "${DIST_DIR}/soth-update-windows-amd64.exe"
 
   echo
   echo "==> sha256 manifests"
@@ -287,6 +326,370 @@ cmd_publish_cli_prod() {
   done
 
   cmd_verify_against "$PROD_BASE_URL"
+}
+
+# --- release manifest (Phase 1 hot-update) ----------------------------------
+#
+# After publish-cli has uploaded the per-platform binaries + .sha256
+# sidecars, generate-manifest assembles a signed manifest that clients
+# fetch via `soth update --check`. The manifest is the source of truth
+# for "what's the latest version on channel X?" — clients only trust
+# what's signed.
+#
+# Schema is documented in docs/common/2026-05-09/hot-update-plan.md §2.1.
+# Signature is raw ed25519 (64 bytes) over the manifest.json bytes.
+# OpenSSL 3.0+ is required (-rawin support).
+
+default_channel_for_env() {
+  case "$1" in
+    staging) echo "staging" ;;
+    prod)    echo "stable" ;;
+    local)   echo "staging" ;;
+    *)       echo "" ;;
+  esac
+}
+
+# Map channel → which keypair signs it. Stable releases use the stable
+# key; staging-internal and explicit canary cuts share the canary key
+# (they're both "unstable" from a customer trust perspective).
+key_basename_for_channel() {
+  case "$1" in
+    stable)            echo "stable" ;;
+    canary | staging)  echo "canary" ;;
+    *) err "unknown channel '$1' (expected stable|canary|staging)" ;;
+  esac
+}
+
+base_url_for_env() {
+  case "$1" in
+    staging) echo "$STAGING_BASE_URL" ;;
+    prod)    echo "$PROD_BASE_URL" ;;
+    local)   echo "" ;;
+    *)       echo "" ;;
+  esac
+}
+
+# Map a publish-cli filename to the manifest's platform key.
+# soth-darwin-arm64           → darwin-arm64
+# soth-windows-amd64.exe      → windows-amd64
+binary_to_platform_key() {
+  local f="$1"
+  f="${f#soth-}"
+  f="${f%.exe}"
+  echo "$f"
+}
+
+extract_workspace_version() {
+  awk '
+    /^\[workspace\.package\]/ { in_wp=1; next }
+    /^\[/                     { in_wp=0 }
+    in_wp && /^version[[:space:]]*=/ {
+      gsub(/[\"[:space:]]/, "", $0)
+      sub(/^version=/, "")
+      print
+      exit
+    }
+  ' Cargo.toml
+}
+
+# Pull the current channel manifest's release_seq so we can monotonically
+# increment. Returns 0 if no manifest exists yet (first publish to channel).
+fetch_current_release_seq() {
+  local base="$1" channel="$2"
+  local url="${base}/manifest/${channel}.json?cb=$(date +%s)"
+  local body
+  body=$(curl -sfL "$url" 2>/dev/null || true)
+  if [ -z "$body" ]; then
+    echo 0
+    return
+  fi
+  echo "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("release_seq", 0))' 2>/dev/null || echo 0
+}
+
+# Resolve the channel: explicit $CHANNEL wins, else env-derived default.
+resolve_channel() {
+  if [ -n "$CHANNEL" ]; then
+    echo "$CHANNEL"
+  else
+    default_channel_for_env "$ENV"
+  fi
+}
+
+cmd_generate_manifest() {
+  ensure_dist_present
+  require_cmd python3
+  require_cmd shasum
+  require_cmd curl
+
+  local channel
+  channel=$(resolve_channel)
+  [ -n "$channel" ] || err "could not resolve channel for ENV=$ENV (set CHANNEL explicitly)"
+
+  local base
+  base=$(base_url_for_env "$ENV")
+  [ -n "$base" ] || err "no base URL for ENV=$ENV (only staging|prod produce remote manifests)"
+
+  local version
+  version=$(extract_workspace_version)
+  [ -n "$version" ] || err "could not extract workspace version from Cargo.toml"
+
+  local current_seq next_seq
+  current_seq=$(fetch_current_release_seq "$base" "$channel")
+  next_seq=$((current_seq + 1))
+
+  local released_at
+  released_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local notes_url="${RELEASE_NOTES_URL_TEMPLATE/\%VERSION\%/$version}"
+
+  mkdir -p "${DIST_DIR}/manifest"
+  local out="${DIST_DIR}/manifest/${channel}.json"
+
+  echo "==> generate manifest (channel=${channel}, version=${version}, release_seq=${next_seq})"
+
+  # Build platforms map by walking CLI_BINARIES + their .sha256 sidecars.
+  # The sidecar updater (soth-update-windows-amd64.exe) is published
+  # but kept OUT of the manifest — it's not a primary install artifact;
+  # the client looks for it locally on Windows and never via the
+  # manifest's `platforms` map.
+  local platforms_json="{"
+  local first=1
+  for f in "${CLI_BINARIES[@]}"; do
+    case "$f" in
+      soth-update-*) continue ;;
+    esac
+    local key sha
+    key=$(binary_to_platform_key "$f")
+    sha=$(awk '{print $1}' "${DIST_DIR}/${f}.sha256")
+    [ -n "$sha" ] || err "empty sha256 for ${f}"
+    if [ "$first" = 1 ]; then first=0; else platforms_json+=", "; fi
+    platforms_json+="\"${key}\": {\"url\": \"${base}/${f}\", \"sha256\": \"${sha}\"}"
+  done
+  platforms_json+="}"
+
+  # python3 emits the canonical JSON (sorted keys, no trailing whitespace)
+  # so the signing input is byte-stable across operator machines.
+  python3 - "$out" <<-PYEOF
+	import json, os, sys
+	out = sys.argv[1]
+	manifest = {
+	    "schema_version": 1,
+	    "channel": "${channel}",
+	    "version": "${version}",
+	    "release_seq": ${next_seq},
+	    "released_at": "${released_at}",
+	    "min_supported_version": "${MIN_SUPPORTED_VERSION}",
+	    "release_notes_url": "${notes_url}",
+	    "platforms": ${platforms_json},
+	}
+	with open(out, "w") as fh:
+	    json.dump(manifest, fh, sort_keys=True, separators=(",", ":"))
+	    fh.write("\n")
+	size = os.path.getsize(out)
+	print(f"  wrote {out} ({size} bytes, {len(manifest['platforms'])} platforms)")
+PYEOF
+}
+
+cmd_sign_manifest() {
+  require_cmd openssl
+  local channel key_basename key_path manifest sig pubkey
+  channel=$(resolve_channel)
+  [ -n "$channel" ] || err "could not resolve channel for ENV=$ENV"
+  key_basename=$(key_basename_for_channel "$channel")
+
+  key_path="${SOTH_RELEASE_KEY_DIR}/${key_basename}.private.pem"
+  manifest="${DIST_DIR}/manifest/${channel}.json"
+  sig="${manifest}.sig"
+  pubkey="ops/keys/${key_basename}.public.pem"
+
+  [ -f "$key_path" ] || err "private key missing: $key_path (pull from 1Password)"
+  [ -f "$manifest" ] || err "manifest missing: $manifest (run generate-manifest first)"
+  [ -f "$pubkey" ] || err "public key missing: $pubkey"
+
+  echo "==> sign manifest (channel=${channel}, key=${key_basename})"
+  openssl pkeyutl -sign -inkey "$key_path" -rawin -in "$manifest" -out "$sig"
+
+  # Self-verify before publishing — guarantees the signature roundtrips
+  # against the public key that ships in the binary.
+  openssl pkeyutl -verify -pubin -inkey "$pubkey" -rawin \
+    -in "$manifest" -sigfile "$sig" >/dev/null \
+    || err "self-verify failed; aborting publish"
+
+  printf "  manifest:  %s\n" "$manifest"
+  printf "  signature: %s (%s bytes)\n" "$sig" "$(wc -c < "$sig" | tr -d ' ')"
+  printf "  pubkey:    %s\n" "$pubkey"
+}
+
+cmd_publish_manifest() {
+  local channel manifest sig
+  channel=$(resolve_channel)
+  manifest="${DIST_DIR}/manifest/${channel}.json"
+  sig="${manifest}.sig"
+
+  [ -f "$manifest" ] || err "manifest missing: $manifest"
+  [ -f "$sig" ]      || err "signature missing: $sig"
+
+  case "$ENV" in
+    local)
+      echo "==> ENV=local: manifest stays in ${manifest}, no remote publish."
+      ;;
+    staging)
+      require_var MINIO_ACCESS_KEY
+      require_var MINIO_SECRET_KEY
+      require_cmd aws
+      export AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY"
+      export AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY"
+      export AWS_CA_BUNDLE
+      for f in "${channel}.json" "${channel}.json.sig"; do
+        echo "==> S3 put s3://${MINIO_BUCKET}/manifest/${f}"
+        aws s3 cp "${DIST_DIR}/manifest/${f}" "s3://${MINIO_BUCKET}/manifest/${f}" \
+          --endpoint-url "$MINIO_ENDPOINT_URL" \
+          --cache-control "no-store, max-age=0" \
+          --no-progress
+      done
+      ;;
+    prod)
+      require_cmd npx
+      local WRANGLER="npx -y wrangler@4.75.0"
+      $WRANGLER whoami >/dev/null 2>&1 \
+        || err "wrangler not logged in (run \`npx -y wrangler@4.75.0 login\`)"
+      unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+      for f in "${channel}.json" "${channel}.json.sig"; do
+        echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}manifest/${f}"
+        $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}manifest/${f}" \
+          --file="${DIST_DIR}/manifest/${f}" \
+          --remote \
+          --cache-control "no-store, max-age=0"
+      done
+      ;;
+    *) err "ENV must be local|staging|prod (got '$ENV')" ;;
+  esac
+}
+
+# Register the just-published release with soth-cloud's admin API
+# (Phase 3a). The hot-update resolver reads `cli_releases` on every
+# heartbeat; without this row, a channel pointing at this version will
+# never emit an offer.
+#
+# Idempotent: re-posting the same (version, platform) overwrites url +
+# sha256. Soft-fail (warn) — the manifest is the trust root, so a
+# registration failure means "fleet won't auto-discover this version
+# yet" not "this release is broken".
+#
+# Requires PLATFORM_ADMIN_TOKEN + ADMIN_API. Skipped for ENV=local.
+cmd_register_release() {
+  case "$ENV" in
+    local)
+      echo "==> ENV=local: skipping release registration."
+      return 0
+      ;;
+    staging | prod) ;;
+    *) err "ENV must be local|staging|prod (got '$ENV')" ;;
+  esac
+
+  if [ -z "$PLATFORM_ADMIN_TOKEN" ] || [ -z "$ADMIN_API" ]; then
+    echo "==> WARN: PLATFORM_ADMIN_TOKEN or ADMIN_API empty; skipping release registration."
+    echo "         The release is published but won't be served by the heartbeat resolver"
+    echo "         until you POST it to ${ADMIN_API:-<unset>}/api/v1/admin/cli/releases."
+    return 0
+  fi
+
+  require_cmd python3
+  require_cmd curl
+
+  local channel manifest
+  channel=$(resolve_channel)
+  manifest="${DIST_DIR}/manifest/${channel}.json"
+  [ -f "$manifest" ] || err "manifest missing: $manifest (run generate-manifest first)"
+
+  echo "==> register release ${ADMIN_API}/api/v1/admin/cli/releases"
+
+  # The admin API's request body is a strict subset of the manifest
+  # (no channel, schema_version, min_supported_version, released_at).
+  # python3 transforms the existing manifest into the registration
+  # payload to avoid drift between the two shapes.
+  local body
+  body=$(python3 - "$manifest" <<-'PYEOF'
+	import json, sys
+	with open(sys.argv[1]) as fh:
+	    m = json.load(fh)
+	out = {
+	    "version": m["version"],
+	    "release_seq": m["release_seq"],
+	    "platforms": m["platforms"],
+	}
+	if m.get("release_notes_url"):
+	    out["release_notes_url"] = m["release_notes_url"]
+	print(json.dumps(out, separators=(",", ":")))
+PYEOF
+  )
+
+  local http_code
+  http_code=$(curl -sS -o /tmp/soth-release-register-resp.json -w "%{http_code}" \
+    -X POST "${ADMIN_API}/api/v1/admin/cli/releases" \
+    -H "Authorization: Bearer ${PLATFORM_ADMIN_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data-raw "$body" 2>&1) || true
+
+  if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+    printf "  HTTP %s\n" "$http_code"
+    python3 - <<-'PYEOF'
+	import json
+	with open("/tmp/soth-release-register-resp.json") as fh:
+	    r = json.load(fh)
+	print(f"  registered version={r['version']} release_seq={r['release_seq']} platforms={len(r['platforms'])}")
+PYEOF
+  else
+    echo "  WARN: release registration returned HTTP ${http_code}; body:"
+    sed 's/^/    /' /tmp/soth-release-register-resp.json 2>/dev/null || true
+    echo "  Manifest is published; resolver won't serve this version until /admin/cli/releases is populated."
+  fi
+}
+
+# Round-trip verify: download the freshly-published manifest, verify the
+# sig with the committed public key, ensure version + sha entries match
+# what we just uploaded. Belt-and-braces — same idea as cmd_verify_against
+# for binaries.
+cmd_verify_manifest() {
+  require_cmd curl
+  require_cmd openssl
+
+  local channel base manifest_url sig_url tmpdir
+  channel=$(resolve_channel)
+  base=$(base_url_for_env "$ENV")
+  [ -n "$base" ] || err "ENV=$ENV has no remote (use staging|prod)"
+
+  manifest_url="${base}/manifest/${channel}.json?cb=$(date +%s)"
+  sig_url="${base}/manifest/${channel}.json.sig?cb=$(date +%s)"
+
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "$tmpdir"' RETURN
+
+  echo "==> fetch ${manifest_url}"
+  curl -sfL "$manifest_url" -o "$tmpdir/manifest.json" \
+    || err "manifest fetch failed"
+  curl -sfL "$sig_url" -o "$tmpdir/manifest.json.sig" \
+    || err "signature fetch failed"
+
+  local key_basename pubkey
+  key_basename=$(key_basename_for_channel "$channel")
+  pubkey="ops/keys/${key_basename}.public.pem"
+  [ -f "$pubkey" ] || err "public key missing: $pubkey"
+
+  openssl pkeyutl -verify -pubin -inkey "$pubkey" -rawin \
+    -in "$tmpdir/manifest.json" -sigfile "$tmpdir/manifest.json.sig" >/dev/null \
+    || err "remote signature verification FAILED"
+
+  printf "  channel:   %s\n" "$channel"
+  printf "  signature: OK (verified with %s)\n" "$pubkey"
+  python3 - "$tmpdir/manifest.json" <<-'PYEOF'
+	import json, sys
+	with open(sys.argv[1]) as fh: m = json.load(fh)
+	print(f"  version:   {m['version']}")
+	print(f"  release_seq: {m['release_seq']}")
+	print(f"  released_at: {m['released_at']}")
+	print(f"  platforms: {len(m['platforms'])} entries")
+PYEOF
 }
 
 # --- verify-cli -------------------------------------------------------------
@@ -475,6 +878,17 @@ cmd_status_all() {
 cmd_release_cli() {
   cmd_build_cli
   cmd_publish_cli
+  # Hot-update manifest pipeline. Skipped for ENV=local — local releases
+  # don't need a signed manifest, and the private key may not be present.
+  if [ "$ENV" != "local" ]; then
+    cmd_generate_manifest
+    cmd_sign_manifest
+    cmd_publish_manifest
+    cmd_verify_manifest
+    # Phase 3a: register the artifact metadata with soth-cloud's
+    # admin API so the heartbeat resolver can serve it. Soft-fail.
+    cmd_register_release
+  fi
 }
 
 # --- classify bundle: build + publish + verify ------------------------------
@@ -842,6 +1256,11 @@ case "$VERB" in
   publish-cli)       cmd_publish_cli ;;
   release-cli)       cmd_release_cli ;;
   verify-cli)        cmd_verify_cli ;;
+  generate-manifest) cmd_generate_manifest ;;
+  sign-manifest)     cmd_sign_manifest ;;
+  publish-manifest)  cmd_publish_manifest ;;
+  verify-manifest)   cmd_verify_manifest ;;
+  register-release)  cmd_register_release ;;
   build-classify)    cmd_build_classify ;;
   publish-classify)  cmd_publish_classify ;;
   release-classify)  cmd_release_classify ;;

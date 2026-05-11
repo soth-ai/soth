@@ -211,6 +211,34 @@ pub async fn run(
             None
         };
 
+    // Phase 4 hot-update auto-applier. Polls ~/.soth/run/update_pending.json
+    // every 60s and runs the same `soth update --apply` path the user
+    // would run, but only for offers with urgency=Forced. Notify and
+    // Recommended urgencies remain user-driven.
+    //
+    // Disabled on Windows until 0.2.0 ships the sidecar updater (the
+    // current Windows swap path can't run from inside the running
+    // daemon — the binary is locked).
+    //
+    // Enterprise / deployment-guide override: SOTH_DISABLE_AUTO_APPLY=1
+    // skips the supervisor entirely. Cheaper than threading a config
+    // flag through cli_config for the 0.1.5 cut.
+    let _update_applier_supervisor: Option<tokio::task::JoinHandle<()>> = {
+        let auto_apply_disabled = std::env::var("SOTH_DISABLE_AUTO_APPLY")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false);
+        if auto_apply_disabled || cfg!(target_os = "windows") {
+            None
+        } else {
+            Some(tokio::spawn(async move {
+                super::update_applier::run().await;
+            }))
+        }
+    };
+
     // Engage the OS-level system proxy so traffic actually flows through us.
     // Reached by both foreground (`soth up --foreground`) and daemon-child
     // paths; the standalone-daemon path (line ~67) re-execs back into this

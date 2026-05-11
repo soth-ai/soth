@@ -17,13 +17,57 @@ fn help_lists_supported_commands() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     for token in [
         "start", "stop", "up", "down", "on", "off", "logs", "status", "init", "enroll", "setup-ca",
-        "doctor", "env", "events", "bundle", "config",
+        "doctor", "env", "events", "bundle", "config", "update",
     ] {
         assert!(
             stdout.contains(token),
             "expected `--help` output to contain `{token}`"
         );
     }
+}
+
+#[test]
+fn update_help_lists_check_apply_rollback() {
+    let out = run_cli(&["update", "--help"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for token in [
+        "--check",
+        "--apply",
+        "--rollback",
+        "--channel",
+        "--force-downgrade",
+    ] {
+        assert!(
+            stdout.contains(token),
+            "expected `update --help` output to contain `{token}`, got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn update_check_reports_network_error_against_unreachable_url() {
+    // Use a TCP port that's almost certainly closed — the CLI should
+    // surface a network error rather than a panic or a silent success.
+    let out = run_cli(&[
+        "update",
+        "--check",
+        "--manifest-url",
+        "http://127.0.0.1:1/release",
+    ]);
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("manifest")
+            || stderr.contains("Connection")
+            || stderr.contains("fetching")
+            || stderr.contains("verify"),
+        "expected network/error context in stderr, got: {stderr}"
+    );
 }
 
 #[test]

@@ -915,6 +915,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -2907,6 +2908,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3697,6 +3707,10 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "sentry"
@@ -4011,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "soth-api-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4020,7 +4034,7 @@ dependencies = [
 
 [[package]]
 name = "soth-bundle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -4042,7 +4056,7 @@ dependencies = [
 
 [[package]]
 name = "soth-classify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "criterion",
@@ -4066,9 +4080,10 @@ dependencies = [
 
 [[package]]
 name = "soth-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -4079,9 +4094,11 @@ dependencies = [
  "hex",
  "libc",
  "owo-colors",
+ "rand 0.8.5",
  "rcgen 0.13.2",
  "reqwest",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4106,8 +4123,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "soth-cli-update-sidecar"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "soth-code"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4134,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "soth-conformance-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "serde",
@@ -4150,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "soth-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",
@@ -4167,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "soth-detect"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4196,7 +4221,7 @@ dependencies = [
 
 [[package]]
 name = "soth-extensions"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -4214,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "soth-historian"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4282,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "soth-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -4296,7 +4321,7 @@ dependencies = [
 
 [[package]]
 name = "soth-parse"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "graphql-parser",
@@ -4312,7 +4337,7 @@ dependencies = [
 
 [[package]]
 name = "soth-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "criterion",
@@ -4327,7 +4352,7 @@ dependencies = [
 
 [[package]]
 name = "soth-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4382,7 +4407,7 @@ dependencies = [
 
 [[package]]
 name = "soth-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pyo3",
  "soth-core",
@@ -4393,7 +4418,7 @@ dependencies = [
 
 [[package]]
 name = "soth-sdk-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "opentelemetry",
@@ -4413,7 +4438,7 @@ dependencies = [
 
 [[package]]
 name = "soth-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4443,7 +4468,7 @@ dependencies = [
 
 [[package]]
 name = "soth-telemetry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chacha20poly1305",

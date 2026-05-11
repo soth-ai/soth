@@ -11,6 +11,7 @@ pub(crate) mod shell_env;
 mod start;
 mod status;
 mod system;
+mod update_applier;
 
 /// Apply `CREATE_NO_WINDOW` to a `std::process::Command` on Windows so that
 /// spawned helper processes (tasklist, reg, certutil, etc.) don't briefly

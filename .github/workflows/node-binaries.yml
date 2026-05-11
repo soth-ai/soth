@@ -20,39 +20,26 @@ name: node-binaries
 # devDependencies for the build itself).
 
 on:
-  # Per-arch wheel/binary builds are expensive: 7-target matrix with
-  # 2 macOS + 1 Windows runners (≈10× and 2× the per-minute cost of
-  # Linux runners). They mostly exist as a release gate, not a PR
-  # smoke test — `ci.yml::bindings-build-check` already compiles
-  # `soth-py` and `soth-node` on Linux for every PR and catches
-  # FFI-surface regressions cheaply.
+  # Release-gate only. The 7-target matrix (4 Linux + 2 macOS @ 10x +
+  # 1 Windows @ 2x) is one of the biggest CI-minute consumers in the
+  # repo — running it on every PR was burning hours on the
+  # bindings-config tweaks that didn't actually change generated
+  # binaries.
   #
-  # Trigger policy:
-  #   • push to main / sdk-*  → full matrix, broad core-crate paths
-  #     (release gate; we want the prebuilt artifacts ready before
-  #     merge to a release line).
-  #   • pull_request          → only when the bindings themselves are
-  #     touched. A `Cargo.toml` tweak no longer fires this workflow
-  #     on PRs; the next push to main exercises it then.
-  #   • workflow_dispatch     → ad-hoc (release prep, debugging).
+  # Per-PR FFI signal lives in ci.yml's pure-Rust compile check on
+  # Linux (bindings-build-check). Per-arch artifacts are only needed
+  # at release-publication time, which is what tag-push gates.
+  #
+  # workflow_dispatch is preserved for ad-hoc release prep / debugging.
   push:
-    branches:
-      - main
-      - 'sdk-*'
-    paths:
-      - 'bindings/soth-node/**'
-      - 'crates/soth-sdk-core/**'
-      - 'crates/soth-core/**'
-      - 'crates/soth-detect/**'
-      - 'crates/soth-classify/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/node-binaries.yml'
-  pull_request:
-    paths:
-      - 'bindings/soth-node/**'
-      - '.github/workflows/node-binaries.yml'
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or commit SHA to test'
+        required: false
+        type: string
 
 # Cancel duplicate runs on the same PR (push-rebase-push cycles).
 # fail-fast is already off for the matrix, so individual target

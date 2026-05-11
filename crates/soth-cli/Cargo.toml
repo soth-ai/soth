@@ -40,6 +40,8 @@ rcgen = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+semver = { workspace = true }
+async-trait = { workspace = true }
 sha1 = "0.10"
 x509-parser = "0.18"
 toml = "0.8"
@@ -55,3 +57,4 @@ comfy-table = "7.0"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
+rand = { workspace = true }

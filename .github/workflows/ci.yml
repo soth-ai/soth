@@ -3,16 +3,17 @@ name: ci
 on:
   pull_request:
     # Skip CI on PRs that only touch docs / markdown — saves a full
-    # workflow run (9 jobs) per readme tweak. The ignore filter is
-    # path-based: any code/config change still triggers everything.
+    # workflow run per readme tweak. The ignore filter is path-based:
+    # any code/config change still triggers everything.
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
       - 'LICENSE*'
   push:
-    # Add `staging` so direct pushes (cargo-fmt fixups, ops tweaks)
-    # get verified — `staging` is a real merge target, not just a
-    # branch name.
+    # `staging` is a real merge target; pushes to it (cargo-fmt fixups,
+    # ops tweaks) get the same fmt + clippy + test verification PRs do.
+    # `main` is the release line — heavy lanes (Windows, conformance,
+    # bindings matrices) trigger from release-ci.yml on tag push.
     branches: [main, staging]
     paths-ignore:
       - '**/*.md'
@@ -29,7 +30,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Per-PR lane is intentionally minimal: fmt + clippy + test on Linux
+# only. Windows tests, FFI conformance, and the per-arch
+# bindings/wheel matrices all live under release-ci.yml and fire on
+# release tags (`v*`) — they're release-gate signal, not per-PR
+# signal, and they dominate the CI-minute budget when run on every
+# push. See release-ci.yml for the full list.
 jobs:
+  # fmt runs first; clippy + test `needs: fmt`. A syntax-error PR
+  # that fails fmt no longer pays for a full clippy + test run —
+  # fmt is ~30s, the rest is 5-10min each.
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -41,6 +51,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    needs: fmt
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,57 +62,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    needs: fmt
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --lib --bins
-
-  # Parser / detect / policy / install tests on Windows — gryph
-  # PR #42's `unzip` Windows-specific bug shipped because there
-  # was no Windows runner in CI. We do ship Windows soth-cli
-  # binaries (see node-binaries.yml release lane), so any
-  # Windows-only regression in parser/detect/policy/install code
-  # paths must land on a real Windows runner before merge.
-  #
-  # Scoped to library tests for the crates whose code paths
-  # actually differ on Windows: path resolution
-  # (`extensions/code/src/paths.rs` reads dirs::home_dir →
-  # %USERPROFILE% on Windows), settings.json install
-  # (different default per agent — `~/.claude/...` vs
-  # `%USERPROFILE%\.claude\...`), regex / unicode handling in
-  # detect, and signature-verify on policy.  soth-proxy is
-  # excluded — its async networking surface includes Linux-
-  # specific syscalls (epoll, AF_UNIX) that don't compile on
-  # Windows and are not the historical regression site.
-  test-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: lib tests on Windows
-        shell: bash
-        run: |
-          cargo test --lib -p soth-core
-          cargo test --lib -p soth-classify
-          cargo test --lib -p soth-detect
-          cargo test --lib -p soth-policy
-          cargo test --lib -p soth-bundle
-          cargo test --lib -p soth-extensions
-          cargo test --lib -p soth-parse
-          cargo test --lib -p soth-code
-
-  # SDK-related jobs (conformance / wasm matrix / bindings-build-check) are
-  # intentionally NOT in this workflow.
-  #
-  # They live in dedicated workflows that are already path-filtered to fire
-  # only when the SDK surface or bindings actually change:
-  #   - ffi-conformance.yml   (bindings + sdk-core fixtures)
-  #   - python-wheels.yml     (bindings/soth-py + sdk-core)
-  #   - node-binaries.yml     (bindings/soth-node + sdk-core)
-  #
-  # Keeping the basic CI lane (fmt + clippy + test) lean speeds up review
-  # for the proxy/historian/cli changes that are >90% of PRs against
-  # staging. The dedicated workflows still run on the relevant paths and
-  # on push to main / sdk-* branches as a release gate.

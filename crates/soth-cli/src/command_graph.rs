@@ -97,6 +97,10 @@ pub enum Commands {
         #[command(subcommand)]
         action: commands::code::CodeCommands,
     },
+
+    /// Check for or apply a soth release update
+    /// (`docs/common/2026-05-09/hot-update-plan.md`)
+    Update(UpdateArgs),
 }
 
 #[derive(Subcommand)]
@@ -271,6 +275,36 @@ pub struct InitArgs {
     /// Output directory
     #[arg(short, long, default_value = "~/.soth")]
     pub output: PathBuf,
+}
+
+#[derive(Args, Clone)]
+pub struct UpdateArgs {
+    /// Channel to query (default: stable). Operators can run --channel
+    /// canary on the same machine to ride pre-stable releases.
+    #[arg(long, default_value = "stable")]
+    pub channel: String,
+
+    /// Just check; don't download or swap (this is the default).
+    #[arg(long, conflicts_with_all = ["apply", "rollback"])]
+    pub check: bool,
+
+    /// Download, verify, and atomically swap to the latest version.
+    #[arg(long, conflicts_with = "rollback")]
+    pub apply: bool,
+
+    /// Restore the previous binary from <install>.previous and restart.
+    #[arg(long)]
+    pub rollback: bool,
+
+    /// Bypass the release_seq anti-rollback gate. Operator escape hatch
+    /// for emergency reverts; refuses to run without --apply.
+    #[arg(long, requires = "apply")]
+    pub force_downgrade: bool,
+
+    /// Override the manifest base URL. Hidden from --help; used by
+    /// integration tests and ad-hoc operator overrides.
+    #[arg(long, hide = true)]
+    pub manifest_url: Option<String>,
 }
 
 #[derive(Args, Clone)]
@@ -457,8 +491,30 @@ async fn run_command(command: Commands, global_config: Option<PathBuf>) -> anyho
             // the hook subcommand; `status` does normally return.
             commands::code::run(action, global_config).await?;
         }
+        Commands::Update(args) => {
+            run_update_command(args).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_update_command(args: UpdateArgs) -> anyhow::Result<()> {
+    use crate::update::Channel;
+    let channel: Channel = args.channel.parse()?;
+    if args.rollback {
+        commands::update::run_rollback().await?;
+        return Ok(());
+    }
+    if args.apply {
+        commands::update::run_apply(channel, args.manifest_url, args.force_downgrade).await?;
+        return Ok(());
+    }
+    // default: --check
+    let status = commands::update::run_check(channel, args.manifest_url).await?;
+    if let crate::commands::update::UpdateStatus::UpdateAvailable = status {
+        std::process::exit(status.exit_code());
+    }
     Ok(())
 }
 
