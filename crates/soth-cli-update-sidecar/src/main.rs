@@ -52,7 +52,7 @@ fn parse_args() -> Result<Args> {
     while let Some(flag) = args.next() {
         let value = args
             .next()
-            .ok_or_else(|| anyhow!("flag {} requires a value", flag))?;
+            .ok_or_else(|| anyhow!("flag {flag} requires a value"))?;
         match flag.as_str() {
             "--parent-pid" => {
                 parent_pid = Some(value.parse().context("--parent-pid not a u32")?);
@@ -60,7 +60,7 @@ fn parse_args() -> Result<Args> {
             "--new-binary" => new_binary = Some(PathBuf::from(value)),
             "--install-path" => install_path = Some(PathBuf::from(value)),
             "--previous-path" => previous_path = Some(PathBuf::from(value)),
-            other => bail!("unknown flag {}", other),
+            other => bail!("unknown flag {other}"),
         }
     }
 
@@ -80,7 +80,7 @@ fn main() -> std::process::ExitCode {
             // attached console if any, otherwise it's lost. The main
             // soth.exe should redirect stderr to a log file when
             // spawning to keep diagnostics.
-            eprintln!("soth-update: {:#}", err);
+            eprintln!("soth-update: {err:#}");
             std::process::ExitCode::from(1)
         }
     }
@@ -125,14 +125,13 @@ fn run() -> Result<()> {
         args.install_path.display(),
         args.previous_path.display()
     );
-    windows::move_file_replace(&args.install_path, &args.previous_path)
-        .with_context(|| {
-            format!(
-                "MoveFileExW {} → {}",
-                args.install_path.display(),
-                args.previous_path.display()
-            )
-        })?;
+    windows::move_file_replace(&args.install_path, &args.previous_path).with_context(|| {
+        format!(
+            "MoveFileExW {} → {}",
+            args.install_path.display(),
+            args.previous_path.display()
+        )
+    })?;
 
     eprintln!(
         "soth-update: installing {} → {}",
@@ -194,7 +193,9 @@ fn run() -> Result<()> {
 fn rollback(args: &Args, healthcheck_timeout: std::time::Duration) -> Result<()> {
     // Best-effort: try to stop the (presumably bad) service first so
     // we don't double-bind the port.
-    let _ = std::process::Command::new("sc").args(["stop", "soth"]).status();
+    let _ = std::process::Command::new("sc")
+        .args(["stop", "soth"])
+        .status();
     // Park the failed install at .failed so it's preserved for forensics.
     let mut failed = args.install_path.clone();
     let stem = failed
@@ -204,9 +205,10 @@ fn rollback(args: &Args, healthcheck_timeout: std::time::Duration) -> Result<()>
         .to_string();
     failed.set_file_name(format!("{}.failed.exe", stem));
     let _ = windows::move_file_replace(&args.install_path, &failed);
-    windows::move_file_replace(&args.previous_path, &args.install_path)
-        .context("rollback move")?;
-    let _ = std::process::Command::new("sc").args(["start", "soth"]).status();
+    windows::move_file_replace(&args.previous_path, &args.install_path).context("rollback move")?;
+    let _ = std::process::Command::new("sc")
+        .args(["start", "soth"])
+        .status();
     if !wait_for_listener(healthcheck_timeout) {
         bail!(
             "rollback: previous binary failed to bind listener within {:?}",
@@ -269,9 +271,7 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     /// Returns true if the process is still running. False on either
     /// "not found" or "access denied" (we never run elevated, so a

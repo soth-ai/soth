@@ -27,7 +27,10 @@ impl UpdateStatus {
 }
 
 /// `soth update [--check]` — fetch + verify manifest, write cache, print status.
-pub async fn run_check(channel: Channel, base_url_override: Option<String>) -> Result<UpdateStatus> {
+pub async fn run_check(
+    channel: Channel,
+    base_url_override: Option<String>,
+) -> Result<UpdateStatus> {
     let opts = VerifyOptions {
         base_url: base_url_override,
         last_release_seq: read_last_seen_seq(channel),
@@ -77,9 +80,7 @@ pub async fn run_check(channel: Channel, base_url_override: Option<String>) -> R
     if !is_newer {
         println!(
             "up-to-date (you're on {}, channel {} latest is {})",
-            current,
-            manifest.channel,
-            manifest.version
+            current, manifest.channel, manifest.version
         );
         return Ok(UpdateStatus::UpToDate);
     }
@@ -106,7 +107,10 @@ pub async fn run_check(channel: Channel, base_url_override: Option<String>) -> R
     if let Some(notes) = &manifest.release_notes_url {
         println!("  notes:  {}", notes);
     }
-    println!("  apply:  soth update --apply --channel {}", manifest.channel);
+    println!(
+        "  apply:  soth update --apply --channel {}",
+        manifest.channel
+    );
 
     Ok(UpdateStatus::UpdateAvailable)
 }
@@ -154,10 +158,7 @@ pub async fn run_apply(
         .with_context(|| format!("manifest has no platform entry for '{}'", plat))?
         .clone();
 
-    println!(
-        "downloading soth {} from {}…",
-        manifest.version, entry.url
-    );
+    println!("downloading soth {} from {}…", manifest.version, entry.url);
     let sink = BinarySink::default_for_user()?;
     let staged = download_binary(&entry.url, &entry.sha256, &sink)
         .await
@@ -182,7 +183,11 @@ pub async fn run_apply(
         tracing::warn!(error = %e, "post-swap healthcheck failed; rolling back");
         if let Err(rb) = swapper.rollback().await {
             mark_pending_apply_failed(&format!("apply+rollback: {:#}", e));
-            bail!("apply failed AND rollback failed: apply={:#}; rollback={:#}", e, rb);
+            bail!(
+                "apply failed AND rollback failed: apply={:#}; rollback={:#}",
+                e,
+                rb
+            );
         }
         mark_pending_apply_failed(&format!("post-swap rolled back: {:#}", e));
         bail!("apply failed: {:#}; rolled back to previous binary", e);
@@ -207,7 +212,10 @@ pub async fn run_apply(
         tracing::warn!(error = %e, "failed to clear update_pending.json after successful apply");
     }
 
-    println!("✓ updated to {} (channel {})", manifest.version, manifest.channel);
+    println!(
+        "✓ updated to {} (channel {})",
+        manifest.version, manifest.channel
+    );
     Ok(())
 }
 

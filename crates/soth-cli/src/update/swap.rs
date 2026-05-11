@@ -43,11 +43,15 @@ pub trait Swapper: Send + Sync {
 pub fn make_swapper(staged_binary: PathBuf) -> Result<Box<dyn Swapper>> {
     #[cfg(target_os = "macos")]
     {
-        return Ok(Box::new(super::swap_macos::MacosSwapper::new(staged_binary)?));
+        return Ok(Box::new(super::swap_macos::MacosSwapper::new(
+            staged_binary,
+        )?));
     }
     #[cfg(target_os = "linux")]
     {
-        return Ok(Box::new(super::swap_linux::LinuxSwapper::new(staged_binary)?));
+        return Ok(Box::new(super::swap_linux::LinuxSwapper::new(
+            staged_binary,
+        )?));
     }
     #[cfg(target_os = "windows")]
     {

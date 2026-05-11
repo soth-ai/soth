@@ -65,8 +65,7 @@ pub fn read() -> Result<Option<PendingUpdate>> {
             Ok(Some(parsed))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::Error::from(e)
-            .context(format!("reading {}", path.display()))),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     }
 }
 
@@ -78,8 +77,7 @@ pub fn clear() -> Result<()> {
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(anyhow::Error::from(e)
-            .context(format!("removing {}", path.display()))),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("removing {}", path.display()))),
     }
 }
 

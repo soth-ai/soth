@@ -16,10 +16,10 @@ pub mod download;
 pub mod manifest;
 pub mod swap;
 
-#[cfg(target_os = "macos")]
-mod swap_macos;
 #[cfg(target_os = "linux")]
 mod swap_linux;
+#[cfg(target_os = "macos")]
+mod swap_macos;
 #[cfg(target_os = "windows")]
 mod swap_windows;
 
@@ -31,8 +31,8 @@ pub use download::{download_binary, BinarySink};
 // warnings until those callers land.
 #[allow(unused_imports)]
 pub use manifest::{
-    fetch_and_verify_manifest, platform_key, Channel, PlatformEntry, UpdateManifest,
-    VerifyOptions, MANIFEST_SCHEMA_VERSION,
+    fetch_and_verify_manifest, platform_key, Channel, PlatformEntry, UpdateManifest, VerifyOptions,
+    MANIFEST_SCHEMA_VERSION,
 };
 #[allow(unused_imports)]
 pub use swap::{make_swapper, Swapper};

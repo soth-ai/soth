@@ -108,10 +108,7 @@ impl Swapper for MacosSwapper {
             .await
             .context("codesign --force --sign -")?;
         if !out.status.success() {
-            bail!(
-                "codesign failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            bail!("codesign failed: {}", String::from_utf8_lossy(&out.stderr));
         }
 
         // Best-effort: clear quarantine xattr if present.
@@ -129,13 +126,15 @@ impl Swapper for MacosSwapper {
         }
 
         // install_path → previous (rename, atomic on same fs)
-        tokio::fs::rename(&self.install_path, &prev).await.with_context(|| {
-            format!(
-                "renaming {} → {}",
-                self.install_path.display(),
-                prev.display()
-            )
-        })?;
+        tokio::fs::rename(&self.install_path, &prev)
+            .await
+            .with_context(|| {
+                format!(
+                    "renaming {} → {}",
+                    self.install_path.display(),
+                    prev.display()
+                )
+            })?;
         // stage → install
         tokio::fs::rename(&self.stage_path, &self.install_path)
             .await
@@ -199,9 +198,9 @@ impl Swapper for MacosSwapper {
                 .to_string();
             failed.set_file_name(format!("{}.failed", name));
             let _ = tokio::fs::remove_file(&failed).await;
-            tokio::fs::rename(&self.install_path, &failed).await.with_context(
-                || format!("parking failed binary at {}", failed.display()),
-            )?;
+            tokio::fs::rename(&self.install_path, &failed)
+                .await
+                .with_context(|| format!("parking failed binary at {}", failed.display()))?;
         }
         tokio::fs::rename(&prev, &self.install_path)
             .await
@@ -233,9 +232,7 @@ async fn wait_for_listener_or_log(timeout: Duration) -> Result<()> {
     let port = match read_configured_port() {
         Some(p) => p,
         None => {
-            tracing::info!(
-                "could not read configured proxy port; skipping post-swap healthcheck"
-            );
+            tracing::info!("could not read configured proxy port; skipping post-swap healthcheck");
             return Ok(());
         }
     };

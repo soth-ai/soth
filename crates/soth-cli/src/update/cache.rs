@@ -72,8 +72,7 @@ impl UpdateCache {
                 Ok(Some(parsed))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(anyhow::Error::from(e)
-                .context(format!("reading {}", path.display()))),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
         }
     }
 

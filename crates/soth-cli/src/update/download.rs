@@ -41,7 +41,11 @@ fn soth_new_filename() -> &'static str {
 /// Stream `url` to `sink.stage_path`, computing sha256 as bytes flow.
 /// Returns the resolved stage path on success. On any failure the
 /// partial file is removed.
-pub async fn download_binary(url: &str, expected_sha256: &str, sink: &BinarySink) -> Result<PathBuf> {
+pub async fn download_binary(
+    url: &str,
+    expected_sha256: &str,
+    sink: &BinarySink,
+) -> Result<PathBuf> {
     if let Some(parent) = sink.stage_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await

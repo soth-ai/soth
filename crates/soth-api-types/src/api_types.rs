@@ -405,18 +405,13 @@ pub struct UpdateAvailable {
 /// - `Recommended`: surface in `soth status`; user-driven update.
 /// - `Forced`: Phase 4 auto-applies within minutes (subject to
 ///   `apply_after` and the per-channel update window).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateUrgency {
     Notify,
+    #[default]
     Recommended,
     Forced,
-}
-
-impl Default for UpdateUrgency {
-    fn default() -> Self {
-        UpdateUrgency::Recommended
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

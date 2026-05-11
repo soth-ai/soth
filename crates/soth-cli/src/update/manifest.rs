@@ -76,7 +76,10 @@ impl std::str::FromStr for Channel {
             "stable" => Ok(Channel::Stable),
             "canary" => Ok(Channel::Canary),
             "staging" => Ok(Channel::Staging),
-            other => bail!("unknown channel '{}' (expected stable|canary|staging)", other),
+            other => bail!(
+                "unknown channel '{}' (expected stable|canary|staging)",
+                other
+            ),
         }
     }
 }
@@ -175,8 +178,8 @@ pub fn verify_manifest_bytes(
     channel: Channel,
     opts: &VerifyOptions,
 ) -> Result<UpdateManifest> {
-    let pubkey_pem = std::str::from_utf8(channel.pubkey_pem())
-        .context("baked-in public key is not UTF-8")?;
+    let pubkey_pem =
+        std::str::from_utf8(channel.pubkey_pem()).context("baked-in public key is not UTF-8")?;
     verify_manifest_bytes_with_pubkey(
         manifest_bytes,
         sig_bytes,
@@ -387,8 +390,7 @@ mod tests {
             current_version_override: Some("0.1.1".into()),
             ..Default::default()
         };
-        let m =
-            verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "stable", &opts).unwrap();
+        let m = verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "stable", &opts).unwrap();
         assert_eq!(m.version, "0.1.2");
         assert_eq!(m.release_seq, 5);
         assert_eq!(m.platforms.len(), 5);
@@ -405,14 +407,10 @@ mod tests {
             current_version_override: Some("0.1.1".into()),
             ..Default::default()
         };
-        let err = verify_manifest_bytes_with_pubkey(&tampered, &sig, &pem, "stable", &opts)
-            .unwrap_err();
+        let err =
+            verify_manifest_bytes_with_pubkey(&tampered, &sig, &pem, "stable", &opts).unwrap_err();
         let msg = format!("{:#}", err);
-        assert!(
-            msg.contains("signature verification failed"),
-            "got {}",
-            msg
-        );
+        assert!(msg.contains("signature verification failed"), "got {}", msg);
     }
 
     #[test]
@@ -425,8 +423,8 @@ mod tests {
             current_version_override: Some("0.1.1".into()),
             ..Default::default()
         };
-        let err = verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "canary", &opts)
-            .unwrap_err();
+        let err =
+            verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "canary", &opts).unwrap_err();
         let msg = format!("{:#}", err);
         assert!(msg.contains("does not match"), "got {}", msg);
     }
@@ -461,8 +459,8 @@ mod tests {
             current_version_override: Some("0.1.1".into()),
             ..Default::default()
         };
-        let err = verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "stable", &opts)
-            .unwrap_err();
+        let err =
+            verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "stable", &opts).unwrap_err();
         assert!(format!("{:#}", err).contains("anti-rollback"));
 
         // last_release_seq = 5, force_downgrade = true; should accept.
@@ -495,8 +493,8 @@ mod tests {
             current_version_override: Some("0.1.1".into()),
             ..Default::default()
         };
-        let err = verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "stable", &opts)
-            .unwrap_err();
+        let err =
+            verify_manifest_bytes_with_pubkey(&body, &sig, &pem, "stable", &opts).unwrap_err();
         assert!(format!("{:#}", err).contains("min_supported_version"));
     }
 

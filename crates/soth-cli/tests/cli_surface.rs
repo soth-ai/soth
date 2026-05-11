@@ -29,9 +29,19 @@ fn help_lists_supported_commands() {
 #[test]
 fn update_help_lists_check_apply_rollback() {
     let out = run_cli(&["update", "--help"]);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for token in ["--check", "--apply", "--rollback", "--channel", "--force-downgrade"] {
+    for token in [
+        "--check",
+        "--apply",
+        "--rollback",
+        "--channel",
+        "--force-downgrade",
+    ] {
         assert!(
             stdout.contains(token),
             "expected `update --help` output to contain `{token}`, got:\n{stdout}"
