@@ -287,15 +287,26 @@ cmd_publish_cli_staging() {
   export AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY"
   export AWS_CA_BUNDLE
 
+  # Per-version layout. All binaries land at
+  #   ${MINIO_BUCKET}/v<VERSION>/<filename>
+  # No unversioned latest-pointer copy — the signed channel manifest
+  # is the only routing layer. Customers consuming
+  # `${BASE_URL}/soth-darwin-arm64` directly (without the manifest)
+  # broke on the 0.1.0 GA cut; that path was never the supported one.
+  local version
+  version=$(extract_workspace_version)
+  [ -n "$version" ] || err "could not extract workspace version from Cargo.toml"
+  local version_prefix="v${version}/"
+
   for f in "${CLI_BINARIES[@]}" "${CLI_BINARIES[@]/%/.sha256}"; do
-    echo "==> S3 put s3://${MINIO_BUCKET}/${f}"
-    aws s3 cp "${DIST_DIR}/${f}" "s3://${MINIO_BUCKET}/${f}" \
+    echo "==> S3 put s3://${MINIO_BUCKET}/${version_prefix}${f}"
+    aws s3 cp "${DIST_DIR}/${f}" "s3://${MINIO_BUCKET}/${version_prefix}${f}" \
       --endpoint-url "$MINIO_ENDPOINT_URL" \
-      --cache-control "no-store, max-age=0" \
+      --cache-control "public, max-age=31536000, immutable" \
       --no-progress
   done
 
-  cmd_verify_against "$STAGING_BASE_URL"
+  cmd_verify_against "$STAGING_BASE_URL" "$version_prefix"
 }
 
 cmd_publish_cli_prod() {
@@ -317,15 +328,23 @@ cmd_publish_cli_prod() {
 
   unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
 
+  local version
+  version=$(extract_workspace_version)
+  [ -n "$version" ] || err "could not extract workspace version from Cargo.toml"
+  local version_prefix="v${version}/"
+
   for f in "${CLI_BINARIES[@]}" "${CLI_BINARIES[@]/%/.sha256}"; do
-    echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}${f}"
-    $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}${f}" \
+    echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}${version_prefix}${f}"
+    # Per-version paths are immutable — bytes at v0.1.0/soth-darwin-arm64
+    # never change after the first publish. Cache for a year so the CDN
+    # absorbs traffic.
+    $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}${version_prefix}${f}" \
       --file="${DIST_DIR}/${f}" \
       --remote \
-      --cache-control "no-store, max-age=0"
+      --cache-control "public, max-age=31536000, immutable"
   done
 
-  cmd_verify_against "$PROD_BASE_URL"
+  cmd_verify_against "$PROD_BASE_URL" "$version_prefix"
 }
 
 # --- release manifest (Phase 1 hot-update) ----------------------------------
@@ -452,6 +471,10 @@ cmd_generate_manifest() {
   # but kept OUT of the manifest — it's not a primary install artifact;
   # the client looks for it locally on Windows and never via the
   # manifest's `platforms` map.
+  #
+  # Per-version URL pattern: <base>/v<VERSION>/<filename>. Frozen,
+  # immutable, cacheable forever. Old manifests on client disk
+  # continue to point at real bytes even after newer versions ship.
   local platforms_json="{"
   local first=1
   for f in "${CLI_BINARIES[@]}"; do
@@ -463,7 +486,7 @@ cmd_generate_manifest() {
     sha=$(awk '{print $1}' "${DIST_DIR}/${f}.sha256")
     [ -n "$sha" ] || err "empty sha256 for ${f}"
     if [ "$first" = 1 ]; then first=0; else platforms_json+=", "; fi
-    platforms_json+="\"${key}\": {\"url\": \"${base}/${f}\", \"sha256\": \"${sha}\"}"
+    platforms_json+="\"${key}\": {\"url\": \"${base}/v${version}/${f}\", \"sha256\": \"${sha}\"}"
   done
   platforms_json+="}"
 
@@ -521,13 +544,25 @@ cmd_sign_manifest() {
 }
 
 cmd_publish_manifest() {
-  local channel manifest sig
+  local channel manifest sig version
   channel=$(resolve_channel)
   manifest="${DIST_DIR}/manifest/${channel}.json"
   sig="${manifest}.sig"
+  version=$(extract_workspace_version)
+  [ -n "$version" ] || err "could not extract workspace version from Cargo.toml"
 
   [ -f "$manifest" ] || err "manifest missing: $manifest"
   [ -f "$sig" ]      || err "signature missing: $sig"
+
+  # Two publish targets per channel manifest:
+  #   1. manifest/<channel>.json{,.sig}              ← channel-current pointer.
+  #      Overwritten every release. no-store cache so a stale CDN doesn't
+  #      hide a fresh release. The "what's latest on stable" route.
+  #   2. manifest/<channel>.v<VERSION>.json{,.sig}   ← frozen per-version
+  #      snapshot. Never overwritten. Long-cached. Lets `soth update
+  #      --version 0.1.0` and rollback paths fetch a manifest that matches
+  #      the per-version binary URLs forever.
+  local versioned_manifest_name="${channel}.v${version}.json"
 
   case "$ENV" in
     local)
@@ -540,11 +575,24 @@ cmd_publish_manifest() {
       export AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY"
       export AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY"
       export AWS_CA_BUNDLE
+
+      # Channel-current (mutable, no-cache).
       for f in "${channel}.json" "${channel}.json.sig"; do
         echo "==> S3 put s3://${MINIO_BUCKET}/manifest/${f}"
         aws s3 cp "${DIST_DIR}/manifest/${f}" "s3://${MINIO_BUCKET}/manifest/${f}" \
           --endpoint-url "$MINIO_ENDPOINT_URL" \
           --cache-control "no-store, max-age=0" \
+          --no-progress
+      done
+
+      # Frozen per-version snapshot (immutable, year-cached).
+      for f in "${manifest}" "${sig}"; do
+        local frozen_name
+        frozen_name=$(basename "$f" | sed "s/^${channel}/${channel}.v${version}/")
+        echo "==> S3 put s3://${MINIO_BUCKET}/manifest/${frozen_name}"
+        aws s3 cp "$f" "s3://${MINIO_BUCKET}/manifest/${frozen_name}" \
+          --endpoint-url "$MINIO_ENDPOINT_URL" \
+          --cache-control "public, max-age=31536000, immutable" \
           --no-progress
       done
       ;;
@@ -554,6 +602,8 @@ cmd_publish_manifest() {
       $WRANGLER whoami >/dev/null 2>&1 \
         || err "wrangler not logged in (run \`npx -y wrangler@4.75.0 login\`)"
       unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+
+      # Channel-current (mutable, no-cache).
       for f in "${channel}.json" "${channel}.json.sig"; do
         echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}manifest/${f}"
         $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}manifest/${f}" \
@@ -561,9 +611,22 @@ cmd_publish_manifest() {
           --remote \
           --cache-control "no-store, max-age=0"
       done
+
+      # Frozen per-version snapshot (immutable, year-cached).
+      for f in "${manifest}" "${sig}"; do
+        local frozen_name
+        frozen_name=$(basename "$f" | sed "s/^${channel}/${channel}.v${version}/")
+        echo "==> R2 put ${R2_BUCKET}/${R2_PREFIX}manifest/${frozen_name}"
+        $WRANGLER r2 object put "${R2_BUCKET}/${R2_PREFIX}manifest/${frozen_name}" \
+          --file="$f" \
+          --remote \
+          --cache-control "public, max-age=31536000, immutable"
+      done
       ;;
     *) err "ENV must be local|staging|prod (got '$ENV')" ;;
   esac
+
+  printf "  frozen snapshot: manifest/%s\n" "$versioned_manifest_name"
 }
 
 # Register the just-published release with soth-cloud's admin API
@@ -695,23 +758,30 @@ PYEOF
 # --- verify-cli -------------------------------------------------------------
 
 cmd_verify_cli() {
+  local version_prefix
+  version_prefix="v$(extract_workspace_version)/"
   case "$ENV" in
-    staging) cmd_verify_against "$STAGING_BASE_URL" ;;
-    prod) cmd_verify_against "$PROD_BASE_URL" ;;
+    staging) cmd_verify_against "$STAGING_BASE_URL" "$version_prefix" ;;
+    prod) cmd_verify_against "$PROD_BASE_URL" "$version_prefix" ;;
     *) err "verify-cli only supported for ENV=staging|prod" ;;
   esac
 }
 
-# Walk the binaries, compare local sha to remote sha (cache-busted).
+# Walk the binaries, compare local sha to remote sha. Per-version paths
+# are immutable + year-cached, so the cb= cache-buster is dropped.
+# If the upload just happened, the CDN may briefly serve a 404 on the
+# new path; curl's -f flag would error out which is the right behavior.
 cmd_verify_against() {
   local base="$1"
+  local version_prefix="${2:-}"
   echo
-  echo "=== verifying ${ENV} (${base}) against ${DIST_DIR}/ ==="
+  echo "=== verifying ${ENV} (${base}${version_prefix:+/${version_prefix%/}}) against ${DIST_DIR}/ ==="
   local fail=0
   for f in "${CLI_BINARIES[@]}"; do
-    local local_sha remote_sha
+    local local_sha remote_sha url
+    url="${base}/${version_prefix}${f}"
     local_sha=$(shasum -a 256 "${DIST_DIR}/${f}" | awk '{print $1}')
-    remote_sha=$(curl -sL "${base}/${f}?cb=$(date +%s)" | shasum -a 256 | awk '{print $1}')
+    remote_sha=$(curl -sfL "$url" | shasum -a 256 | awk '{print $1}')
     if [ "$local_sha" = "$remote_sha" ]; then
       printf "  %-30s OK    %s\n" "$f" "$local_sha"
     else
@@ -738,13 +808,16 @@ cmd_diff() {
     prod)    base="$PROD_BASE_URL" ;;
     *) err "diff requires ENV=staging|prod" ;;
   esac
-  echo "=== local ${DIST_DIR}/ vs ${ENV} (${base}) ==="
+  local version version_prefix
+  version=$(extract_workspace_version)
+  version_prefix="v${version}/"
+  echo "=== local ${DIST_DIR}/ vs ${ENV} (${base}/${version_prefix%/}) ==="
   echo
   echo "CLI binaries:"
   for f in "${CLI_BINARIES[@]}"; do
     local local_sha remote_sha status
     local_sha=$(shasum -a 256 "${DIST_DIR}/${f}" 2>/dev/null | awk '{print $1}' || echo "missing")
-    remote_sha=$(curl -sL "${base}/${f}?cb=$(date +%s)" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
+    remote_sha=$(curl -sL "${base}/${version_prefix}${f}" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
     if [ "$local_sha" = "$remote_sha" ]; then status="OK"; else status="DIFF"; fi
     printf "  %-30s local=%-12s remote=%-12s %s\n" \
       "$f" "${local_sha:0:12}" "${remote_sha:0:12}" "$status"
@@ -800,20 +873,35 @@ cmd_status_local() {
 }
 
 cmd_status_remote() {
-  local base
+  local base channel
   case "$ENV" in
     staging) base="$STAGING_BASE_URL" ;;
     prod)    base="$PROD_BASE_URL" ;;
   esac
+  channel=$(resolve_channel)
   echo "=== ${ENV} status ==="
 
-  echo
-  echo "CLI binaries (${base}):"
-  for f in "${CLI_BINARIES[@]}"; do
-    local sha
-    sha=$(curl -sL "${base}/${f}?cb=$(date +%s)" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
-    printf "  %-30s %s\n" "$f" "${sha:0:12}"
-  done
+  # Resolve the per-version path from the published channel manifest
+  # rather than walking unversioned URLs (those don't exist after
+  # 0.1.0). The manifest is the routing layer; we follow it.
+  local manifest_url remote_version
+  manifest_url="${base}/manifest/${channel}.json?cb=$(date +%s)"
+  remote_version=$(curl -sfL "$manifest_url" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null \
+    || echo "")
+  if [ -z "$remote_version" ]; then
+    echo
+    echo "CLI binaries: no channel manifest at ${manifest_url}"
+  else
+    local version_prefix="v${remote_version}/"
+    echo
+    echo "CLI binaries (${base}/${version_prefix%/}, channel=${channel}, version=${remote_version}):"
+    for f in "${CLI_BINARIES[@]}"; do
+      local sha
+      sha=$(curl -sL "${base}/${version_prefix}${f}" 2>/dev/null | shasum -a 256 | awk '{print $1}' || echo "unreachable")
+      printf "  %-30s %s\n" "$f" "${sha:0:12}"
+    done
+  fi
 
   echo
   echo "Classify bundle (last published from this machine):"

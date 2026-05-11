@@ -1,10 +1,10 @@
 # SOTH Install Paths — Canonical Reference
 
 This is the authoritative spec for **where the `soth` binary lives** on each
-supported platform. The Phase 1+ self-update code (`crates/soth-cli/src/update/swap_*.rs`)
+supported platform. The self-update code (`crates/soth-cli/src/update/swap_*.rs`)
 relies on these paths being stable. Treat changes here as breaking.
 
-## Quick start (BETA)
+## Quick start
 
 ```bash
 # macOS / Linux
@@ -14,27 +14,59 @@ curl -fsSL https://soth.ai/install.sh | bash
 iwr -useb https://soth.ai/install.ps1 | iex
 ```
 
-Channel + install-dir overrides:
+Channel, version, and install-dir overrides:
 
 ```bash
 # Bash
 SOTH_CHANNEL=canary curl -fsSL https://soth.ai/install.sh | bash
+SOTH_VERSION=0.1.0 curl -fsSL https://soth.ai/install.sh | bash
 curl -fsSL https://soth.ai/install.sh | bash -s -- --install-dir /opt/soth/bin
+curl -fsSL https://soth.ai/install.sh | bash -s -- --version 0.1.0
 
 # PowerShell
 $env:SOTH_CHANNEL = 'canary'; iwr -useb https://soth.ai/install.ps1 | iex
+$env:SOTH_VERSION = '0.1.0'; iwr -useb https://soth.ai/install.ps1 | iex
 ```
 
 Both scripts:
-1. Fetch `<base>/manifest/<channel>.json{,.sig}` over HTTPS,
+1. Fetch the manifest over HTTPS (channel-current pointer by default, frozen
+   per-version snapshot when `--version` / `SOTH_VERSION` is set),
 2. Verify the ed25519 signature against a public key embedded in the script,
-3. Download the platform binary (and the soth-update.exe sidecar on Windows),
+3. Download the platform binary (and the soth-update.exe sidecar on Windows)
+   from the per-version path the manifest points at,
 4. Verify each artifact's sha256 against the manifest before installing,
 5. Atomically swap into place, preserving the previous binary at `<install>.previous`.
 
-Sources: `scripts/install.sh`, `scripts/install.ps1`. Marked BETA until both
-have run through CI on a real release; safe to use today against the
-production storage URL.
+## Storage layout (since 0.1.0 GA)
+
+```
+storage.soth.ai/release/
+├── v0.1.0/                            # Per-version, frozen, immutable.
+│   ├── soth-darwin-arm64              # Cache-Control: public, max-age=31536000, immutable
+│   ├── soth-darwin-arm64.sha256
+│   ├── soth-darwin-amd64{,.sha256}
+│   ├── soth-linux-amd64{,.sha256}
+│   ├── soth-linux-arm64{,.sha256}
+│   ├── soth-windows-amd64.exe{,.sha256}
+│   └── soth-update-windows-amd64.exe{,.sha256}
+├── v0.1.1/ …                          # Each new release goes in its own prefix
+├── v0.2.0/ …
+└── manifest/
+    ├── stable.json                    # Channel-current pointer (mutable, no-cache)
+    ├── stable.json.sig
+    ├── stable.v0.1.0.json              # Frozen per-version snapshot (immutable)
+    ├── stable.v0.1.0.json.sig
+    ├── canary.json{,.sig} + per-version
+    └── staging.json{,.sig} + per-version  (on storage.staging.soth.xyz)
+```
+
+**The manifest is the only routing layer.** Old (unversioned)
+`storage.soth.ai/release/soth-darwin-arm64` URLs return 404 — they were
+removed in the 0.1.0 GA cut. Consumers that hard-code the binary URL
+must update to fetch through the channel manifest.
+
+**`release_seq`** is monotonic per channel. Anti-rollback ships by default;
+`--force-downgrade` or `--version <X>` are the explicit opt-outs.
 
 ## Why this exists
 

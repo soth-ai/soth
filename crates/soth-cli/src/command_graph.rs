@@ -301,6 +301,15 @@ pub struct UpdateArgs {
     #[arg(long, requires = "apply")]
     pub force_downgrade: bool,
 
+    /// Pin a specific version. Fetches the frozen per-version manifest
+    /// at <base>/manifest/<channel>.v<version>.json instead of the
+    /// channel-current pointer, so the binary URLs and sha256s in the
+    /// manifest match a real, historical release. Implicitly disables
+    /// the anti-rollback gate (the version pin is itself the explicit
+    /// operator authorization).
+    #[arg(long)]
+    pub version: Option<String>,
+
     /// Override the manifest base URL. Hidden from --help; used by
     /// integration tests and ad-hoc operator overrides.
     #[arg(long, hide = true)]
@@ -507,11 +516,17 @@ async fn run_update_command(args: UpdateArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     if args.apply {
-        commands::update::run_apply(channel, args.manifest_url, args.force_downgrade).await?;
+        commands::update::run_apply(
+            channel,
+            args.manifest_url,
+            args.force_downgrade,
+            args.version,
+        )
+        .await?;
         return Ok(());
     }
     // default: --check
-    let status = commands::update::run_check(channel, args.manifest_url).await?;
+    let status = commands::update::run_check(channel, args.manifest_url, args.version).await?;
     if let crate::commands::update::UpdateStatus::UpdateAvailable = status {
         std::process::exit(status.exit_code());
     }

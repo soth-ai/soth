@@ -118,6 +118,12 @@ pub struct VerifyOptions {
     /// Useful for tests; production callers leave this `None` so the
     /// real `CARGO_PKG_VERSION` is used.
     pub current_version_override: Option<String>,
+    /// When set, fetch the frozen per-version manifest at
+    /// `<base>/manifest/<channel>.v<version>.json{,.sig}` instead of
+    /// the channel-current pointer. Lets `soth update --version 0.1.0`
+    /// and rollback paths target a specific historical release whose
+    /// binary URLs and sha256s never change.
+    pub pinned_version: Option<String>,
 }
 
 /// Fetch `<base>/manifest/<channel>.json{,.sig}`, verify the signature,
@@ -137,7 +143,12 @@ pub async fn fetch_and_verify_manifest(
         .unwrap_or(channel.default_base_url())
         .trim_end_matches('/');
 
-    let manifest_url = format!("{}/manifest/{}.json", base, channel.as_str());
+    // Channel-current pointer:   <base>/manifest/<channel>.json
+    // Frozen per-version:         <base>/manifest/<channel>.v<version>.json
+    let manifest_url = match &opts.pinned_version {
+        Some(v) => format!("{}/manifest/{}.v{}.json", base, channel.as_str(), v),
+        None => format!("{}/manifest/{}.json", base, channel.as_str()),
+    };
     let sig_url = format!("{}.sig", manifest_url);
 
     let client = reqwest::Client::builder()
@@ -224,6 +235,22 @@ pub fn verify_manifest_bytes_with_pubkey(
         );
     }
 
+    // When a pinned version was requested, the manifest we fetched
+    // MUST be that exact frozen snapshot — refuse a server that
+    // signs-and-serves a manifest with a different version under the
+    // pinned URL. Belt-and-braces; in practice the frozen URL is
+    // immutable, but a wrong-cache-key or storage bug shouldn't
+    // silently surface as "we installed something else."
+    if let Some(pinned) = opts.pinned_version.as_deref() {
+        if manifest.version != pinned {
+            bail!(
+                "manifest version '{}' does not match pinned --version '{}'",
+                manifest.version,
+                pinned
+            );
+        }
+    }
+
     let current_str = opts
         .current_version_override
         .as_deref()
@@ -244,12 +271,16 @@ pub fn verify_manifest_bytes_with_pubkey(
         );
     }
 
-    if !opts.force_downgrade {
+    // Anti-rollback gate. Skipped when the operator either explicitly
+    // passed --force-downgrade, OR pinned a specific version (the
+    // version-pin is itself the explicit operator authorization).
+    if !opts.force_downgrade && opts.pinned_version.is_none() {
         if let Some(last) = opts.last_release_seq {
             if manifest.release_seq <= last {
                 bail!(
                     "manifest release_seq {} is not greater than last-applied {} \
-                     (anti-rollback gate; pass --force-downgrade to override)",
+                     (anti-rollback gate; pass --force-downgrade or --version <X> \
+                     to override)",
                     manifest.release_seq,
                     last
                 );
