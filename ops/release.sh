@@ -11,7 +11,8 @@
 #   help         show this help
 #   build-cli    build all 5 platform binaries with embedded creds → dist/
 #   publish-cli  push dist/ binaries to ENV destination + verify
-#   release-cli  build-cli + publish-cli
+#   release-cli  build-cli + publish-cli + manifest pipeline for both
+#                stable and canary channels (override with CHANNEL=…)
 #   verify-cli   re-run sha verification only (no build, no publish)
 #   diff         local sha vs ENV currently-served sha
 #   clean-dist   rm -rf dist/
@@ -136,7 +137,9 @@ cmd_help() {
 	CLI binaries (Phase 1):
 	  build-cli              Build all 5 platform binaries (embedded creds) → ${DIST_DIR}/
 	  publish-cli            Push ${DIST_DIR}/ binaries to ENV destination + verify
-	  release-cli            build-cli + publish-cli + manifest gen/sign/publish/verify
+	  release-cli            build-cli + publish-cli + manifest pipeline.
+	                         Publishes both stable + canary manifests by default;
+	                         set CHANNEL=<stable|canary> to ship one channel only.
 	  verify-cli             Re-verify remote sha matches ${DIST_DIR}/ (no build/publish)
 	  diff                   Local sha vs ENV's currently-served sha
 
@@ -436,6 +439,27 @@ resolve_channel() {
     echo "$CHANNEL"
   else
     default_channel_for_env "$ENV"
+  fi
+}
+
+# Which channels `release-cli` should publish a manifest for.
+#
+# When the operator explicitly sets $CHANNEL (e.g. `CHANNEL=canary make
+# release-cli`) we honor it — that's the "ship a single channel" path.
+# Otherwise we publish BOTH stable and canary in one pass. The
+# motivation: every staging environment defaults its install script
+# to canary (matching the trust tier for risk-tolerant clients), but
+# operators tend to think "I bumped stable, I'm done" — leaving the
+# canary manifest stale or absent. The install script then 404s on
+# the canary URL even though stable is fine. Symmetric publish
+# prevents that whole class of asymmetry footgun.
+#
+# Local env skips manifest publish entirely (handled by cmd_release_cli).
+channels_to_publish() {
+  if [ -n "$CHANNEL" ]; then
+    echo "$CHANNEL"
+  else
+    echo "stable canary"
   fi
 }
 
@@ -977,14 +1001,29 @@ cmd_release_cli() {
   cmd_publish_cli
   # Hot-update manifest pipeline. Skipped for ENV=local — local releases
   # don't need a signed manifest, and the private key may not be present.
+  #
+  # Loops over `channels_to_publish` so a default `make release-cli
+  # ENV=staging` ships both stable and canary manifests in one pass.
+  # Save/restore $CHANNEL so the loop's overrides don't leak out
+  # (matters when this function is sourced from a longer script that
+  # set $CHANNEL itself before invoking us).
   if [ "$ENV" != "local" ]; then
-    cmd_generate_manifest
-    cmd_sign_manifest
-    cmd_publish_manifest
-    cmd_verify_manifest
-    # Phase 3a: register the artifact metadata with soth-cloud's
-    # admin API so the heartbeat resolver can serve it. Soft-fail.
-    cmd_register_release
+    local saved_channel="$CHANNEL"
+    for channel in $(channels_to_publish); do
+      CHANNEL="$channel"
+      echo
+      echo "###############################################################"
+      echo "###  release-cli: channel = $channel"
+      echo "###############################################################"
+      cmd_generate_manifest
+      cmd_sign_manifest
+      cmd_publish_manifest
+      cmd_verify_manifest
+      # Phase 3a: register the artifact metadata with soth-cloud's
+      # admin API so the heartbeat resolver can serve it. Soft-fail.
+      cmd_register_release
+    done
+    CHANNEL="$saved_channel"
   fi
 }
 
