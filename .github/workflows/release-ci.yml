@@ -91,3 +91,11 @@ jobs:
         run: |
           cargo build -p soth-cli-update-sidecar --bin soth-update --release
           cargo test --lib -p soth-cli-update-sidecar
+
+  # FFI conformance is also a per-PR lane (paths-gated on
+  # sdk-core / detect / classify / bindings / fixtures), but we
+  # re-run it on tag push as part of the release gate. Reuses the
+  # exact same job definition via `workflow_call` so there's only
+  # one source of truth for the conformance pipeline.
+  ffi-conformance:
+    uses: ./.github/workflows/ffi-conformance.yml

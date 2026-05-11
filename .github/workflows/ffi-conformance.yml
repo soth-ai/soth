@@ -8,14 +8,37 @@ name: ffi-conformance
 # lane can't see.
 
 on:
-  # Release-gate only. Per-PR FFI signal is already covered by the
-  # bindings-build-check step in ci.yml (Linux Rust compile of both
-  # bindings); the full conformance harness is the release-gate
-  # validation and runs only on version-tag push or manual dispatch.
-  # See release-ci.yml header for the full rationale.
+  # Conformance is the only heavy workflow that fires on PR / push as
+  # well as on release tags. The marshalling surface lives in
+  # soth-sdk-core + soth-detect + soth-classify, and a regression in
+  # any of those crates can break the Python / Node bindings in ways
+  # the per-PR Linux compile-check can't see (it doesn't load the
+  # built bindings; the conformance harness does). Path-gated so PRs
+  # that don't touch the SDK surface still skip this lane.
+  #
+  # Tag-push trigger is wired through release-ci.yml's
+  # `uses: ./.github/workflows/ffi-conformance.yml` job — kept
+  # centralized there with the rest of the release-gate lanes.
+  pull_request:
+    paths:
+      - 'crates/soth-sdk-core/**'
+      - 'crates/soth-detect/**'
+      - 'crates/soth-classify/**'
+      - 'bindings/**'
+      - 'crates/soth-conformance-tests/fixtures/**'
+      - '.github/workflows/ffi-conformance.yml'
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+      - staging
+    paths:
+      - 'crates/soth-sdk-core/**'
+      - 'crates/soth-detect/**'
+      - 'crates/soth-classify/**'
+      - 'bindings/**'
+      - 'crates/soth-conformance-tests/fixtures/**'
+      - '.github/workflows/ffi-conformance.yml'
+  workflow_call:
   workflow_dispatch:
     inputs:
       ref:
