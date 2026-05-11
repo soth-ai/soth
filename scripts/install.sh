@@ -192,11 +192,20 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 # 1. Fetch + verify manifest
 log "fetching manifest"
+# Manifest URL: channel-current pointer by default, or per-version
+# frozen snapshot when --version is set. Per-version snapshots are
+# immutable, so they're cacheable forever and never mismatched against
+# the binary URLs (which are also per-version).
+if [ -n "$SOTH_VERSION" ]; then
+  manifest_name="${SOTH_CHANNEL}.v${SOTH_VERSION}.json"
+else
+  manifest_name="${SOTH_CHANNEL}.json"
+fi
 curl_secure -fsSL \
-  "${SOTH_BASE_URL%/}/manifest/${SOTH_CHANNEL}.json" \
+  "${SOTH_BASE_URL%/}/manifest/${manifest_name}" \
   -o "$TMPDIR/manifest.json"
 curl_secure -fsSL \
-  "${SOTH_BASE_URL%/}/manifest/${SOTH_CHANNEL}.json.sig" \
+  "${SOTH_BASE_URL%/}/manifest/${manifest_name}.sig" \
   -o "$TMPDIR/manifest.json.sig"
 
 pubkey_for_channel "$SOTH_CHANNEL" > "$TMPDIR/pubkey.pem"
@@ -214,14 +223,10 @@ manifest_channel=$(manifest_field "$TMPDIR/manifest.json" "channel")
   || err "manifest channel '$manifest_channel' != requested '$SOTH_CHANNEL'"
 
 manifest_version=$(manifest_field "$TMPDIR/manifest.json" "version")
+# When --version was passed, the manifest we fetched is the per-version
+# snapshot — its `version` field must match what we asked for.
 if [ -n "$SOTH_VERSION" ] && [ "$SOTH_VERSION" != "$manifest_version" ]; then
-  # The current manifest is per-channel-current; pinning a specific
-  # historical version isn't supported by this installer (would need
-  # a separate per-version manifest URL). Surface the limitation
-  # rather than silently installing the wrong thing.
-  err "manifest is on $manifest_version but you asked for $SOTH_VERSION. \
-Pinning a non-current version is not supported by install.sh; download \
-the binary directly from $SOTH_BASE_URL or downgrade the channel."
+  err "pinned manifest version mismatch: requested $SOTH_VERSION, got $manifest_version"
 fi
 
 # 3. Pull platform entry

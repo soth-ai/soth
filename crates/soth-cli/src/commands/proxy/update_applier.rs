@@ -164,7 +164,7 @@ async fn tick() -> Result<()> {
     );
     countdown(COUNTDOWN_SECS).await;
 
-    match crate::commands::update::run_apply(channel, None, false).await {
+    match crate::commands::update::run_apply(channel, None, false, None).await {
         Ok(()) => {
             tracing::info!(
                 version = %pending.offer.version,

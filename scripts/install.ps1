@@ -28,6 +28,7 @@
 [CmdletBinding()]
 param(
     [string]$Channel = $(if ($env:SOTH_CHANNEL) { $env:SOTH_CHANNEL } else { "stable" }),
+    [string]$Version = $(if ($env:SOTH_VERSION) { $env:SOTH_VERSION } else { "" }),
     [string]$InstallDir = $(if ($env:SOTH_INSTALL_DIR) { $env:SOTH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "soth" }),
     [string]$BaseUrl = $(if ($env:SOTH_BASE_URL) { $env:SOTH_BASE_URL } else { "https://storage.soth.ai/release" })
 )
@@ -172,8 +173,15 @@ try {
     Write-Step "fetching manifest"
     $manifestPath = Join-Path $tmpDir "manifest.json"
     $sigPath = Join-Path $tmpDir "manifest.json.sig"
-    Download-File "$($BaseUrl.TrimEnd('/'))/manifest/$Channel.json" $manifestPath
-    Download-File "$($BaseUrl.TrimEnd('/'))/manifest/$Channel.json.sig" $sigPath
+    # Manifest name: channel-current pointer by default, per-version
+    # frozen snapshot when -Version is set.
+    if ($Version) {
+        $manifestName = "$Channel.v$Version.json"
+    } else {
+        $manifestName = "$Channel.json"
+    }
+    Download-File "$($BaseUrl.TrimEnd('/'))/manifest/$manifestName" $manifestPath
+    Download-File "$($BaseUrl.TrimEnd('/'))/manifest/$manifestName.sig" $sigPath
 
     $pubkey = Get-PubkeyPem $Channel
     if (-not (Verify-Ed25519 $manifestPath $sigPath $pubkey)) {
@@ -188,6 +196,9 @@ or signed with a key the installer doesn't recognize.
     $manifest = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
     if ($manifest.channel -ne $Channel) {
         Fail "manifest channel '$($manifest.channel)' != requested '$Channel'"
+    }
+    if ($Version -and $manifest.version -ne $Version) {
+        Fail "pinned manifest version mismatch: requested $Version, got $($manifest.version)"
     }
     Write-Step "version $($manifest.version)"
 
@@ -206,9 +217,10 @@ or signed with a key the installer doesn't recognize.
 
     # 4. Download the Phase 4b sidecar updater. NOT in the manifest's
     #    `platforms` map by design (it's a one-time install asset, not
-    #    a primary update artifact). We compute its URL by convention
-    #    from the same base URL.
-    $sidecarUrl = "$($BaseUrl.TrimEnd('/'))/soth-update-windows-amd64.exe"
+    #    a primary update artifact). Pulled from the same per-version
+    #    path as the main binary so it stays paired with the release
+    #    that built it.
+    $sidecarUrl = "$($BaseUrl.TrimEnd('/'))/v$($manifest.version)/soth-update-windows-amd64.exe"
     $sidecarShaUrl = "$sidecarUrl.sha256"
     $stagedSidecar = Join-Path $tmpDir "soth-update.exe"
     $sidecarShaFile = Join-Path $tmpDir "soth-update.exe.sha256"

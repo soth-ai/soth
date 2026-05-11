@@ -30,12 +30,14 @@ impl UpdateStatus {
 pub async fn run_check(
     channel: Channel,
     base_url_override: Option<String>,
+    pinned_version: Option<String>,
 ) -> Result<UpdateStatus> {
     let opts = VerifyOptions {
         base_url: base_url_override,
         last_release_seq: read_last_seen_seq(channel),
         force_downgrade: false,
         current_version_override: None,
+        pinned_version,
     };
 
     let manifest = match fetch_and_verify_manifest(channel, &opts).await {
@@ -131,19 +133,27 @@ pub async fn run_apply(
     channel: Channel,
     base_url_override: Option<String>,
     force_downgrade: bool,
+    pinned_version: Option<String>,
 ) -> Result<()> {
+    let pinned_label = pinned_version.clone();
     let opts = VerifyOptions {
         base_url: base_url_override,
         last_release_seq: read_last_seen_seq(channel),
         force_downgrade,
         current_version_override: None,
+        pinned_version,
     };
     let manifest = fetch_and_verify_manifest(channel, &opts)
         .await
         .with_context(|| format!("manifest fetch/verify for channel {}", channel.as_str()))?;
 
     let current = env!("CARGO_PKG_VERSION");
-    if !force_downgrade && !is_strictly_newer(&manifest.version, current) {
+    // A version pin is the operator's explicit "I want exactly this"
+    // — equivalent to --force-downgrade. Skip the "already on latest"
+    // short-circuit so the pinned version is installed even if it's
+    // older than what's running.
+    let skip_already_on_check = force_downgrade || pinned_label.is_some();
+    if !skip_already_on_check && !is_strictly_newer(&manifest.version, current) {
         println!(
             "already on {} (channel {} latest is {}); nothing to do",
             current, manifest.channel, manifest.version
