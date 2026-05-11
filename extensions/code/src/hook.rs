@@ -1219,12 +1219,13 @@ fn infer_provider_from_model(model: &str) -> &'static str {
 }
 
 fn data_source_for_agent(agent: &str) -> &'static str {
-    // Snake_case wire form for the seven Code{Agent} DataSource variants.
-    // Unknown agents (e.g. stub testing with arbitrary names) get the
-    // generic "code" tag — TelemetryEvent::from_governable will fail to
-    // map this to a known DataSource and fall back to LiveProxy, which
-    // is acceptable for the smoke path. Group 4+ adapters set the right
-    // tag once they know their canonical agent name.
+    // Snake_case wire form for the eight Code{Agent} DataSource variants.
+    // Unknown agents (mistyped --agent flags, stub adapters, manual
+    // experiments) map to `code_unknown` so the event lands on the
+    // Action layer and surfaces as an audit-worthy "unknown" bucket.
+    // The earlier smoke-friendly fallback to `code_claude_code` silently
+    // mis-attributed unknown-agent events to Claude Code on the
+    // dashboard, which is worse than visibly bucketing them out.
     match agent {
         "claude_code" => "code_claude_code",
         "cursor" => "code_cursor",
@@ -1233,7 +1234,7 @@ fn data_source_for_agent(agent: &str) -> &'static str {
         "windsurf" => "code_windsurf",
         "opencode" => "code_open_code",
         "pi_agent" => "code_pi_agent",
-        _ => "code_claude_code", // smoke-friendly default
+        _ => "code_unknown",
     }
 }
 
@@ -1509,6 +1510,31 @@ mod tests {
         // than guessed — wrong attribution is worse than no attribution
         // on the engineering models page.
         assert_eq!(infer_provider_from_model("some-future-model-x"), "unknown");
+    }
+
+    #[test]
+    fn data_source_for_agent_maps_known_adapters() {
+        // Pin the wire form per adapter so the dashboard's
+        // `data_source` filtering stays stable when new adapters land.
+        assert_eq!(data_source_for_agent("claude_code"), "code_claude_code");
+        assert_eq!(data_source_for_agent("cursor"), "code_cursor");
+        assert_eq!(data_source_for_agent("codex"), "code_codex");
+        assert_eq!(data_source_for_agent("gemini_cli"), "code_gemini_cli");
+        assert_eq!(data_source_for_agent("windsurf"), "code_windsurf");
+        assert_eq!(data_source_for_agent("opencode"), "code_open_code");
+        assert_eq!(data_source_for_agent("pi_agent"), "code_pi_agent");
+    }
+
+    #[test]
+    fn data_source_for_agent_falls_back_to_code_unknown_not_claude_code() {
+        // Regression guard: the historical fallback was
+        // `code_claude_code`, which silently mis-attributed every
+        // unrecognized agent's events to Claude Code on the
+        // dashboard. Unknown agents must land in the dedicated
+        // `code_unknown` bucket so operators can audit them.
+        assert_eq!(data_source_for_agent(""), "code_unknown");
+        assert_eq!(data_source_for_agent("mistyped_agent"), "code_unknown");
+        assert_eq!(data_source_for_agent("CursorAdapter"), "code_unknown");
     }
 
     #[test]
