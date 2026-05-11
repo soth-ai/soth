@@ -18,16 +18,9 @@ pub struct GlobalOptions {
     pub verbose: bool,
 }
 
-// Visible build marker. Surfaces in `soth --version` so a hot-update
-// can be eyeballed end-to-end (compare the marker before vs after the
-// swap). Replace per release with a short build identifier that names
-// the meaningful change; CI can substitute the git short SHA later.
-const SOTH_VERSION_LONG: &str =
-    concat!(env!("CARGO_PKG_VERSION"), " (auto-apply fixes 2026-05-11)");
-
 #[derive(Parser)]
 #[command(name = "soth")]
-#[command(author, version = SOTH_VERSION_LONG, about, long_about = None)]
+#[command(author, version, about, long_about = None)]
 pub struct Cli {
     #[command(flatten)]
     pub global: GlobalOptions,
