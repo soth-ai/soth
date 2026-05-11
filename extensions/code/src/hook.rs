@@ -590,7 +590,14 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
         source: EventSource::Extension {
             source: ExtensionSource::Code,
         },
-        provider: "code".into(),
+        // Provider is determined first by the agent (claude_code is
+        // always Anthropic, codex is always OpenAI, etc.). Multi-
+        // provider agents (cursor / windsurf / opencode) don't have a
+        // fixed provider, so we sniff the model id as a fallback. The
+        // earlier `"code"` placeholder leaked into the dashboard's
+        // `provider` column and surfaced every code-extension event
+        // under a synthetic "code" tile on the models page.
+        provider: resolve_provider(&ev.agent, ev.model.as_deref()).into(),
         model: ev.model.clone(),
         endpoint_type: EndpointType::Unknown,
         normalized: None,
@@ -768,15 +775,21 @@ fn synthesize_tool_call_sidecar(ev: &CodeEvent, phase: ToolHookPhase) -> Classif
 
 /// Which LLM provider sits behind each agent. Surfaces in
 /// `IdentityContext::declared_provider` so cloud analytics can
-/// segment by provider when classify-on-hook is the only signal.
+/// segment by provider when classify-on-hook is the only signal,
+/// and is also the primary input to `resolve_provider` (which
+/// `governable_from_code_event` uses to populate the wire-level
+/// `provider` field — previously hardcoded to the placeholder
+/// `"code"` and surfaced as a synthetic provider tile on the
+/// engineering models page).
 fn provider_for_agent(agent: &str) -> Option<&'static str> {
     match agent {
-        "claude_code" => Some("anthropic"),
+        "claude_code" | "openclaw" => Some("anthropic"),
         "codex" => Some("openai"),
         "gemini_cli" => Some("google"),
-        // Cursor / Windsurf / OpenCode / Pi Agent are multi-provider —
-        // the agent payload doesn't always reveal which API was hit.
-        // Leave as None and let cloud-side enrichment fill in if it can.
+        "pi_agent" => Some("inflection"),
+        // Cursor / Windsurf / OpenCode are multi-provider — the agent
+        // payload doesn't reveal which API was hit. `resolve_provider`
+        // falls back to model-string sniffing in this case.
         _ => None,
     }
 }
@@ -1146,6 +1159,65 @@ fn classify_bundle_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".soth").join("bundle"))
 }
 
+/// Resolve the provider for a code event. Prefers the adapter-based
+/// answer; only sniffs the model id when the agent supports multiple
+/// providers (or is unknown). Replaces the legacy `"code"` placeholder
+/// that was leaking into the dashboard's `provider` column.
+fn resolve_provider(agent: &str, model: Option<&str>) -> &'static str {
+    if let Some(p) = provider_for_agent(agent) {
+        return p;
+    }
+    infer_provider_from_model(model.unwrap_or(""))
+}
+
+/// Best-effort model → provider mapping. Only used as a fallback for
+/// multi-provider IDEs whose `provider_for_agent` returns `None`.
+///
+/// Returns `"unknown"` for empty or unrecognized model strings rather
+/// than the historical `"code"` placeholder — unmapped models surface
+/// as a single auditable "unknown" bucket on the engineering models
+/// page instead of inflating a fake provider tile.
+fn infer_provider_from_model(model: &str) -> &'static str {
+    let m = model.trim().to_ascii_lowercase();
+    if m.is_empty() {
+        return "unknown";
+    }
+    if m.starts_with("claude") {
+        return "anthropic";
+    }
+    if m.starts_with("gpt")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("text-davinci")
+        || m.starts_with("chatgpt")
+    {
+        return "openai";
+    }
+    if m.starts_with("gemini") {
+        return "google";
+    }
+    if m.starts_with("deepseek") {
+        return "deepseek";
+    }
+    if m.starts_with("qwen") {
+        return "qwen";
+    }
+    if m.starts_with("grok") {
+        return "xai";
+    }
+    if m.starts_with("llama") || m.starts_with("meta-llama") {
+        return "meta";
+    }
+    if m.starts_with("mistral") || m.starts_with("mixtral") || m.starts_with("magistral") {
+        return "mistral";
+    }
+    if m.starts_with("command") {
+        return "cohere";
+    }
+    "unknown"
+}
+
 fn data_source_for_agent(agent: &str) -> &'static str {
     // Snake_case wire form for the seven Code{Agent} DataSource variants.
     // Unknown agents (e.g. stub testing with arbitrary names) get the
@@ -1342,6 +1414,102 @@ pub fn write_outcome(outcome: &HookOutcome) -> Result<(), io::Error> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn infer_provider_recognizes_known_prefixes() {
+        assert_eq!(infer_provider_from_model("claude-opus-4-7"), "anthropic");
+        assert_eq!(
+            infer_provider_from_model("claude-sonnet-4-5-20251022"),
+            "anthropic",
+        );
+        assert_eq!(infer_provider_from_model("gpt-4o-mini"), "openai");
+        assert_eq!(infer_provider_from_model("gpt-5"), "openai");
+        assert_eq!(infer_provider_from_model("o1-preview"), "openai");
+        assert_eq!(infer_provider_from_model("o3-mini"), "openai");
+        assert_eq!(infer_provider_from_model("chatgpt-4o-latest"), "openai");
+        assert_eq!(infer_provider_from_model("gemini-1.5-pro"), "google");
+        assert_eq!(infer_provider_from_model("deepseek-v3"), "deepseek");
+        assert_eq!(infer_provider_from_model("qwen2.5-coder"), "qwen");
+        assert_eq!(infer_provider_from_model("grok-2"), "xai");
+        assert_eq!(infer_provider_from_model("llama-3.3-70b"), "meta");
+        assert_eq!(infer_provider_from_model("mistral-large"), "mistral");
+        assert_eq!(infer_provider_from_model("command-r-plus"), "cohere");
+    }
+
+    #[test]
+    fn infer_provider_handles_casing_and_whitespace() {
+        assert_eq!(infer_provider_from_model("  Claude-3 "), "anthropic");
+        assert_eq!(infer_provider_from_model("GPT-4O"), "openai");
+        assert_eq!(infer_provider_from_model("Gemini-2.0-Flash"), "google");
+    }
+
+    #[test]
+    fn provider_for_agent_returns_fixed_provider_for_single_provider_agents() {
+        assert_eq!(provider_for_agent("claude_code"), Some("anthropic"));
+        assert_eq!(provider_for_agent("openclaw"), Some("anthropic"));
+        assert_eq!(provider_for_agent("codex"), Some("openai"));
+        assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
+        assert_eq!(provider_for_agent("pi_agent"), Some("inflection"));
+    }
+
+    #[test]
+    fn provider_for_agent_returns_none_for_multi_provider_agents() {
+        // Cursor / Windsurf / Opencode let the user pick a model from
+        // any provider, so the agent name alone can't determine
+        // attribution. Callers fall back to model-string inference.
+        assert_eq!(provider_for_agent("cursor"), None);
+        assert_eq!(provider_for_agent("windsurf"), None);
+        assert_eq!(provider_for_agent("opencode"), None);
+        assert_eq!(provider_for_agent("unknown_agent"), None);
+    }
+
+    #[test]
+    fn resolve_provider_prefers_agent_over_model() {
+        // Even if the model string would map to a different provider,
+        // the adapter's known provider wins. (Claude Code only ever
+        // talks to Anthropic, so a stray "gpt-4" in the model field
+        // is either a bug or test data — should still attribute to
+        // Anthropic, not OpenAI.)
+        assert_eq!(resolve_provider("claude_code", Some("gpt-4o")), "anthropic");
+        assert_eq!(resolve_provider("codex", Some("claude-3")), "openai");
+    }
+
+    #[test]
+    fn resolve_provider_falls_back_to_model_for_multi_provider_agents() {
+        assert_eq!(
+            resolve_provider("cursor", Some("claude-opus-4-7")),
+            "anthropic"
+        );
+        assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "openai");
+        assert_eq!(
+            resolve_provider("opencode", Some("gemini-1.5-pro")),
+            "google"
+        );
+    }
+
+    #[test]
+    fn resolve_provider_returns_unknown_when_nothing_known() {
+        // Multi-provider agent + unmapped model string → "unknown".
+        // Never falls back to the legacy "code" placeholder.
+        assert_eq!(
+            resolve_provider("cursor", Some("future-model-x")),
+            "unknown"
+        );
+        assert_eq!(resolve_provider("cursor", None), "unknown");
+        assert_eq!(resolve_provider("brand_new_agent", None), "unknown");
+    }
+
+    #[test]
+    fn infer_provider_falls_back_to_unknown_for_unmapped_and_empty() {
+        // Empty model string (rare but possible on extract_model
+        // miss) must not surface as the legacy "code" placeholder.
+        assert_eq!(infer_provider_from_model(""), "unknown");
+        assert_eq!(infer_provider_from_model("   "), "unknown");
+        // Models we don't recognize get bucketed under unknown rather
+        // than guessed — wrong attribution is worse than no attribution
+        // on the engineering models page.
+        assert_eq!(infer_provider_from_model("some-future-model-x"), "unknown");
+    }
 
     #[test]
     fn pre_tool_use_synthesizes_label_from_tool_name() {
