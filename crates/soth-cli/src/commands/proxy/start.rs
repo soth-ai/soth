@@ -216,9 +216,14 @@ pub async fn run(
     // would run, but only for offers with urgency=Forced. Notify and
     // Recommended urgencies remain user-driven.
     //
-    // Disabled on Windows until 0.2.0 ships the sidecar updater (the
-    // current Windows swap path can't run from inside the running
-    // daemon — the binary is locked).
+    // Windows is supported: the swap path on that OS spawns the
+    // `soth-update.exe` sidecar (Phase 4b), exits the daemon to
+    // release the exclusive .exe lock, and lets the sidecar do the
+    // `MoveFileExW` swap plus restart via `sc start soth` (or a
+    // direct spawn fallback for user-mode installs). The earlier
+    // Windows gate here was a leftover safety from before the
+    // sidecar landed; verified end-to-end with the 0.1.0 → 0.1.1
+    // smoke test today.
     //
     // Enterprise / deployment-guide override: SOTH_DISABLE_AUTO_APPLY=1
     // skips the supervisor entirely. Cheaper than threading a config
@@ -230,7 +235,7 @@ pub async fn run(
                 !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
             })
             .unwrap_or(false);
-        if auto_apply_disabled || cfg!(target_os = "windows") {
+        if auto_apply_disabled {
             None
         } else {
             Some(tokio::spawn(async move {
