@@ -802,6 +802,22 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
 /// loader is small.
 /// Resolve and load the operator's CEL policy bundle.
 ///
+/// Resolution order:
+///   1. On-disk signed bundle at `bundle_path()` (operator-installed via
+///      `soth code policy install-default` or `apply`, or — once the
+///      cloud publishes them — automatically synced).
+///   2. **Embedded default bundle** baked into the binary at compile
+///      time from `extensions/code/policies/code-default-rules.json`.
+///
+/// The embedded fallback is the key fix for the
+/// "fresh-install + code-shaped prompt → silent block" regression:
+/// without it, a missing on-disk bundle dropped the hook into the
+/// artifact-default-deny path, which blocked on any CodeBlock artifact
+/// (any prompt containing `{` `}` plus enough special chars). With the
+/// embedded fallback, the hook always evaluates against a real CEL
+/// rule set whose default rules only target genuinely risky shapes
+/// (`rm -rf`, `dd of=/dev/...`, writes to `~/.ssh/` etc.).
+///
 /// Production path uses a process-wide `OnceLock` cache so the
 /// hook subprocess only pays the bundle-load cost once per
 /// invocation (subprocess is short-lived; cache lives a few ms).
@@ -818,55 +834,84 @@ fn policy_bundle() -> Option<&'static PolicyBundle> {
     #[cfg(test)]
     {
         // In tests, opt-out via `SOTH_CODE_POLICY_BUNDLE_DISABLE=1`
-        // forces None regardless of what's on disk.  No cache
-        // — each test gets a fresh resolution so per-test env
-        // mutations take effect immediately.  The intentional
-        // leak (Box::leak) keeps the &'static contract; tests
-        // run for milliseconds and tear down the process, so
-        // leaked bundles cost nothing.
+        // forces None — bypasses both on-disk AND embedded defaults
+        // so tests that exercise the no-bundle fallback path
+        // (default_deny_from_artifacts) stay deterministic.  No
+        // cache — each call re-resolves so per-test env mutations
+        // take effect immediately.  The intentional leak
+        // (Box::leak) keeps the &'static contract; tests run for
+        // milliseconds and tear down the process, so leaked
+        // bundles cost nothing.
         if std::env::var("SOTH_CODE_POLICY_BUNDLE_DISABLE")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
         {
             return None;
         }
-        let path = bundle_path()?;
-        if !path.exists() {
-            return None;
-        }
-        match soth_policy::load_bundle(&path) {
-            Ok(bundle) => {
-                soth_policy::warm(&bundle);
-                Some(Box::leak(Box::new(bundle)))
+        if let Some(path) = bundle_path() {
+            if path.exists() {
+                match soth_policy::load_bundle(&path) {
+                    Ok(bundle) => {
+                        soth_policy::warm(&bundle);
+                        return Some(Box::leak(Box::new(bundle)));
+                    }
+                    Err(_) => {} // fall through to embedded
+                }
             }
-            Err(_) => None,
         }
+        load_embedded_bundle().map(|b| &*Box::leak(Box::new(b)))
     }
     #[cfg(not(test))]
     {
         static CACHE: OnceLock<Option<PolicyBundle>> = OnceLock::new();
         CACHE
             .get_or_init(|| {
-                let path = bundle_path()?;
-                if !path.exists() {
-                    return None;
-                }
-                match soth_policy::load_bundle(&path) {
-                    Ok(bundle) => {
-                        soth_policy::warm(&bundle);
-                        Some(bundle)
+                if let Some(path) = bundle_path() {
+                    if path.exists() {
+                        match soth_policy::load_bundle(&path) {
+                            Ok(bundle) => {
+                                soth_policy::warm(&bundle);
+                                return Some(bundle);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    bundle_path = %path.display(),
+                                    error = ?e,
+                                    "soth-code: on-disk policy bundle failed to load; \
+                                     falling through to embedded default rule pack"
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            bundle_path = %path.display(),
-                            error = ?e,
-                            "soth-code: failed to load policy bundle; falling through to artifact default-deny"
-                        );
-                        None
-                    }
                 }
+                load_embedded_bundle()
             })
             .as_ref()
+    }
+}
+
+/// Compile the embedded default rule pack into a `PolicyBundle`.
+///
+/// Returns `None` only if the embedded JSON or one of its rules fails
+/// to compile — both developer errors caught by `cargo test`. A
+/// returned `None` drops the hook into `default_deny_from_artifacts`,
+/// which itself only blocks on credential artifacts (so user prompts
+/// still flow).
+fn load_embedded_bundle() -> Option<PolicyBundle> {
+    match crate::policy_defaults::embedded_default_bundle() {
+        Ok(bundle) => {
+            soth_policy::warm(&bundle);
+            Some(bundle)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "soth-code: embedded default policy bundle failed to build; \
+                 hook will use credential-only default-deny — install a real \
+                 bundle with `soth code policy install-default`"
+            );
+            None
+        }
     }
 }
 
@@ -1060,37 +1105,42 @@ fn translate_policy_decision(
     (decision, pd)
 }
 
-/// Default-deny when no policy bundle is loaded. Mirrors the Group 4b
-/// behavior — kept here as an explicit branch so the policy-loaded
-/// path doesn't have to repeat the artifact-driven decision logic.
+/// Fallback decision when no policy bundle is loaded — reached only
+/// when *both* the on-disk signed bundle and the embedded default
+/// bundle are unavailable (the embedded path failing means the binary
+/// was built with a malformed `code-default-rules.json`, caught by
+/// `cargo test`), or when a test explicitly forces this path via
+/// `SOTH_CODE_POLICY_BUNDLE_DISABLE=1`.
+///
+/// **Never blocks.** The code extension's default posture is
+/// observational: artifacts (credentials, code blocks, …) are still
+/// recorded in the audit queue, but the agent action proceeds. Only
+/// CEL rules from a loaded policy bundle can produce a Block decision.
+/// This matches the "notify, don't gate" stance an operator expects
+/// from a fresh install — Block on a paste-in is a worse UX than a
+/// missed flag, and the audit trail still surfaces the artifact for
+/// post-hoc review or alerting.
+///
+/// When credential artifacts are present we emit a Flag decision (the
+/// dashboard renders these distinctly from a clean Allow) so an
+/// operator scanning `soth code tail` still sees the credential
+/// detection, just without the agent-side enforcement.
 fn default_deny_from_artifacts(artifacts: &[SensitiveArtifact]) -> (HookDecision, PolicyDecision) {
-    if artifacts.is_empty() {
-        return (
-            HookDecision::Allow,
-            PolicyDecision {
-                kind: PolicyDecisionKind::Allow,
-                matched_rule: None,
-                warnings: Vec::new(),
-                eval_latency_us: 0,
-            },
-        );
-    }
-    let kinds: Vec<String> = artifacts
+    let credential_kinds: Vec<String> = artifacts
         .iter()
         .filter_map(|a| a.credential_kind.clone())
         .collect();
-    let reason = format!("credentials detected ({})", kinds.join(", "));
-    let guidance = "remove credentials from the payload before retrying";
+    let policy_kind = if credential_kinds.is_empty() {
+        PolicyDecisionKind::Allow
+    } else {
+        PolicyDecisionKind::Flag {
+            reason: format!("credentials detected ({})", credential_kinds.join(", ")),
+        }
+    };
     (
-        HookDecision::Block {
-            reason: reason.clone(),
-            guidance: Some(guidance.to_string()),
-        },
+        HookDecision::Allow,
         PolicyDecision {
-            kind: PolicyDecisionKind::Block {
-                status: 403,
-                message: reason,
-            },
+            kind: policy_kind,
             matched_rule: None,
             warnings: Vec::new(),
             eval_latency_us: 0,
@@ -1415,6 +1465,15 @@ pub fn write_outcome(outcome: &HookOutcome) -> Result<(), io::Error> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Process-global lock for tests that mutate `SOTH_CODE_POLICY_BUNDLE_DISABLE`
+    /// or `SOTH_CODE_POLICY_BUNDLE`. Cargo runs tests in parallel by default,
+    /// so two tests poking the same env var will race — one setting `1` while
+    /// another expects `unset` flips the embedded-bundle fallback off and
+    /// silently breaks the second test's assertions. Acquire this lock for
+    /// the entire body of any test that touches those vars.
+    static POLICY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn infer_provider_recognizes_known_prefixes() {
@@ -1821,7 +1880,12 @@ mod tests {
     }
 
     #[test]
-    fn default_deny_blocks_when_artifacts_present() {
+    fn default_deny_flags_but_does_not_block_on_credentials() {
+        // Code-extension stance: the fallback path is observational.
+        // A credential artifact produces a Flag (visible in `soth code
+        // tail` and the dashboard) but the action proceeds. Blocking
+        // only happens via explicit CEL rules from a loaded policy
+        // bundle (embedded default or operator-installed).
         let arts = vec![SensitiveArtifact {
             kind: soth_core::ArtifactKind::AwsAccessKey,
             credential_kind: Some("aws_access_key".to_string()),
@@ -1831,13 +1895,39 @@ mod tests {
             redacted_hint: None,
         }];
         let (decision, policy) = default_deny_from_artifacts(&arts);
-        assert!(matches!(decision, HookDecision::Block { .. }));
-        assert!(matches!(policy.kind, PolicyDecisionKind::Block { .. }));
+        assert!(matches!(decision, HookDecision::Allow));
+        match policy.kind {
+            PolicyDecisionKind::Flag { ref reason } => {
+                assert!(reason.contains("aws_access_key"), "got: {reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
     }
 
     #[test]
     fn default_deny_allows_when_no_artifacts() {
         let (decision, policy) = default_deny_from_artifacts(&[]);
+        assert!(matches!(decision, HookDecision::Allow));
+        assert!(matches!(policy.kind, PolicyDecisionKind::Allow));
+    }
+
+    #[test]
+    fn default_deny_allows_when_only_code_block_artifacts() {
+        // The original Windows regression: a CodeBlock artifact (emitted
+        // by soth-detect when the payload looks code-shaped) used to
+        // trigger a silent Block via the default-deny path. The fix
+        // requires Allow.
+        let arts = vec![SensitiveArtifact {
+            kind: soth_core::ArtifactKind::CodeBlock {
+                language: "unknown".to_string(),
+            },
+            credential_kind: None,
+            severity: soth_core::ArtifactSeverity::Low,
+            location: soth_core::ArtifactLocation::Unknown,
+            commitment: None,
+            redacted_hint: None,
+        }];
+        let (decision, policy) = default_deny_from_artifacts(&arts);
         assert!(matches!(decision, HookDecision::Allow));
         assert!(matches!(policy.kind, PolicyDecisionKind::Allow));
     }
@@ -2183,14 +2273,15 @@ mod tests {
 
     #[test]
     fn capture_audit_persists_only_for_block_decisions() {
-        // Force `policy_bundle()` to return None so this test
-        // exercises the artifact-default-deny path regardless
-        // of whatever bundle the dev host has at
-        // `~/.soth/code-policy.bundle`.  Without this opt-out,
-        // a host with a real bundle that allows the test's
-        // synthesized AKIA pattern would skip the Block path
-        // and the assertion below would fail.
-        std::env::set_var("SOTH_CODE_POLICY_BUNDLE_DISABLE", "1");
+        // Exercises the Audit capture mode's contract: raw_payload is
+        // attached *only* when the policy decision was Block. Uses the
+        // embedded default rule pack's `code_block_destructive_rm_rf`
+        // rule (active by default without any on-disk bundle) to
+        // produce a deterministic Block — credentials alone no longer
+        // block under the code extension's notify-don't-gate stance,
+        // so we trigger the block via an explicit CEL rule match.
+        let _guard = POLICY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SOTH_CODE_POLICY_BUNDLE_DISABLE");
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
         let cap = HookCaptureConfig {
@@ -2203,20 +2294,11 @@ mod tests {
             br#"{"session_id":"audit","tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}"#;
         run_hook("claude_code", "pre_tool_use", allow_stdin, &paths, &cap).unwrap();
 
-        // Block event — credential synthesized at runtime so the
-        // source file itself is free of the pattern.
-        let synth = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
-        let block_stdin = format!(
-            r#"{{"session_id":"audit","tool_name":"Bash","tool_input":{{"command":"K={synth} aws s3 ls"}}}}"#,
-        );
-        run_hook(
-            "claude_code",
-            "pre_tool_use",
-            block_stdin.as_bytes(),
-            &paths,
-            &cap,
-        )
-        .unwrap();
+        // Block event — `rm -rf` matches the embedded default rule
+        // `code_block_destructive_rm_rf` (block action).
+        let block_stdin =
+            br#"{"session_id":"audit","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}"#;
+        run_hook("claude_code", "pre_tool_use", block_stdin, &paths, &cap).unwrap();
 
         let lines: Vec<_> = std::fs::read_to_string(&paths.queue)
             .unwrap()
@@ -2233,7 +2315,7 @@ mod tests {
         let block_meta = &lines[1]["event"]["context"]["metadata"];
         assert!(
             block_meta["raw_payload"].is_string(),
-            "Audit MUST capture on Block"
+            "Audit MUST capture on Block (rm -rf rule)"
         );
         assert_eq!(block_meta["raw_capture"], "audit");
     }
@@ -2282,18 +2364,20 @@ mod tests {
     }
 
     #[test]
-    fn pre_tool_use_with_credentials_still_blocks() {
-        // Regression guard: the enforcement gate must NOT downgrade
-        // Block on enforceable hook types. PreToolUse with a
-        // credential remains a Block.
-        // Force the policy-bundle path to None so this test
-        // exercises the artifact-default-deny code path
-        // regardless of any real bundle on the dev host.
+    fn pre_tool_use_with_credentials_does_not_block_by_default() {
+        // Contract for the code extension's default stance: credential
+        // detection alone never produces a Block. The artifact is
+        // recorded (audit trail) and surfaced as a Flag, but the
+        // agent's action proceeds. Operators who *do* want to block on
+        // credentials install an explicit CEL rule via
+        // `soth code policy apply` — the embedded default pack ships
+        // with notify-only behavior for credentials.
+        let _guard = POLICY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOTH_CODE_POLICY_BUNDLE_DISABLE", "1");
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodePaths::from_root(tmp.path());
         let stdin = br#"{
-            "session_id": "sess-block-still",
+            "session_id": "sess-creds-allow",
             "tool_name": "Bash",
             "tool_input": { "command": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE aws s3 ls" }
         }"#;
@@ -2306,8 +2390,56 @@ mod tests {
         )
         .unwrap();
         assert!(
+            matches!(outcome.decision, HookDecision::Allow),
+            "PreToolUse with AWS key must Allow under default-deny fallback, got {:?}",
+            outcome.decision
+        );
+        // The artifact must still land in the queue — audit trail
+        // matters even when enforcement doesn't.
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&paths.queue)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let artifacts = row["event"]["artifacts"]
+            .as_array()
+            .expect("artifacts array");
+        assert!(
+            !artifacts.is_empty(),
+            "credential artifact must be recorded even though decision is Allow"
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_when_embedded_rule_matches() {
+        // Counterpart to the credential test above: the embedded
+        // default rule pack DOES block on explicit destructive
+        // patterns (rm -rf, dd of=/dev/, …). Verifies the
+        // embedded-bundle fallback wires through to enforcement when a
+        // CEL rule matches.
+        let _guard = POLICY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SOTH_CODE_POLICY_BUNDLE_DISABLE");
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CodePaths::from_root(tmp.path());
+        let stdin = br#"{
+            "session_id": "sess-rmrf-block",
+            "tool_name": "Bash",
+            "tool_input": { "command": "rm -rf /tmp/anything" }
+        }"#;
+        let outcome = run_hook(
+            "claude_code",
+            "pre_tool_use",
+            stdin,
+            &paths,
+            &HookCaptureConfig::default(),
+        )
+        .unwrap();
+        assert!(
             matches!(outcome.decision, HookDecision::Block { .. }),
-            "PreToolUse with AWS key must still Block, got {:?}",
+            "embedded `rm -rf` rule must produce a Block, got {:?}",
             outcome.decision
         );
     }
@@ -2318,6 +2450,7 @@ mod tests {
         // exercise policy_bundle() directly without polluting the
         // OnceLock for other tests, but the path resolution function
         // is testable in isolation.
+        let _guard = POLICY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let key = "SOTH_CODE_POLICY_BUNDLE";
         std::env::set_var(key, "/some/test/path");
         let p = bundle_path().unwrap();
