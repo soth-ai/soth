@@ -704,10 +704,25 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     println!("policy:");
     match &bundle_path {
         None => println!("  bundle    —  (HOME unresolvable)"),
-        Some(p) if !p.exists() => println!(
-            "  bundle    · {} (not present — run `soth code policy install-default`)",
-            p.display()
-        ),
+        Some(p) if !p.exists() => {
+            // No on-disk bundle: surface the embedded fallback so
+            // operators understand the hook is still enforcing real
+            // rules, just from the in-process default pack instead of
+            // a host-local file. `soth code policy install-default`
+            // is still the way to get an editable copy on disk.
+            match soth_code::policy_defaults::embedded_default_bundle() {
+                Ok(b) => println!(
+                    "  bundle    · {} (not present — using embedded default: {} system + {} org rules)",
+                    p.display(),
+                    b.system_rules.rules.len(),
+                    b.org_rules.rules.len(),
+                ),
+                Err(e) => println!(
+                    "  bundle    ✗ {} (not present and embedded default failed to build: {e})",
+                    p.display()
+                ),
+            }
+        }
         Some(p) => match fs::read(p) {
             Err(e) => println!("  bundle    ✗ {} (read error: {e})", p.display()),
             Ok(bytes) => match soth_policy::load_bundle_from_bytes(&bytes) {
@@ -984,30 +999,15 @@ const DEV_SIGNING_SEED: [u8; 32] = [
     0x6c, 0x69, 0x63, 0x79, 0x2d, 0x76, 0x31, 0x2d, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x21, 0x21, 0x21,
 ];
 
-/// JSON source of the starter rule pack. Bundled at compile time —
-/// embedded into the binary so `soth code policy install-default`
-/// works on a fresh host with no extra files.
-const DEFAULT_RULES_JSON: &str =
-    include_str!("../../../../extensions/code/policies/code-default-rules.json");
-
-#[derive(serde::Deserialize)]
-struct DefaultRulesSource {
-    #[serde(default)]
-    system_rules: Vec<soth_policy::RuleDefinition>,
-    #[serde(default)]
-    org_rules: Vec<soth_policy::RuleDefinition>,
-    #[serde(default)]
-    org_patterns: soth_policy::OrgPatterns,
-    #[serde(default)]
-    budget_limits: soth_policy::BudgetLimits,
-}
-
 fn run_policy_install_default(args: PolicyInstallDefaultArgs) -> Result<()> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use ed25519_dalek::{Signer, SigningKey};
     use std::time::SystemTime;
 
-    let source: DefaultRulesSource = serde_json::from_str(DEFAULT_RULES_JSON)
+    // Pull the rule source from the soth-code crate so both the on-disk
+    // signed bundle (this function) and the in-process embedded fallback
+    // (soth-code::policy_defaults) read from the exact same JSON file.
+    let source = soth_code::policy_defaults::DefaultRulesSource::from_embedded()
         .context("parse embedded code-default-rules.json")?;
 
     let signed_at = SystemTime::now()

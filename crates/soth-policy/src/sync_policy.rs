@@ -187,16 +187,28 @@ pub fn load_bundle(path: &Path) -> Result<PolicyBundle, PolicyBundleError> {
 pub fn load_bundle_from_bytes(bytes: &[u8]) -> Result<PolicyBundle, PolicyBundleError> {
     let envelope: SignedPolicyBundle = serde_json::from_slice(bytes)?;
     verify_bundle_signature(&envelope.payload, &envelope.signature, &envelope.public_key)?;
+    build_bundle(envelope.payload)
+}
 
-    let system_rules = compile_rule_set(&envelope.payload.system_rules, RuleKind::System)?;
-    let org_rules = compile_rule_set(&envelope.payload.org_rules, RuleKind::Org)?;
+/// Compile a `PolicyBundlePayload` into an in-memory `PolicyBundle` without
+/// signature verification.
+///
+/// Intended for in-process defaults (e.g. extensions that ship a starter
+/// rule pack baked into the binary via `include_str!`). The on-disk
+/// signed path through `load_bundle` / `load_bundle_from_bytes` remains
+/// the only way to install operator-authored rules — this helper is
+/// strictly for compile-time-trusted payloads the caller embedded
+/// itself.
+pub fn build_bundle(payload: PolicyBundlePayload) -> Result<PolicyBundle, PolicyBundleError> {
+    let system_rules = compile_rule_set(&payload.system_rules, RuleKind::System)?;
+    let org_rules = compile_rule_set(&payload.org_rules, RuleKind::Org)?;
 
     Ok(PolicyBundle {
-        metadata: envelope.payload.metadata,
+        metadata: payload.metadata,
         system_rules: Arc::new(system_rules),
         org_rules: Arc::new(org_rules),
-        org_patterns: Arc::new(envelope.payload.org_patterns),
-        budget_limits: envelope.payload.budget_limits,
+        org_patterns: Arc::new(payload.org_patterns),
+        budget_limits: payload.budget_limits,
     })
 }
 
