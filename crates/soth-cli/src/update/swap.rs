@@ -217,8 +217,6 @@ mod tests {
         assert!(!is_canonical_install_path(Path::new("/tmp/soth")));
         // A file named "soth.exe" that isn't in either canonical
         // Windows layout should be rejected too.
-        assert!(!is_canonical_install_path(Path::new(
-            r"C:\tools\soth.exe"
-        )));
+        assert!(!is_canonical_install_path(Path::new(r"C:\tools\soth.exe")));
     }
 }
