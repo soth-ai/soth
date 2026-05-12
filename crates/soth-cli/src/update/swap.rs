@@ -68,11 +68,16 @@ pub fn make_swapper(staged_binary: PathBuf) -> Result<Box<dyn Swapper>> {
 
 /// Resolve the canonical install path. Used by all three swap impls.
 ///
-/// Order (matches docs/INSTALL.md):
-/// 1. `which soth` — if it points to one of the canonical paths, use it.
-/// 2. `~/.local/bin/soth` (Unix) or `%LOCALAPPDATA%\soth\soth.exe`.
-/// 3. `/usr/local/bin/soth` (Unix) or `%PROGRAMFILES%\soth\soth.exe`.
-/// 4. Refuse with a clear error if nothing matches.
+/// Order (matches docs/INSTALL.md + soth-app's hosted install script):
+/// 1. `current_exe()` — if it points to one of the canonical paths, use it.
+/// 2. `~/.local/bin/soth[.exe]` — the install script's default on every
+///    OS (it standardizes on a Unix-style layout that works under MINGW
+///    / Git Bash on Windows, where `$HOME` resolves to the user profile
+///    and the binary lands at `C:\Users\<name>\.local\bin\soth.exe`).
+/// 3. Windows-only fallbacks for sysadmin-style installs:
+///    `%LOCALAPPDATA%\soth\soth.exe` and `%PROGRAMFILES%\soth\soth.exe`.
+/// 4. Unix-only fallback: `/usr/local/bin/soth`.
+/// 5. Refuse with a clear error if nothing matches.
 pub(super) fn resolve_install_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::current_exe() {
         if is_canonical_install_path(&path) {
@@ -80,14 +85,19 @@ pub(super) fn resolve_install_path() -> Result<PathBuf> {
         }
     }
 
+    // The hosted install script always installs to `$HOME/.local/bin/`
+    // — Unix-shaped layout that works the same way under MINGW on
+    // Windows (Git Bash's `$HOME` is `C:\Users\<name>`). Checked first
+    // on every OS so the swap path lines up with the install path.
+    if let Some(home) = dirs::home_dir() {
+        let user = home.join(".local").join("bin").join(soth_filename());
+        if user.exists() {
+            return Ok(user);
+        }
+    }
+
     #[cfg(unix)]
     {
-        if let Some(home) = dirs::home_dir() {
-            let user = home.join(".local").join("bin").join("soth");
-            if user.exists() {
-                return Ok(user);
-            }
-        }
         let root = PathBuf::from("/usr/local/bin/soth");
         if root.exists() {
             return Ok(root);
@@ -114,13 +124,101 @@ pub(super) fn resolve_install_path() -> Result<PathBuf> {
     )
 }
 
+#[cfg(windows)]
+fn soth_filename() -> &'static str {
+    "soth.exe"
+}
+#[cfg(not(windows))]
+fn soth_filename() -> &'static str {
+    "soth"
+}
+
 fn is_canonical_install_path(p: &Path) -> bool {
     let s = p.to_string_lossy();
     // Reject Homebrew-managed paths — Homebrew owns its bottles, we don't.
     if s.contains("/Cellar/") || s.contains("/opt/homebrew/") || s.contains("/linuxbrew/") {
         return false;
     }
-    s.ends_with("/.local/bin/soth")
-        || s.ends_with("/usr/local/bin/soth")
-        || s.ends_with("\\soth\\soth.exe")
+    // Unix install locations.
+    if s.ends_with("/.local/bin/soth") || s.ends_with("/usr/local/bin/soth") {
+        return true;
+    }
+    // Windows install locations. The hosted install script places the
+    // binary at `%USERPROFILE%\.local\bin\soth.exe` (MINGW-style
+    // layout that mirrors the Unix install for consistency). The
+    // sysadmin path is `%LOCALAPPDATA%\soth\soth.exe` or
+    // `%PROGRAMFILES%\soth\soth.exe`. Accept both shapes.
+    s.ends_with("\\.local\\bin\\soth.exe") || s.ends_with("\\soth\\soth.exe")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_install_paths_accepted() {
+        assert!(is_canonical_install_path(Path::new(
+            "/home/user/.local/bin/soth"
+        )));
+        assert!(is_canonical_install_path(Path::new("/usr/local/bin/soth")));
+    }
+
+    #[test]
+    fn windows_install_script_path_accepted() {
+        // The hosted install script writes to
+        // `$HOME/.local/bin/soth.exe` on every OS — including Windows
+        // under MINGW where `$HOME` is `C:\Users\<name>`. Regression
+        // guard for the 0.1.1 Windows smoke test that surfaced this
+        // bug ("soth not installed at a canonical path" on a binary
+        // installed by the standard install script).
+        assert!(is_canonical_install_path(Path::new(
+            r"C:\Users\Prabhat\.local\bin\soth.exe"
+        )));
+        assert!(is_canonical_install_path(Path::new(
+            r"C:\Users\someone with spaces\.local\bin\soth.exe"
+        )));
+    }
+
+    #[test]
+    fn windows_sysadmin_paths_accepted() {
+        assert!(is_canonical_install_path(Path::new(
+            r"C:\Users\u\AppData\Local\soth\soth.exe"
+        )));
+        assert!(is_canonical_install_path(Path::new(
+            r"C:\Program Files\soth\soth.exe"
+        )));
+    }
+
+    #[test]
+    fn homebrew_paths_rejected() {
+        // Homebrew owns its bottles; we can't replace files under
+        // /opt/homebrew/ without breaking brew's manifest tracking.
+        assert!(!is_canonical_install_path(Path::new(
+            "/opt/homebrew/bin/soth"
+        )));
+        assert!(!is_canonical_install_path(Path::new(
+            "/opt/homebrew/Cellar/soth/0.1.0/bin/soth"
+        )));
+        assert!(!is_canonical_install_path(Path::new(
+            "/home/linuxbrew/.linuxbrew/bin/soth"
+        )));
+    }
+
+    #[test]
+    fn dev_checkout_and_random_paths_rejected() {
+        // A dev checkout build (cargo build) shouldn't self-swap —
+        // it's not the user's installed binary.
+        assert!(!is_canonical_install_path(Path::new(
+            "/Users/me/code/soth/target/debug/soth"
+        )));
+        assert!(!is_canonical_install_path(Path::new(
+            r"D:\work\SothRepo\soth\target\release\soth.exe"
+        )));
+        assert!(!is_canonical_install_path(Path::new("/tmp/soth")));
+        // A file named "soth.exe" that isn't in either canonical
+        // Windows layout should be rejected too.
+        assert!(!is_canonical_install_path(Path::new(
+            r"C:\tools\soth.exe"
+        )));
+    }
 }
