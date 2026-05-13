@@ -712,15 +712,34 @@ const WINDSURF_HOOK_TYPES: &[(&str, &str)] = &[
 /// natively; we normalize at install time so the hook subprocess
 /// accepts a uniform CLI shape across all agents.
 const CURSOR_HOOK_TYPES: &[(&str, &str)] = &[
-    // Pre-action (can block)
+    // Pre-action (can block) — every entry here mirrors a hook the
+    // adapter knows how to parse + `is_pre_action_hook()` allows.
+    // Coverage gap closed: `beforeMCPExecution` (credential leak
+    // surface), `beforeTabFileRead` (Cursor Tab file-read gate),
+    // and `subagentStart` (subagent fan-out) were previously only
+    // adapter-parseable — not installed, so they never fired.
     ("preToolUse", "pre_tool_use"),
     ("beforeShellExecution", "before_shell_execution"),
     ("beforeReadFile", "before_read_file"),
+    ("beforeTabFileRead", "before_tab_file_read"),
+    ("beforeMCPExecution", "before_mcp_execution"),
     ("beforeSubmitPrompt", "before_submit_prompt"),
+    ("subagentStart", "subagent_start"),
     // Post-action (audit)
     ("postToolUse", "post_tool_use"),
+    // `postToolUseFailure` fires when Cursor's tool call returned an
+    // error — high-signal for audit (failed file writes, blocked
+    // shells, denied API calls). Parser already handles it
+    // (`adapter/cursor.rs:231` collapses with `post_tool_use` for
+    // ActionType), so installing it just turns on the visibility.
+    ("postToolUseFailure", "post_tool_use_failure"),
     ("afterFileEdit", "after_file_edit"),
+    ("afterTabFileEdit", "after_tab_file_edit"),
     ("afterShellExecution", "after_shell_execution"),
+    ("afterMCPExecution", "after_mcp_execution"),
+    ("afterAgentResponse", "after_agent_response"),
+    ("afterAgentThought", "after_agent_thought"),
+    ("subagentStop", "subagent_stop"),
     // Lifecycle
     ("sessionStart", "session_start"),
     ("sessionEnd", "session_end"),
@@ -1443,6 +1462,99 @@ fn kind_label(v: &Value) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Doctor / status helpers — exposed so the CLI can synthesize one row per
+// agent that combines (settings file marker count) + (installed.json record)
+// + (binary drift). Previously the doctor only grep'd for the marker
+// substring, which couldn't distinguish "fully installed" from "hand-edited
+// down to one entry" from "marker text appears in a user comment".
+// ---------------------------------------------------------------------------
+
+/// Number of hook entries `install_*` writes for a given agent.
+/// `Some(N)` for JSON-config agents (claude_code, cursor, codex,
+/// gemini_cli, windsurf); `None` for plugin-file agents
+/// (opencode, pi_agent) — those don't have a per-hook count, just a
+/// single managed file.
+pub fn expected_hook_count(agent: &str) -> Option<usize> {
+    match agent {
+        "claude_code" => Some(HOOK_TYPES.len()),
+        "cursor" => Some(CURSOR_HOOK_TYPES.len()),
+        // The CLI surfaces codex as both names; both resolve to the
+        // same install. Mapping both keeps the doctor happy whether
+        // the caller passed `--target codex` or read `openai_codex`
+        // from installed.json.
+        "codex" | "openai_codex" => Some(CODEX_HOOK_TYPES.len()),
+        "gemini_cli" => Some(GEMINI_HOOK_TYPES.len()),
+        "windsurf" => Some(WINDSURF_HOOK_TYPES.len()),
+        _ => None,
+    }
+}
+
+/// Count the number of `_soth_managed: true` entries anywhere in the
+/// settings/hooks JSON at `path`. Walks the entire tree so it works
+/// uniformly across both shapes we install:
+///
+/// - Matcher-style (claude_code, gemini_cli): the managed marker
+///   lives on the *outer* object that wraps a `matcher`+`hooks` pair.
+/// - Flat-style (cursor, codex, windsurf): the managed marker lives
+///   on the per-event command object.
+///
+/// A missing or empty file returns `Ok(0)` so the doctor can
+/// distinguish that case from a parse error. Malformed JSON
+/// surfaces `Err(InstallError::Malformed)` — same contract as the
+/// install side, so the doctor doesn't silently report "0 hooks"
+/// for a config the operator broke while editing.
+pub fn count_soth_managed_entries(path: &Path) -> Result<usize, InstallError> {
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(InstallError::Read {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+    if content.trim().is_empty() {
+        return Ok(0);
+    }
+    let doc: Value = serde_json::from_str(&content).map_err(|e| InstallError::Malformed {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(count_marker_recursive(&doc))
+}
+
+fn count_marker_recursive(v: &Value) -> usize {
+    match v {
+        Value::Object(map) => {
+            // An object with `_soth_managed: true` counts itself as
+            // one entry — and we DON'T descend further, since the
+            // marker lives on leaf-ish wrapper objects (Claude Code's
+            // matcher object, Cursor's per-event command object) and
+            // descending would double-count nested arrays we don't
+            // own.
+            if map.get(SOTH_MARKER_KEY) == Some(&Value::Bool(true)) {
+                return 1;
+            }
+            map.values().map(count_marker_recursive).sum()
+        }
+        Value::Array(arr) => arr.iter().map(count_marker_recursive).sum(),
+        _ => 0,
+    }
+}
+
+/// True when the plugin file at `path` exists and contains the
+/// soth-managed marker comment line. Used by the doctor for the
+/// plugin-style agents (opencode, pi_agent) where there's no
+/// per-hook count, only a single file-presence + marker check.
+pub fn plugin_file_is_soth_managed(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(content) => content.contains(PLUGIN_MARKER_LINE),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1728,6 +1840,61 @@ mod tests {
     }
 
     #[test]
+    fn cursor_install_covers_all_adapter_known_hooks() {
+        // Regression guard: every soth-side hook name in
+        // CURSOR_HOOK_TYPES must be one the CursorAdapter recognizes
+        // (returns a non-`Notification` ActionType OR is the literal
+        // session_end / stop lifecycle hook). Catches the class of
+        // drift bug that left `beforeMCPExecution`, `beforeTabFileRead`
+        // etc. adapter-parseable but never installed.
+        use crate::adapter::{Adapter as _, CursorAdapter};
+        let a = CursorAdapter::new();
+        for (cursor_event, soth_hook_type) in CURSOR_HOOK_TYPES {
+            let parsed = a
+                .parse_event(soth_hook_type, b"{\"conversation_id\":\"c\"}")
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "CursorAdapter must parse hook {cursor_event} → {soth_hook_type} \
+                         that install.rs registers"
+                    )
+                });
+            assert_eq!(
+                parsed.hook_type, *soth_hook_type,
+                "adapter must preserve installed hook_type verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_install_writes_extended_hook_coverage() {
+        // Pins the post-PR coverage: we install the full set
+        // (pre_action + post_action + lifecycle), not just the
+        // original 10. Bump intentionally if/when the set changes.
+        let (_tmp, path) = fixture_settings("");
+        let report = install_cursor(&path, Some(binary_path())).unwrap();
+        assert_eq!(report.hooks_added.len(), CURSOR_HOOK_TYPES.len());
+        assert!(
+            CURSOR_HOOK_TYPES.len() >= 19,
+            "cursor coverage should remain at-or-above 19 hooks (gryph parity + postToolUseFailure)"
+        );
+        let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // Spot-check newly added hooks land in the file.
+        for new_event in [
+            "beforeMCPExecution",
+            "beforeTabFileRead",
+            "subagentStart",
+            "afterAgentResponse",
+            "afterMCPExecution",
+            "subagentStop",
+        ] {
+            assert!(
+                body["hooks"][new_event].is_array(),
+                "cursor must install hook for {new_event}"
+            );
+        }
+    }
+
+    #[test]
     fn cursor_install_still_writes_version_field() {
         // Regression guard: the shared `install_flat_style` helper is
         // also used by Cursor; the `version: 1` field should only
@@ -1736,6 +1903,94 @@ mod tests {
         super::install_cursor(&path, Some(binary_path())).unwrap();
         let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(body["version"], 1);
+    }
+
+    #[test]
+    fn expected_hook_count_matches_installed_per_agent() {
+        // Pin the doctor's expected-vs-actual comparison: every
+        // hook-based install must agree with `expected_hook_count`.
+        // Plugin-based agents return `None` since they ship a single
+        // file rather than per-event entries.
+        for (agent, install_fn) in [
+            (
+                "claude_code",
+                install_claude_code
+                    as fn(&Path, Option<PathBuf>) -> Result<InstallReport, InstallError>,
+            ),
+            ("cursor", install_cursor),
+            ("codex", install_codex),
+            ("gemini_cli", install_gemini_cli),
+            ("windsurf", install_windsurf),
+        ] {
+            let (_tmp, path) = fixture_settings("");
+            let report = install_fn(&path, Some(binary_path())).unwrap();
+            let expected =
+                expected_hook_count(agent).expect("hook-based agent must expose a count");
+            assert_eq!(
+                report.hooks_added.len(),
+                expected,
+                "install_{agent} must add exactly expected_hook_count() entries"
+            );
+            let counted = count_soth_managed_entries(&path).unwrap();
+            assert_eq!(
+                counted, expected,
+                "count_soth_managed_entries must agree with install for {agent}"
+            );
+        }
+        // Plugin-based agents return None: there's no per-hook count
+        // to compare; doctor falls back to plugin_file_is_soth_managed.
+        assert_eq!(expected_hook_count("opencode"), None);
+        assert_eq!(expected_hook_count("pi_agent"), None);
+        // Unknown agents return None too.
+        assert_eq!(expected_hook_count("unknown"), None);
+    }
+
+    #[test]
+    fn count_soth_managed_entries_handles_missing_empty_and_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing file: 0, not an error.
+        let missing = tmp.path().join("nope.json");
+        assert_eq!(count_soth_managed_entries(&missing).unwrap(), 0);
+        // Empty file: 0.
+        let empty = tmp.path().join("empty.json");
+        fs::write(&empty, "").unwrap();
+        assert_eq!(count_soth_managed_entries(&empty).unwrap(), 0);
+        // Malformed JSON: errors so the doctor surfaces the broken
+        // config instead of silently reporting "0 hooks" for a file
+        // the operator broke mid-edit.
+        let bad = tmp.path().join("bad.json");
+        fs::write(&bad, "{not json").unwrap();
+        assert!(matches!(
+            count_soth_managed_entries(&bad),
+            Err(InstallError::Malformed { .. })
+        ));
+        // Unmanaged file: 0 (operator's own hook, no marker).
+        let unmanaged = tmp.path().join("user.json");
+        fs::write(
+            &unmanaged,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/their-hook"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(count_soth_managed_entries(&unmanaged).unwrap(), 0);
+    }
+
+    #[test]
+    fn plugin_file_is_soth_managed_distinguishes_managed_from_unmanaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("soth-code.mjs");
+        install_opencode(&managed, Some(binary_path())).unwrap();
+        assert!(plugin_file_is_soth_managed(&managed));
+
+        let unmanaged = tmp.path().join("user.mjs");
+        fs::write(
+            &unmanaged,
+            "// the operator's own plugin\nexport default {};",
+        )
+        .unwrap();
+        assert!(!plugin_file_is_soth_managed(&unmanaged));
+
+        let missing = tmp.path().join("missing.mjs");
+        assert!(!plugin_file_is_soth_managed(&missing));
     }
 
     #[test]

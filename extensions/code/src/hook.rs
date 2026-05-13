@@ -590,13 +590,14 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
         source: EventSource::Extension {
             source: ExtensionSource::Code,
         },
-        // Provider is determined first by the agent (claude_code is
-        // always Anthropic, codex is always OpenAI, etc.). Multi-
-        // provider agents (cursor / windsurf / opencode) don't have a
-        // fixed provider, so we sniff the model id as a fallback. The
-        // earlier `"code"` placeholder leaked into the dashboard's
-        // `provider` column and surfaced every code-extension event
-        // under a synthetic "code" tile on the models page.
+        // Provider attribution: single-provider agents (claude_code →
+        // Anthropic, codex → OpenAI, etc.) map by name. IDE-agnostic
+        // agents (cursor / windsurf / opencode) attribute to the IDE
+        // itself, not to a backend family inferred from the model
+        // string — the IDE *is* the attribution surface (gryph takes
+        // the same stance: its Event struct has no provider field).
+        // The legacy `"code"` placeholder and the model-sniff fallback
+        // both leaked through to the dashboard as misleading tiles.
         provider: resolve_provider(&ev.agent, ev.model.as_deref()).into(),
         model: ev.model.clone(),
         endpoint_type: EndpointType::Unknown,
@@ -787,9 +788,18 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
         "codex" => Some("openai"),
         "gemini_cli" => Some("google"),
         "pi_agent" => Some("inflection"),
-        // Cursor / Windsurf / OpenCode are multi-provider — the agent
-        // payload doesn't reveal which API was hit. `resolve_provider`
-        // falls back to model-string sniffing in this case.
+        // Cursor / Windsurf / OpenCode are multi-provider IDEs — the
+        // agent payload doesn't reveal which backend API was hit, and
+        // model-string sniffing is unreliable (Cursor lifecycle hooks
+        // carry no model, and even when present the model string can
+        // be a custom local route that doesn't match any backend
+        // family). Attribute to the IDE itself — gryph's
+        // `core/events/event.go` takes the same stance: no provider
+        // field at all, only `AgentName`. The IDE *is* the
+        // attribution surface for these tools.
+        "cursor" => Some("cursor"),
+        "windsurf" => Some("windsurf"),
+        "opencode" => Some("opencode"),
         _ => None,
     }
 }
@@ -1513,14 +1523,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_for_agent_returns_none_for_multi_provider_agents() {
+    fn provider_for_ide_agnostic_agents_is_the_ide_name() {
         // Cursor / Windsurf / Opencode let the user pick a model from
-        // any provider, so the agent name alone can't determine
-        // attribution. Callers fall back to model-string inference.
-        assert_eq!(provider_for_agent("cursor"), None);
-        assert_eq!(provider_for_agent("windsurf"), None);
-        assert_eq!(provider_for_agent("opencode"), None);
+        // any provider, but the IDE *is* the attribution surface — the
+        // model string is unreliable (lifecycle hooks carry no model;
+        // custom routes don't match families) and gryph's own data
+        // model has no provider field at all. Attribute to the IDE
+        // itself so the dashboard shows "cursor" instead of
+        // model-string-inferred "anthropic" or the literal "unknown".
+        assert_eq!(provider_for_agent("cursor"), Some("cursor"));
+        assert_eq!(provider_for_agent("windsurf"), Some("windsurf"));
+        assert_eq!(provider_for_agent("opencode"), Some("opencode"));
+        // Truly unknown agents still return None so the legacy
+        // model-sniff path remains the last resort.
         assert_eq!(provider_for_agent("unknown_agent"), None);
+        assert_eq!(provider_for_agent(""), None);
     }
 
     #[test]
@@ -1535,28 +1552,38 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_falls_back_to_model_for_multi_provider_agents() {
+    fn resolve_provider_attributes_ide_agnostic_to_ide_not_model() {
+        // Regression guard for the "cursor sending events with
+        // anthropic" symptom: with a claude model picked inside
+        // Cursor, the IDE attribution should still surface as
+        // "cursor" so operators can distinguish IDE traffic from
+        // direct-API traffic on the dashboard.
         assert_eq!(
             resolve_provider("cursor", Some("claude-opus-4-7")),
-            "anthropic"
+            "cursor"
         );
-        assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "openai");
+        assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "windsurf");
         assert_eq!(
             resolve_provider("opencode", Some("gemini-1.5-pro")),
-            "google"
+            "opencode"
         );
+        // Lifecycle hooks (no model) used to land on "unknown" —
+        // now they correctly attribute to the IDE.
+        assert_eq!(resolve_provider("cursor", None), "cursor");
+        assert_eq!(resolve_provider("windsurf", None), "windsurf");
     }
 
     #[test]
-    fn resolve_provider_returns_unknown_when_nothing_known() {
-        // Multi-provider agent + unmapped model string → "unknown".
-        // Never falls back to the legacy "code" placeholder.
+    fn resolve_provider_returns_unknown_only_for_truly_unrecognized() {
+        // Brand-new agents not yet in `provider_for_agent` + an
+        // unmapped model string genuinely have nothing to attribute to.
         assert_eq!(
-            resolve_provider("cursor", Some("future-model-x")),
+            resolve_provider("brand_new_agent", Some("future-model-x")),
             "unknown"
         );
-        assert_eq!(resolve_provider("cursor", None), "unknown");
         assert_eq!(resolve_provider("brand_new_agent", None), "unknown");
+        // Never falls back to the legacy "code" placeholder.
+        assert_ne!(resolve_provider("brand_new_agent", None), "code");
     }
 
     #[test]
@@ -2007,7 +2034,9 @@ mod tests {
         assert_eq!(provider_for_agent("claude_code"), Some("anthropic"));
         assert_eq!(provider_for_agent("codex"), Some("openai"));
         assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
-        assert_eq!(provider_for_agent("cursor"), None); // multi-provider
+        // IDE-agnostic — attribute to the IDE itself, not to a backend
+        // family inferred from the model string.
+        assert_eq!(provider_for_agent("cursor"), Some("cursor"));
         assert_eq!(provider_for_agent("unknown_agent"), None);
     }
 

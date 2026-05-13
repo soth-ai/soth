@@ -33,6 +33,12 @@ pub struct CodePaths {
     /// `docs/gryph/plan.md` §10.12 / §11). Holds responses larger than
     /// the configured inline threshold.
     pub blob_dir: PathBuf,
+    /// Per-host install state file recording which agent hooks
+    /// (`claude_code`, `cursor`, …) have been wired by `soth code
+    /// install`. Source of truth for `soth code status`'s
+    /// `installed` field — `code.yaml` is for tuning knobs and may
+    /// legitimately be absent on a host with hooks installed.
+    pub installed_state: PathBuf,
 }
 
 impl CodePaths {
@@ -53,6 +59,7 @@ impl CodePaths {
             config: root.join("code.yaml"),
             plugin_dir: root.join("code").join("plugins"),
             blob_dir: root.join("code").join("blobs"),
+            installed_state: root.join("installed.json"),
         }
     }
 }
@@ -74,6 +81,11 @@ mod tests {
         assert_eq!(p.config, PathBuf::from("/test/.soth/code.yaml"));
         assert_eq!(p.plugin_dir, PathBuf::from("/test/.soth/code/plugins"));
         assert_eq!(p.blob_dir, PathBuf::from("/test/.soth/code/blobs"));
+        assert_eq!(
+            p.installed_state,
+            PathBuf::from("/test/.soth/installed.json"),
+            "installed_state must match InstalledHostState::default_path()"
+        );
     }
 
     #[test]
