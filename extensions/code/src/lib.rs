@@ -16,7 +16,13 @@
 //! - Group 5: classify + policy integration (the synchronous decision path).
 //! - Group 6: proxy bypass / cost-skim wiring; dashboard contract.
 
-#![forbid(unsafe_code)]
+// `deny` instead of `forbid` so a narrow, audited exception can live
+// behind `#[allow(unsafe_code)]` for the Win32 `GetShortPathNameW` FFI
+// in `install::windows_short_path` — required to surface the 8.3
+// no-space form for hook commands that Codex Desktop's non-shell hook
+// spawner needs. Every other use of `unsafe` in this crate remains
+// a compile error.
+#![deny(unsafe_code)]
 
 pub mod adapter;
 pub mod classify_daemon;

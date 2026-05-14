@@ -83,6 +83,27 @@ pub fn run_hook(
     let adapter =
         adapter::for_agent(agent_name).ok_or_else(|| HookError::UnknownAgent(agent_name.into()))?;
 
+    // Cursor honors Claude Code's hook-protocol contract: when Cursor's
+    // AI integration runs, it reads BOTH ~/.cursor/hooks.json AND
+    // ~/.claude/settings.json, firing two hook subprocesses per action.
+    // The cursor-side invocation already produces a canonical event;
+    // skip the claude_code duplicate when an ancestor process is Cursor.
+    // Standalone `claude` CLI invocations (Cursor not in the parent chain)
+    // continue to fire normally.
+    if agent_name == "claude_code" && ancestor_chain_includes_cursor() {
+        let decision = HookDecision::Allow;
+        let response = adapter.render_decision(&decision);
+        tracing::debug!(
+            hook_type = hook_type,
+            "soth-code: claude_code hook invoked by Cursor; skipping enqueue (cursor sibling will own the event)"
+        );
+        return Ok(HookOutcome {
+            event_id: Uuid::nil(),
+            decision,
+            exit_code: response.exit_code(),
+        });
+    }
+
     // 1. parse — adapter produces a CodeEvent.  Strip a leading
     //    UTF-8 BOM defensively before handing to the adapter so
     //    every parse path benefits regardless of how stdin was
@@ -442,6 +463,41 @@ fn strip_utf8_bom(buf: Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// Detect whether this hook subprocess was invoked by Cursor (the IDE
+/// honoring Claude Code's hook-protocol contract) rather than by the
+/// standalone `claude` CLI.
+///
+/// Cursor reads BOTH `~/.cursor/hooks.json` AND `~/.claude/settings.json`
+/// when its AI integration runs, so a single user action fires two
+/// soth-code hook subprocesses — one as `--agent cursor`, one as
+/// `--agent claude_code` — with identical content. Returns `true` if
+/// any ancestor process in the chain is Cursor; callers use this to
+/// drop the duplicate `--agent claude_code` event.
+fn ancestor_chain_includes_cursor() -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    let mut pid = Pid::from(std::process::id() as usize);
+    for _ in 0..8 {
+        let Some(proc) = system.process(pid) else {
+            return false;
+        };
+        let name = proc.name().to_string_lossy().to_ascii_lowercase();
+        if name.starts_with("cursor") {
+            return true;
+        }
+        let Some(parent) = proc.parent() else {
+            return false;
+        };
+        pid = parent;
+    }
+    false
+}
+
 fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
     // Map `CodeEvent.agent` → DataSource variant via metadata
     // (TelemetryEvent::from_governable reads "data_source" string from
@@ -458,6 +514,21 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
     metadata.insert("agent".to_string(), ev.agent.clone());
     metadata.insert("hook_type".to_string(), ev.hook_type.clone());
     metadata.insert("data_source".to_string(), data_source.into());
+
+    // Attribute every code-extension event to a "<agent>-app" tool so the
+    // cloud's CH_TOOL_NAME_EXPR resolves a real name on dashboards like
+    // /view?domain=engineering instead of falling through to 'unknown'.
+    // Both keys are needed: `tool_identity_key` is what makes
+    // TelemetryEvent::from_governable synthesize a ProcessResolution at
+    // all; `tool_name` is what populates the ClickHouse
+    // `resolved_tool_name` column that CH_TOOL_NAME_EXPR checks first.
+    // Skip for `code_unknown` so unattributed agents don't pollute the
+    // tool catalog with an "unknown-app" entry.
+    if data_source != "code_unknown" {
+        let tool_app = format!("{}-app", ev.agent);
+        metadata.insert("tool_identity_key".to_string(), tool_app.clone());
+        metadata.insert("tool_name".to_string(), tool_app);
+    }
     if let Some(seq) = ev.action_seq {
         metadata.insert("action_seq".to_string(), seq.to_string());
     }
@@ -787,9 +858,16 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
         "codex" => Some("openai"),
         "gemini_cli" => Some("google"),
         "pi_agent" => Some("inflection"),
-        // Cursor / Windsurf / OpenCode are multi-provider — the agent
-        // payload doesn't reveal which API was hit. `resolve_provider`
-        // falls back to model-string sniffing in this case.
+        // Multi-provider IDEs (Cursor / Windsurf / OpenCode) attribute
+        // to the IDE itself, not the downstream LLM. Even if the
+        // underlying call hits Anthropic or OpenAI, the user-facing
+        // source of the event is the IDE — that's what dashboard
+        // Feed/Signals should bucket under. The actual upstream model
+        // (if exposed) still lives in the `model` column for drill-
+        // down; this field reflects origin, not destination.
+        "cursor" => Some("cursor"),
+        "windsurf" => Some("windsurf"),
+        "opencode" => Some("opencode"),
         _ => None,
     }
 }

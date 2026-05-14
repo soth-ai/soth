@@ -4151,6 +4151,7 @@ dependencies = [
  "soth-detect",
  "soth-extensions",
  "soth-policy",
+ "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
