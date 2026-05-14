@@ -95,6 +95,26 @@ impl Swapper for MacosSwapper {
                 tracing::warn!(stderr = %stderr, "launchctl bootout returned non-zero (continuing)");
             }
         }
+
+        // `launchctl bootout` is async — it sends SIGTERM and returns
+        // before the daemon has finished tearing down its listener.
+        // Without an explicit wait here, post_swap's bootstrap races
+        // the old daemon's port-release path and the new daemon-child
+        // can't bind 8080 → KeepAlive retries for ~90s before the port
+        // finally frees (observed in edge-autostart.log:
+        //   "Error: port 8080 is already bound by pid(s) X (not a soth
+        //    process). Stop that process or pass `--port <PORT>` to
+        //    use a different port."
+        // repeated every ~10s for ~1m40s until success).
+        //
+        // Poll the proxy port until we can bind it ourselves — that's
+        // the only signal the old listener is truly gone. Time out
+        // after 15s and let post_swap try anyway; if it fails the
+        // helper's rollback path takes over. Mirrors the Windows
+        // sidecar's `wait_for_pid_exit` pattern.
+        if let Some(port) = read_configured_port() {
+            wait_for_port_release(port, Duration::from_secs(15)).await;
+        }
         Ok(())
     }
 
@@ -223,6 +243,45 @@ fn launch_agent_plist_path() -> Result<PathBuf> {
         .join(format!("{}.plist", LAUNCHD_LABEL)))
 }
 
+/// Wait for the proxy port to be unbound — i.e. for the previous
+/// daemon's listener to fully release after `launchctl bootout`.
+///
+/// `launchctl bootout` is asynchronous: it returns immediately after
+/// signalling the daemon, before the listener fd has been closed.
+/// If the helper races into `launchctl bootstrap` while the kernel is
+/// still tearing down the listener, the new daemon-child fails to
+/// bind 8080 and launchd's KeepAlive falls into a 1s/attempt retry
+/// loop that can stretch to ~90s before the port finally frees.
+///
+/// We poll by trying to bind the port ourselves; the moment that
+/// succeeds (we drop immediately), the new daemon will too. Best-
+/// effort: on timeout we just continue and let post_swap's bootstrap
+/// race the old listener — the helper's rollback path covers the
+/// failure case if bootstrap actually fails.
+async fn wait_for_port_release(port: u16, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    while std::time::Instant::now() < deadline {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                // Drop the listener immediately so the new daemon-
+                // child can claim it. If bind succeeds the kernel
+                // has fully released the previous owner's fd.
+                drop(listener);
+                return;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    tracing::warn!(
+        port = port,
+        timeout_secs = timeout.as_secs(),
+        "port still bound after bootout — proceeding anyway; bootstrap may need to retry"
+    );
+}
+
 /// Best-effort: wait for the daemon to bind its TCP listener.
 /// We can't always know the port (pre-config or different config
 /// schemas across versions), so we attempt to read `~/.soth/soth.yaml`
@@ -268,4 +327,78 @@ fn read_configured_port() -> Option<u16> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Returns immediately when the port is already free.
+    #[tokio::test]
+    async fn wait_for_port_release_returns_immediately_when_port_is_free() {
+        // Bind ephemeral port to get a guaranteed-free one, then release.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let start = Instant::now();
+        wait_for_port_release(port, Duration::from_secs(15)).await;
+        let elapsed = start.elapsed();
+        // Should complete on the first poll, well under the 250ms
+        // backoff. Allow generous slack for CI scheduling.
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "expected immediate return on free port; took {elapsed:?}",
+        );
+    }
+
+    /// Waits + then succeeds when the port is held but released
+    /// before the deadline.
+    #[tokio::test]
+    async fn wait_for_port_release_unblocks_when_other_listener_drops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Drop the listener after a short delay; the wait helper
+        // should observe the port free and return.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            drop(listener);
+        });
+
+        let start = Instant::now();
+        wait_for_port_release(port, Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "expected to wait for the spawned drop; took {elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "expected to return shortly after drop; took {elapsed:?}",
+        );
+    }
+
+    /// Times out gracefully when the port is held past the deadline.
+    /// Best-effort means we log + continue; the function never errors.
+    #[tokio::test]
+    async fn wait_for_port_release_times_out_gracefully() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let start = Instant::now();
+        wait_for_port_release(port, Duration::from_millis(500)).await;
+        let elapsed = start.elapsed();
+        // Should have waited approximately the full timeout (port
+        // never freed) and returned without panicking.
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "expected to wait near the timeout; took {elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "expected to give up after the timeout; took {elapsed:?}",
+        );
+        drop(listener);
+    }
 }
