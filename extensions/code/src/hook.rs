@@ -1629,13 +1629,10 @@ mod tests {
         assert_eq!(
             resolve_provider("cursor", Some("claude-opus-4-7")),
             "cursor"
-            "cursor"
         );
-        assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "windsurf");
         assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "windsurf");
         assert_eq!(
             resolve_provider("opencode", Some("gemini-1.5-pro")),
-            "opencode"
             "opencode"
         );
         assert_eq!(resolve_provider("pi_agent", Some("gpt-5.5")), "pi_agent");
