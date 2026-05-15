@@ -857,17 +857,21 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
         "claude_code" | "openclaw" => Some("anthropic"),
         "codex" => Some("openai"),
         "gemini_cli" => Some("google"),
-        "pi_agent" => Some("inflection"),
-        // Multi-provider IDEs (Cursor / Windsurf / OpenCode) attribute
-        // to the IDE itself, not the downstream LLM. Even if the
-        // underlying call hits Anthropic or OpenAI, the user-facing
-        // source of the event is the IDE — that's what dashboard
-        // Feed/Signals should bucket under. The actual upstream model
-        // (if exposed) still lives in the `model` column for drill-
-        // down; this field reflects origin, not destination.
+        // Multi-provider agents (Cursor / Windsurf / OpenCode / Pi)
+        // attribute to the agent itself, not the downstream LLM.
+        // Even if the underlying call hits Anthropic or OpenAI, the
+        // user-facing source of the event is the agent — that's what
+        // dashboard Feed/Signals should bucket under. The actual
+        // upstream model (if exposed) still lives in the `model`
+        // column for drill-down; this field reflects origin, not
+        // destination. Pi was previously hardcoded to "inflection"
+        // back when it was Inflection's product, but pi v0.74+ is
+        // model-agnostic — defaulting to the legacy provider made
+        // every pi event misattribute to Inflection on the dashboard.
         "cursor" => Some("cursor"),
         "windsurf" => Some("windsurf"),
         "opencode" => Some("opencode"),
+        "pi_agent" => Some("pi_agent"),
         _ => None,
     }
 }
@@ -1587,17 +1591,24 @@ mod tests {
         assert_eq!(provider_for_agent("openclaw"), Some("anthropic"));
         assert_eq!(provider_for_agent("codex"), Some("openai"));
         assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
-        assert_eq!(provider_for_agent("pi_agent"), Some("inflection"));
     }
 
     #[test]
-    fn provider_for_agent_returns_none_for_multi_provider_agents() {
-        // Cursor / Windsurf / Opencode let the user pick a model from
-        // any provider, so the agent name alone can't determine
-        // attribution. Callers fall back to model-string inference.
-        assert_eq!(provider_for_agent("cursor"), None);
-        assert_eq!(provider_for_agent("windsurf"), None);
-        assert_eq!(provider_for_agent("opencode"), None);
+    fn provider_for_agent_attributes_multi_provider_agents_to_themselves() {
+        // Cursor / Windsurf / OpenCode / Pi let the user pick a model
+        // from any provider, so we can't attribute to the downstream
+        // LLM. Instead they bucket under the agent name itself so the
+        // Feed/Signals dashboard groups events by user-facing source.
+        // Pi was previously `Some("inflection")` — that misattributed
+        // every pi event to Inflection's product even when the user
+        // had pi running against openai-codex or anthropic. v0.74+
+        // pi is model-agnostic, so it joins this group.
+        assert_eq!(provider_for_agent("cursor"), Some("cursor"));
+        assert_eq!(provider_for_agent("windsurf"), Some("windsurf"));
+        assert_eq!(provider_for_agent("opencode"), Some("opencode"));
+        assert_eq!(provider_for_agent("pi_agent"), Some("pi_agent"));
+        // Genuinely unknown agents still return None so resolve_provider
+        // falls back to model-string inference.
         assert_eq!(provider_for_agent("unknown_agent"), None);
     }
 
@@ -1613,27 +1624,30 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_falls_back_to_model_for_multi_provider_agents() {
+    fn resolve_provider_uses_agent_name_for_multi_provider_agents() {
+        // Multi-provider agents (cursor/windsurf/opencode/pi) attribute
+        // to themselves regardless of downstream model. The downstream
+        // LLM still appears in the `model` column for drill-down.
         assert_eq!(
             resolve_provider("cursor", Some("claude-opus-4-7")),
-            "anthropic"
+            "cursor"
         );
-        assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "openai");
+        assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "windsurf");
         assert_eq!(
             resolve_provider("opencode", Some("gemini-1.5-pro")),
-            "google"
+            "opencode"
         );
+        assert_eq!(resolve_provider("pi_agent", Some("gpt-5.5")), "pi_agent");
     }
 
     #[test]
-    fn resolve_provider_returns_unknown_when_nothing_known() {
-        // Multi-provider agent + unmapped model string → "unknown".
+    fn resolve_provider_returns_unknown_only_for_genuinely_unknown_agents() {
+        // Truly unknown agent + unmapped model string → "unknown".
         // Never falls back to the legacy "code" placeholder.
         assert_eq!(
-            resolve_provider("cursor", Some("future-model-x")),
+            resolve_provider("brand_new_agent", Some("future-model-x")),
             "unknown"
         );
-        assert_eq!(resolve_provider("cursor", None), "unknown");
         assert_eq!(resolve_provider("brand_new_agent", None), "unknown");
     }
 
@@ -2085,7 +2099,11 @@ mod tests {
         assert_eq!(provider_for_agent("claude_code"), Some("anthropic"));
         assert_eq!(provider_for_agent("codex"), Some("openai"));
         assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
-        assert_eq!(provider_for_agent("cursor"), None); // multi-provider
+        // Multi-provider agents attribute to themselves (see
+        // provider_for_agent_attributes_multi_provider_agents_to_themselves
+        // for full coverage).
+        assert_eq!(provider_for_agent("cursor"), Some("cursor"));
+        assert_eq!(provider_for_agent("pi_agent"), Some("pi_agent"));
         assert_eq!(provider_for_agent("unknown_agent"), None);
     }
 
