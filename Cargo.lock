@@ -4025,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "soth-api-types"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4034,7 +4034,7 @@ dependencies = [
 
 [[package]]
 name = "soth-bundle"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -4056,7 +4056,7 @@ dependencies = [
 
 [[package]]
 name = "soth-classify"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "criterion",
@@ -4080,7 +4080,7 @@ dependencies = [
 
 [[package]]
 name = "soth-cli"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4124,7 +4124,7 @@ dependencies = [
 
 [[package]]
 name = "soth-cli-update-sidecar"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "windows-sys 0.59.0",
@@ -4132,7 +4132,7 @@ dependencies = [
 
 [[package]]
 name = "soth-code"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4160,7 +4160,7 @@ dependencies = [
 
 [[package]]
 name = "soth-conformance-tests"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "serde",
@@ -4176,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "soth-core"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",
@@ -4193,7 +4193,7 @@ dependencies = [
 
 [[package]]
 name = "soth-detect"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "soth-extensions"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -4240,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "soth-historian"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4308,7 +4308,7 @@ dependencies = [
 
 [[package]]
 name = "soth-node"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "soth-parse"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "graphql-parser",
@@ -4338,7 +4338,7 @@ dependencies = [
 
 [[package]]
 name = "soth-policy"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "criterion",
@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "soth-proxy"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "soth-py"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "pyo3",
  "soth-core",
@@ -4419,7 +4419,7 @@ dependencies = [
 
 [[package]]
 name = "soth-sdk-core"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "opentelemetry",
@@ -4439,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "soth-sync"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4469,7 +4469,7 @@ dependencies = [
 
 [[package]]
 name = "soth-telemetry"
-version = "0.1.4"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chacha20poly1305",

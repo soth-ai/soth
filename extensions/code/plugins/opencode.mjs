@@ -100,6 +100,19 @@ function invokeSoth(hookType, payload) {
 }
 
 export const SothCodePlugin = async ({ directory }) => ({
+  // OpenCode's plugin API splits the tool-execute event into
+  // `(input, output)` where `input` carries identity (sessionID,
+  // tool, callID) and `output.args` carries the *mutable* tool
+  // arguments — plugins can rewrite `output.args` to alter what
+  // actually runs. So tool name comes from `input.tool` and tool
+  // args come from `output.args`; that's correct per the upstream
+  // contract, not a bug.
+  //
+  // Known gap: OpenCode's plugin SDK has no synchronous pre-prompt
+  // hook (only `tool.execute.before/after` + `session.*` + the
+  // post-action `chat.message`). Until upstream adds one, we cannot
+  // enforce a Block decision on a user prompt before it reaches the
+  // model — `OpenCodeAdapter::is_pre_action_hook` reflects that.
   "tool.execute.before": async (input, output) => {
     invokeSoth("tool_execute_before", {
       session_id: input.sessionID,

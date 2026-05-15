@@ -95,10 +95,16 @@ impl Adapter for OpenCodeAdapter {
     }
 
     fn is_pre_action_hook(&self, hook_type: &str) -> bool {
-        matches!(
-            hook_type,
-            "tool_execute_before" | "user_prompt_submit" | "session_idle_before"
-        )
+        // `tool_execute_before` is the only enforceable surface
+        // OpenCode's plugin API actually exposes. The pre-LLM prompt
+        // submit + `session_idle_before` hooks don't exist in the
+        // upstream plugin contract (only `tool.execute.before/after`,
+        // `chat.message` — which is post-action — and the four
+        // `session.*` events), so claiming we could block them would
+        // be a false promise that silently fails when the policy
+        // gate fires. Re-add either entry only if OpenCode's plugin
+        // SDK gains a synchronous pre-prompt hook upstream.
+        matches!(hook_type, "tool_execute_before")
     }
 
     fn classify_input(&self, event: &CodeEvent) -> Option<HookContentExtract> {
@@ -241,6 +247,18 @@ mod tests {
         assert!(a.is_pre_action_hook("tool_execute_before"));
         assert!(!a.is_pre_action_hook("tool_execute_after"));
         assert!(!a.is_pre_action_hook("session_idle"));
+        // Regression guard: these were previously advertised as
+        // enforceable but OpenCode's plugin API never exposes them,
+        // so the policy gate would silently fail to block. Keep them
+        // false until upstream adds a pre-prompt hook.
+        assert!(
+            !a.is_pre_action_hook("user_prompt_submit"),
+            "OpenCode plugin API has no pre-prompt hook"
+        );
+        assert!(
+            !a.is_pre_action_hook("session_idle_before"),
+            "OpenCode plugin API has no session_idle_before"
+        );
     }
 
     #[test]

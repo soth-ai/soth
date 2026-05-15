@@ -624,75 +624,164 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         paths.blob_dir.display()
     );
 
-    // Agents — per-adapter install state.  Each row tries the
-    // canonical settings path for that agent; "installed" means
-    // the file contains the soth-managed marker.  No file →
-    // "missing" (agent likely not on this host); file present
-    // but no marker → "not_installed" (agent here, soth-code
-    // hooks not wired).
+    // Agents — one synthesized row per supported adapter that joins
+    // three sources of truth so the operator can tell apart "fully
+    // installed", "partial install / drift", "binary moved",
+    // "unrecorded hand-install", and "agent not on this host". Three
+    // sources joined:
+    //   1. Canonical settings file (Cursor: ~/.cursor/hooks.json, etc.)
+    //   2. Marker count via `count_soth_managed_entries` (JSON
+    //      adapters) or `plugin_file_is_soth_managed` (plugins) —
+    //      catches partial deletes that pure substring grep missed.
+    //   3. `~/.soth/installed.json` — the record `soth code install`
+    //      wrote, including the binary path used.
+    //
+    // Status taxonomy:
+    //   ✓ ok                 → file present, full hook count, state
+    //                          recorded, binary path matches current
+    //   ⚠ N/M hooks          → file present + marker, but missing
+    //                          hooks; reinstall picks them up
+    //   ✗ binary drift       → state recorded against a soth binary
+    //                          that's not the one running today;
+    //                          reinstall repoints
+    //   ✗ orphaned           → installed.json records install but
+    //                          the file has no soth-managed entries
+    //                          (operator hand-edited soth out)
+    //   ·  unrecorded         → file installed but `soth code install`
+    //                          never ran (manual install or stale
+    //                          installed.json wipe)
+    //   ·  not present        → no canonical file + no recorded
+    //                          install → agent not on this host
+    //   —  no OS path         → no canonical path on this platform
+    //   !  malformed          → settings file is broken JSON
+    let current_binary = std::env::current_exe().ok();
+    let state = soth_code::state::InstalledHostState::default_path()
+        .and_then(|p| soth_code::state::InstalledHostState::load(&p).ok())
+        .unwrap_or_default();
+
     println!("agents:");
-    let agents: &[(&str, fn() -> Option<PathBuf>, &str)] = &[
-        ("claude_code", default_claude_settings_path, "_soth_managed"),
-        ("cursor", default_cursor_hooks_path, "_soth_managed"),
-        ("openai_codex", default_codex_hooks_path, "_soth_managed"),
-        ("gemini_cli", default_gemini_settings_path, "_soth_managed"),
-        ("windsurf", default_windsurf_hooks_path, "_soth_managed"),
-        ("pi_agent", default_pi_agent_plugin_path, "soth-code"),
-        ("opencode", default_opencode_plugin_path, "soth-code"),
+    enum AgentKind {
+        Json,   // settings.json / hooks.json with per-event entries
+        Plugin, // single .mjs / .ts file with a marker line
+    }
+    let agents: &[(&str, fn() -> Option<PathBuf>, AgentKind)] = &[
+        ("claude_code", default_claude_settings_path, AgentKind::Json),
+        ("cursor", default_cursor_hooks_path, AgentKind::Json),
+        ("openai_codex", default_codex_hooks_path, AgentKind::Json),
+        ("gemini_cli", default_gemini_settings_path, AgentKind::Json),
+        ("windsurf", default_windsurf_hooks_path, AgentKind::Json),
+        ("pi_agent", default_pi_agent_plugin_path, AgentKind::Plugin),
+        ("opencode", default_opencode_plugin_path, AgentKind::Plugin),
     ];
-    for (name, default_fn, marker) in agents {
-        match default_fn() {
-            None => println!("  {name:<11} —  (no canonical path on this OS)"),
-            Some(path) => {
-                let state = match fs::read_to_string(&path) {
-                    Ok(content) if content.contains(marker) => "installed",
-                    Ok(_) => "not_installed",
-                    Err(_) => "missing",
-                };
-                println!(
-                    "  {name:<11} {} {state:<14} {}",
-                    exists(&path),
-                    path.display()
-                );
+    for (name, default_fn, kind) in agents {
+        let path = match default_fn() {
+            None => {
+                println!("  {name:<13} — no canonical path on this OS");
+                continue;
             }
-        }
+            Some(p) => p,
+        };
+        let state_rec = state.hooks.get(*name);
+        let path_display = path.display().to_string();
+
+        // Branch on agent shape — JSON vs plugin file.
+        let (status_marker, status_text): (&str, String) = match kind {
+            AgentKind::Json => {
+                let expected = soth_code::install::expected_hook_count(name).unwrap_or(0);
+                match soth_code::install::count_soth_managed_entries(&path) {
+                    Err(e) => ("!", format!("malformed ({e})")),
+                    Ok(0) if state_rec.is_some() => {
+                        // Recorded but file has no soth-managed entries.
+                        ("✗", format!("orphaned ({expected} expected, 0 present — re-run `soth code install --target {name}`)"))
+                    }
+                    Ok(0) if path.exists() => ("·", "unmanaged (no soth-managed entries)".into()),
+                    Ok(0) => ("·", "not present".into()),
+                    Ok(n) if n < expected => {
+                        let action = format!(
+                            "re-run `soth code install --target {name}` to add {} more",
+                            expected - n
+                        );
+                        ("⚠", format!("{n}/{expected} hooks — {action}"))
+                    }
+                    Ok(n) if n > expected => {
+                        // Possible if the operator hand-added marker
+                        // objects, or upstream contract shrank. Loud
+                        // signal so the human can investigate.
+                        ("⚠", format!("{n}/{expected} hooks (excess — unexpected)"))
+                    }
+                    Ok(n) => {
+                        // Exact match — check binary drift.
+                        match (state_rec, current_binary.as_deref()) {
+                            (Some(rec), Some(cur)) if rec.binary_path != cur => (
+                                "✗",
+                                format!(
+                                    "binary drift ({n}/{expected} hooks ok, but recorded {} ≠ current {} — re-run `soth code install --target {name}`)",
+                                    rec.binary_path.display(),
+                                    cur.display()
+                                ),
+                            ),
+                            (Some(rec), _) => (
+                                "✓",
+                                format!("{n}/{expected} hooks (installed {})", rec.installed_at),
+                            ),
+                            (None, _) => (
+                                "·",
+                                format!(
+                                    "{n}/{expected} hooks (unrecorded — installed.json missing entry)"
+                                ),
+                            ),
+                        }
+                    }
+                }
+            }
+            AgentKind::Plugin => {
+                let managed = soth_code::install::plugin_file_is_soth_managed(&path);
+                match (managed, state_rec, path.exists()) {
+                    (true, Some(rec), _) => {
+                        // Plugin present + state recorded → check drift.
+                        match current_binary.as_deref() {
+                            Some(cur) if rec.binary_path != cur => (
+                                "✗",
+                                format!(
+                                    "binary drift (recorded {} ≠ current {} — re-run `soth code install --target {name}`)",
+                                    rec.binary_path.display(),
+                                    cur.display()
+                                ),
+                            ),
+                            _ => ("✓", format!("plugin ok (installed {})", rec.installed_at)),
+                        }
+                    }
+                    (true, None, _) => ("·", "plugin ok (unrecorded — installed.json missing entry)".into()),
+                    (false, Some(_), _) => (
+                        "✗",
+                        format!("orphaned (installed.json records plugin, but no marker — re-run `soth code install --target {name}`)"),
+                    ),
+                    (false, None, true) => ("·", "unmanaged (file present, no marker)".into()),
+                    (false, None, false) => ("·", "not present".into()),
+                }
+            }
+        };
+        println!("  {name:<13} {status_marker} {status_text:<60}  {path_display}");
     }
     // OpenClaw: parser/runtime ready, install path pending.
     // Surface this distinctly so operators can tell the
     // difference between "agent unsupported" and "supported but
     // configure manually".
-    println!("  openclaw    -  manual         (auto-install pending upstream config spec)");
+    println!("  openclaw      —  manual (auto-install pending upstream config spec)");
 
-    // Per-host install state (~/.soth/installed.json) — what
-    // `soth up` actually wrote, when, and pointing at which
-    // binary.  Surfaces drift between the auto-installer's
-    // record and the on-disk settings file (operator manually
-    // edited a settings file the auto-installer thought it
-    // owned, etc.).  Empty when `soth up` has never run on
-    // this host with hook auto-install enabled.
     if let Some(state_path) = soth_code::state::InstalledHostState::default_path() {
-        match soth_code::state::InstalledHostState::load(&state_path) {
-            Ok(state) if !state.hooks.is_empty() => {
-                println!("install_state: {}", state_path.display());
-                for (agent, rec) in &state.hooks {
-                    println!(
-                        "  {:<11} {} (binary {})",
-                        agent,
-                        rec.installed_at,
-                        rec.binary_path.display()
-                    );
-                }
-            }
-            Ok(_) => {
-                println!(
-                    "install_state: {} (empty — `soth up` has not auto-installed any hooks)",
-                    state_path.display()
-                );
-            }
-            Err(e) => println!(
-                "install_state: {} (read error: {e:#})",
+        if state.hooks.is_empty() {
+            println!(
+                "install_state:  · {} (empty — `soth code install` has not run on this host)",
                 state_path.display()
-            ),
+            );
+        } else {
+            println!(
+                "install_state:  ✓ {} ({} agent{} recorded)",
+                state_path.display(),
+                state.hooks.len(),
+                if state.hooks.len() == 1 { "" } else { "s" }
+            );
         }
     }
 

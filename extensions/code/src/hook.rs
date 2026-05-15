@@ -661,13 +661,14 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
         source: EventSource::Extension {
             source: ExtensionSource::Code,
         },
-        // Provider is determined first by the agent (claude_code is
-        // always Anthropic, codex is always OpenAI, etc.). Multi-
-        // provider agents (cursor / windsurf / opencode) don't have a
-        // fixed provider, so we sniff the model id as a fallback. The
-        // earlier `"code"` placeholder leaked into the dashboard's
-        // `provider` column and surfaced every code-extension event
-        // under a synthetic "code" tile on the models page.
+        // Provider attribution: single-provider agents (claude_code →
+        // Anthropic, codex → OpenAI, etc.) map by name. IDE-agnostic
+        // agents (cursor / windsurf / opencode) attribute to the IDE
+        // itself, not to a backend family inferred from the model
+        // string — the IDE *is* the attribution surface (gryph takes
+        // the same stance: its Event struct has no provider field).
+        // The legacy `"code"` placeholder and the model-sniff fallback
+        // both leaked through to the dashboard as misleading tiles.
         provider: resolve_provider(&ev.agent, ev.model.as_deref()).into(),
         model: ev.model.clone(),
         endpoint_type: EndpointType::Unknown,
@@ -1610,6 +1611,7 @@ mod tests {
         // Genuinely unknown agents still return None so resolve_provider
         // falls back to model-string inference.
         assert_eq!(provider_for_agent("unknown_agent"), None);
+        assert_eq!(provider_for_agent(""), None);
     }
 
     #[test]
@@ -1631,10 +1633,13 @@ mod tests {
         assert_eq!(
             resolve_provider("cursor", Some("claude-opus-4-7")),
             "cursor"
+            "cursor"
         );
+        assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "windsurf");
         assert_eq!(resolve_provider("windsurf", Some("gpt-4o")), "windsurf");
         assert_eq!(
             resolve_provider("opencode", Some("gemini-1.5-pro")),
+            "opencode"
             "opencode"
         );
         assert_eq!(resolve_provider("pi_agent", Some("gpt-5.5")), "pi_agent");
@@ -1646,9 +1651,12 @@ mod tests {
         // Never falls back to the legacy "code" placeholder.
         assert_eq!(
             resolve_provider("brand_new_agent", Some("future-model-x")),
+            resolve_provider("brand_new_agent", Some("future-model-x")),
             "unknown"
         );
         assert_eq!(resolve_provider("brand_new_agent", None), "unknown");
+        // Never falls back to the legacy "code" placeholder.
+        assert_ne!(resolve_provider("brand_new_agent", None), "code");
     }
 
     #[test]
