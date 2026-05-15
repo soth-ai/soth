@@ -2105,6 +2105,60 @@ mod tests {
         assert_eq!(report.hooks_added, vec!["opencode plugin".to_string()]);
     }
 
+    /// Windows-shaped paths embed characters JS treats as escape
+    /// sequences (`\U`, `\b`, `\.`). The installer must double-escape
+    /// every `\` before substitution; a raw `C:\Users\...` left
+    /// untouched produces a JS string literal that either fails to
+    /// parse or silently resolves to the wrong path (the `\b` becomes
+    /// a literal backspace at runtime). This test forces the bug to
+    /// surface even when the harness runs on a non-Windows host —
+    /// the substituted value must contain the doubled `\\` form, NOT
+    /// the raw single backslash that would survive a no-op install.
+    #[test]
+    fn opencode_plugin_escapes_backslashes_in_substituted_path() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_path = tmp.path().join("plugins").join("soth-code.js");
+        // Path crafted to contain characters that are JS escape
+        // sequences after a single backslash: `\U`, `\b`, `\s`, `\.`,
+        // plus a space (to mirror typical Windows user folders).
+        let synthetic = PathBuf::from(r"C:\Users\test user\.local\bin\soth.exe");
+        install_opencode(&plugin_path, Some(synthetic)).unwrap();
+        let body = fs::read_to_string(&plugin_path).unwrap();
+        // Must contain the JS-escaped form...
+        assert!(
+            body.contains(r#"const SOTH_BIN = "C:\\Users\\test user\\.local\\bin\\soth.exe""#),
+            "expected doubled `\\\\` escaping in substituted SOTH_BIN, got:\n{body}"
+        );
+        // ...and must NOT contain the raw, JS-invalid single-backslash
+        // form. Without `\\` doubling, `\b` becomes a backspace at
+        // runtime and the plugin silently spawns the wrong path.
+        assert!(
+            !body.contains(r#"const SOTH_BIN = "C:\Users"#),
+            "raw single-backslash path leaked into the installed plugin"
+        );
+    }
+
+    /// Counterpart to the Windows-escaping test: on Linux / macOS the
+    /// binary path has no `\`, so the same `replace('\\', "\\\\")`
+    /// must be a no-op — the substituted source should match the raw
+    /// path byte-for-byte. Locks in cross-platform correctness so a
+    /// future "fix" that gates the escape on `cfg!(windows)` can't
+    /// silently regress Unix installs.
+    #[test]
+    fn opencode_plugin_unix_path_substituted_verbatim() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_path = tmp.path().join("plugins").join("soth-code.js");
+        let unix = PathBuf::from("/home/test/.local/bin/soth");
+        install_opencode(&plugin_path, Some(unix)).unwrap();
+        let body = fs::read_to_string(&plugin_path).unwrap();
+        assert!(
+            body.contains(r#"const SOTH_BIN = "/home/test/.local/bin/soth""#),
+            "expected Unix path substituted verbatim with no extra escaping, got:\n{body}"
+        );
+    }
+
     #[test]
     fn plugin_install_refuses_to_overwrite_user_authored_file() {
         // Pre-install a hand-authored plugin without our marker. The
