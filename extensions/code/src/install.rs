@@ -269,10 +269,7 @@ fn windows_short_path(path: &Path) -> Option<String> {
 ///   (there's no 8.3 equivalent on APFS / ext4; mitigations would
 ///   require a no-space symlink at install time, which is heavier).
 fn executable_token(binary_path: &Path) -> String {
-    let normalized = binary_path
-        .display()
-        .to_string()
-        .replace('\\', "/");
+    let normalized = binary_path.display().to_string().replace('\\', "/");
 
     #[cfg(windows)]
     {
@@ -1808,8 +1805,14 @@ mod tests {
         // back on here.
         let p_space = PathBuf::from("/Users/John Doe/.local/bin/soth");
         let token = executable_token(&p_space);
-        assert!(token.starts_with('"'), "POSIX space path must be quoted: {token}");
-        assert!(token.ends_with('"'),   "POSIX space path must be quoted: {token}");
+        assert!(
+            token.starts_with('"'),
+            "POSIX space path must be quoted: {token}"
+        );
+        assert!(
+            token.ends_with('"'),
+            "POSIX space path must be quoted: {token}"
+        );
     }
 
     #[test]
@@ -1871,8 +1874,8 @@ mod tests {
         let bogus = PathBuf::from(r"C:\Users\Definitely Not A Real User\bin\soth.exe");
         let token = executable_token(&bogus);
         assert!(token.starts_with('"'), "fallback must quote: {token}");
-        assert!(token.ends_with('"'),   "fallback must quote: {token}");
-        assert!(token.contains(' '),    "fallback preserves long path: {token}");
+        assert!(token.ends_with('"'), "fallback must quote: {token}");
+        assert!(token.contains(' '), "fallback preserves long path: {token}");
     }
 
     #[test]

@@ -476,11 +476,7 @@ fn strip_utf8_bom(buf: Vec<u8>) -> Vec<u8> {
 fn ancestor_chain_includes_cursor() -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing(),
-    );
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
     let mut pid = Pid::from(std::process::id() as usize);
     for _ in 0..8 {
         let Some(proc) = system.process(pid) else {
