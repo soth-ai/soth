@@ -370,34 +370,35 @@ pub fn default_pi_agent_plugin_path() -> Option<PathBuf> {
 
 /// Default OpenCode plugin location.
 ///
-/// Per-OS resolution:
-/// - macOS / Linux: `~/.config/opencode/plugins/soth-code.mjs`
-/// - Windows: `%APPDATA%\opencode\plugins\soth-code.mjs`
+/// OpenCode uses an XDG-style layout on **every** platform —
+/// `~/.config/opencode/plugins/soth-code.js` on macOS, Linux, and
+/// Windows. On Windows that resolves to `C:\Users\<user>\.config\
+/// opencode\plugins\soth-code.js` (a literal `.config` directory
+/// under the user profile, NOT `%APPDATA%\Roaming\`). Confirmed
+/// empirically and against the official plugin docs at
+/// <https://opencode.ai/docs/plugins/>: the OpenCode app on Windows
+/// reads `opencode.jsonc` / `opencode.json`, log files, AND the
+/// plugins directory from this same XDG root, not from `%APPDATA%`.
 ///
-/// OpenCode on Windows explicitly bypasses the XDG /
-/// `~/.config/` convention and forces `%APPDATA%\opencode\`
-/// (verified upstream — see opencode-antigravity-auth issue
-/// #251 / #265 / #295 acknowledging the platform-specific
-/// override).  Without the cfg(windows) branch the install
-/// command would write to `%USERPROFILE%\.config\opencode\
-/// plugins\` which OpenCode does not read on Windows.  gryph
-/// upstream's `agent/opencode/detect.go` also misses this
-/// (single platform-agnostic `~/.config/opencode` constant);
-/// our fix is the upstream fix.
+/// File extension is `.js` (NOT `.mjs`). The docs explicitly list
+/// "JavaScript (`.js`) or TypeScript (`.ts`)" as the accepted plugin
+/// extensions, and empirically `.mjs` files in the plugins directory
+/// are skipped by OpenCode's auto-discovery loader.
+///
+/// An earlier version of this function used `dirs::config_dir()` on
+/// Windows, which resolves to `%APPDATA%\Roaming\` — produced
+/// installs that wrote `soth-code.mjs` to a path OpenCode never
+/// loaded from. The install reported success but the plugin silently
+/// never fired. Fixed by unifying the path to `~/.config/opencode/
+/// plugins/` (empirically verified to be where OpenCode actually
+/// reads plugins from on Windows).
 pub fn default_opencode_plugin_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        dirs::config_dir().map(|c| c.join("opencode").join("plugins").join("soth-code.mjs"))
-    }
-    #[cfg(not(windows))]
-    {
-        dirs::home_dir().map(|h| {
-            h.join(".config")
-                .join("opencode")
-                .join("plugins")
-                .join("soth-code.mjs")
-        })
-    }
+    dirs::home_dir().map(|h| {
+        h.join(".config")
+            .join("opencode")
+            .join("plugins")
+            .join("soth-code.js")
+    })
 }
 
 /// One row in the auto-detection result — the agent the
@@ -2093,7 +2094,7 @@ mod tests {
     #[test]
     fn opencode_plugin_installs_with_binary_substituted() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("plugins").join("soth-code.mjs");
+        let path = tmp.path().join("plugins").join("soth-code.js");
         let report = install_opencode(&path, Some(binary_path())).unwrap();
         assert!(path.exists());
         let body = fs::read_to_string(&path).unwrap();

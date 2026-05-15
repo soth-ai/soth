@@ -54,11 +54,15 @@ impl Adapter for OpenCodeAdapter {
             .unwrap_or("")
             .to_string();
         // OpenCode's JS plugin can attach `model` / `ctx.model` to
-        // the stdin payload — wire it through when present.
+        // the stdin payload — wire it through when present. Newer
+        // OpenCode versions carry `model` on the per-event `input`
+        // object (chat.message / chat.params), so also probe
+        // `/input/model` as a fallback before giving up.
         let model = payload
             .get("model")
             .and_then(Value::as_str)
             .or_else(|| payload.pointer("/ctx/model").and_then(Value::as_str))
+            .or_else(|| payload.pointer("/input/model").and_then(Value::as_str))
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         let mut event = CodeEvent::new(NAME, hook_type, action, session, payload);
@@ -106,6 +110,37 @@ impl Adapter for OpenCodeAdapter {
                     content: p.to_string(),
                 })
             }
+            // OpenCode chat hooks: the plugin pre-extracts the user's
+            // typed text into `content` (concatenating `output.parts`
+            // text parts for chat.message, or `input.message.parts`
+            // for chat.params). Feed that to the classifier so the
+            // dashboard's use_case column gets a real ML label
+            // instead of "unknown".
+            "chat_message" => {
+                let text = event.payload.get("content").and_then(Value::as_str)?;
+                if text.is_empty() {
+                    return None;
+                }
+                let role = event.payload.get("role").and_then(Value::as_str);
+                let kind = match role {
+                    Some("assistant") => HookContentKind::AssistantTurn,
+                    _ => HookContentKind::PromptText,
+                };
+                Some(HookContentExtract {
+                    kind,
+                    content: text.to_string(),
+                })
+            }
+            "chat_params" => {
+                let text = event.payload.get("content").and_then(Value::as_str)?;
+                if text.is_empty() {
+                    return None;
+                }
+                Some(HookContentExtract {
+                    kind: HookContentKind::PromptText,
+                    content: text.to_string(),
+                })
+            }
             "tool_execute_before" => {
                 let tool = event
                     .payload
@@ -142,10 +177,24 @@ fn action_type_for(hook_type: &str, payload: &Value) -> ActionType {
             let tool = payload.get("tool").and_then(Value::as_str).unwrap_or("");
             tool_to_action(tool)
         }
+        // OpenCode emits `chat.message` for both user and assistant
+        // turns. The plugin tags `role` on the payload; treat the
+        // user-role turn like `user_prompt_submit` so the existing
+        // classify pipeline produces a real use-case label, and the
+        // assistant-role turn as a generic notification (model output
+        // doesn't drive policy in this codepath).
+        "chat_message" => match payload.get("role").and_then(Value::as_str) {
+            Some("assistant") => ActionType::Notification,
+            _ => ActionType::UserPromptSubmit,
+        },
         "user_prompt_submit" => ActionType::UserPromptSubmit,
         "session_created" | "session_idle_before" => ActionType::SessionStart,
         "session_idle" => ActionType::Notification,
         "session_error" | "session_end" => ActionType::SessionEnd,
+        // chat_params and permission_ask are bookkeeping today —
+        // surface them as notifications. Promote to a dedicated
+        // ActionType variant once we want policy to gate on them.
+        "chat_params" | "permission_ask" => ActionType::Notification,
         _ => ActionType::Notification,
     }
 }
@@ -192,5 +241,50 @@ mod tests {
         assert!(a.is_pre_action_hook("tool_execute_before"));
         assert!(!a.is_pre_action_hook("tool_execute_after"));
         assert!(!a.is_pre_action_hook("session_idle"));
+    }
+
+    #[test]
+    fn chat_message_user_role_maps_to_user_prompt_submit() {
+        let a = OpenCodeAdapter::new();
+        let payload = br#"{
+            "session_id": "ses_abc",
+            "model": "claude-sonnet-4-5-20251022",
+            "role": "user",
+            "content": "refactor this function for readability"
+        }"#;
+        let ev = a.parse_event("chat_message", payload).unwrap();
+        assert_eq!(ev.action_type, ActionType::UserPromptSubmit);
+        assert_eq!(ev.model.as_deref(), Some("claude-sonnet-4-5-20251022"));
+        let extract = a.classify_input(&ev).expect("user chat message classifies");
+        assert_eq!(extract.kind, HookContentKind::PromptText);
+        assert_eq!(extract.content, "refactor this function for readability");
+    }
+
+    #[test]
+    fn chat_message_assistant_role_routes_as_assistant_turn() {
+        let a = OpenCodeAdapter::new();
+        let payload = br#"{
+            "session_id": "ses_abc",
+            "role": "assistant",
+            "content": "Here's the refactored function..."
+        }"#;
+        let ev = a.parse_event("chat_message", payload).unwrap();
+        assert_eq!(ev.action_type, ActionType::Notification);
+        let extract = a.classify_input(&ev).expect("assistant turn classifies");
+        assert_eq!(extract.kind, HookContentKind::AssistantTurn);
+    }
+
+    #[test]
+    fn model_extracted_from_nested_input_path() {
+        // Older plugin builds didn't lift model to the top level —
+        // adapter should still find it on /input/model so we don't
+        // regress when running against an un-updated plugin.
+        let a = OpenCodeAdapter::new();
+        let payload = br#"{
+            "session_id": "ses_abc",
+            "input": { "sessionID": "ses_abc", "model": "gpt-5-codex" }
+        }"#;
+        let ev = a.parse_event("chat_message", payload).unwrap();
+        assert_eq!(ev.model.as_deref(), Some("gpt-5-codex"));
     }
 }
