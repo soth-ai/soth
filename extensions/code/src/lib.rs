@@ -1,5 +1,12 @@
 //! `soth-code` — synchronous per-action policy gate for AI coding agents.
 //!
+//! # Status: Experimental
+//!
+//! This extension is under active development. Public types and the on-disk
+//! hook contract may change between releases. APIs annotated as stable
+//! (`HookDecision`, `HookOutcome`, `run_hook`) are unlikely to move, but the
+//! parser / adapter / install surface is still in flux.
+//!
 //! See `docs/gryph/plan.md` for the architecture. In short:
 //!
 //! - The proxy observes the **network** layer (HTTP traffic to AI APIs).
@@ -9,12 +16,6 @@
 //!   agent's hook boundary, *before* a tool call / file edit / shell
 //!   command executes. Returns Allow / Block / Redact decisions that
 //!   propagate to the agent via its native blocking-hook contract.
-//!
-//! Subsequent groups land:
-//! - Group 3: `soth code hook` CLI handler (smoke E2E with stub adapter).
-//! - Group 4: Claude Code adapter (parser, install, redact, fixtures).
-//! - Group 5: classify + policy integration (the synchronous decision path).
-//! - Group 6: proxy bypass / cost-skim wiring; dashboard contract.
 
 #![forbid(unsafe_code)]
 
