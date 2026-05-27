@@ -105,7 +105,7 @@ pub fn run_hook(
 
     // 2. detect — scan payload for credential shapes, produce
     //    SensitiveArtifact per match. Same model the proxy uses.
-    //    Detection NEVER mutates the payload (gryph PR #40 / proxy
+    //    Detection NEVER mutates the payload (matches proxy
     //    semantics): mutation would be a policy decision
     //    (`PolicyDecisionKind::Redact`), not the detector's.
     let detect_start = std::time::Instant::now();
@@ -305,8 +305,8 @@ pub fn run_hook(
     //    decision is authoritative: Rego/CEL rules can Block, Allow,
     //    Redact, Reroute, Flag based on classify outputs + artifacts.
     //    When no bundle is loaded, fall through to the artifact-
-    //    driven default-deny — gryph Issue #20's silent fail-open
-    //    lesson, encoded as a security-tool default.
+    //    driven default-deny — silent fail-open is the failure mode
+    //    we explicitly avoid, encoded as a security-tool default.
     let policy_start = std::time::Instant::now();
     let (mut decision, mut policy) = match policy_bundle() {
         Some(bundle) => {
@@ -421,10 +421,9 @@ pub fn run_hook(
 /// Strips a leading UTF-8 BOM (`0xEF 0xBB 0xBF`) before returning.
 /// Cursor on Windows (Electron-based child_process.spawn) prepends a
 /// BOM to JSON stdin; serde_json doesn't tolerate it and rejects the
-/// payload as `expected value at line 1 column 1`.  gryph upstream
-/// has the identical latent bug — it just hasn't bitten them because
-/// most reporters run macOS / Linux Cursor builds where the BOM
-/// doesn't appear (filed for upstream as well).  Strip defensively
+/// payload as `expected value at line 1 column 1`.  The latent bug
+/// is upstream-wide: most reporters run macOS / Linux Cursor builds
+/// where the BOM doesn't appear. Strip defensively
 /// here in the common entry point so every adapter benefits, not
 /// just Cursor.  Costs nothing when no BOM is present.
 pub fn read_stdin_to_end() -> Result<Vec<u8>, io::Error> {
@@ -594,8 +593,8 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
         // Anthropic, codex → OpenAI, etc.) map by name. IDE-agnostic
         // agents (cursor / windsurf / opencode) attribute to the IDE
         // itself, not to a backend family inferred from the model
-        // string — the IDE *is* the attribution surface (gryph takes
-        // the same stance: its Event struct has no provider field).
+        // string — the IDE *is* the attribution surface (the
+        // dashboard already treats it as such).
         // The legacy `"code"` placeholder and the model-sniff fallback
         // both leaked through to the dashboard as misleading tiles.
         provider: resolve_provider(&ev.agent, ev.model.as_deref()).into(),
@@ -793,10 +792,9 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
         // model-string sniffing is unreliable (Cursor lifecycle hooks
         // carry no model, and even when present the model string can
         // be a custom local route that doesn't match any backend
-        // family). Attribute to the IDE itself — gryph's
-        // `core/events/event.go` takes the same stance: no provider
-        // field at all, only `AgentName`. The IDE *is* the
-        // attribution surface for these tools.
+        // family). Attribute to the IDE itself: no provider field at
+        // all, only the agent name. The IDE *is* the attribution
+        // surface for these tools.
         "cursor" => Some("cursor"),
         "windsurf" => Some("windsurf"),
         "opencode" => Some("opencode"),
@@ -957,8 +955,7 @@ fn build_normalized_for_policy(ev: &CodeEvent) -> NormalizedRequest {
 /// Build a `PolicyContext` from a `CodeEvent`. The `semantic` field
 /// carries classify outputs so OPA rules can read
 /// `input.semantic.use_case_label`, `input.semantic.anomaly_score`,
-/// etc. — which is the SOTH-vs-gryph capability advantage
-/// (docs/gryph/plan.md §10.10).
+/// etc.
 fn build_policy_context(ev: &CodeEvent) -> PolicyContext {
     let semantic = ev.classify.as_ref().map(|c| SemanticPolicyContext {
         use_case_label: parse_use_case_label(&c.use_case_label),
@@ -1316,7 +1313,7 @@ fn should_capture_raw(mode: CodeCaptureMode, decision: &HookDecision) -> bool {
 
 /// Insert the raw payload into the GovernableEvent's metadata,
 /// truncated to `capture.max_payload_bytes` so a megabyte-sized MCP
-/// tool response (gryph PR #32 surfaced this in the wild) doesn't
+/// tool response (observed in production at megabyte sizes) doesn't
 /// blow up queue-row size. The truncation marker `…[truncated]` is
 /// appended so the dashboard can render "this was cut" rather than
 /// silently dropping the tail.
@@ -1525,7 +1522,7 @@ mod tests {
         // Cursor / Windsurf / Opencode let the user pick a model from
         // any provider, but the IDE *is* the attribution surface — the
         // model string is unreliable (lifecycle hooks carry no model;
-        // custom routes don't match families) and gryph's own data
+        // custom routes don't match families) and the event data
         // model has no provider field at all. Attribute to the IDE
         // itself so the dashboard shows "cursor" instead of
         // model-string-inferred "anthropic" or the literal "unknown".

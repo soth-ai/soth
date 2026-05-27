@@ -2,7 +2,7 @@
 //! agent's native config so each tool action triggers
 //! `soth code hook --agent <name> --type <hook>`.
 //!
-//! Discipline (gryph PR #37 + the `settings.json` corruption class):
+//! Discipline (`settings.json` corruption class):
 //!
 //! 1. **Atomic write.** `tempfile::NamedTempFile::persist` does a
 //!    rename over the target path; either the new content lands fully
@@ -110,8 +110,7 @@ pub enum InstallError {
 /// Implementation note: hand-rolled wrapping (`format!("\"{}\"",
 /// …)`) covered the common case but missed paths containing `"`,
 /// `$`, backticks, or shell metachars.  Switched to `shlex::try_quote`
-/// — battle-tested escape rules that the engineer recommended
-/// ("check how gryph solves it or offload it").  shlex emits POSIX
+/// — battle-tested escape rules.  shlex emits POSIX
 /// shell-safe single-quoted form when needed; for plain paths
 /// without metachars it returns the path as-is.
 ///
@@ -163,7 +162,7 @@ pub fn default_claude_settings_path() -> Option<PathBuf> {
 
 /// Default Cursor hooks file location. Cursor uses a separate
 /// `hooks.json` file (not the larger `settings.json`) for hook
-/// configuration, mirroring gryph's `agent/cursor/detect.go::HooksPath`.
+/// configuration.
 pub fn default_cursor_hooks_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".cursor").join("hooks.json"))
 }
@@ -175,8 +174,7 @@ pub fn default_gemini_settings_path() -> Option<PathBuf> {
 }
 
 /// Default Codex hooks file location. Codex uses a dedicated
-/// `~/.codex/hooks.json` file separate from any larger settings doc
-/// (per gryph `agent/codex/detect.go::HooksPath`).
+/// `~/.codex/hooks.json` file separate from any larger settings doc.
 pub fn default_codex_hooks_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
 }
@@ -192,9 +190,9 @@ pub fn default_codex_hooks_path() -> Option<PathBuf> {
 /// Windsurf\`), which differs from the macOS / Linux dotfile
 /// convention.  Without the cfg(windows) branch the install
 /// command would write the hook config to a path the editor
-/// never reads from.  gryph upstream's `agent/windsurf/detect.go`
-/// has the same bug — falls back to the dotfile path on every
-/// OS — and our fix is the upstream fix.
+/// never reads from.  Upstream Windsurf detect paths have the same
+/// bug — falls back to the dotfile path on every OS — and our fix
+/// is the upstream fix.
 pub fn default_windsurf_hooks_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -235,9 +233,9 @@ pub fn default_pi_agent_plugin_path() -> Option<PathBuf> {
 /// #251 / #265 / #295 acknowledging the platform-specific
 /// override).  Without the cfg(windows) branch the install
 /// command would write to `%USERPROFILE%\.config\opencode\
-/// plugins\` which OpenCode does not read on Windows.  gryph
-/// upstream's `agent/opencode/detect.go` also misses this
-/// (single platform-agnostic `~/.config/opencode` constant);
+/// plugins\` which OpenCode does not read on Windows.  Upstream
+/// OpenCode also misses this (single platform-agnostic
+/// `~/.config/opencode` constant);
 /// our fix is the upstream fix.
 pub fn default_opencode_plugin_path() -> Option<PathBuf> {
     #[cfg(windows)]
@@ -323,7 +321,7 @@ pub fn canonical_agent_name(agent: &str) -> Option<&'static str> {
 /// trail.
 ///
 /// OpenClaw is intentionally excluded — its install path is
-/// pending upstream config-format spec (gryph PR #31).
+/// pending upstream config-format stabilization.
 pub fn detect_installable_agents() -> Vec<DetectedAgent> {
     // Each entry: (agent_name, default-path-fn, soth-managed-marker
     // string).  The marker matches what each installer writes;
@@ -592,8 +590,8 @@ pub fn install_claude_code(
     } else {
         // Pre-flight parse: refuse to overwrite a malformed settings
         // file. The operator may have an in-progress edit they
-        // haven't finished; clobbering it would be the gryph PR #37
-        // class of bug.
+        // haven't finished; clobbering it would be a destructive
+        // overwrite of work-in-progress config.
         serde_json::from_str(&original_content).map_err(|e| InstallError::Malformed {
             path: settings_path.to_path_buf(),
             source: e,
@@ -667,9 +665,8 @@ pub fn install_claude_code(
 
 /// Gemini CLI's hook events. Upstream uses PascalCase (`BeforeTool`,
 /// `AfterTool`, `SessionStart`); we normalize to snake_case for the
-/// soth-code CLI surface uniform across agents. The 5 hook types
-/// gryph installs (slim set — Gemini's hook protocol is younger than
-/// Claude Code's).
+/// soth-code CLI surface uniform across agents. Slim 5-hook set —
+/// Gemini's hook protocol is younger than Claude Code's.
 const GEMINI_HOOK_TYPES: &[(&str, &str)] = &[
     ("BeforeTool", "before_tool_call"),
     ("AfterTool", "after_tool_call"),
@@ -749,7 +746,7 @@ const CURSOR_HOOK_TYPES: &[(&str, &str)] = &[
 
 /// Install soth-code hooks into Cursor's `~/.cursor/hooks.json`.
 ///
-/// Cursor's hooks.json shape (per gryph's `cursor/hooks.go`):
+/// Cursor's hooks.json shape:
 ///
 /// ```json
 /// {
@@ -768,7 +765,7 @@ const CURSOR_HOOK_TYPES: &[(&str, &str)] = &[
 /// user-authored hook entries.
 ///
 /// Same atomic-write + `.bak` + pre-flight-parse discipline as
-/// `install_claude_code` (gryph PR #37 lessons).
+/// `install_claude_code`.
 pub fn install_cursor(
     hooks_path: &Path,
     binary_path_override: Option<PathBuf>,
@@ -913,8 +910,8 @@ pub fn uninstall_cursor(hooks_path: &Path) -> Result<(), InstallError> {
 }
 
 /// Install soth-code hooks into Gemini CLI's `~/.gemini/settings.json`.
-/// Same nested-matcher shape Claude Code uses — gryph's
-/// `agent/gemini/hooks.go` confirms `HookMatcher{matcher, hooks:[{type,command}]}`
+/// Same nested-matcher shape Claude Code uses —
+/// `HookMatcher{matcher, hooks:[{type,command}]}`
 /// is the wire form Gemini accepts. Reuses the Claude Code helper to
 /// minimize divergent install paths.
 pub fn install_gemini_cli(
@@ -950,8 +947,7 @@ pub fn uninstall_codex(hooks_path: &Path) -> Result<(), InstallError> {
 }
 
 /// Install soth-code hooks into Windsurf's
-/// `~/.codeium/windsurf/hooks.json`. Cursor-style flat shape per
-/// gryph `agent/windsurf/hooks.go`.
+/// `~/.codeium/windsurf/hooks.json`. Cursor-style flat shape.
 pub fn install_windsurf(
     hooks_path: &Path,
     binary_path_override: Option<PathBuf>,
@@ -1876,7 +1872,7 @@ mod tests {
         assert_eq!(report.hooks_added.len(), CURSOR_HOOK_TYPES.len());
         assert!(
             CURSOR_HOOK_TYPES.len() >= 19,
-            "cursor coverage should remain at-or-above 19 hooks (gryph parity + postToolUseFailure)"
+            "cursor coverage should remain at-or-above 19 hooks (full Cursor hook surface + postToolUseFailure)"
         );
         let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         // Spot-check newly added hooks land in the file.
@@ -1899,7 +1895,7 @@ mod tests {
     fn cursor_install_still_writes_version_field() {
         // Regression guard: the shared `install_flat_style` helper is
         // also used by Cursor; the `version: 1` field should only
-        // appear for Cursor (per gryph upstream), not Windsurf.
+        // appear for Cursor, not Windsurf.
         let (_tmp, path) = fixture_settings("");
         super::install_cursor(&path, Some(binary_path())).unwrap();
         let body: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();

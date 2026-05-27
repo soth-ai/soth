@@ -7,7 +7,7 @@
 //! (`HookDecision`, `HookOutcome`, `run_hook`) are unlikely to move, but the
 //! parser / adapter / install surface is still in flux.
 //!
-//! See `docs/gryph/plan.md` for the architecture. In short:
+//! Architecture in short:
 //!
 //! - The proxy observes the **network** layer (HTTP traffic to AI APIs).
 //! - The historian observes the **session** layer (local file-watch

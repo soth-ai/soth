@@ -3,9 +3,9 @@
 //! Mirrors `parser_corpus.rs` (Claude Code) but for the Cursor adapter.
 //! Walks `tests/fixtures/cursor/<hook_type>/*.json` and runs every
 //! file through `CursorAdapter::parse_event`. Fixtures are ported from
-//! gryph's `agent/cursor/testdata/` — gryph upstream is the closest
-//! thing to a captured-payload corpus we have today; replace with
-//! locally-captured payloads as we observe them in production.
+//! the bundled test fixtures — the closest thing to a captured-
+//! payload corpus we have today; replace with locally-captured
+//! payloads as we observe them in production.
 
 use std::fs;
 use std::path::Path;

@@ -8,7 +8,7 @@
 // `soth` binary for each hook event, propagating Block decisions
 // (exit code 2) back to Pi Agent so the upcoming action is halted.
 //
-// Architectural choice (gryph PR #20 / #22 lessons):
+// Architectural choices:
 //   - spawnSync, not spawn — fire-and-forget would silently bypass
 //     policy enforcement.
 //   - Hard 30s timeout — anything longer freezes the agent UX.

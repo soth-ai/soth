@@ -31,8 +31,8 @@ function invokeSoth(hookType, payload) {
   } catch (e) {
     // Exit code 2 → policy Block. Throw so OpenCode halts the action.
     // Other exit codes (1 = tooling error) get logged but don't
-    // block — gryph Issue #20 lesson: distinguish enforcement from
-    // tooling errors.
+    // block — distinguish enforcement from tooling errors so plugin
+    // bugs never silently bypass policy.
     if (e && e.status === 2) {
       const reason =
         (e.stderr && e.stderr.toString().trim()) || "Blocked by soth-code policy";

@@ -77,10 +77,9 @@ impl Adapter for CursorAdapter {
         }
 
         // Cursor carries `model` in the top-level hook payload on
-        // every hook (`agent/cursor/parser.go:18` in gryph). Note:
-        // when a `subagent_start` event includes a separate
-        // `subagent.model`, gryph treats the subagent's model as
-        // the authoritative one for that branch — we mirror that.
+        // every hook. Note: when a `subagent_start` event includes a
+        // separate `subagent.model`, we treat the subagent's model
+        // as the authoritative one for that branch.
         let model = event
             .payload
             .pointer("/subagent/model")
@@ -443,9 +442,8 @@ mod tests {
 
     #[test]
     fn extract_model_prefers_subagent_when_present() {
-        // gryph treats subagent.model as authoritative for
-        // subagent_start branches (gryph cursor parser handles
-        // the same way).  Pin that ordering.
+        // subagent.model is authoritative for subagent_start
+        // branches. Pin that ordering.
         let a = CursorAdapter::new();
         let p = br#"{
             "conversation_id":"c1",

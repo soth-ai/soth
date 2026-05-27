@@ -56,8 +56,7 @@ fn fixtures_in(hook_type: &str) -> Vec<(String, Vec<u8>)> {
 }
 
 /// The fixture corpus exists and has at least the documented minimum
-/// (≥20 across hook types, per docs/gryph/implementation.md D-2 and
-/// Phase 1 gate).
+/// (≥20 captured payloads across hook types).
 #[test]
 fn corpus_meets_minimum_size() {
     let mut total = 0;
@@ -140,8 +139,8 @@ fn pre_tool_use_mcp_collapses_to_tool_use() {
 
 #[test]
 fn subagent_attribution_extracted_from_inline_fields() {
-    // gryph PR #38: detected by *presence* of agent_id + agent_type,
-    // not by hook event name.
+    // Subagent attribution: detected by *presence* of agent_id +
+    // agent_type, not by hook event name.
     let ev = parse("pre_tool_use", "09_subagent_invocation.json");
     let sub = ev.subagent.expect("subagent context populated");
     assert_eq!(sub.subagent_id, "ag-uuid-9000");
@@ -154,14 +153,14 @@ fn subagent_attribution_extracted_from_inline_fields() {
 
 #[test]
 fn post_tool_use_array_response_does_not_crash() {
-    // gryph PR #32: real MCP tool responses are sometimes arrays.
+    // Real MCP tool responses are sometimes arrays.
     let ev = parse("post_tool_use", "04_mcp_array_response.json");
     assert!(ev.payload["tool_response"].is_array());
 }
 
 #[test]
 fn post_tool_use_null_response_does_not_crash() {
-    // gryph PR #32: also null.
+    // Real MCP tool responses are sometimes null.
     let ev = parse("post_tool_use", "05_mcp_null_response.json");
     assert!(ev.payload["tool_response"].is_null());
 }

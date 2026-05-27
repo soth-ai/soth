@@ -10,8 +10,7 @@
 //! JSON `{decision, reason, guidance}` object.
 //!
 //! **Install deferred.** Upstream OpenClaw's hook configuration
-//! format is unstable (gryph PR #31 was still open at the time
-//! of this commit), so `soth code install --target openclaw`
+//! format is still in flux, so `soth code install --target openclaw`
 //! returns a clear "format pending" message rather than writing
 //! a config that may not match upstream's settled shape.  The
 //! parser, classify-on-hook, policy evaluation, and decision
@@ -86,8 +85,7 @@ impl Adapter for OpenClawAdapter {
     }
 
     fn render_decision(&self, decision: &HookDecision) -> AdapterResponse {
-        // Anthropic-style protocol matching gryph's reference
-        // OpenClaw adapter.  stdout carries the decision JSON,
+        // Anthropic-style protocol.  stdout carries the decision JSON,
         // stderr a trimmed reason for terminal display, exit 2
         // signals "halt the action".
         match decision {
@@ -218,8 +216,8 @@ mod tests {
         let a = OpenClawAdapter::new();
         let patterns: Vec<&str> = a.ua_patterns().to_vec();
         // Both case variants and the dashed form — proxy
-        // matching needs all three because gryph's traffic
-        // capture observed all three live.
+        // matching needs all three because production traffic
+        // shows all three live.
         assert!(patterns.contains(&"openclaw/*"));
         assert!(patterns.contains(&"OpenClaw/*"));
         assert!(patterns.contains(&"open-claw/*"));
@@ -232,8 +230,7 @@ mod tests {
         assert!(a.is_pre_action_hook("pre_tool_use"));
         assert!(a.is_pre_action_hook("user_prompt_submit"));
         // Post-action: can't halt the past.  Block decisions
-        // here would just produce stop-hook feedback loops
-        // (the gryph PR #28 lesson encoded crate-wide).
+        // here would just produce stop-hook feedback loops.
         assert!(!a.is_pre_action_hook("post_tool_use"));
         assert!(!a.is_pre_action_hook("stop"));
         assert!(!a.is_pre_action_hook("session_start"));

@@ -1,7 +1,6 @@
 //! `soth code` command family — synchronous policy gate at the AI
-//! coding agent's hook boundary. See `docs/gryph/plan.md` §10 for the
-//! architecture; this module is the CLI surface that the agent's
-//! `spawnSync` invocation ultimately hits.
+//! coding agent's hook boundary. This module is the CLI surface that
+//! the agent's `spawnSync` invocation ultimately hits.
 
 use std::fs;
 use std::io::Write;
@@ -46,7 +45,8 @@ pub enum CodeCommands {
 
     /// Diagnostics: resolved paths, install state, queue size,
     /// adapter availability. Always uses the same path resolver as
-    /// the runtime (gryph PR #37).
+    /// the runtime so doctor output cannot disagree with what the
+    /// hook actually sees at runtime.
     Doctor(DoctorArgs),
 
     /// Print recent action events from the queue file. Defaults to
@@ -284,7 +284,7 @@ fn run_hook(args: HookArgs) -> Result<()> {
             // Group 4+ adapters return per-agent block codes.
             let raw = match &outcome.decision {
                 soth_code::HookDecision::Allow => 0,
-                soth_code::HookDecision::Block { .. } => 2, // gryph PR #22 default
+                soth_code::HookDecision::Block { .. } => 2, // canonical Block exit code
                 soth_code::HookDecision::Error(_) => 1,
             };
             std::process::exit(raw);
@@ -327,7 +327,7 @@ fn run_install(args: InstallArgs) -> Result<()> {
         "openclaw" => anyhow::bail!(
             "OpenClaw install is parser-only — the runtime adapter, classify, \
              and policy paths all work, but the upstream hook-config format \
-             is unstable (gryph PR #31). Configure hooks manually to point \
+             is unstable upstream. Configure hooks manually to point \
              at `soth code hook --agent openclaw --type <hook_type>` and \
              `soth code tail --agent openclaw` will surface them once \
              enabled."
@@ -593,8 +593,9 @@ fn resolve_uninstall_path(
 }
 
 fn run_doctor(args: DoctorArgs) -> Result<()> {
-    // Single-source path resolver — the gryph PR #37 contract.
-    // Doctor must not have its own resolution path that disagrees
+    // Single-source path resolver — the runtime and doctor share
+    // one resolver. Doctor must not have its own resolution path
+    // that disagrees
     // with the runtime hook handler.
     let paths = match args.root {
         Some(root) => CodePaths::from_root(&root),

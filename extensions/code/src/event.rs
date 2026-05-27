@@ -78,7 +78,7 @@ pub struct HookCaptureConfig {
     /// into the queue. Larger payloads are truncated with a marker
     /// suffix. 64 KiB by default — enough for typical Bash commands
     /// and Read content but bounded against MCP tool responses
-    /// (which gryph PR #32 found can be megabyte-sized).
+    /// (which have been observed at megabyte sizes in production).
     pub max_payload_bytes: usize,
 }
 
@@ -134,9 +134,8 @@ impl ActionType {
 /// Subagent attribution from agent-tool / sub-agent invocations
 /// (Claude Code's Agent tool, e.g.). `None` for main-agent calls.
 ///
-/// Detected by *presence* of `agent_id` / `agent_type` in hook payload
-/// — gryph PR #38 verified this is the only reliable signal; hook
-/// event names alone do not distinguish main vs subagent.
+/// Detected by *presence* of `agent_id` / `agent_type` in hook payload.
+/// Hook event names alone do not distinguish main vs subagent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentContext {
     pub subagent_id: String,
@@ -289,9 +288,9 @@ pub struct CodeEvent {
     /// don't have to re-derive.
     pub correlation_key: String,
     /// Raw hook stdin payload. Keep as `Value` until we narrow on use —
-    /// gryph PR #32 showed that real MCP servers return shapes the docs
-    /// don't predict; defensively typed access to the few fields we need
-    /// at parse time, full payload preserved here for telemetry / debug.
+    /// real MCP servers return shapes their own docs don't predict;
+    /// defensively typed access to the few fields we need at parse
+    /// time, full payload preserved here for telemetry / debug.
     pub payload: serde_json::Value,
     /// Outputs from the synchronous classify call run on the hook
     /// payload. `None` when the hook event isn't classifiable

@@ -581,8 +581,7 @@ pub struct HistorianExtensionConfig {
     /// Defaults: `claude_code = true` (plan §9 confirmation;
     /// historian's `claude_code` playbook ships with verified
     /// `usage` extraction). All other agents default `false`
-    /// pending the per-agent audit (`docs/gryph/plan.md` §9
-    /// estimates ~1 engineer-day each).
+    /// pending the per-agent audit (~1 engineer-day each).
     ///
     /// Uses an explicit field-default fn rather than
     /// `#[serde(default)]` so that a YAML file containing
@@ -778,9 +777,7 @@ impl Default for HistorianRunMode {
 }
 
 /// `soth-code` extension config. Per-action policy gate at the AI coding
-/// agent's hook boundary (Claude Code, Cursor, Codex, …). See
-/// `docs/gryph/plan.md` §10 for the layer model and §10.11 for the
-/// per-agent A→C trajectory.
+/// agent's hook boundary (Claude Code, Cursor, Codex, …).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeExtensionConfig {
@@ -797,13 +794,14 @@ pub struct CodeExtensionConfig {
     ///
     /// `Allow`: failures are logged and the action proceeds. Operator
     /// must accept the visibility risk; surfaces a `WARN` log line on
-    /// every fall-through (gryph Issue #20: silent fail-open is how
-    /// Pi Agent shipped policy enforcement that secretly didn't enforce).
+    /// every fall-through. (Silent fail-open is how earlier policy-
+    /// enforcement implementations shipped enforcement that secretly
+    /// did not enforce — do not opt into Allow lightly.)
     pub on_policy_error: PolicyErrorMode,
 
     /// Hard ceiling for the synchronous hook path. The agent waits this
-    /// long before assuming the hook has hung. Default 30s, matching
-    /// gryph PR #22's chosen value (anything longer freezes the agent).
+    /// long before assuming the hook has hung. Default 30s — anything
+    /// longer freezes the agent UX.
     pub timeout_ms: u32,
 
     /// Per-agent enablement. Agents with no entry default to disabled
@@ -878,8 +876,7 @@ impl Default for ClassifyRunMode {
 
 /// `code.capture` block. See [`CodeCaptureMode`] for semantics; the
 /// `max_payload_bytes` cap protects against megabyte-sized MCP tool
-/// responses (gryph PR #32) blowing up queue-row size when raw
-/// capture is enabled.
+/// responses blowing up queue-row size when raw capture is enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeCaptureConfig {
@@ -1125,7 +1122,7 @@ mod code_extension_config_tests {
 
     #[test]
     fn code_config_default_matches_documented() {
-        // README example default must match code default — gryph Issue #41
+        // README example default must match code default — a prior bug
         // shipped because docs claimed `minimal` log level was default while
         // code default was `standard`. Pin the contract here.
         let c = CodeExtensionConfig::default();

@@ -1,7 +1,7 @@
 //! Cross-layer correlation key.
 //!
 //! SOTH observes AI agent activity at three orthogonal layers (network /
-//! action / session — see `docs/gryph/plan.md` §10). Each layer emits its
+//! action / session). Each layer emits its
 //! own event records; the dashboard joins them per-session via this
 //! deterministic key.
 //!

@@ -4,7 +4,7 @@
 //! That covers: adapter parse → credential detect → classify (fallback
 //! bundle) → policy decide → enqueue (atomic JSONL append).
 //!
-//! Targets (docs/gryph/plan.md §10.10):
+//! Targets:
 //! - p99 ≤ 50ms cached
 //! - p99 ≤ 100ms cold
 //!
@@ -22,7 +22,7 @@ use soth_code::paths::CodePaths;
 
 /// Three input shapes covering the hot paths the dashboard cares about:
 /// clean tool action (Allow), credential-bearing command (Block),
-/// MCP tool response with a non-trivial array shape (the gryph PR #32
+/// MCP tool response with a non-trivial array shape (a regression
 /// stress case).
 fn inputs() -> Vec<(&'static str, &'static [u8])> {
     vec![

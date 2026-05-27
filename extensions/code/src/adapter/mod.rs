@@ -54,7 +54,7 @@ pub trait Adapter: Send + Sync {
     /// Extract the content the classify pipeline should see for this
     /// event. `None` for bookkeeping hooks (session_start, etc.).
     /// The default implementation returns `None`; adapters override
-    /// per agent's hook taxonomy. See `docs/gryph/plan.md` §10.10.
+    /// per agent's hook taxonomy.
     fn classify_input(&self, _event: &CodeEvent) -> Option<HookContentExtract> {
         None
     }
@@ -64,9 +64,8 @@ pub trait Adapter: Send + Sync {
     /// action hooks (Stop, PostToolUse, Notification, …) fire after
     /// the fact, where Block prevents nothing and creates feedback
     /// loops when post-event payloads echo content that triggered
-    /// the original detection (gryph 2026-05-08 soak finding;
-    /// hook.rs `is_enforceable_hook` regression test pins this
-    /// guarantee).
+    /// the original detection. The `hook.rs::is_enforceable_hook`
+    /// regression test pins this guarantee.
     ///
     /// Default `false` (safe — adapters must opt their pre-action
     /// hooks in explicitly). Each agent's pre-action hook taxonomy
@@ -120,8 +119,8 @@ pub fn for_agent(name: &str) -> Option<Box<dyn Adapter>> {
         "opencode" => Some(Box::new(OpenCodeAdapter::new())),
         // OpenClaw: parser + classify + decision rendering live;
         // `soth code install --target openclaw` is the deferred
-        // piece (upstream config-format unstable per gryph PR
-        // #31). Manually-configured hooks pointing at
+        // piece (upstream config-format still in flux).
+        // Manually-configured hooks pointing at
         // `soth code hook --agent openclaw --type ...` work
         // end-to-end against this adapter.
         "openclaw" | "open_claw" | "open-claw" => Some(Box::new(OpenClawAdapter::new())),

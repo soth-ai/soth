@@ -1,10 +1,10 @@
 //! Line-count delta helper for `file_write` payloads.
 //!
-//! Direct port of the gryph PR #21/#22 lesson: `SplitLines("")` (Go
-//! difflib) returns `[""]` not `[]` for empty inputs, which made every
-//! "create new file" event look like it had 1 unchanged line. Same trap
-//! exists with naive `str::split('\n').count()`. This helper
-//! special-cases empty sides explicitly.
+//! Subtle Go-difflib trap that has bitten prior implementations:
+//! `SplitLines("")` returns `[""]` not `[]` for empty inputs, which
+//! makes every "create new file" event look like it had 1 unchanged
+//! line. Naive `str::split('\n').count()` has the same problem. This
+//! helper special-cases empty sides explicitly.
 
 /// Compute `(lines_added, lines_removed)` between optional old and new
 /// content. Both `None` and empty-string are treated identically — there
@@ -45,7 +45,7 @@ pub fn line_count_delta(old: Option<&str>, new: Option<&str>) -> (u32, u32) {
 }
 
 /// Count newline-delimited lines in `s`. `None` and `Some("")` both
-/// return 0 — gryph PR #21/#22's bug was in not collapsing those cases.
+/// return 0 — collapse those cases explicitly.
 fn count_lines(s: Option<&str>) -> u32 {
     match s {
         None | Some("") => 0,
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn both_empty_is_zero() {
-        // The trap from gryph PR #21: SplitLines("") returns [""] not [].
+        // The Go-difflib trap: SplitLines("") returns [""] not [].
         // Empty sides must collapse to (0, 0), not (1, 1) or (1, 0).
         assert_eq!(line_count_delta(None, None), (0, 0));
         assert_eq!(line_count_delta(Some(""), Some("")), (0, 0));
