@@ -1687,7 +1687,7 @@ mod tests {
     #[test]
     fn executable_path_matches_canonical_unix_layouts() {
         assert!(is_soth_executable_path("/usr/local/bin/soth"));
-        assert!(is_soth_executable_path("/Users/gilfoyle/.local/bin/soth"));
+        assert!(is_soth_executable_path("/Users/jane/.local/bin/soth"));
         assert!(is_soth_executable_path("soth"));
     }
 

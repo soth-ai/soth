@@ -56,7 +56,7 @@ import (
     "context"
     _ "embed"
 
-    "github.com/labterminal/soth/sdks/soth-go/soth"
+    "github.com/soth-ai/soth/sdks/soth-go/soth"
 )
 
 //go:embed soth_sdk_core.wasm

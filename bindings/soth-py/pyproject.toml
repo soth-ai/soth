@@ -31,8 +31,8 @@ mistral = ["mistralai>=1.0"]
 test = ["pytest>=8", "openai>=1.0"]
 
 [project.urls]
-Homepage = "https://github.com/labterminal/soth"
-Repository = "https://github.com/labterminal/soth"
+Homepage = "https://github.com/soth-ai/soth"
+Repository = "https://github.com/soth-ai/soth"
 
 [tool.maturin]
 # `extension-module` is a soth-py crate feature (gates pyo3's
