@@ -212,6 +212,7 @@ fn tool_to_action(tool_name: &str) -> ActionType {
 /// 1. `GEMINI_MODEL` env var (CI/dev override).
 /// 2. `~/.gemini/settings.json` `model` field — Gemini CLI's
 ///    persistent active-model record.
+///
 /// All failures swallowed; the hook just sets `model = None` and
 /// the dashboard renders "unknown" for that event.
 fn extract_model_fallback() -> Option<String> {

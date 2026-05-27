@@ -16,8 +16,9 @@
 //! - Quarantine xattr (`com.apple.quarantine`) is cleared best-effort —
 //!   most curl-installed binaries don't have it, but downloads through
 //!   Safari/Finder will.
-
-#![cfg(target_os = "macos")]
+//!
+//! Gated at the `mod swap_macos;` declaration in update/mod.rs by
+//! `#[cfg(target_os = "macos")]`; no inner cfg needed here.
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;

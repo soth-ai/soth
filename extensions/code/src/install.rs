@@ -330,7 +330,8 @@ pub fn detect_installable_agents() -> Vec<DetectedAgent> {
     // grep-checking for it tells us if hooks are already wired.
     // Agents listed under their canonical names — same keys
     // historian audit, doctor, and state file all use.
-    let candidates: &[(&'static str, fn() -> Option<PathBuf>, &'static str)] = &[
+    type AgentEntry = (&'static str, fn() -> Option<PathBuf>, &'static str);
+    let candidates: &[AgentEntry] = &[
         ("claude_code", default_claude_settings_path, "_soth_managed"),
         ("cursor", default_cursor_hooks_path, "_soth_managed"),
         ("openai_codex", default_codex_hooks_path, "_soth_managed"),

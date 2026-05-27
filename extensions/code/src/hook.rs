@@ -691,28 +691,6 @@ fn attach_code_detect_metadata(gov: &mut GovernableEvent, meta: &CodeDetectMetad
     }
 }
 
-/// Synthesize a `ClassifySidecar` for per-tool hooks.
-///
-/// `pre_tool_use` / `post_tool_use` payloads are tool args / tool
-/// results — JSON, not natural language.  Running the classify
-/// pipeline on them costs a daemon round-trip and returns Unknown
-/// (`is_ai_call` short-circuits non-NL kinds in
-/// `soth-classify/src/hook_entry.rs:157`).  Instead, we synthesize
-/// a sidecar locally:
-///
-///   * `use_case_label`  — the **tool name** itself ("Bash",
-///     "Read", "Edit") so the dashboard renders one row per tool
-///     call with a deterministic, human-meaningful label.
-///   * `use_case_secondary_label` — canonical `ActionType`
-///     ("FileRead", "CommandExec", …) for grouping multiple tool
-///     names that share an action category.
-///   * `use_case_label_reason` — `pre_tool_call` /
-///     `post_tool_call` so dashboards / rollups can distinguish
-///     synthesized tool rows from real ONNX classifications and
-///     filter pre vs post phase explicitly.
-///   * Numeric scores zeroed (no embedding ran) — prevents
-///     anomaly / complexity rollups from being polluted by
-///     non-NL events.
 /// Pre vs post tool-call hook phase. Stamped as
 /// `UseCaseLabelReason::PreToolCall` / `::PostToolCall` so cloud
 /// rollups can split "tool calls issued" from "tool calls
@@ -750,6 +728,28 @@ fn extract_tool_name(ev: &CodeEvent) -> String {
     format!("{:?}", ev.action_type)
 }
 
+/// Synthesize a `ClassifySidecar` for per-tool hooks.
+///
+/// `pre_tool_use` / `post_tool_use` payloads are tool args / tool
+/// results — JSON, not natural language.  Running the classify
+/// pipeline on them costs a daemon round-trip and returns Unknown
+/// (`is_ai_call` short-circuits non-NL kinds in
+/// `soth-classify/src/hook_entry.rs:157`).  Instead, we synthesize
+/// a sidecar locally:
+///
+///   * `use_case_label`  — the **tool name** itself ("Bash",
+///     "Read", "Edit") so the dashboard renders one row per tool
+///     call with a deterministic, human-meaningful label.
+///   * `use_case_secondary_label` — canonical `ActionType`
+///     ("FileRead", "CommandExec", …) for grouping multiple tool
+///     names that share an action category.
+///   * `use_case_label_reason` — `pre_tool_call` /
+///     `post_tool_call` so dashboards / rollups can distinguish
+///     synthesized tool rows from real ONNX classifications and
+///     filter pre vs post phase explicitly.
+///   * Numeric scores zeroed (no embedding ran) — prevents
+///     anomaly / complexity rollups from being polluted by
+///     non-NL events.
 fn synthesize_tool_call_sidecar(ev: &CodeEvent, phase: ToolHookPhase) -> ClassifySidecar {
     let tool_name = extract_tool_name(ev);
     let reason = match phase {
@@ -860,12 +860,10 @@ fn policy_bundle() -> Option<&'static PolicyBundle> {
         }
         if let Some(path) = bundle_path() {
             if path.exists() {
-                match soth_policy::load_bundle(&path) {
-                    Ok(bundle) => {
-                        soth_policy::warm(&bundle);
-                        return Some(Box::leak(Box::new(bundle)));
-                    }
-                    Err(_) => {} // fall through to embedded
+                // Err falls through to embedded bundle below.
+                if let Ok(bundle) = soth_policy::load_bundle(&path) {
+                    soth_policy::warm(&bundle);
+                    return Some(Box::leak(Box::new(bundle)));
                 }
             }
         }
@@ -1773,7 +1771,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn run_hook_strips_utf8_bom_from_cursor_stdin() {
         // Cursor on Windows (Electron child_process.spawn) prepends
         // a UTF-8 BOM (0xEF 0xBB 0xBF) to JSON stdin — serde_json
@@ -2539,7 +2536,6 @@ mod tests {
         assert_eq!(action.command, None);
     }
 
-    #[test]
     #[test]
     fn build_action_policy_context_normalizes_windows_backslash_paths() {
         // Windows paths use backslashes

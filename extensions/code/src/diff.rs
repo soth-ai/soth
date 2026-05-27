@@ -48,8 +48,7 @@ pub fn line_count_delta(old: Option<&str>, new: Option<&str>) -> (u32, u32) {
 /// return 0 — gryph PR #21/#22's bug was in not collapsing those cases.
 fn count_lines(s: Option<&str>) -> u32 {
     match s {
-        None => 0,
-        Some(t) if t.is_empty() => 0,
+        None | Some("") => 0,
         Some(t) => t.lines().count() as u32,
     }
 }

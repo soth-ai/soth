@@ -113,8 +113,8 @@ pub enum ClassificationMode {
     /// leaves the customer's environment.
     #[default]
     Full,
-    /// No local embedding. Heuristic detect + counter-based anomaly
-    /// + artifact-based policy. Telemetry events emit with sentinel
+    /// No local embedding. Heuristic detect, counter-based anomaly,
+    /// and artifact-based policy. Telemetry events emit with sentinel
     /// values for the semantic fields and a canonical `missing_fields`
     /// list so cloud analytics can filter precisely.
     Reduced,

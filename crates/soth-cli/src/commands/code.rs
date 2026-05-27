@@ -664,7 +664,8 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         Json,   // settings.json / hooks.json with per-event entries
         Plugin, // single .mjs / .ts file with a marker line
     }
-    let agents: &[(&str, fn() -> Option<PathBuf>, AgentKind)] = &[
+    type AgentEntry = (&'static str, fn() -> Option<PathBuf>, AgentKind);
+    let agents: &[AgentEntry] = &[
         ("claude_code", default_claude_settings_path, AgentKind::Json),
         ("cursor", default_cursor_hooks_path, AgentKind::Json),
         ("openai_codex", default_codex_hooks_path, AgentKind::Json),
@@ -1334,7 +1335,8 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         "stage", "p50_us", "p95_us", "p99_us", "max_us"
     );
     println!("  {}", "-".repeat(56));
-    let stages: &[(&str, fn(&soth_code::hook::HookTimings) -> u64)] = &[
+    type StageEntry = (&'static str, fn(&soth_code::hook::HookTimings) -> u64);
+    let stages: &[StageEntry] = &[
         ("parse", |t| t.parse_us),
         ("detect", |t| t.detect_us),
         ("classify", |t| t.classify_us),

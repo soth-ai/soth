@@ -232,8 +232,10 @@ mod tests {
 
     #[test]
     fn scrub_event_redacts_breadcrumb_data() {
-        let mut crumb = sentry::protocol::Breadcrumb::default();
-        crumb.message = Some("ghp_isThisALeak?".to_string());
+        let mut crumb = sentry::protocol::Breadcrumb {
+            message: Some("ghp_isThisALeak?".to_string()),
+            ..sentry::protocol::Breadcrumb::default()
+        };
         crumb
             .data
             .insert("authorization".to_string(), json!("Bearer xyz"));

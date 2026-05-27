@@ -41,8 +41,10 @@ fn fallback_bundle_returns_valid_classification_output() {
 #[test]
 fn embedding_disabled_emits_embedding_disabled_reason() {
     let bundle = soth_classify::ClassifyBundle::fallback();
-    let mut config = soth_classify::ClassifyConfig::default();
-    config.embedding_enabled = false;
+    let config = soth_classify::ClassifyConfig {
+        embedding_enabled: false,
+        ..soth_classify::ClassifyConfig::default()
+    };
     let detect = common::make_detect_result();
     let proxy = common::make_proxy_ctx(None);
 

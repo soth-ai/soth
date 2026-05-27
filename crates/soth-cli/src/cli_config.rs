@@ -1272,12 +1272,14 @@ forward_proxy:
         // claude_code passes audit post-fix; the others stay
         // dropped.  Operator who wires up bypass for the full
         // set sees only `claude-cli/*` engage.
-        let mut proxy = ForwardProxyConfig::default();
-        proxy.bypass_agents = vec![
-            "claude-cli/*".to_string(),
-            "cursor/*".to_string(),
-            "windsurf-extension/*".to_string(),
-        ];
+        let proxy = ForwardProxyConfig {
+            bypass_agents: vec![
+                "claude-cli/*".to_string(),
+                "cursor/*".to_string(),
+                "windsurf-extension/*".to_string(),
+            ],
+            ..ForwardProxyConfig::default()
+        };
         let historian = HistorianExtensionConfig::default();
         let (allowed, dropped) = proxy.audited_bypass_agents(&historian);
         assert_eq!(allowed, vec!["claude-cli/*"]);
@@ -1294,8 +1296,10 @@ forward_proxy:
         // claude-cli/* pass the filter even though the default
         // is false.  This is the "I did the audit, here's the
         // evidence" path.
-        let mut proxy = ForwardProxyConfig::default();
-        proxy.bypass_agents = vec!["claude-cli/*".to_string()];
+        let proxy = ForwardProxyConfig {
+            bypass_agents: vec!["claude-cli/*".to_string()],
+            ..ForwardProxyConfig::default()
+        };
         let mut historian = HistorianExtensionConfig::default();
         historian.adapters.insert(
             "claude_code".to_string(),

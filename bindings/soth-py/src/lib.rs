@@ -9,6 +9,12 @@
 //! partly here (the FFI boundary) and partly in `python/soth/exceptions.py`
 //! (the `SothBlocked` exception + propagation tests).
 
+// pyo3's `?` operator triggers clippy::useless_conversion via the
+// `From<PyErr> for PyErr` blanket impl every time a fallible helper
+// returns PyResult. This is a known false positive — suppressing at
+// module level to keep the binding boundary readable.
+#![allow(clippy::useless_conversion)]
+
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};

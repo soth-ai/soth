@@ -169,14 +169,12 @@ fn realworld_provider_corpus_model_extraction() {
     let mut tested = 0usize;
     let mut model_ok = 0usize;
     let mut ai_call_ok = 0usize;
-    let mut skipped_no_format = 0usize;
     let mut failures = Vec::new();
 
     for (provider_id, entry) in &detect.llm_providers {
         let api_format = match entry.api_format.as_deref() {
             Some(f) => f,
             None => {
-                skipped_no_format += 1;
                 continue;
             }
         };
@@ -184,7 +182,6 @@ fn realworld_provider_corpus_model_extraction() {
         let test_req = match request_for_api_format(api_format) {
             Some(r) => r,
             None => {
-                skipped_no_format += 1;
                 continue;
             }
         };
@@ -202,7 +199,6 @@ fn realworld_provider_corpus_model_extraction() {
             Some(h) => h,
             None => {
                 // Provider only has wildcard domains — skip (can't simulate without real host)
-                skipped_no_format += 1;
                 continue;
             }
         };
@@ -267,9 +263,6 @@ fn realworld_provider_corpus_model_extraction() {
         );
     }
 
-    if !failures.is_empty() {
-        for f in &failures[..failures.len().min(15)] {}
-    }
 
     assert!(
         tested >= 20,

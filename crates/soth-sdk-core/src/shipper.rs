@@ -14,8 +14,9 @@
 //! window, no retry/circuit-breaker. Phase 2 ports the full retry
 //! semantics from `soth-sync` (5 attempts with exp backoff, 72-hour
 //! dead-letter, circuit breaker after 5 consecutive failures).
-
-#![cfg(feature = "http-telemetry")]
+//!
+//! Gated at the `mod shipper;` declaration in lib.rs by
+//! `#[cfg(feature = "http-telemetry")]`; no inner cfg needed here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

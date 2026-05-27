@@ -76,8 +76,10 @@ fn main() {
         raw_body_bytes: None,
     };
 
-    let mut session = SessionSnapshot::default();
-    session.current_request_timestamp = 1_777_000_000_000;
+    let session = SessionSnapshot {
+        current_request_timestamp: 1_777_000_000_000,
+        ..SessionSnapshot::default()
+    };
 
     let proxy = ProxyContext {
         identity: soth_core::IdentityContext {
