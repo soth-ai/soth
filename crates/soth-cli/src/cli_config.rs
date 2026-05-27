@@ -59,29 +59,20 @@ pub struct ForwardProxyConfig {
     pub max_in_flight_bytes: usize,
     pub max_concurrent_flows: usize,
 
-    // ── soth-code per-agent gating (→ docs/gryph/plan.md §10.11/.12) ──
-    /// **Planned, not yet effective.** User-Agent glob patterns for
-    /// AI coding agents whose traffic should bypass MITM at the proxy
-    /// once the §10.11 A→C trajectory closes for that agent.  Today
-    /// the `audited_bypass_agents` filter validates membership against
-    /// `historian.adapters.<agent>.usage_coverage_audited` and
-    /// `soth code audit-status` reports the result, but **the proxy's
-    /// listener loop does not yet consume this list** — adding an
-    /// entry here is observable in `audit-status` but does not
-    /// actually cause the proxy to bypass that agent.  Wiring lands
-    /// when the bypass-eligibility gate becomes a runtime concern;
-    /// until then this knob is forward-looking config only.
-    /// Default empty.
-    #[serde(default)]
+    // ── EXPERIMENTAL: soth-code per-agent gating (forward-looking) ──
+    //
+    // These two knobs are reserved for future per-agent MITM bypass
+    // and cost-skim routing. They are NOT wired into the proxy listener
+    // loop today — setting them has no runtime effect beyond appearing
+    // in `soth code audit-status`. Hidden from rustdoc and skipped from
+    // serialization when empty so they don't show up in default config
+    // dumps. Will become real configuration when the bypass-eligibility
+    // gate lands at runtime.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bypass_agents: Vec<String>,
-    /// User-Agent glob patterns for agents in **cost-skim** mode: proxy
-    /// emits a narrow event with provider/model/tokens/cost only, no
-    /// classify, no tool-use parsing. Used as a transitional fallback
-    /// for agents whose historian playbook does not yet capture
-    /// authoritative `usage` blocks (plan §10.12). Migrates to
-    /// `bypass_agents` once historian usage coverage is audited.
-    /// Default empty.
-    #[serde(default)]
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cost_skim_agents: Vec<String>,
 }
 
