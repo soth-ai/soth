@@ -72,6 +72,7 @@ fn main() {
         ast_normalized_hash: None,
         first_blob_event_id: None,
         import_categories: Vec::new(),
+        user_prompt: None,
         raw_body_bytes: None,
     };
 

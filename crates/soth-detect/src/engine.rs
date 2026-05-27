@@ -249,6 +249,7 @@ pub fn process_normalized(
         first_blob_event_id: None,
         import_categories: scan.import_categories,
         user_prompt,
+        raw_body_bytes: None,
     }
 }
 
@@ -1319,6 +1320,7 @@ pub fn to_core_detect_result(value: &ParseDetectResult) -> soth_core::DetectResu
         first_blob_event_id: value.first_blob_event_id,
         import_categories: value.import_categories.clone(),
         user_prompt: value.normalized.user_prompt.clone(),
+        raw_body_bytes: value.raw_body_bytes.clone(),
     }
 }
 
