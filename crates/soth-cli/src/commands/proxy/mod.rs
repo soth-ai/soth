@@ -155,8 +155,11 @@ pub async fn run_doctor_reset_network() -> anyhow::Result<()> {
 
         // Best-effort sudo invocation. If the user can't sudo without a
         // password, we just print the manual command and continue.
-        let mdns_status = std::process::Command::new("sudo")
-            .args(["-n", "killall", "-HUP", "mDNSResponder"])
+        // Use absolute paths (not bare names) so a malicious binary
+        // earlier in $PATH can't intercept the password prompt or run
+        // arbitrary code as the operator.
+        let mdns_status = std::process::Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/killall", "-HUP", "mDNSResponder"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

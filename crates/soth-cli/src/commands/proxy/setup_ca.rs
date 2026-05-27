@@ -258,9 +258,12 @@ fn install_trust_macos(cert_path: &Path) -> Result<()> {
             "Trusting CA. macOS may prompt for your password (sudo, then a \
              trust-settings authorization dialog).",
         );
-        let status = Command::new("sudo")
+        // Use absolute paths so a binary earlier in $PATH can't
+        // impersonate sudo or `security` and capture the operator's
+        // password or hijack the trust-store mutation.
+        let status = Command::new("/usr/bin/sudo")
             .args([
-                "security",
+                "/usr/bin/security",
                 "add-trusted-cert",
                 "-d",
                 "-r",
