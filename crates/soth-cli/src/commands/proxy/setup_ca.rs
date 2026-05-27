@@ -156,6 +156,22 @@ fn generate_ca_files(cert_path: &Path, key_path: &Path) -> Result<()> {
         .with_context(|| format!("failed writing {}", cert_path.display()))?;
     std::fs::write(key_path, key.serialize_pem())
         .with_context(|| format!("failed writing {}", key_path.display()))?;
+    // The CA private key is the trust root for every TLS interception the proxy
+    // performs — any other local user who can read it can sign certs for any
+    // domain the user later visits. Lock it down to 0600 immediately. On
+    // Windows, ACLs are applied separately by the caller via
+    // reapply_windows_key_acl().
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed setting 0600 permissions on {}",
+                    key_path.display()
+                )
+            })?;
+    }
     Ok(())
 }
 

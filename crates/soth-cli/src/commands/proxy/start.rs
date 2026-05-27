@@ -126,11 +126,15 @@ pub async fn run(
         let key_meta = std::fs::metadata(&key_path)?;
         let mode = key_meta.mode() & 0o777;
         if mode & 0o077 != 0 {
-            tracing::warn!(
-                path = %key_path.display(),
-                mode = format!("{:o}", mode),
-                "CA private key has overly permissive file permissions. \
-                 Expected 0600, got {:o}. Run: chmod 600 {}",
+            // The CA private key is the trust root for every TLS interception
+            // the proxy performs. If group/other can read it, any local user
+            // can sign certs for any domain the user later visits. Refuse to
+            // start until the operator chmods it back to 0600 — warning was
+            // not enough.
+            anyhow::bail!(
+                "CA private key at {} has overly permissive file permissions \
+                 ({:o}). Expected 0600. Fix with: chmod 600 {}",
+                key_path.display(),
                 mode,
                 key_path.display()
             );
