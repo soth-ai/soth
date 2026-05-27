@@ -1,5 +1,9 @@
 # @soth/sdk-edge
 
+> **EXPERIMENTAL — scaffold only.** Public JS API surface is in
+> place but the WASM bridge that backs it is **not yet wired**.
+> Today `guard()` short-circuits to Allow. Do not use in production.
+
 SOTH SDK for edge runtimes — Cloudflare Workers, Vercel Edge,
 Deno Deploy, Fastly Compute. WASM-backed.
 

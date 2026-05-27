@@ -4,7 +4,7 @@
   "description": "SOTH SDK for Node.js — observability + policy enforcement for LLM API calls.",
   "main": "index.js",
   "types": "index.d.ts",
-  "license": "MIT OR Apache-2.0",
+  "license": "MPL-2.0",
   "engines": {
     "node": ">=18"
   },

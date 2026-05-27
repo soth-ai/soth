@@ -1,5 +1,11 @@
 # soth-go
 
+> **EXPERIMENTAL — scaffold only.** Public Go API surface is frozen
+> at this scaffold but the WASM bridge that backs it is **not yet
+> wired**. Today `sdk.Guard()` short-circuits to Allow. Do not use
+> in production. Track readiness via the
+> [Go SDK milestone](https://github.com/soth-ai/soth/milestones).
+
 Go SDK for SOTH — observability + policy enforcement for LLM API calls.
 
 Loads the same `soth-sdk-core` WASM artifact the edge SDK uses, via
