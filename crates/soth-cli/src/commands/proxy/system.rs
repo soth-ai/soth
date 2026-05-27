@@ -1456,7 +1456,7 @@ async fn configure_windows_proxy(enable: bool, port: u16, print_user_output: boo
 #[cfg(target_os = "windows")]
 fn notify_windows_proxy_changed() {
     use windows_sys::Win32::Networking::WinInet::{
-        INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
+        InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
     };
 
     // Two-call WinInet pattern: SETTINGS_CHANGED rebuilds proxy info from
