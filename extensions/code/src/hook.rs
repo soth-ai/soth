@@ -1644,7 +1644,6 @@ mod tests {
         // Never falls back to the legacy "code" placeholder.
         assert_eq!(
             resolve_provider("brand_new_agent", Some("future-model-x")),
-            resolve_provider("brand_new_agent", Some("future-model-x")),
             "unknown"
         );
         assert_eq!(resolve_provider("brand_new_agent", None), "unknown");

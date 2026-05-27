@@ -269,10 +269,9 @@ fn windows_short_path(path: &Path) -> Option<String> {
 ///   (there's no 8.3 equivalent on APFS / ext4; mitigations would
 ///   require a no-space symlink at install time, which is heavier).
 fn executable_token(binary_path: &Path) -> String {
-    let normalized = binary_path.display().to_string().replace('\\', "/");
-
     #[cfg(windows)]
     {
+        let normalized = binary_path.display().to_string().replace('\\', "/");
         // No-whitespace happy path: every spawner can run an unquoted
         // path that has no internal whitespace. Quoting it would
         // regress Codex Desktop without helping anyone else.
@@ -371,24 +370,29 @@ pub fn default_pi_agent_plugin_path() -> Option<PathBuf> {
 /// `~/.config/opencode/plugins/soth-code.js` on macOS, Linux, and
 /// Windows. On Windows that resolves to `C:\Users\<user>\.config\
 /// opencode\plugins\soth-code.js` (a literal `.config` directory
-/// under the user profile, NOT `%APPDATA%\Roaming\`). Confirmed
-/// empirically and against the official plugin docs at
-/// <https://opencode.ai/docs/plugins/>: the OpenCode app on Windows
-/// reads `opencode.jsonc` / `opencode.json`, log files, AND the
-/// plugins directory from this same XDG root, not from `%APPDATA%`.
+/// under the user profile, NOT `%APPDATA%\Roaming\`).
 ///
-/// File extension is `.js` (NOT `.mjs`). The docs explicitly list
-/// "JavaScript (`.js`) or TypeScript (`.ts`)" as the accepted plugin
-/// extensions, and empirically `.mjs` files in the plugins directory
-/// are skipped by OpenCode's auto-discovery loader.
+/// **Source of truth (upstream OpenCode):**
+/// - Config dir resolution: `packages/core/src/global.ts` imports
+///   `xdgConfig` from the `xdg-basedir` npm package; that package
+///   falls back to `path.join(homedir(), '.config')` on every
+///   platform — there is no `%APPDATA%` branch. So Windows resolves
+///   to `<USERPROFILE>\.config\opencode` for config, data, log,
+///   state, and the `plugins/` subdir alike.
+/// - Plugin auto-discovery: `packages/opencode/src/config/plugin.ts`
+///   scans loose files in the plugins dir with the glob
+///   `{plugin,plugins}/*.{ts,js}`. Only `.ts` and `.js` are
+///   matched; `.mjs`, `.cjs`, and `.tsx` files at the top of the
+///   plugins directory are silently skipped by auto-discovery.
+///   That is why this path emits `soth-code.js` rather than
+///   `soth-code.mjs`.
 ///
-/// An earlier version of this function used `dirs::config_dir()` on
-/// Windows, which resolves to `%APPDATA%\Roaming\` — produced
-/// installs that wrote `soth-code.mjs` to a path OpenCode never
-/// loaded from. The install reported success but the plugin silently
-/// never fired. Fixed by unifying the path to `~/.config/opencode/
-/// plugins/` (empirically verified to be where OpenCode actually
-/// reads plugins from on Windows).
+/// An earlier version of this function used `dirs::config_dir()`
+/// on Windows, which resolves to `%APPDATA%\Roaming\`, and wrote
+/// `soth-code.mjs`. Both halves of that path were wrong: OpenCode
+/// never reads from `%APPDATA%`, and even if it had, `.mjs` files
+/// would be filtered out by the `{ts,js}` glob. Installs reported
+/// success but the plugin silently never fired.
 pub fn default_opencode_plugin_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| {
         h.join(".config")
