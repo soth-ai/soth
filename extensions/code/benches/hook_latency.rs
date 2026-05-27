@@ -48,7 +48,14 @@ fn bench_hook_pipeline(c: &mut Criterion) {
     // Warm the classify bundle cache before measuring. Otherwise the
     // first sample in the benchmark would absorb the bundle-load cost
     // and skew the reported p99 upward.
-    let _ = soth_code::run_hook("claude_code", "pre_tool_use", inputs()[0].1, &paths);
+    let capture = soth_code::HookCaptureConfig::default();
+    let _ = soth_code::run_hook(
+        "claude_code",
+        "pre_tool_use",
+        inputs()[0].1,
+        &paths,
+        &capture,
+    );
 
     let mut group = c.benchmark_group("hook_pipeline");
     // Hook subprocess invocations are short-lived; sample a lot for
@@ -66,6 +73,7 @@ fn bench_hook_pipeline(c: &mut Criterion) {
                         black_box("pre_tool_use"),
                         black_box(payload),
                         black_box(&paths),
+                        black_box(&capture),
                     )
                     .expect("hook ok");
                     black_box(outcome.event_id)
