@@ -66,3 +66,4 @@ soth-mitm = "0.3.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tempfile = { workspace = true }
