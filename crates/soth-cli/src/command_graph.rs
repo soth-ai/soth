@@ -552,9 +552,11 @@ async fn run_update_command(args: UpdateArgs) -> anyhow::Result<()> {
                     &pending.offer.url,
                     &pending.offer.version,
                 ) {
-                    eprintln!(
-                        "using pending offer: {} (release_seq={}) from {}",
-                        pending.offer.version, pending.offer.release_seq, base,
+                    tracing::info!(
+                        version = %pending.offer.version,
+                        release_seq = pending.offer.release_seq,
+                        base = %base,
+                        "using pending offer"
                     );
                     manifest_url = Some(base);
                     version = Some(pending.offer.version);
