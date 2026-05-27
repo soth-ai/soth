@@ -290,7 +290,7 @@ fn read_kv_sessions(
                     .record_key_template
                     .replace("{session_id}", &session_id)
                     .replace("{record_id}", "");
-                let pattern = format!("{}%", session_prefix);
+                let pattern = format!("{session_prefix}%");
 
                 let scan_sql = format!(
                     "SELECT {value_column} FROM {table} WHERE key LIKE ?1 ORDER BY rowid ASC"

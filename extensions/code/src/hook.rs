@@ -1403,7 +1403,7 @@ fn append_timing_row(path: &Path, timings: &HookTimings) -> std::io::Result<()> 
         create_dir_all(parent)?;
     }
     let mut line = serde_json::to_string(timings)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     line.push('\n');
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(line.as_bytes())?;

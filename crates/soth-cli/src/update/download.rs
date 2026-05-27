@@ -61,9 +61,9 @@ pub async fn download_binary(
         .get(url)
         .send()
         .await
-        .with_context(|| format!("GET {}", url))?
+        .with_context(|| format!("GET {url}"))?
         .error_for_status()
-        .with_context(|| format!("download returned non-2xx: {}", url))?;
+        .with_context(|| format!("download returned non-2xx: {url}"))?;
 
     let content_length = resp.content_length();
     let mut hasher = Sha256::new();
@@ -107,9 +107,7 @@ pub async fn download_binary(
     if !actual.eq_ignore_ascii_case(expected_sha256) {
         let _ = tokio::fs::remove_file(&sink.stage_path).await;
         bail!(
-            "sha256 mismatch: expected {}, got {} (binary discarded)",
-            expected_sha256,
-            actual,
+            "sha256 mismatch: expected {expected_sha256}, got {actual} (binary discarded)",
         );
     }
 
@@ -117,9 +115,7 @@ pub async fn download_binary(
         if downloaded != total {
             let _ = tokio::fs::remove_file(&sink.stage_path).await;
             bail!(
-                "download size mismatch: expected {} bytes (Content-Length), got {}",
-                total,
-                downloaded
+                "download size mismatch: expected {total} bytes (Content-Length), got {downloaded}"
             );
         }
     }
@@ -188,7 +184,7 @@ mod tests {
             sock.write_all(&body).await.unwrap();
             sock.flush().await.unwrap();
         });
-        format!("http://{}/binary", addr)
+        format!("http://{addr}/binary")
     }
 
     #[tokio::test]
@@ -219,7 +215,7 @@ mod tests {
         };
         let bogus = "0".repeat(64);
         let err = download_binary(&url, &bogus, &sink).await.unwrap_err();
-        assert!(format!("{:#}", err).contains("sha256 mismatch"));
+        assert!(format!("{err:#}").contains("sha256 mismatch"));
         // Partial file must have been removed.
         assert!(!sink.stage_path.exists());
     }

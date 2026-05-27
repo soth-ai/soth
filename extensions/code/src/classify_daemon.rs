@@ -772,7 +772,7 @@ mod tests {
         // verify the oldest get dropped.
         let mut snap = SessionSnapshot::default();
         for i in 0..(MAX_PRIOR_HASHES + 5) {
-            let h = soth_core::sha256_hex(&format!("turn-{i}"));
+            let h = soth_core::sha256_hex(format!("turn-{i}"));
             update_snapshot_with_result(
                 &mut snap,
                 &make_classified_result(&h, (i + 1) as u32),

@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn ua_patterns_cover_known_spellings() {
         let a = OpenClawAdapter::new();
-        let patterns: Vec<&str> = a.ua_patterns().iter().copied().collect();
+        let patterns: Vec<&str> = a.ua_patterns().to_vec();
         // Both case variants and the dashed form — proxy
         // matching needs all three because gryph's traffic
         // capture observed all three live.

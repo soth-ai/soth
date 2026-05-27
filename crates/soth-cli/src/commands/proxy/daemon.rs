@@ -800,8 +800,8 @@ fn is_soth_daemon_command_line(command: &str) -> bool {
         .filter(|t| !t.is_empty())
         .collect();
 
-    let has_start = tokens.iter().any(|t| *t == "start");
-    let has_daemon_child = tokens.iter().any(|t| *t == "--daemon-child");
+    let has_start = tokens.contains(&"start");
+    let has_daemon_child = tokens.contains(&"--daemon-child");
 
     // The first token is the executable. Be lenient about path/extension
     // shapes (`/usr/local/bin/soth`, `C:\…\soth.exe`, plain `soth`).

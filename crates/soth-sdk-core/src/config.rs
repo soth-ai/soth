@@ -141,6 +141,7 @@ pub enum StorageMode {
 /// Where bundles come from at SDK init.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+#[derive(Default)]
 pub enum BundleSource {
     /// Pull from the configured CDN URL with Ed25519 signature
     /// verification. Default for production deployments.
@@ -151,14 +152,10 @@ pub enum BundleSource {
     Embedded,
     /// Tests / dev: use the deterministic fallback bundle from
     /// `soth_classify::fallback_bundle()`.
+    #[default]
     Fallback,
 }
 
-impl Default for BundleSource {
-    fn default() -> Self {
-        BundleSource::Fallback
-    }
-}
 
 /// Top-level SDK configuration. Construct via [`SdkConfigBuilder`].
 pub struct SdkConfig {

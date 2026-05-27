@@ -538,19 +538,12 @@ pub struct PipelineOverrides {
 /// extensions can grow knobs without affecting the others.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ExtensionsConfig {
     pub historian: HistorianExtensionConfig,
     pub code: CodeExtensionConfig,
 }
 
-impl Default for ExtensionsConfig {
-    fn default() -> Self {
-        Self {
-            historian: HistorianExtensionConfig::default(),
-            code: CodeExtensionConfig::default(),
-        }
-    }
-}
 
 /// Historian extension config. Backfills + watches local AI-tool history
 /// (Cursor, Claude Code, Gemini CLI, ...) and enriches it with classify.
@@ -856,17 +849,11 @@ pub struct CodeExtensionConfig {
 /// is dispatched — daemon, in-process, or off entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct CodeClassifyConfig {
     pub run_mode: ClassifyRunMode,
 }
 
-impl Default for CodeClassifyConfig {
-    fn default() -> Self {
-        Self {
-            run_mode: ClassifyRunMode::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -963,6 +950,7 @@ impl Default for PolicyErrorMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct CodeAgentConfig {
     /// Whether the adapter is active. Off-by-default per agent so a
     /// misconfigured `code` block doesn't route through unintended
@@ -970,11 +958,6 @@ pub struct CodeAgentConfig {
     pub enabled: bool,
 }
 
-impl Default for CodeAgentConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
-}
 
 pub fn default_config_path() -> PathBuf {
     dirs::home_dir()

@@ -174,8 +174,7 @@ fn post_batch(
             );
             if std::env::var("SOTH_SHIPPER_VERBOSE").is_ok() {
                 eprintln!(
-                    "[soth-sdk-core::shipper] {} {} -> {} ({} events dropped): {}",
-                    label, endpoint, status, batch_size, body_text
+                    "[soth-sdk-core::shipper] {label} {endpoint} -> {status} ({batch_size} events dropped): {body_text}"
                 );
             }
         }
@@ -187,8 +186,7 @@ fn post_batch(
             );
             if std::env::var("SOTH_SHIPPER_VERBOSE").is_ok() {
                 eprintln!(
-                    "[soth-sdk-core::shipper] {} {} -> ERROR ({} events dropped): {}",
-                    label, endpoint, batch_size, error
+                    "[soth-sdk-core::shipper] {label} {endpoint} -> ERROR ({batch_size} events dropped): {error}"
                 );
             }
         }
@@ -205,7 +203,7 @@ fn build_request(org_id: &str, batch: Vec<CoreTelemetryEvent>) -> TelemetryBatch
         org_id: org_id.to_string(),
         // SDK has no signed device-id-hash flow; cloud accepts the
         // bearer token + org_id alone for SDK-class telemetry.
-        device_id_hash: format!("sdk:{}", org_id),
+        device_id_hash: format!("sdk:{org_id}"),
         proxy_version: format!("soth-sdk-core/{}", env!("CARGO_PKG_VERSION")),
         timestamp,
         events,

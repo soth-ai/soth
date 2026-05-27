@@ -1343,13 +1343,13 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         ("total", |t| t.total_us),
     ];
     for (name, picker) in stages {
-        let mut samples: Vec<u64> = rows.iter().map(|r| picker(r)).collect();
+        let mut samples: Vec<u64> = rows.iter().map(picker).collect();
         samples.sort_unstable();
         let p50 = percentile(&samples, 50);
         let p95 = percentile(&samples, 95);
         let p99 = percentile(&samples, 99);
         let max = *samples.last().unwrap_or(&0);
-        println!("  {:<12} {:>8} {:>8} {:>8} {:>8}", name, p50, p95, p99, max);
+        println!("  {name:<12} {p50:>8} {p95:>8} {p99:>8} {max:>8}");
     }
 
     // Decision breakdown — operators want to know how many hits
@@ -1367,8 +1367,7 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     }
     println!();
     println!(
-        "decisions: {} allow, {} block, {} error",
-        allow_count, block_count, error_count
+        "decisions: {allow_count} allow, {block_count} block, {error_count} error"
     );
     Ok(())
 }
@@ -1399,7 +1398,6 @@ fn print_audit_row(agent: &str, entry: Option<&cli_config::HistorianAdapterAudit
         None => ("no", "—", ""),
     };
     println!(
-        "  {:<14} {:<8} {:<30} {}",
-        agent, audited, audited_at, caveats
+        "  {agent:<14} {audited:<8} {audited_at:<30} {caveats}"
     );
 }

@@ -2134,7 +2134,7 @@ mod tests {
                 .map(|hooks| {
                     hooks.values().any(|v| {
                         v.as_array()
-                            .map(|arr| arr.iter().any(|e| is_soth_managed(e)))
+                            .map(|arr| arr.iter().any(is_soth_managed))
                             .unwrap_or(false)
                     })
                 })

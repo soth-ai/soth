@@ -46,7 +46,7 @@ pub async fn run_check(
             // Soft-fail on the seq gate — we don't want a downgraded
             // manifest to look like an error to a user just running
             // `soth update --check`. Surface as "up-to-date" but warn.
-            let msg = format!("{:#}", e);
+            let msg = format!("{e:#}");
             if msg.contains("anti-rollback gate") {
                 println!("up-to-date (server's manifest is older than last applied)");
                 write_cache_no_update(channel)?;
@@ -101,8 +101,7 @@ pub async fn run_check(
             current, manifest.version, manifest.channel
         );
         println!(
-            "  but no platform entry for '{}' — manual download required",
-            plat
+            "  but no platform entry for '{plat}' — manual download required"
         );
         return Ok(UpdateStatus::UpdateAvailable);
     }
@@ -115,7 +114,7 @@ pub async fn run_check(
     println!("  url:    {}", entry.url);
     println!("  sha256: {}", entry.sha256);
     if let Some(notes) = &manifest.release_notes_url {
-        println!("  notes:  {}", notes);
+        println!("  notes:  {notes}");
     }
     println!(
         "  apply:  soth update --apply --channel {}",
@@ -173,7 +172,7 @@ pub async fn run_apply(
     let entry = manifest
         .platforms
         .get(plat)
-        .with_context(|| format!("manifest has no platform entry for '{}'", plat))?
+        .with_context(|| format!("manifest has no platform entry for '{plat}'"))?
         .clone();
 
     println!("downloading soth {} from {}…", manifest.version, entry.url);
@@ -186,29 +185,27 @@ pub async fn run_apply(
     let swapper = make_swapper(staged)?;
 
     if let Err(e) = swapper.pre_swap().await {
-        mark_pending_apply_failed(&format!("pre-swap: {:#}", e));
-        bail!("pre-swap failed: {:#}", e);
+        mark_pending_apply_failed(&format!("pre-swap: {e:#}"));
+        bail!("pre-swap failed: {e:#}");
     }
     if let Err(e) = swapper.swap().await {
         // We may have stopped the daemon but failed mid-rename. Best-effort
         // restart of whatever is still on disk so the user isn't left
         // without a running proxy.
         let _ = swapper.post_swap().await;
-        mark_pending_apply_failed(&format!("swap: {:#}", e));
-        bail!("swap failed: {:#} (daemon restart attempted)", e);
+        mark_pending_apply_failed(&format!("swap: {e:#}"));
+        bail!("swap failed: {e:#} (daemon restart attempted)");
     }
     if let Err(e) = swapper.post_swap().await {
         tracing::warn!(error = %e, "post-swap healthcheck failed; rolling back");
         if let Err(rb) = swapper.rollback().await {
-            mark_pending_apply_failed(&format!("apply+rollback: {:#}", e));
+            mark_pending_apply_failed(&format!("apply+rollback: {e:#}"));
             bail!(
-                "apply failed AND rollback failed: apply={:#}; rollback={:#}",
-                e,
-                rb
+                "apply failed AND rollback failed: apply={e:#}; rollback={rb:#}"
             );
         }
-        mark_pending_apply_failed(&format!("post-swap rolled back: {:#}", e));
-        bail!("apply failed: {:#}; rolled back to previous binary", e);
+        mark_pending_apply_failed(&format!("post-swap rolled back: {e:#}"));
+        bail!("apply failed: {e:#}; rolled back to previous binary");
     }
 
     // On success, persist updated cache so subsequent --check is honest.
@@ -288,7 +285,7 @@ pub async fn run_finish_staged(
     let entry = manifest
         .platforms
         .get(plat)
-        .with_context(|| format!("manifest has no platform entry for '{}'", plat))?
+        .with_context(|| format!("manifest has no platform entry for '{plat}'"))?
         .clone();
 
     // Re-verify the staged file against the signed manifest's sha256.
@@ -311,26 +308,24 @@ pub async fn run_finish_staged(
     let swapper = make_swapper(staged_path)?;
 
     if let Err(e) = swapper.pre_swap().await {
-        mark_pending_apply_failed(&format!("pre-swap (helper): {:#}", e));
-        bail!("pre-swap failed: {:#}", e);
+        mark_pending_apply_failed(&format!("pre-swap (helper): {e:#}"));
+        bail!("pre-swap failed: {e:#}");
     }
     if let Err(e) = swapper.swap().await {
         let _ = swapper.post_swap().await;
-        mark_pending_apply_failed(&format!("swap (helper): {:#}", e));
-        bail!("swap failed: {:#}", e);
+        mark_pending_apply_failed(&format!("swap (helper): {e:#}"));
+        bail!("swap failed: {e:#}");
     }
     if let Err(e) = swapper.post_swap().await {
         tracing::warn!(error = %e, "post-swap healthcheck failed; rolling back");
         if let Err(rb) = swapper.rollback().await {
-            mark_pending_apply_failed(&format!("apply+rollback (helper): {:#}", e));
+            mark_pending_apply_failed(&format!("apply+rollback (helper): {e:#}"));
             bail!(
-                "apply failed AND rollback failed: apply={:#}; rollback={:#}",
-                e,
-                rb
+                "apply failed AND rollback failed: apply={e:#}; rollback={rb:#}"
             );
         }
-        mark_pending_apply_failed(&format!("post-swap rolled back (helper): {:#}", e));
-        bail!("apply failed: {:#}; rolled back to previous binary", e);
+        mark_pending_apply_failed(&format!("post-swap rolled back (helper): {e:#}"));
+        bail!("apply failed: {e:#}; rolled back to previous binary");
     }
 
     let cached = CachedUpdate {
@@ -392,7 +387,7 @@ pub async fn run_rollback() -> Result<()> {
 /// stray heartbeat offer can't redirect downloads to an attacker-
 /// controlled origin via clever URL crafting.
 pub(crate) fn derive_base_url_from_offer(offer_url: &str, version: &str) -> Option<String> {
-    let marker = format!("/v{}/", version);
+    let marker = format!("/v{version}/");
     offer_url
         .split_once(&marker)
         .map(|(prefix, _)| prefix.to_string())

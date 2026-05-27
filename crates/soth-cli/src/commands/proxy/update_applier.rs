@@ -262,7 +262,7 @@ async fn run_apply_for_platform(
     let entry = manifest
         .platforms
         .get(plat)
-        .with_context(|| format!("manifest has no platform entry for '{}'", plat))?
+        .with_context(|| format!("manifest has no platform entry for '{plat}'"))?
         .clone();
 
     tracing::info!(
@@ -373,8 +373,7 @@ fn spawn_finish_staged_helper(
 
 async fn countdown(secs: u64) {
     eprintln!(
-        "Restarting soth in {} seconds. Press Ctrl-C in the daemon to abort.",
-        secs
+        "Restarting soth in {secs} seconds. Press Ctrl-C in the daemon to abort."
     );
     let interval = if secs >= 5 { secs / 5 } else { 1 };
     let mut remaining = secs;
@@ -383,7 +382,7 @@ async fn countdown(secs: u64) {
         tokio::time::sleep(Duration::from_secs(step)).await;
         remaining = remaining.saturating_sub(step);
         if remaining > 0 {
-            eprintln!("  …{} seconds…", remaining);
+            eprintln!("  …{remaining} seconds…");
         }
     }
 }
