@@ -14,7 +14,6 @@ pub mod error;
 pub mod playbook;
 pub mod playbooks;
 pub mod reader;
-pub mod readers;
 pub mod session;
 pub mod types;
 pub mod watch;
