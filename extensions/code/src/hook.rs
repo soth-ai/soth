@@ -83,6 +83,27 @@ pub fn run_hook(
     let adapter =
         adapter::for_agent(agent_name).ok_or_else(|| HookError::UnknownAgent(agent_name.into()))?;
 
+    // Cursor honors Claude Code's hook-protocol contract: when Cursor's
+    // AI integration runs, it reads BOTH ~/.cursor/hooks.json AND
+    // ~/.claude/settings.json, firing two hook subprocesses per action.
+    // The cursor-side invocation already produces a canonical event;
+    // skip the claude_code duplicate when an ancestor process is Cursor.
+    // Standalone `claude` CLI invocations (Cursor not in the parent chain)
+    // continue to fire normally.
+    if agent_name == "claude_code" && ancestor_chain_includes_cursor() {
+        let decision = HookDecision::Allow;
+        let response = adapter.render_decision(&decision);
+        tracing::debug!(
+            hook_type = hook_type,
+            "soth-code: claude_code hook invoked by Cursor; skipping enqueue (cursor sibling will own the event)"
+        );
+        return Ok(HookOutcome {
+            event_id: Uuid::nil(),
+            decision,
+            exit_code: response.exit_code(),
+        });
+    }
+
     // 1. parse — adapter produces a CodeEvent.  Strip a leading
     //    UTF-8 BOM defensively before handing to the adapter so
     //    every parse path benefits regardless of how stdin was
@@ -442,6 +463,37 @@ fn strip_utf8_bom(buf: Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// Detect whether this hook subprocess was invoked by Cursor (the IDE
+/// honoring Claude Code's hook-protocol contract) rather than by the
+/// standalone `claude` CLI.
+///
+/// Cursor reads BOTH `~/.cursor/hooks.json` AND `~/.claude/settings.json`
+/// when its AI integration runs, so a single user action fires two
+/// soth-code hook subprocesses — one as `--agent cursor`, one as
+/// `--agent claude_code` — with identical content. Returns `true` if
+/// any ancestor process in the chain is Cursor; callers use this to
+/// drop the duplicate `--agent claude_code` event.
+fn ancestor_chain_includes_cursor() -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut pid = Pid::from(std::process::id() as usize);
+    for _ in 0..8 {
+        let Some(proc) = system.process(pid) else {
+            return false;
+        };
+        let name = proc.name().to_string_lossy().to_ascii_lowercase();
+        if name.starts_with("cursor") {
+            return true;
+        }
+        let Some(parent) = proc.parent() else {
+            return false;
+        };
+        pid = parent;
+    }
+    false
+}
+
 fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
     // Map `CodeEvent.agent` → DataSource variant via metadata
     // (TelemetryEvent::from_governable reads "data_source" string from
@@ -458,6 +510,21 @@ fn governable_from_code_event(ev: &CodeEvent) -> GovernableEvent {
     metadata.insert("agent".to_string(), ev.agent.clone());
     metadata.insert("hook_type".to_string(), ev.hook_type.clone());
     metadata.insert("data_source".to_string(), data_source.into());
+
+    // Attribute every code-extension event to a "<agent>-app" tool so the
+    // cloud's CH_TOOL_NAME_EXPR resolves a real name on dashboards like
+    // /view?domain=engineering instead of falling through to 'unknown'.
+    // Both keys are needed: `tool_identity_key` is what makes
+    // TelemetryEvent::from_governable synthesize a ProcessResolution at
+    // all; `tool_name` is what populates the ClickHouse
+    // `resolved_tool_name` column that CH_TOOL_NAME_EXPR checks first.
+    // Skip for `code_unknown` so unattributed agents don't pollute the
+    // tool catalog with an "unknown-app" entry.
+    if data_source != "code_unknown" {
+        let tool_app = format!("{}-app", ev.agent);
+        metadata.insert("tool_identity_key".to_string(), tool_app.clone());
+        metadata.insert("tool_name".to_string(), tool_app);
+    }
     if let Some(seq) = ev.action_seq {
         metadata.insert("action_seq".to_string(), seq.to_string());
     }
@@ -787,19 +854,21 @@ fn provider_for_agent(agent: &str) -> Option<&'static str> {
         "claude_code" | "openclaw" => Some("anthropic"),
         "codex" => Some("openai"),
         "gemini_cli" => Some("google"),
-        "pi_agent" => Some("inflection"),
-        // Cursor / Windsurf / OpenCode are multi-provider IDEs — the
-        // agent payload doesn't reveal which backend API was hit, and
-        // model-string sniffing is unreliable (Cursor lifecycle hooks
-        // carry no model, and even when present the model string can
-        // be a custom local route that doesn't match any backend
-        // family). Attribute to the IDE itself — gryph's
-        // `core/events/event.go` takes the same stance: no provider
-        // field at all, only `AgentName`. The IDE *is* the
-        // attribution surface for these tools.
+        // Multi-provider agents (Cursor / Windsurf / OpenCode / Pi)
+        // attribute to the agent itself, not the downstream LLM.
+        // Even if the underlying call hits Anthropic or OpenAI, the
+        // user-facing source of the event is the agent — that's what
+        // dashboard Feed/Signals should bucket under. The actual
+        // upstream model (if exposed) still lives in the `model`
+        // column for drill-down; this field reflects origin, not
+        // destination. Pi was previously hardcoded to "inflection"
+        // back when it was Inflection's product, but pi v0.74+ is
+        // model-agnostic — defaulting to the legacy provider made
+        // every pi event misattribute to Inflection on the dashboard.
         "cursor" => Some("cursor"),
         "windsurf" => Some("windsurf"),
         "opencode" => Some("opencode"),
+        "pi_agent" => Some("pi_agent"),
         _ => None,
     }
 }
@@ -1519,23 +1588,24 @@ mod tests {
         assert_eq!(provider_for_agent("openclaw"), Some("anthropic"));
         assert_eq!(provider_for_agent("codex"), Some("openai"));
         assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
-        assert_eq!(provider_for_agent("pi_agent"), Some("inflection"));
     }
 
     #[test]
-    fn provider_for_ide_agnostic_agents_is_the_ide_name() {
-        // Cursor / Windsurf / Opencode let the user pick a model from
-        // any provider, but the IDE *is* the attribution surface — the
-        // model string is unreliable (lifecycle hooks carry no model;
-        // custom routes don't match families) and gryph's own data
-        // model has no provider field at all. Attribute to the IDE
-        // itself so the dashboard shows "cursor" instead of
-        // model-string-inferred "anthropic" or the literal "unknown".
+    fn provider_for_agent_attributes_multi_provider_agents_to_themselves() {
+        // Cursor / Windsurf / OpenCode / Pi let the user pick a model
+        // from any provider, so we can't attribute to the downstream
+        // LLM. Instead they bucket under the agent name itself so the
+        // Feed/Signals dashboard groups events by user-facing source.
+        // Pi was previously `Some("inflection")` — that misattributed
+        // every pi event to Inflection's product even when the user
+        // had pi running against openai-codex or anthropic. v0.74+
+        // pi is model-agnostic, so it joins this group.
         assert_eq!(provider_for_agent("cursor"), Some("cursor"));
         assert_eq!(provider_for_agent("windsurf"), Some("windsurf"));
         assert_eq!(provider_for_agent("opencode"), Some("opencode"));
-        // Truly unknown agents still return None so the legacy
-        // model-sniff path remains the last resort.
+        assert_eq!(provider_for_agent("pi_agent"), Some("pi_agent"));
+        // Genuinely unknown agents still return None so resolve_provider
+        // falls back to model-string inference.
         assert_eq!(provider_for_agent("unknown_agent"), None);
         assert_eq!(provider_for_agent(""), None);
     }
@@ -1552,12 +1622,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_attributes_ide_agnostic_to_ide_not_model() {
-        // Regression guard for the "cursor sending events with
-        // anthropic" symptom: with a claude model picked inside
-        // Cursor, the IDE attribution should still surface as
-        // "cursor" so operators can distinguish IDE traffic from
-        // direct-API traffic on the dashboard.
+    fn resolve_provider_uses_agent_name_for_multi_provider_agents() {
+        // Multi-provider agents (cursor/windsurf/opencode/pi) attribute
+        // to themselves regardless of downstream model. The downstream
+        // LLM still appears in the `model` column for drill-down.
         assert_eq!(
             resolve_provider("cursor", Some("claude-opus-4-7")),
             "cursor"
@@ -1567,16 +1635,13 @@ mod tests {
             resolve_provider("opencode", Some("gemini-1.5-pro")),
             "opencode"
         );
-        // Lifecycle hooks (no model) used to land on "unknown" —
-        // now they correctly attribute to the IDE.
-        assert_eq!(resolve_provider("cursor", None), "cursor");
-        assert_eq!(resolve_provider("windsurf", None), "windsurf");
+        assert_eq!(resolve_provider("pi_agent", Some("gpt-5.5")), "pi_agent");
     }
 
     #[test]
-    fn resolve_provider_returns_unknown_only_for_truly_unrecognized() {
-        // Brand-new agents not yet in `provider_for_agent` + an
-        // unmapped model string genuinely have nothing to attribute to.
+    fn resolve_provider_returns_unknown_only_for_genuinely_unknown_agents() {
+        // Truly unknown agent + unmapped model string → "unknown".
+        // Never falls back to the legacy "code" placeholder.
         assert_eq!(
             resolve_provider("brand_new_agent", Some("future-model-x")),
             "unknown"
@@ -2034,9 +2099,11 @@ mod tests {
         assert_eq!(provider_for_agent("claude_code"), Some("anthropic"));
         assert_eq!(provider_for_agent("codex"), Some("openai"));
         assert_eq!(provider_for_agent("gemini_cli"), Some("google"));
-        // IDE-agnostic — attribute to the IDE itself, not to a backend
-        // family inferred from the model string.
+        // Multi-provider agents attribute to themselves (see
+        // provider_for_agent_attributes_multi_provider_agents_to_themselves
+        // for full coverage).
         assert_eq!(provider_for_agent("cursor"), Some("cursor"));
+        assert_eq!(provider_for_agent("pi_agent"), Some("pi_agent"));
         assert_eq!(provider_for_agent("unknown_agent"), None);
     }
 
